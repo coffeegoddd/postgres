@@ -18,6 +18,7 @@
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_store.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
@@ -277,6 +278,8 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 	HASH_SEQ_STATUS seq;
 	AuditEntry *a;
 
+	/* (with no writer meanwhile: a split during it would show chunks twice) */
+	LockRelationOid(RelationGetRelid(idx), ShareLock);
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = sizeof(AuditEntry);
 	ctl.hcxt = CurrentMemoryContext;

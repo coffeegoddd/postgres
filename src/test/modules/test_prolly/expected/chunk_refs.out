@@ -146,7 +146,7 @@ SELECT test_chunk_ref_root('ri', h(node('q', '\x61', '\x61'))) IS NOT NULL AS q_
 SELECT entries AS entries_before FROM test_chunk_index_shape('ri');
  entries_before 
 ----------------
-             15
+             14
 (1 row)
 
 VACUUM ri;
@@ -175,6 +175,68 @@ SELECT ok, chunks, unheld, why FROM test_chunk_check('rl', 'ri');
  t  |      4 |      1 | 
 (1 row)
 
+-- a transaction's changes of one chunk's counts are one change
+SELECT entries AS entries_before FROM test_chunk_index_shape('ri') \gset
+BEGIN;
+SELECT count(test_chunk_ref_root('ri', h('\x61'))) FROM generate_series(1, 5);
+ count 
+-------
+     5
+(1 row)
+
+COMMIT;
+SELECT entries - :entries_before AS entries_added, (counts('\x61')).roots AS a_roots
+FROM test_chunk_index_shape('ri');
+ entries_added | a_roots 
+---------------+---------
+             1 |       5
+(1 row)
+
+-- changes of one chunk in 250 transactions, past its bucket's first page,
+-- through splits of the index, and VACUUM adding them in
+CREATE PROCEDURE many_roots(n int) LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. n LOOP
+		PERFORM test_chunk_ref_root('ri', h('\x62'));
+		COMMIT;
+	END LOOP;
+END $$;
+CALL many_roots(250);
+SELECT buckets AS buckets_before FROM test_chunk_index_shape('ri') \gset
+SELECT count(*) FILTER (WHERE put(convert_to('leaf ' || g, 'UTF8'))) AS leaves
+FROM generate_series(1, 3000) g;
+ leaves 
+--------
+   3000
+(1 row)
+
+SELECT buckets > :buckets_before AS split, (counts('\x62')).roots AS b_roots
+FROM test_chunk_index_shape('ri');
+ split | b_roots 
+-------+---------
+ t     |     250
+(1 row)
+
+SELECT ok, why FROM test_chunk_check('rl', 'ri');
+ ok | why 
+----+-----
+ t  | 
+(1 row)
+
+VACUUM ri;
+SELECT (counts('\x62')).roots AS b_roots, test_chunk_index_unfrozen('ri') AS unfrozen;
+ b_roots | unfrozen 
+---------+----------
+     250 |        0
+(1 row)
+
+SELECT ok, why FROM test_chunk_check('rl', 'ri');
+ ok | why 
+----+-----
+ t  | 
+(1 row)
+
+DROP PROCEDURE many_roots(int);
 -- and finds a chunk naming one the store has lost
 SELECT test_chunk_index_remove('ri', h('\x62')) AS removed_b;
  removed_b 

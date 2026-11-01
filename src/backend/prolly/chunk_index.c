@@ -717,19 +717,25 @@ split_bucket(Relation rel)
 /*
  * The changes of hash's counts on the chain of the bucket whose first page
  * is primary (locked): those this transaction sees added to *drefs and
- * *droots, and the transaction of one it doesn't (another's, running) in
- * *running, if it is given.
+ * *droots; the transaction of a decrease it doesn't see (another's,
+ * running) in *running, if it is given (an increase it doesn't see can only
+ * add to the counts); and where this very transaction's own change is, in
+ * *own_blk and *own_at, if they are given.
  */
 static void
 count_changes(Relation rel, Buffer primary, int mode, const uint8 *hash,
 			  uint32 bucket, const IndexCache *masks, int64 *drefs,
-			  int64 *droots, TransactionId *running)
+			  int64 *droots, TransactionId *running, BlockNumber *own_blk,
+			  int *own_at)
 {
 	Buffer		cur = primary;
+	TransactionId mine = own_blk ? GetCurrentTransactionIdIfAny() : InvalidTransactionId;
 
 	*drefs = *droots = 0;
 	if (running)
 		*running = InvalidTransactionId;
+	if (own_blk)
+		*own_blk = InvalidBlockNumber;
 	for (;;)
 	{
 		Page		page = BufferGetPage(cur);
@@ -749,9 +755,14 @@ count_changes(Relation rel, Buffer primary, int mode, const uint8 *hash,
 				case ENTRY_VISIBLE:
 					*drefs += (int32) e->refs;
 					*droots += (int32) e->roots;
+					if (own_blk && TransactionIdIsValid(mine) && e->xmin == mine)
+					{
+						*own_blk = BufferGetBlockNumber(cur);
+						*own_at = i;
+					}
 					break;
 				case ENTRY_IN_PROGRESS:
-					if (running)
+					if (running && ((int32) e->refs < 0 || (int32) e->roots < 0))
 						*running = e->xmin;
 					break;
 				case ENTRY_DEAD:
@@ -910,7 +921,7 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	if (found != primary)
 		UnlockReleaseBuffer(found);
 	count_changes(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
-				  &drefs, &droots, NULL);
+				  &drefs, &droots, NULL, NULL, NULL);
 	UnlockReleaseBuffer(primary);
 	if (!counts_add(out, drefs, droots))
 		ereport(ERROR,
@@ -987,7 +998,8 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	int64		crefs,
 				croots;
 	TransactionId running;
-	bool		grew;
+	BlockNumber own_blk;
+	int			own_at;
 
 	PreventCommandIfReadOnly("change a chunk index");
 	memset(&change, 0, sizeof(change));
@@ -1009,10 +1021,10 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		if (found != primary)
 			UnlockReleaseBuffer(found);
 		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-					  &crefs, &croots, &running);
+					  &crefs, &croots, &running, &own_blk, &own_at);
 
 		/*
-		 * (a decrease waits for another's changes, as a row's update waits
+		 * (a decrease waits for another's decreases, as a row's update waits
 		 * for another's: two taking the last root away would both see it)
 		 */
 		if ((drefs < 0 || droots < 0) && TransactionIdIsValid(running))
@@ -1031,7 +1043,8 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		{
 			UnlockReleaseBuffer(primary);
 			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					(errcode(refs < 0 || roots < 0 ? ERRCODE_INVALID_PARAMETER_VALUE :
+							 ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("a chunk's reference counts would be %lld and %lld",
 							(long long) refs, (long long) roots)));
 		}
@@ -1039,11 +1052,34 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		out->roots = (uint32) roots;
 	}
 
-	chain_room(idx, primary, &space, &last);
-	grew = add_entry(idx, primary, bucket, space, last, &change);
+	if (BlockNumberIsValid(own_blk))
+	{
+		/* this transaction's change of the chunk's counts, changed again */
+		Buffer		buf = own_blk == BufferGetBlockNumber(primary) ? primary :
+			ReadBuffer(idx, own_blk);
+		GenericXLogState *st;
+		ChunkIndexEntry *e;
+
+		if (buf != primary)
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		st = GenericXLogStart(idx);
+		e = page_entry(GenericXLogRegisterBuffer(st, buf, 0), own_at);
+		e->refs = (uint32) ((int32) e->refs + drefs);
+		e->roots = (uint32) ((int32) e->roots + droots);
+		GenericXLogFinish(st);
+		if (buf != primary)
+			UnlockReleaseBuffer(buf);
+	}
+	else
+	{
+		/*
+		 * (a change past the bucket's first page splits no bucket: the
+		 * changes of one chunk are all in its bucket, and VACUUM takes them)
+		 */
+		chain_room(idx, primary, &space, &last);
+		(void) add_entry(idx, primary, bucket, space, last, &change);
+	}
 	UnlockReleaseBuffer(primary);
-	if (grew)
-		split_bucket(idx);
 	return true;
 }
 
@@ -1061,7 +1097,10 @@ page_remove(Relation idx, const uint8 *hash)
 	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
 
-	/* the chunk's entry, and every change of its counts */
+	/*
+	 * the chunk's entry, and every entry of its hash: other transactions'
+	 * changes too (for tests, which take a chunk out from under the store)
+	 */
 	while (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
 					  false, &found, &at, NULL, NULL, NULL) == ENTRY_VISIBLE)
 	{

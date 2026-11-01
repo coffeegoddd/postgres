@@ -43,6 +43,8 @@ extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
  * that isn't the bytes' is an error, as is a strong reference (as
  * ChunkFormat finds them) to a chunk the store doesn't have.  Storing it
  * counts a reference of each chunk it references, in this transaction.
+ * (A chunk another transaction is putting is not the store's until it
+ * commits: a chunk referencing it is refused meanwhile.)
  */
 extern bool ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 						  const void *data, uint32 len);
@@ -61,7 +63,8 @@ extern void ChunkStoreUnrefRoot(Relation idx, const uint8 *hash,
  * The audit: every chunk's bytes are its own, every chunk it references is
  * in the store, and every chunk's count of references is the edges to it.
  * The chunks, and those nothing holds, in *chunks and *unheld; the first
- * fault in *why.  For tests; O(store).
+ * fault in *why.  It locks the index in ShareLock, so that nothing
+ * writes it meanwhile.  For tests; O(store).
  */
 extern bool ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks,
 							uint64 *unheld, char **why);
