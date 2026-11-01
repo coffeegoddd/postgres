@@ -141,7 +141,7 @@ tests += {
       't/049_chunk_log_recovery.pl',
       't/050_chunk_log_writers.pl',
       't/051_chunk_index_writers.pl',
-      't/052_chunk_hash_verified.pl',
+      't/052_chunk_hash_audit.pl',
       't/053_chunk_refs_crash.pl',
       't/054_chunk_freer.pl',
       't/055_history_pointers.pl',

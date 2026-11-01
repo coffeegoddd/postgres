@@ -41,7 +41,8 @@ extern bool ChunkStoreHas(Relation log, Relation idx, const uint8 *hash);
 
 /*
  * The chunk's bytes, palloc'd, and their length in *len; NULL if absent.
- * Bytes that don't hash to its name are an error.
+ * They are not checked against its name (a page's checksum covers the
+ * read; the audit, and puts, check names).
  */
 extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
 						   uint32 *len);
