@@ -1,8 +1,8 @@
 # A pack whose put fails after one of its entries is on its page (an error
 # in the bucket's split that entry starts, by an injection point of this
-# session's): it wrote none of its bytes; those reserved for the entries it
-# put (rolled back) VACUUM counts dead, each once, and the room left goes
-# to the next put.  A chunk put after it keeps the log's tail, which VACUUM
+# session's): of its bytes, those reserved for the entries it put (rolled
+# back), written or not, VACUUM counts dead, each once, and the room left
+# goes to the next put.  A chunk put after it keeps the log's tail, which VACUUM
 # would otherwise cut.  (Enough chunks that one splits a bucket whatever
 # the index has seen: buckets are never merged.)
 

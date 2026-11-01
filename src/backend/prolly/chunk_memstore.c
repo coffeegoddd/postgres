@@ -188,8 +188,6 @@ mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 		return false;
 	ChunkFormat->refs(data, len, add_ref, &refs);
 	for (int i = 0; i < refs.n; i++)
-		pin(refs.hashes + i * CHUNK_HASH_LEN);
-	for (int i = 0; i < refs.n; i++)
 		if (!find(refs.hashes + i * CHUNK_HASH_LEN))
 			ereport(ERROR,
 					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
@@ -257,7 +255,6 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 		{
 			const uint8 *rh = refs.hashes + r * CHUNK_HASH_LEN;
 
-			pin(rh);
 			if (hash_search(pack, rh, HASH_FIND, NULL) == NULL && !find(rh))
 				ereport(ERROR,
 						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),

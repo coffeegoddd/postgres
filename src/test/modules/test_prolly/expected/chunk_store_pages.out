@@ -413,7 +413,8 @@ SELECT pg_temp.free('cs-leaf-d') AS d_freed;
        1
 (1 row)
 
--- and found already there, too; and a chunk a refused put referenced
+-- and found already there, too; but not one a refused put referenced (its
+-- reference, counted, gone with the refusal)
 SELECT pg_temp.put('cs-leaf-e') AS e;
  e 
 ---
@@ -441,10 +442,10 @@ SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-e', 'cs-nowh
  23503: chunk 66f5c0d3d3a8d301fe743e2a1437bf4e08aeb72f references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
 (1 row)
 
-SELECT pg_temp.free('cs-leaf-e') AS e_pinned_by_refused_put;
- e_pinned_by_refused_put 
--------------------------
-                       0
+SELECT pg_temp.free('cs-leaf-e') AS e_not_held_by_refused_put;
+ e_not_held_by_refused_put 
+---------------------------
+                         1
 (1 row)
 
 COMMIT;

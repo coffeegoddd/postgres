@@ -11,7 +11,8 @@
  *			them), counted per edge as the referring chunk is put
  *	roots	holds from outside the store (branch heads, working sets)
  *	pins	transient holds of the work in flight: a chunk put, or found
- *			already there, is pinned until the transaction ends
+ *			already there, is pinned until the transaction ends (those it
+ *			references are held by the references counted)
  * and only if it keeps every chunk the chunk strongly references: a put of
  * a chunk referencing one the store hasn't is refused.  Freeing cascades
  * through strong references, so it costs the chunks freed.
@@ -81,9 +82,9 @@ typedef struct ChunkStoreRoutine
 
 	/*
 	 * Stores the chunk the bytes are unless the store has it (true if it
-	 * stored it), its name in *hash, and pins it, and every chunk it
-	 * references.  A strong reference to a chunk the store hasn't is an
-	 * error; each one is counted.
+	 * stored it), its name in *hash, and pins it.  A strong reference to a
+	 * chunk the store hasn't is an error; each one is counted, which holds
+	 * the chunk it names (a put refused holds none).
 	 */
 	bool		(*put) (ChunkStore *cs, const void *data, uint32 len,
 						uint8 *hash);

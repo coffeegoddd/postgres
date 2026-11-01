@@ -148,7 +148,8 @@ SELECT pg_temp.put('cs-leaf-d') AS d;
 SELECT pg_temp.free('cs-leaf-d') AS d_pinned;
 COMMIT;
 SELECT pg_temp.free('cs-leaf-d') AS d_freed;
--- and found already there, too; and a chunk a refused put referenced
+-- and found already there, too; but not one a refused put referenced (its
+-- reference, counted, gone with the refusal)
 SELECT pg_temp.put('cs-leaf-e') AS e;
 BEGIN;
 SELECT pg_temp.put('cs-leaf-e') AS e_again;
@@ -156,7 +157,7 @@ SELECT pg_temp.free('cs-leaf-e') AS e_pinned;
 COMMIT;
 BEGIN;
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-e', 'cs-nowhere'))$$);
-SELECT pg_temp.free('cs-leaf-e') AS e_pinned_by_refused_put;
+SELECT pg_temp.free('cs-leaf-e') AS e_not_held_by_refused_put;
 COMMIT;
 
 -- every chunk nothing holds: the held kept (rooted, or referenced by one
