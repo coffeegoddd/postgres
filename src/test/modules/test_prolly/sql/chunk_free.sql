@@ -3,6 +3,8 @@
 -- all there if it aborts.  Pins hold a chunk too.  A chunk freed and put
 -- again starts with nothing of the one before.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
+-- (chunks nothing holds kept across VACUUM: no freer in the background)
+SET chunk_free_in_background = off;
 SELECT test_chunk_format_refs(true);
 CREATE TABLE fl () USING prolly_chunks;
 CREATE TABLE fi () USING prolly_chunk_index;

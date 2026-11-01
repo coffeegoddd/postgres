@@ -2,6 +2,8 @@
 -- counts, by linear hashing in pages of its own; chunks put, got and found
 -- over a log and its index.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
+-- (chunks nothing holds kept across VACUUM: no freer in the background)
+SET chunk_free_in_background = off;
 CREATE TABLE cl () USING prolly_chunks;
 CREATE TABLE ci () USING prolly_chunk_index;
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE

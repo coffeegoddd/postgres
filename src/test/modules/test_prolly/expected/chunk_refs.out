@@ -4,6 +4,8 @@
 -- and the audit checks every count against the edges.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
+-- (chunks nothing holds kept across VACUUM: no freer in the background)
+SET chunk_free_in_background = off;
 SELECT test_chunk_format_refs(true);
  test_chunk_format_refs 
 ------------------------

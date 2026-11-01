@@ -39,10 +39,11 @@
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
+#include "storage/sinval.h"
 #include "storage/smgr.h"
 #include "utils/fmgrprotos.h"
-#include "utils/inval.h"
 #include "utils/injection_point.h"
+#include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -421,7 +422,11 @@ page_append(Relation rel, const void *data, size_t len)
 	 */
 	PreventCommandIfReadOnly("append to a chunk log");
 	(void) GetCurrentTransactionId();
-	Assert(CheckRelationLockedByMe(rel, RowExclusiveLock, true));
+
+	/* (what keeps VACUUM from cutting the log's tail off meanwhile) */
+	if (!CheckRelationLockedByMe(rel, RowExclusiveLock, true))
+		elog(ERROR, "chunk log \"%s\" appended to without RowExclusiveLock",
+			 RelationGetRelationName(rel));
 
 	if (len == 0)
 		return 0;
@@ -728,60 +733,78 @@ ChunkLogRecordFree(Relation rel)
 	FreeSpaceMapVacuum(rel);
 }
 
+/* a page the log's tail may be cut at: free, part written all dead, or new */
+static bool
+tail_page_cuttable(Relation rel, BlockNumber blk)
+{
+	Buffer		buf = ReadBuffer(rel, blk);
+	Page		page = BufferGetPage(buf);
+	bool		cut;
+
+	/*
+	 * (a page part written all dead too: its backend, if any, can append
+	 * to it no more, with no append running and its region forgotten)
+	 */
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	cut = PageIsNew(page) || page_free(page) ||
+		(PageGetSpecialSize(page) == MAXALIGN(sizeof(ChunkPageOpaqueData)) &&
+		 ((ChunkPageOpaque) PageGetSpecialPointer(page))->kind == CHUNK_PAGE_DATA &&
+		 ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead ==
+		 ((PageHeader) page)->pd_lower - AREA_START);
+	UnlockReleaseBuffer(buf);
+	return cut;
+}
+
 /*
- * Cuts the log's free tail off: the pages at its end all free, or never
- * written.  Only with the relation's AccessExclusiveLock got without
- * waiting (as VACUUM cuts a heap's empty end), so never while an append
- * runs, and kept to the transaction's end, which sends a relcache
- * invalidation: a backend whose region lay in the tail cut forgets it
- * before its next append.  Answers the pages cut.
+ * Cuts the log's free tail off: the pages at its end all free, part written
+ * and all dead, or never written.  Only if its last page is such, and with
+ * the relation's AccessExclusiveLock got without waiting (as VACUUM cuts a
+ * heap's empty end), so never while an append runs; the lock is let go of
+ * as soon as the tail is cut.  The relation is truncated first, and the
+ * meta page's next region set after (a crash between leaves only holes
+ * that extensions fill), and a relcache invalidation goes at once, whatever
+ * becomes of this transaction: a backend whose region lay in the tail
+ * forgets it before its next append.  Answers the pages cut.
  */
 BlockNumber
 ChunkLogTruncateTail(Relation rel)
 {
-	BlockNumber nblocks;
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 	BlockNumber keep;
 
+	if (nblocks <= META_BLOCK + 1 || !tail_page_cuttable(rel, nblocks - 1))
+		return 0;
 	if (!ConditionalLockRelation(rel, AccessExclusiveLock))
 		return 0;
 	nblocks = RelationGetNumberOfBlocks(rel);
 	for (keep = nblocks; keep > META_BLOCK + 1; keep--)
-	{
-		Buffer		buf = ReadBuffer(rel, keep - 1);
-		Page		page = BufferGetPage(buf);
-		bool		cut;
-
-		/*
-		 * (a page part written all dead too: its backend, if any, can append
-		 * to it no more, with no append running now and its region
-		 * forgotten after)
-		 */
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		cut = PageIsNew(page) || page_free(page) ||
-			(PageGetSpecialSize(page) == MAXALIGN(sizeof(ChunkPageOpaqueData)) &&
-			 ((ChunkPageOpaque) PageGetSpecialPointer(page))->kind == CHUNK_PAGE_DATA &&
-			 ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead ==
-			 ((PageHeader) page)->pd_lower - AREA_START);
-		UnlockReleaseBuffer(buf);
-		if (!cut)
+		if (!tail_page_cuttable(rel, keep - 1))
 			break;
-	}
 	if (keep < nblocks)
 	{
-		Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
+		Buffer		mbuf;
 		GenericXLogState *st;
 		ChunkLogMetaData *meta;
+		SharedInvalidationMessage msg;
+
+		RelationTruncate(rel, keep);
 
 		/* (no region from the cut on: the next claim starts there) */
+		mbuf = ReadBuffer(rel, META_BLOCK);
 		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 		st = GenericXLogStart(rel);
 		meta = page_meta(rel, GenericXLogRegisterBuffer(st, mbuf, 0));
 		meta->next_block = keep;
 		GenericXLogFinish(st);
 		UnlockReleaseBuffer(mbuf);
-		RelationTruncate(rel, keep);
-		CacheInvalidateRelcache(rel);
+
+		msg.rc.id = SHAREDINVALRELCACHE_ID;
+		msg.rc.dbId = MyDatabaseId;
+		msg.rc.relId = RelationGetRelid(rel);
+		VALGRIND_MAKE_MEM_DEFINED(&msg, sizeof(msg));
+		SendSharedInvalidMessages(&msg, 1);
 	}
+	UnlockRelation(rel, AccessExclusiveLock);
 	return nblocks - keep;
 }
 

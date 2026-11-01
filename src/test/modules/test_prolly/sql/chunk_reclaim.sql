@@ -2,6 +2,8 @@
 -- of a put rolled back), and a page all of whose bytes are dead is used
 -- again for appends, so the log's file doesn't grow.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
+-- (chunks nothing holds kept across VACUUM: no freer in the background)
+SET chunk_free_in_background = off;
 CREATE TABLE ql () USING prolly_chunks;
 CREATE TABLE qi () USING prolly_chunk_index;
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
@@ -29,6 +31,7 @@ FROM test_chunk_log_space('ql');
 -- 150 more, from a backend with no region of its own (one with a region
 -- fills it first), go into the pages freed: the file no bigger
 \c
+SET chunk_free_in_background = off;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('b' || g)), blob('b' || g))) AS put_again
 FROM generate_series(1, 150) g;
 SELECT pg_relation_size('ql') = :size_full AS no_bigger;
@@ -42,6 +45,7 @@ SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 VACUUM qi;
 SELECT free_pages = full_pages AS full_ones_free_again FROM test_chunk_log_space('ql');
 \c
+SET chunk_free_in_background = off;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('c' || g)), blob('c' || g))) AS put_third
 FROM generate_series(1, 150) g;
 SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;

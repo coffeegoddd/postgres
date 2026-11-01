@@ -17,6 +17,7 @@ teardown
 }
 
 session a
+setup		{ SET chunk_free_in_background = off; }
 step a_begin	{ BEGIN; }
 step a_unref	{ SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20)); }
 step a_ref		{ SELECT * FROM test_chunk_ref_root('ri', substr(sha256('\x01'), 1, 20)); }
@@ -24,6 +25,7 @@ step a_commit	{ COMMIT; }
 step a_rollback	{ ROLLBACK; }
 
 session b
+setup		{ SET chunk_free_in_background = off; }
 step b_unref	{ SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20)); }
 step b_ref		{ SELECT * FROM test_chunk_ref_root('ri', substr(sha256('\x01'), 1, 20)); }
 step b_vacuum	{ VACUUM ri; }
