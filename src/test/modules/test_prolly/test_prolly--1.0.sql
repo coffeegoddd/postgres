@@ -439,7 +439,7 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_cs_stats(store text, reset bool,
 	OUT gets int8, OUT found int8, OUT puts int8, OUT stored int8,
-	OUT holds int8, OUT freed int8)
+	OUT holds int8, OUT held int8, OUT freed int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_cs_reset_memory()
