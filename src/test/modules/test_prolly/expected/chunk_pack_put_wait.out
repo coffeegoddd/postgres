@@ -1,7 +1,12 @@
-Parsed test spec with 2 sessions
+Parsed test spec with 3 sessions
 
-starting permutation: a_begin a_put b_pack a_commit b_has b_dead b_free
+starting permutation: b_start b_mark a_begin a_put b_pack a_commit b_has b_dead b_free
+step b_start: VACUUM pg_history.chunk_index;
 b: NOTICE:  table "dead0" does not exist, skipping
+step b_mark: 
+	DROP TABLE IF EXISTS dead0;
+	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+
 step a_begin: BEGIN;
 step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
 stored
@@ -11,7 +16,7 @@ t
 
 step b_pack: 
 	SELECT test_cs_put_many('pages',
-		ARRAY[substr(sha256('\x0a0101'), 1, 20), substr(sha256('\x0a0102'), 1, 20)],
+		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
 		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
  <waiting ...>
 step a_commit: COMMIT;
@@ -22,8 +27,8 @@ stored
 (1 row)
 
 step b_has: 
-	SELECT test_cs_has('pages', substr(sha256('\x0a0101'), 1, 20)) AS first,
-		test_cs_has('pages', substr(sha256('\x0a0102'), 1, 20)) AS second;
+	SELECT test_cs_has('pages', pack_h('\x0a0101')) AS first,
+		test_cs_has('pages', pack_h('\x0a0102')) AS second;
 
 first|second
 -----+------
@@ -39,8 +44,7 @@ more_dead
 (1 row)
 
 step b_free: 
-	SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0101'), 1, 20),
-		substr(sha256('\x0a0102'), 1, 20)]) AS freed;
+	SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')]) AS freed;
 
 freed
 -----
@@ -48,7 +52,12 @@ freed
 (1 row)
 
 
-starting permutation: a_begin a_put b_pack a_rollback b_has b_free
+starting permutation: b_start b_mark a_begin a_put b_pack a_rollback b_has b_free
+step b_start: VACUUM pg_history.chunk_index;
+step b_mark: 
+	DROP TABLE IF EXISTS dead0;
+	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+
 step a_begin: BEGIN;
 step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
 stored
@@ -58,7 +67,7 @@ t
 
 step b_pack: 
 	SELECT test_cs_put_many('pages',
-		ARRAY[substr(sha256('\x0a0101'), 1, 20), substr(sha256('\x0a0102'), 1, 20)],
+		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
 		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
  <waiting ...>
 step a_rollback: ROLLBACK;
@@ -69,8 +78,8 @@ stored
 (1 row)
 
 step b_has: 
-	SELECT test_cs_has('pages', substr(sha256('\x0a0101'), 1, 20)) AS first,
-		test_cs_has('pages', substr(sha256('\x0a0102'), 1, 20)) AS second;
+	SELECT test_cs_has('pages', pack_h('\x0a0101')) AS first,
+		test_cs_has('pages', pack_h('\x0a0102')) AS second;
 
 first|second
 -----+------
@@ -78,11 +87,165 @@ t    |t
 (1 row)
 
 step b_free: 
-	SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0101'), 1, 20),
-		substr(sha256('\x0a0102'), 1, 20)]) AS freed;
+	SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')]) AS freed;
 
 freed
 -----
     2
+(1 row)
+
+
+starting permutation: b_start b_mark a_begin a_put_leaf b_parent a_commit b_leaf b_free_parent
+step b_start: VACUUM pg_history.chunk_index;
+step b_mark: 
+	DROP TABLE IF EXISTS dead0;
+	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+
+step a_begin: BEGIN;
+step a_put_leaf: SELECT stored FROM test_cs_put('pages', '\x0a0201');
+stored
+------
+t     
+(1 row)
+
+step b_parent: 
+	SELECT test_chunk_format_refs(true);
+	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
+		ARRAY[pack_parent(), '\x0a0201']) AS stored;
+ <waiting ...>
+step a_commit: COMMIT;
+step b_parent: <... completed>
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+stored
+------
+     1
+(1 row)
+
+step b_leaf: 
+	SELECT refs, roots FROM test_cs_counts('pages', pack_h('\x0a0201'));
+
+refs|roots
+----+-----
+   1|    0
+(1 row)
+
+step b_free_parent: 
+	SELECT test_cs_free('pages', ARRAY[pack_h(pack_parent())]) AS freed;
+	SELECT test_chunk_format_refs(false);
+
+freed
+-----
+    2
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+
+starting permutation: b_start b_mark a_begin a_put_leaf b_parent a_rollback b_leaf b_free_parent
+step b_start: VACUUM pg_history.chunk_index;
+step b_mark: 
+	DROP TABLE IF EXISTS dead0;
+	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+
+step a_begin: BEGIN;
+step a_put_leaf: SELECT stored FROM test_cs_put('pages', '\x0a0201');
+stored
+------
+t     
+(1 row)
+
+step b_parent: 
+	SELECT test_chunk_format_refs(true);
+	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
+		ARRAY[pack_parent(), '\x0a0201']) AS stored;
+ <waiting ...>
+step a_rollback: ROLLBACK;
+step b_parent: <... completed>
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+stored
+------
+     2
+(1 row)
+
+step b_leaf: 
+	SELECT refs, roots FROM test_cs_counts('pages', pack_h('\x0a0201'));
+
+refs|roots
+----+-----
+   1|    0
+(1 row)
+
+step b_free_parent: 
+	SELECT test_cs_free('pages', ARRAY[pack_h(pack_parent())]) AS freed;
+	SELECT test_chunk_format_refs(false);
+
+freed
+-----
+    2
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+
+starting permutation: b_start b_mark a_begin a_put b_pack c_cancel b_dead a_rollback b_vacuum b_has
+step b_start: VACUUM pg_history.chunk_index;
+step b_mark: 
+	DROP TABLE IF EXISTS dead0;
+	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+
+step a_begin: BEGIN;
+step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
+stored
+------
+t     
+(1 row)
+
+step b_pack: 
+	SELECT test_cs_put_many('pages',
+		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
+		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+ <waiting ...>
+step c_cancel: 
+	SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+	WHERE application_name = 'pack_putter' AND wait_event_type = 'Lock';
+
+pg_cancel_backend
+-----------------
+t                
+(1 row)
+
+step b_pack: <... completed>
+ERROR:  canceling statement due to user request
+step b_dead: 
+	SELECT l.dead - d.dead AS more_dead FROM test_chunk_log_space('pg_history.chunks') l, dead0 d;
+
+more_dead
+---------
+        3
+(1 row)
+
+step a_rollback: ROLLBACK;
+step b_vacuum: VACUUM pg_history.chunk_index;
+step b_has: 
+	SELECT test_cs_has('pages', pack_h('\x0a0101')) AS first,
+		test_cs_has('pages', pack_h('\x0a0102')) AS second;
+
+first|second
+-----+------
+f    |f     
 (1 row)
 
