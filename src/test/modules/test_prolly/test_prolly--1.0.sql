@@ -293,3 +293,16 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_branch_map_reset()
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- The history store's chunk log: append bytes, read them back, its end.
+CREATE FUNCTION test_chunk_log_append(rel regclass, data bytea)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_log_read(rel regclass, loc int8, len int4)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION test_chunk_log_end(rel regclass)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;

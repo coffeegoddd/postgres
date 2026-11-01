@@ -5,5 +5,6 @@ backend_sources += files(
   'branch_catalog_copy.c',
   'branch_catalog_ops.c',
   'branch_filter.c',
+  'chunk_log.c',
   'registry.c',
 )

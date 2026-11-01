@@ -18,6 +18,7 @@ OBJS = \
 	branch_catalog_copy.o \
 	branch_catalog_ops.o \
 	branch_filter.o \
+	chunk_log.o \
 	registry.o
 
 include $(top_srcdir)/src/backend/common.mk
