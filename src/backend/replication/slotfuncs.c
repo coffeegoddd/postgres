@@ -849,6 +849,8 @@ copy_replication_slot(FunctionCallInfo fcinfo, bool logical_slot)
 		MyReplicationSlot->data.catalog_xmin = copy_catalog_xmin;
 		MyReplicationSlot->data.restart_lsn = copy_restart_lsn;
 		MyReplicationSlot->data.confirmed_flush = copy_confirmed_flush;
+		/* (the copy decodes on the source's branch, not the copier's) */
+		MyReplicationSlot->data.branch = first_slot_contents.data.branch;
 		SpinLockRelease(&MyReplicationSlot->mutex);
 
 		ReplicationSlotMarkDirty();

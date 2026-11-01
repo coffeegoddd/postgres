@@ -89,7 +89,8 @@ patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/replication/logical/reorderbuffer.c  1b  decoding on a branch leaves out other branches' tables
-patch src/backend/replication/slot.c  1a  a physical slot keeps its standby's hold on blocks of block-mapped storage (SLOT_VERSION bumped); recomputes the hold as slots are restored, dropped and checkpointed
+patch src/backend/replication/slot.c  1a  a physical slot keeps its standby's hold on blocks of block-mapped storage (SLOT_VERSION bumped); recomputes the hold as slots are restored, dropped and checkpointed; also (1b) a logical slot keeps the branch it was made on (SLOT_VERSION bumped)
+patch src/backend/replication/slotfuncs.c  1b  a copied logical slot keeps the source's branch
 patch src/backend/replication/walreceiver.c  1a  reports in each status reply where a recovery of the standby may begin and whether a backup runs on it, for the block map's standby hold
 patch src/backend/replication/walsender.c  1a  keeps each standby's reported hold, in its physical slot too, and publishes the earliest to the block map (WalSndComputeRecoveryHold), capped by block_map_standby_hold_max_size
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
@@ -147,7 +148,7 @@ patch src/include/nodes/parsenodes.h  1b  CreateSchemaStmt.versioned
 patch src/include/parser/kwlist.h  1b  the VERSIONED keyword
 patch src/include/pgstat.h  1a  the block map's statistics: counts, entry, functions; PGSTAT_FILE_FORMAT_ID bumped
 patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_per_pass
-patch src/include/replication/slot.h  1a  ReplicationSlotPersistentData.recovery_hold, a physical slot's standby's hold; ReplicationSlot.recovery_hold_warned, the hold last said to be let go of
+patch src/include/replication/slot.h  1a  ReplicationSlotPersistentData.recovery_hold, a physical slot's standby's hold; ReplicationSlot.recovery_hold_warned, the hold last said to be let go of; also (1b) a logical slot's branch
 patch src/include/replication/walsender.h  1a  declares WalSndComputeRecoveryHold
 patch src/include/replication/walsender_private.h  1a  WalSnd keeps the standby's reported hold and whether a backup runs on it
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change

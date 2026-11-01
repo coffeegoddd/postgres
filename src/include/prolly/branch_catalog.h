@@ -107,14 +107,14 @@ extern int32 VersionedNamespaceBranch(const char *nspname);
  * between branches.
  */
 extern Oid	ExtensionOidByName(const char *extname);
-
-/*
- * Whether logical decoding in this session leaves out changes to rel:
- * on a branch, another branch's tables are left out; on no branch,
- * nothing is.
- */
-extern bool CatalogBranchSkipsRelation(Relation rel);
 extern void ExtensionCheckNameFree(const char *extname, Oid nspid);
 extern void ExtensionCheckMove(const char *extname, Oid oldnspid, Oid newnspid);
+
+/*
+ * Whether logical decoding leaves out changes to rel: decoding from a slot
+ * made on a branch leaves out another branch's tables; from one made on
+ * no branch, nothing.
+ */
+extern bool CatalogBranchSkipsRelation(Relation rel);
 
 #endif							/* PROLLY_BRANCH_CATALOG_H */

@@ -167,6 +167,14 @@ typedef struct ReplicationSlotPersistentData
 	 * bmap.c), while the standby is away too.
 	 */
 	XLogRecPtr	recovery_hold;
+
+	/*
+	 * A logical slot's branch: the catalog_branch of the session that made
+	 * it.  Decoding from the slot carries that branch's changes and the
+	 * shared schemas', whichever branch the session decoding is on (0: all
+	 * of them).
+	 */
+	int32		branch;
 } ReplicationSlotPersistentData;
 
 /*

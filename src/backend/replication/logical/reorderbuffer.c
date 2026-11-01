@@ -2369,9 +2369,17 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					if (!RelationIsLogicallyLogged(relation))
 						goto change_done;
 
-					/* decoding on a branch leaves out other branches' tables */
+					/*
+					 * Decoding on a branch leaves out other branches' tables.
+					 * Their toast chunks, of a shared schema, were kept for
+					 * the change; it lets go of them as a decoded one would.
+					 */
 					if (CatalogBranchSkipsRelation(relation))
+					{
+						if (change->data.tp.clear_toast_afterwards)
+							ReorderBufferToastReset(rb, txn);
 						goto change_done;
+					}
 
 					/*
 					 * Ignore temporary heaps created during DDL unless the

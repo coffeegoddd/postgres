@@ -52,6 +52,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
+#include "replication/slot.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -275,12 +276,16 @@ VersionedNamespaceBranch(const char *nspname)
 bool
 CatalogBranchSkipsRelation(Relation rel)
 {
+	int32		decoding;
 	int32		branch;
 
-	if (catalog_branch == 0)
+	/* the slot's branch, whichever the session's is */
+	Assert(MyReplicationSlot != NULL);
+	decoding = MyReplicationSlot->data.branch;
+	if (decoding == 0)
 		return false;
 	branch = NamespaceBranch(RelationGetNamespace(rel));
-	return branch != 0 && branch != catalog_branch;
+	return branch != 0 && branch != decoding;
 }
 
 /*

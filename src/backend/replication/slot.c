@@ -46,6 +46,7 @@
 #include "common/string.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "postmaster/interrupt.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
@@ -144,12 +145,13 @@ StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 #define SLOT_MAGIC		0x1051CA1	/* format identifier */
 /*
  * Version 6 keeps a physical slot's recovery hold (the block map's standby
- * hold, WalSndComputeRecoveryHold()).  A data directory with slot files of
- * an older version doesn't start (RestoreSlotFromDisk() PANICs): to move
- * one to this build, drop its slots first and make them again after.
- * pg_upgrade is unaffected: it makes the new cluster's logical slots anew.
+ * hold, WalSndComputeRecoveryHold()); version 7 a logical slot's branch.  A
+ * data directory with slot files of an older version doesn't start
+ * (RestoreSlotFromDisk() PANICs): to move one to this build, drop its slots
+ * first and make them again after.  pg_upgrade makes the new cluster's
+ * logical slots anew, and refuses a cluster with branches.
  */
-#define SLOT_VERSION	6		/* version for new files */
+#define SLOT_VERSION	7		/* version for new files */
 
 /* Control array for replication slot management */
 ReplicationSlotCtlData *ReplicationSlotCtl = NULL;
@@ -416,6 +418,15 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 					errmsg("cannot enable failover for a replication slot created on the standby"));
 
 		/*
+		 * Nor a slot on a branch: a standby's synced copy would not keep the
+		 * branch, and would decode every branch's changes after a failover.
+		 */
+		if (db_specific && catalog_branch != 0 && !IsSyncingReplicationSlots())
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot enable failover for a replication slot made on a branch"));
+
+		/*
 		 * Do not allow users to create failover enabled temporary slots,
 		 * because temporary slots will not be synced to the standby.
 		 *
@@ -490,6 +501,7 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	slot->data.two_phase_at = InvalidXLogRecPtr;
 	slot->data.failover = failover;
 	slot->data.synced = synced;
+	slot->data.branch = db_specific ? catalog_branch : 0;
 
 	/* and then data only present in shared memory */
 	slot->just_dirtied = false;
@@ -1003,6 +1015,12 @@ ReplicationSlotAlter(const char *name, const bool *failover,
 
 	if (failover)
 	{
+		/* (see ReplicationSlotCreate()) */
+		if (*failover && MyReplicationSlot->data.branch != 0)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot enable failover for a replication slot made on a branch"));
+
 		/*
 		 * Do not allow users to enable failover for temporary slots as we do
 		 * not support syncing temporary slots to the standby.
