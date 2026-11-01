@@ -37,17 +37,21 @@
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/fmgrprotos.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	1
+#define CHUNK_LOG_VERSION	2
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
 
 #define META_BLOCK			0
+
+/* the pages a backend claims at a time to append into */
+#define REGION_PAGES		32
 
 /* The special space of each of the log's pages. */
 typedef struct ChunkPageOpaqueData
@@ -63,9 +67,20 @@ typedef ChunkPageOpaqueData *ChunkPageOpaque;
 typedef struct ChunkLogMetaData
 {
 	uint32		version;		/* CHUNK_LOG_VERSION */
-	uint32		unused;
-	uint64		end;			/* the log's length */
+	BlockNumber next_block;		/* the first page no region has */
 } ChunkLogMetaData;
+
+/*
+ * The region a backend appends into, in the relation's rd_amcache: a relcache
+ * reset (the relation's storage replaced, or a rollback) forgets it, and
+ * the rest of it stays unused.
+ */
+typedef struct ChunkLogRegion
+{
+	RelFileNumber relnumber;	/* the storage it is in */
+	uint64		next;			/* where the next append begins */
+	uint64		limit;			/* where the region ends */
+} ChunkLogRegion;
 
 /* The bytes of the log a data page holds, after its header. */
 #define AREA_START		SizeOfPageHeaderData
@@ -135,19 +150,63 @@ log_buffer(Relation rel, BlockNumber blk)
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		return buf;
 	}
+
+	/*
+	 * (another backend may extend the relation past blk meanwhile, with zero
+	 * pages: blk is in this backend's region, and nobody else writes it)
+	 */
 	return ExtendBufferedRelTo(BMR_REL(rel), MAIN_FORKNUM, NULL, 0, blk + 1,
 							   RBM_ZERO_AND_LOCK);
 }
 
 /* ------------------------------------------------------------- the log */
 
+/*
+ * Claims npages new pages for this backend's appends, from the meta page:
+ * the one place appends meet, for one short record per region.
+ */
+static BlockNumber
+claim_pages(Relation rel, BlockNumber npages)
+{
+	Buffer		mbuf = log_buffer(rel, META_BLOCK);
+	GenericXLogState *st = GenericXLogStart(rel);
+	Page		page;
+	ChunkLogMetaData *meta;
+	BlockNumber first;
+
+	if (PageIsNew(BufferGetPage(mbuf)))
+	{
+		page = GenericXLogRegisterBuffer(st, mbuf, GENERIC_XLOG_FULL_IMAGE);
+		init_page(page, CHUNK_PAGE_META);
+		meta = (ChunkLogMetaData *) PageGetContents(page);
+		meta->version = CHUNK_LOG_VERSION;
+		meta->next_block = META_BLOCK + 1;
+		((PageHeader) page)->pd_lower =
+			(char *) meta + sizeof(ChunkLogMetaData) - (char *) page;
+	}
+	else
+	{
+		page = GenericXLogRegisterBuffer(st, mbuf, 0);
+		meta = page_meta(rel, page);
+	}
+	first = meta->next_block;
+	if (npages > MaxBlockNumber - first)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("chunk log \"%s\" is full", RelationGetRelationName(rel))));
+	meta->next_block = first + npages;
+	GenericXLogFinish(st);
+	UnlockReleaseBuffer(mbuf);
+	return first;
+}
+
 static uint64
 page_append(Relation rel, const void *data, size_t len)
 {
 	const char *bytes = data;
-	Buffer		mbuf;
-	uint64		start,
-				end;
+	ChunkLogRegion region;
+	ChunkLogRegion *cached = rel->rd_amcache;
+	uint64		start;
 
 	/*
 	 * The transaction appending gets an id, so that its commit flushes the
@@ -156,88 +215,85 @@ page_append(Relation rel, const void *data, size_t len)
 	 */
 	PreventCommandIfReadOnly("append to a chunk log");
 	(void) GetCurrentTransactionId();
-	Assert(CheckRelationLockedByMe(rel, ExclusiveLock, true));
+	Assert(CheckRelationLockedByMe(rel, RowExclusiveLock, true));
 
-	mbuf = log_buffer(rel, META_BLOCK);
-	if (PageIsNew(BufferGetPage(mbuf)))
-	{
-		GenericXLogState *st = GenericXLogStart(rel);
-		Page		page = GenericXLogRegisterBuffer(st, mbuf,
-													 GENERIC_XLOG_FULL_IMAGE);
-		ChunkLogMetaData *meta;
-
-		init_page(page, CHUNK_PAGE_META);
-		meta = (ChunkLogMetaData *) PageGetContents(page);
-		meta->version = CHUNK_LOG_VERSION;
-		meta->unused = 0;
-		meta->end = 0;
-		((PageHeader) page)->pd_lower =
-			(char *) meta + sizeof(ChunkLogMetaData) - (char *) page;
-		GenericXLogFinish(st);
-	}
-	start = end = page_meta(rel, BufferGetPage(mbuf))->end;
-	LockBuffer(mbuf, BUFFER_LOCK_UNLOCK);
+	if (len == 0)
+		return 0;
 
 	/*
-	 * A page at a time, each page's change logged with the log's new end:
-	 * the meta page is locked only for each, so readers wait for a page's
-	 * change at most (the log's only writer is this one, which holds the
-	 * relation's ExclusiveLock).
+	 * This backend's region, or a new one if the bytes don't fit what is left
+	 * of it (bytes longer than a region get pages enough of their own)
 	 */
+	if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
+		region = *cached;
+	else
+		region.next = region.limit = 0;
+	if (region.limit - region.next < len)
+	{
+		BlockNumber npages = Max(REGION_PAGES, (len + AREA - 1) / AREA);
+		BlockNumber first = claim_pages(rel, npages);
+
+		region.relnumber = rel->rd_locator.relNumber;
+		region.next = (uint64) (first - 1) * AREA;
+		region.limit = region.next + (uint64) npages * AREA;
+	}
+	start = region.next;
+
+	/* a page at a time, each page's change a record of its own */
 	while (len > 0)
 	{
-		BlockNumber blk = LOC_BLOCK(end);
-		size_t		off = LOC_OFFSET(end),
+		BlockNumber blk = LOC_BLOCK(region.next);
+		size_t		off = LOC_OFFSET(region.next),
 					n = Min(len, AREA - off);
 		Buffer		buf;
 		GenericXLogState *st;
 		Page		page;
-		Page		mpage;
 
 		CHECK_FOR_INTERRUPTS();
 		buf = log_buffer(rel, blk);
 
 		/*
-		 * A page the log begins in is past its end, and new; one it goes on
-		 * in holds the log's bytes up to its end.  Anything else is not what
-		 * the log wrote.
+		 * A page this backend's appends begin is new; one they go on in holds
+		 * their bytes up to where they go on.  Anything else is not what the
+		 * log wrote.
 		 */
 		if (off == 0 ? !PageIsNew(BufferGetPage(buf)) :
 			PageIsNew(BufferGetPage(buf)))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("block %u of chunk log \"%s\" is %s, but the log's end is %llu",
+					 errmsg("block %u of chunk log \"%s\" is %s, but its region's appends are at %llu",
 							blk, RelationGetRelationName(rel),
 							off == 0 ? "in use" : "empty",
-							(unsigned long long) end)));
+							(unsigned long long) region.next)));
 		if (off > 0)
 		{
 			check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
 			if (((PageHeader) BufferGetPage(buf))->pd_lower != AREA_START + off)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("block %u of chunk log \"%s\" does not end where the log's end is",
+						 errmsg("block %u of chunk log \"%s\" does not end where its region's appends are",
 								blk, RelationGetRelationName(rel))));
 		}
 
-		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 		st = GenericXLogStart(rel);
 		page = GenericXLogRegisterBuffer(st, buf,
 										 off == 0 ? GENERIC_XLOG_FULL_IMAGE : 0);
-		mpage = GenericXLogRegisterBuffer(st, mbuf, 0);
 		if (off == 0)
 			init_page(page, CHUNK_PAGE_DATA);
 		memcpy((char *) page + AREA_START + off, bytes, n);
 		((PageHeader) page)->pd_lower = AREA_START + off + n;
-		end += n;
-		((ChunkLogMetaData *) PageGetContents(mpage))->end = end;
 		GenericXLogFinish(st);
-		LockBuffer(mbuf, BUFFER_LOCK_UNLOCK);
 		UnlockReleaseBuffer(buf);
+		region.next += n;
 		bytes += n;
 		len -= n;
 	}
-	ReleaseBuffer(mbuf);
+
+	/* (a relcache reset meanwhile forgot the region: it is kept anew) */
+	if (rel->rd_amcache == NULL)
+		rel->rd_amcache = MemoryContextAlloc(CacheMemoryContext,
+											 sizeof(ChunkLogRegion));
+	*(ChunkLogRegion *) rel->rd_amcache = region;
 	return start;
 }
 
@@ -252,7 +308,7 @@ page_end(Relation rel)
 	buf = ReadBuffer(rel, META_BLOCK);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	end = PageIsNew(BufferGetPage(buf)) ? 0 :
-		page_meta(rel, BufferGetPage(buf))->end;
+		(uint64) (page_meta(rel, BufferGetPage(buf))->next_block - 1) * AREA;
 	UnlockReleaseBuffer(buf);
 	return end;
 }
@@ -276,16 +332,28 @@ page_read(Relation rel, uint64 loc, void *dst, size_t len)
 		BlockNumber blk = LOC_BLOCK(loc);
 		size_t		off = LOC_OFFSET(loc),
 					n = Min(len, AREA - off);
-		Buffer		buf = ReadBuffer(rel, blk);
-		Page		page = BufferGetPage(buf);
+		Buffer		buf;
+		Page		page;
 
+		/* (a region's pages are made as its appends reach them) */
+		if (blk >= RelationGetNumberOfBlocks(rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("bytes %llu to %llu of chunk log \"%s\" were never written",
+							(unsigned long long) loc,
+							(unsigned long long) (loc + len),
+							RelationGetRelationName(rel))));
+		buf = ReadBuffer(rel, blk);
+		page = BufferGetPage(buf);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		check_page(rel, blk, page, CHUNK_PAGE_DATA);
 		if (AREA_START + off + n > ((PageHeader) page)->pd_lower)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("block %u of chunk log \"%s\" ends before the log's end says",
-							blk, RelationGetRelationName(rel))));
+					 errmsg("bytes %llu to %llu of chunk log \"%s\" were never written",
+							(unsigned long long) loc,
+							(unsigned long long) (loc + len),
+							RelationGetRelationName(rel))));
 		memcpy(out, (char *) page + AREA_START + off, n);
 		UnlockReleaseBuffer(buf);
 		out += n;

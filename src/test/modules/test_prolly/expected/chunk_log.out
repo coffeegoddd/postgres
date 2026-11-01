@@ -25,7 +25,7 @@ SELECT test_chunk_log_append('chunks', convert_to(repeat('0123456789', 2000), 'U
 SELECT test_chunk_log_append('chunks', '\x') AS empty_at;
  empty_at 
 ----------
-    20003
+        0
 (1 row)
 
 SELECT test_chunk_log_append('chunks', '\x7a') AS last_at;
@@ -37,7 +37,7 @@ SELECT test_chunk_log_append('chunks', '\x7a') AS last_at;
 SELECT test_chunk_log_end('chunks') AS end_after;
  end_after 
 -----------
-     20004
+    261120
 (1 row)
 
 SELECT pg_relation_size('chunks') / current_setting('block_size')::int AS blocks;
@@ -77,16 +77,20 @@ SELECT test_chunk_log_read('chunks', 20004, 0) AS nothing_at_end;
 (1 row)
 
 SELECT test_chunk_log_read('chunks', 20003, 2);
-ERROR:  bytes 20003 to 20005 are past the end of chunk log "chunks" (20004)
+ERROR:  bytes 20003 to 20005 of chunk log "chunks" were never written
 SELECT test_chunk_log_read('chunks', 30000, 0);
-ERROR:  bytes 30000 to 30000 are past the end of chunk log "chunks" (20004)
+ test_chunk_log_read 
+---------------------
+ \x
+(1 row)
+
 -- the pages are the log's (pageinspect reads their special space)
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 SELECT b, lower, special, pagesize FROM generate_series(0, 3) b,
 	LATERAL page_header(get_raw_page('chunks', b)) ORDER BY b;
  b | lower | special | pagesize 
 ---+-------+---------+----------
- 0 |    40 |    8184 |     8192
+ 0 |    32 |    8184 |     8192
  1 |  8184 |    8184 |     8192
  2 |  8184 |    8184 |     8192
  3 |  3708 |    8184 |     8192
@@ -118,7 +122,7 @@ ERROR:  cannot rewrite chunk log relation "chunks"
 SELECT test_chunk_log_end('chunks') AS end_kept;
  end_kept 
 ----------
-    20004
+   261120
 (1 row)
 
 -- a parallel scan and a TID scan find nothing too
@@ -148,14 +152,14 @@ BEGIN;
 SELECT test_chunk_log_append('chunks', '\x02') AS rolled_back_at;
  rolled_back_at 
 ----------------
-          20004
+         261120
 (1 row)
 
 ROLLBACK;
 SELECT test_chunk_log_end('chunks') AS end_after_rollback;
  end_after_rollback 
 --------------------
-              20005
+             522240
 (1 row)
 
 -- and none in a read-only transaction

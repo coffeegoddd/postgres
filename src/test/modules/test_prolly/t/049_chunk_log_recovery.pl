@@ -34,7 +34,8 @@ my $check = qq{SELECT test_chunk_log_end('chunks'),
 	test_chunk_log_read('chunks', 0, 3),
 	test_chunk_log_read('chunks', 3, 30000) = $big,
 	test_chunk_log_read('chunks', 30003, 1)};
-my $want = '30004|\x616263|t|\x7a';
+# (one region of 32 pages of 8160 bytes)
+my $want = '261120|\x616263|t|\x7a';
 
 $primary->stop('immediate');
 $primary->start;
@@ -43,9 +44,10 @@ is($primary->safe_psql('postgres', $check), $want, 'appends survive a crash');
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $check), $want, 'a standby reads what it replayed');
 
-# appending after the crash goes on from the end the crash left
+# appending after the crash, a new backend's, goes into a region after the
+# one the crash left
 is($primary->safe_psql('postgres', "SELECT test_chunk_log_append('chunks', '\\x01')"),
-	'30004', 'the next append begins at the recovered end');
+	'261120', 'the next append begins after the recovered regions');
 
 $primary->backup('after');
 command_ok([ 'pg_verifybackup', $primary->backup_dir . '/after' ],

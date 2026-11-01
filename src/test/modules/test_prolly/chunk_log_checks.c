@@ -41,7 +41,7 @@ open_log(Oid relid, LOCKMODE mode)
 Datum
 test_chunk_log_append(PG_FUNCTION_ARGS)
 {
-	Relation	rel = open_log(PG_GETARG_OID(0), ExclusiveLock);
+	Relation	rel = open_log(PG_GETARG_OID(0), RowExclusiveLock);
 	bytea	   *data = PG_GETARG_BYTEA_PP(1);
 	uint64		loc;
 
