@@ -97,7 +97,8 @@ ReplicationOrigin
 Generic
 LogicalMessage
 XLOG2
-BlockMap$/,
+BlockMap
+ChunkStore$/,
 	'rmgr list');
 
 
