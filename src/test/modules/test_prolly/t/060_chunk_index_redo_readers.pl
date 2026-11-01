@@ -50,6 +50,10 @@ my $all = q{SELECT count(*) FILTER (WHERE test_chunk_has('pg_history.chunks',
 	'pg_history.chunk_index', h(i))) FROM generate_series(1, 3000) i};
 is($standby->safe_psql('postgres', $all), '3000', 'the standby has every chunk');
 
+# (a reader waiting on a page's lock, replay holding it)
+my $reader_waits = q{SELECT count(*) = 1 FROM pg_stat_activity
+	WHERE application_name = 'reader' AND wait_event_type = 'Buffer'};
+
 my $next = 3001;
 for my $point ('chunk-index-redo-split', 'chunk-index-redo-add-page')
 {
@@ -65,7 +69,9 @@ for my $point ('chunk-index-redo-split', 'chunk-index-redo-add-page')
 	# a reader meanwhile: waiting, then finding every chunk (seeing the
 	# record in part, it would read a page not yet a bucket's)
 	my $reader = $standby->background_psql('postgres', on_error_stop => 0);
+	$reader->query_safe(q{SET application_name = 'reader'});
 	$reader->query_until(qr/reading/, "\\echo reading\n$all;\n");
+	$standby->poll_query_until('postgres', $reader_waits) or die 'the reader did not wait';
 	$standby->safe_psql('postgres', qq{
 		SELECT injection_points_detach('$point');
 		SELECT injection_points_wakeup('$point');
@@ -88,27 +94,30 @@ $primary->safe_psql('postgres', q{
 	CREATE TABLE fi () USING prolly_chunk_index;
 	CREATE TABLE fb AS
 		SELECT i, int4send(i) AS d FROM generate_series(1, 100000) i
-		WHERE get_byte(sha256(int4send(i)), 3) & 7 = 5 LIMIT 2;
+		WHERE get_byte(sha256(int4send(i)), 3) & 7 = 5 ORDER BY i LIMIT 2;
 	SELECT test_chunk_put('fl', 'fi', substr(sha256(d), 1, 20), d) FROM fb WHERE i = (SELECT min(i) FROM fb);
 });
 my $hd = q{(SELECT substr(sha256(d), 1, 20) FROM fb WHERE i = (SELECT min(i) FROM fb))};
 my $hc = q{(SELECT substr(sha256(d), 1, 20) FROM fb WHERE i = (SELECT max(i) FROM fb))};
+# (D's changes, each a transaction's, until the bucket's chain has a page
+# more: the page before it full, whatever a page holds)
 my $changes = sub {
-	my ($n) = @_;
 	$primary->safe_psql('postgres', qq{
-		DO \$\$BEGIN
-			FOR k IN 1 .. $n LOOP
+		DO \$\$DECLARE p0 int := (SELECT pages FROM test_chunk_index_shape('fi'));
+		BEGIN
+			LOOP
 				PERFORM test_chunk_index_adjust('fi', $hd, 0, 1);
 				COMMIT;
+				EXIT WHEN (SELECT pages FROM test_chunk_index_shape('fi')) > p0;
 			END LOOP;
 		END\$\$;
 	});
 };
-$changes->(200);
+$changes->();
 $primary->safe_psql('postgres', q{
 	SELECT test_chunk_put('fl', 'fi', substr(sha256(d), 1, 20), d) FROM fb WHERE i = (SELECT max(i) FROM fb);
 });
-$changes->(300);
+$changes->();
 $primary->safe_psql('postgres', qq{SELECT test_chunk_index_adjust('fi', $hc, 0, 1)});
 $primary->wait_for_replay_catchup($standby);
 my $c_counts = qq{SELECT refs || ' ' || roots FROM test_chunk_index_entry('fi', $hc)};
@@ -120,7 +129,9 @@ my $reader = $standby->background_psql('postgres', on_error_stop => 0);
 is($reader->query_safe($c_counts), '0 1', 'a reader, its cache of the index warm');
 $primary->safe_psql('postgres', 'VACUUM fi');
 $standby->wait_for_event('startup', 'chunk-index-redo-fold');
+$reader->query_safe(q{SET application_name = 'reader'});
 $reader->query_until(qr/reading/, "\\echo reading\n$c_counts;\n");
+$standby->poll_query_until('postgres', $reader_waits) or die 'the reader did not wait';
 $standby->safe_psql('postgres', q{
 	SELECT injection_points_detach('chunk-index-redo-fold');
 	SELECT injection_points_wakeup('chunk-index-redo-fold');
