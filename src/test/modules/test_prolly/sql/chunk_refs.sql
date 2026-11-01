@@ -67,6 +67,35 @@ SELECT 'p', * FROM counts(node('p', '\x61', '\x62')) UNION ALL
 SELECT 'q', * FROM counts(node('q', '\x61', '\x61'));
 SELECT ok, chunks, unheld, why FROM test_chunk_check('rl', 'ri');
 
+-- a transaction's changes of one chunk's counts are one change
+SELECT entries AS entries_before FROM test_chunk_index_shape('ri') \gset
+BEGIN;
+SELECT count(test_chunk_ref_root('ri', h('\x61'))) FROM generate_series(1, 5);
+COMMIT;
+SELECT entries - :entries_before AS entries_added, (counts('\x61')).roots AS a_roots
+FROM test_chunk_index_shape('ri');
+
+-- changes of one chunk in 250 transactions, past its bucket's first page,
+-- through splits of the index, and VACUUM adding them in
+CREATE PROCEDURE many_roots(n int) LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. n LOOP
+		PERFORM test_chunk_ref_root('ri', h('\x62'));
+		COMMIT;
+	END LOOP;
+END $$;
+CALL many_roots(250);
+SELECT buckets AS buckets_before FROM test_chunk_index_shape('ri') \gset
+SELECT count(*) FILTER (WHERE put(convert_to('leaf ' || g, 'UTF8'))) AS leaves
+FROM generate_series(1, 3000) g;
+SELECT buckets > :buckets_before AS split, (counts('\x62')).roots AS b_roots
+FROM test_chunk_index_shape('ri');
+SELECT ok, why FROM test_chunk_check('rl', 'ri');
+VACUUM ri;
+SELECT (counts('\x62')).roots AS b_roots, test_chunk_index_unfrozen('ri') AS unfrozen;
+SELECT ok, why FROM test_chunk_check('rl', 'ri');
+DROP PROCEDURE many_roots(int);
+
 -- and finds a chunk naming one the store has lost
 SELECT test_chunk_index_remove('ri', h('\x62')) AS removed_b;
 SELECT ok, regexp_replace(why, '[0-9a-f]{40}', 'H', 'g') AS why FROM test_chunk_check('rl', 'ri');

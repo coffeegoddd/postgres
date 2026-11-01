@@ -60,3 +60,53 @@ refs|roots
 (1 row)
 
 step a_commit: COMMIT;
+
+starting permutation: a_begin a_ref b_unref a_commit
+test_chunk_ref_root
+-------------------
+(0,1)              
+(1 row)
+
+step a_begin: BEGIN;
+step a_ref: SELECT * FROM test_chunk_ref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    2
+(1 row)
+
+step b_unref: SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    0
+(1 row)
+
+step a_commit: COMMIT;
+
+starting permutation: a_begin a_ref b_vacuum b_unfrozen a_commit b_vacuum b_unfrozen
+test_chunk_ref_root
+-------------------
+(0,1)              
+(1 row)
+
+step a_begin: BEGIN;
+step a_ref: SELECT * FROM test_chunk_ref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    2
+(1 row)
+
+step b_vacuum: VACUUM ri;
+step b_unfrozen: SELECT test_chunk_index_unfrozen('ri') AS unfrozen;
+unfrozen
+--------
+       1
+(1 row)
+
+step a_commit: COMMIT;
+step b_vacuum: VACUUM ri;
+step b_unfrozen: SELECT test_chunk_index_unfrozen('ri') AS unfrozen;
+unfrozen
+--------
+       0
+(1 row)
+

@@ -95,7 +95,8 @@ typedef struct ChunkIndexRoutine
 	 * the chunk's when it commits), and answers the entry's counts after,
 	 * as this transaction sees them; false if there is no entry.  Taking a
 	 * count below zero is an error; a decrease waits for another
-	 * transaction changing the chunk's counts to end.
+	 * transaction decreasing the chunk's counts to end.  A transaction's
+	 * changes of one chunk's counts are one change.
 	 */
 	bool		(*adjust) (Relation idx, const uint8 *hash, int32 drefs,
 						   int32 droots, ChunkIndexEntry *out);
