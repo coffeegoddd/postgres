@@ -114,7 +114,12 @@ FROM generate_series(1, 300) g;
 -- no log yet, refused (and the index not bound to it)
 CREATE TABLE ci4 () USING prolly_chunk_index;
 SELECT test_chunk_put('cl3', 'ci4', h('\x0c'), '\x0c');
-DROP TABLE ci3, ci4, cl3;
+-- and an index bound to another log refused a put into a new log, the new
+-- log then not bound to it: another index's put into it goes in
+CREATE TABLE cl4 () USING prolly_chunks;
+SELECT test_chunk_put('cl4', 'ci3', h('\x0c'), '\x0c');
+SELECT test_chunk_put('cl4', 'ci4', h('\x0c'), '\x0c') AS stored;
+DROP TABLE ci3, ci4, cl3, cl4;
 
 -- truncated, it starts again
 TRUNCATE ci;

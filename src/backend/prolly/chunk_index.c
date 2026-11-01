@@ -2126,10 +2126,23 @@ ChunkIndexVacuum(Relation idx)
 		vacuum_delay_point(false);
 
 		/*
-		 * (a bucket's entries taken out, then their bytes counted dead, not
-		 * interrupted between: a cancel there would leave them counted by
-		 * nobody)
+		 * The log the entries' bytes are in, opened (its lock waited for)
+		 * before the bucket's entries are taken out and their bytes counted
+		 * dead, not interrupted between: a cancel there would leave them
+		 * counted by nobody.  An index bound to no log yet has no bytes; one
+		 * a first put binds meanwhile keeps the entries of chunks with bytes
+		 * for the next VACUUM.
 		 */
+		if (!log_tried)
+		{
+			uint64		stamp;
+
+			if (OidIsValid(page_log_of(idx, &stamp)))
+			{
+				log = open_bound_log(idx);
+				log_tried = true;
+			}
+		}
 		HOLD_INTERRUPTS();
 		primary = ReadBuffer(idx, blk);
 		LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
@@ -2149,6 +2162,11 @@ ChunkIndexVacuum(Relation idx)
 			for (int i = 0; i < n; i++)
 			{
 				fates[i] = vacuum_fate(page_entry(page, i), b, &masks, frozen);
+				if (log == NULL &&
+					(fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED) &&
+					page_entry(page, i)->kind == CHUNK_KIND_CHUNK &&
+					page_entry(page, i)->len > 0)
+					fates[i] = FATE_KEEP;
 				if (fates[i] != FATE_KEEP)
 					change = true;
 				if (fates[i] == FATE_REMOVE_FREED &&
@@ -2208,15 +2226,7 @@ ChunkIndexVacuum(Relation idx)
 		unheld += count_unheld(idx, primary);
 		UnlockReleaseBuffer(primary);
 
-		/*
-		 * the bytes of the chunks taken out, dead in their log (found when
-		 * there are some: a first put may have bound the index meanwhile)
-		 */
-		if (ndead > 0 && !log_tried)
-		{
-			log = open_bound_log(idx);
-			log_tried = true;
-		}
+		/* the bytes of the chunks taken out, dead in their log */
 		if (ndead > 0 && log != NULL)
 			for (int i = 0; i < ndead; i++)
 				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len, dead[i].log_gen);

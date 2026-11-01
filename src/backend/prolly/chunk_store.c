@@ -210,6 +210,26 @@ hash_text(const uint8 *hash)
 static bool put_hashed(Relation log, Relation idx, const uint8 *hash,
 					   const void *data, uint32 len);
 
+/*
+ * The log and its index bound to each other (an index is one log
+ * storage's, a log one index's), each checked before either is: a
+ * binding written, then refused, would stay
+ */
+static void
+bind_store(Relation log, Relation idx)
+{
+	uint64		stamp = ChunkLog->stamp(log);
+	uint64		bound_stamp;
+	Oid			bound = ChunkIndex->log_of(idx, &bound_stamp);
+
+	/* (bound to another: bind_log says so, writing nothing) */
+	if (OidIsValid(bound) &&
+		(bound != RelationGetRelid(log) || bound_stamp != stamp))
+		ChunkIndex->bind_log(idx, RelationGetRelid(log), stamp);
+	ChunkLog->bind_index(log, RelationGetRelid(idx));
+	ChunkIndex->bind_log(idx, RelationGetRelid(log), stamp);
+}
+
 /* An entry's place: its bytes reserved in the run prepared (does not fail). */
 typedef struct PlaceArg
 {
@@ -281,8 +301,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
 
 	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
-	ChunkLog->bind_index(log, RelationGetRelid(idx));
-	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
+	bind_store(log, idx);
 
 	/*
 	 * The entry first, its bytes' place reserved as it is put, the bytes
@@ -405,8 +424,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		}
 	}
 
-	ChunkLog->bind_index(log, RelationGetRelid(idx));
-	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
+	bind_store(log, idx);
 
 	/*
 	 * Their entries, room prepared for all their bytes, each one's place
