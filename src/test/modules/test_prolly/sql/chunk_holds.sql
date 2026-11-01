@@ -24,6 +24,14 @@ SAVEPOINT s;
 SELECT test_chunk_hold('pg_history.chunk_index', hh(parent())) AS held_in_subtransaction;
 SELECT entries - :e0 AS holds_still FROM test_chunk_index_shape('pg_history.chunk_index');
 RELEASE s;
+-- (one of a subtransaction committed holds the chunk for the next)
+SAVEPOINT a;
+SELECT test_chunk_hold('pg_history.chunk_index', hh(leaf())) AS held_leaf;
+RELEASE a;
+SAVEPOINT b;
+SELECT test_chunk_hold('pg_history.chunk_index', hh(leaf())) AS held_leaf_again;
+SELECT entries - :e0 AS holds_leaf_once FROM test_chunk_index_shape('pg_history.chunk_index');
+RELEASE b;
 -- (its own freeing passes both by)
 SELECT test_cs_free('pages', ARRAY[hh(parent()), hh(leaf())]) AS freed_own;
 COMMIT;

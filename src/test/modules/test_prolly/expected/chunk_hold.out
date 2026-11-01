@@ -87,3 +87,37 @@ test_cs_free
            1
 (1 row)
 
+
+starting permutation: a_begin a_hold a_save a_hold a_rollback_to b_free a_commit
+stored
+------
+t     
+(1 row)
+
+step a_begin: BEGIN;
+step a_hold: SELECT test_chunk_hold('pg_history.chunk_index', substr(sha256('\x0a0801'), 1, 20)) AS held;
+held
+----
+t   
+(1 row)
+
+step a_save: SAVEPOINT s;
+step a_hold: SELECT test_chunk_hold('pg_history.chunk_index', substr(sha256('\x0a0801'), 1, 20)) AS held;
+held
+----
+t   
+(1 row)
+
+step a_rollback_to: ROLLBACK TO s;
+step b_free: SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0801'), 1, 20)]) AS freed;
+freed
+-----
+    0
+(1 row)
+
+step a_commit: COMMIT;
+test_cs_free
+------------
+           1
+(1 row)
+

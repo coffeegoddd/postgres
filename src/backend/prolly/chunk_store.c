@@ -479,6 +479,7 @@ hold_found(Relation idx, int n, const uint8 *hashes, const void *const *datas,
 				parents[pc->at]++;
 		}
 	}
+	INJECTION_POINT("chunk-pack-found", NULL);
 	for (int i = 0; i < n; i++)
 		if (has[i] && parents[i] == 0)
 			queue[tail++] = i;

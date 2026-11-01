@@ -4,12 +4,14 @@
  *	  Transient holds on the history store's chunks, for this transaction's
  *	  own freeing.
  *
- * A transaction holds each chunk it puts until it ends (or the
- * subtransaction that put it is rolled back): one it stores, by
- * its entry (not committed: no other's freer frees it, and its own freeing
- * passes by); one it finds stored already, by a change of the chunk's
- * counts adding nothing (running: no other's freer frees the chunk while
- * it does, and one freeing it as it is found is waited for), and by a pin.
+ * A transaction holds each chunk it puts until it ends (or at least until
+ * the subtransaction that put it is rolled back; its pin stays): one it
+ * stores, by its entry (not committed: no other's freer frees it, and its
+ * own freeing passes by); one it finds stored already, by a change of the
+ * chunk's counts adding nothing (running: no other's freer frees the chunk
+ * while it does, and one freeing it as it is found is waited for), and by
+ * a pin; one of a pack found stored that another of the pack found
+ * stored, and held, references, by that one's references.
  * A pin is the transaction's own note that it holds the chunk, so that its
  * own freeing, which counts its own changes as made, passes the chunk by.
  * Pins are this backend's alone, in its memory, let go of as its
