@@ -491,6 +491,93 @@ SELECT ok, why FROM test_cs_check(:'store');
  t  | 
 (1 row)
 
+-- a chunk found, not put, held until the transaction ends: its freeing
+-- passes it by; one the store hasn't is not held
+SELECT pg_temp.put('cs-held') AS held_put;
+ held_put 
+----------
+ t
+(1 row)
+
+BEGIN;
+SELECT test_cs_hold(:'store', pg_temp.h('cs-held')) AS held,
+	test_cs_hold(:'store', pg_temp.h('cs-absent')) AS absent_held;
+ held | absent_held 
+------+-------------
+ t    | f
+(1 row)
+
+SELECT pg_temp.free('cs-held') AS freed_held;
+ freed_held 
+------------
+          0
+(1 row)
+
+COMMIT;
+SELECT pg_temp.free('cs-held') AS freed_after;
+ freed_after 
+-------------
+           1
+(1 row)
+
+-- a visit: every chunk the audit counts, with its counts
+SELECT (SELECT count(*) FROM test_cs_visit(:'store')) =
+	(SELECT chunks FROM test_cs_check(:'store')) AS visit_sees_all;
+ visit_sees_all 
+----------------
+ t
+(1 row)
+
+SELECT refs, roots FROM test_cs_visit(:'store') WHERE hash = pg_temp.h('cs-rooted');
+ refs | roots 
+------+-------
+    0 |     1
+(1 row)
+
+SELECT len FROM test_cs_visit(:'store') WHERE hash = pg_temp.h('cs-shared');
+ len 
+-----
+   9
+(1 row)
+
+-- what the store was asked, counted
+SELECT 1 FROM test_cs_stats(:'store', true);
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT pg_temp.put('cs-stat') AS stat1, pg_temp.put('cs-stat') AS stat2;
+ stat1 | stat2 
+-------+-------
+ t     | f
+(1 row)
+
+SELECT test_cs_get(:'store', pg_temp.h('cs-stat')) IS NOT NULL AS got,
+	test_cs_get(:'store', pg_temp.h('cs-nothing')) IS NULL AS absent;
+ got | absent 
+-----+--------
+ t   | t
+(1 row)
+
+SELECT test_cs_hold(:'store', pg_temp.h('cs-stat')) AS held;
+ held 
+------
+ t
+(1 row)
+
+SELECT pg_temp.free('cs-stat') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+SELECT * FROM test_cs_stats(:'store', false);
+ gets | found | puts | stored | holds | freed 
+------+-------+------+--------+-------+-------
+    2 |     1 |    2 |      1 |     1 |     1
+(1 row)
+
 -- let go of
 SELECT pg_temp.root('cs-rooted', false);
  root 

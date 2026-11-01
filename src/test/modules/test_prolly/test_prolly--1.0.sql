@@ -428,6 +428,20 @@ CREATE FUNCTION test_cs_check(store text, OUT ok bool, OUT chunks int8, OUT unhe
 	OUT why text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_cs_hold(store text, hash bytea)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_visit(store text,
+	OUT hash bytea, OUT len int8, OUT refs int8, OUT roots int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_stats(store text, reset bool,
+	OUT gets int8, OUT found int8, OUT puts int8, OUT stored int8,
+	OUT holds int8, OUT freed int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_cs_reset_memory()
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

@@ -172,6 +172,31 @@ SELECT pg_temp.has('cs-rooted') AS rooted, pg_temp.has('cs-shared') AS shared,
 	pg_temp.has('cs-loose') AS loose, pg_temp.has('cs-leaf-e') AS e;
 SELECT ok, why FROM test_cs_check(:'store');
 
+-- a chunk found, not put, held until the transaction ends: its freeing
+-- passes it by; one the store hasn't is not held
+SELECT pg_temp.put('cs-held') AS held_put;
+BEGIN;
+SELECT test_cs_hold(:'store', pg_temp.h('cs-held')) AS held,
+	test_cs_hold(:'store', pg_temp.h('cs-absent')) AS absent_held;
+SELECT pg_temp.free('cs-held') AS freed_held;
+COMMIT;
+SELECT pg_temp.free('cs-held') AS freed_after;
+
+-- a visit: every chunk the audit counts, with its counts
+SELECT (SELECT count(*) FROM test_cs_visit(:'store')) =
+	(SELECT chunks FROM test_cs_check(:'store')) AS visit_sees_all;
+SELECT refs, roots FROM test_cs_visit(:'store') WHERE hash = pg_temp.h('cs-rooted');
+SELECT len FROM test_cs_visit(:'store') WHERE hash = pg_temp.h('cs-shared');
+
+-- what the store was asked, counted
+SELECT 1 FROM test_cs_stats(:'store', true);
+SELECT pg_temp.put('cs-stat') AS stat1, pg_temp.put('cs-stat') AS stat2;
+SELECT test_cs_get(:'store', pg_temp.h('cs-stat')) IS NOT NULL AS got,
+	test_cs_get(:'store', pg_temp.h('cs-nothing')) IS NULL AS absent;
+SELECT test_cs_hold(:'store', pg_temp.h('cs-stat')) AS held;
+SELECT pg_temp.free('cs-stat') AS freed;
+SELECT * FROM test_cs_stats(:'store', false);
+
 -- let go of
 SELECT pg_temp.root('cs-rooted', false);
 SELECT pg_temp.root(pg_temp.parent('cs-shared', 'cs-shared'), false);
