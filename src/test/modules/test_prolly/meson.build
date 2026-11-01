@@ -56,6 +56,7 @@ tests += {
       'chunk_index',
       'chunk_refs',
       'chunk_free',
+      'chunk_reclaim',
     ],
   },
   'isolation': {

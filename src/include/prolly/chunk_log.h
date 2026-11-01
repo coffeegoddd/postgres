@@ -30,7 +30,12 @@
  *
  * Every page keeps the standard page layout (a page header, pd_lower at the
  * end of the bytes, the unused rest a hole) with a ChunkPageOpaque in its
- * special space marking it as a page of this log, which a read checks.
+ * special space marking it as a page of this log, which a read checks, and
+ * counting the page's bytes no chunk's any more.  A page written full and
+ * all of it dead goes in the relation's free space map, and an append
+ * that needs a page takes one from there before claiming new ones.  (A
+ * page a region did not fill stays: its backend may go on appending to
+ * it.)
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -67,10 +72,23 @@ typedef struct ChunkLogRoutine
 
 	/* Where the log's regions end: no bytes are at or after it. */
 	uint64		(*end) (Relation rel);
+
+	/*
+	 * Counts len bytes from loc dead: no chunk's any more.  Space all of
+	 * whose bytes are dead is used again for appends.
+	 */
+	void		(*mark_dead) (Relation rel, uint64 loc, size_t len);
 } ChunkLogRoutine;
 
 extern PGDLLIMPORT const ChunkLogRoutine *ChunkLog;
 extern PGDLLIMPORT const ChunkLogRoutine PageChunkLog;
+
+/*
+ * For tests: the log's pages written, those written full, its dead bytes,
+ * and the pages free to use again.
+ */
+extern void ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full,
+						  uint64 *dead, uint32 *free_pages);
 
 /* The prolly_chunks table access method's relations are a PageChunkLog's. */
 extern bool RelationIsChunkLog(Relation rel);

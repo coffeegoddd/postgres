@@ -38,12 +38,14 @@
 
 #include "access/generic_xlog.h"
 #include "access/multixact.h"
+#include "access/relation.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "prolly/chunk_index.h"
+#include "prolly/chunk_log.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
@@ -53,7 +55,7 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	3
+#define CHUNK_INDEX_VERSION	4
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -88,6 +90,7 @@ typedef struct IndexMetaData
 	uint32		lowmask;
 	uint32		highmask;
 	BlockNumber next_block;		/* the first page not in use */
+	Oid			log;			/* the chunk log the entries are of, or 0 */
 	uint32		ndir;			/* the directory's pages */
 	BlockNumber dir[FLEXIBLE_ARRAY_MEMBER];
 } IndexMetaData;
@@ -101,6 +104,7 @@ typedef struct IndexMetaData
 typedef struct IndexCache
 {
 	RelFileNumber relnumber;
+	Oid			log;
 	uint32		maxbucket;
 	uint32		lowmask;
 	uint32		highmask;
@@ -339,6 +343,7 @@ load_cache(Relation rel)
 	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
 	meta = page_meta(rel, BufferGetPage(mbuf));
 	cache.relnumber = rel->rd_locator.relNumber;
+	cache.log = meta->log;
 	cache.maxbucket = meta->maxbucket;
 	cache.lowmask = meta->lowmask;
 	cache.highmask = meta->highmask;
@@ -1398,11 +1403,57 @@ page_visit(Relation idx, void (*fn) (void *arg, const ChunkIndexEntry *e),
 	}
 }
 
+static Oid
+page_log_of(Relation idx)
+{
+	Buffer		mbuf = ReadBuffer(idx, META_BLOCK);
+	Oid			log;
+
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	log = page_meta(idx, BufferGetPage(mbuf))->log;
+	UnlockReleaseBuffer(mbuf);
+	return log;
+}
+
+static void
+page_bind_log(Relation idx, Oid log)
+{
+	Buffer		mbuf;
+	GenericXLogState *st;
+	IndexMetaData *meta;
+
+	/* (once bound, as a backend's copy of the meta page says: every put) */
+	if (get_cache(idx)->log == log || load_cache(idx)->log == log)
+		return;
+	mbuf = ReadBuffer(idx, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = page_meta(idx, BufferGetPage(mbuf));
+	if (meta->log == log)
+	{
+		UnlockReleaseBuffer(mbuf);
+		return;
+	}
+	if (OidIsValid(meta->log))
+	{
+		UnlockReleaseBuffer(mbuf);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("chunk index \"%s\" is another chunk log's",
+						RelationGetRelationName(idx))));
+	}
+	st = GenericXLogStart(idx);
+	((IndexMetaData *) PageGetContents(GenericXLogRegisterBuffer(st, mbuf, 0)))->log = log;
+	GenericXLogFinish(st);
+	UnlockReleaseBuffer(mbuf);
+}
+
 const ChunkIndexRoutine PageChunkIndex = {
 	.lookup = page_lookup,
 	.insert = page_insert,
 	.adjust = page_adjust,
 	.free = page_free,
+	.log_of = page_log_of,
+	.bind_log = page_bind_log,
 	.remove = page_remove,
 	.visit = page_visit,
 };
@@ -1430,6 +1481,7 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	meta->lowmask = INIT_BUCKETS - 1;
 	meta->highmask = 2 * INIT_BUCKETS - 1;
 	meta->next_block = 2 + INIT_BUCKETS;
+	meta->log = InvalidOid;
 	meta->ndir = 1;
 	meta->dir[0] = 1;
 	set_meta_lower(page, meta);
@@ -1628,7 +1680,8 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 typedef enum VacuumFate
 {
 	FATE_KEEP,
-	FATE_REMOVE,				/* not the bucket's, aborted, or freed */
+	FATE_REMOVE,				/* aborted, or freed: its bytes dead */
+	FATE_REMOVE_COPY,			/* not the bucket's: another's bytes */
 	FATE_FREEZE,				/* xmin committed, not noted so in WAL */
 	FATE_CLEAR,					/* xmax aborted: no freeing now */
 	FATE_FREEZE_CLEAR,
@@ -1646,7 +1699,7 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
 	bool		clear = false;
 
 	if (!belongs(e, bucket, masks))
-		return FATE_REMOVE;
+		return FATE_REMOVE_COPY;
 	if (!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
 	{
 		if (e->flags & CHUNK_ENTRY_ABORTED)
@@ -1681,6 +1734,12 @@ ChunkIndexVacuum(Relation idx)
 {
 	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
 	double		kept_entries = 0;
+	Oid			logid = page_log_of(idx);
+	Relation	log = OidIsValid(logid) ?
+		try_relation_open(logid, RowExclusiveLock) : NULL;
+	ChunkIndexEntry *dead = NULL;
+	int			ndead = 0,
+				dead_cap = 0;
 
 	/*
 	 * Every transaction older than frozen has ended: past its bucket's
@@ -1728,8 +1787,23 @@ ChunkIndexVacuum(Relation idx)
 				{
 					ChunkIndexEntry e = *page_entry(p, i);
 
-					if (fates[i] == FATE_REMOVE)
+					if (fates[i] == FATE_REMOVE_COPY)
 						continue;
+					if (fates[i] == FATE_REMOVE)
+					{
+						/* (a chunk's bytes, dead once its entry is out) */
+						if (e.kind == CHUNK_KIND_CHUNK && e.len > 0)
+						{
+							if (ndead == dead_cap)
+							{
+								dead_cap = dead_cap ? dead_cap * 2 : 64;
+								dead = dead ? repalloc(dead, dead_cap * sizeof(*dead)) :
+									palloc(dead_cap * sizeof(*dead));
+							}
+							dead[ndead++] = e;
+						}
+						continue;
+					}
 					if (fates[i] == FATE_FREEZE || fates[i] == FATE_FREEZE_CLEAR)
 						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
 					if (fates[i] == FATE_CLEAR || fates[i] == FATE_FREEZE_CLEAR)
@@ -1758,7 +1832,15 @@ ChunkIndexVacuum(Relation idx)
 		}
 		fold_changes(idx, primary, b, &masks);
 		UnlockReleaseBuffer(primary);
+
+		/* the bytes of the chunks taken out, dead in their log */
+		if (ndead > 0 && log != NULL)
+			for (int i = 0; i < ndead; i++)
+				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len);
+		ndead = 0;
 	}
+	if (log != NULL)
+		relation_close(log, NoLock);
 
 	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), kept_entries, 0, 0,
 						false, frozen, InvalidMultiXactId, NULL, NULL, false);

@@ -1,6 +1,6 @@
 Parsed test spec with 2 sessions
 
-starting permutation: a_begin a_put b_has b_put a_commit b_has
+starting permutation: a_begin a_put b_has b_put a_commit b_has b_dead
 step a_begin: BEGIN;
 step a_put: SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01');
 test_chunk_put
@@ -26,6 +26,12 @@ step b_has: SELECT test_chunk_has('cl', 'ci', substr(sha256('\x01'), 1, 20));
 test_chunk_has
 --------------
 t             
+(1 row)
+
+step b_dead: SELECT dead FROM test_chunk_log_space('cl');
+dead
+----
+   1
 (1 row)
 
 

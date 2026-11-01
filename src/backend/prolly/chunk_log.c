@@ -37,6 +37,7 @@
 #include "prolly/chunk_log.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
+#include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/fmgrprotos.h"
@@ -48,7 +49,7 @@
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	2
+#define CHUNK_LOG_VERSION	3
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
@@ -64,6 +65,7 @@ typedef struct ChunkPageOpaqueData
 	uint32		magic;			/* CHUNK_LOG_MAGIC */
 	uint16		kind;			/* CHUNK_PAGE_META or CHUNK_PAGE_DATA */
 	uint16		unused;
+	uint32		dead;			/* a data page's bytes no chunk's any more */
 } ChunkPageOpaqueData;
 
 typedef ChunkPageOpaqueData *ChunkPageOpaque;
@@ -107,6 +109,26 @@ init_page(Page page, uint16 kind)
 	opaque->magic = CHUNK_LOG_MAGIC;
 	opaque->kind = kind;
 	opaque->unused = 0;
+	opaque->dead = 0;
+}
+
+/* a page whose every byte was written, and is dead: free to use again */
+static inline bool
+page_free(Page page)
+{
+	return ((PageHeader) page)->pd_lower == AREA_START + AREA &&
+		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead == AREA;
+}
+
+/* a page made afresh to use again, nothing on it yet */
+static inline bool
+page_fresh(Page page)
+{
+	return !PageIsNew(page) &&
+		PageGetSpecialSize(page) == MAXALIGN(sizeof(ChunkPageOpaqueData)) &&
+		((ChunkPageOpaque) PageGetSpecialPointer(page))->kind == CHUNK_PAGE_DATA &&
+		((PageHeader) page)->pd_lower == AREA_START &&
+		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead == 0;
 }
 
 static void
@@ -226,6 +248,50 @@ claim_pages(Relation rel, BlockNumber npages)
 	return first;
 }
 
+/*
+ * A page the free space map has as free (every byte dead), made afresh for
+ * this backend's appends; InvalidBlockNumber if there is none.  The map is
+ * a hint, not WAL-logged: a page it has wrongly is passed by, and taken
+ * out of it.
+ */
+static BlockNumber
+take_free_page(Relation rel)
+{
+	for (int tries = 0; tries < 8; tries++)
+	{
+		/*
+		 * (the map keeps space in steps, a whole page rounding past what a
+		 * page can have: half of one finds the pages recorded free, which
+		 * are then checked)
+		 */
+		BlockNumber blk = GetPageWithFreeSpace(rel, AREA / 2);
+		Buffer		buf;
+		GenericXLogState *st;
+		Page		page;
+
+		if (!BlockNumberIsValid(blk) || blk == META_BLOCK ||
+			blk >= RelationGetNumberOfBlocks(rel))
+			return InvalidBlockNumber;
+		buf = ReadBuffer(rel, blk);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		if (PageIsNew(page) || !page_free(page))
+		{
+			UnlockReleaseBuffer(buf);
+			RecordPageWithFreeSpace(rel, blk, 0);
+			continue;
+		}
+		st = GenericXLogStart(rel);
+		init_page(GenericXLogRegisterBuffer(st, buf, GENERIC_XLOG_FULL_IMAGE),
+				  CHUNK_PAGE_DATA);
+		GenericXLogFinish(st);
+		UnlockReleaseBuffer(buf);
+		RecordPageWithFreeSpace(rel, blk, 0);
+		return blk;
+	}
+	return InvalidBlockNumber;
+}
+
 /* pages enough for len bytes, from the first */
 static void
 claim_run(Relation rel, uint64 len, BlockNumber npages, ChunkLogRegion *run)
@@ -285,7 +351,17 @@ page_append(Relation rel, const void *data, size_t len)
 			region.next = region.limit = 0;
 		if (region.limit - region.next < len)
 		{
-			claim_run(rel, len, REGION_PAGES, &region);
+			/* a page freed, if the bytes fit one, else a region of new ones */
+			BlockNumber blk = len <= AREA ? take_free_page(rel) : InvalidBlockNumber;
+
+			if (BlockNumberIsValid(blk))
+			{
+				region.relnumber = rel->rd_locator.relNumber;
+				region.next = (uint64) (blk - 1) * AREA;
+				region.limit = region.next + AREA;
+			}
+			else
+				claim_run(rel, len, REGION_PAGES, &region);
 			keep_region(rel, &region);
 		}
 	}
@@ -305,11 +381,11 @@ page_append(Relation rel, const void *data, size_t len)
 		buf = data_buffer(rel, blk);
 
 		/*
-		 * A page this backend's appends begin is new; one they go on in holds
-		 * their bytes up to where they go on.  Anything else is not what the
-		 * log wrote.
+		 * A page this backend's appends begin is new, or made afresh to use
+		 * again; one they go on in holds their bytes up to where they go on.
+		 * Anything else is not what the log wrote.
 		 */
-		if (off == 0 ? !PageIsNew(BufferGetPage(buf)) :
+		if (off == 0 ? !(PageIsNew(BufferGetPage(buf)) || page_fresh(BufferGetPage(buf))) :
 			PageIsNew(BufferGetPage(buf)))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -413,9 +489,91 @@ page_read(Relation rel, uint64 loc, void *dst, size_t len)
 	}
 }
 
+/*
+ * Counts len bytes from loc dead, a page at a time; a page all of whose
+ * bytes are dead then goes in the free space map, to be used again.
+ */
+static void
+page_mark_dead(Relation rel, uint64 loc, size_t len)
+{
+	while (len > 0)
+	{
+		BlockNumber blk = LOC_BLOCK(loc);
+		size_t		off = LOC_OFFSET(loc),
+					n = Min(len, AREA - off);
+		Buffer		buf;
+		GenericXLogState *st;
+		Page		page;
+		ChunkPageOpaque opaque;
+		bool		freed;
+
+		CHECK_FOR_INTERRUPTS();
+		if (blk >= RelationGetNumberOfBlocks(rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("bytes %llu to %llu of chunk log \"%s\" were never written",
+							(unsigned long long) loc, (unsigned long long) (loc + len),
+							RelationGetRelationName(rel))));
+		buf = ReadBuffer(rel, blk);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
+		st = GenericXLogStart(rel);
+		page = GenericXLogRegisterBuffer(st, buf, 0);
+		opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
+		if (opaque->dead + n > ((PageHeader) page)->pd_lower - AREA_START)
+		{
+			GenericXLogAbort(st);
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("block %u of chunk log \"%s\" would have more bytes dead than written",
+							blk, RelationGetRelationName(rel))));
+		}
+		opaque->dead += n;
+		freed = page_free(page);
+		GenericXLogFinish(st);
+		UnlockReleaseBuffer(buf);
+		if (freed)
+		{
+			RecordPageWithFreeSpace(rel, blk, AREA);
+			FreeSpaceMapVacuumRange(rel, blk, blk + 1);
+		}
+		loc += n;
+		len -= n;
+	}
+}
+
+void
+ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full, uint64 *dead,
+			  uint32 *free_pages)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+
+	*pages = *full = *free_pages = 0;
+	*dead = 0;
+	for (BlockNumber blk = META_BLOCK + 1; blk < nblocks; blk++)
+	{
+		Buffer		buf = ReadBuffer(rel, blk);
+		Page		page = BufferGetPage(buf);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(page))
+		{
+			(*pages)++;
+			if (((PageHeader) page)->pd_lower == AREA_START + AREA)
+				(*full)++;
+			*dead += ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead;
+			if (page_free(page))
+				(*free_pages)++;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+}
+
 const ChunkLogRoutine PageChunkLog = {
 	.append = page_append,
 	.read = page_read,
+	.mark_dead = page_mark_dead,
 	.end = page_end,
 };
 

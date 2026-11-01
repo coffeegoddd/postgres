@@ -131,6 +131,14 @@ typedef struct ChunkIndexRoutine
 						 bool (*held) (const uint8 *hash),
 						 ChunkIndexEntry *out);
 
+	/*
+	 * The chunk log the index's entries are of (InvalidOid until it is
+	 * bound to one), and binding it to one: an index is one log's, which
+	 * VACUUM counts the bytes of chunks it takes out dead in.
+	 */
+	Oid			(*log_of) (Relation idx);
+	void		(*bind_log) (Relation idx, Oid log);
+
 	/* Removes hash's entry; false if there was none. */
 	bool		(*remove) (Relation idx, const uint8 *hash);
 } ChunkIndexRoutine;

@@ -26,13 +26,13 @@ my $get = q{SELECT test_chunk_get('cl', 'ci', substr(sha256(convert_to(repeat('A
 is($node->safe_psql('postgres', $get), 't', 'the chunk reads back');
 
 # where its 10th byte is in the log's file: a page holds its bytes after a
-# 24-byte header and before an 8-byte special space, and the log's block 1
+# 24-byte header and before a 16-byte special space, and the log's block 1
 # holds its first
 my $loc = $node->safe_psql('postgres',
 	q{SELECT loc FROM test_chunk_index_entry('ci', substr(sha256(convert_to(repeat('A', 100), 'UTF8')), 1, 20))});
 my $path = $node->data_dir . '/' . $node->safe_psql('postgres', q{SELECT pg_relation_filepath('cl')});
 my $bs = $node->safe_psql('postgres', q{SELECT current_setting('block_size')});
-my $area = $bs - 24 - 8;
+my $area = $bs - 24 - 16;
 my $at = (1 + int($loc / $area)) * $bs + 24 + ($loc % $area) + 10;
 $node->stop;
 
