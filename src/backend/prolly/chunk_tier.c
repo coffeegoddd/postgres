@@ -1482,6 +1482,8 @@ tier_read_many(Relation rel, int n, const uint64 *locs, const uint32 *lens, void
 			   Max(end, (uint64) LOC_OFF(locs[last + 1]) + lens[last + 1]) - start <= READ_SPAN_BYTES)
 		{
 			last++;
+			/* (in order: a range is the bytes after the one before) */
+			Assert(locs[last - 1] <= locs[last]);
 			end = Max(end, (uint64) LOC_OFF(locs[last]) + lens[last]);
 		}
 		if (last == i)

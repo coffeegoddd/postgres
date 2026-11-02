@@ -186,8 +186,18 @@ note_kid(void *arg, const uint8 *hash)
 	bool		found;
 
 	(void) hash_search(ps->seen, hash, HASH_FIND, &found);
-	if (found || cs_hold(ps->to, hash))
+	if (found)
 		return;
+	/* (held there: seen, so asked once, whatever order it is put in) */
+	if (cs_hold(ps->to, hash))
+	{
+		(void) hash_search(ps->seen, hash, HASH_ENTER, NULL);
+		return;
+	}
+	/* (a chunk named twice by one: read once) */
+	for (int i = 0; i < ps->nkids; i++)
+		if (memcmp(ps->kids + (Size) i * CHUNK_HASH_LEN, hash, CHUNK_HASH_LEN) == 0)
+			return;
 	if (ps->nkids == ps->kidcap)
 	{
 		ps->kidcap = Max(ps->kidcap * 2, 64);

@@ -283,6 +283,19 @@ SELECT count(*) FROM generate_series(0, 14) g, LATERAL test_cs_put('pages', pg_t
 SELECT count(*) FROM generate_series(0, 2) m, LATERAL test_cs_put('pages', pg_temp.tm(m));
 SELECT (test_cs_put('pages', pg_temp.tr())).stored;
 SELECT pg_history_push('tree', ARRAY[pg_temp.h(pg_temp.tr())]) AS copied;
+-- (laid out as walked: each of the three's leaves together, it after them)
+WITH t AS (
+	SELECT t.hash, t.off, t.len FROM test_tier_packs('pg_history.tier_chunks') p,
+		LATERAL test_tier_pack_table('pg_history.tier_chunks', p.id) t
+	WHERE p.state <> 'removed' AND p.kind = 'pack' AND p.size > 0 AND EXISTS (
+		SELECT FROM test_tier_pack_table('pg_history.tier_chunks', p.id) r
+		WHERE r.hash = pg_temp.h(pg_temp.tr())))
+SELECT bool_and(mid.off = (SELECT max(l.off + l.len) FROM t l
+		WHERE l.hash IN (SELECT pg_temp.h(pg_temp.tl(m * 5 + g)) FROM generate_series(0, 4) g))
+	AND mid.off - 1000 = (SELECT min(l.off) FROM t l
+		WHERE l.hash IN (SELECT pg_temp.h(pg_temp.tl(m * 5 + g)) FROM generate_series(0, 4) g)))
+	AS leaves_together
+FROM generate_series(0, 2) m JOIN t mid ON mid.hash = pg_temp.h(pg_temp.tm(m));
 BEGIN;
 SELECT test_tier_object_reads() AS reads0 \gset
 SELECT pg_history_fetch('tree') AS fetched;

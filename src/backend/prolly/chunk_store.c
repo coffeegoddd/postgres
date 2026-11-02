@@ -721,10 +721,12 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	 * in one order: no deadlock); then their bytes, written where reserved.
 	 * Each entry's waits and failures are before its place is taken, and
 	 * bytes reserved are their entry's, which (aborted) counts them dead,
-	 * written or not: a chunk another put first reserves none.  Room is made a chunk at a time, so that a
-	 * chunk fitting a page freed goes into one; the bytes reserved in a
-	 * region are written before it is let go of (it is sealed from where
-	 * they end).
+	 * written or not: a chunk another put first reserves none.  A log that
+	 * lays a pack out at once (prepare_pack) has its room made for all of it,
+	 * the bytes in the caller's order; for one that does not, room is made a
+	 * chunk at a time, so that a chunk fitting a page freed goes into one,
+	 * and the bytes reserved in a region are written before it is let go of
+	 * (it is sealed from where they end).
 	 */
 	{
 		PackOrder  *order = palloc(Max(n, 1) * sizeof(PackOrder));
