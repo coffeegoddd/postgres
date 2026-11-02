@@ -25,6 +25,7 @@ OBJS = \
 	chunk_pin.o \
 	chunk_dump.o \
 	chunk_pointers.o \
+	chunk_push.o \
 	chunk_region.o \
 	chunk_store.o \
 	chunk_tier.o \

@@ -50,7 +50,7 @@ test_prolly_isolation = [
 ]
 # (these need injection points)
 if get_option('injection_points')
-  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend', 'chunk_tier_table', 'object_store_race']
+  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend', 'chunk_tier_table', 'history_push_inflight', 'object_store_race']
 endif
 
 tests += {
@@ -86,6 +86,7 @@ tests += {
       'chunk_store_pages',
       'chunk_store_memory',
       'chunk_store_tier',
+      'history_push',
       'chunk_pack_reclaim',
       'object_store_directory',
     ],

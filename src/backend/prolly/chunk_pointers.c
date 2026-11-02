@@ -80,6 +80,12 @@ ChunkStorePointersRelid(void)
 	return store_relid("pointers");
 }
 
+Oid
+ChunkStoreBundlesRelid(void)
+{
+	return store_relid("bundles");
+}
+
 /* the hash a pointer's row names */
 static const uint8 *
 row_hash(TriggerData *td, HeapTuple tuple)
@@ -91,7 +97,7 @@ row_hash(TriggerData *td, HeapTuple tuple)
 	bytea	   *b;
 
 	if (attnum <= 0)
-		elog(ERROR, "the history store's pointers have no column \"hash\"");
+		elog(ERROR, "\"%s\" has no column \"hash\"", RelationGetRelationName(td->tg_relation));
 	d = heap_getattr(tuple, attnum, desc, &isnull);
 
 	if (isnull)
@@ -145,6 +151,47 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 			ChunkStoreUnrefRoot(idx, old, &e);
 		}
 	}
+	relation_close(idx, NoLock);
+	return PointerGetDatum(NULL);
+}
+
+/*
+ * pg_history.bundles' trigger: each row holds its root in the tier (a
+ * bundle's, pushed there: prolly/chunk_push.c), taken as it is inserted
+ * and let go of as it is deleted; rows are not changed, and the table is
+ * not truncated
+ */
+Datum
+pg_history_bundle_changed(PG_FUNCTION_ARGS)
+{
+	TriggerData *td = (TriggerData *) fcinfo->context;
+	Relation	idx;
+	ChunkIndexEntry e;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "pg_history_bundle_changed is a trigger function");
+	if (TRIGGER_FIRED_BY_TRUNCATE(td->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot truncate the history store's bundles"),
+				 errhint("Release them: each row holds a root in the tier.")));
+	if (!TRIGGER_FIRED_FOR_ROW(td->tg_event) || !TRIGGER_FIRED_AFTER(td->tg_event))
+		elog(ERROR, "pg_history_bundle_changed is an AFTER ROW trigger");
+	if (RelationGetRelid(td->tg_relation) != ChunkStoreBundlesRelid())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_history_bundle_changed is pg_history.bundles' trigger alone")));
+	if (TRIGGER_FIRED_BY_UPDATE(td->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change a bundle's roots"),
+				 errhint("Push another bundle, and release this one.")));
+
+	idx = relation_open(ChunkStoreTierIndexRelid(), RowExclusiveLock);
+	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+		ChunkStoreRefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
+	else
+		ChunkStoreUnrefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
 	relation_close(idx, NoLock);
 	return PointerGetDatum(NULL);
 }

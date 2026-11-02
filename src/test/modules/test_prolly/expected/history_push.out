@@ -1,0 +1,243 @@
+-- History pushed to the history store's tier as bundles: a push copies what
+-- its roots reach that the tier has not into the tier, its rows of
+-- pg_history.bundles hold the roots there, and the store lets go of the
+-- caller's roots and frees what nothing else holds (what other history
+-- holds stays); a read of what was pushed is an error, until fetched back;
+-- a release frees in the tier what nothing else holds.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SET chunk_free_in_background = off;
+SELECT test_chunk_format_refs(true);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+-- (two leaves of their own and one shared; two parents, a root each)
+CREATE FUNCTION pg_temp.p1() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x5202'::bytea || pg_temp.h('\x0a1101') || pg_temp.h('\x0a11ff')$$;
+CREATE FUNCTION pg_temp.p2() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x5202'::bytea || pg_temp.h('\x0a1102') || pg_temp.h('\x0a11ff')$$;
+SELECT count(*) FROM unnest(ARRAY['\x0a1101', '\x0a1102', '\x0a11ff']::bytea[]) d,
+	LATERAL test_cs_put('pages', d);
+ count 
+-------
+     3
+(1 row)
+
+SELECT (test_cs_put('pages', pg_temp.p1())).stored AS p1, (test_cs_put('pages', pg_temp.p2())).stored AS p2;
+ p1 | p2 
+----+----
+ t  | t
+(1 row)
+
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p1()));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p2()));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+-- the push: three copied (the parent, its leaf, the shared leaf)
+SELECT pg_history_push('b1', ARRAY[pg_temp.h(pg_temp.p1())]) AS copied;
+ copied 
+--------
+      3
+(1 row)
+
+SELECT name, hash = pg_temp.h(pg_temp.p1()) AS its_root FROM pg_history.bundles;
+ name | its_root 
+------+----------
+ b1   | t
+(1 row)
+
+SELECT (test_cs_counts('tier', pg_temp.h(pg_temp.p1()))).roots AS tier_roots;
+ tier_roots 
+------------
+          1
+(1 row)
+
+SELECT test_cs_has('tier', pg_temp.h(pg_temp.p1())) AS p1,
+	test_cs_has('tier', pg_temp.h('\x0a1101')) AS leaf1,
+	test_cs_has('tier', pg_temp.h('\x0a11ff')) AS shared,
+	test_cs_has('tier', pg_temp.h(pg_temp.p2())) AS p2_not;
+ p1 | leaf1 | shared | p2_not 
+----+-------+--------+--------
+ t  | t     | t      | f
+(1 row)
+
+-- locally: what it alone held let go of; the other parent's kept
+SELECT test_cs_has('pages', pg_temp.h(pg_temp.p1())) AS p1,
+	test_cs_has('pages', pg_temp.h('\x0a1101')) AS leaf1,
+	test_cs_has('pages', pg_temp.h('\x0a11ff')) AS shared,
+	test_cs_has('pages', pg_temp.h(pg_temp.p2())) AS p2,
+	test_cs_has('pages', pg_temp.h('\x0a1102')) AS leaf2;
+ p1 | leaf1 | shared | p2 | leaf2 
+----+-------+--------+----+-------
+ f  | f     | t      | t  | t
+(1 row)
+
+SELECT ok FROM test_cs_check('pages');
+ ok 
+----
+ t
+(1 row)
+
+SELECT ok FROM test_cs_check('tier');
+ ok 
+----
+ t
+(1 row)
+
+-- a read of what was pushed: an error; so is a root taken of it
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p1()));
+ERROR:  chunk 89aba503089c0f5f14e9a4b14c69aae11e689993 was pushed to the history store's tier
+DETAIL:  History pushed is not fetched back yet.
+SELECT test_cs_get_many('pages', ARRAY[pg_temp.h(pg_temp.p2()), pg_temp.h('\x0a1101')]);
+ERROR:  chunk 665d5db05b355f7dc6207477095191af5e256ac3 was pushed to the history store's tier
+DETAIL:  History pushed is not fetched back yet.
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p1()));
+ERROR:  chunk 89aba503089c0f5f14e9a4b14c69aae11e689993 was pushed to the history store's tier
+DETAIL:  History pushed is not fetched back yet.
+-- (what is shared, and was kept, reads)
+SELECT test_cs_get('pages', pg_temp.h('\x0a11ff'));
+ test_cs_get 
+-------------
+ \x0a11ff
+(1 row)
+
+-- a second bundle sharing what the first has: only what the tier has not
+-- copied (the parent and its leaf; the shared leaf is the tier's)
+SELECT pg_history_push('b2', ARRAY[pg_temp.h(pg_temp.p2())]) AS copied;
+ copied 
+--------
+      2
+(1 row)
+
+SELECT test_cs_has('pages', pg_temp.h('\x0a11ff')) AS shared_let_go;
+ shared_let_go 
+---------------
+ t
+(1 row)
+
+-- refused: a bundle there already, a root given twice, none, a root the
+-- caller does not hold, one the store has not
+SELECT pg_history_push('b1', ARRAY[pg_temp.h('\x0a11ff')]);
+ERROR:  bundle "b1" is in the history store's tier already
+SELECT (test_cs_put('pages', '\x0a1199')).stored;
+ stored 
+--------
+ t
+(1 row)
+
+SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199'), pg_temp.h('\x0a1199')]);
+ERROR:  root 554f980c5247a07ece9379bfd7e4c4f336caf002 is given twice
+SELECT pg_history_push('b3', ARRAY[]::bytea[]);
+ERROR:  a bundle has a root at least
+SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]);
+ERROR:  chunk 554f980c5247a07ece9379bfd7e4c4f336caf002 has no root to push
+HINT:  Take a root of it to push (a bundle takes it), or delete the pointers.
+SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1198')]);
+ERROR:  the history store has no chunk 90f4c3cd0489dcb2e5d5b3851a5b8fc3c49a704c to push
+-- (a root of a pointer's alone is the pointer's)
+INSERT INTO pg_history.pointers VALUES ('main', pg_temp.h('\x0a1199'));
+SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]);
+ERROR:  chunk 554f980c5247a07ece9379bfd7e4c4f336caf002 has no root to push but its pointers'
+HINT:  Take a root of it to push (a bundle takes it), or delete the pointers.
+DELETE FROM pg_history.pointers WHERE name = 'main';
+-- the bundles' rows are not changed, nor truncated
+UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
+ERROR:  cannot change a bundle's roots
+HINT:  Push another bundle, and release this one.
+TRUNCATE pg_history.bundles;
+ERROR:  permission denied: "bundles" is a system catalog
+-- a push aborted: nothing pushed, nothing let go of
+SELECT test_cs_ref_root('pages', pg_temp.h('\x0a1199'));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]) AS copied;
+ copied 
+--------
+      1
+(1 row)
+
+ROLLBACK;
+SELECT test_cs_has('pages', pg_temp.h('\x0a1199')) AS kept,
+	(test_cs_counts('pages', pg_temp.h('\x0a1199'))).roots AS roots,
+	test_cs_has('tier', pg_temp.h('\x0a1199')) AS not_in_tier,
+	(SELECT count(*) FROM pg_history.bundles WHERE name = 'b3') AS no_rows;
+ kept | roots | not_in_tier | no_rows 
+------+-------+-------------+---------
+ t    |     1 | f           |       0
+(1 row)
+
+-- releases: the tier frees what nothing else holds (the shared leaf, held
+-- by the other bundle's parent, at the second)
+SELECT pg_history_release('b1') AS freed;
+ freed 
+-------
+     2
+(1 row)
+
+SELECT test_cs_has('tier', pg_temp.h('\x0a11ff')) AS shared_kept;
+ shared_kept 
+-------------
+ t
+(1 row)
+
+SELECT pg_history_release('b2') AS freed;
+ freed 
+-------
+     3
+(1 row)
+
+SELECT count(*) AS rows FROM pg_history.bundles;
+ rows 
+------
+    0
+(1 row)
+
+SELECT pg_history_release('b2');
+ERROR:  there is no bundle "b2" in the history store's tier
+-- and a chunk released is no longer pushed: a read finds nothing
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p1())) IS NULL AS absent;
+ absent 
+--------
+ t
+(1 row)
+
+SELECT ok FROM test_cs_check('tier');
+ ok 
+----
+ t
+(1 row)
+
+SELECT test_cs_unref_root('pages', pg_temp.h('\x0a1199'));
+ test_cs_unref_root 
+--------------------
+ 
+(1 row)
+
+SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1199')]);
+ test_cs_free 
+--------------
+            1
+(1 row)
+
+SELECT test_chunk_format_refs(false);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+

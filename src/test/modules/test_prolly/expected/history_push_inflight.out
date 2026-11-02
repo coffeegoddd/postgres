@@ -1,0 +1,71 @@
+Parsed test spec with 3 sessions
+
+starting permutation: r_begin r_read p_push r_read p_after r_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+bytes   
+--------
+\x0a2101
+(1 row)
+
+step p_push: 
+	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
+
+copied
+------
+     2
+(1 row)
+
+step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+bytes   
+--------
+\x0a2101
+(1 row)
+
+step p_after: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+ERROR:  chunk 694e992221317cc70d7d1f2cc10bca607d528eda was pushed to the history store's tier
+step r_commit: COMMIT;
+test_cs_free
+------------
+           0
+(1 row)
+
+
+starting permutation: w_begin w_hold p_push w_commit p_held
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step w_begin: BEGIN;
+step w_hold: SELECT test_cs_hold('pages', hp_h('\x0a2102')) AS held;
+held
+----
+t   
+(1 row)
+
+step p_push: 
+	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
+
+copied
+------
+     2
+(1 row)
+
+step w_commit: COMMIT;
+step p_held: SELECT test_cs_has('pages', hp_h('\x0a2102')) AS kept;
+kept
+----
+t   
+(1 row)
+
+test_cs_free
+------------
+           1
+(1 row)
+
