@@ -194,7 +194,7 @@ SELECT pg_history_release('b6') AS freed;
 (1 row)
 
 -- (a bundle's row of a root twice: refused, its roots each once)
-INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')]);
+INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')], 0);
 ERROR:  a bundle's root is given twice
 -- the bundles' rows are not changed, nor truncated (the table a system
 -- catalog: by one allowed to change those)
@@ -485,6 +485,108 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p7())]) AS freed;
  freed 
 -------
      2
+(1 row)
+
+-- manifests: each bundle's, in the tier's store, which lists the bundles
+-- from it alone; a push aborted leaves an orphan, removed by VACUUM; a
+-- release's manifest stays until VACUUM, its release committed, removes it
+SELECT (test_cs_put('pages', '\x0a1901')).stored, (test_cs_put('pages', '\x0a1902')).stored;
+ stored | stored 
+--------+--------
+ t      | t
+(1 row)
+
+SELECT pg_history_push('b9', ARRAY[pg_temp.h('\x0a1901')]) AS copied;
+ copied 
+--------
+      1
+(1 row)
+
+SELECT name, roots = ARRAY[pg_temp.h('\x0a1901')] AS its_roots FROM pg_history_tier_bundles() ORDER BY name;
+ name | its_roots 
+------+-----------
+ b1   | f
+ b2   | f
+ b3   | f
+ b6   | f
+ b7   | f
+ b8   | f
+ b9   | t
+(7 rows)
+
+SELECT manifest > 0 AS has_manifest FROM pg_history.bundles WHERE name = 'b9';
+ has_manifest 
+--------------
+ t
+(1 row)
+
+BEGIN;
+SELECT pg_history_push('b10', ARRAY[pg_temp.h('\x0a1902')]) AS copied;
+ copied 
+--------
+      1
+(1 row)
+
+ROLLBACK;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+ name 
+------
+ b1
+ b10
+ b2
+ b3
+ b6
+ b7
+ b8
+ b9
+(8 rows)
+
+VACUUM pg_history.tier_index;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+ name 
+------
+ b9
+(1 row)
+
+-- (a release aborted: its manifest kept)
+BEGIN;
+SELECT pg_history_release('b9') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+ROLLBACK;
+VACUUM pg_history.tier_index;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+ name 
+------
+ b9
+(1 row)
+
+SELECT pg_history_release('b9') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+ name 
+------
+ b9
+(1 row)
+
+VACUUM pg_history.tier_index;
+SELECT count(*) AS left_after_vacuum FROM pg_history_tier_bundles();
+ left_after_vacuum 
+-------------------
+                 0
+(1 row)
+
+SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1902')]) AS freed;
+ freed 
+-------
+     1
 (1 row)
 
 SELECT test_chunk_format_refs(false);

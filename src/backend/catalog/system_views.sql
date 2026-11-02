@@ -1634,7 +1634,8 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
 -- them).
 CREATE TABLE pg_history.bundles (
 	name text COLLATE "C" PRIMARY KEY,
-	roots bytea[] NOT NULL CHECK (cardinality(roots) > 0)
+	roots bytea[] NOT NULL CHECK (cardinality(roots) > 0),
+	manifest int8 NOT NULL
 );
 CREATE TRIGGER bundles_roots
 	AFTER INSERT OR UPDATE OR DELETE ON pg_history.bundles
@@ -1648,6 +1649,7 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_bundle_changed() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_push(text, bytea[]) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_release(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_fetch(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_tier_bundles() FROM PUBLIC;
 
 --
 -- The history store dumped and restored: pg_history_export() the store as

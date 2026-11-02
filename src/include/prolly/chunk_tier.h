@@ -143,6 +143,21 @@ extern void ChunkTierCheckIndex(Relation idx, const char *what);
 extern bool ChunkTierDatabaseHasPacks(Oid dboid);
 
 /*
+ * A bundle's manifest (prolly/chunk_push.c's, its bytes the tier's to
+ * keep, not to read), in the tier: an entry of the catalog of its own kind,
+ * this transaction's, its object written now under manifests/, the entry's
+ * record flushed first; answers its number.  Aborted, or cut short by a
+ * crash, it is an orphan, removed by VACUUM.  Dropped, by a release: once
+ * that commits, VACUUM counts it all dead and removes it.  Listed: each
+ * manifest the tier's store has, its bytes passed to fn.
+ */
+extern uint32 ChunkTierWriteManifest(Relation rel, const void *data, size_t len);
+extern void ChunkTierDropManifest(Relation rel, uint32 id);
+extern void ChunkTierListManifests(Relation rel,
+								   void (*fn) (void *arg, const char *data, size_t len),
+								   void *arg);
+
+/*
  * For the access method: VACUUM of a tier log, every pack whose transaction
  * ended settled (committed, or orphaned) and its relfrozenxid advanced; no
  * object is touched (VACUUM of its index removes them).
