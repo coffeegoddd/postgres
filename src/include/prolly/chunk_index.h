@@ -169,6 +169,18 @@ typedef struct ChunkIndexRoutine
 	Oid			(*log_of) (Relation idx, uint64 *stamp);
 	void		(*bind_log) (Relation idx, Oid log, uint64 stamp);
 
+	/*
+	 * A chunk's entry, the one seen (its xmin and place), moved: freed by
+	 * this transaction and put anew, its counts the same, its new place set
+	 * by reserve (as insert's), in *moved; false, nothing done, if it is no
+	 * longer the chunk's, a transaction holds or changes it, or this one put
+	 * it.  Others wait for this transaction to see which the chunk's is.
+	 * For compaction (prolly/chunk_store.h's ChunkStoreCompact).
+	 */
+	bool		(*move) (Relation idx, const ChunkIndexEntry *seen,
+						 ChunkIndexEntry *moved, ChunkReserveFn reserve,
+						 void *arg);
+
 	/* Removes hash's entry; false if there was none. */
 	bool		(*remove) (Relation idx, const uint8 *hash);
 

@@ -277,6 +277,23 @@ page_free(Page page)
 		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead == AREA;
 }
 
+/*
+ * a page written full, not free, at least fraction of its bytes dead (and
+ * some): one to compact, its chunks' bytes put elsewhere
+ */
+static inline bool
+page_compactable(Page page, double fraction)
+{
+	uint32		dead;
+
+	if (PageIsNew(page))
+		return false;
+	dead = ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead;
+	return ((ChunkPageOpaque) PageGetSpecialPointer(page))->kind == CHUNK_PAGE_DATA &&
+		((PageHeader) page)->pd_lower == AREA_START + AREA &&
+		dead > 0 && dead < AREA && dead >= fraction * AREA;
+}
+
 /* a page made afresh to use again, nothing on it yet */
 static inline bool
 page_fresh(Page page)
@@ -884,8 +901,8 @@ check_writer(Relation rel)
  * region), what was left of the old one
  * let go of.  The region, kept in the relation's rd_amcache too, in *run.
  */
-static void
-page_prepare(Relation rel, size_t len, ChunkLogRun *run)
+static bool
+prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow)
 {
 	ChunkLogRegion *cached = rel->rd_amcache;
 	ChunkLogRegion region;
@@ -963,8 +980,17 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 			region.next = (uint64) first * AREA;
 			region.limit = region.next + (uint64) Max(npages, 1) * AREA;
 		}
-		else
+		else if (may_grow)
 			claim_run(rel, len, REGION_PAGES, &region);
+		else
+		{
+			/* (none free, and the log not to grow: no room, no region) */
+			region.next = region.limit = 0;
+			run->relnumber = region.relnumber;
+			run->next = run->limit = 0;
+			run->generation = generation;
+			return false;
+		}
 
 		region.generation = generation;
 		keep_region(rel, &region);
@@ -973,6 +999,19 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	run->next = region.next;
 	run->limit = region.limit;
 	run->generation = region.generation;
+	return true;
+}
+
+static void
+page_prepare(Relation rel, size_t len, ChunkLogRun *run)
+{
+	(void) prepare_run(rel, len, run, true);
+}
+
+static bool
+page_prepare_free(Relation rel, size_t len, ChunkLogRun *run)
+{
+	return prepare_run(rel, len, run, false);
 }
 
 /*
@@ -1652,30 +1691,79 @@ page_stamp(Relation rel)
  * Puts every page free (written full, all dead) in the free space map:
  * the map is not WAL-logged, and a crash, a standby's promotion or a move
  * to another tablespace leaves it without pages freed since it was last
- * written.  O(log).
+ * written.  Answers the pages to compact (fraction of them dead), if their
+ * dead bytes come to a region's (fewer gain nothing: what is moved off them
+ * leaves a page part written, which is made full, its rest dead), and the
+ * pages compaction may grow the log by: none if a region's pages are free
+ * (what it moves goes on them), else a region's.  O(log).
  */
-void
-ChunkLogRecordFree(Relation rel)
+uint32
+ChunkLogRecordFree(Relation rel, double fraction, BlockNumber *grow)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	uint32		compactable = 0;
+	uint64		compactable_dead = 0;
+	uint64		free_pages = 0;
 
 	for (BlockNumber blk = META_BLOCK + 1; blk < nblocks; blk++)
 	{
 		Buffer		buf;
+		Page		page;
 		bool		freed;
 
 		if (IS_MAP_BLOCK(blk))
 			continue;
 		buf = ReadBuffer(rel, blk);
+		page = BufferGetPage(buf);
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		freed = !PageIsNew(BufferGetPage(buf)) && page_free(BufferGetPage(buf));
+		freed = !PageIsNew(page) && page_free(page);
+		if (page_compactable(page, fraction))
+		{
+			compactable++;
+			compactable_dead += ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead;
+		}
 		UnlockReleaseBuffer(buf);
 		if (freed)
+		{
 			RecordPageWithFreeSpace(rel, blk, AREA);
+			free_pages++;
+		}
 		CHECK_FOR_INTERRUPTS();
 	}
 	FreeSpaceMapVacuum(rel);
+	*grow = free_pages >= REGION_PAGES ? 0 : REGION_PAGES;
+	return compactable_dead >= (uint64) REGION_PAGES * AREA ? compactable : 0;
+}
+
+int
+ChunkLogCompactable(Relation rel, double fraction, uint64 from, int max,
+					uint64 *starts, uint64 *ends)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	int			n = 0;
+
+	for (uint64 d = from / AREA + (from % AREA != 0); n < max; d++)
+	{
+		BlockNumber blk = DATA_BLOCK(d);
+		Buffer		buf;
+		bool		compact;
+
+		if (blk >= nblocks)
+			break;
+		buf = ReadBuffer(rel, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		compact = page_compactable(BufferGetPage(buf), fraction);
+		UnlockReleaseBuffer(buf);
+		if (compact)
+		{
+			starts[n] = d * AREA;
+			ends[n] = (d + 1) * AREA;
+			n++;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	return n;
 }
 
 /* a page the log's tail may be cut at: free, part written all dead, or new */
@@ -1764,6 +1852,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.reserve = page_reserve,
 	.write = page_write_at,
 	.release = page_release,
+	.prepare_free = page_prepare_free,
 	.extend = page_extend,
 	.bind_index = page_bind_index,
 	.read = page_read,

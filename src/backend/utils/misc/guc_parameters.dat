@@ -492,6 +492,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'chunk_compact_dead_fraction', type => 'real', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the fraction of a history store log page\'s bytes dead at which its chunks are moved elsewhere.',
+  long_desc => 'The chunk freer VACUUM of a chunk index starts compacts pages with at least this fraction of their bytes dead.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'chunk_compact_dead_fraction',
+  boot_val => '0.5',
+  min => '0.0',
+  max => '1.0',
+},
+
 { name => 'chunk_free_in_background', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Frees the history store\'s chunks nothing holds after VACUUM of its index.',
   long_desc => 'VACUUM of a chunk index starts a background worker that frees the chunks nothing holds.',

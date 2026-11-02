@@ -27,6 +27,7 @@ PG_FUNCTION_INFO_V1(test_chunk_log_append);
 PG_FUNCTION_INFO_V1(test_chunk_log_read);
 PG_FUNCTION_INFO_V1(test_chunk_log_end);
 PG_FUNCTION_INFO_V1(test_chunk_log_space);
+PG_FUNCTION_INFO_V1(test_chunk_log_compactable);
 PG_FUNCTION_INFO_V1(test_chunk_log_regions);
 
 static Relation
@@ -107,6 +108,29 @@ test_chunk_log_space(PG_FUNCTION_ARGS)
 	values[1] = Int32GetDatum((int32) full);
 	values[2] = Int64GetDatum((int64) dead);
 	values[3] = Int32GetDatum((int32) free_pages);
+	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
+}
+
+/*
+ * test_chunk_log_compactable(rel, fraction, OUT pages, OUT grow): the pages
+ * VACUUM would have compacted, and the pages it would let the freer grow
+ * the log by
+ */
+Datum
+test_chunk_log_compactable(PG_FUNCTION_ARGS)
+{
+	Relation	rel = open_log(PG_GETARG_OID(0), AccessShareLock);
+	BlockNumber grow;
+	uint32		pages = ChunkLogRecordFree(rel, PG_GETARG_FLOAT8(1), &grow);
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	relation_close(rel, AccessShareLock);
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum((int64) pages);
+	values[1] = Int64GetDatum((int64) grow);
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
 }
 

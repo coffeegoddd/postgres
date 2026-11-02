@@ -124,6 +124,25 @@ extern uint64 ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes,
 extern uint64 ChunkStoreFreeUnheld(Relation log, Relation idx);
 
 /*
+ * Compaction: the chunks with bytes on the log's next pages to compact
+ * (prolly/chunk_log.h's ChunkLogCompactable), up to npages of them from
+ * the place *from on, moved: their bytes read, checked, and put elsewhere
+ * in the log, their entries moved (prolly/chunk_index.h's move), in this
+ * transaction.  A chunk a transaction holds or changes is passed by.  The
+ * old bytes are dead once VACUUM takes the old entries out, after this
+ * transaction commits and no snapshot might read them: the pages, then
+ * free, are used again.  Unless may_grow, the chunks go only where the
+ * log has room (this backend's region, pages free), and it stops once
+ * there is none, answering -1.  Sets *from past the pages looked at, and
+ * answers how many there were (none: no more from there on); the chunks
+ * moved and their bytes in *chunks and *bytes.  O(store) (a visit of the
+ * index).
+ */
+extern int	ChunkStoreCompact(Relation log, Relation idx, double fraction,
+							  uint64 *from, int npages, bool may_grow,
+							  uint64 *chunks, uint64 *bytes);
+
+/*
  * The audit: every chunk's bytes are its own, every chunk it references is
  * in the store, and every chunk's count of references is the edges to it.
  * The chunks, and those nothing holds, in *chunks and *unheld; the first

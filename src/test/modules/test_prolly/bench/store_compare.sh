@@ -3,7 +3,8 @@
 # 4 KB committed BATCH to a transaction; every chunk read back in random
 # order (warm, then after a restart: cold in shared buffers, not in the
 # kernel's cache; every byte fetched); a half freed and its space taken
-# back, and that half put again.  Beside it, the same workload as rows of
+# back (the production store's compacted, by VACUUM's freers, round by
+# round), and that half put again.  Beside it, the same workload as rows of
 # a table (hash key, STORAGE EXTERNAL), and dirstore (the prototype's file
 # store, src/prolly/bench/storebench) if given.
 # The half freed is a random one (FREED=random, as experiment F), or the
@@ -23,14 +24,14 @@ FREED=${FREED:-random}
 if [ "$FREED" = oldest ]; then order="n"; else order="random()"; fi
 test -e "$D" && { echo "$D exists"; exit 1; }
 "$B/initdb" -D "$D" -A trust >/dev/null 2>&1
-printf "port = $P\nautovacuum = off\nchunk_free_in_background = off\nmax_wal_size = 8GB\n" >> "$D/postgresql.conf"
+printf "port = $P\nautovacuum = off\nchunk_free_in_background = off\nmax_wal_size = 8GB\nlog_min_messages = debug1\n" >> "$D/postgresql.conf"
 "$B/pg_ctl" -D "$D" -l "$D/log" -w start >/dev/null
 q() { "$B/psql" -X -q -At -p $P -d postgres "$@"; }
 ms() { echo $(( $(date +%s%N) / 1000000 )); }
 lsn() { q -c "SELECT pg_current_wal_insert_lsn()"; }
 walmb() { q -c "SELECT round(pg_wal_lsn_diff('$2', '$1') / 1048576.0, 1)"; }
 mb() { q -c "SELECT round(($1) / 1048576.0, 1)"; }
-restart() { "$B/pg_ctl" -D "$D" -m fast -w restart >/dev/null; }
+restart() { "$B/pg_ctl" -D "$D" -l "$D/log" -m fast -w restart >/dev/null; }
 row() { printf "  %-9s %-9s %8s ms   WAL %7s MB   disk %7s MB\n" "$1" "$2" "$3" "$4" "$5"; }
 
 q <<SQL >/dev/null
@@ -93,6 +94,22 @@ for store in rows pages; do
 		w0=$(lsn); t0=$(ms); q -c "VACUUM FULL e.chunks" >/dev/null; t1=$(ms); w1=$(lsn)
 		row rows "vac full" $((t1 - t0)) "$(walmb $w0 $w1)" "$(mb "$disk")"
 	else
+		# compacted: a VACUUM with no freer takes out the entries moved,
+		# and the next starts a freer to move more, waited for to its end
+		w0=$(lsn); t0=$(ms); rounds=0
+		while :; do
+			q -c "VACUUM pg_history.chunk_index" >/dev/null
+			left=$(q -c "SELECT pages FROM test_chunk_log_compactable('pg_history.chunks', current_setting('chunk_compact_dead_fraction')::float8)")
+			[ "$left" = 0 ] && break
+			before=$(grep -c "chunk freer freed" "$D/log" || true)
+			q -c "SET chunk_free_in_background = on" -c "VACUUM pg_history.chunk_index" >/dev/null
+			while [ "$(grep -c "chunk freer freed" "$D/log" || true)" = "$before" ]; do sleep 0.1; done
+			rounds=$((rounds + 1))
+		done
+		t1=$(ms); w1=$(lsn)
+		row pages "compact" $((t1 - t0)) "$(walmb $w0 $w1)" "$(mb "$disk")"
+		echo "  pages compacted in $rounds rounds"
+
 		# the pages freed used again: the half freed put again
 		half=$(( N / 2 ))
 		t0=$(ms)

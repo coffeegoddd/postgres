@@ -13,6 +13,7 @@
 
 #include "access/xact.h"
 #include "common/cryptohash.h"
+#include "common/int.h"
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "prolly/chunk_log.h"
@@ -855,6 +856,135 @@ ChunkStoreFreeUnheld(Relation log, Relation idx)
 	if (st.list.hashes)
 		pfree(st.list.hashes);
 	return freed;
+}
+
+/* ------------------------------------------------------- compaction */
+
+typedef struct CompactState
+{
+	const uint64 *starts;		/* the pages to compact, ascending */
+	const uint64 *ends;
+	int			npages;
+	ChunkIndexEntry *entries;	/* the chunks with bytes on any */
+	int			n;
+	int			cap;
+} CompactState;
+
+/* a chunk's entry kept if its bytes are on any page to compact */
+static void
+collect_compact(void *arg, const ChunkIndexEntry *e)
+{
+	CompactState *st = arg;
+	int			lo = 0,
+				hi = st->npages;
+
+	if (e->len == 0)
+		return;
+	/* (the first page ending past the chunk's start: on it, or past it) */
+	while (lo < hi)
+	{
+		int			mid = (lo + hi) / 2;
+
+		if (st->ends[mid] <= e->loc)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo == st->npages || st->starts[lo] >= e->loc + e->len)
+		return;
+	if (st->n == st->cap)
+	{
+		st->cap = Max(64, st->cap * 2);
+		st->entries = st->entries ?
+			repalloc_huge(st->entries, st->cap * sizeof(ChunkIndexEntry)) :
+			palloc_extended(st->cap * sizeof(ChunkIndexEntry), MCXT_ALLOC_HUGE);
+	}
+	st->entries[st->n++] = *e;
+}
+
+static int
+entry_loc_cmp(const void *a, const void *b)
+{
+	return pg_cmp_u64(((const ChunkIndexEntry *) a)->loc,
+					  ((const ChunkIndexEntry *) b)->loc);
+}
+
+int
+ChunkStoreCompact(Relation log, Relation idx, double fraction, uint64 *from,
+				  int npages, bool may_grow, uint64 *chunks, uint64 *bytes)
+{
+	CompactState st = {0};
+	uint64	   *starts = palloc(npages * sizeof(uint64));
+	uint64	   *ends = palloc(npages * sizeof(uint64));
+	int			found;
+
+	PreventCommandIfReadOnly("compact the history store");
+	if (!HaveRegisteredOrActiveSnapshot())
+		elog(ERROR, "cannot compact the history store without an active snapshot");
+	*chunks = *bytes = 0;
+	found = ChunkLogCompactable(log, fraction, *from, npages, starts, ends);
+	if (found == 0)
+	{
+		pfree(starts);
+		pfree(ends);
+		return 0;
+	}
+	*from = ends[found - 1];
+
+	st.starts = starts;
+	st.ends = ends;
+	st.npages = found;
+	ChunkIndex->visit(idx, collect_compact, &st);
+
+	/* (in the order they are in the log: read so, and put so) */
+	if (st.n > 1)
+		qsort(st.entries, st.n, sizeof(ChunkIndexEntry), entry_loc_cmp);
+	(void) GetCurrentTransactionId();
+	for (int i = 0; i < st.n; i++)
+	{
+		ChunkIndexEntry *e = &st.entries[i];
+		ChunkIndexEntry moved;
+		ChunkLogRun run;
+		PlaceArg	place;
+		void	   *data;
+
+		/*
+		 * (read under this transaction's snapshot: the bytes stay until no
+		 * snapshot might read them, whatever frees the chunk meanwhile; the
+		 * move then finds whether the entry is the chunk's still)
+		 */
+		data = palloc_extended(e->len, MCXT_ALLOC_HUGE);
+		ChunkLog->read(log, e->loc, data, e->len);
+		check_hash(e->hash, data, e->len, log, e->loc);
+
+		if (may_grow)
+			ChunkLog->prepare(log, e->len, &run);
+		else if (!ChunkLog->prepare_free(log, e->len, &run))
+		{
+			/* (no room but in pages new: done, as far as it may go) */
+			ChunkLog->release(log, &run);
+			pfree(data);
+			found = -1;
+			break;
+		}
+		place.log = log;
+		place.run = &run;
+		if (ChunkIndex->move(idx, e, &moved, reserve_place, &place))
+		{
+			INJECTION_POINT("chunk-compact-moved", NULL);
+			ChunkLog->write(log, moved.loc, data, e->len);
+			(*chunks)++;
+			*bytes += e->len;
+		}
+		ChunkLog->release(log, &run);
+		pfree(data);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (st.entries)
+		pfree(st.entries);
+	pfree(starts);
+	pfree(ends);
+	return found;
 }
 
 /* ------------------------------------------------------- the audit */

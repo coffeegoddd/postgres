@@ -443,6 +443,9 @@ typedef struct LoggedPage
 	size_t		len;
 } LoggedPage;
 
+static void fold_changes(Relation idx, Buffer primary, uint32 bucket,
+						 const IndexCache *masks);
+
 /*
  * The block id of a record's bucket's first page, when the pages it changes
  * are others of the bucket's chain: registered unchanged, so that redo
@@ -762,11 +765,13 @@ find_entry_freeing(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
 
+			TransactionId wait = InvalidTransactionId;
+
 			if (e->kind != CHUNK_KIND_CHUNK ||
 				memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
 				!belongs(e, bucket, masks))
 				continue;
-			switch (entry_state_wait(e, cur, running))
+			switch (entry_state_wait(e, cur, &wait))
 			{
 				case ENTRY_VISIBLE:
 					*found_buf = cur;
@@ -774,13 +779,23 @@ find_entry_freeing(Relation rel, Buffer primary, int mode, const uint8 *hash,
 					return ENTRY_VISIBLE;
 				case ENTRY_IN_PROGRESS:
 					result = ENTRY_IN_PROGRESS;
+
+					/*
+					 * (a freeing found stands, whatever entry of the chunk
+					 * follows: a move's new one, put by the transaction
+					 * freeing the old, is waited for with it)
+					 */
+					if (freeing && *freeing)
+						break;
+					if (running)
+						*running = wait;
 					/*
 					 * (a chunk put and freed by one transaction running is
 					 * not the store's to wait for: whatever it does, the
 					 * chunk is gone)
 					 */
 					if (freeing && running)
-						*freeing = (*running == e->xmax && e->xmax != e->xmin);
+						*freeing = (wait == e->xmax && e->xmax != e->xmin);
 					break;
 				case ENTRY_DEAD:
 					break;
@@ -1887,6 +1902,90 @@ page_visit_as_of(Relation idx, Snapshot snap,
 	}
 }
 
+/*
+ * A chunk's entry moved (compaction): the entry seen, if it is the chunk's
+ * still (its xmin and place), its committed changes folded in, held by no
+ * transaction (no change running, not being freed) and not this one's, is
+ * marked freed by this transaction, and a new entry of the chunk put, its
+ * counts the old's, its place reserved by reserve (the bytes written after,
+ * as a put's are).  To others the chunk is being freed and put until this
+ * transaction ends, and they wait to see; once it commits the new entry is
+ * the chunk's, and the old entry, freed, is taken out by VACUUM (its bytes
+ * then dead) once no snapshot might be reading them.  False, and nothing
+ * done, if the chunk is not to be moved.
+ */
+static bool
+page_move(Relation idx, const ChunkIndexEntry *seen, ChunkIndexEntry *moved,
+		  ChunkReserveFn reserve, void *arg)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary;
+	Buffer		found;
+	int			at;
+	int64		drefs,
+				droots;
+	TransactionId running;
+	TransactionId xid;
+	ChunkIndexEntry e;
+	BlockNumber space;
+	BlockNumber last;
+	bool		grew;
+	xl_chunk_index_slot xlrec = {0};
+
+	PreventCommandIfReadOnly("move a chunk");
+	xid = GetCurrentTransactionId();
+	primary = lock_bucket(idx, seen->hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	fold_changes(idx, primary, bucket, &masks);
+	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, seen->hash, bucket, &masks,
+				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
+	{
+		UnlockReleaseBuffer(primary);
+		return false;
+	}
+	e = *page_entry(BufferGetPage(found), at);
+	if (found != primary)
+		LockBuffer(found, BUFFER_LOCK_UNLOCK);
+	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, &e, bucket, &masks,
+				  true, &drefs, &droots, &running, NULL, NULL, NULL);
+	if (found != primary)
+		LockBuffer(found, BUFFER_LOCK_EXCLUSIVE);
+	if (e.xmin != seen->xmin || e.loc != seen->loc || e.len != seen->len ||
+		TransactionIdIsValid(running) || drefs != 0 || droots != 0 ||
+		ChunkEntryIsMine(&e))
+	{
+		release_found(primary, found);
+		return false;
+	}
+
+	/* the old entry freed by this transaction */
+	xlrec.slot = at;
+	xlrec.xmax = xid;
+	START_CRIT_SECTION();
+	ipage_set_xmax(BufferGetPage(found), at, xid);
+	log_slot_change(idx, primary, found, XLOG_CHUNK_INDEX_SET_XMAX, &xlrec);
+	END_CRIT_SECTION();
+	if (found != primary)
+		UnlockReleaseBuffer(found);
+
+	/* and the chunk's new one, its counts the old's */
+	memset(moved, 0, sizeof(*moved));
+	memcpy(moved->hash, e.hash, CHUNK_HASH_LEN);
+	moved->len = e.len;
+	moved->refs = e.refs;
+	moved->roots = e.roots;
+	moved->xmin = xid;
+	moved->kind = CHUNK_KIND_CHUNK;
+	chain_room(idx, primary, &space, &last);
+	grew = add_entry(idx, primary, bucket, space, last, moved, reserve, arg);
+	UnlockReleaseBuffer(primary);
+	pgstat_count_heap_insert(idx, 1);
+	pgstat_count_heap_delete(idx);
+	if (grew)
+		split_bucket(idx);
+	return true;
+}
+
 const ChunkIndexRoutine PageChunkIndex = {
 	.lookup = page_lookup,
 	.insert = page_insert,
@@ -1898,6 +1997,7 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.visit = page_visit,
 	.lookup_as_of = page_lookup_as_of,
 	.visit_as_of = page_visit_as_of,
+	.move = page_move,
 };
 
 const ChunkIndexRoutine *ChunkIndex = &PageChunkIndex;
@@ -2294,6 +2394,8 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	bool		any_pass = false;
 	ChunkLogSweep *sweep = NULL;
 	uint64		unheld = 0;
+	uint32		compactable = 0;
+	BlockNumber grow = 0;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
 				dead_cap = 0;
@@ -2449,7 +2551,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		INJECTION_POINT("chunk-index-vacuum-sweep", NULL);
 		if (sweep != NULL)
 			ChunkLogSweepEnd(log, sweep);
-		ChunkLogRecordFree(log);
+		compactable = ChunkLogRecordFree(log, chunk_compact_dead_fraction, &grow);
 		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
 		/*
 		 * (unless VACUUM is not to truncate, or the log's own
@@ -2461,9 +2563,14 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 			  ((StdRdOptions *) log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE))
 			(void) ChunkLogTruncateTail(log);
 
-		/* chunks nothing holds: a freer frees them, and what they held */
-		if (unheld > 0)
-			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx));
+		/*
+		 * chunks nothing holds, or pages to compact: a freer frees them, and
+		 * what they held, and compacts as far as the log may grow
+		 */
+		if (unheld > 0 || compactable > 0)
+			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx),
+									compactable > 0, chunk_compact_dead_fraction,
+									grow);
 		relation_close(log, NoLock);
 	}
 
