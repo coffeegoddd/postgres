@@ -82,5 +82,51 @@ is($node->safe_psql('d1', q{SELECT test_cs_get('tier', h('\x0a7302'))}), '\x0a73
 ($ret, $out, $err) = $node->psql('postgres', 'DROP DATABASE d1');
 like($err, qr/its history store's tier has packs/, 'd1, with a pack, not dropped');
 
+# a pack's beginning cut short after the marker is made (an error as the
+# catalog's file is extended): the tier has no pack, and the marker stays;
+# the tier dropped, empty, takes the marker with it, and the database goes
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+	  if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', 'CREATE DATABASE dx');
+	$node->safe_psql('dx', $setup . q{
+		CREATE EXTENSION injection_points;
+		SET allow_system_table_mods = on;
+		CREATE TABLE pg_history.t () USING prolly_tier;
+		CREATE TABLE pg_history.ti () USING prolly_chunk_index;
+	});
+	my ($r, $o, $e) = $node->psql('dx', q{
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('chunk-tier-page-extended', 'error');
+		SELECT test_chunk_put('pg_history.t', 'pg_history.ti', h('\x0a7309'), '\x0a7309');
+	});
+	like($e, qr/error triggered for injection point/, 'a pack begun, cut short');
+	$node->safe_psql('dx', q{
+		SET allow_system_table_mods = on;
+		DROP TABLE pg_history.t, pg_history.ti;
+	});
+	$node->safe_psql('postgres', 'DROP DATABASE dx');
+	pass('the empty tier dropped took its marker: the database dropped');
+}
+
+# the tier's place changed with packs in it: VACUUM and puts refused, the
+# packs not taken for gone; set back, all as it was
+my $tier2 = PostgreSQL::Test::Utils::tempdir;
+$node->append_conf('postgresql.conf', qq{history_tier_location = '$tier2'});
+$node->reload;
+$node->poll_query_until('d1', qq{SELECT current_setting('history_tier_location') = '$tier2'})
+  or die 'location not reloaded';
+($ret, $out, $err) = $node->psql('d1', 'VACUUM pg_history.tier_index');
+like($err, qr/objects are in another place than history_tier_store and history_tier_location say/, 'VACUUM refused elsewhere');
+($ret, $out, $err) = $node->psql('d1', q{SELECT (test_cs_put('tier', '\x0a7304')).stored});
+like($err, qr/objects are in another place/, 'and a put');
+$node->append_conf('postgresql.conf', qq{history_tier_location = '$tier'});
+$node->reload;
+$node->poll_query_until('d1', qq{SELECT current_setting('history_tier_location') = '$tier'})
+  or die 'location not reloaded';
+$node->safe_psql('d1', 'VACUUM pg_history.tier_index');
+is($node->safe_psql('d1', q{SELECT test_cs_get('tier', h('\x0a7302'))}), '\x0a7302', 'set back: read as it was');
+
 $node->stop;
 done_testing();

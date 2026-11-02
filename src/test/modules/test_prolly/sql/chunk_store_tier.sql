@@ -189,6 +189,16 @@ DROP TABLE pg_history.my_tier4, pg_history.my_tier4_index;
 SELECT count(*) AS objects_made FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') n
 WHERE n.name NOT IN (SELECT name FROM names1);
 
+-- no chunk through an index made in this transaction either: aborted, the
+-- index would go, the tier's packs left with none to be freed through
+CREATE TABLE pg_history.my_tier5 () USING prolly_tier;
+BEGIN;
+CREATE TABLE pg_history.my_tier5_index () USING prolly_chunk_index;
+SELECT test_chunk_put('pg_history.my_tier5', 'pg_history.my_tier5_index', substr(sha256('\x0e05'), 1, 20), '\x0e05');
+ROLLBACK;
+SELECT count(*) AS packs FROM test_tier_packs('pg_history.my_tier5');
+DROP TABLE pg_history.my_tier5;
+
 -- the index bound to a tier with packs is not dropped, nor truncated (the
 -- tier's packs could not be freed without it); and a tier is not moved out
 -- of pg_history

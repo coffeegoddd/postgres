@@ -2518,6 +2518,8 @@ ci_relation_vacuum(Relation rel, const VacuumParams *params,
 static void
 ci_relation_nontransactional_truncate(Relation rel)
 {
+	/* (made in this transaction, a tier's chunks through it: the same) */
+	ChunkTierCheckIndex(rel, "truncate");
 	RelationTruncate(rel, 0);
 	ChunkIndexInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
 	if (rel->rd_amcache != NULL)
@@ -2770,6 +2772,7 @@ tier_relation_set_new_filelocator(Relation rel,
 						RelationGetRelationName(rel))));
 	ChunkTierNewStorage(rel);
 	ChunkTierCheckEmpty(rel, "truncate");
+	ChunkTierForgetMarker(rel);
 	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 	/* (its packs' entries name the transactions that made them) */
 	*freezeXid = RecentXmin;
@@ -2791,6 +2794,7 @@ tier_relation_nontransactional_truncate(Relation rel)
 {
 	/* (none: a tier made in this transaction takes no chunk until it commits) */
 	ChunkTierCheckEmpty(rel, "truncate");
+	ChunkTierForgetMarker(rel);
 	RelationTruncate(rel, 0);
 	ChunkTierInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
 	ChunkTierTruncated(rel);

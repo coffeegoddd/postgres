@@ -294,10 +294,10 @@ is($packs->(), $p5 - 1, 'and removed once it is gone');
 $node->safe_psql('postgres', 'ALTER SYSTEM RESET wal_sender_timeout');
 $node->reload;
 
-# the store opened again once the settings change: a pack after a reload
-# where they say
+# the settings read again once they change: the tier's packs elsewhere
+# than they now say, a put after a reload is refused; set back, it goes
 my $tier2 = PostgreSQL::Test::Utils::tempdir;
-my $r = $node->background_psql('postgres');
+my $r = $node->background_psql('postgres', on_error_stop => 0);
 $r->query_safe(q{SELECT (test_cs_put('tier', blob('there', 100))).stored});
 $r->query_safe(qq{ALTER SYSTEM SET history_tier_location = '$tier2'});
 $r->query_safe('SELECT pg_reload_conf()');
@@ -309,12 +309,20 @@ for (1 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
 	usleep(100_000);
 }
 ok($seen, 'the session has the new setting');
-$r->query_safe(q{SELECT (test_cs_put('tier', blob('moved', 100))).stored});
+my $moved = $r->query(q{SELECT (test_cs_put('tier', blob('moved', 100))).stored});
+like($r->{stderr}, qr/objects are in another place/, 'a put where the packs are not: refused');
+$r->{stderr} = '';
 $r->query_safe('ALTER SYSTEM RESET history_tier_location');
 $r->query_safe('SELECT pg_reload_conf()');
+for (1 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
+{
+	last if $r->query_safe(q{SELECT current_setting('history_tier_location')}) ne $tier2;
+	usleep(100_000);
+}
+is($r->query_safe(q{SELECT (test_cs_put('tier', blob('moved', 100))).stored}), 't', 'set back, it goes');
 $r->quit;
 opendir(my $dh2, $tier2) or die;
-is(scalar(grep(/^packs#/, readdir($dh2))), 1, 'a pack where the setting says, after a reload');
+is(scalar(grep(/^packs#/, readdir($dh2))), 0, 'nothing put where the packs are not');
 closedir($dh2);
 
 # two standbys promoted apart, the primary stopped: each on timeline 2,

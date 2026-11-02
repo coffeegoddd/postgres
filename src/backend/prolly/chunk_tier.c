@@ -84,7 +84,7 @@ char	   *history_tier_store = NULL;
 char	   *history_tier_location = NULL;
 
 #define TIER_MAGIC			0x54494552	/* "TIER" */
-#define TIER_VERSION		5
+#define TIER_VERSION		6
 #define TIER_META_BLOCK		0
 
 typedef struct TierMeta
@@ -99,6 +99,9 @@ typedef struct TierMeta
 	uint32		adopted;		/* packs numbered below are this server's */
 	Oid			dboid;			/* the database its objects are named for (a
 								 * copy's, another's, until its first pack) */
+	uint32		marked;			/* the database's marker made, not removed */
+	uint64		place;			/* the store and place its objects are in
+								 * (their hash; 0: none yet) */
 } TierMeta;
 
 /* a pack's states */
@@ -353,7 +356,7 @@ pack_live(const TierPack *p)
 /* ------------------------------------------------------------ packs */
 
 static void tier_xact_callback(XactEvent event, void *arg);
-static void ensure_marker(uint64 stamp);
+static LOCKMODE ensure_marker(Relation rel);
 static void refuse_copied(Relation rel, const TierMeta *meta);
 static uint64 tier_stamp(Relation rel);
 static void note_object(void *arg, const char *name, uint64 size);
@@ -386,16 +389,108 @@ marker_name(uint64 stamp)
 	return name;
 }
 
+/*
+ * The marker's lock, a lock of the tier (an object's, apart from any
+ * other's of it): a pack begun takes it shared, or, the marker to be made,
+ * exclusively; its removal, exclusively.  The marker made and removed under
+ * it, no buffer locked (the store's calls may wait).
+ */
+#define MARKER_LOCK_SUBID	1
+
 static void
-ensure_marker(uint64 stamp)
+lock_marker(Relation rel, LOCKMODE mode)
 {
-	ObjectStore *os = tier_objects();
-	char	   *name = marker_name(stamp);
+	LockDatabaseObject(RelationRelationId, RelationGetRelid(rel), MARKER_LOCK_SUBID, mode);
+}
+
+static void
+unlock_marker(Relation rel, LOCKMODE mode)
+{
+	UnlockDatabaseObject(RelationRelationId, RelationGetRelid(rel), MARKER_LOCK_SUBID, mode);
+}
+
+/* the meta page's marked set (WAL-logged, flushed if cleared) */
+static void
+set_marked(Relation rel, bool marked)
+{
+	Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
+	GenericXLogState *state;
+	XLogRecPtr	lsn;
+
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	state = GenericXLogStart(rel);
+	tier_meta(rel, GenericXLogRegisterBuffer(state, mbuf, 0))->marked = marked;
+	lsn = GenericXLogFinish(state);
+	UnlockReleaseBuffer(mbuf);
+
+	/* (cleared before the marker is removed: after a crash, no stale mark) */
+	if (!marked)
+		XLogFlush(lsn);
+}
+
+/*
+ * The database's marker of the tier there before a pack is begun (marker
+ * lock held, in mode, as the entry is made; the caller lets it go)
+ */
+static LOCKMODE
+ensure_marker(Relation rel)
+{
+	TierMeta	meta;
+	ObjectStore *os;
+	char	   *name;
 	uint64		size;
 
+	lock_marker(rel, ShareLock);
+	meta = read_meta(rel);
+	if (meta.marked && meta.dboid == MyDatabaseId)
+		return ShareLock;
+	unlock_marker(rel, ShareLock);
+	lock_marker(rel, ExclusiveLock);
+	meta = read_meta(rel);
+	if (meta.marked && meta.dboid == MyDatabaseId)
+		return ExclusiveLock;
+	os = tier_objects();
+	name = marker_name(stamp_for(meta.stamp, MyDatabaseId));
 	if (!os->routine->size(os, name, &size))
 		os->routine->put(os, name, "", 0);
 	pfree(name);
+	set_marked(rel, true);
+	return ExclusiveLock;
+}
+
+/* the marker removed, the mark cleared first (marker lock held exclusively) */
+static void
+remove_marker(Relation rel, const TierMeta *meta)
+{
+	ObjectStore *os = tier_objects();
+	char	   *name = marker_name(meta_stamp(meta));
+
+	set_marked(rel, false);
+	os->routine->remove(os, name);
+	pfree(name);
+}
+
+/* the store and place set now: a hash of them, never 0 */
+static uint64
+current_place(void)
+{
+	char	   *both = psprintf("%s:%s", history_tier_store, history_tier_location);
+	uint64		h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
+
+	pfree(both);
+	return h != 0 ? h : 1;
+}
+
+/* the tier's objects not where the settings say now: an error */
+static void
+check_place(Relation rel, const TierMeta *meta)
+{
+	if (meta->place != 0 && meta->place != current_place())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("tier \"%s\"'s objects are in another place than history_tier_store and history_tier_location say",
+						RelationGetRelationName(rel)),
+				 errhint("Set them back to where its packs were put.")));
 }
 
 /*
@@ -466,11 +561,15 @@ begin_pack(Relation rel)
 	/* (the top transaction's: a subtransaction's rollback leaves its pack) */
 	TransactionId xid = GetTopTransactionId();
 
+	LOCKMODE	marker_mode;
+
 	/* (taken before the locks: a new owner, if this timeline has none) */
 	if (!pg_strong_random(&owner, sizeof(owner)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not make a tier's owner")));
+	/* (the database's marker there first, its lock held as the entry is made) */
+	marker_mode = ensure_marker(rel);
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = tier_meta(rel, BufferGetPage(mbuf));
 
@@ -482,7 +581,7 @@ begin_pack(Relation rel)
 	 */
 	if (meta->dboid != MyDatabaseId)
 		refuse_copied(rel, meta);
-	ensure_marker(stamp_for(meta->stamp, MyDatabaseId));
+	check_place(rel, meta);
 	id = meta->next_pack;
 	if (id == PG_UINT32_MAX)
 		ereport(ERROR,
@@ -524,6 +623,8 @@ begin_pack(Relation rel)
 	}
 	meta = (TierMeta *) PageGetContents(mpage);
 	meta->next_pack = id + 1;
+	if (meta->place == 0)
+		meta->place = current_place();
 	/* (named for this database, from its first pack: a copy's, its own) */
 	meta->dboid = MyDatabaseId;
 	/* (the first pack begun on this timeline: this server's own owner) */
@@ -545,6 +646,7 @@ begin_pack(Relation rel)
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(pbuf);
 	UnlockReleaseBuffer(mbuf);
+	unlock_marker(rel, marker_mode);
 
 	pending.id = id;
 	pending.relid = RelationGetRelid(rel);
@@ -718,6 +820,22 @@ ChunkTierCheckEmpty(Relation rel, const char *what)
 								  "%u packs, the first %u, are not removed: their objects would be left in the tier's store.",
 								  left, left, first_left),
 				 errhint("Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).")));
+}
+
+void
+ChunkTierForgetMarker(Relation rel)
+{
+	TierMeta	meta;
+
+	if (!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ||
+		RelationGetNumberOfBlocks(rel) == 0 ||
+		history_tier_location == NULL || history_tier_location[0] == '\0')
+		return;
+	lock_marker(rel, ExclusiveLock);
+	meta = read_meta(rel);
+	if (meta.dboid == MyDatabaseId)
+		remove_marker(rel, &meta);
+	unlock_marker(rel, ExclusiveLock);
 }
 
 void
@@ -1380,11 +1498,16 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 {
 	TierMeta	meta = read_meta(rel);
 	TimeLineID	tli = GetWALInsertionTimeLine();
-	uint32	   *gone = palloc_array(uint32, PACKS_PER_PAGE);
+	uint32	   *gone;
 	uint32		live = 0;
 	int			held = 0;
 	pid_t		blocker = 0;
 	const char *why = NULL;
+
+	/* (objects elsewhere than the settings say: none removed, none counted gone) */
+	if (remove)
+		check_place(rel, &meta);
+	gone = palloc_array(uint32, PACKS_PER_PAGE);
 
 	*frozen = RecentXmin;
 	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
@@ -1463,24 +1586,19 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 	pfree(gone);
 
 	/*
-	 * (none left: the database's marker removed, under the meta page's lock,
-	 * no pack begun since the walk began; a pack begun makes it again)
+	 * (none left: the database's marker removed, under its lock, no pack
+	 * begun since the walk began; a pack begun makes it again)
 	 */
 	if (remove && live == 0 &&
 		history_tier_location != NULL && history_tier_location[0] != '\0')
 	{
-		Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
+		TierMeta	now;
 
-		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
-		if (tier_meta(rel, BufferGetPage(mbuf))->next_pack == meta.next_pack)
-		{
-			ObjectStore *os = tier_objects();
-			char	   *name = marker_name(meta_stamp(&meta));
-
-			os->routine->remove(os, name);
-			pfree(name);
-		}
-		UnlockReleaseBuffer(mbuf);
+		lock_marker(rel, ExclusiveLock);
+		now = read_meta(rel);
+		if (now.next_pack == meta.next_pack && now.dboid == MyDatabaseId)
+			remove_marker(rel, &now);
+		unlock_marker(rel, ExclusiveLock);
 	}
 	if (held > 0)
 		ereport(LOG,
