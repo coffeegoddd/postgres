@@ -66,8 +66,12 @@ SELECT convert_from(test_cs_get('tier', substr(sha256(convert_to('tier-sub-kept'
 SELECT ok FROM test_cs_check('tier');
 
 -- a dump of the tier's chunks: no bundle, none of them (a bundle's chunks
--- are dumped from the tier, and the bundle after them)
-SELECT count(*) FILTER (WHERE roots IS NOT NULL) AS bundles FROM pg_history_export();
+-- are dumped from the tier, and the bundle after them), the store's alone
+SELECT count(*) FILTER (WHERE roots IS NOT NULL) AS bundles,
+	count(*) FILTER (WHERE tier) AS tier_chunks,
+	count(*) FILTER (WHERE NOT tier AND data IS NOT NULL) =
+		(SELECT chunks FROM test_cs_check('pages')) AS the_stores
+	FROM pg_history_export();
 
 -- a pack's table, at its end: each chunk in it, by hash, its bytes there
 -- hashing to it

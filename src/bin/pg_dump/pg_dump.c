@@ -4159,8 +4159,9 @@ dumpLO(Archive *fout, const LoInfo *loinfo)
 /*
  * getHistory:
  *	The database's version-control history store, if the server has one
- *	and it has a chunk: its chunks, each after those it references, and
- *	then its pointers, as of the dump's snapshot.  A role that cannot read
+ *	and it has a chunk or a bundle: its chunks, each after those it
+ *	references, its tier's bundles' chunks so, and then its pointers and
+ *	its bundles, as of the dump's snapshot.  A role that cannot read
  *	it may not dump the database whole but with --no-history (history is
  *	never left out unless asked).
  */
@@ -4201,12 +4202,13 @@ getHistory(Archive *fout)
 	history->dobj.dump = DUMP_COMPONENT_DATA;
 
 	/*
-	 * (one COPY, of the store as of the dump's snapshot: its chunks, then
-	 * its pointers, restored in one statement, so that none restored is
-	 * freed before the pointers holding it are)
+	 * (one COPY, of the store as of the dump's snapshot: its chunks, its
+	 * tier's, then its pointers and bundles, restored in one statement, so
+	 * that none restored is freed before the pointers or bundles holding it
+	 * are)
 	 */
-	history->query = "COPY (SELECT hash, data, name, roots FROM pg_catalog.pg_history_export()) TO stdout;";
-	history->copyStmt = "COPY pg_history.chunk_restore (hash, data, name, roots) FROM stdin;\n";
+	history->query = "COPY (SELECT hash, data, name, roots, tier FROM pg_catalog.pg_history_export()) TO stdout;";
+	history->copyStmt = "COPY pg_history.chunk_restore (hash, data, name, roots, tier) FROM stdin;\n";
 	res = ExecuteSqlQueryForSingleRow(fout, "SELECT pg_relation_size('pg_history.chunks')");
 	history->size = (pgoff_t) strtoll(PQgetvalue(res, 0, 0), NULL, 10);
 	PQclear(res);

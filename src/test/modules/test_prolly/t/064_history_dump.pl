@@ -134,7 +134,7 @@ is($restore->('dsn', 'pg_restore', "$dir/snap.dump"), $want, 'the store as of th
 
 # bytes not their chunk's, and a chunk referenced and left out, refused
 my $plain = slurp_file("$dir/src.sql");
-my ($rows) = $plain =~ /COPY pg_history\.chunk_restore \(hash, data, name, roots\) FROM stdin;\n(.*?)\n\\\.\n/s;
+my ($rows) = $plain =~ /COPY pg_history\.chunk_restore \(hash, data, name, roots, tier\) FROM stdin;\n(.*?)\n\\\.\n/s;
 ok(defined $rows, 'the plain dump has the store\'s rows');
 my @rows = split /\n/, $rows;
 # (the store in one COPY, one statement, so in one transaction: no chunk
