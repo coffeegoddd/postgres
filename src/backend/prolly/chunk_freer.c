@@ -170,8 +170,8 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 				case FREER_BEGIN_COMPACT:
 				case FREER_BEGIN_EVACUATE:
 					n = op == FREER_BEGIN_COMPACT ?
-						ChunkLog->compactable(log, args->fraction, COMPACT_SEGMENTS, starts, ends) :
-						ChunkLog->evacuable(log, COMPACT_SEGMENTS, starts, ends);
+						ChunkLogOf(log)->compactable(log, args->fraction, COMPACT_SEGMENTS, starts, ends) :
+						ChunkLogOf(log)->evacuable(log, COMPACT_SEGMENTS, starts, ends);
 					fs->c = ChunkStoreCompactBegin(log, idx, n, starts, ends, fs->cxt);
 
 					/*

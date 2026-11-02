@@ -173,7 +173,11 @@ typedef struct ChunkLogRoutine
 	uint64		(*stamp) (Relation rel);
 } ChunkLogRoutine;
 
-extern PGDLLIMPORT const ChunkLogRoutine *ChunkLog;
+/*
+ * The routine of the chunk log rel: its access method's.  A store reaches
+ * its log through it, so that its index may be bound to a log of any kind.
+ */
+extern const ChunkLogRoutine *ChunkLogOf(Relation rel);
 extern PGDLLIMPORT const ChunkLogRoutine PageChunkLog;
 
 /*
