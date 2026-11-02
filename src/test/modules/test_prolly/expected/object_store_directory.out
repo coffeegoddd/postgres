@@ -381,3 +381,28 @@ SELECT count(*) AS left FROM test_os_list(:'store', :'location', '');
     0
 (1 row)
 
+-- a location with a trailing "/" is the same directory
+SELECT test_os_put('directory', 'pg_test_object_store/', 'slash/x', '\x07'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_read('directory', 'pg_test_object_store', 'slash/x', 0, 1) AS same_dir;
+ same_dir 
+----------
+ \x07
+(1 row)
+
+SELECT test_os_remove('directory', 'pg_test_object_store//', 'slash/x');
+ test_os_remove 
+----------------
+ 
+(1 row)
+
+SELECT count(*) AS left FROM test_os_list('directory', 'pg_test_object_store', '');
+ left 
+------
+    0
+(1 row)
+

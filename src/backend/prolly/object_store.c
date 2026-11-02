@@ -152,9 +152,19 @@ dir_open(const char *location)
 				 errmsg("a directory object store needs a directory")));
 	ds->store.routine = &DirectoryObjectStore;
 	ds->dir = pstrdup(location);
+	/* (its trailing "/"s off, but the root's) */
+	for (size_t n = strlen(ds->dir); n > 1 && ds->dir[n - 1] == '/'; n--)
+		ds->dir[n - 1] = '\0';
 
-	/* (made, it and its entry in its parent synced, as a put's are) */
-	if (MakePGDirectory(ds->dir) == 0)
+	if (MakePGDirectory(ds->dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create directory \"%s\": %m", ds->dir)));
+
+	/*
+	 * (it and its entry in its parent synced, at every open: one made just
+	 * before a crash, and not synced then, is synced before it is used)
+	 */
 	{
 		char	   *parent = pstrdup(ds->dir);
 		char	   *slash = strrchr(parent, '/');
@@ -162,17 +172,13 @@ dir_open(const char *location)
 		fsync_fname(ds->dir, true);
 		if (slash == NULL)
 			fsync_fname(".", true);
-		else
+		else if (slash[1] != '\0')
 		{
 			*slash = '\0';
 			fsync_fname(slash == parent ? "/" : parent, true);
 		}
 		pfree(parent);
 	}
-	else if (errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create directory \"%s\": %m", ds->dir)));
 	return &ds->store;
 }
 
