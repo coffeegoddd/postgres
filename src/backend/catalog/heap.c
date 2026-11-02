@@ -64,6 +64,8 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
+#include "prolly/chunk_log.h"
+#include "prolly/chunk_tier.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
@@ -1867,6 +1869,10 @@ heap_drop_with_catalog(Oid relid)
 	 * Open and lock the relation.
 	 */
 	rel = relation_open(relid, AccessExclusiveLock);
+
+	/* (prolly: a tier of the history store with packs is not dropped) */
+	if (RelationIsTierLog(rel))
+		ChunkTierCheckEmpty(rel, "drop", false);
 
 	/*
 	 * There can no longer be anyone *else* touching the relation, but we

@@ -132,17 +132,32 @@ SELECT count(*) AS entries, count(DISTINCT off) AS places
 FROM test_tier_pack_table('pg_history.tier_chunks', :twice_pack)
 WHERE hash = substr(sha256(convert_to('twice in a pack', 'UTF8')), 1, 20);
 
--- a tier the test makes: its stamp, in its packs' names, a new one after
--- TRUNCATE (the one kept in the relcache let go)
-CREATE TABLE my_tier () USING prolly_tier;
-CREATE TABLE my_tier_index () USING prolly_chunk_index;
-SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0a'), 1, 20), '\x0a');
-SELECT test_chunk_get('my_tier', 'my_tier_index', substr(sha256('\x0a'), 1, 20));
+-- a tier is pg_history's alone (the tests' made there, and truncated and
+-- dropped, as one allowed to change the system's catalogs)
+CREATE TABLE public_tier () USING prolly_tier;
+SET allow_system_table_mods = on;
+CREATE TABLE pg_history.my_tier () USING prolly_tier;
+CREATE TABLE pg_history.my_tier_index () USING prolly_chunk_index;
+
+-- a tier with packs is not truncated, nor dropped (their objects would be
+-- left in the store, named by no catalog); emptied, it is
+SELECT test_chunk_put('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0a'), 1, 20), '\x0a');
+SELECT test_chunk_get('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0a'), 1, 20));
+TRUNCATE pg_history.my_tier, pg_history.my_tier_index;
+DROP TABLE pg_history.my_tier;
 CREATE TEMP TABLE names0 AS
 	SELECT name FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
-TRUNCATE my_tier, my_tier_index;
-SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0b'), 1, 20), '\x0b');
-SELECT test_chunk_get('my_tier', 'my_tier_index', substr(sha256('\x0b'), 1, 20));
+SELECT test_chunk_free('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0a'), 1, 20));
+VACUUM pg_history.my_tier_index;
+SELECT count(*) FILTER (WHERE state <> 'removed') AS packs_left FROM test_tier_packs('pg_history.my_tier');
+SELECT count(*) AS its_object_gone FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') n
+WHERE n.name NOT IN (SELECT name FROM names0);
+
+-- its stamp, in its packs' names, a new one after TRUNCATE (the one kept in
+-- the relcache let go)
+TRUNCATE pg_history.my_tier, pg_history.my_tier_index;
+SELECT test_chunk_put('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0b'), 1, 20), '\x0b');
+SELECT test_chunk_get('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0b'), 1, 20));
 SELECT count(*) AS new_names,
 	count(*) FILTER (WHERE split_part(n.name, '/', 2) IN
 		(SELECT split_part(o.name, '/', 2) FROM names0 o)) AS of_a_stamp_before
@@ -150,33 +165,51 @@ FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') n
 WHERE n.name NOT IN (SELECT name FROM names0);
 
 -- and TRUNCATE in the transaction that made the tier (its storage cut in
--- place): the pack begun before it gone with it
+-- place): the pack begun before it, not written, gone with it; one a pack
+-- filled had written, refused
 BEGIN;
-CREATE TABLE my_tier2 () USING prolly_tier;
-CREATE TABLE my_tier2_index () USING prolly_chunk_index;
-SELECT test_chunk_put('my_tier2', 'my_tier2_index', substr(sha256('\x0d'), 1, 20), '\x0d');
-TRUNCATE my_tier2, my_tier2_index;
-SELECT test_chunk_put('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20), '\x0e');
+CREATE TABLE pg_history.my_tier2 () USING prolly_tier;
+CREATE TABLE pg_history.my_tier2_index () USING prolly_chunk_index;
+SELECT test_chunk_put('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0d'), 1, 20), '\x0d');
+TRUNCATE pg_history.my_tier2, pg_history.my_tier2_index;
+SELECT test_chunk_put('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0e'), 1, 20), '\x0e');
 COMMIT;
-SELECT test_chunk_get('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20)),
-	test_chunk_has('my_tier2', 'my_tier2_index', substr(sha256('\x0d'), 1, 20)) AS gone;
-SELECT id, state FROM test_tier_packs('my_tier2');
-DROP TABLE my_tier2, my_tier2_index;
+SELECT test_chunk_get('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0e'), 1, 20)),
+	test_chunk_has('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0d'), 1, 20)) AS gone;
+SELECT id, state FROM test_tier_packs('pg_history.my_tier2');
+SELECT test_chunk_free('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0e'), 1, 20));
+VACUUM pg_history.my_tier2_index;
+DROP TABLE pg_history.my_tier2, pg_history.my_tier2_index;
+BEGIN;
+CREATE TABLE pg_history.my_tier3 () USING prolly_tier;
+CREATE TABLE pg_history.my_tier3_index () USING prolly_chunk_index;
+SELECT count(*) FROM generate_series(1, 65) g,
+	LATERAL test_chunk_put('pg_history.my_tier3', 'pg_history.my_tier3_index',
+		substr(sha256(convert_to(rpad(g::text, 1048576, '.'), 'UTF8')), 1, 20),
+		convert_to(rpad(g::text, 1048576, '.'), 'UTF8'));
+SELECT state, size > 0 AS written FROM test_tier_packs('pg_history.my_tier3') WHERE id = 1;
+TRUNCATE pg_history.my_tier3, pg_history.my_tier3_index;
+ROLLBACK;
 
 -- TRUNCATE (new storage) in a transaction that put chunks in the tier:
 -- refused (its pack's entry is the storage's)
 BEGIN;
-SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0f'), 1, 20), '\x0f');
-TRUNCATE my_tier, my_tier_index;
+SELECT test_chunk_put('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0f'), 1, 20), '\x0f');
+TRUNCATE pg_history.my_tier, pg_history.my_tier_index;
 ROLLBACK;
 
--- a tier dropped in the transaction that put chunks in it: named as it
--- commits
+-- a tier dropped in the transaction that put chunks in it: refused (its
+-- pack, being made, is one)
 BEGIN;
-SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0c'), 1, 20), '\x0c');
-DROP TABLE my_tier;
-COMMIT;
-DROP TABLE my_tier, my_tier_index;
+SELECT test_chunk_put('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0c'), 1, 20), '\x0c');
+DROP TABLE pg_history.my_tier;
+ROLLBACK;
+-- (emptied, dropped)
+VACUUM pg_history.my_tier_index;
+SELECT test_chunk_free('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0b'), 1, 20));
+VACUUM pg_history.my_tier_index;
+DROP TABLE pg_history.my_tier, pg_history.my_tier_index;
+RESET allow_system_table_mods;
 
 -- repacking: a pack with more than the fraction of its bytes dead is a
 -- segment to compact; compaction moves its live chunks into a pack of its
