@@ -2,8 +2,9 @@
 -- its roots reach that the tier has not into the tier, its row of
 -- pg_history.bundles holds the roots there, and the store frees what
 -- nothing holds any more (the caller letting go of its roots first, in the
--- push's transaction; what anything else holds stays); a read of what was pushed is an error, until fetched back;
--- a release frees in the tier what nothing else holds.
+-- push's transaction; what anything else holds stays); a read of what was
+-- pushed is an error, until fetched back; a release frees in the tier what
+-- nothing else holds; and a fetch copies a bundle back.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
@@ -303,6 +304,113 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1199')]);
  test_cs_free 
 --------------
             1
+(1 row)
+
+-- a fetch: what a bundle's roots reach copied back from the tier, the
+-- tier keeping its copy; the caller takes its roots in the fetch's
+-- transaction; a fetch again copies nothing; a release then leaves the
+-- copy here
+CREATE FUNCTION pg_temp.p7() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x5201'::bytea || pg_temp.h('\x0a1701')$$;
+SELECT (test_cs_put('pages', '\x0a1701')).stored, (test_cs_put('pages', pg_temp.p7())).stored;
+ stored | stored 
+--------+--------
+ t      | t
+(1 row)
+
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p7()));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SELECT test_cs_unref_root('pages', pg_temp.h(pg_temp.p7()));
+ test_cs_unref_root 
+--------------------
+ 
+(1 row)
+
+SELECT pg_history_push('b7', ARRAY[pg_temp.h(pg_temp.p7())]) AS copied;
+ copied 
+--------
+      2
+(1 row)
+
+COMMIT;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7()));
+ERROR:  chunk 7c40254dc47854781e934a8d7c876b778fb418e6 was pushed to the history store's tier
+DETAIL:  History pushed is not fetched back yet.
+-- (a fetch aborted: still pushed)
+BEGIN;
+SELECT pg_history_fetch('b7') AS copied;
+ copied 
+--------
+      2
+(1 row)
+
+ROLLBACK;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7()));
+ERROR:  chunk 7c40254dc47854781e934a8d7c876b778fb418e6 was pushed to the history store's tier
+DETAIL:  History pushed is not fetched back yet.
+BEGIN;
+SELECT pg_history_fetch('b7') AS copied;
+ copied 
+--------
+      2
+(1 row)
+
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p7()));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+COMMIT;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_here,
+	test_cs_get('pages', pg_temp.h('\x0a1701')) AS leaf_here,
+	test_cs_has('tier', pg_temp.h(pg_temp.p7())) AS tier_keeps;
+ read_here | leaf_here | tier_keeps 
+-----------+-----------+------------
+ t         | \x0a1701  | t
+(1 row)
+
+SELECT ok, unheld FROM test_cs_check('pages');
+ ok | unheld 
+----+--------
+ t  |      0
+(1 row)
+
+SELECT pg_history_fetch('b7') AS copied_again;
+ copied_again 
+--------------
+            0
+(1 row)
+
+SELECT pg_history_release('b7') AS freed;
+ freed 
+-------
+     2
+(1 row)
+
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_still;
+ read_still 
+------------
+ t
+(1 row)
+
+SELECT pg_history_fetch('b7');
+ERROR:  there is no bundle "b7" in the history store's tier
+SELECT test_cs_unref_root('pages', pg_temp.h(pg_temp.p7()));
+ test_cs_unref_root 
+--------------------
+ 
+(1 row)
+
+SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p7())]) AS freed;
+ freed 
+-------
+     2
 (1 row)
 
 SELECT test_chunk_format_refs(false);

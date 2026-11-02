@@ -21,9 +21,10 @@
  * read of a chunk the store has not and the tier has is an error until it
  * is fetched back (prolly/chunkstore.h's "pages").
  *
- * A release of a bundle deletes its rows (the tier letting go of its
+ * A release of a bundle deletes its row (the tier letting go of its
  * roots) and frees in the tier what nothing else holds, its packs' bytes
- * counted dead for VACUUM to remove.
+ * counted dead for VACUUM to remove.  A fetch of a bundle copies what its
+ * roots reach back into the store, the tier keeping its copy.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -64,6 +65,7 @@ typedef struct PushState
 {
 	ChunkStore *from;
 	ChunkStore *to;
+	const char *verb;			/* "push" or "fetch", for errors */
 	PushFrame  *stack;
 	int			depth;
 	int			cap;
@@ -162,8 +164,8 @@ copy_reached(PushState *ps, HTAB *seen, const uint8 *root)
 		if (f->data == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("the history store has no chunk %s to push",
-							ChunkHashText(f->hash))));
+					 errmsg("the history store has no chunk %s to %s",
+							ChunkHashText(f->hash), ps->verb)));
 		/* (an empty chunk's bytes, palloc'd for the batch to free) */
 		if (f->len == 0)
 		{
@@ -275,6 +277,7 @@ pg_history_push(PG_FUNCTION_ARGS)
 
 	ps.from = ChunkStoreOpen("pages");
 	ps.to = ChunkStoreOpen("tier");
+	ps.verb = "push";
 	ps.cap = 64;
 	ps.stack = palloc_array(PushFrame, ps.cap);
 	ps.ncap = 64;
@@ -347,4 +350,66 @@ pg_history_release(PG_FUNCTION_ARGS)
 	SPI_finish();
 	freed = cs_free(ChunkStoreOpen("tier"), roots, n);
 	PG_RETURN_INT64((int64) freed);
+}
+
+/*
+ * pg_history_fetch(bundle text) returns int8: the chunks copied back into
+ * the store.  What the bundle's roots reach that the store has not is
+ * copied from the tier into it (the walk a push's, the other way: each
+ * chunk's bytes checked against its name as it is put), the tier keeping
+ * its copy, the bundle as it was.  A fetch takes no root: the chunks it
+ * put are held until its transaction ends, and the caller takes its roots
+ * in it (those it does not are freed after, as any unheld).  A push undone
+ * is a fetch, the caller's roots taken, and a release.
+ */
+Datum
+pg_history_fetch(PG_FUNCTION_ARGS)
+{
+	text	   *bundle = PG_GETARG_TEXT_PP(0);
+	Oid			types[1] = {TEXTOID};
+	Datum		values[1] = {PointerGetDatum(bundle)};
+	uint8	   *roots;
+	int			n;
+	PushState	ps = {0};
+	HASHCTL		ctl;
+	HTAB	   *seen;
+
+	check_pusher();
+	SPI_connect();
+	if (SPI_execute_with_args("SELECT roots FROM pg_history.bundles WHERE name = $1",
+							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not look up a bundle");
+	if (SPI_processed == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("there is no bundle \"%s\" in the history store's tier",
+						text_to_cstring(bundle))));
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+		uint8	   *found = array_hashes(DatumGetArrayTypeP(d), &n);
+
+		/* (in the caller's memory: SPI_finish lets go of SPI's) */
+		roots = SPI_palloc((Size) Max(n, 1) * CHUNK_HASH_LEN);
+		memcpy(roots, found, (Size) n * CHUNK_HASH_LEN);
+	}
+	SPI_finish();
+
+	ps.from = ChunkStoreOpen("tier");
+	ps.to = ChunkStoreOpen("pages");
+	ps.verb = "fetch";
+	ps.cap = 64;
+	ps.stack = palloc_array(PushFrame, ps.cap);
+	ps.ncap = 64;
+	ps.hashes = palloc((Size) ps.ncap * CHUNK_HASH_LEN);
+	ps.datas = palloc_array(void *, ps.ncap);
+	ps.lens = palloc_array(uint32, ps.ncap);
+	ctl.keysize = CHUNK_HASH_LEN;
+	ctl.entrysize = CHUNK_HASH_LEN;
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("history fetch", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < n; i++)
+		copy_reached(&ps, seen, roots + (Size) i * CHUNK_HASH_LEN);
+	flush_batch(&ps);
+	PG_RETURN_INT64((int64) ps.copied);
 }
