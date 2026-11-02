@@ -14,7 +14,19 @@ bytes
 (1 row)
 
 step p_push: 
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2101'));
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2102'));
 	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
 
 copied
 ------
@@ -50,7 +62,19 @@ bytes
 (1 row)
 
 step p_push: 
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2101'));
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2102'));
 	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
 
 copied
 ------
@@ -96,7 +120,19 @@ t
 (1 row)
 
 step p_push: 
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2101'));
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2102'));
 	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
 
 copied
 ------

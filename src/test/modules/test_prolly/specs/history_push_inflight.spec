@@ -36,6 +36,8 @@ step w_commit	{ COMMIT; }
 session p
 setup			{ SET chunk_free_in_background = off; }
 step p_push		{
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2101'));
+	SELECT test_cs_unref_root('pages', hp_h('\x0a2102'));
 	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
 }
 step p_after	{ SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes; }

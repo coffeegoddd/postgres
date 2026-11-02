@@ -159,12 +159,6 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("pg_history_pointer_changed is pg_history.pointers' trigger alone")));
 
-	/* (a push is its transaction's alone: prolly/chunk_push.c) */
-	if (ChunkStorePushedInTransaction())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot change the history store's pointers in a transaction that pushed history"),
-				 errhint("Change them in a transaction of their own.")));
 	idx = relation_open(ChunkStoreIndexRelid(), RowExclusiveLock);
 	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
 	{

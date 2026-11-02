@@ -1,6 +1,6 @@
-Parsed test spec with 3 sessions
+Parsed test spec with 2 sessions
 
-starting permutation: p_rr q_pointer p_push1 p_rollback
+starting permutation: p_rr q_pointer p_push1 p_commit p_kept
 test_cs_ref_root
 ----------------
                 
@@ -14,34 +14,21 @@ snapshot
 
 step q_pointer: INSERT INTO pg_history.pointers VALUES ('hr_ptr', hr_h('\x0a3101'));
 step p_push1: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3101')]) AS copied;
-ERROR:  chunk 6c531dff94610c28ed645085bb8fc4809f2beba2 has no root to push but its pointers'
-step p_rollback: ROLLBACK;
-test_cs_free
-------------
-           3
-(1 row)
-
-
-starting permutation: p_begin p_push2 q_push p_commit
-test_cs_ref_root
-----------------
-                
-(1 row)
-
-step p_begin: BEGIN;
-step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
 copied
 ------
      1
 (1 row)
 
-step q_push: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3103')]) AS copied; <waiting ...>
 step p_commit: COMMIT;
-step q_push: <... completed>
-ERROR:  duplicate key value violates unique constraint "bundles_pkey"
+step p_kept: SELECT test_cs_has('pages', hr_h('\x0a3101')) AS kept, test_cs_has('pages', hr_h('\x0a3103')) AS kept3;
+kept|kept3
+----+-----
+t   |t    
+(1 row)
+
 test_cs_free
 ------------
-           2
+           3
 (1 row)
 
 
@@ -52,7 +39,15 @@ test_cs_ref_root
 (1 row)
 
 step p_begin: BEGIN;
-step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+step p_push2: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3102'));
+	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
 copied
 ------
      1
@@ -66,29 +61,7 @@ test_cs_free
 (1 row)
 
 
-starting permutation: p_begin p_push2 p_pointer p_rollback
-test_cs_ref_root
-----------------
-                
-(1 row)
-
-step p_begin: BEGIN;
-step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
-copied
-------
-     1
-(1 row)
-
-step p_pointer: INSERT INTO pg_history.pointers VALUES ('hr_ptr', hr_h('\x0a3101'));
-ERROR:  cannot change the history store's pointers in a transaction that pushed history
-step p_rollback: ROLLBACK;
-test_cs_free
-------------
-           3
-(1 row)
-
-
-starting permutation: q_begin q_pointer2 q_push2 q_commit
+starting permutation: q_begin q_pointer2 p_push2 q_commit
 test_cs_ref_root
 ----------------
                 
@@ -96,36 +69,24 @@ test_cs_ref_root
 
 step q_begin: BEGIN;
 step q_pointer2: INSERT INTO pg_history.pointers VALUES ('hr_ptr2', hr_h('\x0a3101'));
-step q_push2: SELECT pg_history_push('hr2', ARRAY[hr_h('\x0a3103')]) AS copied;
-ERROR:  cannot push history in a transaction that changed the history store's pointers
-step q_commit: COMMIT;
-test_cs_free
-------------
-           3
+step p_push2: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3102'));
+	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
 (1 row)
 
-
-starting permutation: p_begin p_push4 q_push4 s_pointer p_commit
-test_cs_ref_root
-----------------
-                
-(1 row)
-
-step p_begin: BEGIN;
-step p_push4: SELECT pg_history_push('hr3', ARRAY[hr_h('\x0a3104')]) AS copied;
 copied
 ------
      1
 (1 row)
 
-step q_push4: SELECT pg_history_push('hr4', ARRAY[hr_h('\x0a3104')]) AS copied; <waiting ...>
-step s_pointer: INSERT INTO pg_history.pointers VALUES ('hr_ptr', hr_h('\x0a3101'));
-step p_commit: COMMIT;
-step q_push4: <... completed>
-ERROR:  chunk d663d7dedba5f30ce26fea4dc7d3c840fc31743e has no root to push but its pointers'
+step q_commit: COMMIT;
 test_cs_free
 ------------
-           3
+           2
 (1 row)
 
 
@@ -136,7 +97,15 @@ test_cs_ref_root
 (1 row)
 
 step p_begin: BEGIN;
-step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+step p_push2: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3102'));
+	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
 copied
 ------
      1
@@ -146,6 +115,88 @@ step q_pointer_pushed: INSERT INTO pg_history.pointers VALUES ('hr_ptr2', hr_h('
 step p_commit: COMMIT;
 step q_pointer_pushed: <... completed>
 ERROR:  chunk 6dec999aa125ef4c76c83c010a831ea2ca93bdc3 was pushed to the history store's tier
+test_cs_free
+------------
+           2
+(1 row)
+
+
+starting permutation: p_begin p_push3 q_begin q_push3 p_commit q_commit p_kept
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_begin: BEGIN;
+step p_push3: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3103'));
+	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3103')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+copied
+------
+     1
+(1 row)
+
+step q_begin: BEGIN;
+step q_push3: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3103'));
+	SELECT pg_history_push('hr2', ARRAY[hr_h('\x0a3103')]) AS copied;
+ <waiting ...>
+step p_commit: COMMIT;
+step q_push3: <... completed>
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+copied
+------
+     0
+(1 row)
+
+step q_commit: COMMIT;
+step p_kept: SELECT test_cs_has('pages', hr_h('\x0a3101')) AS kept, test_cs_has('pages', hr_h('\x0a3103')) AS kept3;
+kept|kept3
+----+-----
+t   |f    
+(1 row)
+
+test_cs_free
+------------
+           2
+(1 row)
+
+
+starting permutation: p_begin p_push2 q_push p_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_begin: BEGIN;
+step p_push2: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3102'));
+	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+copied
+------
+     1
+(1 row)
+
+step q_push: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3103')]) AS copied; <waiting ...>
+step p_commit: COMMIT;
+step q_push: <... completed>
+ERROR:  duplicate key value violates unique constraint "bundles_pkey"
 test_cs_free
 ------------
            2
