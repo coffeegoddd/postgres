@@ -678,7 +678,12 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			int			i = order[k].at;
 
 			CHECK_FOR_INTERRUPTS();
-			if (!have_run || run.limit - run.next < lens[i])
+			/*
+			 * (the region grown in place if it can be, the bytes reserved
+			 * still to write; else they are written before it is let go of)
+			 */
+			if (!have_run ||
+				(run.limit - run.next < lens[i] && !ChunkLog->extend(log, &run, lens[i])))
 			{
 				write_pack(log, order, unwritten, k, fresh, locs, datas, lens);
 				unwritten = k;

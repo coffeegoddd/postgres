@@ -41,7 +41,7 @@ step b_free		{ SELECT free_pages FROM test_chunk_log_space('rl'); }
 step b_put		{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('x', 20000)), rs_big('x', 20000)) AS put; }
 step b_put_more	{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 330000)), rs_big('z', 330000)) AS put; }
 
-# b's put takes a run of the pages freed (a region's), waits for a's, and
-# finds the chunk a's: the run left afresh.  Its next, longer than a region
-# (pages new for it), lets the run go: its pages free again
+# b's put takes a run of three pages freed, waits for a's, and finds the
+# chunk a's: the run left afresh.  Its next, longer than a region (pages new
+# for it), lets the run go: its three pages free again
 permutation b_vacuum b_free a_begin a_put b_put a_commit b_free b_put_more b_free

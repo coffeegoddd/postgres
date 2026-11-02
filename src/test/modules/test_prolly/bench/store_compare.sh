@@ -1,8 +1,9 @@
 #!/bin/bash
 # Experiment F rerun on the production history store: N random chunks of
 # 4 KB committed BATCH to a transaction; every chunk read back in random
-# order (warm, then after a restart; every byte fetched); a random half
-# freed and its space taken back.  Beside it, the same workload as rows of
+# order (warm, then after a restart: cold in shared buffers, not in the
+# kernel's cache; every byte fetched); a half freed and its space taken
+# back, and that half put again.  Beside it, the same workload as rows of
 # a table (hash key, STORAGE EXTERNAL), and dirstore (the prototype's file
 # store, src/prolly/bench/storebench) if given.
 # The half freed is a random one (FREED=random, as experiment F), or the
@@ -11,7 +12,7 @@
 #   usage: [FREED=random|oldest] store_compare.sh BIN_DIR NEW_DATA_DIR [N [BATCH [STOREBENCH]]]
 # BIN_DIR is an installed build's bin, with test_prolly installed;
 # NEW_DATA_DIR must not exist (a cluster is made there, on port 55494).
-set -u
+set -eu
 B=$1
 D=$2
 N=${3:-100000}
@@ -56,14 +57,16 @@ INSERT INTO stage SELECT g, (SELECT decode(string_agg(md5(random()::text || g ||
 							  FROM generate_series(1, 256) i) FROM generate_series(1, $N) g;
 CREATE UNLOGGED TABLE hashes AS SELECT n, substr(sha256(d), 1, 20) AS hash FROM stage ORDER BY $order;
 ALTER TABLE hashes ADD COLUMN pos serial;
+CREATE INDEX ON hashes (pos);
 VACUUM ANALYZE stage;
 VACUUM ANALYZE hashes;
 SQL
 echo "# $N random chunks of $(q -c "SELECT length(d) FROM stage LIMIT 1") bytes, $BATCH to a commit; the $FREED half freed"
 
 for store in rows pages; do
+	# (every fork of each, both ways)
 	if [ $store = rows ]; then put=e.put; get=e.get; disk="pg_total_relation_size('e.chunks')"
-	else put=e.pput; get=e.pget; disk="pg_relation_size('pg_history.chunks') + pg_relation_size('pg_history.chunk_index')"; fi
+	else put=e.pput; get=e.pget; disk="pg_total_relation_size('pg_history.chunks') + pg_total_relation_size('pg_history.chunk_index')"; fi
 	q -c "CHECKPOINT" >/dev/null
 	w0=$(lsn); t0=$(ms)
 	for k in $(seq 0 $(( N / BATCH - 1 ))); do
@@ -90,8 +93,7 @@ for store in rows pages; do
 		w0=$(lsn); t0=$(ms); q -c "VACUUM FULL e.chunks" >/dev/null; t1=$(ms); w1=$(lsn)
 		row rows "vac full" $((t1 - t0)) "$(walmb $w0 $w1)" "$(mb "$disk")"
 	else
-		# the pages freed in the middle of the log used again: the other half
-		# put again, the file no bigger
+		# the pages freed used again: the half freed put again
 		half=$(( N / 2 ))
 		t0=$(ms)
 		for k in $(seq 0 $(( half / BATCH - 1 ))); do
@@ -105,6 +107,7 @@ done
 "$B/pg_ctl" -D "$D" -m fast stop >/dev/null
 
 if [ -n "$SB" ]; then
+	test -e "$D-dirstore" && { echo "$D-dirstore exists"; exit 1; }
 	echo "  dirstore (its own journal, no WAL; chunks reached through a node per batch):"
 	"$SB" "$D-dirstore" "$N" "$BATCH" | sed 's/^/    /'
 fi

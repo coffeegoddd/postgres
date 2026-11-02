@@ -93,6 +93,14 @@ typedef struct ChunkLogRoutine
 	void		(*release) (Relation rel, const ChunkLogRun *run);
 
 	/*
+	 * The run prepared, grown in place over the pages after it to room for
+	 * len bytes more, if they are free; false if not (the run as it was).
+	 * Nothing of the run is let go of either way: bytes reserved in it and
+	 * not yet written may stay so (a pack's, written after).
+	 */
+	bool		(*extend) (Relation rel, ChunkLogRun *run, size_t len);
+
+	/*
 	 * Binds the log to the one chunk index naming its bytes (the first to
 	 * ask), or errors if it is another's: a tail cut, by that index's
 	 * VACUUM, needs every entry naming the log's bytes to have been seen.

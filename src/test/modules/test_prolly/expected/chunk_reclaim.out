@@ -115,7 +115,7 @@ FROM generate_series(1, 150) g;
 SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;
  still_no_bigger 
 -----------------
- f
+ t
 (1 row)
 
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');

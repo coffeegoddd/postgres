@@ -546,15 +546,15 @@ probe_free(Relation rel, uint64 d, BlockNumber nblocks)
 
 /*
  * npages data pages one after another the free space map has as free (every
- * byte dead), and the free ones after them up to a region's, made afresh
- * for this backend's appends; the first, or -1 if none are found, and how
- * many in *taken.  A page the map has is looked at with those before it, for
+ * byte dead), made afresh for this backend's appends; the first, or -1 if
+ * none are found (a region of them grows a page at a time as its appends
+ * reach its end: see extend_region).  A page the map has is looked at with those before it, for
  * where a run of free pages begins; the run's pages are then locked in order,
  * each checked free, and made afresh.  The map is a hint, not WAL-logged: a
  * page it has wrongly is passed by, and taken out of it.
  */
 static int64
-take_free_pages(Relation rel, uint32 generation, int npages, int *taken)
+take_free_pages(Relation rel, uint32 generation, int npages)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 
@@ -616,29 +616,6 @@ take_free_pages(Relation rel, uint32 generation, int npages, int *taken)
 			continue;
 		}
 
-		/*
-		 * (and the free pages after them, as far as a region goes: chunks
-		 * after go on across them as across pages new, where a page alone
-		 * would leave each chunk's rest that the next does not fit dead)
-		 */
-		while (npages < REGION_PAGES)
-		{
-			BlockNumber b = DATA_BLOCK(first + npages);
-			Page		page;
-
-			if (b >= nblocks)
-				break;
-			bufs[npages] = ReadBuffer(rel, b);
-			LockBuffer(bufs[npages], BUFFER_LOCK_EXCLUSIVE);
-			page = BufferGetPage(bufs[npages]);
-			if (PageIsNew(page) || !page_free(page))
-			{
-				UnlockReleaseBuffer(bufs[npages]);
-				break;
-			}
-			npages++;
-		}
-		*taken = npages;
 
 		/* (this backend's region's, and open, before they are made to use) */
 		ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), generation,
@@ -657,6 +634,59 @@ take_free_pages(Relation rel, uint32 generation, int npages, int *taken)
 }
 
 static void page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation);
+
+/*
+ * The region grown over the data pages just after it, as many as len bytes
+ * need past its end, if they are free (every byte dead): locked in order,
+ * each checked free, published as this backend's region's (from its page
+ * now on) and marked open, then made afresh.  False, nothing done, if they
+ * are not all free, or more than a region's.
+ */
+static bool
+extend_region(Relation rel, ChunkLogRegion *region, size_t len)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	uint64		room = region->limit - region->next;
+	uint64		first = region->limit / AREA;
+	int			n = (int) Min((uint64) REGION_PAGES + 1, (len - room + AREA - 1) / AREA);
+	Buffer		bufs[REGION_PAGES];
+	int			locked = 0;
+
+	if (n > REGION_PAGES || region->limit % AREA != 0)
+		return false;
+	for (int j = 0; j < n; j++)
+	{
+		BlockNumber b = DATA_BLOCK(first + j);
+		Page		page;
+
+		if (b >= nblocks)
+			break;
+		bufs[j] = ReadBuffer(rel, b);
+		LockBuffer(bufs[j], BUFFER_LOCK_EXCLUSIVE);
+		locked++;
+		page = BufferGetPage(bufs[j]);
+		if (PageIsNew(page) || !page_free(page))
+			break;
+	}
+	if (locked < n || PageIsNew(BufferGetPage(bufs[n - 1])) ||
+		!page_free(BufferGetPage(bufs[n - 1])))
+	{
+		for (int j = 0; j < locked; j++)
+			UnlockReleaseBuffer(bufs[j]);
+		return false;
+	}
+	ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), region->generation,
+					   LOC_BLOCK(region->next), DATA_BLOCK(first + n - 1) + 1);
+	map_mark(rel, first, n, true);
+	for (int j = 0; j < n; j++)
+		make_page(rel, bufs[j], false);
+	for (int j = 0; j < n; j++)
+		UnlockReleaseBuffer(bufs[j]);
+	for (int j = 0; j < n; j++)
+		RecordPageWithFreeSpace(rel, DATA_BLOCK(first + j), 0);
+	region->limit += (uint64) n * AREA;
+	return true;
+}
 
 /*
  * Lets go of what is left of a region, from loc to limit: the page loc is
@@ -879,11 +909,20 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 		if (cached != NULL && cached->relnumber == region.relnumber)
 			cached->next = cached->limit = 0;
 	}
+	/*
+	 * (a region grown over the free pages just after it, if they are free,
+	 * as far as the bytes need: chunks go on across them as across pages
+	 * new, where a region of a page alone would leave each page's rest the
+	 * next chunk does not fit dead, and a region of many taken at once
+	 * would keep from others pages its backend may never use)
+	 */
+	if (region.limit > 0 && region.limit - region.next < len &&
+		extend_region(rel, &region, len))
+		keep_region(rel, &region);
 	if (region.limit - region.next < len)
 	{
 		uint64		npages;
 		int64		first;
-		int			taken = 0;
 		uint32		generation;
 
 		/*
@@ -904,16 +943,17 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 		generation = log_generation(rel, NULL);
 		/*
 		 * (pages freed first, as many as the bytes need, if no more than a
-		 * region's: a run of them found where the map has one free)
+		 * region's: a run of them found where the map has one free; the
+		 * region then grows over free pages after it as appends reach them)
 		 */
 		npages = (len + AREA - 1) / AREA;
 		first = npages <= REGION_PAGES ?
-			take_free_pages(rel, generation, Max(npages, 1), &taken) : -1;
+			take_free_pages(rel, generation, Max(npages, 1)) : -1;
 		if (first >= 0)
 		{
 			region.relnumber = rel->rd_locator.relNumber;
 			region.next = (uint64) first * AREA;
-			region.limit = region.next + (uint64) taken * AREA;
+			region.limit = region.next + (uint64) Max(npages, 1) * AREA;
 		}
 		else
 			claim_run(rel, len, REGION_PAGES, &region);
@@ -1006,6 +1046,26 @@ page_write_at(Relation rel, uint64 loc, const void *data, size_t len)
 
 		INJECTION_POINT("chunk-log-append-page", NULL);
 	}
+}
+
+static bool
+page_extend(Relation rel, ChunkLogRun *run, size_t len)
+{
+	ChunkLogRegion region = {
+		.relnumber = run->relnumber,
+		.next = run->next,
+		.limit = run->limit,
+		.generation = run->generation,
+	};
+
+	check_writer(rel);
+	if (run->relnumber != rel->rd_locator.relNumber ||
+		run->limit - run->next >= len ||
+		!extend_region(rel, &region, len))
+		return run->limit - run->next >= len;
+	keep_region(rel, &region);
+	run->limit = region.limit;
+	return true;
 }
 
 /* The region kept once more, should an invalidation have forgotten it. */
@@ -1695,6 +1755,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.reserve = page_reserve,
 	.write = page_write_at,
 	.release = page_release,
+	.extend = page_extend,
 	.bind_index = page_bind_index,
 	.read = page_read,
 	.mark_dead = page_mark_dead,
