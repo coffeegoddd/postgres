@@ -49,13 +49,17 @@
 #include "storage/bufmgr.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 bool		chunk_free_in_background = true;
 double		chunk_compact_dead_fraction = 0.5;
@@ -152,6 +156,7 @@ typedef struct FreerEntry
 	uint32		generation;		/* which registration it is */
 	TimestampTz registered;
 	bool		waiter;			/* a freer waiting on the transactions */
+	ProcNumber	waiter_proc;	/* its, to wake */
 	int			nwaiting;
 	TransactionId waiting[FREER_WAITING];
 } FreerEntry;
@@ -199,6 +204,7 @@ freer_entry(Oid dboid, Oid idx, bool make)
 		e->generation = 0;
 		e->registered = 0;
 		e->waiter = false;
+		e->waiter_proc = INVALID_PROC_NUMBER;
 		e->nwaiting = 0;
 	}
 	return e;
@@ -293,7 +299,13 @@ freer_xact_callback(XactEvent event, void *arg)
 		event != XACT_EVENT_PARALLEL_ABORT && event != XACT_EVENT_PREPARE)
 		return;
 	nmarked = 0;
-	if (event != XACT_EVENT_COMMIT)
+
+	/*
+	 * (prepared, it asks too: a pass finds its changes running, and the
+	 * waiter waits on it until it is committed or rolled back, which no
+	 * callback here sees)
+	 */
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_PREPARE)
 		return;
 	for (int i = 0; i < n; i++)
 		freer_ask(MyDatabaseId, marked_indexes[i].log, marked_indexes[i].idx);
@@ -343,9 +355,11 @@ ChunkFreerChanged(Relation idx, bool marked)
 
 /* this freer's freeing, and its waiting, let go of as it exits, however */
 static Oid	exit_idx = InvalidOid;
+static Oid	exit_log = InvalidOid;
 static uint32 exit_generation = 0;
 static bool exit_freeing = false;
 static bool exit_waiting = false;
+static bool exit_registered = false;
 
 static void
 freer_exit(int code, Datum arg)
@@ -357,12 +371,26 @@ freer_exit(int code, Datum arg)
 	e = freer_entry(MyDatabaseId, exit_idx, false);
 	if (e)
 	{
+		bool		left = false;
+
 		if (exit_freeing && e->worker && e->generation == exit_generation)
 			e->worker = false;
 		if (exit_waiting)
+		{
 			e->waiter = false;
+			e->waiter_proc = INVALID_PROC_NUMBER;
+			left = e->nwaiting > 0;
+		}
 		dshash_release_lock(freer_table(), e);
+
+		/*
+		 * (a waiter stopped, transactions left to wait on: a freer asked
+		 * for, whose pass finds them, and waits on them in its stead)
+		 */
+		if (left)
+			freer_ask(MyDatabaseId, exit_log, exit_idx);
 	}
+	exit_freeing = exit_waiting = false;
 }
 
 /* what the freer does in a transaction */
@@ -398,6 +426,8 @@ typedef struct FreerState
 	uint32	   *retry;
 	int			nretry;
 	bool		retrying;
+	bool		retry_left;		/* one left, freed again: nothing running there */
+	bool		wait;			/* this freer the index's waiter, once done */
 } FreerState;
 
 static void
@@ -498,6 +528,8 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 							note_running(fs, SubTransGetTopmostTransaction(w));
 						else if (!fs->retrying)
 							fs->retry[fs->nretry++] = fs->buckets[b];
+						else
+							fs->retry_left = true;
 					}
 					break;
 				case FREER_BEGIN_COMPACT:
@@ -534,39 +566,61 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 
 /*
  * Waiting on the transactions passes left buckets marked for, this freer
- * the index's waiter: each one's end waited for, nothing of the freeing
- * held, and a freer asked for after; until none is left to wait on.
+ * the index's waiter, nothing of the freeing held: as any of them ends
+ * (each looked at a second at a time, or as a pass tells of more), it is
+ * taken off, and a freer asked for; until none is left.  A transaction
+ * stays on until it ends, so a waiter stopped leaves it to the next.  (A
+ * waiter is a background worker as long as the transactions it waits on
+ * run, one an index.)
  */
 static void
 freer_wait(const ChunkFreerArgs *args)
 {
-	TransactionId waiting[FREER_WAITING];
-
 	pgstat_report_activity(STATE_RUNNING, "waiting on transactions holding chunks to free");
 	for (;;)
 	{
-		FreerEntry *e = freer_entry(args->dboid, args->idx, false);
-		int			n;
+		FreerEntry *e;
+		bool		ended = false;
+		bool		none;
+		int			kept = 0;
 
+		StartTransactionCommand();
+		(void) GetTransactionSnapshot();
+		e = freer_entry(args->dboid, args->idx, false);
 		if (e == NULL)
+		{
+			CommitTransactionCommand();
 			return;
-		n = e->nwaiting;
-		memcpy(waiting, e->waiting, n * sizeof(TransactionId));
-		e->nwaiting = 0;
-		if (n == 0)
+		}
+		for (int i = 0; i < e->nwaiting; i++)
+		{
+			if (TransactionIdIsInProgress(e->waiting[i]))
+				e->waiting[kept++] = e->waiting[i];
+			else
+				ended = true;
+		}
+		e->nwaiting = kept;
+		none = kept == 0 && !ended;
+		if (none)
 		{
 			e->waiter = false;
+			e->waiter_proc = INVALID_PROC_NUMBER;
 			exit_waiting = false;
 		}
 		dshash_release_lock(freer_table(), e);
-		if (n == 0)
-			return;
-		StartTransactionCommand();
-		for (int i = 0; i < n; i++)
-			XactLockTableWait(waiting[i], NULL, NULL, XLTW_None);
 		CommitTransactionCommand();
-		INJECTION_POINT("chunk-freer-waited", NULL);
-		freer_ask(args->dboid, args->log, args->idx);
+		if (none)
+			return;
+		if (ended)
+		{
+			INJECTION_POINT("chunk-freer-waited", NULL);
+			freer_ask(args->dboid, args->log, args->idx);
+			continue;
+		}
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1000, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
 	}
 }
 
@@ -587,7 +641,7 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 	FreerEntry *e;
 	uint32		generation = args->generation;
 	bool		mine;
-	bool		wait = false;
+	bool		retried_pass = false;
 
 	e = freer_entry(args->dboid, args->idx, true);
 	mine = args->owner ? e->worker && e->generation == generation :
@@ -600,9 +654,11 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 	if (!mine)
 		return true;
 	exit_idx = args->idx;
+	exit_log = args->log;
 	exit_generation = generation;
 	exit_freeing = true;
 	before_shmem_exit(freer_exit, 0);
+	exit_registered = true;
 	am_freer = true;
 	fs->buckets = MemoryContextAlloc(fs->cxt, FREE_BUCKETS * sizeof(uint32));
 	fs->retry = MemoryContextAlloc(fs->cxt, FREE_BUCKETS * sizeof(uint32));
@@ -617,6 +673,7 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 		freer_marked = false;
 		fs->from = 0;
 		fs->nrunning = 0;
+		fs->retry_left = false;
 		INJECTION_POINT("chunk-freer-pass", NULL);
 		for (;;)
 		{
@@ -651,8 +708,20 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 		INJECTION_POINT("chunk-freer-passed", NULL);
 		e = freer_entry(args->dboid, args->idx, false);
 		again = e->asked != asked || freer_marked;
+
+		/*
+		 * (a bucket freed again and left again, nothing running there: one
+		 * more pass, once; one left still is VACUUM's to find)
+		 */
+		if (!again && fs->retry_left && !retried_pass)
+		{
+			again = true;
+			retried_pass = true;
+		}
 		if (!again)
 		{
+			ProcNumber	wake = INVALID_PROC_NUMBER;
+
 			/* (the transactions to wait on the waiter's, this freer it if none is) */
 			for (int r = 0; r < fs->nrunning; r++)
 			{
@@ -666,26 +735,27 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 			if (fs->nrunning > 0 && !e->waiter)
 			{
 				e->waiter = true;
+				e->waiter_proc = MyProcNumber;
 				exit_waiting = true;
-				wait = true;
+				fs->wait = true;
 			}
+			else if (fs->nrunning > 0)
+				wake = e->waiter_proc;
 			if (e->worker && e->generation == generation)
 				e->worker = false;
 			exit_freeing = false;
+			dshash_release_lock(freer_table(), e);
+			/* (the waiter told of more) */
+			if (wake != INVALID_PROC_NUMBER)
+				SetLatch(&GetPGProcByNumber(wake)->procLatch);
+			break;
 		}
 		dshash_release_lock(freer_table(), e);
-		if (!again)
-			break;
 	}
-	if (wait)
-		freer_wait(args);
-	cancel_before_shmem_exit(freer_exit, 0);
 	return true;
 
 gone:
 	freer_exit(0, 0);
-	exit_freeing = exit_waiting = false;
-	cancel_before_shmem_exit(freer_exit, 0);
 	return false;
 }
 
@@ -738,7 +808,13 @@ ChunkFreerMain(Datum main_arg)
 			pgstat_report_activity(STATE_RUNNING, "evacuating the chunk log's end");
 			freer_compact(&args, FREER_BEGIN_EVACUATE, &fs, &moved, &moved_bytes);
 		}
+
+		/* (the waiting last: a compaction waits behind no transaction) */
+		if (fs.wait)
+			freer_wait(&args);
 	}
+	if (exit_registered)
+		cancel_before_shmem_exit(freer_exit, 0);
 	pgstat_report_stat(true);
 	ereport(DEBUG1,
 			(errmsg_internal("chunk freer freed %llu chunks of chunk index %u, looking in %llu buckets marked, and moved %llu (%llu bytes)",
