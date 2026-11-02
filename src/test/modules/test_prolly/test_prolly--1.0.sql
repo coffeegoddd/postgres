@@ -483,3 +483,29 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_cs_memory_miscount(hash bytea)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Object stores (prolly/object_store.h), each by its implementation and a
+-- location (for "directory", a directory, relative to the data directory).
+CREATE FUNCTION test_os_stores() RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_os_put(store text, location text, name text, data bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_os_read(store text, location text, name text, off int8, len int4)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_os_size(store text, location text, name text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_os_list(store text, location text, prefix text,
+	OUT name text, OUT size int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_os_remove(store text, location text, name text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

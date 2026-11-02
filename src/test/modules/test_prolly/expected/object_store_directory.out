@@ -1,0 +1,259 @@
+-- The object store conformance suite against "directory": objects as files
+-- under a directory (here one in the data directory).  An unknown
+-- implementation is an error, as is a directory store with no directory.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SELECT test_os_size('no_such_store', 'x', 'a');
+ERROR:  there is no object store "no_such_store"
+SELECT test_os_size('directory', '', 'a');
+ERROR:  a directory object store needs a directory
+\set store directory
+\set location pg_test_object_store
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set suite :abs_srcdir '/sql/object_store_suite.inc'
+\i :suite
+-- The object store conformance suite, run against the store :store at
+-- :location (object_store_<store>.sql).
+-- (an error's code and message, or none: what is refused, shown the same
+-- in every store's output)
+CREATE FUNCTION pg_temp.refused(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'not refused';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || SQLERRM;
+END$$;
+CREATE FUNCTION pg_temp.put_refused(name text, data bytea) RETURNS text LANGUAGE sql
+	AS $$SELECT pg_temp.refused(format('SELECT test_os_put(%L, %L, %L, %L)',
+		current_setting('test.os_store'), current_setting('test.os_location'), name, data))$$;
+SELECT set_config('test.os_store', :'store', false) IS NOT NULL AS store_set,
+	set_config('test.os_location', :'location', false) IS NOT NULL AS location_set;
+ store_set | location_set 
+-----------+--------------
+ t         | t
+(1 row)
+
+-- every implementation is run by a file of its own
+SELECT count(*) FILTER (WHERE s = :'store') AS registered FROM test_os_stores() s;
+ registered 
+------------
+          1
+(1 row)
+
+-- an object written whole, read whole and in ranges
+SELECT test_os_put(:'store', :'location', 'a/one', '\x0102030405'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_read(:'store', :'location', 'a/one', 0, 5) AS whole,
+	test_os_read(:'store', :'location', 'a/one', 1, 3) AS middle,
+	test_os_read(:'store', :'location', 'a/one', 5, 0) AS none_at_end;
+    whole     |  middle  | none_at_end 
+--------------+----------+-------------
+ \x0102030405 | \x020304 | \x
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'a/one') AS size;
+ size 
+------
+    5
+(1 row)
+
+-- an empty one
+SELECT test_os_put(:'store', :'location', 'a/empty', ''::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'a/empty') AS empty_size;
+ empty_size 
+------------
+          0
+(1 row)
+
+-- a large one, read in ranges across it
+SELECT test_os_put(:'store', :'location', 'b/large',
+	(SELECT string_agg(decode(md5(i::text), 'hex'), '' ORDER BY i) FROM generate_series(1, 100000) i));
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'b/large') AS large_size;
+ large_size 
+------------
+    1600000
+(1 row)
+
+SELECT test_os_read(:'store', :'location', 'b/large', 16 * 54321, 16) = decode(md5('54322'), 'hex') AS large_range;
+ large_range 
+-------------
+ t
+(1 row)
+
+-- never replaced: a second write of the name is an error, the first kept
+SELECT pg_temp.put_refused('a/one', '\xff') AS second_write;
+              second_write              
+----------------------------------------
+ 42710: object "a/one" is there already
+(1 row)
+
+SELECT test_os_read(:'store', :'location', 'a/one', 0, 5) AS still_first;
+ still_first  
+--------------
+ \x0102030405
+(1 row)
+
+-- not there, or too short: errors; a size of none is NULL
+SELECT pg_temp.refused(format('SELECT test_os_read(%L, %L, %L, 0, 1)', :'store', :'location', 'a/none')) AS none_read;
+              none_read              
+-------------------------------------
+ 42704: object "a/none" is not there
+(1 row)
+
+SELECT pg_temp.refused(format('SELECT test_os_read(%L, %L, %L, 3, 3)', :'store', :'location', 'a/one')) AS short_read;
+                  short_read                  
+----------------------------------------------
+ XX001: object "a/one" has fewer than 6 bytes
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'a/none') IS NULL AS no_size;
+ no_size 
+---------
+ t
+(1 row)
+
+-- listed in the names' order, by a prefix
+SELECT test_os_put(:'store', :'location', 'a/two', '\x02'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT name, size FROM test_os_list(:'store', :'location', '');
+  name   |  size   
+---------+---------
+ a/empty |       0
+ a/one   |       5
+ a/two   |       1
+ b/large | 1600000
+(4 rows)
+
+SELECT name FROM test_os_list(:'store', :'location', 'a/t');
+ name  
+-------
+ a/two
+(1 row)
+
+-- removed, once
+SELECT test_os_remove(:'store', :'location', 'a/two') AS removed,
+	test_os_remove(:'store', :'location', 'a/two') AS again;
+ removed | again 
+---------+-------
+ t       | f
+(1 row)
+
+SELECT name FROM test_os_list(:'store', :'location', 'a/');
+  name   
+---------
+ a/empty
+ a/one
+(2 rows)
+
+-- (a name removed may be written again)
+SELECT test_os_put(:'store', :'location', 'a/two', '\x22'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_read(:'store', :'location', 'a/two', 0, 1) AS rewritten;
+ rewritten 
+-----------
+ \x22
+(1 row)
+
+-- names: letters, digits and "._-", in parts by "/", none empty, "." or ".."
+SELECT pg_temp.put_refused('', '\x00') AS refused;
+                       refused                       
+-----------------------------------------------------
+ 22023: an object's name must be 1 to 256 bytes long
+(1 row)
+
+SELECT pg_temp.put_refused('/abs', '\x00') AS refused;
+                         refused                          
+----------------------------------------------------------
+ 22023: object name "/abs" has an empty, "." or ".." part
+(1 row)
+
+SELECT pg_temp.put_refused('a//b', '\x00') AS refused;
+                         refused                          
+----------------------------------------------------------
+ 22023: object name "a//b" has an empty, "." or ".." part
+(1 row)
+
+SELECT pg_temp.put_refused('a/../b', '\x00') AS refused;
+                          refused                           
+------------------------------------------------------------
+ 22023: object name "a/../b" has an empty, "." or ".." part
+(1 row)
+
+SELECT pg_temp.put_refused('a/./b', '\x00') AS refused;
+                          refused                          
+-----------------------------------------------------------
+ 22023: object name "a/./b" has an empty, "." or ".." part
+(1 row)
+
+SELECT pg_temp.put_refused('a/b/', '\x00') AS refused;
+                         refused                          
+----------------------------------------------------------
+ 22023: object name "a/b/" has an empty, "." or ".." part
+(1 row)
+
+SELECT pg_temp.put_refused('a b', '\x00') AS refused;
+                                      refused                                       
+------------------------------------------------------------------------------------
+ 22023: object name "a b" has a character other than letters, digits, "._-" and "/"
+(1 row)
+
+SELECT pg_temp.put_refused('x.tmp.1', '\x00') AS refused;
+                    refused                     
+------------------------------------------------
+ 22023: object name "x.tmp.1" has ".tmp." in it
+(1 row)
+
+SELECT pg_temp.put_refused(repeat('n', 257), '\x00') AS refused;
+                       refused                       
+-----------------------------------------------------
+ 22023: an object's name must be 1 to 256 bytes long
+(1 row)
+
+SELECT test_os_put(:'store', :'location', 'A-z_0.9/ok', '\x09'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'A-z_0.9/ok') AS ok_name;
+ ok_name 
+---------
+       1
+(1 row)
+
+-- cleaned up
+SELECT count(*) FILTER (WHERE test_os_remove(:'store', :'location', name)) AS removed_all
+FROM test_os_list(:'store', :'location', '');
+ removed_all 
+-------------
+           5
+(1 row)
+
+SELECT count(*) AS left FROM test_os_list(:'store', :'location', '');
+ left 
+------
+    0
+(1 row)
+

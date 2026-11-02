@@ -9,6 +9,7 @@ OBJS = \
 	chunk_index_checks.o \
 	chunk_log_checks.o \
 	chunk_store_conformance.o \
+	object_store_conformance.o \
 	test_checksum.o \
 	test_prolly.o \
 	unit_branch_filter.o \
@@ -25,7 +26,7 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
 	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats \
 	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_holds chunk_reclaim chunk_compact chunk_abandoned \
-	history_pointers chunk_store_pages chunk_store_memory chunk_pack_reclaim
+	history_pointers chunk_store_pages chunk_store_memory chunk_pack_reclaim object_store_directory
 ISOLATION = bmap_shared_writers chunk_index_put_wait chunk_roots_wait chunk_free_wait \
 	chunk_pack_put_wait chunk_vacuum_cancel chunk_pack_pins chunk_take_back chunk_hold chunk_run_seal chunk_free_order chunk_move
 REGRESS_OPTS = --temp-config=$(srcdir)/chunk_store.conf

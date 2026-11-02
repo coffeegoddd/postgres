@@ -15,5 +15,6 @@ backend_sources += files(
   'chunk_region.c',
   'chunk_store.c',
   'chunkstore.c',
+  'object_store.c',
   'registry.c',
 )

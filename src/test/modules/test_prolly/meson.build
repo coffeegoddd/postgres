@@ -7,6 +7,7 @@ test_prolly_sources = files(
   'chunk_index_checks.c',
   'chunk_log_checks.c',
   'chunk_store_conformance.c',
+  'object_store_conformance.c',
   'test_checksum.c',
   'test_prolly.c',
   'unit_branch_filter.c',
@@ -85,6 +86,7 @@ tests += {
       'chunk_store_pages',
       'chunk_store_memory',
       'chunk_pack_reclaim',
+      'object_store_directory',
     ],
   },
   'isolation': {
@@ -161,6 +163,7 @@ tests += {
       't/066_history_concurrent.pl',
       't/067_chunk_compaction.pl',
       't/068_chunk_compaction_stale.pl',
+      't/069_object_store_crash.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
