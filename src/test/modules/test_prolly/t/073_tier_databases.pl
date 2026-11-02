@@ -144,7 +144,7 @@ $node->poll_query_until('d3', qq{SELECT current_setting('history_tier_location')
 ($ret, $out, $err) = $node->psql('d3', q{SELECT (test_cs_put('tier', '\x0a7312')).stored});
 like($err, qr/objects are in another place/, 'a put elsewhere refused');
 opendir(my $dh3, $tier3) or die;
-is(scalar(grep(!/^\./, readdir($dh3))), 0, 'nothing made there');
+is(scalar(grep(!/^\.|^store-identity$/, readdir($dh3))), 0, 'nothing made there (but its identity)');
 closedir($dh3);
 $node->append_conf('postgresql.conf', qq{history_tier_location = '$tier'});
 $node->reload;
@@ -201,6 +201,14 @@ pass('emptied there, dropped');
 $reload_to->("$tier/./", 'd1');
 is($node->safe_psql('d1', q{SELECT (test_cs_put('tier', '\x0a7305')).stored}), 't',
 	'the same directory spelled otherwise: a put there');
+# and reached by a symbolic link: the same store, known by its identity
+my $link = PostgreSQL::Test::Utils::tempdir . '/tier_link';
+symlink($tier, $link) or die "symlink: $!";
+$reload_to->($link, 'd1');
+is($node->safe_psql('d1', q{SELECT (test_cs_put('tier', '\x0a7306')).stored}), 't',
+	'the same store by a link: a put there');
+is($node->safe_psql('d1', q{SELECT test_cs_get('tier', h('\x0a7302'))}), '\x0a7302',
+	'and its packs read');
 $reload_to->($tier, 'd1');
 
 $node->stop;
