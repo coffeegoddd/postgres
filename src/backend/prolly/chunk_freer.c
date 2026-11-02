@@ -428,6 +428,7 @@ typedef struct FreerState
 	bool		retrying;
 	bool		retry_left;		/* one left, freed again: nothing running there */
 	bool		wait;			/* this freer the index's waiter, once done */
+	bool		wait_after;		/* or to be, once it has compacted, if none is */
 } FreerState;
 
 static void
@@ -732,7 +733,14 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 				if (!known && e->nwaiting < FREER_WAITING)
 					e->waiting[e->nwaiting++] = fs->running[r];
 			}
-			if (fs->nrunning > 0 && !e->waiter)
+			/*
+			 * (a freer to compact after: the waiting not taken now, which
+			 * would hold it as the compaction runs; taken after, if no
+			 * other has it)
+			 */
+			if (fs->nrunning > 0 && !e->waiter && (args->compact || args->evacuate))
+				fs->wait_after = true;
+			else if (fs->nrunning > 0 && !e->waiter)
 			{
 				e->waiter = true;
 				e->waiter_proc = MyProcNumber;
@@ -810,6 +818,20 @@ ChunkFreerMain(Datum main_arg)
 		}
 
 		/* (the waiting last: a compaction waits behind no transaction) */
+		if (fs.wait_after)
+		{
+			FreerEntry *e = freer_entry(args.dboid, args.idx, false);
+
+			if (e && !e->waiter && e->nwaiting > 0)
+			{
+				e->waiter = true;
+				e->waiter_proc = MyProcNumber;
+				exit_waiting = true;
+				fs.wait = true;
+			}
+			if (e)
+				dshash_release_lock(freer_table(), e);
+		}
 		if (fs.wait)
 			freer_wait(&args);
 	}
