@@ -21,3 +21,5 @@ backend_sources += files(
   'object_store.c',
   'registry.c',
 )
+
+subdir('engine')

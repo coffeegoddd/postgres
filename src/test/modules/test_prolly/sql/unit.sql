@@ -16,3 +16,11 @@ SELECT suite, test, result FROM test_prolly_unit_tests('harness');
 SELECT count(*) AS failures FROM test_prolly_unit_tests() WHERE result <> 'ok';
 
 SELECT * FROM test_prolly_unit_tests('no_such_suite');
+
+-- the engine's long operations check for interrupts: a build of many rows,
+-- cancelled by a statement timeout
+SELECT test_engine_build(1000), test_engine_build_finished();
+SET statement_timeout = '100ms';
+SELECT test_engine_build(3000000);
+RESET statement_timeout;
+SELECT test_engine_build_finished();

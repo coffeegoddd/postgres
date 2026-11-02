@@ -548,3 +548,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 REVOKE ALL ON FUNCTION test_os_put(text, text, text, bytea),
 	test_os_read(text, text, text, int8, int4), test_os_size(text, text, text),
 	test_os_list(text, text, text), test_os_remove(text, text, text) FROM PUBLIC;
+
+-- A map of rows rows built on this backend's memory store, its count (for
+-- a cancel of a long build).
+CREATE FUNCTION test_engine_build(rows int8)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Whether the last test_engine_build ran to its end.
+CREATE FUNCTION test_engine_build_finished()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

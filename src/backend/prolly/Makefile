@@ -13,6 +13,8 @@ subdir = src/backend/prolly
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+SUBDIRS = engine
+
 OBJS = \
 	branch_catalog.o \
 	branch_catalog_copy.o \

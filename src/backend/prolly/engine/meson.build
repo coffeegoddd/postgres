@@ -1,0 +1,7 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+backend_sources += files(
+  'chunkfmt.c',
+  'phash.c',
+  'prolly.c',
+)
