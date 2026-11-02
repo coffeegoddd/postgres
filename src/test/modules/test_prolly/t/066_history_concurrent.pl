@@ -90,7 +90,7 @@ is($q->(q{SELECT count(*) FILTER (WHERE test_cs_has('pages', hash)
 
 # what nobody holds freed, and taken out: what is left the pointers' alone
 $q->(q{SELECT test_cs_free_unheld('pages')});
-$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+$node->safe_psql('postgres', "$refs VACUUM pg_history.chunk_index");
 is($q->(q{SELECT ok || ' ' || unheld || ' ' || coalesce(why, '') FROM test_cs_check('pages')}), 'true 0 ',
 	'nothing unheld left, the audit clean');
 is($q->(q{SELECT (SELECT chunks FROM test_cs_check('pages')) =
