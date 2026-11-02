@@ -246,7 +246,9 @@ bundle_exists(text *bundle)
 
 /*
  * pg_history_push(bundle text, roots bytea[]) returns int8: the chunks
- * copied into the tier
+ * copied into the tier.  The caller lets go of its roots before it, in its
+ * transaction, for them to be freed here with it; let go of after, they
+ * stay unheld here until the background freer frees them.
  */
 Datum
 pg_history_push(PG_FUNCTION_ARGS)
