@@ -548,9 +548,9 @@ probe_free(Relation rel, uint64 d, BlockNumber nblocks)
  * npages data pages one after another the free space map has as free (every
  * byte dead), made afresh for this backend's appends; the first, or -1 if
  * none are found (a region of them grows a page at a time as its appends
- * reach its end: see extend_region).  A page the map has is looked at with those before it, for
- * where a run of free pages begins; the run's pages are then locked in order,
- * each checked free, and made afresh.  The map is a hint, not WAL-logged: a
+ * reach its end: see extend_region).  A page the map has is looked at with
+ * those before it, for where a run of free pages begins; the run's pages
+ * are then locked in order, each checked free, and made afresh.  The map is a hint, not WAL-logged: a
  * page it has wrongly is passed by, and taken out of it.
  */
 static int64
@@ -640,7 +640,7 @@ static void page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generati
  * need past its end, if they are free (every byte dead): locked in order,
  * each checked free, published as this backend's region's (from its page
  * now on) and marked open, then made afresh.  False, nothing done, if they
- * are not all free, or more than a region's.
+ * are not all free, or more than a region's.  (Its first page as before.)
  */
 static bool
 extend_region(Relation rel, ChunkLogRegion *region, size_t len)
@@ -652,7 +652,9 @@ extend_region(Relation rel, ChunkLogRegion *region, size_t len)
 	Buffer		bufs[REGION_PAGES];
 	int			locked = 0;
 
-	if (n > REGION_PAGES || region->limit % AREA != 0)
+	BlockNumber from = ChunkRegionMineFirst(rel->rd_locator);
+
+	if (n > REGION_PAGES || region->limit % AREA != 0 || !BlockNumberIsValid(from))
 		return false;
 	for (int j = 0; j < n; j++)
 	{
@@ -675,8 +677,13 @@ extend_region(Relation rel, ChunkLogRegion *region, size_t len)
 			UnlockReleaseBuffer(bufs[j]);
 		return false;
 	}
+	/*
+	 * (published from the region's first page still: a pack's bytes reserved
+	 * on its pages before may not be written yet, which VACUUM must not take
+	 * for a region let go of)
+	 */
 	ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), region->generation,
-					   LOC_BLOCK(region->next), DATA_BLOCK(first + n - 1) + 1);
+					   from, DATA_BLOCK(first + n - 1) + 1);
 	map_mark(rel, first, n, true);
 	for (int j = 0; j < n; j++)
 		make_page(rel, bufs[j], false);
@@ -1065,6 +1072,7 @@ page_extend(Relation rel, ChunkLogRun *run, size_t len)
 		return run->limit - run->next >= len;
 	keep_region(rel, &region);
 	run->limit = region.limit;
+	INJECTION_POINT("chunk-log-extended", NULL);
 	return true;
 }
 

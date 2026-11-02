@@ -51,5 +51,5 @@ endif
 
 # (these need injection points: known once Makefile.global is in)
 ifeq ($(enable_injection_points),yes)
-ISOLATION += chunk_pack_order chunk_pack_error chunk_pack_found
+ISOLATION += chunk_pack_order chunk_pack_error chunk_pack_found chunk_pack_extend
 endif

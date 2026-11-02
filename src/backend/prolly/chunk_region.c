@@ -272,6 +272,14 @@ ChunkRegionAppending(bool on)
 	appending = on;
 }
 
+BlockNumber
+ChunkRegionMineFirst(RelFileLocator log)
+{
+	int			j = entry_of(log);
+
+	return j < 0 ? InvalidBlockNumber : my_table()->entries[j].first;
+}
+
 void
 ChunkRegionKept(RelFileLocator log)
 {

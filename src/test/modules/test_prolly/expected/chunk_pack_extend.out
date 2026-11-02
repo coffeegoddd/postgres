@@ -1,0 +1,68 @@
+Parsed test spec with 3 sessions
+
+starting permutation: v_vacuum p_attach p_pack o_wake v_vacuum o_wake p_detach v_check
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+test_cs_free
+------------
+          40
+(1 row)
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step v_vacuum: VACUUM pg_history.chunk_index;
+step p_attach: SELECT injection_points_attach('chunk-log-extended', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step p_pack: 
+	SELECT test_cs_put_many('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(101, 112) i),
+		ARRAY(SELECT pe_d(i) FROM generate_series(101, 112) i)) AS stored;
+ <waiting ...>
+step o_wake: SELECT injection_points_wakeup('chunk-log-extended');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step v_vacuum: VACUUM pg_history.chunk_index;
+step o_wake: SELECT injection_points_wakeup('chunk-log-extended');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step p_pack: <... completed>
+stored
+------
+    12
+(1 row)
+
+step p_detach: SELECT injection_points_detach('chunk-log-extended');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step v_check: 
+	SELECT ok, count(*) FILTER (WHERE test_cs_get('pages', pe_h(pe_d(i))) = pe_d(i)) AS read_back
+	FROM test_cs_check('pages'), generate_series(101, 112) i GROUP BY ok;
+
+ok|read_back
+--+---------
+t |       12
+(1 row)
+
+test_cs_free_unheld
+-------------------
+                 13
+(1 row)
+
