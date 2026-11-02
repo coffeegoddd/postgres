@@ -667,11 +667,12 @@ take_free_segment(Relation rel, uint32 generation, uint64 below, int64 hint)
 		int			locked = 0;
 		bool		all_free = true;
 
-		/* (the hint first, then what the map finds) */
-		if (tries == 0 && hint >= 0)
+		/* (the hint first, once, then what the map finds) */
+		if (hint >= 0)
 		{
 			first = (uint64) hint;
 			blk = DATA_BLOCK(first);
+			hint = -1;
 		}
 		else
 		{
@@ -1910,8 +1911,12 @@ scan_segments(Relation rel, const uint8 *pending, uint64 npending,
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
-	for (uint64 g = 0; pending != NULL && g < nseg && g < npending; g++)
-		if (pending[g / 8] & (1 << (g % 8)))
+	/*
+	 * (segments past those marked, the log grown meanwhile, taken for
+	 * pending: chunks put there and freed may be kept too)
+	 */
+	for (uint64 g = 0; pending != NULL && g < nseg; g++)
+		if (g >= npending || (pending[g / 8] & (1 << (g % 8))))
 			st[g].pending = true;
 	FreeAccessStrategy(strategy);
 	*out = st;
