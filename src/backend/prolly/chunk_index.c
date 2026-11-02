@@ -1006,9 +1006,10 @@ split_bucket(Relation rel)
 /*
  * The changes of hash's counts on the chain of the bucket whose first page
  * is primary (locked): those this transaction sees added to *drefs and
- * *droots; the transaction of a decrease it doesn't see (another's,
- * running) in *running, if it is given (an increase it doesn't see can only
- * add to the counts); and where this very transaction's own change is, in
+ * *droots; the transaction of a decrease of roots it doesn't see
+ * (another's, running) in *running, if it is given (or of any change, if
+ * any_running: an increase it doesn't see can only add to the counts); and
+ * where this very transaction's own change is, in
  * *own_blk and *own_at, if they are given.
  */
 static void
@@ -1054,8 +1055,7 @@ count_changes(Relation rel, Buffer primary, int mode,
 					}
 					break;
 				case ENTRY_IN_PROGRESS:
-					if (running &&
-						(any_running || (int32) e->refs < 0 || (int32) e->roots < 0))
+					if (running && (any_running || (int32) e->roots < 0))
 						*running = e->xmin;
 					break;
 				case ENTRY_DEAD:
@@ -1374,12 +1374,16 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 					  false, &crefs, &croots, &running, &own_blk, &own_at, &any_own);
 
 		/*
-		 * (a decrease waits for another's decreases, as a row's update waits
-		 * for another's: two taking the last root away would both see it.
-		 * One taking back no more than this transaction's own increase does
-		 * not: no other sees what it takes back)
+		 * (a root let go of waits for another's, as a row's update waits for
+		 * another's: two taking the last root away would both see it.  One
+		 * taking back no more than this transaction's own increase does not:
+		 * no other sees what it takes back.  Nor does a reference let go
+		 * of: one is let go of only by the freeing of the chunk it is from,
+		 * which one transaction alone may free, so no two let go of one
+		 * reference, and freeings, each letting go of the references of
+		 * the chunks it frees in an order of its own, wait for no other's)
 		 */
-		if ((drefs < 0 || droots < 0) && TransactionIdIsValid(running) &&
+		if (droots < 0 && TransactionIdIsValid(running) &&
 			!own_change_covers(idx, primary, own_blk, own_at, drefs, droots))
 		{
 			UnlockReleaseBuffer(primary);
