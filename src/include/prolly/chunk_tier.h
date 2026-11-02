@@ -22,7 +22,7 @@
  *
  * The objects are where history_tier_store (an implementation, "directory")
  * at history_tier_location keeps them, the names "packs/" and the log's
- * stamp and the pack's number.
+ * stamp, the pack's owner (the server's that made it) and its number.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -48,6 +48,13 @@ extern PGDLLIMPORT const ChunkLogRoutine TierChunkLog;
 extern void ChunkTierInitStorage(SMgrRelation srel, bool use_wal);
 
 /*
+ * For the access method: a tier log's storage cut in place (TRUNCATE in the
+ * transaction that made it), this backend's pack of it let go: its chunks
+ * went with the index cut with it.
+ */
+extern void ChunkTierTruncated(Relation rel);
+
+/*
  * For the access method: VACUUM of a tier log, every pack whose transaction
  * ended settled (committed, or orphaned) and its relfrozenxid advanced; no
  * object is touched (VACUUM of its index removes them).
@@ -61,8 +68,16 @@ typedef struct ChunkTierPackInfo
 	const char *state;
 	uint64		size;
 	uint64		dead;
+	uint64		owner;
 } ChunkTierPackInfo;
 
 extern int	ChunkTierPacks(Relation rel, ChunkTierPackInfo **out);
+
+/*
+ * Every pack the tier has made so far this server's to remove, whatever
+ * its owner (those from before a promotion, or a recovery to a point in
+ * time): for when no other server uses them.  Answers how many it took.
+ */
+extern int	ChunkTierAdopt(Relation rel);
 
 #endif							/* PROLLY_CHUNK_TIER_H */

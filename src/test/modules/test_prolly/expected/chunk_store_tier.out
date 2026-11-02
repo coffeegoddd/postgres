@@ -948,3 +948,90 @@ SELECT ok FROM test_cs_check('tier');
 SELECT count(*) FROM pg_history_export();
 ERROR:  the history store's tier has chunks, which cannot be dumped yet
 HINT:  Dump without history (--no-history).
+-- a tier the test makes: its stamp, in its packs' names, a new one after
+-- TRUNCATE (the one kept in the relcache let go)
+CREATE TABLE my_tier () USING prolly_tier;
+CREATE TABLE my_tier_index () USING prolly_chunk_index;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0a'), 1, 20), '\x0a');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+SELECT test_chunk_get('my_tier', 'my_tier_index', substr(sha256('\x0a'), 1, 20));
+ test_chunk_get 
+----------------
+ \x0a
+(1 row)
+
+CREATE TEMP TABLE names0 AS
+	SELECT name FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
+TRUNCATE my_tier, my_tier_index;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0b'), 1, 20), '\x0b');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+SELECT test_chunk_get('my_tier', 'my_tier_index', substr(sha256('\x0b'), 1, 20));
+ test_chunk_get 
+----------------
+ \x0b
+(1 row)
+
+SELECT count(*) AS new_names,
+	count(*) FILTER (WHERE split_part(n.name, '/', 2) IN
+		(SELECT split_part(o.name, '/', 2) FROM names0 o)) AS of_a_stamp_before
+FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') n
+WHERE n.name NOT IN (SELECT name FROM names0);
+ new_names | of_a_stamp_before 
+-----------+-------------------
+         1 |                 0
+(1 row)
+
+-- and TRUNCATE in the transaction that made the tier (its storage cut in
+-- place): the pack begun before it gone with it
+BEGIN;
+CREATE TABLE my_tier2 () USING prolly_tier;
+CREATE TABLE my_tier2_index () USING prolly_chunk_index;
+SELECT test_chunk_put('my_tier2', 'my_tier2_index', substr(sha256('\x0d'), 1, 20), '\x0d');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+TRUNCATE my_tier2, my_tier2_index;
+SELECT test_chunk_put('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20), '\x0e');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+COMMIT;
+SELECT test_chunk_get('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20)),
+	test_chunk_has('my_tier2', 'my_tier2_index', substr(sha256('\x0d'), 1, 20)) AS gone;
+ test_chunk_get | gone 
+----------------+------
+ \x0e           | f
+(1 row)
+
+SELECT id, state FROM test_tier_packs('my_tier2');
+ id | state 
+----+-------
+  1 | made
+(1 row)
+
+DROP TABLE my_tier2, my_tier2_index;
+-- a tier dropped in the transaction that put chunks in it: named as it
+-- commits
+BEGIN;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0c'), 1, 20), '\x0c');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+DROP TABLE my_tier;
+COMMIT;
+ERROR:  the tier this transaction put chunks in was dropped
+DROP TABLE my_tier, my_tier_index;

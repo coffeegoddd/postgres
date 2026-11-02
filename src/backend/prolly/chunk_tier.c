@@ -6,9 +6,10 @@
  *
  *	block 0		the meta page: the next pack's number, the log's stamp (part
  *				of its packs' names, so that a log made afresh names none
- *				of another's), and the index bound to it
+ *				of another's), its owner, and the index bound to it
  *	blocks 1-	the packs, by number, an entry each: the transaction that
- *				made it, its size once written, and the bytes of it dead
+ *				made it, its owner, its size once written, and the bytes of
+ *				it dead
  *
  * Changes of the catalog are WAL-logged as generic records.  A pack's entry
  * is its transaction's (its top transaction's): once that commits, the
@@ -23,10 +24,20 @@
  * advances.  At the end of VACUUM of the index, an orphan's object is
  * removed, and so is a committed pack all of whose bytes are dead once
  * every standby connected has replayed past where they died (its readers
- * may read the pack until then).  Packs are named by the timeline they
- * were written on, and only the current timeline's are removed: another
- * timeline's, shared with what came before a promotion, may be another
- * server's still.
+ * may read the pack until then).  A standby the primary does not see
+ * streaming from it (cascaded, fed from an archive, or between a base
+ * backup and streaming) is not waited for: a read there of a pack removed
+ * fails, "not there".
+ *
+ * A pack is its owner's, a random number the server takes the first time
+ * it begins a pack on a timeline, and its name has its owner's: so servers
+ * promoted apart, on the same timeline or not, name none of each other's.
+ * A server removes only its own owner's packs, and those of packs adopted
+ * (pg_history_tier_adopt): packs from before a promotion, or a recovery to
+ * a point in time, may be another server's still, until it is said they
+ * are not.  A server that goes on as primary after another is promoted
+ * (the two sharing the tier's place) is not supported: it removes its own
+ * packs, which the other's catalog has too.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -44,6 +55,7 @@
 #include "access/xlog.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "prolly/chunk_store.h"
 #include "prolly/chunk_tier.h"
 #include "prolly/object_store.h"
 #include "storage/bufmgr.h"
@@ -55,13 +67,14 @@
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/fmgrprotos.h"
 #include "utils/rel.h"
 
 char	   *history_tier_store = NULL;
 char	   *history_tier_location = NULL;
 
 #define TIER_MAGIC			0x54494552	/* "TIER" */
-#define TIER_VERSION		1
+#define TIER_VERSION		2
 #define TIER_META_BLOCK		0
 
 typedef struct TierMeta
@@ -69,9 +82,11 @@ typedef struct TierMeta
 	uint32		magic;
 	uint32		version;
 	uint32		next_pack;		/* the next pack's number, from 1 */
-	uint32		unused;
+	TimeLineID	owner_tli;		/* the timeline owner was taken on (0: none) */
 	uint64		stamp;			/* made with the storage */
+	uint64		owner;			/* the packs this server begins are its */
 	Oid			index;			/* the chunk index bound to it */
+	uint32		adopted;		/* packs numbered below are this server's */
 } TierMeta;
 
 /* a pack's states */
@@ -84,8 +99,7 @@ typedef struct TierPack
 {
 	uint32		state;
 	TransactionId xid;			/* the transaction that made it */
-	TimeLineID	tli;			/* the timeline it was written on */
-	uint32		unused;
+	uint64		owner;			/* the server's that made it */
 	uint64		size;			/* its bytes, once written */
 	uint64		dead;			/* of them, no chunk's any more */
 	XLogRecPtr	dead_lsn;		/* where the last of them died */
@@ -110,7 +124,7 @@ typedef struct TierPending
 	Oid			relid;
 	RelFileNumber relnumber;
 	uint64		stamp;
-	TimeLineID	tli;
+	uint64		owner;
 	char	   *buf;
 	uint64		len;
 	uint64		cap;
@@ -203,11 +217,12 @@ pack_entry(Page page, uint32 id)
 	return &((TierPack *) PageGetContents(page))[PACK_SLOT(id)];
 }
 
-/* a pack's object's name: the log's stamp, its timeline, its number */
+/* a pack's object's name: the log's stamp, its owner, its number */
 static char *
-pack_name(uint64 stamp, TimeLineID tli, uint32 id)
+pack_name(uint64 stamp, uint64 owner, uint32 id)
 {
-	return psprintf("packs/%016llx/%08x/%u", (unsigned long long) stamp, tli, id);
+	return psprintf("packs/%016llx/%016llx/%u", (unsigned long long) stamp,
+					(unsigned long long) owner, id);
 }
 
 /*
@@ -286,8 +301,16 @@ begin_pack(Relation rel)
 	TierPack   *p;
 	bool		fresh;
 	uint64		stamp;
-	TimeLineID	tli;
+	uint64		owner;
+	TimeLineID	tli = GetWALInsertionTimeLine();
+	/* (the top transaction's: a subtransaction's rollback leaves its pack) */
+	TransactionId xid = GetTopTransactionId();
 
+	/* (taken before the locks: a new owner, if this timeline has none) */
+	if (!pg_strong_random(&owner, sizeof(owner)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not make a tier's owner")));
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = tier_meta(rel, BufferGetPage(mbuf));
 	id = meta->next_pack;
@@ -329,17 +352,23 @@ begin_pack(Relation rel)
 			MAXALIGN(SizeOfPageHeaderData) + PACKS_PER_PAGE * sizeof(TierPack);
 		memset(PageGetContents(ppage), 0, PACKS_PER_PAGE * sizeof(TierPack));
 	}
-	((TierMeta *) PageGetContents(mpage))->next_pack = id + 1;
+	meta = (TierMeta *) PageGetContents(mpage);
+	meta->next_pack = id + 1;
+	/* (the first pack begun on this timeline: this server's own owner) */
+	if (meta->owner_tli != tli)
+	{
+		meta->owner = owner;
+		meta->owner_tli = tli;
+	}
 	p = pack_entry(ppage, id);
 	p->state = PACK_MADE;
-	/* (the top transaction's: a subtransaction's rollback leaves its pack) */
-	p->xid = GetTopTransactionId();
-	p->tli = GetWALInsertionTimeLine();
+	p->xid = xid;
+	p->owner = meta->owner;
 	p->size = 0;
 	p->dead = 0;
 	p->dead_lsn = InvalidXLogRecPtr;
 	stamp = meta->stamp;
-	tli = p->tli;
+	owner = meta->owner;
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(pbuf);
 	UnlockReleaseBuffer(mbuf);
@@ -348,7 +377,7 @@ begin_pack(Relation rel)
 	pending.relid = RelationGetRelid(rel);
 	pending.relnumber = rel->rd_locator.relNumber;
 	pending.stamp = stamp;
-	pending.tli = tli;
+	pending.owner = owner;
 	pending.len = 0;
 }
 
@@ -358,6 +387,13 @@ forget_pending(void)
 	if (pending.buf)
 		pfree(pending.buf);
 	memset(&pending, 0, sizeof(pending));
+}
+
+void
+ChunkTierTruncated(Relation rel)
+{
+	if (pending.id != 0 && pending.relid == RelationGetRelid(rel))
+		forget_pending();
 }
 
 /*
@@ -374,7 +410,7 @@ write_pack(Relation rel)
 	if (pending.len > 0)
 	{
 		ObjectStore *os = tier_objects();
-		char	   *name = pack_name(pending.stamp, pending.tli, pending.id);
+		char	   *name = pack_name(pending.stamp, pending.owner, pending.id);
 
 		/*
 		 * (the entry's record flushed before the object is written, as the
@@ -583,31 +619,16 @@ tier_read(Relation rel, uint64 loc, void *dst, size_t len)
 	else
 	{
 		Buffer		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
-		TimeLineID	tli = pack_entry(BufferGetPage(buf), id)->tli;
+		uint64		owner = pack_entry(BufferGetPage(buf), id)->owner;
 		ObjectStore *os;
 		char	   *name;
 
 		UnlockReleaseBuffer(buf);
 		os = tier_objects();
-		name = pack_name(cached_stamp(rel), tli, id);
+		name = pack_name(cached_stamp(rel), owner, id);
 		os->routine->read(os, name, LOC_OFF(loc), dst, len);
 		pfree(name);
 	}
-}
-
-/* the pack's object removed, and its entry: removed (buf its page, locked) */
-static void
-remove_pack(Relation rel, Buffer buf, uint32 id, uint64 stamp)
-{
-	GenericXLogState *state;
-	ObjectStore *os = tier_objects();
-	char	   *name = pack_name(stamp, pack_entry(BufferGetPage(buf), id)->tli, id);
-
-	os->routine->remove(os, name);
-	pfree(name);
-	state = GenericXLogStart(rel);
-	pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id)->state = PACK_REMOVED;
-	GenericXLogFinish(state);
 }
 
 /*
@@ -701,79 +722,144 @@ tier_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 }
 
 /*
- * The oldest place a standby connected has yet to replay, or
- * InvalidXLogRecPtr if every one has replayed all, or none is connected
+ * Whether every standby connected (a physical walsender) has replayed past
+ * lsn: one not yet streaming, or that has not said how far it replayed
+ * (wal_receiver_status_interval 0, or no reply yet), has not
  */
-static XLogRecPtr
-standbys_replayed(void)
+static bool
+standbys_replayed(XLogRecPtr lsn)
 {
-	XLogRecPtr	oldest = InvalidXLogRecPtr;
-
 	if (WalSndCtl == NULL)
-		return InvalidXLogRecPtr;
+		return true;
 	for (int i = 0; i < max_wal_senders; i++)
 	{
 		WalSnd	   *w = &WalSndCtl->walsnds[i];
 		XLogRecPtr	apply;
 		pid_t		pid;
-		WalSndState st;
 		ReplicationKind kind;
 
 		SpinLockAcquire(&w->mutex);
 		pid = w->pid;
 		apply = w->apply;
-		st = w->state;
 		kind = w->kind;
 		SpinLockRelease(&w->mutex);
-		if (pid == 0 || kind != REPLICATION_KIND_PHYSICAL ||
-			(st != WALSNDSTATE_STREAMING && st != WALSNDSTATE_CATCHUP))
+		if (pid == 0 || kind != REPLICATION_KIND_PHYSICAL)
 			continue;
-		if (oldest == InvalidXLogRecPtr || apply < oldest)
-			oldest = apply;
+		if (apply == InvalidXLogRecPtr || apply < lsn)
+			return false;
 	}
-	return oldest;
+	return true;
+}
+
+/* whether a pack's transaction ended, and the pack is to be settled */
+static bool
+to_settle(const TierPack *p)
+{
+	return p->state == PACK_MADE && !TransactionIdIsCurrentTransactionId(p->xid) &&
+		!TransactionIdIsInProgress(p->xid);
+}
+
+/*
+ * Whether a pack is to be removed: this server's (its owner's, or adopted),
+ * an orphan, or committed and all dead, every standby past where it died
+ */
+static bool
+to_remove(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p)
+{
+	if (!((meta->owner_tli == tli && p->owner == meta->owner) || id < meta->adopted))
+		return false;
+	if (p->state == PACK_ORPHANED)
+		return true;
+	return p->state == PACK_COMMITTED && p->size > 0 && p->dead >= p->size &&
+		standbys_replayed(p->dead_lsn);
 }
 
 /*
  * Every pack whose transaction ended settled, once: committed, or orphaned
- * (WAL-logged; no object touched); the oldest transaction a pack still
- * names, or RecentXmin, in *frozen
+ * (WAL-logged, a record a page); the oldest transaction a pack still
+ * names, or RecentXmin, in *frozen.  And if remove, the packs to be removed
+ * removed: their objects (no lock held), then their entries.
  */
 static void
-settle_packs(Relation rel, TransactionId *frozen)
+walk_packs(Relation rel, bool remove, TransactionId *frozen)
 {
 	TierMeta	meta = read_meta(rel);
+	TimeLineID	tli = GetWALInsertionTimeLine();
+	uint32	   *gone = palloc_array(uint32, PACKS_PER_PAGE);
 
 	*frozen = RecentXmin;
-	for (uint32 id = 1; id < meta.next_pack; id++)
+	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
 	{
-		Buffer		buf;
-		TierPack   *p;
+		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
+		bool		settle = false;
+		int			ngone = 0;
 
-		if (PACK_SLOT(id) == 0 || id == 1)
-			CHECK_FOR_INTERRUPTS();
-		buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
-		p = pack_entry(BufferGetPage(buf), id);
-		if (p->state == PACK_MADE)
+		CHECK_FOR_INTERRUPTS();
+		for (uint32 id = first; id < last && !settle; id++)
+			settle = to_settle(pack_entry(BufferGetPage(buf), id));
+		if (settle)
 		{
-			if (TransactionIdIsCurrentTransactionId(p->xid) ||
-				TransactionIdIsInProgress(p->xid))
-			{
-				if (TransactionIdPrecedes(p->xid, *frozen))
-					*frozen = p->xid;
-			}
-			else
-			{
-				bool		committed = TransactionIdDidCommit(p->xid);
-				GenericXLogState *state = GenericXLogStart(rel);
+			GenericXLogState *state;
+			Page		page;
 
-				pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id)->state =
-					committed ? PACK_COMMITTED : PACK_ORPHANED;
-				GenericXLogFinish(state);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			state = GenericXLogStart(rel);
+			page = GenericXLogRegisterBuffer(state, buf, 0);
+			for (uint32 id = first; id < last; id++)
+			{
+				TierPack   *p = pack_entry(page, id);
+
+				if (to_settle(p))
+					p->state = TransactionIdDidCommit(p->xid) ? PACK_COMMITTED : PACK_ORPHANED;
 			}
+			GenericXLogFinish(state);
 		}
-		UnlockReleaseBuffer(buf);
+		for (uint32 id = first; id < last; id++)
+		{
+			TierPack   *p = pack_entry(BufferGetPage(buf), id);
+
+			if (p->state == PACK_MADE && TransactionIdPrecedes(p->xid, *frozen))
+				*frozen = p->xid;
+			if (remove && to_remove(&meta, tli, id, p))
+				gone[ngone++] = id;
+		}
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+		/*
+		 * (orphans and packs all dead change no more, and only VACUUM of the
+		 * index removes, under its lock: what is seen stays so)
+		 */
+		if (ngone > 0)
+		{
+			ObjectStore *os = tier_objects();
+			GenericXLogState *state;
+			Page		page;
+
+			for (int i = 0; i < ngone; i++)
+			{
+				TierPack	p;
+				char	   *name;
+
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				p = *pack_entry(BufferGetPage(buf), gone[i]);
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				name = pack_name(meta.stamp, p.owner, gone[i]);
+				os->routine->remove(os, name);
+				pfree(name);
+			}
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			state = GenericXLogStart(rel);
+			page = GenericXLogRegisterBuffer(state, buf, 0);
+			for (int i = 0; i < ngone; i++)
+				pack_entry(page, gone[i])->state = PACK_REMOVED;
+			GenericXLogFinish(state);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		}
+		ReleaseBuffer(buf);
 	}
+	pfree(gone);
 }
 
 /*
@@ -797,7 +883,7 @@ ChunkTierVacuum(Relation rel)
 {
 	TransactionId frozen;
 
-	settle_packs(rel, &frozen);
+	walk_packs(rel, false, &frozen);
 	advance_frozen(rel, frozen, true);
 }
 
@@ -808,47 +894,62 @@ tier_vacuum_begin(Relation rel)
 }
 
 /*
- * VACUUM of the index ended: every pack settled, the relfrozenxid advanced;
- * then every orphan's object removed (what object of it may have been
- * written: the store's removes are of what is there), and every committed
- * pack's all of whose bytes are dead once every standby connected has
- * replayed past where they died; the current timeline's alone
+ * VACUUM of the index ended: every pack settled, the relfrozenxid advanced,
+ * and the packs to be removed removed (what object of an orphan's may have
+ * been written: the store's removes are of what is there)
  */
 static void
 tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
 				const uint8 *pending_bits, uint64 npending, ChunkLogSegments *out)
 {
-	TierMeta	meta = read_meta(rel);
 	TransactionId frozen;
-	XLogRecPtr	replayed = standbys_replayed();
-	TimeLineID	tli = GetWALInsertionTimeLine();
 
 	memset(out, 0, sizeof(*out));
-	settle_packs(rel, &frozen);
+	walk_packs(rel, true, &frozen);
 	advance_frozen(rel, frozen, false);
-	for (uint32 id = 1; id < meta.next_pack; id++)
-	{
-		Buffer		buf;
-		TierPack	p;
+}
 
-		if (PACK_SLOT(id) == 0 || id == 1)
-			CHECK_FOR_INTERRUPTS();
-		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
-		p = *pack_entry(BufferGetPage(buf), id);
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		if (p.tli == tli &&
-			(p.state == PACK_ORPHANED ||
-			 (p.state == PACK_COMMITTED && p.size > 0 && p.dead >= p.size &&
-			  (replayed == InvalidXLogRecPtr || p.dead_lsn <= replayed))))
-		{
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			p = *pack_entry(BufferGetPage(buf), id);
-			if (p.state == PACK_ORPHANED || p.state == PACK_COMMITTED)
-				remove_pack(rel, buf, id, meta.stamp);
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		}
-		ReleaseBuffer(buf);
-	}
+/*
+ * pg_history_tier_adopt(): ChunkTierAdopt of the store's tier, for a
+ * superuser, who says no other server uses its packs
+ */
+Datum
+pg_history_tier_adopt(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	int			n;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("only a superuser may adopt the history store's tier's packs")));
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot adopt the history store's tier's packs during recovery")));
+	/* (VACUUM of the index, which removes, waits) */
+	rel = relation_open(ChunkStoreTierLogRelid(), ShareUpdateExclusiveLock);
+	n = ChunkTierAdopt(rel);
+	relation_close(rel, ShareUpdateExclusiveLock);
+	PG_RETURN_INT32(n);
+}
+
+int
+ChunkTierAdopt(Relation rel)
+{
+	Buffer		buf = ReadBuffer(rel, TIER_META_BLOCK);
+	GenericXLogState *state;
+	TierMeta   *meta;
+	int			n;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	state = GenericXLogStart(rel);
+	meta = tier_meta(rel, GenericXLogRegisterBuffer(state, buf, 0));
+	n = meta->next_pack - Max(meta->adopted, 1);
+	meta->adopted = meta->next_pack;
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+	return Max(n, 0);
 }
 
 /*
@@ -930,6 +1031,7 @@ ChunkTierPacks(Relation rel, ChunkTierPackInfo **out)
 			p.state == PACK_ORPHANED ? "orphaned" : "removed";
 		packs[n].size = p.size;
 		packs[n].dead = p.dead;
+		packs[n].owner = p.owner;
 		n++;
 	}
 	*out = packs;

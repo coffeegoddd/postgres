@@ -67,3 +67,42 @@ SELECT ok FROM test_cs_check('tier');
 
 -- a dump refuses the tier's chunks, not yet dumped
 SELECT count(*) FROM pg_history_export();
+
+-- a tier the test makes: its stamp, in its packs' names, a new one after
+-- TRUNCATE (the one kept in the relcache let go)
+CREATE TABLE my_tier () USING prolly_tier;
+CREATE TABLE my_tier_index () USING prolly_chunk_index;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0a'), 1, 20), '\x0a');
+SELECT test_chunk_get('my_tier', 'my_tier_index', substr(sha256('\x0a'), 1, 20));
+CREATE TEMP TABLE names0 AS
+	SELECT name FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
+TRUNCATE my_tier, my_tier_index;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0b'), 1, 20), '\x0b');
+SELECT test_chunk_get('my_tier', 'my_tier_index', substr(sha256('\x0b'), 1, 20));
+SELECT count(*) AS new_names,
+	count(*) FILTER (WHERE split_part(n.name, '/', 2) IN
+		(SELECT split_part(o.name, '/', 2) FROM names0 o)) AS of_a_stamp_before
+FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') n
+WHERE n.name NOT IN (SELECT name FROM names0);
+
+-- and TRUNCATE in the transaction that made the tier (its storage cut in
+-- place): the pack begun before it gone with it
+BEGIN;
+CREATE TABLE my_tier2 () USING prolly_tier;
+CREATE TABLE my_tier2_index () USING prolly_chunk_index;
+SELECT test_chunk_put('my_tier2', 'my_tier2_index', substr(sha256('\x0d'), 1, 20), '\x0d');
+TRUNCATE my_tier2, my_tier2_index;
+SELECT test_chunk_put('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20), '\x0e');
+COMMIT;
+SELECT test_chunk_get('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20)),
+	test_chunk_has('my_tier2', 'my_tier2_index', substr(sha256('\x0d'), 1, 20)) AS gone;
+SELECT id, state FROM test_tier_packs('my_tier2');
+DROP TABLE my_tier2, my_tier2_index;
+
+-- a tier dropped in the transaction that put chunks in it: named as it
+-- commits
+BEGIN;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0c'), 1, 20), '\x0c');
+DROP TABLE my_tier;
+COMMIT;
+DROP TABLE my_tier, my_tier_index;
