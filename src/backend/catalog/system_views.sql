@@ -1647,6 +1647,7 @@ ALTER TABLE pg_history.bundles ENABLE ALWAYS TRIGGER bundles_no_truncate;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_bundle_changed() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_push(text, bytea[]) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_release(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_fetch(text) FROM PUBLIC;
 
 --
 -- The history store dumped and restored: pg_history_export() the store as

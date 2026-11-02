@@ -2,8 +2,9 @@
 -- its roots reach that the tier has not into the tier, its row of
 -- pg_history.bundles holds the roots there, and the store frees what
 -- nothing holds any more (the caller letting go of its roots first, in the
--- push's transaction; what anything else holds stays); a read of what was pushed is an error, until fetched back;
--- a release frees in the tier what nothing else holds.
+-- push's transaction; what anything else holds stays); a read of what was
+-- pushed is an error, until fetched back; a release frees in the tier what
+-- nothing else holds; and a fetch copies a bundle back.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 SET chunk_free_in_background = off;
 SELECT test_chunk_format_refs(true);
@@ -116,4 +117,37 @@ SELECT ok FROM test_cs_check('tier');
 
 SELECT test_cs_unref_root('pages', pg_temp.h('\x0a1199'));
 SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1199')]);
+-- a fetch: what a bundle's roots reach copied back from the tier, the
+-- tier keeping its copy; the caller takes its roots in the fetch's
+-- transaction; a fetch again copies nothing; a release then leaves the
+-- copy here
+CREATE FUNCTION pg_temp.p7() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x5201'::bytea || pg_temp.h('\x0a1701')$$;
+SELECT (test_cs_put('pages', '\x0a1701')).stored, (test_cs_put('pages', pg_temp.p7())).stored;
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p7()));
+BEGIN;
+SELECT test_cs_unref_root('pages', pg_temp.h(pg_temp.p7()));
+SELECT pg_history_push('b7', ARRAY[pg_temp.h(pg_temp.p7())]) AS copied;
+COMMIT;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7()));
+-- (a fetch aborted: still pushed)
+BEGIN;
+SELECT pg_history_fetch('b7') AS copied;
+ROLLBACK;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7()));
+BEGIN;
+SELECT pg_history_fetch('b7') AS copied;
+SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p7()));
+COMMIT;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_here,
+	test_cs_get('pages', pg_temp.h('\x0a1701')) AS leaf_here,
+	test_cs_has('tier', pg_temp.h(pg_temp.p7())) AS tier_keeps;
+SELECT ok, unheld FROM test_cs_check('pages');
+SELECT pg_history_fetch('b7') AS copied_again;
+SELECT pg_history_release('b7') AS freed;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_still;
+SELECT pg_history_fetch('b7');
+SELECT test_cs_unref_root('pages', pg_temp.h(pg_temp.p7()));
+SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p7())]) AS freed;
+
 SELECT test_chunk_format_refs(false);
