@@ -109,13 +109,19 @@ extern void ChunkTierTruncated(Relation rel);
 extern void ChunkTierNewStorage(Relation rel);
 
 /*
- * For DROP and TRUNCATE: refused while the tier has a pack not removed (an
- * object of it there, or that may be), which the storage going would leave
- * in the store, named by no catalog; this backend's pack being filled, not
- * written, aside if pending_ok.  Release its bundles and VACUUM its index,
- * and it is empty.
+ * For DROP and TRUNCATE (what, the verb): refused while the tier has a
+ * pack not removed (an object of it there, or that may be), which the
+ * storage going would leave in the store, named by no catalog.  Release
+ * its bundles, free its chunks and VACUUM its index, and it is empty.
  */
-extern void ChunkTierCheckEmpty(Relation rel, const char *what, bool pending_ok);
+extern void ChunkTierCheckEmpty(Relation rel, const char *what);
+
+/*
+ * The same, for DROP and TRUNCATE of a chunk index bound to a tier (its
+ * stamp the tier's now): refused while the tier has packs, which it alone
+ * could free.
+ */
+extern void ChunkTierCheckIndex(Relation idx, const char *what);
 
 /*
  * For the access method: VACUUM of a tier log, every pack whose transaction

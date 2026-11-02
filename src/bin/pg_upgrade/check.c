@@ -1340,9 +1340,9 @@ check_for_branches(ClusterInfo *cluster)
  * log, chunk index and pointers) is made by initdb, and the upgrade carries
  * over only the relations users made: the new cluster's stores would be
  * empty.  Until the upgrade carries them, a cluster in which any store has
- * a pointer, or a chunk log of more than its meta page, or a tier of more
- * than its meta page (packs made, their objects named by its stamp), is
- * refused.
+ * a pointer, or a chunk log of more than its meta page, or any tier (a
+ * relation of the prolly_tier access method) of more than its meta page
+ * (packs made, their objects named by its stamp), is refused.
  */
 static void
 check_for_history(ClusterInfo *cluster)
@@ -1367,8 +1367,11 @@ check_for_history(ClusterInfo *cluster)
 									"SELECT EXISTS (SELECT 1 FROM pg_history.pointers) OR "
 									"       pg_catalog.pg_relation_size('pg_history.chunks') > "
 									"       pg_catalog.current_setting('block_size')::pg_catalog.int8 OR "
-									"       COALESCE(pg_catalog.pg_relation_size(pg_catalog.to_regclass('pg_history.tier_chunks')) > "
-									"       pg_catalog.current_setting('block_size')::pg_catalog.int8, false)");
+									"       EXISTS (SELECT 1 FROM pg_catalog.pg_class c "
+									"               JOIN pg_catalog.pg_am a ON a.oid = c.relam "
+									"               WHERE a.amname = 'prolly_tier' AND "
+									"                     pg_catalog.pg_relation_size(c.oid) > "
+									"                     pg_catalog.current_setting('block_size')::pg_catalog.int8)");
 			if (PQgetvalue(res, 0, 0)[0] == 't')
 				pg_fatal("Database \"%s\" has version-control history, which cannot be upgraded yet.\n"
 						 "Its history store (pg_history) holds chunks or pointers the upgrade\n"

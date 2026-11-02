@@ -2494,8 +2494,12 @@ ci_relation_set_new_filelocator(Relation rel,
 								TransactionId *freezeXid,
 								MultiXactId *minmulti)
 {
-	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
-											 freezeXid, minmulti);
+	SMgrRelation srel;
+
+	/* (an index truncated whose tier has packs: those could not be freed) */
+	if (rel->rd_createSubid == InvalidSubTransactionId)
+		ChunkTierCheckIndex(rel, "truncate");
+	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 
 	/* (its entries name the transactions that inserted them) */
 	*freezeXid = RecentXmin;
@@ -2758,13 +2762,14 @@ tier_relation_set_new_filelocator(Relation rel,
 	 * (a tier is pg_history's alone: one made elsewhere would be one more
 	 * store of objects to account for)
 	 */
-	if (!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) &&
+	if (rel->rd_createSubid != InvalidSubTransactionId &&
 		RelationGetNamespace(rel) != PG_HISTORY_NAMESPACE)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a tier of the history store is made in pg_history alone")));
+				 errmsg("cannot create tier \"%s\" outside schema \"pg_history\"",
+						RelationGetRelationName(rel))));
 	ChunkTierNewStorage(rel);
-	ChunkTierCheckEmpty(rel, "truncate", false);
+	ChunkTierCheckEmpty(rel, "truncate");
 	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 	/* (its packs' entries name the transactions that made them) */
 	*freezeXid = RecentXmin;
@@ -2784,8 +2789,8 @@ tier_relation_vacuum(Relation rel, const VacuumParams *params,
 static void
 tier_relation_nontransactional_truncate(Relation rel)
 {
-	/* (this backend's pack being filled is let go of with it: no object) */
-	ChunkTierCheckEmpty(rel, "truncate", true);
+	/* (none: a tier made in this transaction takes no chunk until it commits) */
+	ChunkTierCheckEmpty(rel, "truncate");
 	RelationTruncate(rel, 0);
 	ChunkTierInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
 	ChunkTierTruncated(rel);

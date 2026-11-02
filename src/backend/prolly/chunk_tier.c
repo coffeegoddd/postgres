@@ -61,6 +61,7 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
+#include "prolly/chunk_index.h"
 #include "prolly/chunk_store.h"
 #include "prolly/chunk_tier.h"
 #include "prolly/object_store.h"
@@ -73,6 +74,7 @@
 #include "storage/smgr.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -553,37 +555,62 @@ ChunkTierReadPackTable(ObjectStore *os, const char *name,
 }
 
 void
-ChunkTierCheckEmpty(Relation rel, const char *what, bool pending_ok)
+ChunkTierCheckEmpty(Relation rel, const char *what)
 {
 	TierMeta	meta;
+	uint32		left = 0;
+	uint32		first_left = 0;
 
 	/* (a tier being made has no storage yet: none to leave) */
 	if (!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ||
 		RelationGetNumberOfBlocks(rel) == 0)
 		return;
 	meta = read_meta(rel);
-	for (uint32 id = 1; id < meta.next_pack; id++)
+	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
 	{
-		Buffer		buf;
-		TierPack	p;
+		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
 
-		if (PACK_SLOT(id) == 0)
-			CHECK_FOR_INTERRUPTS();
-		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
-		p = *pack_entry(BufferGetPage(buf), id);
+		CHECK_FOR_INTERRUPTS();
+		for (uint32 id = first; id < last; id++)
+			if (pack_entry(BufferGetPage(buf), id)->state != PACK_REMOVED)
+			{
+				if (left++ == 0)
+					first_left = id;
+			}
 		UnlockReleaseBuffer(buf);
-		if (p.state == PACK_REMOVED)
-			continue;
-		if (pending_ok && id == pending.id &&
-			pending.relnumber == rel->rd_locator.relNumber)
-			continue;
+	}
+	if (left > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot %s tier \"%s\": it has packs", what,
+				 errmsg("cannot %s tier \"%s.%s\" while it has pack objects", what,
+						get_namespace_name(RelationGetNamespace(rel)),
 						RelationGetRelationName(rel)),
-				 errdetail("Pack %u is not removed: its object would be left in the tier's store.", id),
-				 errhint("Release its bundles, free its chunks, and VACUUM its index until it has none.")));
+				 errdetail_plural("%u pack, %u, is not removed: its object would be left in the tier's store.",
+								  "%u packs, the first %u, are not removed: their objects would be left in the tier's store.",
+								  left, left, first_left),
+				 errhint("Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).")));
+}
+
+void
+ChunkTierCheckIndex(Relation idx, const char *what)
+{
+	uint64		stamp;
+	Oid			log = ChunkIndex->log_of(idx, &stamp);
+	Relation	tier;
+
+	if (!OidIsValid(log) || !RelationIsChunkIndex(idx))
+		return;
+	tier = try_relation_open(log, AccessShareLock);
+	if (tier == NULL)
+		return;
+	if (RelationIsTierLog(tier) && read_meta(tier).stamp == stamp)
+	{
+		char	   *verb = psprintf("%s index \"%s\" of", what, RelationGetRelationName(idx));
+
+		ChunkTierCheckEmpty(tier, verb);
 	}
+	relation_close(tier, AccessShareLock);
 }
 
 void
@@ -702,6 +729,19 @@ static void
 tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 {
 	check_writer(rel);
+
+	/*
+	 * (a tier whose storage is this transaction's, made or truncated in it,
+	 * takes no chunk until it commits: its catalog goes if the transaction
+	 * aborts, and with it what knows the objects of packs written)
+	 */
+	if (rel->rd_createSubid != InvalidSubTransactionId ||
+		rel->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot put chunks in tier \"%s\" in the transaction that made or truncated it",
+						RelationGetRelationName(rel)),
+				 errhint("Commit first.")));
 	if (IsInParallelMode())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),

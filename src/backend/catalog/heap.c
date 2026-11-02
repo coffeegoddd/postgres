@@ -64,12 +64,13 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
-#include "prolly/chunk_log.h"
-#include "prolly/chunk_tier.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/chunk_index.h"
+#include "prolly/chunk_log.h"
+#include "prolly/chunk_tier.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/array.h"
@@ -1870,9 +1871,14 @@ heap_drop_with_catalog(Oid relid)
 	 */
 	rel = relation_open(relid, AccessExclusiveLock);
 
-	/* (prolly: a tier of the history store with packs is not dropped) */
+	/*
+	 * (prolly: a tier of the history store with packs is not dropped, nor
+	 * the index bound to it, without which its packs could not be freed)
+	 */
 	if (RelationIsTierLog(rel))
-		ChunkTierCheckEmpty(rel, "drop", false);
+		ChunkTierCheckEmpty(rel, "drop");
+	else if (RelationIsChunkIndex(rel))
+		ChunkTierCheckIndex(rel, "drop");
 
 	/*
 	 * There can no longer be anyone *else* touching the relation, but we
