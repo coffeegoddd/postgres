@@ -32,6 +32,7 @@
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "prolly/chunk_store.h"
+#include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/fmgrprotos.h"
 #include "utils/injection_point.h"
@@ -88,6 +89,39 @@ ChunkStoreBundlesRelid(void)
 	return store_relid("bundles");
 }
 
+void
+ChunkStoreLockPointersTo(const uint8 *hash, LOCKMODE mode)
+{
+	uint32		objid;
+	uint16		subid;
+
+	memcpy(&objid, hash, sizeof(objid));
+	memcpy(&subid, hash + sizeof(objid), sizeof(subid));
+	LockDatabaseObject(ChunkStorePointersRelid(), objid, subid, mode);
+}
+
+/*
+ * A root about to be taken of hash in the store of idx: an error if the
+ * store has not the chunk because it was pushed to the tier, saying so
+ */
+static void
+refuse_pushed(Relation idx, const uint8 *hash)
+{
+	Relation	tier;
+	bool		pushed;
+
+	if (ChunkStoreHas(NULL, idx, hash))
+		return;
+	tier = relation_open(ChunkStoreTierIndexRelid(), AccessShareLock);
+	pushed = ChunkStoreHas(NULL, tier, hash);
+	relation_close(tier, NoLock);
+	if (pushed)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("chunk %s was pushed to the history store's tier", ChunkHashText(hash)),
+				 errdetail("History pushed is not fetched back yet.")));
+}
+
 /* the hash a pointer's row names */
 static const uint8 *
 row_hash(TriggerData *td, HeapTuple tuple)
@@ -136,10 +170,18 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 				 errmsg("pg_history_pointer_changed is pg_history.pointers' trigger alone")));
 
 	idx = relation_open(ChunkStoreIndexRelid(), RowExclusiveLock);
+	/* (each chunk's pointers locked: a push of it waits, or is waited for) */
 	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+	{
+		ChunkStoreLockPointersTo(row_hash(td, td->tg_trigtuple), RowExclusiveLock);
+		refuse_pushed(idx, row_hash(td, td->tg_trigtuple));
 		ChunkStoreRefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
+	}
 	else if (TRIGGER_FIRED_BY_DELETE(td->tg_event))
+	{
+		ChunkStoreLockPointersTo(row_hash(td, td->tg_trigtuple), RowExclusiveLock);
 		ChunkStoreUnrefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
+	}
 	else
 	{
 		const uint8 *old = row_hash(td, td->tg_trigtuple);
@@ -148,6 +190,9 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 		/* (the new chunk's first: a pointer moved to itself keeps it) */
 		if (memcmp(old, new, CHUNK_HASH_LEN) != 0)
 		{
+			ChunkStoreLockPointersTo(new, RowExclusiveLock);
+			ChunkStoreLockPointersTo(old, RowExclusiveLock);
+			refuse_pushed(idx, new);
 			ChunkStoreRefRoot(idx, new, &e);
 			INJECTION_POINT("history-pointer-moving", NULL);
 			ChunkStoreUnrefRoot(idx, old, &e);
@@ -217,6 +262,12 @@ pg_history_bundle_changed(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("a chunk's hash is %d bytes", CHUNK_HASH_LEN)));
+			/* (a root once: a bundle holds each of its roots once) */
+			for (int j = 0; j < i && TRIGGER_FIRED_BY_INSERT(td->tg_event); j++)
+				if (memcmp(VARDATA_ANY(DatumGetByteaPP(elems[j])), VARDATA_ANY(b), CHUNK_HASH_LEN) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("a bundle's root is given twice")));
 			if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
 				ChunkStoreRefRoot(idx, (const uint8 *) VARDATA_ANY(b), &e);
 			else

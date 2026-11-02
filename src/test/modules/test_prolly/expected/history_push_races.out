@@ -44,3 +44,77 @@ test_cs_free
            2
 (1 row)
 
+
+starting permutation: p_begin p_push2 q_pointer2 p_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_begin: BEGIN;
+step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+copied
+------
+     1
+(1 row)
+
+step q_pointer2: INSERT INTO pg_history.pointers VALUES ('hr_ptr2', hr_h('\x0a3101'));
+step p_commit: COMMIT;
+test_cs_free
+------------
+           2
+(1 row)
+
+
+starting permutation: p_begin p_push2 q_begin q_push2 p_pointer q_pointer2 p_commit q_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_begin: BEGIN;
+step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+copied
+------
+     1
+(1 row)
+
+step q_begin: BEGIN;
+step q_push2: SELECT pg_history_push('hr2', ARRAY[hr_h('\x0a3103')]) AS copied;
+copied
+------
+     1
+(1 row)
+
+step p_pointer: INSERT INTO pg_history.pointers VALUES ('hr_ptr', hr_h('\x0a3101'));
+step q_pointer2: INSERT INTO pg_history.pointers VALUES ('hr_ptr2', hr_h('\x0a3101'));
+step p_commit: COMMIT;
+step q_commit: COMMIT;
+test_cs_free
+------------
+           1
+(1 row)
+
+
+starting permutation: p_begin p_push2 q_pointer_pushed p_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_begin: BEGIN;
+step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+copied
+------
+     1
+(1 row)
+
+step q_pointer_pushed: INSERT INTO pg_history.pointers VALUES ('hr_ptr2', hr_h('\x0a3102')); <waiting ...>
+step p_commit: COMMIT;
+step q_pointer_pushed: <... completed>
+ERROR:  chunk 6dec999aa125ef4c76c83c010a831ea2ca93bdc3 was pushed to the history store's tier
+test_cs_free
+------------
+           2
+(1 row)
+

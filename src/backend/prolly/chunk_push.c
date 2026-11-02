@@ -230,8 +230,9 @@ check_pusher(void)
 
 /*
  * The pointers naming each of roots, in counts[]: as of now, with no
- * pointer made or dropped until this transaction ends (the pointers
- * locked), so that the roots counted with them are as these are
+ * pointer to any of them made or dropped until this transaction ends (the
+ * pointers to each locked: those changing them waited for), so that the
+ * roots counted with them are as these are
  */
 static void
 pointers_of(ArrayType *roots_arr, const uint8 *roots, int n, uint64 *counts)
@@ -240,7 +241,8 @@ pointers_of(ArrayType *roots_arr, const uint8 *roots, int n, uint64 *counts)
 	Datum		values[1] = {PointerGetDatum(roots_arr)};
 	SPIPlanPtr	plan;
 
-	LockRelationOid(ChunkStorePointersRelid(), ShareLock);
+	for (int i = 0; i < n; i++)
+		ChunkStoreLockPointersTo(roots + (Size) i * CHUNK_HASH_LEN, ShareLock);
 	plan = SPI_prepare("SELECT hash, count(*) FROM pg_history.pointers "
 					   "WHERE hash = ANY($1) GROUP BY hash", 1, types);
 	if (plan == NULL ||

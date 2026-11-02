@@ -160,6 +160,9 @@ SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]);
 ERROR:  chunk 554f980c5247a07ece9379bfd7e4c4f336caf002 has no root to push but its pointers'
 HINT:  Take a root of it to push (a bundle takes it), or delete the pointers.
 DELETE FROM pg_history.pointers WHERE name = 'main';
+-- (a bundle's row of a root twice: refused, its roots each once)
+INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')]);
+ERROR:  a bundle's root is given twice
 -- the bundles' rows are not changed, nor truncated (the table a system
 -- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';

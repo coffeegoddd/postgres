@@ -64,6 +64,8 @@ SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1198')]);
 INSERT INTO pg_history.pointers VALUES ('main', pg_temp.h('\x0a1199'));
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]);
 DELETE FROM pg_history.pointers WHERE name = 'main';
+-- (a bundle's row of a root twice: refused, its roots each once)
+INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')]);
 -- the bundles' rows are not changed, nor truncated (the table a system
 -- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
