@@ -98,6 +98,9 @@ extern ObjectStore *ObjectStoreOpen(const char *impl, const char *location);
  */
 extern char *ObjectStoreIdentity(ObjectStore *os, const char *impl);
 
+/* The same, NULL if the store has no identity yet (none made). */
+extern char *ObjectStoreIdentityIfAny(ObjectStore *os, const char *impl);
+
 /* The implementations registered (ProllyImplementation), in order. */
 extern List *ObjectStoreList(void);
 

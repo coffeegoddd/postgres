@@ -2974,3 +2974,9 @@ chunk_log_mask(char *pagedata, BlockNumber blkno)
 	mask_page_hint_bits(pagedata);
 	mask_unused_space(pagedata);
 }
+
+uint32
+ChunkLogFormatVersion(void)
+{
+	return CHUNK_LOG_VERSION;
+}

@@ -219,6 +219,9 @@ extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
  */
 extern void ChunkIndexVacuum(Relation idx, bool truncate);
 
+/* The chunk index's format, its meta page's version: for pg_upgrade. */
+extern uint32 ChunkIndexFormatVersion(void);
+
 /* For tests: the entries on the buckets' pages not frozen. */
 extern uint64 ChunkIndexUnfrozen(Relation idx);
 

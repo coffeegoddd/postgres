@@ -3804,16 +3804,6 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		newrelfilenumber = binary_upgrade_next_heap_pg_class_relfilenumber;
 		binary_upgrade_next_heap_pg_class_relfilenumber = InvalidOid;
 	}
-	else if (relation->rd_rel->relkind == RELKIND_TOASTVALUE)
-	{
-		if (!OidIsValid(binary_upgrade_next_toast_pg_class_relfilenumber))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("toast relfilenumber value not set when in binary upgrade mode")));
-
-		newrelfilenumber = binary_upgrade_next_toast_pg_class_relfilenumber;
-		binary_upgrade_next_toast_pg_class_relfilenumber = InvalidOid;
-	}
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

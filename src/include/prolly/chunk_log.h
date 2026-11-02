@@ -244,6 +244,9 @@ typedef struct ChunkLogSweep ChunkLogSweep;
 
 /* The log's generation: one more at each tail cut. */
 extern uint32 ChunkLogGeneration(Relation rel);
+
+/* The chunk log's format, its meta page's version: for pg_upgrade. */
+extern uint32 ChunkLogFormatVersion(void);
 extern ChunkLogSweep *ChunkLogSweepBegin(Relation rel);
 extern void ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep);
 

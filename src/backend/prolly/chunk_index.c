@@ -3042,3 +3042,9 @@ chunk_index_mask(char *pagedata, BlockNumber blkno)
 	}
 }
 
+
+uint32
+ChunkIndexFormatVersion(void)
+{
+	return CHUNK_INDEX_VERSION;
+}

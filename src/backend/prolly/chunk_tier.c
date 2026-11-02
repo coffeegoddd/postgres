@@ -699,9 +699,24 @@ ChunkTierDatabaseHasPacks(Oid dboid)
 uint64
 ChunkTierPlace(void)
 {
+	char	   *both;
+	uint64		h;
+
 	if (history_tier_location == NULL || history_tier_location[0] == '\0')
 		return 0;
-	return current_place();
+	/* (asked, not made: a store with no identity has no packs) */
+	both = ObjectStoreIdentityIfAny(tier_objects(), history_tier_store);
+	if (both == NULL)
+		return 0;
+	h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
+	pfree(both);
+	return h != 0 ? h : 1;
+}
+
+uint32
+ChunkTierFormatVersion(void)
+{
+	return TIER_VERSION;
 }
 
 void
@@ -724,6 +739,23 @@ ChunkTierMarkUpgraded(Relation rel, uint64 old_sysid)
 	os = tier_objects();
 	check_place(rel, &meta, false);
 	set_marked(rel, 0);
+
+	/*
+	 * (its packs this server's still: pg_upgrade starts the new cluster on
+	 * a timeline of its own, which their owner was not taken on)
+	 */
+	if (meta.owner_tli != 0 && meta.owner_tli != GetWALInsertionTimeLine())
+	{
+		Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
+		GenericXLogState *state;
+
+		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+		state = GenericXLogStart(rel);
+		tier_meta(rel, GenericXLogRegisterBuffer(state, mbuf, 0))->owner_tli =
+			GetWALInsertionTimeLine();
+		GenericXLogFinish(state);
+		UnlockReleaseBuffer(mbuf);
+	}
 	if (!empty)
 	{
 		name = marker_name(stamp_for(meta.stamp, MyDatabaseId));
@@ -732,8 +764,11 @@ ChunkTierMarkUpgraded(Relation rel, uint64 old_sysid)
 		pfree(name);
 		set_marked(rel, current_place());
 	}
-	/* (a system of the same identifier: its marker this one's) */
-	if (old_sysid != GetSystemIdentifier())
+	/*
+	 * (a system of the same identifier: its marker this one's, kept if the
+	 * tier has packs; an empty tier's, still marked, removed)
+	 */
+	if (old_sysid != GetSystemIdentifier() || empty)
 	{
 		name = psprintf("databases/%016llx/%u/%016llx", (unsigned long long) old_sysid,
 						MyDatabaseId, (unsigned long long) stamp_for(meta.stamp, MyDatabaseId));
@@ -2031,6 +2066,7 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 	{
 		TierMeta	now;
 
+		INJECTION_POINT("chunk-tier-marker-remove", NULL);
 		lock_marker(rel, ExclusiveLock);
 		now = read_meta(rel);
 		/* (a marker made meanwhile elsewhere than the settings say: left) */
