@@ -2742,9 +2742,10 @@ tier_relation_set_new_filelocator(Relation rel,
 								  TransactionId *freezeXid,
 								  MultiXactId *minmulti)
 {
-	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
-											 freezeXid, minmulti);
+	SMgrRelation srel;
 
+	ChunkTierNewStorage(rel);
+	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 	/* (its packs' entries name the transactions that made them) */
 	*freezeXid = RecentXmin;
 	ChunkTierInitStorage(srel, XLogIsNeeded());
