@@ -605,7 +605,8 @@ WHERE (is_catalog_text_unique_index_oid(indexrelid) <>
         indexrelid        
 --------------------------
  pg_history.pointers_pkey
-(1 row)
+ pg_history.bundles_pkey
+(2 rows)
 
 -- **************** pg_range ****************
 -- Look for illegal values in pg_range fields.
