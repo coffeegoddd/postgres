@@ -1639,6 +1639,10 @@ CREATE VIEW pg_history.chunk_restore AS
 CREATE TRIGGER chunk_restore_put
 	INSTEAD OF INSERT ON pg_history.chunk_restore
 	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_chunk_restore();
+-- (whatever session_replication_role is, as the pointers' triggers: a view
+-- takes no ALTER ... ENABLE ALWAYS TRIGGER)
+UPDATE pg_catalog.pg_trigger SET tgenabled = 'A' WHERE tgname = 'chunk_restore_put'
+	AND tgrelid = 'pg_history.chunk_restore'::regclass;
 REVOKE ALL ON pg_history.chunk_restore FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_export() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_chunk_restore() FROM PUBLIC;

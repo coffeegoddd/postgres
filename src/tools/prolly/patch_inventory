@@ -48,6 +48,8 @@ patch doc/src/sgml/config.sgml  1b  catalog_branch
 patch doc/src/sgml/libpq.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/protocol.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/ref/create_schema.sgml  1b  CREATE SCHEMA ... VERSIONED
+patch doc/src/sgml/ref/pg_dump.sgml  2  --no-history
+patch doc/src/sgml/ref/pg_dumpall.sgml  2  --no-history
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time, as of the branch the scan began on

@@ -1073,6 +1073,18 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--no-history</option></term>
+      <listitem>
+       <para>
+        Do not dump the database's version-control history store (its
+        chunks and pointers).  Without it, a database whose store has
+        history is dumped with its history, which needs a role that can
+        read the store; a role that cannot must give this option.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--no-policies</option></term>
       <listitem>
        <para>

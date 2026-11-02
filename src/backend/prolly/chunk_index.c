@@ -2187,7 +2187,13 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
 	}
 	if (e->kind != CHUNK_KIND_CHUNK)
 		return FATE_KEEP;		/* (a change is added in, not frozen) */
-	freeze = !(e->flags & CHUNK_ENTRY_FROZEN);
+
+	/*
+	 * (frozen once no snapshot running might not see it: frozen is seen by
+	 * every snapshot, as of which a dump reads the store, and the relation's
+	 * relfrozenxid is the same horizon)
+	 */
+	freeze = !(e->flags & CHUNK_ENTRY_FROZEN) && TransactionIdPrecedes(e->xmin, frozen);
 	if (TransactionIdIsValid(e->xmax))
 	{
 		if (e->flags & CHUNK_ENTRY_XMAX_COMMITTED)

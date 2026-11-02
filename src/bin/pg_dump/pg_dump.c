@@ -4160,9 +4160,9 @@ dumpLO(Archive *fout, const LoInfo *loinfo)
  * getHistory:
  *	The database's version-control history store, if the server has one
  *	and it has a chunk: its chunks, each after those it references, and
- *	then its pointers, as of the dump's snapshot.  A role that cannot read it may not
- *	dump the database whole but with --no-history (history is never left
- *	out unless asked).
+ *	then its pointers, as of the dump's snapshot.  A role that cannot read
+ *	it may not dump the database whole but with --no-history (history is
+ *	never left out unless asked).
  */
 static void
 getHistory(Archive *fout)

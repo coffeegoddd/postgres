@@ -87,6 +87,13 @@ $node->safe_psql('postgres', 'CREATE DATABASE dp TEMPLATE template0');
 $node->command_ok([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1', '--file' => "$dir/src.sql",
 	'--dbname' => $node->connstr('dp') ], 'restored into dp');
 is($node->safe_psql('dp', $state), $want, 'plain format: the store as it was');
+# (a bulk load's session, its triggers firing as a replica's: the store's
+# fire all the same)
+$node->safe_psql('postgres', 'CREATE DATABASE dr TEMPLATE template0');
+$node->command_ok([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1',
+	'--command' => 'SET session_replication_role = replica', '--file' => "$dir/src.sql",
+	'--dbname' => $node->connstr('dr') ], 'restored into dr as a replica\'s session');
+is($node->safe_psql('dr', $state), $want, 'as a replica\'s session: the store as it was');
 
 # directory format, restored in parallel
 $node->command_ok([ 'pg_dump', '--format' => 'directory', '--jobs' => 2, '--file' => "$dir/srcdir",
@@ -114,6 +121,10 @@ $node->safe_psql('src', q{
 my $freed = $node->safe_psql('src', q{SELECT test_chunk_format_refs(true); SELECT test_cs_free_unheld('pages')});
 $freed =~ s/^\n//;
 cmp_ok($freed, '>=', 21, 'the deep chain, and the loose leaf, freed after the snapshot');
+# (and chunks put after it, a parent and its leaf, which VACUUM sees
+# committed: not the snapshot's, nor in the dump)
+$node->safe_psql('src', q{SELECT test_chunk_format_refs(true);
+	SELECT test_cs_put('pages', leaf(7000)), test_cs_put('pages', node(leaf(7000)))});
 $node->safe_psql('src', 'VACUUM pg_history.chunk_index');
 $node->command_ok([ 'pg_dump', '--format' => 'custom', '--snapshot' => $snapshot,
 	'--file' => "$dir/snap.dump", $node->connstr('src') ], 'pg_dump with the snapshot');
@@ -140,7 +151,10 @@ my ($out, $err) = run_command([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP
 	'--file' => "$dir/tampered.sql", '--dbname' => $node->connstr('dt') ]);
 like($err, qr/do not hash to it|does not match|not their name/, 'a chunk\'s bytes changed: refused');
 my $missing = $plain;
-$missing =~ s/\Q$rows[0]\E\n//;
+my $leaf_hex = $node->safe_psql('src', q{SELECT encode(h(leaf(500)), 'hex')});
+my ($leaf_row) = grep { /^\\\\x$leaf_hex\t/ } @rows;
+ok(defined $leaf_row, 'the chain\'s leaf has its row in the dump');
+$missing =~ s/\Q$leaf_row\E\n//;
 append_to_file("$dir/missing.sql", $missing);
 $node->safe_psql('postgres', 'CREATE DATABASE dm TEMPLATE template0');
 ($out, $err) = run_command([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1',
