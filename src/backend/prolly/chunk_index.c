@@ -1283,8 +1283,10 @@ find_moved(Relation rel, Buffer primary, int mode, const uint8 *hash,
 				memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
 				!belongs(e, bucket, masks))
 				continue;
+			/* (one this transaction put and freed is neither) */
+			if (TransactionIdEquals(e->xmin, xid) && TransactionIdEquals(e->xmax, xid))
+				continue;
 			if (TransactionIdEquals(e->xmin, xid) &&
-				!TransactionIdEquals(e->xmax, xid) &&
 				!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
 				put = true;
 			else if (TransactionIdEquals(e->xmax, xid) && !BufferIsValid(old_buf))
@@ -2471,11 +2473,15 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	ChunkLogSweep *sweep = NULL;
 	uint64		unheld = 0;
 	ChunkLogSegments segs = {0};
-	/* (chunks freed kept for snapshots: their places, their segments passed by) */
-	int			npending = 0,
-				pending_cap = 0;
-	uint64	   *plocs = NULL;
-	uint32	   *plens = NULL;
+	/*
+	 * (the log's segments with bytes of chunks freed kept for snapshots, a
+	 * bit each, to pass by: made as the log is opened, outside the windows
+	 * between taking entries out and counting their bytes dead, where
+	 * nothing is allocated; segments the log grows by meanwhile are not)
+	 */
+	uint8	   *pending = NULL;
+	uint64		npending = 0;
+	uint64		segment_bytes = 0;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
 				dead_cap = 0;
@@ -2513,6 +2519,12 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 			{
 				log = open_bound_log(idx);
 				log_tried = true;
+				if (log != NULL)
+				{
+					segment_bytes = ChunkLog->segment_bytes(log);
+					npending = ChunkLog->end(log) / segment_bytes + 1;
+					pending = palloc0((npending + 7) / 8);
+				}
 
 				/*
 				 * (the pages of regions held by none as the pass begins, to
@@ -2555,22 +2567,17 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				 * dead only later, once no snapshot might read them)
 				 */
 				if ((fates[i] == FATE_KEEP || fates[i] == FATE_FREEZE) &&
+					pending != NULL &&
 					page_entry(page, i)->kind == CHUNK_KIND_CHUNK &&
 					page_entry(page, i)->len > 0 &&
 					TransactionIdIsValid(page_entry(page, i)->xmax) &&
 					!(page_entry(page, i)->flags & CHUNK_ENTRY_XMAX_ABORTED))
 				{
-					if (npending == pending_cap)
-					{
-						pending_cap = Max(64, pending_cap * 2);
-						plocs = plocs ? repalloc_array(plocs, uint64, pending_cap) :
-							palloc_array(uint64, pending_cap);
-						plens = plens ? repalloc_array(plens, uint32, pending_cap) :
-							palloc_array(uint32, pending_cap);
-					}
-					plocs[npending] = page_entry(page, i)->loc;
-					plens[npending] = page_entry(page, i)->len;
-					npending++;
+					ChunkIndexEntry *pe = page_entry(page, i);
+
+					for (uint64 g = pe->loc / segment_bytes;
+						 g < npending && g <= (pe->loc + pe->len - 1) / segment_bytes; g++)
+						pending[g / 8] |= (uint8) (1 << (g % 8));
 				}
 				if (fates[i] == FATE_REMOVE_FREED &&
 					(!TransactionIdIsValid(horizon) ||
@@ -2672,8 +2679,10 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		 * later, and the chunks a freer moved off them, maybe, moved
 		 * already: a freer now would find nothing there to move)
 		 */
-		ChunkLogRecordFree(log, chunk_compact_dead_fraction, npending, plocs,
-						   plens, &segs);
+		ChunkLogRecordFree(log, chunk_compact_dead_fraction, pending, npending,
+						   &segs);
+		if (pending)
+			pfree(pending);
 
 		/*
 		 * chunks nothing holds, segments to compact, or the end to evacuate:

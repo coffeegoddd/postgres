@@ -611,6 +611,8 @@ static int64
 free_segment_hint(Relation rel, uint64 below)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	BlockNumber passed = InvalidBlockNumber;
+	int			npassed = 0;
 
 	for (int tries = 0; tries < 8; tries++)
 	{
@@ -625,8 +627,16 @@ free_segment_hint(Relation rel, uint64 below)
 			continue;
 		}
 		first = pages_below(blk) / SEGMENT_PAGES * SEGMENT_PAGES;
+		/* (one past where room may be passed by, as take_free_segment does) */
 		if (below > 0 && first + SEGMENT_PAGES > below)
+		{
+			if (blk == passed || ++npassed > 4096)
+				return -1;
+			if (!BlockNumberIsValid(passed))
+				passed = blk;
+			tries--;
 			continue;
+		}
 		return (int64) first;
 	}
 	return -1;
@@ -646,6 +656,8 @@ take_free_segment(Relation rel, uint32 generation, uint64 below, int64 hint)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 	uint64		claimed = claimed_pages(rel);
+	BlockNumber passed = InvalidBlockNumber;
+	int			npassed = 0;
 
 	for (int tries = 0; tries < 8; tries++)
 	{
@@ -677,9 +689,19 @@ take_free_segment(Relation rel, uint32 generation, uint64 below, int64 hint)
 			}
 			first = pages_below(blk) / SEGMENT_PAGES * SEGMENT_PAGES;
 		}
-		/* (one past where room may be: others may be under it) */
+		/*
+		 * (one past where room may be passed by, not counted a try: others
+		 * may be under it; until the map comes round to the first passed)
+		 */
 		if (below > 0 && first + SEGMENT_PAGES > below)
+		{
+			if (blk == passed || ++npassed > 4096)
+				return -1;
+			if (!BlockNumberIsValid(passed))
+				passed = blk;
+			tries--;
 			continue;
+		}
 		for (int j = 0; j < SEGMENT_PAGES; j++)
 		{
 			BlockNumber b = DATA_BLOCK(first + j);
@@ -1088,6 +1110,13 @@ prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow,
 		 * invalidation has every backend forget its region)
 		 */
 		generation = log_generation(rel, NULL);
+
+		/*
+		 * (a hint the map has wrongly, and none free after all, leaves the
+		 * region let go of here though it could have gone on into pages
+		 * new: it is let go of before what replaces it is made the
+		 * backend's, and the segment found is locked only then, in order)
+		 */
 		first = hint >= 0 ? take_free_segment(rel, generation, below, hint) : -1;
 		if (first >= 0)
 		{
@@ -1823,12 +1852,12 @@ typedef struct SegmentState
 
 /*
  * each segment's state, read a page at a time (O(log), through a ring of
- * buffers of its own), the chunks freed and kept (npending, at plocs,
- * plens long) marking theirs; how many
+ * buffers of its own), those with chunks freed kept for snapshots marked
+ * (pending, a bit a segment, of the first npending); how many
  */
 static uint32
-scan_segments(Relation rel, int npending, const uint64 *plocs,
-			  const uint32 *plens, SegmentState **out)
+scan_segments(Relation rel, const uint8 *pending, uint64 npending,
+			  SegmentState **out)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 	uint64		npages = pages_below(nblocks);
@@ -1881,9 +1910,8 @@ scan_segments(Relation rel, int npending, const uint64 *plocs,
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
-	for (int k = 0; k < npending; k++)
-		for (uint64 g = plocs[k] / SEGMENT_BYTES;
-			 g < nseg && g <= (plocs[k] + Max(plens[k], 1) - 1) / SEGMENT_BYTES; g++)
+	for (uint64 g = 0; pending != NULL && g < nseg && g < npending; g++)
+		if (pending[g / 8] & (1 << (g % 8)))
 			st[g].pending = true;
 	FreeAccessStrategy(strategy);
 	*out = st;
@@ -1944,11 +1972,11 @@ evacuable_from(const SegmentState *st, uint32 nseg)
 
 /* what is found of the segments, the free ones put in the map if record */
 static void
-find_segments(Relation rel, double fraction, int npending, const uint64 *plocs,
-			  const uint32 *plens, bool record, ChunkLogSegments *out)
+find_segments(Relation rel, double fraction, const uint8 *pending,
+			  uint64 npending, bool record, ChunkLogSegments *out)
 {
 	SegmentState *st;
-	uint32		nseg = scan_segments(rel, npending, plocs, plens, &st);
+	uint32		nseg = scan_segments(rel, pending, npending, &st);
 	uint32		from = evacuable_from(st, nseg);
 
 	memset(out, 0, sizeof(*out));
@@ -1986,16 +2014,16 @@ find_segments(Relation rel, double fraction, int npending, const uint64 *plocs,
 }
 
 void
-ChunkLogRecordFree(Relation rel, double fraction, int npending,
-				   const uint64 *plocs, const uint32 *plens, ChunkLogSegments *out)
+ChunkLogRecordFree(Relation rel, double fraction, const uint8 *pending,
+				   uint64 npending, ChunkLogSegments *out)
 {
-	find_segments(rel, fraction, npending, plocs, plens, true, out);
+	find_segments(rel, fraction, pending, npending, true, out);
 }
 
-void
-ChunkLogFindSegments(Relation rel, double fraction, ChunkLogSegments *out)
+static void
+page_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 {
-	find_segments(rel, fraction, 0, NULL, NULL, false, out);
+	find_segments(rel, fraction, NULL, 0, false, out);
 }
 
 static int
@@ -2003,7 +2031,7 @@ page_compactable_segments(Relation rel, double fraction, int max,
 						  uint64 *starts, uint64 *ends)
 {
 	SegmentState *st;
-	uint32		nseg = scan_segments(rel, 0, NULL, NULL, &st);
+	uint32		nseg = scan_segments(rel, NULL, 0, &st);
 	int			n = 0;
 
 	for (uint32 g = 0; g < nseg && n < max; g++)
@@ -2025,7 +2053,7 @@ static int
 page_evacuable_segments(Relation rel, int max, uint64 *starts, uint64 *ends)
 {
 	SegmentState *st;
-	uint32		nseg = scan_segments(rel, 0, NULL, NULL, &st);
+	uint32		nseg = scan_segments(rel, NULL, 0, &st);
 	uint32		from = evacuable_from(st, nseg);
 	int			n = 0;
 
@@ -2160,6 +2188,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.compactable = page_compactable_segments,
 	.evacuable = page_evacuable_segments,
 	.segment_bytes = page_segment_bytes,
+	.find_segments = page_find_segments,
 	.extend = page_extend,
 	.bind_index = page_bind_index,
 	.read = page_read,

@@ -12,10 +12,9 @@
  */
 #include "postgres.h"
 
-#include "access/xact.h"
-
-#include "access/relation.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
+#include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "prolly/chunk_log.h"
@@ -129,7 +128,7 @@ test_chunk_log_segments(PG_FUNCTION_ARGS)
 	Datum		values[6];
 	bool		nulls[6] = {false, false, false, false, false, false};
 
-	ChunkLogFindSegments(rel, PG_GETARG_FLOAT8(1), &segs);
+	ChunkLog->find_segments(rel, PG_GETARG_FLOAT8(1), &segs);
 	relation_close(rel, AccessShareLock);
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -143,8 +142,9 @@ test_chunk_log_segments(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_chunk_log_let_go(rel): this backend's region in the log forgotten,
- * as a relcache invalidation of the log has it (for VACUUM to let go of)
+ * test_chunk_log_let_go(rel): the regions in the log forgotten, as a
+ * relcache invalidation of the log has them (this backend's at once, every
+ * other's as it takes the invalidation in), for VACUUM to let go of
  */
 Datum
 test_chunk_log_let_go(PG_FUNCTION_ARGS)

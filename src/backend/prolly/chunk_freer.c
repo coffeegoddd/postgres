@@ -45,9 +45,9 @@
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
-#include "utils/rel.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 bool		chunk_free_in_background = true;
