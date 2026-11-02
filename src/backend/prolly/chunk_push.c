@@ -275,8 +275,9 @@ batch_add(PushState *ps, const PushFrame *f)
  * Every chunk root reaches that the target has not, copied into it: a walk
  * down, each chunk once (seen as it comes to the top), one the target has
  * held there and not walked below (the target has what it references); a
- * chunk's children read at once as it is come to (a chunk named twice may
- * be read twice: the second, seen, let go of)
+ * chunk's children read at once as it is come to (a chunk named by two
+ * not yet out may be read twice, the second, seen, let go of; one named
+ * twice by one chunk is read once)
  */
 static void
 copy_reached(PushState *ps, const uint8 *root)
