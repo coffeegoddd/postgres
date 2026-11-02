@@ -57,6 +57,26 @@ is($standby->safe_psql('postgres', $state), 'true true false 1',
 is($node->safe_psql('postgres', q{SELECT ok FROM test_chunk_check('pg_history.chunks', 'pg_history.chunk_index')}),
 	't', 'the audit agrees');
 
+# on the standby, a commit's chunk and pointer move appear together as its
+# commit replays: the records before it replayed, neither; the commit
+# replayed, both
+my $mid = $node->background_psql('postgres');
+$mid->query_safe(q{BEGIN});
+$mid->query_safe(q{SELECT put('\x03')});
+$mid->query_safe(q{UPDATE pg_history.pointers SET hash = h('\x03') WHERE name = 'main'});
+# (another's commit, its WAL after the open transaction's records)
+$node->safe_psql('postgres', 'CREATE TABLE flushed ()');
+$node->wait_for_replay_catchup($standby);
+my $at3 = q{SELECT (SELECT hash = h('\x03') FROM pg_history.pointers WHERE name = 'main')
+	|| ' ' || test_chunk_has('pg_history.chunks', 'pg_history.chunk_index', h('\x03'))};
+is($standby->safe_psql('postgres', $at3), 'false false',
+	'its records replayed, not its commit: neither the chunk nor the pointer moved');
+$mid->query_safe(q{COMMIT});
+$mid->quit;
+$node->wait_for_replay_catchup($standby);
+is($standby->safe_psql('postgres', $at3), 'true true', 'its commit replayed: both');
+$node->safe_psql('postgres', q{UPDATE pg_history.pointers SET hash = h('\x01') WHERE name = 'main'});
+
 # the pointer dropped, VACUUM of the store's index has a freer free the chunk
 $node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'main'});
 $node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');

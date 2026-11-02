@@ -60,7 +60,7 @@ patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared p
 patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; counts a shared page left as it is as an eager scan's failure; reads pages it skips as all-visible for their free space while the storage manager says the free space map may not know them (smgrfreespaceunknown)
 patch src/backend/access/nbtree/nbtpage.c  1a  B-tree VACUUM takes leaf cleanup locks unprepared and prepares only the pages it changes, so shared leaves aren't copied
 patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions; also (2) chunkdesc.o
-patch src/backend/access/rmgrdesc/chunkdesc.c  2  the history store's WAL records (ChunkStore)
+patch src/backend/access/rmgrdesc/chunkdesc.c  2  the history store's WAL records (ChunkLog and ChunkIndex)
 patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
 patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions; also (2) chunkdesc.c
 patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager; also (2) prolly/chunk_xlog.h
@@ -79,7 +79,7 @@ patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's
 patch src/backend/catalog/objectaddress.c  1b  the pg_namespace name cache is NAMESPACENAMEBRANCH
 patch src/backend/catalog/pg_depend.c  1b  refuses a dependency of a shared object on a versioned one, or across branches
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
-patch src/backend/catalog/pg_publication.c  2  publications leave chunk log relations out; also (2) the history store's relations, and pg_history, are not publishable
+patch src/backend/catalog/pg_publication.c  2  publications leave chunk log and chunk index relations out; also (2) the history store's relations, and pg_history, are not publishable
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
 patch src/backend/catalog/pg_subscription.c  1b  a subscription's branch
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers; also (1b) a versioned schema's relations are block-mapped
@@ -131,8 +131,8 @@ patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per
 patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch; also (2) chunk_free_in_background
-patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_free_in_background
+patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h)
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
@@ -153,7 +153,7 @@ patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences
 patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and each database's page store whole in every tablespace that has one, even one no relation names (kept in --swap)
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source; also (2) the history store's (chunkdesc.c)
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager; also (2) prolly/chunk_xlog.h
-patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode
+patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode; also (2) ChunkLog and ChunkIndex in the rmgr list
 patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
