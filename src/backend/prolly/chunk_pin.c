@@ -21,6 +21,7 @@
 #include "prolly/chunk_pin.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 static HTAB *pins = NULL;
 static bool callback_registered = false;
@@ -35,9 +36,26 @@ forget_pins(XactEvent event, void *arg)
 		pins = NULL;
 }
 
-void
-ChunkPin(const uint8 *hash)
+/* a pin's key: the store's index, and the chunk's name */
+typedef struct PinKey
 {
+	Oid			idx;
+	uint8		hash[CHUNK_HASH_LEN];
+} PinKey;
+
+static void
+pin_key(PinKey *key, Relation idx, const uint8 *hash)
+{
+	memset(key, 0, sizeof(*key));
+	key->idx = RelationGetRelid(idx);
+	memcpy(key->hash, hash, CHUNK_HASH_LEN);
+}
+
+void
+ChunkPin(Relation idx, const uint8 *hash)
+{
+	PinKey		key;
+
 	if (!callback_registered)
 	{
 		RegisterXactCallback(forget_pins, NULL);
@@ -47,17 +65,23 @@ ChunkPin(const uint8 *hash)
 	{
 		HASHCTL		ctl;
 
-		ctl.keysize = CHUNK_HASH_LEN;
-		ctl.entrysize = CHUNK_HASH_LEN;
+		ctl.keysize = sizeof(PinKey);
+		ctl.entrysize = sizeof(PinKey);
 		ctl.hcxt = TopTransactionContext;
 		pins = hash_create("chunk pins", 64, &ctl,
 						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	(void) hash_search(pins, hash, HASH_ENTER, NULL);
+	pin_key(&key, idx, hash);
+	(void) hash_search(pins, &key, HASH_ENTER, NULL);
 }
 
 bool
-ChunkPinned(const uint8 *hash)
+ChunkPinned(Relation idx, const uint8 *hash)
 {
-	return pins != NULL && hash_search(pins, hash, HASH_FIND, NULL) != NULL;
+	PinKey		key;
+
+	if (pins == NULL)
+		return false;
+	pin_key(&key, idx, hash);
+	return hash_search(pins, &key, HASH_FIND, NULL) != NULL;
 }

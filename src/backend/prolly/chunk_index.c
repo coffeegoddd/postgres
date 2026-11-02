@@ -1588,7 +1588,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
  * transaction changing them, and not being freed already.
  */
 static bool
-page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
+page_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uint8 *hash),
 		  ChunkIndexEntry *out)
 {
 	uint32		bucket;
@@ -1630,7 +1630,7 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 	 */
 	if ((int64) out->refs + drefs != 0 || (int64) out->roots + droots != 0 ||
 		TransactionIdIsValid(running) || ChunkEntryIsMine(out) ||
-		(held && held(hash)))
+		(held && held(idx, hash)))
 	{
 		release_found(primary, found);
 		return false;

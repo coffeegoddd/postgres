@@ -323,7 +323,7 @@ found_held(Relation idx, const uint8 *hash)
 		return true;
 	if (!ChunkIndex->adjust(idx, hash, 0, 0, &e))
 		return false;
-	ChunkPin(hash);
+	ChunkPin(idx, hash);
 	return true;
 }
 

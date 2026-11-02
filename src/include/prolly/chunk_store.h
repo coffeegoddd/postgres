@@ -55,12 +55,6 @@ extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
 						   uint32 *len);
 
 /*
- * Many chunks' bytes at once: out[i] (palloc'd) and lens[i] for hashes[i],
- * NULL for one absent.  Read in the log's order, whatever the order asked
- * (a tree's level read at once reads its pages through once); a name asked
- * twice is read twice.
- */
-/*
  * The chunk's bytes as of snap, palloc'd, and their length in *len: a
  * chunk the store had then (its freeing not committed before snap, nor by
  * this transaction), whose bytes are kept until no snapshot could find it;
@@ -69,6 +63,12 @@ extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
 extern void *ChunkStoreGetAsOf(Relation log, Relation idx, const uint8 *hash,
 							   Snapshot snap, uint32 *len);
 
+/*
+ * Many chunks' bytes at once: out[i] (palloc'd) and lens[i] for hashes[i],
+ * NULL for one absent.  Read in the log's order, whatever the order asked
+ * (a tree's level read at once reads its pages through once); a name asked
+ * twice is read twice.
+ */
 extern void ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes,
 							  int n, void **out, uint32 *lens);
 

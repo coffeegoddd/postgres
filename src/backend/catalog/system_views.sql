@@ -1629,12 +1629,12 @@ ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_no_truncate;
 -- take and let go of roots of any chunk)
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
 
--- The bundles of history pushed to the tier: a row a root, which holds it
--- there (pg_history_push and pg_history_release make and delete them).
+-- The bundles of history pushed to the tier: a row a bundle, which holds
+-- its roots there (pg_history_push and pg_history_release make and delete
+-- them).
 CREATE TABLE pg_history.bundles (
-	name text COLLATE "C" NOT NULL,
-	hash bytea NOT NULL CHECK (octet_length(hash) = 20),
-	PRIMARY KEY (name, hash)
+	name text COLLATE "C" PRIMARY KEY,
+	roots bytea[] NOT NULL CHECK (cardinality(roots) > 0)
 );
 CREATE TRIGGER bundles_roots
 	AFTER INSERT OR UPDATE OR DELETE ON pg_history.bundles

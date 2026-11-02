@@ -15,7 +15,9 @@
  * A pin is the transaction's own note that it holds the chunk, so that its
  * own freeing, which counts its own changes as made, passes the chunk by.
  * Pins are this backend's alone, in its memory, let go of as its
- * transaction ends; none is shared, and there is no limit to them.
+ * transaction ends; none is shared, and there is no limit to them.  A pin
+ * is of a chunk in one store (its index): a chunk of the same name in
+ * another store is another chunk.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -26,10 +28,15 @@
 #ifndef PROLLY_CHUNK_PIN_H
 #define PROLLY_CHUNK_PIN_H
 
-/* Notes that this transaction holds the chunk named hash, until it ends. */
-extern void ChunkPin(const uint8 *hash);
+#include "utils/relcache.h"
 
-/* Whether this transaction holds the chunk (for its own freeing). */
-extern bool ChunkPinned(const uint8 *hash);
+/*
+ * Notes that this transaction holds the chunk named hash, in the store of
+ * the index idx, until it ends.
+ */
+extern void ChunkPin(Relation idx, const uint8 *hash);
+
+/* Whether this transaction holds the chunk there (for its own freeing). */
+extern bool ChunkPinned(Relation idx, const uint8 *hash);
 
 #endif							/* PROLLY_CHUNK_PIN_H */

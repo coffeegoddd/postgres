@@ -36,6 +36,52 @@ test_cs_free
 (1 row)
 
 
+starting permutation: r_begin r_read p_push p_release r_read p_after r_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+bytes   
+--------
+\x0a2101
+(1 row)
+
+step p_push: 
+	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
+
+copied
+------
+     2
+(1 row)
+
+step p_release: SELECT pg_history_release('hp') AS freed;
+freed
+-----
+    2
+(1 row)
+
+step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+bytes   
+--------
+\x0a2101
+(1 row)
+
+step p_after: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+bytes
+-----
+     
+(1 row)
+
+step r_commit: COMMIT;
+test_cs_free
+------------
+           0
+(1 row)
+
+
 starting permutation: w_begin w_hold p_push w_commit p_held
 test_cs_ref_root
 ----------------

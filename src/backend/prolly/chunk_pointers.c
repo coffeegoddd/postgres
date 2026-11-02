@@ -27,10 +27,12 @@
 #include "access/relation.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "prolly/chunk_store.h"
+#include "utils/array.h"
 #include "utils/fmgrprotos.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
@@ -156,7 +158,7 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_history.bundles' trigger: each row holds its root in the tier (a
+ * pg_history.bundles' trigger: each row holds its roots in the tier (a
  * bundle's, pushed there: prolly/chunk_push.c), taken as it is inserted
  * and let go of as it is deleted; rows are not changed, and the table is
  * not truncated
@@ -174,7 +176,7 @@ pg_history_bundle_changed(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot truncate the history store's bundles"),
-				 errhint("Release them: each row holds a root in the tier.")));
+				 errhint("Release them: each holds its roots in the tier.")));
 	if (!TRIGGER_FIRED_FOR_ROW(td->tg_event) || !TRIGGER_FIRED_AFTER(td->tg_event))
 		elog(ERROR, "pg_history_bundle_changed is an AFTER ROW trigger");
 	if (RelationGetRelid(td->tg_relation) != ChunkStoreBundlesRelid())
@@ -188,10 +190,39 @@ pg_history_bundle_changed(PG_FUNCTION_ARGS)
 				 errhint("Push another bundle, and release this one.")));
 
 	idx = relation_open(ChunkStoreTierIndexRelid(), RowExclusiveLock);
-	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
-		ChunkStoreRefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
-	else
-		ChunkStoreUnrefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
+	{
+		TupleDesc	desc = RelationGetDescr(td->tg_relation);
+		int			attnum = SPI_fnumber(desc, "roots");
+		bool		isnull;
+		Datum		d;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			n;
+
+		if (attnum <= 0)
+			elog(ERROR, "\"%s\" has no column \"roots\"", RelationGetRelationName(td->tg_relation));
+		d = heap_getattr(td->tg_trigtuple, attnum, desc, &isnull);
+		if (isnull)
+			elog(ERROR, "a bundle has no roots");
+		deconstruct_array(DatumGetArrayTypeP(d), BYTEAOID, -1, false, TYPALIGN_INT,
+						  &elems, &nulls, &n);
+		for (int i = 0; i < n; i++)
+		{
+			bytea	   *b;
+
+			if (nulls[i])
+				elog(ERROR, "a bundle's root is null");
+			b = DatumGetByteaPP(elems[i]);
+			if (VARSIZE_ANY_EXHDR(b) != CHUNK_HASH_LEN)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("a chunk's hash is %d bytes", CHUNK_HASH_LEN)));
+			if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+				ChunkStoreRefRoot(idx, (const uint8 *) VARDATA_ANY(b), &e);
+			else
+				ChunkStoreUnrefRoot(idx, (const uint8 *) VARDATA_ANY(b), &e);
+		}
+	}
 	relation_close(idx, NoLock);
 	return PointerGetDatum(NULL);
 }
