@@ -349,9 +349,11 @@ SKIP:
 	# a waiter stopped: the next freer waits in its stead
 	my $t = $hold->(8903);
 	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'a waiter');
-	$node->safe_psql('postgres', qq{SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+	my $old = $node->safe_psql('postgres', qq{SELECT pid FROM pg_stat_activity
 		WHERE backend_type = 'chunk freer' AND query = 'waiting on transactions holding chunks to free'});
-	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'another waiting in its stead');
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($old)");
+	ok($node->poll_query_until('postgres', "SELECT ($waiting AND pid <> $old) = 1"),
+		'another waiting in its stead');
 	$t->query_safe('COMMIT');
 	$t->quit;
 	$gone->(q{h(leaf(89031))}, 'the waiter stopped, the transaction ended: freed');
