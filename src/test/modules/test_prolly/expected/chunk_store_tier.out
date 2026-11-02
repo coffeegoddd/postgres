@@ -1104,7 +1104,7 @@ WHERE hash = substr(sha256(convert_to('twice in a pack', 'UTF8')), 1, 20);
 -- a tier is pg_history's alone (the tests' made there, and truncated and
 -- dropped, as one allowed to change the system's catalogs)
 CREATE TABLE public_tier () USING prolly_tier;
-ERROR:  a tier of the history store is made in pg_history alone
+ERROR:  cannot create tier "public_tier" outside schema "pg_history"
 SET allow_system_table_mods = on;
 CREATE TABLE pg_history.my_tier () USING prolly_tier;
 CREATE TABLE pg_history.my_tier_index () USING prolly_chunk_index;
@@ -1123,13 +1123,13 @@ SELECT test_chunk_get('pg_history.my_tier', 'pg_history.my_tier_index', substr(s
 (1 row)
 
 TRUNCATE pg_history.my_tier, pg_history.my_tier_index;
-ERROR:  cannot truncate tier "my_tier": it has packs
-DETAIL:  Pack 1 is not removed: its object would be left in the tier's store.
-HINT:  Release its bundles, free its chunks, and VACUUM its index until it has none.
+ERROR:  cannot truncate tier "pg_history.my_tier" while it has pack objects
+DETAIL:  1 pack, 1, is not removed: its object would be left in the tier's store.
+HINT:  Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).
 DROP TABLE pg_history.my_tier;
-ERROR:  cannot drop tier "my_tier": it has packs
-DETAIL:  Pack 1 is not removed: its object would be left in the tier's store.
-HINT:  Release its bundles, free its chunks, and VACUUM its index until it has none.
+ERROR:  cannot drop tier "pg_history.my_tier" while it has pack objects
+DETAIL:  1 pack, 1, is not removed: its object would be left in the tier's store.
+HINT:  Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).
 CREATE TEMP TABLE names0 AS
 	SELECT name FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
 SELECT test_chunk_free('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0a'), 1, 20));
@@ -1177,82 +1177,54 @@ WHERE n.name NOT IN (SELECT name FROM names0);
          1 |                 0
 (1 row)
 
--- and TRUNCATE in the transaction that made the tier (its storage cut in
--- place): the pack begun before it, not written, gone with it; one a pack
--- filled had written, refused
+-- a tier whose storage is this transaction's (made, or truncated, in it)
+-- takes no chunk until it commits: aborted, its catalog would go, and with
+-- it what knows the objects of packs written; the store's objects as they
+-- were
+CREATE TEMP TABLE names1 AS
+	SELECT name FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
 BEGIN;
 CREATE TABLE pg_history.my_tier2 () USING prolly_tier;
 CREATE TABLE pg_history.my_tier2_index () USING prolly_chunk_index;
-SELECT test_chunk_put('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0d'), 1, 20), '\x0d');
- test_chunk_put 
-----------------
- t
-(1 row)
-
-TRUNCATE pg_history.my_tier2, pg_history.my_tier2_index;
-SELECT test_chunk_put('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0e'), 1, 20), '\x0e');
- test_chunk_put 
-----------------
- t
-(1 row)
-
-COMMIT;
-SELECT test_chunk_get('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0e'), 1, 20)),
-	test_chunk_has('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0d'), 1, 20)) AS gone;
- test_chunk_get | gone 
-----------------+------
- \x0e           | f
-(1 row)
-
-SELECT id, state FROM test_tier_packs('pg_history.my_tier2');
- id | state 
-----+-------
-  1 | made
-(1 row)
-
-SELECT test_chunk_free('pg_history.my_tier2', 'pg_history.my_tier2_index', substr(sha256('\x0e'), 1, 20));
- test_chunk_free 
------------------
-               1
-(1 row)
-
-VACUUM pg_history.my_tier2_index;
-DROP TABLE pg_history.my_tier2, pg_history.my_tier2_index;
-BEGIN;
-CREATE TABLE pg_history.my_tier3 () USING prolly_tier;
-CREATE TABLE pg_history.my_tier3_index () USING prolly_chunk_index;
+-- (65 MB: a pack filled would be written as it goes)
 SELECT count(*) FROM generate_series(1, 65) g,
-	LATERAL test_chunk_put('pg_history.my_tier3', 'pg_history.my_tier3_index',
+	LATERAL test_chunk_put('pg_history.my_tier2', 'pg_history.my_tier2_index',
 		substr(sha256(convert_to(rpad(g::text, 1048576, '.'), 'UTF8')), 1, 20),
 		convert_to(rpad(g::text, 1048576, '.'), 'UTF8'));
- count 
--------
-    65
-(1 row)
-
-SELECT state, size > 0 AS written FROM test_tier_packs('pg_history.my_tier3') WHERE id = 1;
- state | written 
--------+---------
- made  | t
-(1 row)
-
-TRUNCATE pg_history.my_tier3, pg_history.my_tier3_index;
-ERROR:  cannot truncate tier "my_tier3": it has packs
-DETAIL:  Pack 1 is not removed: its object would be left in the tier's store.
-HINT:  Release its bundles, free its chunks, and VACUUM its index until it has none.
+ERROR:  cannot put chunks in tier "my_tier2" in the transaction that made or truncated it
+HINT:  Commit first.
 ROLLBACK;
--- TRUNCATE (new storage) in a transaction that put chunks in the tier:
--- refused (its pack's entry is the storage's)
+CREATE TABLE pg_history.my_tier4 () USING prolly_tier;
+CREATE TABLE pg_history.my_tier4_index () USING prolly_chunk_index;
 BEGIN;
-SELECT test_chunk_put('pg_history.my_tier', 'pg_history.my_tier_index', substr(sha256('\x0f'), 1, 20), '\x0f');
- test_chunk_put 
-----------------
- t
+TRUNCATE pg_history.my_tier4, pg_history.my_tier4_index;
+SELECT test_chunk_put('pg_history.my_tier4', 'pg_history.my_tier4_index', substr(sha256('\x0d'), 1, 20), '\x0d');
+ERROR:  cannot put chunks in tier "my_tier4" in the transaction that made or truncated it
+HINT:  Commit first.
+ROLLBACK;
+DROP TABLE pg_history.my_tier4, pg_history.my_tier4_index;
+SELECT count(*) AS objects_made FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') n
+WHERE n.name NOT IN (SELECT name FROM names1);
+ objects_made 
+--------------
+            0
 (1 row)
 
-TRUNCATE pg_history.my_tier, pg_history.my_tier_index;
-ERROR:  cannot truncate tier "my_tier" in a transaction that put chunks in it
-ROLLBACK;
+-- the index bound to a tier with packs is not dropped, nor truncated (the
+-- tier's packs could not be freed without it); and a tier is not moved out
+-- of pg_history
+DROP TABLE pg_history.my_tier_index;
+ERROR:  cannot drop index "my_tier_index" of tier "pg_history.my_tier" while it has pack objects
+DETAIL:  1 pack, 1, is not removed: its object would be left in the tier's store.
+HINT:  Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).
+TRUNCATE pg_history.my_tier_index;
+ERROR:  cannot truncate index "my_tier_index" of tier "pg_history.my_tier" while it has pack objects
+DETAIL:  1 pack, 1, is not removed: its object would be left in the tier's store.
+HINT:  Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).
+CREATE SCHEMA tier_elsewhere;
+ALTER TABLE pg_history.my_tier SET SCHEMA tier_elsewhere;
+ERROR:  cannot move tier "my_tier" out of schema "pg_history"
+DROP SCHEMA tier_elsewhere;
 -- a tier dropped in the transaction that put chunks in it: refused (its
 -- pack, being made, is one)
 BEGIN;
@@ -1263,9 +1235,9 @@ SELECT test_chunk_put('pg_history.my_tier', 'pg_history.my_tier_index', substr(s
 (1 row)
 
 DROP TABLE pg_history.my_tier;
-ERROR:  cannot drop tier "my_tier": it has packs
-DETAIL:  Pack 1 is not removed: its object would be left in the tier's store.
-HINT:  Release its bundles, free its chunks, and VACUUM its index until it has none.
+ERROR:  cannot drop tier "pg_history.my_tier" while it has pack objects
+DETAIL:  2 packs, the first 1, are not removed: their objects would be left in the tier's store.
+HINT:  Release its bundles, free its chunks and VACUUM its index until it has none; adopt packs another server made first (pg_history_tier_adopt).
 ROLLBACK;
 -- (emptied, dropped)
 VACUUM pg_history.my_tier_index;

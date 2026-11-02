@@ -88,6 +88,7 @@
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/chunk_log.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
@@ -19686,6 +19687,13 @@ AlterTableNamespace(AlterObjectSchemaStmt *stmt, Oid *oldschema)
 	rel = relation_open(relid, NoLock);
 
 	oldNspOid = RelationGetNamespace(rel);
+
+	/* (prolly: a tier of the history store is pg_history's alone) */
+	if (RelationIsTierLog(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move tier \"%s\" out of schema \"pg_history\"",
+						RelationGetRelationName(rel))));
 
 	/* If it's an owned sequence, disallow moving it by itself. */
 	if (rel->rd_rel->relkind == RELKIND_SEQUENCE)
