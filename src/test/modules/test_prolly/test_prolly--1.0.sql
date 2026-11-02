@@ -418,9 +418,9 @@ CREATE FUNCTION test_tier_pack_table(rel regclass, id int8, OUT hash bytea, OUT 
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
--- A tier's packs: their states, sizes, dead bytes and owners.
+-- A tier's packs: their states, sizes, dead bytes, owners and kinds (pack or manifest).
 CREATE FUNCTION test_tier_packs(rel regclass, OUT id int8, OUT state text, OUT size int8,
-	OUT dead int8, OUT owner text)
+	OUT dead int8, OUT owner text, OUT kind text)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 

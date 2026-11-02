@@ -205,4 +205,59 @@ VACUUM pg_history.tier_index;
 SELECT count(*) AS left_after_vacuum FROM pg_history_tier_bundles();
 SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1902')]) AS freed;
 
+-- a release in a subtransaction rolled back: its manifest the bundle's
+-- still; a push in one: its manifest an orphan, removed; a release after
+-- one aborted, at once
+SELECT (test_cs_put('pages', '\x0a1903')).stored, (test_cs_put('pages', '\x0a1904')).stored;
+SELECT pg_history_push('b11', ARRAY[pg_temp.h('\x0a1903')]) AS copied;
+BEGIN;
+SAVEPOINT s;
+SELECT pg_history_release('b11') AS freed;
+ROLLBACK TO s;
+COMMIT;
+VACUUM pg_history.tier_index;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+BEGIN;
+SAVEPOINT s;
+SELECT pg_history_push('b12', ARRAY[pg_temp.h('\x0a1904')]) AS copied;
+ROLLBACK TO s;
+COMMIT;
+VACUUM pg_history.tier_index;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+BEGIN;
+SELECT pg_history_release('b11') AS freed;
+ROLLBACK;
+SELECT pg_history_release('b11') AS freed_at_once;
+VACUUM pg_history.tier_index;
+SELECT count(*) AS left FROM pg_history_tier_bundles();
+SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1904')]) AS freed;
+
+-- a bundle's row names one manifest, its own, a tier's entry's number
+SELECT (test_cs_put('pages', '\x0a1905')).stored, (test_cs_put('pages', '\x0a1906')).stored;
+SELECT pg_history_push('b13', ARRAY[pg_temp.h('\x0a1905')]) AS copied;
+INSERT INTO pg_history.bundles VALUES ('b14', ARRAY[pg_temp.h('\x0a1905')], -5);
+INSERT INTO pg_history.bundles SELECT 'b14', roots, manifest FROM pg_history.bundles WHERE name = 'b13';
+SELECT kind FROM test_tier_packs('pg_history.tier_chunks')
+WHERE id = (SELECT manifest FROM pg_history.bundles WHERE name = 'b13');
+
+-- an object under manifests/ that is no manifest: the listing refuses it
+SELECT split_part(name, '/', 2) AS mstamp FROM test_os_list('directory', 'pg_test_history_tier', 'manifests/') LIMIT 1 \gset
+SELECT test_os_put('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000000',
+	int8send(5498985688337368140) || int4send(1) || int4send(1) || int4send(0) || int4send(0) || '\x41'::bytea);
+SELECT count(*) FROM pg_history_tier_bundles();
+SELECT test_os_remove('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000000');
+SELECT pg_history_release('b13') AS freed;
+VACUUM pg_history.tier_index;
+
+-- a pack begun in a subtransaction rolled back, the transaction committed:
+-- written, the tier locked again as it is
+BEGIN;
+SAVEPOINT s;
+SELECT pg_history_push('b15', ARRAY[pg_temp.h('\x0a1906')]) AS copied;
+ROLLBACK TO s;
+COMMIT;
+SELECT count(*) AS no_b15 FROM pg_history.bundles WHERE name = 'b15';
+SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1906')]) AS freed;
+VACUUM pg_history.tier_index;
+
 SELECT test_chunk_format_refs(false);

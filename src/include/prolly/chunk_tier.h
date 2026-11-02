@@ -172,6 +172,7 @@ typedef struct ChunkTierPackInfo
 	uint64		size;
 	uint64		dead;
 	uint64		owner;
+	const char *kind;			/* "pack" or "manifest" */
 } ChunkTierPackInfo;
 
 extern int	ChunkTierPacks(Relation rel, ChunkTierPackInfo **out);
