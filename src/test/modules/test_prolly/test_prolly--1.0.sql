@@ -399,9 +399,11 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 -- Waits (up to a minute) for the backend pid to be gone: a session that
 -- reconnects (psql's \\c) closes the old connection only after the new.
+-- (pg_stat_activity is a transaction's snapshot: cleared each time)
 CREATE FUNCTION test_wait_backend_gone(pid int) RETURNS bool LANGUAGE plpgsql AS $$
 BEGIN
 	FOR i IN 1 .. 6000 LOOP
+		PERFORM pg_stat_clear_snapshot();
 		IF NOT EXISTS (SELECT FROM pg_stat_activity a WHERE a.pid = test_wait_backend_gone.pid) THEN
 			RETURN true;
 		END IF;
