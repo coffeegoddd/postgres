@@ -1635,7 +1635,7 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
 CREATE TABLE pg_history.bundles (
 	name text COLLATE "C" PRIMARY KEY,
 	roots bytea[] NOT NULL CHECK (cardinality(roots) > 0),
-	manifest int8 NOT NULL
+	manifest int8 NOT NULL UNIQUE CHECK (manifest > 0 AND manifest <= 4294967295)
 );
 CREATE TRIGGER bundles_roots
 	AFTER INSERT OR UPDATE OR DELETE ON pg_history.bundles

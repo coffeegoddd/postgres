@@ -40,6 +40,7 @@
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "prolly/chunk_format.h"
@@ -112,8 +113,10 @@ decode_manifest(const char *data, size_t len, char **name, uint8 **roots, int *n
 				 errmsg("an object under manifests/ is no bundle's manifest of this format")));
 	namelen = pg_ntoh32(h.namelen);
 	*n = (int) pg_ntoh32(h.nroots);
-	if (namelen > len - sizeof(h) ||
-		(uint64) *n * CHUNK_HASH_LEN != len - sizeof(h) - namelen)
+	if (*n <= 0 || namelen > len - sizeof(h) ||
+		(uint64) *n * CHUNK_HASH_LEN != len - sizeof(h) - namelen ||
+		memchr(data + sizeof(h), '\0', namelen) != NULL ||
+		!pg_verifymbstr(data + sizeof(h), namelen, true))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("a bundle's manifest of %zu bytes does not hold its name and %d roots", len, *n)));
@@ -436,6 +439,11 @@ pg_history_release(PG_FUNCTION_ARGS)
 	{
 		Relation	tier = relation_open(ChunkStoreTierLogRelid(), RowExclusiveLock);
 
+		if (manifest <= 0 || manifest > PG_UINT32_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("bundle \"%s\" names no manifest (%lld)",
+							text_to_cstring(bundle), (long long) manifest)));
 		ChunkTierDropManifest(tier, (uint32) manifest);
 		relation_close(tier, NoLock);
 	}
@@ -557,7 +565,10 @@ pg_history_tier_bundles(PG_FUNCTION_ARGS)
 	BundlesListed bl;
 	Relation	tier;
 
-	check_pusher("pg_history_tier_bundles()");
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("only a superuser may list the bundles in the history store's tier")));
 	InitMaterializedSRF(fcinfo, 0);
 	bl.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	tier = relation_open(ChunkStoreTierLogRelid(), AccessShareLock);

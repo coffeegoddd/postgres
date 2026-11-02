@@ -685,13 +685,13 @@ ChunkTierDatabaseHasPacks(Oid dboid)
 }
 
 /*
- * An entry made: a number from the meta page, its entry this transaction's
- * (flags its kind), the stamp and owner its object is named by in
+ * An entry made: a number from the meta page, its entry xid's (flags its
+ * kind), the stamp and owner its object is named by in
  * *stamp_out and *owner_out, the entry's record in *lsn_out
  */
 static uint32
-make_entry(Relation rel, uint32 flags, uint64 *stamp_out, uint64 *owner_out,
-		   XLogRecPtr *lsn_out)
+make_entry(Relation rel, uint32 flags, TransactionId xid, uint64 *stamp_out,
+		   uint64 *owner_out, XLogRecPtr *lsn_out)
 {
 	Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
 	Buffer		pbuf;
@@ -706,8 +706,6 @@ make_entry(Relation rel, uint32 flags, uint64 *stamp_out, uint64 *owner_out,
 	uint64		stamp;
 	uint64		owner;
 	TimeLineID	tli = GetWALInsertionTimeLine();
-	/* (the top transaction's: a subtransaction's rollback leaves its pack) */
-	TransactionId xid = GetTopTransactionId();
 
 	LOCKMODE	marker_mode;
 
@@ -808,7 +806,8 @@ begin_pack(Relation rel)
 	uint64		stamp;
 	uint64		owner;
 	XLogRecPtr	lsn;
-	uint32		id = make_entry(rel, 0, &stamp, &owner, &lsn);
+	/* (the top transaction's: a subtransaction's rollback leaves its pack) */
+	uint32		id = make_entry(rel, 0, GetTopTransactionId(), &stamp, &owner, &lsn);
 
 	pending.id = id;
 	pending.relid = RelationGetRelid(rel);
@@ -1100,7 +1099,11 @@ tier_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PRE_COMMIT:
 			if (pending.id != 0)
 			{
-				Relation	rel = try_relation_open(pending.relid, NoLock);
+				/*
+				 * (locked again: a subtransaction that put chunks, rolled
+				 * back, let go of the tier's lock; its pack is this one's)
+				 */
+				Relation	rel = try_relation_open(pending.relid, RowExclusiveLock);
 
 				if (rel == NULL)
 					ereport(ERROR,
@@ -1960,7 +1963,10 @@ tier_check_live(Relation rel, int n, const uint64 *locs, const uint32 *lens,
 		if (p.state == PACK_MADE && !TransactionIdIsCurrentTransactionId(p.xid) &&
 			!TransactionIdIsInProgress(p.xid) && TransactionIdDidCommit(p.xid))
 			p.state = PACK_COMMITTED;
-		if (!pack_live(&p))
+		if (p.flags & PACK_MANIFEST)
+			*why = psprintf("a chunk is in tier \"%s\"'s entry %u, a manifest",
+							RelationGetRelationName(rel), id);
+		else if (!pack_live(&p))
 			*why = psprintf("pack %u of tier \"%s\" has live chunks but is %s",
 							id, RelationGetRelationName(rel),
 							p.state == PACK_REMOVED ? "removed" :
@@ -1996,7 +2002,11 @@ ChunkTierWriteManifest(Relation rel, const void *data, size_t len)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot write a manifest in tier \"%s\" in the transaction that made or truncated it",
 						RelationGetRelationName(rel))));
-	id = make_entry(rel, PACK_MANIFEST, &stamp, &owner, &lsn);
+	/*
+	 * (this subtransaction's: the push it is of rolled back, it is an
+	 * orphan, removed)
+	 */
+	id = make_entry(rel, PACK_MANIFEST, GetCurrentTransactionId(), &stamp, &owner, &lsn);
 
 	/*
 	 * (the entry's record flushed before the object is written: after a
@@ -2007,6 +2017,7 @@ ChunkTierWriteManifest(Relation rel, const void *data, size_t len)
 	name = manifest_name(stamp, owner, id);
 	os->routine->put(os, name, data, len);
 	pfree(name);
+	INJECTION_POINT("chunk-tier-manifest-written", NULL);
 	buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
 	state = GenericXLogStart(rel);
 	p = pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id);
@@ -2030,8 +2041,11 @@ ChunkTierDropManifest(Relation rel, uint32 id)
 				 errmsg("tier \"%s\" has no manifest %u", RelationGetRelationName(rel), id)));
 	buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
 	p = pack_entry(BufferGetPage(buf), id);
-	if (!(p->flags & PACK_MANIFEST) || p->state == PACK_REMOVED ||
-		TransactionIdIsValid(p->release_xid) || p->dead > 0)
+	if (!(p->flags & PACK_MANIFEST) || p->state == PACK_REMOVED || p->dead > 0 ||
+		(TransactionIdIsValid(p->release_xid) &&
+		 (TransactionIdIsCurrentTransactionId(p->release_xid) ||
+		  TransactionIdIsInProgress(p->release_xid) ||
+		  TransactionIdDidCommit(p->release_xid))))
 	{
 		UnlockReleaseBuffer(buf);
 		ereport(ERROR,
@@ -2046,7 +2060,11 @@ ChunkTierDropManifest(Relation rel, uint32 id)
 	 */
 	state = GenericXLogStart(rel);
 	p = pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id);
-	p->release_xid = GetTopTransactionId();
+	/*
+	 * (this subtransaction's: rolled back, the manifest is the bundle's
+	 * still; one before it that ended uncommitted, replaced)
+	 */
+	p->release_xid = GetCurrentTransactionId();
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
 }
@@ -2060,6 +2078,10 @@ ChunkTierListManifests(Relation rel, void (*fn) (void *arg, const char *data, si
 	char	   *prefix = psprintf("manifests/%016llx/", (unsigned long long) meta_stamp(&meta));
 	ManifestList ml = {0};
 
+	/* (VACUUM of the index, which removes them, waited for, and waits) */
+	if (OidIsValid(meta.index))
+		LockRelationOid(meta.index, ShareUpdateExclusiveLock);
+
 	os->routine->list(os, prefix, collect_name, &ml);
 	for (int i = 0; i < ml.n; i++)
 	{
@@ -2069,7 +2091,12 @@ ChunkTierListManifests(Relation rel, void (*fn) (void *arg, const char *data, si
 		/* (one removed since it was listed: gone) */
 		if (!os->routine->size(os, ml.names[i], &size))
 			continue;
-		data = palloc_extended(Max(size, 1), MCXT_ALLOC_HUGE);
+		if (size > MaxAllocSize)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("object \"%s\" is %llu bytes, too many for a manifest",
+							ml.names[i], (unsigned long long) size)));
+		data = palloc(Max(size, 1));
 		os->routine->read(os, ml.names[i], 0, data, size);
 		fn(arg, data, size);
 		pfree(data);
@@ -2129,6 +2156,7 @@ ChunkTierPacks(Relation rel, ChunkTierPackInfo **out)
 		packs[n].size = p.size;
 		packs[n].dead = p.dead;
 		packs[n].owner = p.owner;
+		packs[n].kind = (p.flags & PACK_MANIFEST) ? "manifest" : "pack";
 		n++;
 	}
 	*out = packs;

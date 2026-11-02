@@ -173,7 +173,7 @@ test_chunk_log_let_go(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* test_tier_packs(rel) returns setof (id, state, size, dead, owner): its packs */
+/* test_tier_packs(rel) returns setof (id, state, size, dead, owner, kind): its packs */
 Datum
 test_tier_packs(PG_FUNCTION_ARGS)
 {
@@ -191,12 +191,13 @@ test_tier_packs(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	for (int i = 0; i < n; i++)
 	{
-		Datum		values[5] = {
+		Datum		values[6] = {
 			Int64GetDatum(packs[i].id), CStringGetTextDatum(packs[i].state),
 			Int64GetDatum((int64) packs[i].size), Int64GetDatum((int64) packs[i].dead),
-			CStringGetTextDatum(psprintf("%016llx", (unsigned long long) packs[i].owner))
+			CStringGetTextDatum(psprintf("%016llx", (unsigned long long) packs[i].owner)),
+			CStringGetTextDatum(packs[i].kind)
 		};
-		bool		nulls[5] = {false, false, false, false, false};
+		bool		nulls[6] = {false, false, false, false, false, false};
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
