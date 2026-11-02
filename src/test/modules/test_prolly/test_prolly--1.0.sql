@@ -410,6 +410,12 @@ BEGIN
 	RETURN false;
 END $$;
 
+-- The table at the end of a tier's written pack.
+CREATE FUNCTION test_tier_pack_table(rel regclass, id int8, OUT hash bytea, OUT off int8,
+	OUT len int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- A tier's packs: their states, sizes, dead bytes and owners.
 CREATE FUNCTION test_tier_packs(rel regclass, OUT id int8, OUT state text, OUT size int8,
 	OUT dead int8, OUT owner text)
