@@ -410,6 +410,12 @@ BEGIN
 	RETURN false;
 END $$;
 
+-- A tier's packs: their states, sizes and dead bytes.
+CREATE FUNCTION test_tier_packs(rel regclass, OUT id int8, OUT state text, OUT size int8,
+	OUT dead int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- The regions of the log that live backends hold.
 CREATE FUNCTION test_chunk_log_regions(rel regclass)
 RETURNS int4

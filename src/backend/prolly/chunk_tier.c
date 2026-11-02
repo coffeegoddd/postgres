@@ -11,11 +11,22 @@
  *				made it, its size once written, and the bytes of it dead
  *
  * Changes of the catalog are WAL-logged as generic records.  A pack's entry
- * is its transaction's: once that commits, the pack is the store's (its
- * object written before the commit record); if it aborts, or a crash cuts
- * it short, VACUUM removes what object of it there may be.  The entry's
+ * is its transaction's (its top transaction's): once that commits, the
+ * pack is the store's (its object written before the commit record); if
+ * it aborts, or a crash cuts it short, the pack is an orphan.  The entry's
  * record is flushed before the object is written, as the WAL is before
  * the pages it describes, so the catalog has every object there may be.
+ *
+ * VACUUM (of the tier's index, or of the tier itself) settles each pack
+ * whose transaction ended, once: committed, or orphaned; so the catalog
+ * keeps no transaction's id past the tier's relfrozenxid, which it then
+ * advances.  At the end of VACUUM of the index, an orphan's object is
+ * removed, and so is a committed pack all of whose bytes are dead once
+ * every standby connected has replayed past where they died (its readers
+ * may read the pack until then).  Packs are named by the timeline they
+ * were written on, and only the current timeline's are removed: another
+ * timeline's, shared with what came before a promotion, may be another
+ * server's still.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -26,18 +37,23 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/multixact.h"
 #include "access/relation.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "prolly/chunk_tier.h"
 #include "prolly/object_store.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
+#include "replication/walsender.h"
+#include "replication/walsender_private.h"
 #include "storage/procarray.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -59,15 +75,20 @@ typedef struct TierMeta
 } TierMeta;
 
 /* a pack's states */
-#define PACK_MADE			1	/* its transaction's: if committed, the store's */
+#define PACK_MADE			1	/* its transaction's, running or not settled */
 #define PACK_REMOVED		2	/* its object gone, or never written */
+#define PACK_COMMITTED		3	/* the store's: its transaction committed */
+#define PACK_ORPHANED		4	/* its transaction aborted, or a crash cut it */
 
 typedef struct TierPack
 {
 	uint32		state;
 	TransactionId xid;			/* the transaction that made it */
+	TimeLineID	tli;			/* the timeline it was written on */
+	uint32		unused;
 	uint64		size;			/* its bytes, once written */
 	uint64		dead;			/* of them, no chunk's any more */
+	XLogRecPtr	dead_lsn;		/* where the last of them died */
 } TierPack;
 
 #define PACKS_PER_PAGE \
@@ -89,6 +110,7 @@ typedef struct TierPending
 	Oid			relid;
 	RelFileNumber relnumber;
 	uint64		stamp;
+	TimeLineID	tli;
 	char	   *buf;
 	uint64		len;
 	uint64		cap;
@@ -96,6 +118,7 @@ typedef struct TierPending
 
 static TierPending pending;
 static bool callback_registered = false;
+static bool past_pre_commit = false;	/* this transaction's packs written */
 
 /* ------------------------------------------------------------ pages */
 
@@ -154,7 +177,7 @@ read_meta(Relation rel)
 	return meta;
 }
 
-/* pack id's entry's page, locked exclusively; *slot its place */
+/* pack id's entry's page, locked in mode */
 static Buffer
 pack_buffer(Relation rel, uint32 id, int mode)
 {
@@ -180,34 +203,68 @@ pack_entry(Page page, uint32 id)
 	return &((TierPack *) PageGetContents(page))[PACK_SLOT(id)];
 }
 
-/* a pack's object's name: the log's stamp and the pack's number */
+/* a pack's object's name: the log's stamp, its timeline, its number */
 static char *
-pack_name(uint64 stamp, uint32 id)
+pack_name(uint64 stamp, TimeLineID tli, uint32 id)
 {
-	return psprintf("packs/%016llx/%u", (unsigned long long) stamp, id);
+	return psprintf("packs/%016llx/%08x/%u", (unsigned long long) stamp, tli, id);
 }
 
-/* the store the tier keeps its packs in */
+/*
+ * The store the tier keeps its packs in, opened once a backend (again if
+ * the settings change)
+ */
 static ObjectStore *
 tier_objects(void)
 {
+	static ObjectStore *os = NULL;
+	static char *os_store = NULL;
+	static char *os_location = NULL;
+	MemoryContext old;
+
 	if (history_tier_location == NULL || history_tier_location[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the history store's tier has no place set"),
 				 errhint("Set history_tier_location.")));
-	return ObjectStoreOpen(history_tier_store, history_tier_location);
+	if (os != NULL && strcmp(os_store, history_tier_store) == 0 &&
+		strcmp(os_location, history_tier_location) == 0)
+		return os;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	if (os != NULL)
+	{
+		os->routine->close(os);
+		pfree(os_store);
+		pfree(os_location);
+		os = NULL;
+	}
+	os = ObjectStoreOpen(history_tier_store, history_tier_location);
+	os_store = pstrdup(history_tier_store);
+	os_location = pstrdup(history_tier_location);
+	MemoryContextSwitchTo(old);
+	return os;
 }
 
-/* whether a pack's transaction committed (this one's: as if it had) */
-static bool
-pack_committed(const TierPack *p)
+/* the log's stamp, kept in its relcache entry */
+static uint64
+cached_stamp(Relation rel)
 {
-	if (TransactionIdIsCurrentTransactionId(p->xid))
-		return true;
-	if (TransactionIdIsInProgress(p->xid))
-		return false;
-	return TransactionIdDidCommit(p->xid);
+	if (rel->rd_amcache == NULL)
+	{
+		uint64	   *stamp = MemoryContextAlloc(CacheMemoryContext, sizeof(uint64));
+
+		*stamp = read_meta(rel).stamp;
+		rel->rd_amcache = stamp;
+	}
+	return *(uint64 *) rel->rd_amcache;
+}
+
+/* whether a pack is the store's: committed, or this transaction's */
+static bool
+pack_live(const TierPack *p)
+{
+	return p->state == PACK_COMMITTED ||
+		(p->state == PACK_MADE && TransactionIdIsCurrentTransactionId(p->xid));
 }
 
 /* ------------------------------------------------------------ packs */
@@ -228,6 +285,8 @@ begin_pack(Relation rel)
 	BlockNumber blk;
 	TierPack   *p;
 	bool		fresh;
+	uint64		stamp;
+	TimeLineID	tli;
 
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = tier_meta(rel, BufferGetPage(mbuf));
@@ -251,7 +310,14 @@ begin_pack(Relation rel)
 	{
 		pbuf = ReadBuffer(rel, blk);
 		LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+
+		/*
+		 * (one the file was extended by, and a crash before its record:
+		 * made now)
+		 */
+		fresh = PageIsNew(BufferGetPage(pbuf));
 	}
+	INJECTION_POINT("chunk-tier-page-extended", NULL);
 
 	state = GenericXLogStart(rel);
 	mpage = GenericXLogRegisterBuffer(state, mbuf, 0);
@@ -266,22 +332,23 @@ begin_pack(Relation rel)
 	((TierMeta *) PageGetContents(mpage))->next_pack = id + 1;
 	p = pack_entry(ppage, id);
 	p->state = PACK_MADE;
-	p->xid = GetCurrentTransactionId();
+	/* (the top transaction's: a subtransaction's rollback leaves its pack) */
+	p->xid = GetTopTransactionId();
+	p->tli = GetWALInsertionTimeLine();
 	p->size = 0;
 	p->dead = 0;
+	p->dead_lsn = InvalidXLogRecPtr;
+	stamp = meta->stamp;
+	tli = p->tli;
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(pbuf);
 	UnlockReleaseBuffer(mbuf);
 
-	if (!callback_registered)
-	{
-		RegisterXactCallback(tier_xact_callback, NULL);
-		callback_registered = true;
-	}
 	pending.id = id;
 	pending.relid = RelationGetRelid(rel);
 	pending.relnumber = rel->rd_locator.relNumber;
-	pending.stamp = meta->stamp;
+	pending.stamp = stamp;
+	pending.tli = tli;
 	pending.len = 0;
 }
 
@@ -307,7 +374,7 @@ write_pack(Relation rel)
 	if (pending.len > 0)
 	{
 		ObjectStore *os = tier_objects();
-		char	   *name = pack_name(pending.stamp, pending.id);
+		char	   *name = pack_name(pending.stamp, pending.tli, pending.id);
 
 		/*
 		 * (the entry's record flushed before the object is written, as the
@@ -319,7 +386,6 @@ write_pack(Relation rel)
 		/* (no lock held as it is written: its entry is this transaction's) */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		os->routine->put(os, name, pending.buf, pending.len);
-		os->routine->close(os);
 		pfree(name);
 		INJECTION_POINT("chunk-tier-pack-written", NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -347,11 +413,17 @@ tier_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PRE_COMMIT:
 			if (pending.id != 0)
 			{
-				Relation	rel = relation_open(pending.relid, NoLock);
+				Relation	rel = try_relation_open(pending.relid, NoLock);
 
+				if (rel == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("the tier this transaction put chunks in was dropped")));
 				write_pack(rel);
 				relation_close(rel, NoLock);
 			}
+			/* (a put after, by a callback run later, would be lost: refused) */
+			past_pre_commit = true;
 			break;
 		case XACT_EVENT_PRE_PREPARE:
 			if (pending.id != 0)
@@ -365,6 +437,7 @@ tier_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			forget_pending();
+			past_pre_commit = false;
 			break;
 		default:
 			break;
@@ -385,6 +458,19 @@ static void
 tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 {
 	check_writer(rel);
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot put chunks in the history store's tier in parallel mode")));
+	if (past_pre_commit)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot put chunks in the history store's tier as the transaction commits")));
+	if (!callback_registered)
+	{
+		RegisterXactCallback(tier_xact_callback, NULL);
+		callback_registered = true;
+	}
 	if (pending.id != 0 && pending.relnumber != rel->rd_locator.relNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -407,6 +493,8 @@ tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 			MemoryContextAllocHuge(TopMemoryContext, cap);
 		pending.cap = cap;
 	}
+	/* (zeroed: bytes reserved and never written are no memory's) */
+	memset(pending.buf + pending.len, 0, len);
 	run->relnumber = rel->rd_locator.relNumber;
 	run->next = PACK_LOC(pending.id, pending.len);
 	run->limit = run->next + len;
@@ -494,32 +582,39 @@ tier_read(Relation rel, uint64 loc, void *dst, size_t len)
 	}
 	else
 	{
-		TierMeta	meta = read_meta(rel);
-		ObjectStore *os = tier_objects();
-		char	   *name = pack_name(meta.stamp, id);
+		Buffer		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
+		TimeLineID	tli = pack_entry(BufferGetPage(buf), id)->tli;
+		ObjectStore *os;
+		char	   *name;
 
+		UnlockReleaseBuffer(buf);
+		os = tier_objects();
+		name = pack_name(cached_stamp(rel), tli, id);
 		os->routine->read(os, name, LOC_OFF(loc), dst, len);
-		os->routine->close(os);
 		pfree(name);
 	}
 }
 
-/* a pack all dead, its transaction committed: its object removed */
+/* the pack's object removed, and its entry: removed (buf its page, locked) */
 static void
 remove_pack(Relation rel, Buffer buf, uint32 id, uint64 stamp)
 {
 	GenericXLogState *state;
 	ObjectStore *os = tier_objects();
-	char	   *name = pack_name(stamp, id);
+	char	   *name = pack_name(stamp, pack_entry(BufferGetPage(buf), id)->tli, id);
 
 	os->routine->remove(os, name);
-	os->routine->close(os);
 	pfree(name);
 	state = GenericXLogStart(rel);
 	pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id)->state = PACK_REMOVED;
 	GenericXLogFinish(state);
 }
 
+/*
+ * (only counted, WAL-logged, nothing else: VACUUM's end removes what is
+ * dead.  Called between taking entries out and the rest, it must not fail
+ * for want of anything outside.)
+ */
 static void
 tier_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation)
 {
@@ -533,7 +628,7 @@ tier_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation)
 		return;
 	buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
 	p = pack_entry(BufferGetPage(buf), id);
-	if (p->state != PACK_MADE)
+	if (p->state == PACK_REMOVED)
 	{
 		UnlockReleaseBuffer(buf);
 		return;
@@ -541,11 +636,10 @@ tier_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation)
 	state = GenericXLogStart(rel);
 	p = pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id);
 	p->dead += len;
+	/* (where the last died: after the index's records taking them out) */
+	if (p->size > 0 && p->dead >= p->size)
+		p->dead_lsn = GetXLogInsertRecPtr();
 	GenericXLogFinish(state);
-	p = pack_entry(BufferGetPage(buf), id);
-	if (p->size > 0 && p->dead >= p->size && pack_committed(p) &&
-		!TransactionIdIsCurrentTransactionId(p->xid))
-		remove_pack(rel, buf, id, meta.stamp);
 	UnlockReleaseBuffer(buf);
 }
 
@@ -606,24 +700,51 @@ tier_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 	memset(out, 0, sizeof(*out));
 }
 
-static void *
-tier_vacuum_begin(Relation rel)
+/*
+ * The oldest place a standby connected has yet to replay, or
+ * InvalidXLogRecPtr if every one has replayed all, or none is connected
+ */
+static XLogRecPtr
+standbys_replayed(void)
 {
-	return NULL;
+	XLogRecPtr	oldest = InvalidXLogRecPtr;
+
+	if (WalSndCtl == NULL)
+		return InvalidXLogRecPtr;
+	for (int i = 0; i < max_wal_senders; i++)
+	{
+		WalSnd	   *w = &WalSndCtl->walsnds[i];
+		XLogRecPtr	apply;
+		pid_t		pid;
+		WalSndState st;
+		ReplicationKind kind;
+
+		SpinLockAcquire(&w->mutex);
+		pid = w->pid;
+		apply = w->apply;
+		st = w->state;
+		kind = w->kind;
+		SpinLockRelease(&w->mutex);
+		if (pid == 0 || kind != REPLICATION_KIND_PHYSICAL ||
+			(st != WALSNDSTATE_STREAMING && st != WALSNDSTATE_CATCHUP))
+			continue;
+		if (oldest == InvalidXLogRecPtr || apply < oldest)
+			oldest = apply;
+	}
+	return oldest;
 }
 
 /*
- * VACUUM's end: every pack whose transaction aborted, or a crash cut
- * short, removed (what object of it may have been written: the store's
- * removes are of what is there); every pack all dead removed
+ * Every pack whose transaction ended settled, once: committed, or orphaned
+ * (WAL-logged; no object touched); the oldest transaction a pack still
+ * names, or RecentXmin, in *frozen
  */
 static void
-tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
-				const uint8 *pending_bits, uint64 npending, ChunkLogSegments *out)
+settle_packs(Relation rel, TransactionId *frozen)
 {
 	TierMeta	meta = read_meta(rel);
 
-	memset(out, 0, sizeof(*out));
+	*frozen = RecentXmin;
 	for (uint32 id = 1; id < meta.next_pack; id++)
 	{
 		Buffer		buf;
@@ -633,12 +754,100 @@ tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
 			CHECK_FOR_INTERRUPTS();
 		buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
 		p = pack_entry(BufferGetPage(buf), id);
-		if (p->state == PACK_MADE &&
-			!TransactionIdIsCurrentTransactionId(p->xid) &&
-			!TransactionIdIsInProgress(p->xid) &&
-			(!TransactionIdDidCommit(p->xid) || (p->size > 0 && p->dead >= p->size)))
-			remove_pack(rel, buf, id, meta.stamp);
+		if (p->state == PACK_MADE)
+		{
+			if (TransactionIdIsCurrentTransactionId(p->xid) ||
+				TransactionIdIsInProgress(p->xid))
+			{
+				if (TransactionIdPrecedes(p->xid, *frozen))
+					*frozen = p->xid;
+			}
+			else
+			{
+				bool		committed = TransactionIdDidCommit(p->xid);
+				GenericXLogState *state = GenericXLogStart(rel);
+
+				pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id)->state =
+					committed ? PACK_COMMITTED : PACK_ORPHANED;
+				GenericXLogFinish(state);
+			}
+		}
 		UnlockReleaseBuffer(buf);
+	}
+}
+
+/*
+ * the tier's relfrozenxid advanced to frozen, under the lock VACUUM of it
+ * takes (got without waiting from VACUUM of its index: else that VACUUM
+ * advances it)
+ */
+static void
+advance_frozen(Relation rel, TransactionId frozen, bool locked)
+{
+	if (!locked && !ConditionalLockRelation(rel, ShareUpdateExclusiveLock))
+		return;
+	vac_update_relstats(rel, RelationGetNumberOfBlocks(rel), 0, 0, 0, false,
+						frozen, InvalidMultiXactId, NULL, NULL, false);
+	if (!locked)
+		UnlockRelation(rel, ShareUpdateExclusiveLock);
+}
+
+void
+ChunkTierVacuum(Relation rel)
+{
+	TransactionId frozen;
+
+	settle_packs(rel, &frozen);
+	advance_frozen(rel, frozen, true);
+}
+
+static void *
+tier_vacuum_begin(Relation rel)
+{
+	return NULL;
+}
+
+/*
+ * VACUUM of the index ended: every pack settled, the relfrozenxid advanced;
+ * then every orphan's object removed (what object of it may have been
+ * written: the store's removes are of what is there), and every committed
+ * pack's all of whose bytes are dead once every standby connected has
+ * replayed past where they died; the current timeline's alone
+ */
+static void
+tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
+				const uint8 *pending_bits, uint64 npending, ChunkLogSegments *out)
+{
+	TierMeta	meta = read_meta(rel);
+	TransactionId frozen;
+	XLogRecPtr	replayed = standbys_replayed();
+	TimeLineID	tli = GetWALInsertionTimeLine();
+
+	memset(out, 0, sizeof(*out));
+	settle_packs(rel, &frozen);
+	advance_frozen(rel, frozen, false);
+	for (uint32 id = 1; id < meta.next_pack; id++)
+	{
+		Buffer		buf;
+		TierPack	p;
+
+		if (PACK_SLOT(id) == 0 || id == 1)
+			CHECK_FOR_INTERRUPTS();
+		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
+		p = *pack_entry(BufferGetPage(buf), id);
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		if (p.tli == tli &&
+			(p.state == PACK_ORPHANED ||
+			 (p.state == PACK_COMMITTED && p.size > 0 && p.dead >= p.size &&
+			  (replayed == InvalidXLogRecPtr || p.dead_lsn <= replayed))))
+		{
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			p = *pack_entry(BufferGetPage(buf), id);
+			if (p.state == PACK_ORPHANED || p.state == PACK_COMMITTED)
+				remove_pack(rel, buf, id, meta.stamp);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		}
+		ReleaseBuffer(buf);
 	}
 }
 
@@ -683,10 +892,14 @@ tier_check_live(Relation rel, int n, const uint64 *locs, const uint32 *lens,
 		UnlockReleaseBuffer(buf);
 		if (id == pending.id && pending.relnumber == rel->rd_locator.relNumber)
 			p.size = pending.len;
-		if (p.state != PACK_MADE || !pack_committed(&p))
+		if (p.state == PACK_MADE && !TransactionIdIsCurrentTransactionId(p.xid) &&
+			!TransactionIdIsInProgress(p.xid) && TransactionIdDidCommit(p.xid))
+			p.state = PACK_COMMITTED;
+		if (!pack_live(&p))
 			*why = psprintf("pack %u of tier \"%s\" has live chunks but is %s",
 							id, RelationGetRelationName(rel),
-							p.state != PACK_MADE ? "removed" : "no committed transaction's");
+							p.state == PACK_REMOVED ? "removed" :
+							p.state == PACK_ORPHANED ? "an orphan" : "no committed transaction's");
 		else if (live[id] + p.dead > p.size)
 			*why = psprintf("pack %u of tier \"%s\" has %llu bytes of live chunks, %llu dead, and %llu in all",
 							id, RelationGetRelationName(rel),
@@ -696,6 +909,31 @@ tier_check_live(Relation rel, int n, const uint64 *locs, const uint32 *lens,
 	}
 	pfree(live);
 	return ok;
+}
+
+int
+ChunkTierPacks(Relation rel, ChunkTierPackInfo **out)
+{
+	TierMeta	meta = read_meta(rel);
+	ChunkTierPackInfo *packs = palloc0_array(ChunkTierPackInfo, Max(meta.next_pack, 1));
+	int			n = 0;
+
+	for (uint32 id = 1; id < meta.next_pack; id++)
+	{
+		Buffer		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
+		TierPack	p = *pack_entry(BufferGetPage(buf), id);
+
+		UnlockReleaseBuffer(buf);
+		packs[n].id = id;
+		packs[n].state = p.state == PACK_MADE ? "made" :
+			p.state == PACK_COMMITTED ? "committed" :
+			p.state == PACK_ORPHANED ? "orphaned" : "removed";
+		packs[n].size = p.size;
+		packs[n].dead = p.dead;
+		n++;
+	}
+	*out = packs;
+	return n;
 }
 
 const ChunkLogRoutine TierChunkLog = {

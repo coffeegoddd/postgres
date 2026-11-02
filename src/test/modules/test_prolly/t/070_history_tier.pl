@@ -3,9 +3,12 @@
 # The history store's tier across crashes and on a hot standby: a pack
 # written as its transaction commits survives a crash; one written, the
 # crash before the commit, is an orphan, its chunks not there, its object
-# removed by VACUUM; a transaction's chunks past a pack's size go in
-# packs one after another; and a hot standby, at the same tier, reads
-# them.
+# removed by VACUUM; a crash after the catalog's file is extended for a
+# pack's entry, before the entry's record, leaves a page the next pack
+# makes; a transaction's chunks past a pack's size go in packs one after
+# another; a hot standby, at the same tier, reads them; and a pack all
+# dead keeps its object until the standby has replayed past where it
+# died.
 
 use strict;
 use warnings FATAL => 'all';
@@ -25,6 +28,8 @@ $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 chunk_free_in_background = off
 history_tier_location = '$tier'
+# (no flush of the WAL but what the tier and commits ask)
+wal_writer_delay = 10000
 });
 $node->start;
 $node->safe_psql('postgres', q{
@@ -78,6 +83,30 @@ $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $before - 1, 'and removed by VACUUM, an orphan');
 is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('tier')}), 't', 'the audit clean');
 
+# the catalog's file extended for a new page of entries, the crash before
+# the entry's record: a page of zeros, which the next pack makes a page
+my $kept0 = $node->safe_psql('postgres', q{SELECT count(*) FROM test_tier_packs('pg_history.tier_chunks')});
+my $per_page = int((8192 - 24) / 40);
+my $to_page = $per_page - ($kept0 % $per_page);
+$node->safe_psql('postgres', qq{
+	DO \$\$BEGIN FOR i IN 1 .. $to_page LOOP
+		PERFORM test_cs_put('tier', convert_to('fill' || i, 'UTF8'));
+		COMMIT;
+	END LOOP; END\$\$;
+});
+my $e = $node->background_psql('postgres', on_error_stop => 0);
+$e->query_safe(q{SELECT injection_points_set_local()});
+$e->query_safe(q{SELECT injection_points_attach('chunk-tier-page-extended', 'wait')});
+$e->query_until(qr/extending/, "\\echo extending\nSELECT test_cs_put('tier', convert_to('lost', 'UTF8'));\n");
+$node->wait_for_event('client backend', 'chunk-tier-page-extended');
+$node->stop('immediate');
+$e->{run}->finish;
+$node->start;
+is($node->safe_psql('postgres', q{SELECT (test_cs_put('tier', convert_to('after-zero', 'UTF8'))).stored}),
+	't', 'a pack begun on the page of zeros the crash left');
+is($node->safe_psql('postgres', q{SELECT convert_from(test_cs_get('tier', substr(sha256(convert_to('after-zero', 'UTF8')), 1, 20)), 'UTF8')}),
+	'after-zero', 'and read back');
+
 # more than a pack holds, in one transaction: packs one after another
 my $p0 = $packs->();
 $node->safe_psql('postgres', q{
@@ -93,6 +122,25 @@ is($node->safe_psql('postgres', q{SELECT count(*) FILTER (WHERE test_cs_get('tie
 # a hot standby at the same tier reads them
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $kept), '20', 'the standby reads the tier\'s chunks');
+
+# a pack all dead, the standby's replay paused before: its object kept
+# (the standby's readers may read it) until the standby replays past
+$standby->safe_psql('postgres', 'SELECT pg_wal_replay_pause()');
+$node->safe_psql('postgres', q{
+	SELECT count(*) FROM generate_series(1, 20) g,
+		LATERAL test_cs_unref_root('tier', h(blob('kept' || g, 3000)));
+	SELECT test_cs_free('tier', ARRAY(SELECT h(blob('kept' || g, 3000)) FROM generate_series(1, 20) g));
+});
+my $p1 = $packs->();
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p1, 'all dead, kept while the standby has not replayed past');
+is($standby->safe_psql('postgres', $kept), '20', 'the standby reads them still');
+$standby->safe_psql('postgres', 'SELECT pg_wal_replay_resume()');
+# (VACUUM's records flushed, for the standby to have them)
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p1 - 1, 'and removed once it has');
 
 $standby->stop;
 $node->stop;

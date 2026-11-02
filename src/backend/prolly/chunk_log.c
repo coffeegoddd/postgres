@@ -2745,8 +2745,18 @@ tier_relation_set_new_filelocator(Relation rel,
 	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
 											 freezeXid, minmulti);
 
+	/* (its packs' entries name the transactions that made them) */
+	*freezeXid = RecentXmin;
 	ChunkTierInitStorage(srel, XLogIsNeeded());
 	smgrclose(srel);
+}
+
+/* a tier log's VACUUM: its packs settled, its relfrozenxid advanced */
+static void
+tier_relation_vacuum(Relation rel, const VacuumParams *params,
+					 BufferAccessStrategy bstrategy)
+{
+	ChunkTierVacuum(rel);
 }
 
 /* (made afresh, a stamp of its own: the packs of the one before are not its) */
@@ -2755,6 +2765,12 @@ tier_relation_nontransactional_truncate(Relation rel)
 {
 	RelationTruncate(rel, 0);
 	ChunkTierInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+	/* (its stamp a new one) */
+	if (rel->rd_amcache != NULL)
+	{
+		pfree(rel->rd_amcache);
+		rel->rd_amcache = NULL;
+	}
 }
 
 static TableAmRoutine tier_routine;
@@ -2769,6 +2785,7 @@ tier_table_routine(void)
 		tier_routine.relation_set_new_filelocator = tier_relation_set_new_filelocator;
 		tier_routine.relation_nontransactional_truncate =
 			tier_relation_nontransactional_truncate;
+		tier_routine.relation_vacuum = tier_relation_vacuum;
 		tier_routine_made = true;
 	}
 	return &tier_routine;
