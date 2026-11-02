@@ -125,8 +125,9 @@ typedef struct ChunkIndexRoutine
 	 * Adds drefs and droots to hash's counts, in this transaction (they are
 	 * the chunk's when it commits), and answers the entry's counts after,
 	 * as this transaction sees them; false if there is no entry.  Taking a
-	 * count below zero is an error; a decrease waits for another
-	 * transaction decreasing the chunk's counts to end.  A subtransaction's
+	 * count below zero is an error; a decrease of roots waits for another
+	 * transaction decreasing the chunk's roots to end (references are let
+	 * go of only by freeing the chunk they are from, once).  A subtransaction's
 	 * changes of one chunk's counts are one change.  Adding nothing holds
 	 * the chunk: no other transaction frees it while this one runs (a
 	 * change is written, unless this transaction, or one it is part of,

@@ -44,6 +44,7 @@ test_prolly_isolation = [
   'chunk_take_back',
   'chunk_hold',
   'chunk_run_seal',
+  'chunk_free_order',
 ]
 # (these need injection points)
 if get_option('injection_points')
@@ -152,6 +153,7 @@ tests += {
       't/060_chunk_index_redo_readers.pl',
       't/061_history_backups.pl',
       't/062_chunk_entries_first.pl',
+      't/066_history_concurrent.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

@@ -1,0 +1,66 @@
+Parsed test spec with 3 sessions
+
+starting permutation: a_begin b_begin a_free1 b_free1 a_free2 b_free2 a_commit b_commit c_counts
+stored
+------
+t     
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step a_begin: BEGIN;
+step b_begin: BEGIN;
+step a_free1: SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf1', '\x0a0c01'))]) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step b_free1: SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf3', '\x0a0c02'))]) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step a_free2: SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf2', '\x0a0c02'))]) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step b_free2: SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf4', '\x0a0c01'))]) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step a_commit: COMMIT;
+step b_commit: COMMIT;
+step c_counts: 
+	SELECT string_agg(coalesce(refs::text, '-'), ',' ORDER BY k) AS refs
+	FROM unnest(ARRAY['\x0a0c01', '\x0a0c02']::bytea[]) WITH ORDINALITY u(d, k),
+		LATERAL test_cs_counts('pages', fo_h(d));
+
+refs
+----
+0,0 
+(1 row)
+
+test_cs_free_unheld
+-------------------
+                  2
+(1 row)
+
