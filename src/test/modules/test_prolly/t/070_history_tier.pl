@@ -206,6 +206,48 @@ $node->safe_psql('postgres', 'CHECKPOINT');
 $node->wait_for_replay_catchup($standby);
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $p4 - 1, 'all dead, removed with pg_receivewal streaming');
+
+# a pack kept for a standby replaying, and one after it removed (with
+# pg_receivewal, looked at after the standby, streaming still): the
+# standby's walsender named
+my $make = sub {
+	my ($tag) = @_;
+	$node->safe_psql('postgres', qq{
+		SELECT count(*) FROM generate_series(1, 5) g,
+			LATERAL test_cs_put('tier', blob('$tag' || g, 3000));
+		SELECT count(*) FROM generate_series(1, 5) g,
+			LATERAL test_cs_ref_root('tier', h(blob('$tag' || g, 3000)));
+	});
+};
+my $kill = sub {
+	my ($tag) = @_;
+	$node->safe_psql('postgres', qq{
+		SELECT count(*) FROM generate_series(1, 5) g,
+			LATERAL test_cs_unref_root('tier', h(blob('$tag' || g, 3000)));
+		SELECT test_cs_free('tier', ARRAY(SELECT h(blob('$tag' || g, 3000)) FROM generate_series(1, 5) g));
+	});
+};
+$make->('lagging');
+$make->('passing');
+$kill->('passing');
+my $p6 = $packs->();
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+$standby->safe_psql('postgres', 'SELECT pg_wal_replay_pause()');
+$kill->('lagging');
+my $standby_sender = $node->safe_psql('postgres',
+	q{SELECT pid FROM pg_stat_replication WHERE application_name = 'tier_standby'});
+$log_at = -s $node->logfile;
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p6 - 1, 'the pack the standby replayed past removed, the other kept');
+ok($node->log_contains(qr/DETAIL:  Walsender $standby_sender has not replayed past where they died/, $log_at),
+	'the standby\'s walsender named');
+$standby->safe_psql('postgres', 'SELECT pg_wal_replay_resume()');
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p6 - 2, 'and that one once it has');
 $rw->kill_kill;
 $node->poll_query_until('postgres',
 	q{SELECT count(*) = 0 FROM pg_stat_replication WHERE application_name = 'pg_receivewal'})
@@ -213,6 +255,9 @@ $node->poll_query_until('postgres',
 
 # a sender that has not yet replied (as a standby just connected): waited
 # for
+# (the walsender not asking it for a reply)
+$node->safe_psql('postgres', 'ALTER SYSTEM SET wal_sender_timeout = 0');
+$node->reload;
 my $wal_dir2 = PostgreSQL::Test::Utils::tempdir;
 my $rw2 = IPC::Run::start(
 	[ 'pg_receivewal', '--no-loop', '--status-interval=0', '--directory' => $wal_dir2,
@@ -236,6 +281,8 @@ $node->poll_query_until('postgres',
   or die 'the quiet pg_receivewal runs still';
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $p5 - 1, 'and removed once it is gone');
+$node->safe_psql('postgres', 'ALTER SYSTEM RESET wal_sender_timeout');
+$node->reload;
 
 # the store opened again once the settings change: a pack after a reload
 # where they say
