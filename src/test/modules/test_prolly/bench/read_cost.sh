@@ -7,8 +7,8 @@
 # time (read in the log's order); every byte read summed, as storebench
 # sums dirstore's.  Each three times.  Warm: everything in shared buffers
 # (set large enough to hold the store).  Cold: just after a restart,
-# shared buffers empty, the kernel's page cache as it is (not dropped: that
-# needs root), so no read goes to the disk.  Beside it, dirstore's
+# shared buffers empty, the kernel's page cache not dropped (that needs
+# root), and warm from the writes just before.  Beside it, dirstore's
 # memory-mapped reads (src/prolly/bench/storebench) if given: its "read"
 # just after its writes, and its "read cold" after it reopens, the page
 # cache warm both times.
