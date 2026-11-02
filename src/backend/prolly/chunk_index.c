@@ -969,6 +969,7 @@ split_bucket(Relation rel)
 	}
 	else
 		dir_blk = meta->dir[new_b / DIR_PER_PAGE];
+	INJECTION_POINT("chunk-index-split-copied", NULL);
 
 	/* one record makes it a bucket */
 	{

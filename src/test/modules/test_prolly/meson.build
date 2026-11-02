@@ -157,7 +157,6 @@ tests += {
       't/064_history_dump.pl',
       't/065_history_crash_steps.pl',
       't/066_history_concurrent.pl',
-      't/066_history_concurrent.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
