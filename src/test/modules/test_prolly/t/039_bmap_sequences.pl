@@ -65,6 +65,11 @@ isnt(sql(qq{SELECT test_bmap_rows_digest($s)}), $shared_at,
 # Reading a shared sequence's value copies nothing and logs nothing.
 my $copy2 = sql(qq{SELECT test_bmap_share($s)});
 my $phys2 = sql(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 0});
+# (read once first: the catalogs' tuples read hinted then, whose hints a
+# first read would log, with checksums, as images of their pages)
+sql(q{SELECT last_value FROM pg_sequences WHERE sequencename = 's';
+	SELECT pg_sequence_last_value('s'); SELECT * FROM pg_get_sequence_data('s')});
+$phys2 = sql(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 0});
 my $lsn = sql(q{SELECT pg_current_wal_insert_lsn()});
 sql(q{SELECT last_value FROM pg_sequences WHERE sequencename = 's';
 	SELECT pg_sequence_last_value('s'); SELECT * FROM pg_get_sequence_data('s')});
