@@ -134,4 +134,27 @@ FROM generate_series(1, 30) g;
 SELECT ok, chunks FROM test_chunk_check('ql3', 'qi3');
 DROP TABLE ql3, qi3;
 DROP FUNCTION big(text);
+
+-- chunks of half a page and a little more, freed, and others as long put
+-- again: into the run of pages freed (not a page at a time, which would
+-- leave each page's rest, too short for the next, dead), the file no bigger
+CREATE TABLE ql4 () USING prolly_chunks;
+CREATE TABLE qi4 () USING prolly_chunk_index;
+CREATE FUNCTION mid(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad(tag, 4100, '.'), 'UTF8')$$;
+SELECT count(*) FILTER (WHERE test_chunk_put('ql4', 'qi4', h(mid('a' || g)), mid('a' || g))) AS put
+FROM generate_series(1, 60) g;
+SELECT test_chunk_put('ql4', 'qi4', h(mid('anchor')), mid('anchor')) AS anchor;
+SELECT roots FROM test_chunk_ref_root('qi4', h(mid('anchor')));
+SELECT pg_relation_size('ql4') AS size4 \gset
+SELECT test_chunk_free_unheld('ql4', 'qi4') AS freed;
+VACUUM qi4;
+\c
+SET chunk_free_in_background = off;
+SELECT count(*) FILTER (WHERE test_chunk_put('ql4', 'qi4', h(mid('b' || g)), mid('b' || g))) AS put_again
+FROM generate_series(1, 55) g;
+SELECT pg_relation_size('ql4') = :size4 AS no_bigger_run;
+SELECT ok, chunks FROM test_chunk_check('ql4', 'qi4');
+DROP TABLE ql4, qi4;
+DROP FUNCTION mid(text);
 DROP FUNCTION blob(text), h(bytea);
