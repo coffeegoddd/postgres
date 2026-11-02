@@ -33,6 +33,14 @@ SELECT set_config('test.os_store', :'store', false) IS NOT NULL AS store_set,
  t         | t
 (1 row)
 
+-- (the location emptied first, of what a run cut short may have left)
+SELECT count(test_os_remove(:'store', :'location', name)) >= 0 AS emptied
+FROM test_os_list(:'store', :'location', '');
+ emptied 
+---------
+ t
+(1 row)
+
 -- every implementation is run by a file of its own
 SELECT count(*) FILTER (WHERE s = :'store') AS registered FROM test_os_stores() s;
  registered 
@@ -107,7 +115,7 @@ SELECT test_os_read(:'store', :'location', 'a/one', 0, 5) AS still_first;
  \x0102030405
 (1 row)
 
--- not there, or too short: errors; a size of none is NULL
+-- not there, or a range not all in it: errors; a size of none is NULL
 SELECT pg_temp.refused(format('SELECT test_os_read(%L, %L, %L, 0, 1)', :'store', :'location', 'a/none')) AS none_read;
               none_read              
 -------------------------------------
@@ -115,9 +123,15 @@ SELECT pg_temp.refused(format('SELECT test_os_read(%L, %L, %L, 0, 1)', :'store',
 (1 row)
 
 SELECT pg_temp.refused(format('SELECT test_os_read(%L, %L, %L, 3, 3)', :'store', :'location', 'a/one')) AS short_read;
-                  short_read                  
-----------------------------------------------
- XX001: object "a/one" has fewer than 6 bytes
+                         short_read                          
+-------------------------------------------------------------
+ 22023: bytes 3 to 6 are not all in object "a/one" (5 bytes)
+(1 row)
+
+SELECT pg_temp.refused(format('SELECT test_os_read(%L, %L, %L, 6, 0)', :'store', :'location', 'a/one')) AS past_end;
+                          past_end                           
+-------------------------------------------------------------
+ 22023: bytes 6 to 6 are not all in object "a/one" (5 bytes)
 (1 row)
 
 SELECT test_os_size(:'store', :'location', 'a/none') IS NULL AS no_size;
@@ -148,12 +162,12 @@ SELECT name FROM test_os_list(:'store', :'location', 'a/t');
  a/two
 (1 row)
 
--- removed, once
-SELECT test_os_remove(:'store', :'location', 'a/two') AS removed,
-	test_os_remove(:'store', :'location', 'a/two') AS again;
+-- removed; removed again, nothing (as object storage's deletes)
+SELECT test_os_remove(:'store', :'location', 'a/two') IS NOT NULL AS removed,
+	test_os_remove(:'store', :'location', 'a/two') IS NOT NULL AS again;
  removed | again 
 ---------+-------
- t       | f
+ t       | t
 (1 row)
 
 SELECT name FROM test_os_list(:'store', :'location', 'a/');
@@ -176,79 +190,189 @@ SELECT test_os_read(:'store', :'location', 'a/two', 0, 1) AS rewritten;
  \x22
 (1 row)
 
--- names: letters, digits and "._-", in parts by "/", none empty, "." or ".."
-SELECT pg_temp.put_refused('', '\x00') AS refused;
-                       refused                       
------------------------------------------------------
- 22023: an object's name must be 1 to 256 bytes long
-(1 row)
-
-SELECT pg_temp.put_refused('/abs', '\x00') AS refused;
-                         refused                          
-----------------------------------------------------------
- 22023: object name "/abs" has an empty, "." or ".." part
-(1 row)
-
-SELECT pg_temp.put_refused('a//b', '\x00') AS refused;
-                         refused                          
-----------------------------------------------------------
- 22023: object name "a//b" has an empty, "." or ".." part
-(1 row)
-
-SELECT pg_temp.put_refused('a/../b', '\x00') AS refused;
-                          refused                           
-------------------------------------------------------------
- 22023: object name "a/../b" has an empty, "." or ".." part
-(1 row)
-
-SELECT pg_temp.put_refused('a/./b', '\x00') AS refused;
-                          refused                          
------------------------------------------------------------
- 22023: object name "a/./b" has an empty, "." or ".." part
-(1 row)
-
-SELECT pg_temp.put_refused('a/b/', '\x00') AS refused;
-                         refused                          
-----------------------------------------------------------
- 22023: object name "a/b/" has an empty, "." or ".." part
-(1 row)
-
-SELECT pg_temp.put_refused('a b', '\x00') AS refused;
-                                      refused                                       
-------------------------------------------------------------------------------------
- 22023: object name "a b" has a character other than letters, digits, "._-" and "/"
-(1 row)
-
-SELECT pg_temp.put_refused('x.tmp.1', '\x00') AS refused;
-                    refused                     
-------------------------------------------------
- 22023: object name "x.tmp.1" has ".tmp." in it
-(1 row)
-
-SELECT pg_temp.put_refused(repeat('n', 257), '\x00') AS refused;
-                       refused                       
------------------------------------------------------
- 22023: an object's name must be 1 to 256 bytes long
-(1 row)
-
-SELECT test_os_put(:'store', :'location', 'A-z_0.9/ok', '\x09'::bytea);
+-- a name and names under it ("a" and "a/one") both objects; one removed,
+-- the others there
+SELECT test_os_put(:'store', :'location', 'a', '\x0a'::bytea);
  test_os_put 
 -------------
  
 (1 row)
 
-SELECT test_os_size(:'store', :'location', 'A-z_0.9/ok') AS ok_name;
+SELECT name, size FROM test_os_list(:'store', :'location', 'a');
+  name   | size 
+---------+------
+ a       |    1
+ a/empty |    0
+ a/one   |    5
+ a/two   |    1
+(4 rows)
+
+SELECT test_os_remove(:'store', :'location', 'a') IS NOT NULL AS removed_a;
+ removed_a 
+-----------
+ t
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'a') IS NULL AS a_gone,
+	test_os_size(:'store', :'location', 'a/one') AS one_kept;
+ a_gone | one_kept 
+--------+----------
+ t      |        5
+(1 row)
+
+-- listed in byte order: "a-" before "a/", "a/" before "a0"
+SELECT test_os_put(:'store', :'location', 'a-x', '\x01'::bytea),
+	test_os_put(:'store', :'location', 'a0', '\x01'::bytea);
+ test_os_put | test_os_put 
+-------------+-------------
+             | 
+(1 row)
+
+SELECT string_agg(name, ' ' ORDER BY ord) AS listed
+FROM test_os_list(:'store', :'location', 'a') WITH ORDINALITY l(name, size, ord);
+           listed           
+----------------------------
+ a-x a/empty a/one a/two a0
+(1 row)
+
+-- names: lowercase letters, digits and "._-", in parts by "/", none empty,
+-- "." or "..", none ending in "."; not beginning with "."; not, to the
+-- first ".", a Windows device's; at most 200 bytes
+SELECT pg_temp.put_refused('', '\x00') AS refused;
+                       refused                       
+-----------------------------------------------------
+ 22023: an object's name must be 1 to 200 bytes long
+(1 row)
+
+SELECT pg_temp.put_refused('/abs', '\x00') AS refused;
+                              refused                              
+-------------------------------------------------------------------
+ 22023: object name "/abs" has an empty part, or one ending in "."
+(1 row)
+
+SELECT pg_temp.put_refused('a//b', '\x00') AS refused;
+                              refused                              
+-------------------------------------------------------------------
+ 22023: object name "a//b" has an empty part, or one ending in "."
+(1 row)
+
+SELECT pg_temp.put_refused('a/../b', '\x00') AS refused;
+                               refused                               
+---------------------------------------------------------------------
+ 22023: object name "a/../b" has an empty part, or one ending in "."
+(1 row)
+
+SELECT pg_temp.put_refused('a/./b', '\x00') AS refused;
+                              refused                               
+--------------------------------------------------------------------
+ 22023: object name "a/./b" has an empty part, or one ending in "."
+(1 row)
+
+SELECT pg_temp.put_refused('a/b/', '\x00') AS refused;
+                              refused                              
+-------------------------------------------------------------------
+ 22023: object name "a/b/" has an empty part, or one ending in "."
+(1 row)
+
+SELECT pg_temp.put_refused('a b', '\x00') AS refused;
+                                           refused                                            
+----------------------------------------------------------------------------------------------
+ 22023: object name "a b" has a character other than lowercase letters, digits, "._-" and "/"
+(1 row)
+
+SELECT pg_temp.put_refused('Upper', '\x00') AS refused;
+                                            refused                                             
+------------------------------------------------------------------------------------------------
+ 22023: object name "Upper" has a character other than lowercase letters, digits, "._-" and "/"
+(1 row)
+
+SELECT pg_temp.put_refused('a/b.', '\x00') AS refused;
+                              refused                              
+-------------------------------------------------------------------
+ 22023: object name "a/b." has an empty part, or one ending in "."
+(1 row)
+
+SELECT pg_temp.put_refused('.hidden', '\x00') AS refused;
+                   refused                    
+----------------------------------------------
+ 22023: object name ".hidden" begins with "."
+(1 row)
+
+SELECT pg_temp.put_refused('a#b', '\x00') AS refused;
+                                           refused                                            
+----------------------------------------------------------------------------------------------
+ 22023: object name "a#b" has a character other than lowercase letters, digits, "._-" and "/"
+(1 row)
+
+SELECT pg_temp.put_refused('~tmp', '\x00') AS refused;
+                                            refused                                            
+-----------------------------------------------------------------------------------------------
+ 22023: object name "~tmp" has a character other than lowercase letters, digits, "._-" and "/"
+(1 row)
+
+SELECT pg_temp.put_refused('nul', '\x00') AS refused;
+                                refused                                 
+------------------------------------------------------------------------
+ 22023: object name "nul" begins with a name Windows keeps for a device
+(1 row)
+
+SELECT pg_temp.put_refused('com1.txt', '\x00') AS refused;
+                                   refused                                   
+-----------------------------------------------------------------------------
+ 22023: object name "com1.txt" begins with a name Windows keeps for a device
+(1 row)
+
+SELECT pg_temp.put_refused('aux/x', '\x00') AS refused;
+                                 refused                                  
+--------------------------------------------------------------------------
+ 22023: object name "aux/x" begins with a name Windows keeps for a device
+(1 row)
+
+SELECT pg_temp.put_refused(repeat('n', 201), '\x00') AS refused;
+                       refused                       
+-----------------------------------------------------
+ 22023: an object's name must be 1 to 200 bytes long
+(1 row)
+
+SELECT test_os_put(:'store', :'location', repeat('n', 200), '\x0c'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_size(:'store', :'location', repeat('n', 200)) AS longest;
+ longest 
+---------
+       1
+(1 row)
+
+-- (and these are names)
+SELECT test_os_put(:'store', :'location', 'console', '\x01'::bytea),
+	test_os_put(:'store', :'location', 'com10', '\x01'::bytea),
+	test_os_put(:'store', :'location', 'x.y/.z', '\x01'::bytea);
+ test_os_put | test_os_put | test_os_put 
+-------------+-------------+-------------
+             |             | 
+(1 row)
+
+SELECT test_os_put(:'store', :'location', 'a-z_0.9/ok', '\x09'::bytea);
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT test_os_size(:'store', :'location', 'a-z_0.9/ok') AS ok_name;
  ok_name 
 ---------
        1
 (1 row)
 
 -- cleaned up
-SELECT count(*) FILTER (WHERE test_os_remove(:'store', :'location', name)) AS removed_all
+SELECT count(test_os_remove(:'store', :'location', name)) AS removed_all
 FROM test_os_list(:'store', :'location', '');
  removed_all 
 -------------
-           5
+          11
 (1 row)
 
 SELECT count(*) AS left FROM test_os_list(:'store', :'location', '');
