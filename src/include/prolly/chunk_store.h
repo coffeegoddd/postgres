@@ -110,7 +110,9 @@ extern void ChunkStoreUnrefRoot(Relation idx, const uint8 *hash,
  * roots, no pins, no other transaction changing their counts), and those
  * their references alone held, and so on; answers how many it freed.  The
  * freeing is this transaction's: the chunks are gone as it commits, and
- * nothing is if it aborts.  Time is the chunks freed's.
+ * nothing is if it aborts.  Time is the chunks freed's.  A chunk whose last
+ * references two transactions let go of at once is freed by neither (each
+ * sees the other's reference left): VACUUM's freer finds it.
  */
 extern uint64 ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes,
 							 int n);

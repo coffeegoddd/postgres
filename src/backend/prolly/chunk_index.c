@@ -1007,9 +1007,10 @@ split_bucket(Relation rel)
  * The changes of hash's counts on the chain of the bucket whose first page
  * is primary (locked): those this transaction sees added to *drefs and
  * *droots; the transaction of a decrease of roots it doesn't see
- * (another's, running) in *running, if it is given (or of any change, if
- * any_running: an increase it doesn't see can only add to the counts); and
- * where this very transaction's own change is, in
+ * (another's, running) in *running, if it is given (an increase it doesn't
+ * see can only add to the counts, and references are let go of by one
+ * transaction each: see page_adjust), or of any change, if any_running;
+ * and where this very transaction's own change is, in
  * *own_blk and *own_at, if they are given.
  */
 static void

@@ -126,8 +126,12 @@ typedef struct ChunkIndexRoutine
 	 * the chunk's when it commits), and answers the entry's counts after,
 	 * as this transaction sees them; false if there is no entry.  Taking a
 	 * count below zero is an error; a decrease of roots waits for another
-	 * transaction decreasing the chunk's roots to end (references are let
-	 * go of only by freeing the chunk they are from, once).  A subtransaction's
+	 * transaction decreasing the chunk's roots to end.  A decrease of
+	 * references waits for none: its caller lets go of only references
+	 * that are its alone (of a chunk it frees, which no other may, or its
+	 * own increase taken back).  So two letting go of a chunk's last
+	 * references at once may each see one left, and leave it with none,
+	 * for VACUUM's freer to find.  A subtransaction's
 	 * changes of one chunk's counts are one change.  Adding nothing holds
 	 * the chunk: no other transaction frees it while this one runs (a
 	 * change is written, unless this transaction, or one it is part of,
