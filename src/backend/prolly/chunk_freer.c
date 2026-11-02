@@ -153,7 +153,7 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 		/* (compaction appends to the log) */
 		log = try_relation_open(args->log, op == FREER_FREE ? AccessShareLock : RowExclusiveLock);
 		idx = try_relation_open(args->idx, RowExclusiveLock);
-		if (log != NULL && idx != NULL && RelationIsChunkLog(log) &&
+		if (log != NULL && idx != NULL && RelationIsAnyChunkLog(log) &&
 			RelationIsChunkIndex(idx))
 		{
 			BlockNumber nblocks = RelationGetNumberOfBlocks(log);

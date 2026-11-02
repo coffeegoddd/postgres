@@ -5214,8 +5214,9 @@ Indexes:
  heap2              | Table
  prolly_chunk_index | Table
  prolly_chunks      | Table
+ prolly_tier        | Table
  spgist             | Index
-(10 rows)
+(11 rows)
 
 \dA *
    List of access methods
@@ -5230,8 +5231,9 @@ Indexes:
  heap2              | Table
  prolly_chunk_index | Table
  prolly_chunks      | Table
+ prolly_tier        | Table
  spgist             | Index
-(10 rows)
+(11 rows)
 
 \dA h*
 List of access methods
@@ -5268,8 +5270,9 @@ List of access methods
  heap2              | Table | heap_tableam_handler               | 
  prolly_chunk_index | Table | prolly_chunk_index_tableam_handler | chunk index table access method
  prolly_chunks      | Table | prolly_chunks_tableam_handler      | chunk log table access method
+ prolly_tier        | Table | prolly_tier_tableam_handler        | history tier table access method
  spgist             | Index | spghandler                         | SP-GiST index access method
-(10 rows)
+(11 rows)
 
 \dA+ *
                                           List of access methods
@@ -5284,8 +5287,9 @@ List of access methods
  heap2              | Table | heap_tableam_handler               | 
  prolly_chunk_index | Table | prolly_chunk_index_tableam_handler | chunk index table access method
  prolly_chunks      | Table | prolly_chunks_tableam_handler      | chunk log table access method
+ prolly_tier        | Table | prolly_tier_tableam_handler        | history tier table access method
  spgist             | Index | spghandler                         | SP-GiST index access method
-(10 rows)
+(11 rows)
 
 \dA+ h*
                      List of access methods

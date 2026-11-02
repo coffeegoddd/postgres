@@ -1134,7 +1134,7 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 	hash_destroy(as.chunks);
 
 	/* and no live chunk's bytes are counted dead */
-	if (!ChunkLogCheckLive(log, nlive, locs, lens, &dead_why) && es.why == NULL)
+	if (!ChunkLogOf(log)->check_live(log, nlive, locs, lens, &dead_why) && es.why == NULL)
 		es.why = dead_why;
 	pfree(locs);
 	pfree(lens);

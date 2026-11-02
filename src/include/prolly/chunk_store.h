@@ -30,10 +30,13 @@ extern void ChunkHash(const void *data, size_t len, uint8 *out);
 
 /*
  * The relations of this database's history store, from initdb:
- * pg_history.chunks, pg_history.chunk_index and pg_history.pointers.
+ * pg_history.chunks, pg_history.chunk_index, its tier's
+ * pg_history.tier_chunks and pg_history.tier_index, and pg_history.pointers.
  */
 extern Oid	ChunkStoreLogRelid(void);
 extern Oid	ChunkStoreIndexRelid(void);
+extern Oid	ChunkStoreTierLogRelid(void);
+extern Oid	ChunkStoreTierIndexRelid(void);
 extern Oid	ChunkStorePointersRelid(void);
 
 /* A chunk's name, in hex, palloc'd: for messages. */

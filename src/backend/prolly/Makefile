@@ -27,6 +27,7 @@ OBJS = \
 	chunk_pointers.o \
 	chunk_region.o \
 	chunk_store.o \
+	chunk_tier.o \
 	chunkstore.o \
 	object_store.o \
 	registry.o

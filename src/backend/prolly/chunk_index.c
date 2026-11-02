@@ -1828,7 +1828,7 @@ open_bound_log(Relation idx)
 	log = try_relation_open(logid, RowExclusiveLock);
 	if (log == NULL)
 		return NULL;
-	if (!RelationIsChunkLog(log) || ChunkLogOf(log)->stamp(log) != stamp)
+	if (!RelationIsAnyChunkLog(log) || ChunkLogOf(log)->stamp(log) != stamp)
 	{
 		ereport(WARNING,
 				(errmsg("chunk index \"%s\" is of chunk log \"%s\" as it was: the bytes of chunks it takes out are not counted dead",
@@ -2470,7 +2470,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	Relation	log = NULL;
 	bool		log_tried = false;
 	bool		any_pass = false;
-	ChunkLogSweep *sweep = NULL;
+	void	   *sweep = NULL;
 	uint64		unheld = 0;
 	ChunkLogSegments segs = {0};
 	/*
@@ -2528,10 +2528,10 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 
 				/*
 				 * (the pages of regions held by none as the pass begins, to
-				 * let go of after it if unchanged: see ChunkLogSweepBegin)
+				 * let go of after it if unchanged: the log's vacuum_begin)
 				 */
 				if (log != NULL && !any_pass)
-					sweep = ChunkLogSweepBegin(log);
+					sweep = ChunkLogOf(log)->vacuum_begin(log);
 			}
 		}
 		any_pass = true;
@@ -2657,30 +2657,20 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		log = open_bound_log(idx);
 	if (log != NULL)
 	{
-		/* (the regions of backends gone, or that forgot them, let go of) */
-		INJECTION_POINT("chunk-index-vacuum-sweep", NULL);
-		if (sweep != NULL)
-			ChunkLogSweepEnd(log, sweep);
-		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
 		/*
-		 * (unless VACUUM is not to truncate, or the log's own
-		 * vacuum_truncate is off: the cut's AccessExclusiveLock, WAL-logged,
-		 * conflicts with a hot standby's readers of the log)
+		 * The log's own end of VACUUM: the regions of backends gone, or that
+		 * forgot them, let go of; the free end cut (unless VACUUM is not to
+		 * truncate, or the log's own vacuum_truncate is off: the cut's
+		 * AccessExclusiveLock, WAL-logged, conflicts with a hot standby's
+		 * readers of the log); then what it finds of its segments, those with
+		 * chunks freed kept for snapshots passed by
 		 */
-		if (truncate &&
-			!(log->rd_options != NULL &&
-			  ((StdRdOptions *) log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE))
-			(void) ChunkLogTruncateTail(log);
-
-		/*
-		 * The segments free put in the free space map once the free end is
-		 * cut (not before: puts would take the end from the cut); those with
-		 * chunks freed kept for snapshots passed by (their bytes dead
-		 * later, and the chunks a freer moved off them, maybe, moved
-		 * already: a freer now would find nothing there to move)
-		 */
-		ChunkLogRecordFree(log, chunk_compact_dead_fraction, pending, npending,
-						   &segs);
+		ChunkLogOf(log)->vacuum_end(log, sweep,
+									truncate &&
+									!(log->rd_options != NULL &&
+									  ((StdRdOptions *) log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE),
+									chunk_compact_dead_fraction, pending, npending,
+									&segs);
 		if (pending)
 			pfree(pending);
 

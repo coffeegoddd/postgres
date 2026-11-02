@@ -63,6 +63,18 @@ ChunkStoreIndexRelid(void)
 }
 
 Oid
+ChunkStoreTierLogRelid(void)
+{
+	return store_relid("tier_chunks");
+}
+
+Oid
+ChunkStoreTierIndexRelid(void)
+{
+	return store_relid("tier_index");
+}
+
+Oid
 ChunkStorePointersRelid(void)
 {
 	return store_relid("pointers");

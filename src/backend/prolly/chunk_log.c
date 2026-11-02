@@ -38,6 +38,7 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_tier.h"
 #include "prolly/chunk_region.h"
 #include "prolly/chunk_xlog.h"
 #include "storage/bufmgr.h"
@@ -2183,6 +2184,34 @@ ChunkLogTruncateTail(Relation rel)
 	return nblocks - keep;
 }
 
+/*
+ * VACUUM's pass over the log's index begun: the regions held by none, to
+ * let go of after it if unchanged (ChunkLogSweepBegin)
+ */
+static void *
+page_vacuum_begin(Relation rel)
+{
+	return ChunkLogSweepBegin(rel);
+}
+
+/*
+ * and ended: those regions let go of (ChunkLogSweepEnd), the free end cut
+ * if truncate, then the segments free recorded (not before: puts would
+ * take the end from the cut), and what is found of them in *out
+ */
+static void
+page_vacuum_end(Relation rel, void *state, bool truncate, double fraction,
+				const uint8 *pending, uint64 npending, ChunkLogSegments *out)
+{
+	INJECTION_POINT("chunk-index-vacuum-sweep", NULL);
+	if (state != NULL)
+		ChunkLogSweepEnd(rel, state);
+	INJECTION_POINT("chunk-index-vacuum-cut", NULL);
+	if (truncate)
+		(void) ChunkLogTruncateTail(rel);
+	ChunkLogRecordFree(rel, fraction, pending, npending, out);
+}
+
 const ChunkLogRoutine PageChunkLog = {
 	.append = page_append,
 	.prepare = page_prepare,
@@ -2194,6 +2223,9 @@ const ChunkLogRoutine PageChunkLog = {
 	.evacuable = page_evacuable_segments,
 	.segment_bytes = page_segment_bytes,
 	.find_segments = page_find_segments,
+	.vacuum_begin = page_vacuum_begin,
+	.vacuum_end = page_vacuum_end,
+	.check_live = ChunkLogCheckLive,
 	.extend = page_extend,
 	.bind_index = page_bind_index,
 	.read = page_read,
@@ -2205,6 +2237,8 @@ const ChunkLogRoutine PageChunkLog = {
 const ChunkLogRoutine *
 ChunkLogOf(Relation rel)
 {
+	if (RelationIsTierLog(rel))
+		return &TierChunkLog;
 	if (!RelationIsChunkLog(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -2698,6 +2732,58 @@ Datum
 prolly_chunk_index_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(index_routine());
+}
+
+/* a tier log's storage: its meta page (prolly/chunk_tier.h) */
+static void
+tier_relation_set_new_filelocator(Relation rel,
+								  const RelFileLocator *newrlocator,
+								  char persistence,
+								  TransactionId *freezeXid,
+								  MultiXactId *minmulti)
+{
+	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
+											 freezeXid, minmulti);
+
+	ChunkTierInitStorage(srel, XLogIsNeeded());
+	smgrclose(srel);
+}
+
+/* (made afresh, a stamp of its own: the packs of the one before are not its) */
+static void
+tier_relation_nontransactional_truncate(Relation rel)
+{
+	RelationTruncate(rel, 0);
+	ChunkTierInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+}
+
+static TableAmRoutine tier_routine;
+static bool tier_routine_made = false;
+
+static const TableAmRoutine *
+tier_table_routine(void)
+{
+	if (!tier_routine_made)
+	{
+		tier_routine = chunk_log_routine;
+		tier_routine.relation_set_new_filelocator = tier_relation_set_new_filelocator;
+		tier_routine.relation_nontransactional_truncate =
+			tier_relation_nontransactional_truncate;
+		tier_routine_made = true;
+	}
+	return &tier_routine;
+}
+
+bool
+RelationIsTierLog(Relation rel)
+{
+	return rel->rd_tableam == tier_table_routine();
+}
+
+Datum
+prolly_tier_tableam_handler(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(tier_table_routine());
 }
 
 /* ------------------------------------------------------------- redo */

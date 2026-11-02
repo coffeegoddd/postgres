@@ -37,8 +37,9 @@
  *
  * Implementations register with the registry (prolly/registry.h) under
  * CHUNK_STORE_IFACE: "pages", the history store of each database, in its
- * pages (prolly/chunk_store.h); "memory", a backend's, in memory, for unit
- * tests.  Conformance tests every one.
+ * pages (prolly/chunk_store.h); "tier", its tier, the chunks' bytes in pack
+ * objects off the server, its index on it (prolly/chunk_tier.h); "memory",
+ * a backend's, in memory, for unit tests.  Conformance tests every one.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -176,6 +177,7 @@ struct ChunkStore
 };
 
 extern PGDLLIMPORT const ChunkStoreRoutine PagesChunkStore;
+extern PGDLLIMPORT const ChunkStoreRoutine TierChunkStore;
 extern PGDLLIMPORT const ChunkStoreRoutine MemoryChunkStore;
 
 /* The store registered as name; an error if there is none. */

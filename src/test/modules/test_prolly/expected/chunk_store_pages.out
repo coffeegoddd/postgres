@@ -10,7 +10,8 @@ SELECT * FROM test_chunk_stores() ORDER BY name;
 --------+---------------
  memory | f
  pages  | t
-(2 rows)
+ tier   | t
+(3 rows)
 
 \set store pages
 \getenv abs_srcdir PG_ABS_SRCDIR

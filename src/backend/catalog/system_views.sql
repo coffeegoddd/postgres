@@ -1610,6 +1610,8 @@ GRANT SELECT ON pg_branch_id_seq TO PUBLIC;
 
 CREATE TABLE pg_history.chunks () USING prolly_chunks;
 CREATE TABLE pg_history.chunk_index () USING prolly_chunk_index;
+CREATE TABLE pg_history.tier_chunks () USING prolly_tier;
+CREATE TABLE pg_history.tier_index () USING prolly_chunk_index;
 CREATE TABLE pg_history.pointers (
 	name text COLLATE "C" PRIMARY KEY,
 	hash bytea NOT NULL CHECK (octet_length(hash) = 20)

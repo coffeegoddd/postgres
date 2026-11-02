@@ -85,6 +85,7 @@ tests += {
       'history_pointers',
       'chunk_store_pages',
       'chunk_store_memory',
+      'chunk_store_tier',
       'chunk_pack_reclaim',
       'object_store_directory',
     ],
@@ -164,6 +165,7 @@ tests += {
       't/067_chunk_compaction.pl',
       't/068_chunk_compaction_stale.pl',
       't/069_object_store_crash.pl',
+      't/070_history_tier.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
