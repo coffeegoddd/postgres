@@ -84,6 +84,54 @@ SELECT count(*) AS entries,
 		WHERE b IS NOT NULL) AS by_hash
 FROM test_tier_pack_table('pg_history.tier_chunks', :last_pack) t;
 
+-- pack objects malformed: each refused by the reader of tables (a footer:
+-- entries, version, bytes of chunks, magic; an entry: hash, offset, length)
+CREATE FUNCTION pg_temp.footer(n int, version int, data_len int8, magic int8 DEFAULT 5423250189635965004)
+RETURNS bytea LANGUAGE sql AS 'SELECT int4send(n) || int4send(version) || int8send(data_len) || int8send(magic)';
+CREATE FUNCTION pg_temp.entry(d bytea, off int, len int) RETURNS bytea LANGUAGE sql
+	AS 'SELECT substr(sha256(d), 1, 20) || int4send(off) || int4send(len)';
+CREATE FUNCTION pg_temp.pack(name text, data bytea) RETURNS void LANGUAGE sql
+	AS $$SELECT test_os_put('directory', 'pg_test_history_tier', 'bad/' || name, data)$$;
+CREATE FUNCTION pg_temp.read(name text) RETURNS SETOF record LANGUAGE sql
+	AS $$SELECT hash, off, len FROM test_os_pack_table('directory', 'pg_test_history_tier', 'bad/' || name)$$;
+-- (a good one first: two chunks, by hash)
+SELECT pg_temp.pack('good', '\x0102'::bytea || '\x03'::bytea ||
+	(SELECT string_agg(e, '' ORDER BY e) FROM (VALUES (pg_temp.entry('\x0102', 0, 2)), (pg_temp.entry('\x03', 2, 1))) v(e)) ||
+	pg_temp.footer(2, 1, 3));
+SELECT off, len FROM test_os_pack_table('directory', 'pg_test_history_tier', 'bad/good') ORDER BY off;
+SELECT pg_temp.pack('short', '\x0102');
+SELECT * FROM pg_temp.read('short') AS (h bytea, o int8, l int8);
+SELECT pg_temp.pack('magic', pg_temp.footer(0, 1, 0, 1));
+SELECT * FROM pg_temp.read('magic') AS (h bytea, o int8, l int8);
+SELECT pg_temp.pack('version', pg_temp.footer(0, 2, 0));
+SELECT * FROM pg_temp.read('version') AS (h bytea, o int8, l int8);
+SELECT pg_temp.pack('size', '\x01' || pg_temp.footer(0, 1, 2));
+SELECT * FROM pg_temp.read('size') AS (h bytea, o int8, l int8);
+-- (bytes of chunks so many their sum with the rest wraps to the size)
+SELECT pg_temp.pack('wrap', '\x01' || pg_temp.footer(1, 1, -27));
+SELECT * FROM pg_temp.read('wrap') AS (h bytea, o int8, l int8);
+SELECT pg_temp.pack('entries', '\x01' || pg_temp.footer(1000000, 1, 1));
+SELECT * FROM pg_temp.read('entries') AS (h bytea, o int8, l int8);
+SELECT pg_temp.pack('past', '\x0102' || pg_temp.entry('\x0102', 1, 2) || pg_temp.footer(1, 1, 2));
+SELECT * FROM pg_temp.read('past') AS (h bytea, o int8, l int8);
+SELECT pg_temp.pack('order', '\x0102'::bytea || '\x03'::bytea ||
+	(SELECT string_agg(e, '' ORDER BY e DESC) FROM (VALUES (pg_temp.entry('\x0102', 0, 2)), (pg_temp.entry('\x03', 2, 1))) v(e)) ||
+	pg_temp.footer(2, 1, 3));
+SELECT * FROM pg_temp.read('order') AS (h bytea, o int8, l int8);
+
+-- a chunk put, its savepoint rolled back, and put again: two entries of
+-- its hash, each its bytes; the index's the live one
+BEGIN;
+SAVEPOINT s;
+SELECT (test_cs_put('tier', convert_to('twice in a pack', 'UTF8'))).stored;
+ROLLBACK TO s;
+SELECT (test_cs_put('tier', convert_to('twice in a pack', 'UTF8'))).stored;
+COMMIT;
+SELECT max(id) AS twice_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
+SELECT count(*) AS entries, count(DISTINCT off) AS places
+FROM test_tier_pack_table('pg_history.tier_chunks', :twice_pack)
+WHERE hash = substr(sha256(convert_to('twice in a pack', 'UTF8')), 1, 20);
+
 -- a tier the test makes: its stamp, in its packs' names, a new one after
 -- TRUNCATE (the one kept in the relcache let go)
 CREATE TABLE my_tier () USING prolly_tier;

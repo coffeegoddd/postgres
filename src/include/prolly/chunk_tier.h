@@ -43,10 +43,12 @@
 
 /*
  * A pack's object: its chunks' bytes one after another, then its table (an
- * entry a chunk, by hash, then by offset), then its footer.  So a pack says
- * what it has without the server's index.  Numbers are in the byte order
- * of the server that wrote it: one of the other order reads its magic
- * wrong, and refuses it.
+ * entry a chunk, by hash, then by offset), then its footer, numbers in
+ * network byte order.  So a pack says what it has without the server's
+ * index.  Every chunk written in it has an entry, its bytes its hash's;
+ * empty chunks, in no pack, have none.  An entry's chunk may be dead (its
+ * index entry gone), and a hash may be in two (a chunk put, its savepoint
+ * rolled back, and put again): the index says which is live.
  */
 #define CHUNK_TIER_PACK_MAGIC	UINT64CONST(0x4b4341505952504c)	/* "LPRYPACK" */
 #define CHUNK_TIER_PACK_VERSION	1
@@ -66,10 +68,15 @@ typedef struct ChunkTierPackFooter
 	uint64		magic;
 } ChunkTierPackFooter;
 
+StaticAssertDecl(sizeof(ChunkTierPackEntry) == 28, "a pack's entry is 28 bytes");
+StaticAssertDecl(sizeof(ChunkTierPackFooter) == 24, "a pack's footer is 24 bytes");
+
 /*
- * The table of the pack name (palloc'd, in *entries), and the length of
- * its chunks' bytes in *data_len; answers its entries.  An error if it is
- * not there, or not a pack of this format, or its footer does not fit it.
+ * The table of the pack name (palloc'd, in *entries, numbers in this
+ * server's order), and the length of its chunks' bytes in *data_len;
+ * answers its entries.  An error if it is not there, or not a pack of this
+ * format, or its footer does not fit its size, or an entry is out of its
+ * chunks' bytes or of order.
  */
 extern int	ChunkTierReadPackTable(ObjectStore *os, const char *name,
 								   ChunkTierPackEntry **entries, uint64 *data_len);
