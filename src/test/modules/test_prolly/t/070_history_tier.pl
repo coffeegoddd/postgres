@@ -351,11 +351,22 @@ is($standby2->safe_psql('postgres', q{SELECT convert_from(test_cs_get('tier', h(
 	't', 'and so does the other');
 $standby2->stop;
 
+# the packs from before the promotion, partly dead: not to repack, not this
+# server's
+$standby->safe_psql('postgres', q{
+	SELECT count(*) FROM generate_series(1, 300) g,
+		LATERAL test_cs_unref_root('tier', h(blob('big' || g, 250000))) WHERE g % 2 = 0;
+	SELECT test_cs_free('tier', ARRAY(SELECT h(blob('big' || g, 250000)) FROM generate_series(1, 300) g WHERE g % 2 = 0));
+	VACUUM pg_history.tier_index;
+});
+is($standby->safe_psql('postgres', q{SELECT compactable FROM test_chunk_log_segments('pg_history.tier_chunks', 0.4)}),
+	'0', 'inherited packs half dead: none to repack');
+
 # the packs from before the promotion, dead: not removed, until adopted
 $standby->safe_psql('postgres', q{
 	SELECT count(*) FROM generate_series(1, 300) g,
-		LATERAL test_cs_unref_root('tier', h(blob('big' || g, 250000)));
-	SELECT test_cs_free('tier', ARRAY(SELECT h(blob('big' || g, 250000)) FROM generate_series(1, 300) g));
+		LATERAL test_cs_unref_root('tier', h(blob('big' || g, 250000))) WHERE g % 2 = 1;
+	SELECT test_cs_free('tier', ARRAY(SELECT h(blob('big' || g, 250000)) FROM generate_series(1, 300) g WHERE g % 2 = 1));
 });
 $p3 = $packs->();
 $standby->safe_psql('postgres', 'VACUUM pg_history.tier_index');

@@ -983,6 +983,13 @@ ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
 			RelationGetNumberOfBlocks(log) < grow_to;
 
 		/*
+		 * (the cap of bytes not passed by the next chunk: in the tier, a
+		 * pack filled is written, and the next begun for that one chunk)
+		 */
+		if (max_bytes != 0 && *bytes > 0 && *bytes + e->len > max_bytes)
+			break;
+
+		/*
 		 * (a chunk longer than a segment, with the log not to grow: room for
 		 * it only where segments free lie one after another, prepare_free
 		 * looks; else it is passed by)

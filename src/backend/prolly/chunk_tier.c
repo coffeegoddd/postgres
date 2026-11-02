@@ -116,6 +116,13 @@ typedef struct TierPack
 #define PACK_BLOCK(id)		((BlockNumber) (1 + ((id) - 1) / PACKS_PER_PAGE))
 #define PACK_SLOT(id)		((int) (((id) - 1) % PACKS_PER_PAGE))
 
+/*
+ * a repack's packs at most, and their live bytes (it stops at the pack
+ * that reaches them): what one compaction collects
+ */
+#define REPACK_PACKS		64
+#define REPACK_LIVE_BYTES	(16 * TIER_PACK_BYTES)
+
 #define LOC_PACK(loc)		((uint32) ((loc) >> 32))
 #define LOC_OFF(loc)		((uint32) ((loc) & 0xFFFFFFFF))
 #define PACK_LOC(id, off)	(((uint64) (id) << 32) | (uint64) (off))
@@ -903,12 +910,16 @@ tier_bind_index(Relation rel, Oid index)
 	UnlockReleaseBuffer(buf);
 }
 
-/* (packs are not compacted, nor the tier evacuated, yet: none to) */
 /*
- * Repacking: the packs to repack, up to max, ascending, each a segment, its
- * places from its first byte to its last (compaction moves their live
- * chunks into this backend's pack, and the pack, all dead then, is
- * removed)
+ * Repacking: the packs to repack, up to max and to REPACK_PACKS, and their
+ * live bytes to REPACK_LIVE_BYTES (the entries a compaction collects
+ * bounded so, a freer's memory), ascending, each a segment, its places
+ * from its first byte to its last.  Compaction moves their live chunks
+ * into this backend's pack, a chunk read a time from its pack's object;
+ * the pack, all dead then, is removed.  Those with chunks freed kept for
+ * snapshots (pending, which VACUUM counts apart) are among them, as in
+ * the pages' log: a freer moves nothing off them it should not, the
+ * entries freed not the chunks' any more.
  */
 static int
 tier_compactable(Relation rel, double fraction, int max, uint64 *starts,
@@ -917,13 +928,16 @@ tier_compactable(Relation rel, double fraction, int max, uint64 *starts,
 	TierMeta	meta = read_meta(rel);
 	TimeLineID	tli = GetWALInsertionTimeLine();
 	int			n = 0;
+	uint64		live = 0;
 
-	for (uint32 first = 1; first < meta.next_pack && n < max; first += PACKS_PER_PAGE)
+	max = Min(max, REPACK_PACKS);
+	for (uint32 first = 1; first < meta.next_pack && n < max && live < REPACK_LIVE_BYTES;
+		 first += PACKS_PER_PAGE)
 	{
 		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
 		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
 
-		for (uint32 id = first; id < last && n < max; id++)
+		for (uint32 id = first; id < last && n < max && live < REPACK_LIVE_BYTES; id++)
 		{
 			TierPack   *p = pack_entry(BufferGetPage(buf), id);
 
@@ -931,6 +945,7 @@ tier_compactable(Relation rel, double fraction, int max, uint64 *starts,
 			{
 				starts[n] = PACK_LOC(id, 0);
 				ends[n] = PACK_LOC(id, p->size);
+				live += p->size - p->dead;
 				n++;
 			}
 		}
@@ -1073,9 +1088,9 @@ pack_ours(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p)
 }
 
 /*
- * Whether a pack is to be repacked: this server's, committed and written,
- * not all dead (all dead, it is removed), fraction of its bytes dead or
- * more, and not this backend's pack being made
+ * Whether a pack is to be repacked: this server's, committed and written
+ * (not this backend's being made, nor another's), not all dead (all dead,
+ * it is removed), fraction of its bytes dead or more
  */
 static bool
 to_repack(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
@@ -1083,7 +1098,7 @@ to_repack(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
 {
 	return pack_ours(meta, tli, id, p) && p->state == PACK_COMMITTED &&
 		p->size > 0 && p->dead > 0 && p->dead < p->size &&
-		(double) p->dead >= fraction * (double) p->size && id != pending.id;
+		(double) p->dead >= fraction * (double) p->size;
 }
 
 /*

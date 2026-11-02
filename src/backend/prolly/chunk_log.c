@@ -2194,11 +2194,6 @@ page_vacuum_begin(Relation rel)
 	return ChunkLogSweepBegin(rel);
 }
 
-/*
- * and ended: those regions let go of (ChunkLogSweepEnd), the free end cut
- * if truncate, then the segments free recorded (not before: puts would
- * take the end from the cut), and what is found of them in *out
- */
 /* (a step's batch: its chunks' changes of the index, a transaction's) */
 static void
 page_compact_batch(Relation rel, int *chunks, uint64 *bytes)
@@ -2207,6 +2202,11 @@ page_compact_batch(Relation rel, int *chunks, uint64 *bytes)
 	*bytes = 0;
 }
 
+/*
+ * and ended: those regions let go of (ChunkLogSweepEnd), the free end cut
+ * if truncate, then the segments free recorded (not before: puts would
+ * take the end from the cut), and what is found of them in *out
+ */
 static void
 page_vacuum_end(Relation rel, void *state, bool truncate, double fraction,
 				const uint8 *pending, uint64 npending, ChunkLogSegments *out)

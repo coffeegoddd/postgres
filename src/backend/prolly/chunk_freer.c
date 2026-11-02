@@ -54,8 +54,9 @@ bool		chunk_free_in_background = true;
 double		chunk_compact_dead_fraction = 0.5;
 
 /*
- * the segments a freer compacts (or evacuates) at most, and the chunks it
- * moves to a transaction
+ * the segments a freer compacts (or evacuates) at most (a log may give
+ * fewer: the tier's are packs); how much it moves a transaction is the
+ * log's (compact_batch)
  */
 #define COMPACT_SEGMENTS	4096
 
