@@ -17757,7 +17757,7 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 		 * (schema pg_history's, the system's).
 		 */
 		if (IsCatalogNamespace(relForm->relnamespace) ||
-			relForm->relnamespace == PG_HISTORY_NAMESPACE ||
+			IsHistoryStoreNamespace(relForm->relnamespace) ||
 			relForm->relisshared ||
 			isAnyTempNamespace(relForm->relnamespace) ||
 			IsToastNamespace(relForm->relnamespace) ||
