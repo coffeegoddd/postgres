@@ -387,6 +387,7 @@ $node->command_checks_all(
 		'--exclude-schema' => 'pg_catalog',
 		'--exclude-schema' => 'pg_toast',
 		'--exclude-schema' => 'information_schema',
+		'--exclude-schema' => 'pg_history',
 	],
 	1,
 	[qr/^$/],

@@ -100,3 +100,16 @@ DROP ROLE regress_history_user;
 DELETE FROM pg_history.pointers;
 SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
 DROP FUNCTION roots(bytea), put(bytea), h(bytea);
+
+-- ALTER TABLE ALL IN TABLESPACE moves a user's tables and passes the
+-- history store's by, as it passes the catalogs by
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE history_ts LOCATION '';
+CREATE TABLE moved_with_all (a int);
+ALTER TABLE ALL IN TABLESPACE pg_default SET TABLESPACE history_ts;
+SELECT c.relname, coalesce(t.spcname, 'pg_default') AS tablespace
+	FROM pg_class c LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
+	WHERE c.relname IN ('moved_with_all', 'chunks', 'pointers') ORDER BY 1;
+ALTER TABLE ALL IN TABLESPACE history_ts SET TABLESPACE pg_default;
+DROP TABLE moved_with_all;
+DROP TABLESPACE history_ts;
