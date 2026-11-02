@@ -40,9 +40,6 @@ $primary->safe_psql('postgres', q{
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION blob(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 20), 'hex')$$;
-	-- (longer than a page: into a run of pages freed, or pages new at the end)
-	CREATE FUNCTION big(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 600), 'hex')$$;
 	-- (longer than a region: room made for it lets the region go, and is
 	-- pages new at the end, never pages freed)
 	CREATE FUNCTION huge(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
