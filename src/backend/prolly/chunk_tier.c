@@ -1003,9 +1003,26 @@ count_packs(Relation rel, double fraction, bool mark, const uint8 *pending_bits,
 	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
 	{
 		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
-		Buffer		buf = pack_buffer(rel, first, mark ? BUFFER_LOCK_EXCLUSIVE : BUFFER_LOCK_SHARE);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
 		GenericXLogState *state = NULL;
 		Page		page = BufferGetPage(buf);
+		bool		change = false;
+
+		/* (locked exclusively only if a flag is to change) */
+		for (uint32 id = first; id < last && mark && !change; id++)
+		{
+			TierPack   *p = pack_entry(page, id);
+			bool		pending = pending_bits != NULL && id < npending &&
+				(pending_bits[id / 8] & (1 << (id % 8)));
+
+			change = p->state == PACK_COMMITTED && p->size > 0 &&
+				pending != ((p->flags & PACK_PENDING) != 0);
+		}
+		if (change)
+		{
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		}
 
 		for (uint32 id = first; id < last; id++)
 		{
@@ -1017,7 +1034,7 @@ count_packs(Relation rel, double fraction, bool mark, const uint8 *pending_bits,
 				continue;
 
 			/* (VACUUM's: pending marked as it found, WAL-logged) */
-			if (mark && pending != ((p->flags & PACK_PENDING) != 0))
+			if (change && pending != ((p->flags & PACK_PENDING) != 0))
 			{
 				if (state == NULL)
 				{
@@ -1032,7 +1049,8 @@ count_packs(Relation rel, double fraction, bool mark, const uint8 *pending_bits,
 				out->free++;
 			else if (pending)
 			{
-				if (p->dead > 0 && (double) p->dead >= fraction * (double) p->size)
+				if (pack_ours(&meta, tli, id, p) && p->dead > 0 &&
+					(double) p->dead >= fraction * (double) p->size)
 					out->pending++;
 			}
 			else if (to_repack(&meta, tli, id, p, fraction))
