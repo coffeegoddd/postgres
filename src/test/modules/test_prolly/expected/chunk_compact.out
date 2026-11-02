@@ -1,0 +1,153 @@
+-- Compaction: a page with a fraction of its bytes dead (its chunks freed)
+-- has its chunks' bytes put elsewhere, their entries moved; once VACUUM
+-- takes the old entries out the page is free, and used again.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SET chunk_free_in_background = off;
+CREATE TABLE cl () USING prolly_chunks;
+CREATE TABLE ci () USING prolly_chunk_index;
+CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+CREATE FUNCTION blob(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad(tag, 2000, '.'), 'UTF8')$$;
+-- 400 chunks of 2000 bytes, about four a page, every other one held by a
+-- root, and the others freed: every page about half dead (some a little
+-- under: compacted at 0.4 here), none free
+SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(blob('a' || g)), blob('a' || g))) AS put
+FROM generate_series(1, 400) g;
+ put 
+-----
+ 400
+(1 row)
+
+SELECT count(*) FROM generate_series(2, 400, 2) g, LATERAL test_chunk_ref_root('ci', h(blob('a' || g)));
+ count 
+-------
+   200
+(1 row)
+
+SELECT sum(test_chunk_free('cl', 'ci', h(blob('a' || g)))) AS freed FROM generate_series(1, 400, 2) g;
+ freed 
+-------
+   200
+(1 row)
+
+VACUUM ci;
+SELECT pages, free_pages FROM test_chunk_log_space('cl');
+ pages | free_pages 
+-------+------------
+    99 |          0
+(1 row)
+
+SELECT pg_relation_size('cl') AS size_written \gset
+-- nothing to compact if more must be dead
+SELECT pages, chunks FROM test_chunk_compact('cl', 'ci', 0.9, 0);
+ pages | chunks 
+-------+--------
+     0 |      0
+(1 row)
+
+-- compacted: the 200 kept moved, read back, the audit clean (the old
+-- entries freed, their bytes the store's still until VACUUM)
+SELECT pages > 90 AS most_pages, chunks, bytes FROM test_chunk_compact('cl', 'ci', 0.4, 0);
+ most_pages | chunks | bytes  
+------------+--------+--------
+ t          |    199 | 398000
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('a' || g))) = blob('a' || g)) AS read_back
+FROM generate_series(2, 400, 2) g;
+ read_back 
+-----------
+       200
+(1 row)
+
+SELECT ok, chunks FROM test_chunk_check('cl', 'ci');
+ ok | chunks 
+----+--------
+ t  |    200
+(1 row)
+
+-- their counts the same: each a root's still
+SELECT count(*) FILTER (WHERE refs = 0 AND roots = 1) AS counts_kept
+FROM generate_series(2, 400, 2) g, LATERAL test_chunk_index_entry('ci', h(blob('a' || g)));
+ counts_kept 
+-------------
+         200
+(1 row)
+
+-- VACUUM takes the old entries out: the pages compacted free, none left
+-- to compact
+VACUUM ci;
+SELECT free_pages > 90 AS pages_compacted_free FROM test_chunk_log_space('cl');
+ pages_compacted_free 
+----------------------
+ t
+(1 row)
+
+SELECT pages, chunks FROM test_chunk_compact('cl', 'ci', 0.4, 0);
+ pages | chunks 
+-------+--------
+     0 |      0
+(1 row)
+
+SELECT pg_relation_size('cl') AS size_compacted \gset
+-- 200 more go into the pages freed: the file no bigger
+\c
+SET chunk_free_in_background = off;
+SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(blob('b' || g)), blob('b' || g))) AS put_again
+FROM generate_series(1, 200) g;
+ put_again 
+-----------
+       200
+(1 row)
+
+SELECT pg_relation_size('cl') = :size_compacted AS no_bigger;
+ no_bigger 
+-----------
+ t
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('a' || g))) = blob('a' || g)) AS kept_read
+FROM generate_series(2, 400, 2) g;
+ kept_read 
+-----------
+       200
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('b' || g))) = blob('b' || g)) AS new_read
+FROM generate_series(1, 200) g;
+ new_read 
+----------
+      200
+(1 row)
+
+SELECT ok, chunks FROM test_chunk_check('cl', 'ci');
+ ok | chunks 
+----+--------
+ t  |    400
+(1 row)
+
+-- room: a compaction stops once it has moved that many bytes (the pages
+-- it looked at last done)
+SELECT sum(test_chunk_free('cl', 'ci', h(blob('b' || g)))) AS freed FROM generate_series(1, 200, 2) g;
+ freed 
+-------
+   100
+(1 row)
+
+VACUUM ci;
+SELECT chunks < 100 AS some, bytes >= 20000 AS room_moved FROM test_chunk_compact('cl', 'ci', 0.4, 20000);
+ some | room_moved 
+------+------------
+ t    | t
+(1 row)
+
+SELECT ok FROM test_chunk_check('cl', 'ci');
+ ok 
+----
+ t
+(1 row)
+
+DROP TABLE cl, ci;
+DROP FUNCTION h(bytea), blob(text);

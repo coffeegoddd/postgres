@@ -48,7 +48,7 @@ test_prolly_isolation = [
 ]
 # (these need injection points)
 if get_option('injection_points')
-  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend']
+  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend', 'chunk_move']
 endif
 
 tests += {
@@ -78,6 +78,7 @@ tests += {
       'chunk_free',
       'chunk_holds',
       'chunk_reclaim',
+      'chunk_compact',
       'chunk_abandoned',
       'history_pointers',
       'chunk_store_pages',
@@ -157,6 +158,7 @@ tests += {
       't/064_history_dump.pl',
       't/065_history_crash_steps.pl',
       't/066_history_concurrent.pl',
+      't/067_chunk_compaction.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

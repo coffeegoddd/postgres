@@ -101,6 +101,13 @@ typedef struct ChunkLogRoutine
 	bool		(*extend) (Relation rel, ChunkLogRun *run, size_t len);
 
 	/*
+	 * prepare, but only in the room this backend's region has, or on pages
+	 * free: false, no room made (the run empty, for release), if it would
+	 * have to grow the log.
+	 */
+	bool		(*prepare_free) (Relation rel, size_t len, ChunkLogRun *run);
+
+	/*
 	 * Binds the log to the one chunk index naming its bytes (the first to
 	 * ask), or errors if it is another's: a tail cut, by that index's
 	 * VACUUM, needs every entry naming the log's bytes to have been seen.
@@ -145,7 +152,6 @@ extern PGDLLIMPORT const ChunkLogRoutine PageChunkLog;
 extern void ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full,
 						  uint64 *dead, uint32 *free_pages);
 
-/* Puts every page free in the free space map (O(log); VACUUM's). */
 /*
  * For VACUUM of the log's index: lets go of the rest of every region no
  * live backend holds (one whose backend exited, crashed, or forgot it),
@@ -159,7 +165,23 @@ extern uint32 ChunkLogGeneration(Relation rel);
 extern ChunkLogSweep *ChunkLogSweepBegin(Relation rel);
 extern void ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep);
 
-extern void ChunkLogRecordFree(Relation rel);
+/*
+ * Puts every page free in the free space map (O(log); VACUUM's); answers
+ * the pages to compact, written full and fraction of their bytes dead (not
+ * all), if their dead bytes come to a region's (else none), and in *grow
+ * the pages compaction may grow the log by: none if a region's are free,
+ * else a region's.
+ */
+extern uint32 ChunkLogRecordFree(Relation rel, double fraction,
+								 BlockNumber *grow);
+
+/*
+ * The pages to compact from the place from on, up to max, ascending: the
+ * places each begins and ends at, in starts and ends; how many.  A chunk
+ * with bytes on any is to be put elsewhere (O(the pages looked at)).
+ */
+extern int	ChunkLogCompactable(Relation rel, double fraction, uint64 from,
+								int max, uint64 *starts, uint64 *ends);
 
 /*
  * For audits: whether no page counts bytes of the chunks given (at locs,

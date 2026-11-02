@@ -43,6 +43,7 @@ PG_FUNCTION_INFO_V1(test_chunk_ref_root);
 PG_FUNCTION_INFO_V1(test_chunk_unref_root);
 PG_FUNCTION_INFO_V1(test_chunk_check);
 PG_FUNCTION_INFO_V1(test_chunk_read_bench);
+PG_FUNCTION_INFO_V1(test_chunk_compact);
 PG_FUNCTION_INFO_V1(test_chunk_free);
 PG_FUNCTION_INFO_V1(test_chunk_free_unheld);
 PG_FUNCTION_INFO_V1(test_chunk_hold);
@@ -457,6 +458,49 @@ test_chunk_read_bench(PG_FUNCTION_ARGS)
 	values[0] = Int64GetDatum(found);
 	values[1] = Int64GetDatum((int64) bytes);
 	values[2] = Float8GetDatum(INSTR_TIME_GET_MILLISEC(took));
+	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
+}
+
+/*
+ * test_chunk_compact(log, idx, fraction, room, OUT pages, OUT chunks,
+ * OUT bytes): the log's pages to compact compacted, from its start on, in
+ * this transaction, until room bytes are moved (0: every page)
+ */
+Datum
+test_chunk_compact(PG_FUNCTION_ARGS)
+{
+	Relation	log = open_log(PG_GETARG_OID(0), RowExclusiveLock);
+	Relation	idx = open_index(PG_GETARG_OID(1), RowExclusiveLock);
+	double		fraction = PG_GETARG_FLOAT8(2);
+	int64		room = PG_GETARG_INT64(3);
+	uint64		from = 0;
+	int64		pages = 0;
+	uint64		moved = 0,
+				moved_bytes = 0;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	while (room == 0 || moved_bytes < (uint64) room)
+	{
+		uint64		chunks,
+					bytes;
+		int			found = ChunkStoreCompact(log, idx, fraction, &from, 32, true,
+											  &chunks, &bytes);
+
+		if (found == 0)
+			break;
+		pages += found;
+		moved += chunks;
+		moved_bytes += bytes;
+	}
+	relation_close(idx, NoLock);
+	relation_close(log, NoLock);
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum(pages);
+	values[1] = Int64GetDatum((int64) moved);
+	values[2] = Int64GetDatum((int64) moved_bytes);
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
 }
 
