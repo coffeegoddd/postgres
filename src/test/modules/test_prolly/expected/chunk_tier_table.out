@@ -1,6 +1,6 @@
 Parsed test spec with 2 sessions
 
-starting permutation: p_attach p_begin p_pack q_put_a q_wake p_packed p_commit q_tables
+starting permutation: p_attach p_begin p_pack q_put_a q_wake p_packed p_commit q_tables q_dead
 injection_points_set_local
 --------------------------
                           
@@ -60,4 +60,14 @@ entries|each_one_chunk|of_the_three
 -------+--------------+------------
       3|             3|           3
 (1 row)
+
+step q_dead: 
+	SELECT size, dead FROM test_tier_packs('pg_history.tier_chunks')
+	WHERE id > (SELECT id FROM tt_before) AND size > 0 ORDER BY id;
+
+size|dead
+----+----
+ 101|   0
+ 171| 101
+(2 rows)
 

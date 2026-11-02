@@ -35,6 +35,7 @@ PG_FUNCTION_INFO_V1(test_chunk_log_space);
 PG_FUNCTION_INFO_V1(test_chunk_log_segments);
 PG_FUNCTION_INFO_V1(test_chunk_log_let_go);
 PG_FUNCTION_INFO_V1(test_tier_packs);
+PG_FUNCTION_INFO_V1(test_tier_object_reads);
 PG_FUNCTION_INFO_V1(test_tier_pack_table);
 PG_FUNCTION_INFO_V1(test_chunk_log_regions);
 
@@ -238,6 +239,13 @@ test_tier_pack_table(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;
+}
+
+/* test_tier_object_reads() returns int8: the reads of packs' objects this backend made */
+Datum
+test_tier_object_reads(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) ChunkTierObjectReads());
 }
 
 /* test_chunk_log_regions(rel): the regions live backends hold in the log */

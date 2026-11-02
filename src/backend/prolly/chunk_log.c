@@ -1377,6 +1377,17 @@ page_read(Relation rel, uint64 loc, void *dst, size_t len)
 	}
 }
 
+/* (a page read through once, as the places are in order) */
+static void
+page_read_many(Relation rel, int n, const uint64 *locs, const uint32 *lens, void **dsts)
+{
+	for (int i = 0; i < n; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		page_read(rel, locs[i], dsts[i], lens[i]);
+	}
+}
+
 /*
  * Counts len bytes from loc dead, a page at a time; a segment all of whose
  * pages' bytes are dead then goes in the free space map, as VACUUM ends
@@ -2239,6 +2250,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.extend = page_extend,
 	.bind_index = page_bind_index,
 	.read = page_read,
+	.read_many = page_read_many,
 	.mark_dead = page_mark_dead,
 	.stamp = page_stamp,
 	.end = page_end,
