@@ -53,6 +53,9 @@ extern bool ChunkRegionMine(RelFileLocator log, BlockNumber end);
 /* Whether this backend is between a region's prepare and its release. */
 extern void ChunkRegionAppending(bool on);
 
+/* The first page of this backend's entry for the log (InvalidBlockNumber if none). */
+extern BlockNumber ChunkRegionMineFirst(RelFileLocator log);
+
 /* This backend keeps its region in the log (in its relcache entry) again. */
 extern void ChunkRegionKept(RelFileLocator log);
 
