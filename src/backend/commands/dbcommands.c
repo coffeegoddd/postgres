@@ -53,6 +53,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
+#include "prolly/chunk_tier.h"
 #include "replication/slot.h"
 #include "storage/bmap.h"
 #include "storage/copydir.h"
@@ -1032,6 +1033,16 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 						dbtemplate)));
 
 	/*
+	 * (prolly: a template whose history store's tier has packs is not
+	 * copied: the copy's tier would name the template's objects)
+	 */
+	if (ChunkTierDatabaseHasPacks(src_dboid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot copy database \"%s\": its history store's tier has packs", dbtemplate),
+				 errhint("Release its bundles, free their chunks and VACUUM the tier's index in it first.")));
+
+	/*
 	 * If the source database was in the process of being dropped, we can't
 	 * use it as a template.
 	 */
@@ -1784,6 +1795,16 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot drop the currently open database")));
+
+	/*
+	 * (prolly: a database whose history store's tier has packs is not
+	 * dropped: their objects would be left in the tier's store)
+	 */
+	if (ChunkTierDatabaseHasPacks(db_id))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot drop database \"%s\": its history store's tier has packs", dbname),
+				 errhint("Release its bundles, free their chunks and VACUUM the tier's index in it first.")));
 
 	/*
 	 * Check whether there are active logical slots that refer to the

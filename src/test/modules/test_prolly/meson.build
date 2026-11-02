@@ -171,6 +171,7 @@ tests += {
       't/070_history_tier.pl',
       't/071_wait_backend_gone.pl',
       't/072_tier_repack.pl',
+      't/073_tier_databases.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
