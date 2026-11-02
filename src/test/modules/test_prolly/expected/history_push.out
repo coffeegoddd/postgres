@@ -441,11 +441,19 @@ SELECT test_cs_get('pages', pg_temp.h(pg_temp.p8())) = pg_temp.p8() AS read_here
  t
 (1 row)
 
--- (a fetch in a read-only transaction, and by one not a superuser, granted
--- it: refused)
+-- (a fetch, a push and a release in a read-only transaction, and a fetch
+-- by one not a superuser, granted it: refused)
 BEGIN READ ONLY;
 SELECT pg_history_fetch('b8');
 ERROR:  cannot execute pg_history_fetch() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT pg_history_push('bx', ARRAY[pg_temp.h('\x0a1701')]);
+ERROR:  cannot execute pg_history_push() in a read-only transaction
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT pg_history_release('b8');
+ERROR:  cannot execute pg_history_release() in a read-only transaction
 ROLLBACK;
 CREATE ROLE regress_history_fetcher;
 GRANT EXECUTE ON FUNCTION pg_history_fetch(text) TO regress_history_fetcher;

@@ -157,10 +157,16 @@ SELECT pg_history_fetch('b8') AS copied_but_the_leaf_here;
 SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p8())]) AS freed_here;
 SELECT pg_history_fetch('b8') AS put_again;
 SELECT test_cs_get('pages', pg_temp.h(pg_temp.p8())) = pg_temp.p8() AS read_here;
--- (a fetch in a read-only transaction, and by one not a superuser, granted
--- it: refused)
+-- (a fetch, a push and a release in a read-only transaction, and a fetch
+-- by one not a superuser, granted it: refused)
 BEGIN READ ONLY;
 SELECT pg_history_fetch('b8');
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT pg_history_push('bx', ARRAY[pg_temp.h('\x0a1701')]);
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT pg_history_release('b8');
 ROLLBACK;
 CREATE ROLE regress_history_fetcher;
 GRANT EXECUTE ON FUNCTION pg_history_fetch(text) TO regress_history_fetcher;
