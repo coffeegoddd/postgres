@@ -30,13 +30,12 @@ extern PGDLLIMPORT double chunk_compact_dead_fraction;
  * (turned off, or no worker free).
  */
 extern bool ChunkFreerLaunch(Oid log, Oid idx, bool owner, bool compact, bool evacuate,
-							 double fraction, BlockNumber grow);
+							 double fraction, BlockNumber grow, uint32 generation);
 
 /*
  * This transaction changed the counts of idx, and marked a bucket of it
- * (prolly/chunk_index.h's marked), or not: as it commits, a freer asked for
- * if it marked one, or if a freer left buckets marked for it (running then);
- * registered unless one is, which passes again.
+ * (prolly/chunk_index.h's marked), or not: if it marked one, as it commits a
+ * freer asked for, registered unless one is, which passes again.
  */
 extern void ChunkFreerChanged(Relation idx, bool marked);
 

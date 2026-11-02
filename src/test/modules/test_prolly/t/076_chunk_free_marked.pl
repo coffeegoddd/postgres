@@ -42,7 +42,8 @@ $node->safe_psql('postgres', q{
 my $idle = sub {
 	my ($name) = @_;
 	ok($node->poll_query_until('postgres',
-		q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'chunk freer'}),
+		q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'chunk freer'
+			AND query <> 'waiting on transactions holding chunks to free'}),
 		$name // '(no freer running)');
 };
 my $gone = sub {
@@ -159,8 +160,7 @@ $gone->(q{h(leaf(80003))}, 'another dropped after: freed, by another freer');
 is($node->safe_psql('postgres', q{SELECT test_cs_has('pages', h(leaf(80001)))}), 't',
 	'the prepared one\'s not yet');
 $node->safe_psql('postgres', q{COMMIT PREPARED 'held'});
-$node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'p80004'});
-$gone->(q{h(leaf(80001))}, 'committed: freed by the next freer');
+$gone->(q{h(leaf(80001))}, 'committed: freed, the waiter on it asking');
 
 # a reference let go of as another transaction lets go of a root of one
 # chunk: the root's marks (another changing the counts), and the
@@ -177,8 +177,11 @@ my $ra = $node->background_psql('postgres');
 $ra->query_safe(q{BEGIN; SELECT test_cs_free('pages', ARRAY[h(node(leaf(81001), leaf(81002)))])});
 $offset = -s $node->logfile;
 $node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'x'});
-# (the freer the drop started, its pass done before the other commits)
-$node->wait_for_log(qr/chunk freer freed \d+ chunks/, $offset);
+# (the freer the drop started, its pass done before the other commits: it
+# waits on the other, the freeing let go of)
+ok($node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity
+	WHERE backend_type = 'chunk freer' AND query = 'waiting on transactions holding chunks to free'}),
+	'the freer waiting on the open transaction');
 $idle->();
 is($node->safe_psql('postgres', q{SELECT test_cs_has('pages', h(leaf(81001)))}), 't',
 	'held by the open transaction\'s reference');
@@ -245,6 +248,97 @@ SKIP:
 	});
 	$gone->(q{h(leaf(83001))}, 'a transaction ended between freeing and unmarking: its chunk freed');
 	$idle->();
+}
+
+# noted, and ending, as the pass that noted it ends: waited on all the same
+# (it ended), asked again
+SKIP:
+{
+	skip 'injection points not supported by this build', 9
+		if $ENV{enable_injection_points} ne 'yes';
+	my $race = sub {
+		my ($tag, $ending) = @_;
+		$node->safe_psql('postgres', qq{
+			SELECT count(*) FROM generate_series(${tag}1, ${tag}2) i, LATERAL test_cs_put('pages', leaf(i));
+			SELECT test_cs_put('pages', node(leaf(${tag}1), leaf(${tag}2)));
+			INSERT INTO pg_history.pointers VALUES ('r$tag', h(leaf(${tag}1))), ('s$tag', h(leaf(${tag}2)));
+		});
+		$idle->();
+		my $t1 = $node->background_psql('postgres');
+		$t1->query_safe(qq{BEGIN; SELECT test_cs_free('pages', ARRAY[h(node(leaf(${tag}1), leaf(${tag}2)))])});
+		$node->safe_psql('postgres', q{SELECT injection_points_attach('chunk-freer-passed', 'wait')});
+		$node->safe_psql('postgres', qq{DELETE FROM pg_history.pointers WHERE name = 'r$tag'});
+		$node->wait_for_event('chunk freer', 'chunk-freer-passed');
+		$t1->query_safe($ending);
+		$t1->quit;
+		$node->safe_psql('postgres', q{
+			SELECT injection_points_detach('chunk-freer-passed');
+			SELECT injection_points_wakeup('chunk-freer-passed');
+		});
+	};
+	$race->(8401, 'COMMIT');
+	$gone->(q{h(leaf(84011))}, 'the reference let go of committed as the pass noting it ended: freed');
+
+	# (aborted: the reference held again, the root the one let go of)
+	$race->(8402, 'ROLLBACK');
+	is($node->safe_psql('postgres', q{SELECT test_cs_has('pages', h(leaf(84021)))}), 't',
+		'aborted: held by the reference again');
+
+	# two running in its bucket, one let go of a reference, one taking a
+	# root, both ended (one aborted): its chunk freed
+	$node->safe_psql('postgres', q{
+		SELECT count(*) FROM generate_series(85001, 85002) i, LATERAL test_cs_put('pages', leaf(i));
+		SELECT test_cs_put('pages', node(leaf(85001), leaf(85002)));
+		INSERT INTO pg_history.pointers VALUES ('z', h(leaf(85001))), ('z2', h(leaf(85002)));
+	});
+	$idle->();
+	my $t1 = $node->background_psql('postgres');
+	my $t3 = $node->background_psql('postgres');
+	$t1->query_safe(q{BEGIN; SELECT test_cs_free('pages', ARRAY[h(node(leaf(85001), leaf(85002)))])});
+	$t3->query_safe(q{BEGIN; SELECT test_cs_ref_root('pages', h(leaf(85001)))});
+	$node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'z'});
+	$t1->query_safe('COMMIT');
+	$t3->query_safe('ROLLBACK');
+	$t1->quit;
+	$t3->quit;
+	$gone->(q{h(leaf(85001))}, 'two running there, one committed, one aborted: freed');
+
+	# a freer stopped by an error lets the freeing go: the next commit's
+	# freer frees
+	$node->safe_psql('postgres', q{
+		SELECT count(*) FROM generate_series(86001, 86002) i, LATERAL test_cs_put('pages', leaf(i));
+		INSERT INTO pg_history.pointers VALUES ('e1', h(leaf(86001))), ('e2', h(leaf(86002)));
+	});
+	$idle->();
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('chunk-freer-pass', 'error')});
+	my $offset = -s $node->logfile;
+	$node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'e1'});
+	$node->wait_for_log(qr/error triggered for injection point chunk-freer-pass/, $offset);
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('chunk-freer-pass')});
+	$idle->();
+	$node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'e2'});
+	$gone->(q{h(leaf(86001))}, 'a freer stopped by an error: the next frees');
+	$gone->(q{h(leaf(86002))}, '(and its own)');
+
+	# VACUUM's freer, the freeing another's: frees nothing, and asks it to
+	# pass again (a chunk put and never held, VACUUM's mark alone, freed by
+	# the other's pass after)
+	$idle->();
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('chunk-freer-passed', 'wait')});
+	$node->safe_psql('postgres', q{
+		SELECT test_cs_put('pages', leaf(87001)), test_cs_put('pages', leaf(87002));
+		INSERT INTO pg_history.pointers VALUES ('v', h(leaf(87001)));
+		DELETE FROM pg_history.pointers WHERE name = 'v';
+	});
+	$node->wait_for_event('chunk freer', 'chunk-freer-passed');
+	$offset = -s $node->logfile;
+	$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+	$node->wait_for_log(qr/chunk freer freed 0 chunks of chunk index \d+, looking in 0 buckets/, $offset);
+	$node->safe_psql('postgres', q{
+		SELECT injection_points_detach('chunk-freer-passed');
+		SELECT injection_points_wakeup('chunk-freer-passed');
+	});
+	$gone->(q{h(leaf(87002))}, 'VACUUM\'s freer, the freeing another\'s: the other passes again, freeing what VACUUM marked');
 }
 
 $node->stop;

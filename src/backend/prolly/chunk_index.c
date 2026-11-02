@@ -1122,9 +1122,10 @@ split_bucket(Relation rel)
  * buckets marked, not the index.  A bucket is marked and unmarked with its
  * first page locked exclusively, so an unmark sees every change made before
  * it; a split marks the new bucket of a bucket marked, the old one's first
- * page locked (not the new one's: a mark more is only a look more).  The marks are a bitmap, a bit a bucket, on pages the meta
- * page lists, made as buckets reach them (locks: a bucket's first page,
- * the meta page, a marks' page).
+ * page locked (not the new one's: a mark more is only a look more).  The
+ * marks are a bitmap, a bit a bucket, on pages the meta page lists, made
+ * as buckets reach them (locks: a bucket's first page, the meta page, a
+ * marks' page).
  */
 
 /* the marks' pages up to the kth made (a bucket's first page locked) */
@@ -3008,7 +3009,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx), false,
 									segs.compactable > 0 && segs.worth,
 									segs.evacuable > 0,
-									chunk_compact_dead_fraction, segs.grow);
+									chunk_compact_dead_fraction, segs.grow, 0);
 		}
 		relation_close(log, NoLock);
 	}
