@@ -28,6 +28,7 @@ OBJS = \
 	chunk_region.o \
 	chunk_store.o \
 	chunkstore.o \
+	object_store.o \
 	registry.o
 
 include $(top_srcdir)/src/backend/common.mk
