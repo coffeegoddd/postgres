@@ -58,6 +58,25 @@ ObjectStoreOpen(const char *impl, const char *location)
 	return ((const ObjectStoreRoutine *) found->routine)->open(location);
 }
 
+char *
+ObjectStoreIdentity(const char *impl, const char *location)
+{
+	const ProllyImplementation *found;
+	char	   *id;
+	char	   *both;
+
+	register_object_stores();
+	found = ProllyLookupImplementation(OBJECT_STORE_IFACE, impl);
+	if (found == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("there is no object store \"%s\"", impl)));
+	id = ((const ObjectStoreRoutine *) found->routine)->identity(location);
+	both = psprintf("%s:%s", impl, id);
+	pfree(id);
+	return both;
+}
+
 List *
 ObjectStoreList(void)
 {
@@ -139,6 +158,23 @@ dir_path(DirectoryStore *ds, const char *name)
 		if (*c == '/')
 			*c = '#';
 	return path;
+}
+
+/* a directory's path, absolute (from the data directory) and canonical */
+static char *
+dir_identity(const char *location)
+{
+	char	   *path = make_absolute_path(location);
+	char	   *id;
+
+	if (path == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	canonicalize_path(path);
+	id = pstrdup(path);
+	free(path);
+	return id;
 }
 
 static ObjectStore *
@@ -452,6 +488,7 @@ dir_remove(ObjectStore *os, const char *name)
 
 const ObjectStoreRoutine DirectoryObjectStore = {
 	.open = dir_open,
+	.identity = dir_identity,
 	.close = dir_close,
 	.put = dir_put,
 	.read = dir_read,

@@ -412,7 +412,7 @@ unlock_marker(Relation rel, LOCKMODE mode)
 }
 
 static uint64 current_place(void);
-static void check_place(Relation rel, const TierMeta *meta);
+static void check_place(Relation rel, const TierMeta *meta, bool may_move);
 
 /*
  * The meta page's mark set: the marker made, at the place set now, on
@@ -465,14 +465,19 @@ ensure_marker(Relation rel)
 
 	lock_marker(rel, ShareLock);
 	meta = read_meta(rel);
-	/* (objects elsewhere than the settings say: nothing made, refused) */
-	check_place(rel, &meta);
+	/*
+	 * (objects elsewhere than the settings say: nothing made, refused; or,
+	 * with none, the place set now taken)
+	 */
+	check_place(rel, &meta, true);
+	meta = read_meta(rel);
 	if (marked_here(&meta))
 		return ShareLock;
 	unlock_marker(rel, ShareLock);
 	lock_marker(rel, ExclusiveLock);
 	meta = read_meta(rel);
-	check_place(rel, &meta);
+	check_place(rel, &meta, true);
+	meta = read_meta(rel);
 	if (marked_here(&meta))
 		return ExclusiveLock;
 	os = tier_objects();
@@ -496,27 +501,80 @@ remove_marker(Relation rel, const TierMeta *meta)
 	pfree(name);
 }
 
-/* the store and place set now: a hash of them, never 0 */
+/*
+ * The store and place set now: a hash of the store's identity (the same
+ * however the place is spelled), never 0
+ */
 static uint64
 current_place(void)
 {
-	char	   *both = psprintf("%s:%s", history_tier_store, history_tier_location);
+	char	   *both = ObjectStoreIdentity(history_tier_store, history_tier_location);
 	uint64		h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
 
 	pfree(both);
 	return h != 0 ? h : 1;
 }
 
-/* the tier's objects not where the settings say now: an error */
-static void
-check_place(Relation rel, const TierMeta *meta)
+/* whether the tier has no pack not removed, a manifest's or a chunks' */
+static bool
+tier_empty(Relation rel, const TierMeta *meta)
 {
-	if (meta->place != 0 && meta->place != current_place())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("tier \"%s\"'s objects are in another place than history_tier_store and history_tier_location say",
-						RelationGetRelationName(rel)),
-				 errhint("Set them back to where its packs were put.")));
+	for (uint32 first = 1; first < meta->next_pack; first += PACKS_PER_PAGE)
+	{
+		uint32		last = Min(first + PACKS_PER_PAGE, meta->next_pack);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
+		bool		any = false;
+
+		for (uint32 id = first; id < last && !any; id++)
+			any = pack_entry(BufferGetPage(buf), id)->state != PACK_REMOVED;
+		UnlockReleaseBuffer(buf);
+		if (any)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Whether the tier's objects, or its marker, are elsewhere than the
+ * settings say now
+ */
+static bool
+place_differs(const TierMeta *meta)
+{
+	uint64		now = current_place();
+
+	return (meta->place != 0 && meta->place != now) ||
+		(meta->marked_place != 0 && meta->marked_place != now);
+}
+
+/*
+ * The tier's objects, or its marker, not where the settings say now: an
+ * error; but a tier with none (no pack not removed, no marker) takes the
+ * place set now (may_move: about to put), its place cleared, WAL-logged,
+ * for its next pack to set
+ */
+static void
+check_place(Relation rel, const TierMeta *meta, bool may_move)
+{
+	if (!place_differs(meta))
+		return;
+	if (may_move && meta->marked_place == 0 && tier_empty(rel, meta))
+	{
+		Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
+		GenericXLogState *state;
+
+		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+		state = GenericXLogStart(rel);
+		tier_meta(rel, GenericXLogRegisterBuffer(state, mbuf, 0))->place = 0;
+		GenericXLogFinish(state);
+		UnlockReleaseBuffer(mbuf);
+		return;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("tier \"%s\"'s objects are in another place than history_tier_store and history_tier_location say",
+					RelationGetRelationName(rel)),
+			 errhint("Set them back to where its packs were put.")));
 }
 
 /*
@@ -607,7 +665,7 @@ begin_pack(Relation rel)
 	 */
 	if (meta->dboid != MyDatabaseId)
 		refuse_copied(rel, meta);
-	check_place(rel, meta);
+	check_place(rel, meta, false);
 	id = meta->next_pack;
 	if (id == PG_UINT32_MAX)
 		ereport(ERROR,
@@ -859,10 +917,16 @@ ChunkTierForgetMarker(Relation rel)
 		return;
 	lock_marker(rel, ExclusiveLock);
 	meta = read_meta(rel);
-	/* (its marker elsewhere than the settings say: not dropped, nor truncated) */
-	check_place(rel, &meta);
-	if (meta.dboid == MyDatabaseId)
-		remove_marker(rel, &meta);
+	/*
+	 * (no marker made: none to remove, wherever the settings say; one made
+	 * elsewhere than they say: not dropped, nor truncated)
+	 */
+	if (meta.marked_place != 0)
+	{
+		check_place(rel, &meta, false);
+		if (meta.dboid == MyDatabaseId)
+			remove_marker(rel, &meta);
+	}
 	unlock_marker(rel, ExclusiveLock);
 }
 
@@ -1536,7 +1600,8 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 	 * (objects elsewhere than the settings say: none removed, none counted
 	 * gone, nor the marker; the rest of VACUUM done)
 	 */
-	if (remove && meta.place != 0 && meta.place != current_place())
+	if (remove && place_differs(&meta) &&
+		!(meta.marked_place == 0 && tier_empty(rel, &meta)))
 	{
 		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
