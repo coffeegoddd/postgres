@@ -3,7 +3,7 @@
 # by hash) stopped as it finds what the tier has, another session putting
 # A meanwhile, so that A's put fails and B and C, which fit A's room, are
 # put one after another.  Each entry of every pack names one chunk, its
-# bytes its hash's.
+# bytes its hash's; and the place laid out for A, unused, is counted dead.
 
 setup
 {
@@ -43,6 +43,10 @@ session q
 setup		{ SET chunk_free_in_background = off; }
 step q_put_a	{ SELECT stored FROM test_cs_put('tier', tt_a()); }
 step q_wake		{ SELECT injection_points_wakeup('chunk-pack-found'); }
+step q_dead		{
+	SELECT size, dead FROM test_tier_packs('pg_history.tier_chunks')
+	WHERE id > (SELECT id FROM tt_before) AND size > 0 ORDER BY id;
+}
 step q_tables	{
 	SELECT count(*) AS entries,
 		count(*) FILTER (WHERE substr(sha256(test_cs_get('tier', t.hash)), 1, 20) = t.hash
@@ -53,4 +57,4 @@ step q_tables	{
 	WHERE p.state <> 'removed' AND p.size > 0 AND p.id > (SELECT id FROM tt_before);
 }
 
-permutation p_attach p_begin p_pack q_put_a q_wake p_packed p_commit q_tables
+permutation p_attach p_begin p_pack q_put_a q_wake p_packed p_commit q_tables q_dead

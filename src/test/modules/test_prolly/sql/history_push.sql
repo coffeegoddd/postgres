@@ -269,4 +269,27 @@ SELECT count(*) AS no_b15 FROM pg_history.bundles WHERE name = 'b15';
 SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1906')]) AS freed;
 VACUUM pg_history.tier_index;
 
+-- a fetch reads a pack as the push laid it out (a chunk's children
+-- together): a few reads of the tier's objects for a tree, not one a chunk
+CREATE FUNCTION pg_temp.tl(g int) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad('tree' || g, 200, '.'), 'UTF8')$$;
+CREATE FUNCTION pg_temp.tm(m int) RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+	SELECT '\x52'::bytea || set_byte('\x00'::bytea, 0, 5) ||
+		(SELECT string_agg(pg_temp.h(pg_temp.tl(m * 5 + g)), ''::bytea ORDER BY g) FROM generate_series(0, 4) g)$$;
+CREATE FUNCTION pg_temp.tr() RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+	SELECT '\x52'::bytea || set_byte('\x00'::bytea, 0, 3) ||
+		(SELECT string_agg(pg_temp.h(pg_temp.tm(m)), ''::bytea ORDER BY m) FROM generate_series(0, 2) m)$$;
+SELECT count(*) FROM generate_series(0, 14) g, LATERAL test_cs_put('pages', pg_temp.tl(g));
+SELECT count(*) FROM generate_series(0, 2) m, LATERAL test_cs_put('pages', pg_temp.tm(m));
+SELECT (test_cs_put('pages', pg_temp.tr())).stored;
+SELECT pg_history_push('tree', ARRAY[pg_temp.h(pg_temp.tr())]) AS copied;
+BEGIN;
+SELECT test_tier_object_reads() AS reads0 \gset
+SELECT pg_history_fetch('tree') AS fetched;
+SELECT test_tier_object_reads() - :reads0 <= 2 * 3 + 1 AS few_reads,
+	test_tier_object_reads() - :reads0 AS reads;
+ROLLBACK;
+SELECT pg_history_release('tree') AS freed;
+VACUUM pg_history.tier_index;
+
 SELECT test_chunk_format_refs(false);

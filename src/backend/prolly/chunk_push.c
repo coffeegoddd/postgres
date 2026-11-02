@@ -134,8 +134,9 @@ decode_manifest(const char *data, size_t len, char **name, uint8 **roots, int *n
 typedef struct PushFrame
 {
 	uint8		hash[CHUNK_HASH_LEN];
-	void	   *data;			/* once its children are on the stack */
+	void	   *data;			/* its bytes, read with its siblings' */
 	uint32		len;
+	bool		expanded;		/* its children on the stack */
 } PushFrame;
 
 typedef struct PushState
@@ -147,7 +148,11 @@ typedef struct PushState
 	PushFrame  *stack;
 	int			depth;
 	int			cap;
-	/* the batch: chunks whose children are all in the tier, or in it */
+	/* a chunk's children to read, at once */
+	int			nkids;
+	int			kidcap;
+	uint8	   *kids;
+	/* the batch: chunks whose children are all in the target, or in it */
 	int			n;
 	int			ncap;
 	uint8	   *hashes;
@@ -155,10 +160,11 @@ typedef struct PushState
 	uint32	   *lens;
 	uint64		bytes;
 	uint64		copied;
+	HTAB	   *seen;			/* the chunks walked */
 } PushState;
 
 static void
-push_frame(PushState *ps, const uint8 *hash)
+push_frame(PushState *ps, const uint8 *hash, void *data, uint32 len)
 {
 	if (ps->depth == ps->cap)
 	{
@@ -166,15 +172,61 @@ push_frame(PushState *ps, const uint8 *hash)
 		ps->stack = repalloc_array(ps->stack, PushFrame, ps->cap);
 	}
 	memcpy(ps->stack[ps->depth].hash, hash, CHUNK_HASH_LEN);
-	ps->stack[ps->depth].data = NULL;
-	ps->stack[ps->depth].len = 0;
+	ps->stack[ps->depth].data = data;
+	ps->stack[ps->depth].len = len;
+	ps->stack[ps->depth].expanded = false;
 	ps->depth++;
 }
 
+/* a child noted to read, unless seen already, or the target has it (held) */
 static void
-push_ref(void *arg, const uint8 *hash)
+note_kid(void *arg, const uint8 *hash)
 {
-	push_frame((PushState *) arg, hash);
+	PushState  *ps = arg;
+	bool		found;
+
+	(void) hash_search(ps->seen, hash, HASH_FIND, &found);
+	if (found || cs_hold(ps->to, hash))
+		return;
+	if (ps->nkids == ps->kidcap)
+	{
+		ps->kidcap = Max(ps->kidcap * 2, 64);
+		ps->kids = ps->kids ? repalloc(ps->kids, (Size) ps->kidcap * CHUNK_HASH_LEN) :
+			palloc((Size) ps->kidcap * CHUNK_HASH_LEN);
+	}
+	memcpy(ps->kids + (Size) ps->nkids * CHUNK_HASH_LEN, hash, CHUNK_HASH_LEN);
+	ps->nkids++;
+}
+
+/*
+ * The chunks noted read from the source at once (in its own order: the
+ * tier's, a few reads of each pack), each pushed with its bytes
+ */
+static void
+push_kids(PushState *ps)
+{
+	void	  **datas;
+	uint32	   *lens;
+
+	if (ps->nkids == 0)
+		return;
+	datas = palloc_array(void *, ps->nkids);
+	lens = palloc_array(uint32, ps->nkids);
+	cs_get_many(ps->from, ps->kids, ps->nkids, datas, lens);
+	for (int i = 0; i < ps->nkids; i++)
+	{
+		const uint8 *hash = ps->kids + (Size) i * CHUNK_HASH_LEN;
+
+		if (datas[i] == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("%s has no chunk %s to %s",
+							ps->source, ChunkHashText(hash), ps->verb)));
+		push_frame(ps, hash, datas[i], lens[i]);
+	}
+	pfree(datas);
+	pfree(lens);
+	ps->nkids = 0;
 }
 
 static void
@@ -210,21 +262,24 @@ batch_add(PushState *ps, const PushFrame *f)
 }
 
 /*
- * Every chunk root reaches that the tier has not, copied into it: a walk
- * down, each chunk once (seen), one the tier has held there and not walked
- * below (the tier has what it references)
+ * Every chunk root reaches that the target has not, copied into it: a walk
+ * down, each chunk once (seen as it comes to the top), one the target has
+ * held there and not walked below (the target has what it references); a
+ * chunk's children read at once as it is come to (a chunk named twice may
+ * be read twice: the second, seen, let go of)
  */
 static void
-copy_reached(PushState *ps, HTAB *seen, const uint8 *root)
+copy_reached(PushState *ps, const uint8 *root)
 {
-	push_frame(ps, root);
+	note_kid(ps, root);
+	push_kids(ps);
 	while (ps->depth > 0)
 	{
 		PushFrame  *f = &ps->stack[ps->depth - 1];
 		bool		found;
 
 		CHECK_FOR_INTERRUPTS();
-		if (f->data != NULL)
+		if (f->expanded)
 		{
 			PushFrame	done = *f;
 
@@ -232,31 +287,22 @@ copy_reached(PushState *ps, HTAB *seen, const uint8 *root)
 			batch_add(ps, &done);
 			continue;
 		}
-		(void) hash_search(seen, f->hash, HASH_ENTER, &found);
-		if (found || cs_hold(ps->to, f->hash))
+		(void) hash_search(ps->seen, f->hash, HASH_ENTER, &found);
+		if (found)
 		{
+			pfree(f->data);
 			ps->depth--;
 			continue;
 		}
-		f->data = cs_get(ps->from, f->hash, &f->len);
-		if (f->data == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s has no chunk %s to %s",
-							ps->source, ChunkHashText(f->hash), ps->verb)));
-		/* (an empty chunk's bytes, palloc'd for the batch to free) */
-		if (f->len == 0)
-		{
-			pfree(f->data);
-			f->data = palloc(1);
-		}
+		f->expanded = true;
 		/* (f may move as the stack grows: its references found from a copy) */
 		{
 			void	   *data = f->data;
 			uint32		len = f->len;
 
-			ChunkFormat->refs(data, len, push_ref, ps);
+			ChunkFormat->refs(data, len, note_kid, ps);
 		}
+		push_kids(ps);
 	}
 }
 
@@ -339,7 +385,6 @@ pg_history_push(PG_FUNCTION_ARGS)
 	uint8	   *roots = array_hashes(PG_GETARG_ARRAYTYPE_P(1), &n);
 	PushState	ps = {0};
 	HASHCTL		ctl;
-	HTAB	   *seen;
 	Oid			types[3] = {TEXTOID, BYTEAARRAYOID, INT8OID};
 
 	check_pusher("pg_history_push()");
@@ -367,9 +412,9 @@ pg_history_push(PG_FUNCTION_ARGS)
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = CHUNK_HASH_LEN;
 	ctl.hcxt = CurrentMemoryContext;
-	seen = hash_create("history push", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ps.seen = hash_create("history push", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	for (int i = 0; i < n; i++)
-		copy_reached(&ps, seen, roots + (Size) i * CHUNK_HASH_LEN);
+		copy_reached(&ps, roots + (Size) i * CHUNK_HASH_LEN);
 	flush_batch(&ps);
 
 	/*
@@ -476,7 +521,6 @@ pg_history_fetch(PG_FUNCTION_ARGS)
 	int			n;
 	PushState	ps = {0};
 	HASHCTL		ctl;
-	HTAB	   *seen;
 
 	check_pusher("pg_history_fetch()");
 	SPI_connect();
@@ -518,9 +562,9 @@ pg_history_fetch(PG_FUNCTION_ARGS)
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = CHUNK_HASH_LEN;
 	ctl.hcxt = CurrentMemoryContext;
-	seen = hash_create("history fetch", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ps.seen = hash_create("history fetch", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	for (int i = 0; i < n; i++)
-		copy_reached(&ps, seen, roots + (Size) i * CHUNK_HASH_LEN);
+		copy_reached(&ps, roots + (Size) i * CHUNK_HASH_LEN);
 	flush_batch(&ps);
 	PG_RETURN_INT64((int64) ps.copied);
 }

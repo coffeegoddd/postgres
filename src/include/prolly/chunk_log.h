@@ -93,6 +93,16 @@ typedef struct ChunkLogRoutine
 	 */
 	void		(*prepare) (Relation rel, size_t len, ChunkLogRun *run);
 	uint64		(*reserve) (Relation rel, ChunkLogRun *run, size_t len);
+
+	/*
+	 * Optional (NULL: none): a pack's chunks' room at once, len bytes of
+	 * nchunks chunks (it may fail), and each chunk's place off bytes into
+	 * it, as the caller lays them out, in any order (it does not fail):
+	 * bytes no chunk is placed at are counted dead.  So a pack reads as its
+	 * caller walked it, its entries put in whatever order they must be.
+	 */
+	void		(*prepare_pack) (Relation rel, int nchunks, size_t len, ChunkLogRun *run);
+	uint64		(*reserve_at) (Relation rel, ChunkLogRun *run, uint64 off, size_t len);
 	void		(*write) (Relation rel, uint64 loc, const void *data, size_t len);
 	void		(*release) (Relation rel, const ChunkLogRun *run);
 
@@ -180,6 +190,14 @@ typedef struct ChunkLogRoutine
 	 * log's.
 	 */
 	void		(*read) (Relation rel, uint64 loc, void *dst, size_t len);
+
+	/*
+	 * read of each of n places, locs ascending, into dsts[i] (lens[i]
+	 * bytes): as the log reads best many at once (the tier's, a few reads
+	 * of each pack's object, its ranges near one another read together)
+	 */
+	void		(*read_many) (Relation rel, int n, const uint64 *locs,
+							  const uint32 *lens, void **dsts);
 
 	/* Where the log's regions end: no bytes are at or after it. */
 	uint64		(*end) (Relation rel);

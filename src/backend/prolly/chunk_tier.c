@@ -181,10 +181,14 @@ typedef struct TierPending
 	TierSlot   *slots;			/* the chunks reserved, for the pack's table */
 	int			nslots;
 	int			slots_cap;
+	bool		slots_unsorted;	/* reserved out of their offsets' order */
 	uint64		table_len;		/* the table's and footer's, once appended */
 } TierPending;
 
 static TierPending pending;
+
+/* the reads of packs' objects this backend made: for tests */
+static uint64 tier_object_reads = 0;
 static bool callback_registered = false;
 static bool past_pre_commit = false;	/* this transaction's packs written */
 
@@ -1079,6 +1083,23 @@ write_pack(Relation rel)
 	state = GenericXLogStart(rel);
 	p = pack_entry(GenericXLogRegisterBuffer(state, buf, 0), pending.id);
 	p->size = pending.len;
+
+	/*
+	 * (bytes no chunk reserved, a pack's chunk another put first, laid out
+	 * as its caller placed them: no entry's, dead now)
+	 */
+	{
+		uint64		reserved = 0;
+
+		for (int k = 0; k < pending.nslots; k++)
+			reserved += pending.slots[k].len;
+		if (pending.len > reserved)
+		{
+			p->dead += pending.len - reserved;
+			if (p->dead >= p->size)
+				p->dead_lsn = GetXLogInsertRecPtr();
+		}
+	}
 	if (pending.len == 0)
 		p->state = PACK_REMOVED;
 	GenericXLogFinish(state);
@@ -1144,8 +1165,9 @@ check_writer(Relation rel)
 			 RelationGetRelationName(rel));
 }
 
+/* a put about to be made in the tier: refused as tier_prepare says */
 static void
-tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
+check_put(Relation rel)
 {
 	check_writer(rel);
 
@@ -1178,21 +1200,25 @@ tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a transaction puts chunks in one tier of the history store")));
+}
 
-	/* (a pack full written now, and another begun) */
+/*
+ * Room made in this backend's pack for len bytes of nchunks chunks, after
+ * its bytes so far: a pack full written first, and another begun; its
+ * buffer grown (for its table too, so that writing the pack copies
+ * nothing), its slots, and the room zeroed (bytes reserved and never
+ * written are no memory's); the run over it in *run
+ */
+static void
+make_room(Relation rel, size_t len, int nchunks, ChunkLogRun *run)
+{
 	if (pending.id != 0 && pending.len > 0 && pending.len + len > TIER_PACK_BYTES)
 		write_pack(rel);
 	if (pending.id == 0)
 		begin_pack(rel);
-
-	/*
-	 * (room made now: reserve, which must not fail, takes it, and a slot
-	 * for it; and room for the table, so that writing the pack copies
-	 * nothing)
-	 */
-	if (pending.len + len + TABLE_ROOM(pending.nslots + 1) > pending.cap)
+	if (pending.len + len + TABLE_ROOM(pending.nslots + nchunks) > pending.cap)
 	{
-		uint64		need = pending.len + len + TABLE_ROOM(pending.nslots + 1);
+		uint64		need = pending.len + len + TABLE_ROOM(pending.nslots + nchunks);
 		uint64		cap = Max(pending.cap * 2, 1024 * 1024);
 
 		/*
@@ -1207,19 +1233,66 @@ tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 			MemoryContextAllocHuge(TopMemoryContext, cap);
 		pending.cap = cap;
 	}
-	if (pending.nslots == pending.slots_cap)
+	if (pending.nslots + nchunks > pending.slots_cap)
 	{
-		pending.slots_cap = Max(pending.slots_cap * 2, 64);
+		pending.slots_cap = Max(Max(pending.slots_cap * 2, 64), pending.nslots + nchunks);
 		pending.slots = pending.slots ?
 			repalloc_huge(pending.slots, pending.slots_cap * sizeof(TierSlot)) :
 			MemoryContextAllocHuge(TopMemoryContext, pending.slots_cap * sizeof(TierSlot));
 	}
-	/* (zeroed: bytes reserved and never written are no memory's) */
 	memset(pending.buf + pending.len, 0, len);
 	run->relnumber = rel->rd_locator.relNumber;
 	run->next = PACK_LOC(pending.id, pending.len);
 	run->limit = run->next + len;
 	run->generation = 0;
+}
+
+static void
+tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
+{
+	check_put(rel);
+	make_room(rel, len, 1, run);
+}
+
+/*
+ * A pack's chunks' room at once, their bytes in the order the caller
+ * places them (reserve_at), whatever order their entries are put in: so a
+ * pack laid out as its caller walked (a chunk's children together) reads
+ * so
+ */
+static void
+tier_prepare_pack(Relation rel, int nchunks, size_t len, ChunkLogRun *run)
+{
+	check_put(rel);
+	make_room(rel, len, nchunks, run);
+}
+
+/*
+ * A chunk's place off bytes into the room prepare_pack made (it must not
+ * fail: its slot made room for there); the run's start and end kept (its
+ * places are the caller's to give)
+ */
+static uint64
+tier_reserve_at(Relation rel, ChunkLogRun *run, uint64 off, size_t len)
+{
+	uint64		loc = run->next + off;
+
+	if (off + len > run->limit - run->next || LOC_PACK(loc) != pending.id ||
+		pending.nslots == pending.slots_cap)
+		elog(PANIC, "tier \"%s\": %zu bytes reserved past the room prepared",
+			 RelationGetRelationName(rel), len);
+	pending.len = Max(pending.len, (uint64) LOC_OFF(loc) + len);
+	if (len > 0)
+	{
+		/* (out of order, maybe: sorted before they are looked in) */
+		if (pending.nslots > 0 && pending.slots[pending.nslots - 1].off > LOC_OFF(loc))
+			pending.slots_unsorted = true;
+		pending.slots[pending.nslots].off = LOC_OFF(loc);
+		pending.slots[pending.nslots].len = len;
+		pending.slots[pending.nslots].written = false;
+		pending.nslots++;
+	}
+	return loc;
 }
 
 static bool
@@ -1234,6 +1307,15 @@ tier_prepare_free(Relation rel, size_t len, uint64 below, ChunkLogRun *run)
 	}
 	tier_prepare(rel, len, run);
 	return true;
+}
+
+static int
+slot_cmp(const void *a, const void *b)
+{
+	uint32		x = ((const TierSlot *) a)->off;
+	uint32		y = ((const TierSlot *) b)->off;
+
+	return (x > y) - (x < y);
 }
 
 static uint64
@@ -1268,9 +1350,14 @@ tier_write(Relation rel, uint64 loc, const void *data, size_t len)
 
 	/*
 	 * (the chunks reserved whose bytes these are written: one write may be
-	 * of several, one after another; slots are in the order of their
-	 * offsets)
+	 * of several, one after another; slots in the order of their offsets,
+	 * sorted so if reserved otherwise)
 	 */
+	if (pending.slots_unsorted)
+	{
+		qsort(pending.slots, pending.nslots, sizeof(TierSlot), slot_cmp);
+		pending.slots_unsorted = false;
+	}
 	{
 		uint64		start = LOC_OFF(loc);
 		uint64		end = start + len;
@@ -1346,8 +1433,84 @@ tier_read(Relation rel, uint64 loc, void *dst, size_t len)
 		os = tier_objects();
 		name = pack_name(cached_stamp(rel), owner, id);
 		os->routine->read(os, name, LOC_OFF(loc), dst, len);
+		tier_object_reads++;
 		pfree(name);
 	}
+}
+
+/*
+ * Ranges of a pack read together if this near one another, and up to this
+ * much at once: a pack's chunks read in few of its object's reads
+ */
+#define READ_GAP_BYTES		(64 * 1024)
+#define READ_SPAN_BYTES		(16 * 1024 * 1024)
+
+static void
+tier_read_many(Relation rel, int n, const uint64 *locs, const uint32 *lens, void **dsts)
+{
+	int			i = 0;
+
+	while (i < n)
+	{
+		uint32		id = LOC_PACK(locs[i]);
+		uint64		start;
+		uint64		end;
+		int			last;
+		Buffer		buf;
+		uint64		owner;
+		char	   *span;
+		char	   *name;
+		ObjectStore *os;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* (an empty chunk's, or this transaction's pack's: one at a time) */
+		if (lens[i] == 0 || id == 0 ||
+			(id == pending.id && pending.relnumber == rel->rd_locator.relNumber))
+		{
+			tier_read(rel, locs[i], dsts[i], lens[i]);
+			i++;
+			continue;
+		}
+
+		/* (the ranges of this pack near one another, to a span's bytes) */
+		start = LOC_OFF(locs[i]);
+		end = start + lens[i];
+		last = i;
+		while (last + 1 < n && LOC_PACK(locs[last + 1]) == id && lens[last + 1] > 0 &&
+			   LOC_OFF(locs[last + 1]) <= end + READ_GAP_BYTES &&
+			   Max(end, (uint64) LOC_OFF(locs[last + 1]) + lens[last + 1]) - start <= READ_SPAN_BYTES)
+		{
+			last++;
+			end = Max(end, (uint64) LOC_OFF(locs[last]) + lens[last]);
+		}
+		if (last == i)
+		{
+			tier_read(rel, locs[i], dsts[i], lens[i]);
+			i++;
+			continue;
+		}
+
+		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
+		owner = pack_entry(BufferGetPage(buf), id)->owner;
+		UnlockReleaseBuffer(buf);
+		os = tier_objects();
+		name = pack_name(cached_stamp(rel), owner, id);
+		span = palloc_extended(end - start, MCXT_ALLOC_HUGE);
+		os->routine->read(os, name, start, span, end - start);
+		tier_object_reads++;
+		for (int k = i; k <= last; k++)
+			memcpy(dsts[k], span + (LOC_OFF(locs[k]) - start), lens[k]);
+		pfree(span);
+		pfree(name);
+		i = last + 1;
+	}
+}
+
+uint64
+ChunkTierObjectReads(void)
+{
+	return tier_object_reads;
 }
 
 /*
@@ -2189,6 +2352,9 @@ const ChunkLogRoutine TierChunkLog = {
 	.check_live = tier_check_live,
 	.bind_index = tier_bind_index,
 	.read = tier_read,
+	.prepare_pack = tier_prepare_pack,
+	.reserve_at = tier_reserve_at,
+	.read_many = tier_read_many,
 	.mark_dead = tier_mark_dead,
 	.stamp = tier_stamp,
 	.end = tier_end,

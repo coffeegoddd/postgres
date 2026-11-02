@@ -177,6 +177,9 @@ typedef struct ChunkTierPackInfo
 
 extern int	ChunkTierPacks(Relation rel, ChunkTierPackInfo **out);
 
+/* For tests: the reads of packs' objects this backend has made. */
+extern uint64 ChunkTierObjectReads(void);
+
 /*
  * Every pack the tier has made so far this server's to remove, whatever
  * its owner (those from before a promotion, or a recovery to a point in

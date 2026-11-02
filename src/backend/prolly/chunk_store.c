@@ -170,17 +170,29 @@ ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes, int n,
 		}
 	}
 
-	/* (in the log's order: its pages each read through once) */
+	/* (in the log's order, read as the log reads many best) */
 	qsort(places, found, sizeof(ChunkPlace), place_cmp);
-	for (int k = 0; k < found; k++)
+	if (found > 0)
 	{
-		ChunkPlace *pl = &places[k];
-		void	   *data = palloc_extended(Max(pl->len, 1), MCXT_ALLOC_HUGE);
+		uint64	   *locs = palloc_array(uint64, found);
+		uint32	   *plens = palloc_array(uint32, found);
+		void	  **dsts = palloc_array(void *, found);
 
-		CHECK_FOR_INTERRUPTS();
-		ChunkLogOf(log)->read(log, pl->loc, data, pl->len);
-		out[pl->at] = data;
-		lens[pl->at] = pl->len;
+		for (int k = 0; k < found; k++)
+		{
+			locs[k] = places[k].loc;
+			plens[k] = places[k].len;
+			dsts[k] = palloc_extended(Max(places[k].len, 1), MCXT_ALLOC_HUGE);
+		}
+		ChunkLogOf(log)->read_many(log, found, locs, plens, dsts);
+		for (int k = 0; k < found; k++)
+		{
+			out[places[k].at] = dsts[k];
+			lens[places[k].at] = places[k].len;
+		}
+		pfree(locs);
+		pfree(plens);
+		pfree(dsts);
 	}
 	pfree(places);
 }
@@ -357,6 +369,24 @@ typedef struct PlaceArg
 	Relation	log;
 	ChunkLogRun *run;
 } PlaceArg;
+
+/* a place the caller laid out, in a pack's room prepared at once */
+typedef struct PlaceAtArg
+{
+	Relation	log;
+	ChunkLogRun *run;
+	uint64		off;
+} PlaceAtArg;
+
+static void
+reserve_place_at(void *arg, ChunkIndexEntry *entry)
+{
+	PlaceAtArg *place = arg;
+
+	entry->loc = entry->len > 0 ?
+		ChunkLogOf(place->log)->reserve_at(place->log, place->run, place->off, entry->len) : 0;
+	entry->log_gen = place->run->generation;
+}
 
 static void
 reserve_place(void *arg, ChunkIndexEntry *entry)
@@ -703,6 +733,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		bool		have_run = false;
 		ChunkLogRun run;
 		PlaceArg	place;
+		bool		laid_out = false;
 
 		for (int i = 0; i < n; i++)
 			if (fresh[i])
@@ -714,6 +745,63 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		qsort(order, nfresh, sizeof(PackOrder), pack_order_cmp);
 		place.log = log;
 		place.run = &run;
+
+		/*
+		 * (a log that lays a pack out at once: its room prepared for all of
+		 * it, each chunk's place given in the order the caller put them, its
+		 * entries put in their names' order still; then each one's bytes
+		 * written where it was placed.  A chunk another put first leaves its
+		 * place unused, counted dead.)
+		 */
+		if (ChunkLogOf(log)->prepare_pack != NULL && nfresh > 0)
+		{
+			uint64	   *offs = palloc0(Max(n, 1) * sizeof(uint64));
+			uint64		total = 0;
+			int			nonempty = 0;
+			PlaceAtArg	at = {.log = log, .run = &run};
+
+			for (int i = 0; i < n; i++)
+				if (fresh[i] && lens[i] > 0)
+				{
+					offs[i] = total;
+					total += lens[i];
+					nonempty++;
+				}
+			ChunkLogOf(log)->prepare_pack(log, nonempty, total, &run);
+			for (int k = 0; k < nfresh; k++)
+			{
+				int			i = order[k].at;
+
+				CHECK_FOR_INTERRUPTS();
+				at.off = offs[i];
+				for (;;)
+				{
+					memset(&e, 0, sizeof(e));
+					memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
+					e.len = lens[i];
+					if (ChunkIndex->insert(idx, &e, reserve_place_at, &at))
+					{
+						locs[i] = e.loc;
+						stored++;
+						break;
+					}
+					if (found_held(idx, hashes + i * CHUNK_HASH_LEN))
+					{
+						fresh[i] = false;
+						break;
+					}
+				}
+				INJECTION_POINT("chunk-pack-entry", NULL);
+			}
+			INJECTION_POINT("chunk-put-entered", NULL);
+			for (int i = 0; i < n; i++)
+				if (fresh[i] && lens[i] > 0)
+					ChunkLogOf(log)->write(log, locs[i], datas[i], lens[i]);
+			ChunkLogOf(log)->release(log, &run);
+			pfree(offs);
+			nfresh = 0;
+			laid_out = true;
+		}
 		for (int k = 0; k < nfresh; k++)
 		{
 			int			i = order[k].at;
@@ -754,7 +842,8 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			}
 			INJECTION_POINT("chunk-pack-entry", NULL);
 		}
-		INJECTION_POINT("chunk-put-entered", NULL);
+		if (!laid_out)
+			INJECTION_POINT("chunk-put-entered", NULL);
 		write_pack(log, order, unwritten, nfresh, fresh, locs, datas, lens);
 		if (have_run)
 			ChunkLogOf(log)->release(log, &run);
