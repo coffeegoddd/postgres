@@ -66,7 +66,7 @@ open_log(Oid relid, LOCKMODE mode)
 {
 	Relation	rel = relation_open(relid, mode);
 
-	if (!RelationIsChunkLog(rel))
+	if (!RelationIsAnyChunkLog(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a chunk log relation",

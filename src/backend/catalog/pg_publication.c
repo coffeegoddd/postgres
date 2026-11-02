@@ -194,6 +194,7 @@ is_publishable_class(Oid relid, Form_pg_class reltuple)
 		reltuple->relpersistence == RELPERSISTENCE_PERMANENT &&
 		reltuple->relam != PROLLY_CHUNKS_TABLE_AM_OID &&
 		reltuple->relam != PROLLY_CHUNK_INDEX_TABLE_AM_OID &&
+		reltuple->relam != PROLLY_TIER_TABLE_AM_OID &&
 		relid >= FirstNormalObjectId;
 }
 
