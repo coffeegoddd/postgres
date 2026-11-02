@@ -1876,7 +1876,10 @@ heap_drop_with_catalog(Oid relid)
 	 * the index bound to it, without which its packs could not be freed)
 	 */
 	if (RelationIsTierLog(rel))
+	{
 		ChunkTierCheckEmpty(rel, "drop");
+		ChunkTierForgetMarker(rel);
+	}
 	else if (RelationIsChunkIndex(rel))
 		ChunkTierCheckIndex(rel, "drop");
 

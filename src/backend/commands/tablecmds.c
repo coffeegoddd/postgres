@@ -19688,13 +19688,6 @@ AlterTableNamespace(AlterObjectSchemaStmt *stmt, Oid *oldschema)
 
 	oldNspOid = RelationGetNamespace(rel);
 
-	/* (prolly: a tier of the history store is pg_history's alone) */
-	if (RelationIsTierLog(rel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot move tier \"%s\" out of schema \"pg_history\"",
-						RelationGetRelationName(rel))));
-
 	/* If it's an owned sequence, disallow moving it by itself. */
 	if (rel->rd_rel->relkind == RELKIND_SEQUENCE)
 	{
@@ -19745,6 +19738,16 @@ AlterTableNamespaceInternal(Relation rel, Oid oldNspOid, Oid nspOid,
 	Relation	classRel;
 
 	Assert(objsMoved != NULL);
+
+	/*
+	 * (prolly: a tier of the history store is pg_history's alone; here, as
+	 * every move of a table, an extension's too, comes)
+	 */
+	if (RelationIsTierLog(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move tier \"%s\" out of schema \"pg_history\"",
+						RelationGetRelationName(rel))));
 
 	/* OK, modify the pg_class row and pg_depend entry */
 	classRel = table_open(RelationRelationId, RowExclusiveLock);

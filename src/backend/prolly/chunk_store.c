@@ -293,9 +293,25 @@ check_refs(Relation idx, const uint8 *chunk, const RefList *refs, HTAB *pack,
 static void
 bind_store(Relation log, Relation idx)
 {
-	uint64		stamp = ChunkLogOf(log)->stamp(log);
+	uint64		stamp;
 	uint64		bound_stamp;
-	Oid			bound = ChunkIndex->log_of(idx, &bound_stamp);
+	Oid			bound;
+
+	/*
+	 * (a tier takes no chunk through an index whose storage is this
+	 * transaction's: aborted, the index would go, and the tier's packs
+	 * with no index to be freed through)
+	 */
+	if (RelationIsTierLog(log) &&
+		(idx->rd_createSubid != InvalidSubTransactionId ||
+		 idx->rd_firstRelfilelocatorSubid != InvalidSubTransactionId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot put chunks in tier \"%s\" through index \"%s\" in the transaction that made or truncated it",
+						RelationGetRelationName(log), RelationGetRelationName(idx)),
+				 errhint("Commit first.")));
+	stamp = ChunkLogOf(log)->stamp(log);
+	bound = ChunkIndex->log_of(idx, &bound_stamp);
 
 	/* (bound to another: bind_log says so, writing nothing) */
 	if (OidIsValid(bound) &&

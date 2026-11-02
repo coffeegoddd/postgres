@@ -1033,16 +1033,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 						dbtemplate)));
 
 	/*
-	 * (prolly: a template whose history store's tier has packs is not
-	 * copied: the copy's tier would name the template's objects)
-	 */
-	if (ChunkTierDatabaseHasPacks(src_dboid))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot copy database \"%s\": its history store's tier has packs", dbtemplate),
-				 errhint("Release its bundles, free their chunks and VACUUM the tier's index in it first.")));
-
-	/*
 	 * If the source database was in the process of being dropped, we can't
 	 * use it as a template.
 	 */
@@ -1465,6 +1455,17 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 				 errdetail_busy_db(notherbackends, npreparedxacts)));
 
 	/*
+	 * (prolly: a template whose history store's tier has packs is not
+	 * copied: the copy's tier would name the template's objects.  Looked at
+	 * once no one else is in it: none can begin a pack since.)
+	 */
+	if (ChunkTierDatabaseHasPacks(src_dboid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot copy database \"%s\": its history store's tier has packs", dbtemplate),
+				 errhint("Release its bundles, free their chunks and VACUUM the tier's index in it first, or copy another (TEMPLATE template0).")));
+
+	/*
 	 * Select an OID for the new database, checking that it doesn't have a
 	 * filename conflict with anything already existing in the tablespace
 	 * directories.
@@ -1796,15 +1797,6 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot drop the currently open database")));
 
-	/*
-	 * (prolly: a database whose history store's tier has packs is not
-	 * dropped: their objects would be left in the tier's store)
-	 */
-	if (ChunkTierDatabaseHasPacks(db_id))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot drop database \"%s\": its history store's tier has packs", dbname),
-				 errhint("Release its bundles, free their chunks and VACUUM the tier's index in it first.")));
 
 	/*
 	 * Check whether there are active logical slots that refer to the
@@ -1859,6 +1851,17 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 				 errmsg("database \"%s\" is being accessed by other users",
 						dbname),
 				 errdetail_busy_db(notherbackends, npreparedxacts)));
+
+	/*
+	 * (prolly: a database whose history store's tier has packs is not
+	 * dropped: their objects would be left in the tier's store.  Looked at
+	 * once no one else is in it: none can begin a pack since.)
+	 */
+	if (ChunkTierDatabaseHasPacks(db_id))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot drop database \"%s\": its history store's tier has packs", dbname),
+				 errhint("Release its bundles, free their chunks and VACUUM the tier's index in it first.")));
 
 	/*
 	 * Delete any comments or security labels associated with the database.

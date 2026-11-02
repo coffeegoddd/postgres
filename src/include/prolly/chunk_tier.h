@@ -117,6 +117,14 @@ extern void ChunkTierNewStorage(Relation rel);
 extern void ChunkTierCheckEmpty(Relation rel, const char *what);
 
 /*
+ * For DROP and TRUNCATE of a tier found empty: the database's marker of it
+ * removed (one left by a pack's beginning cut short would else stay, and
+ * keep the database from being dropped).  Its mark cleared first, so that
+ * one rolled back is as one emptied.
+ */
+extern void ChunkTierForgetMarker(Relation rel);
+
+/*
  * The same, for DROP and TRUNCATE of a chunk index bound to a tier (its
  * stamp the tier's now): refused while the tier has packs, which it alone
  * could free.
