@@ -59,22 +59,30 @@ ObjectStoreOpen(const char *impl, const char *location)
 }
 
 char *
-ObjectStoreIdentity(const char *impl, const char *location)
+ObjectStoreIdentity(ObjectStore *os, const char *impl)
 {
-	const ProllyImplementation *found;
-	char	   *id;
-	char	   *both;
+	const char *name = "store-identity";
+	uint64		size;
+	uint64		id;
+	char		buf[17];
 
-	register_object_stores();
-	found = ProllyLookupImplementation(OBJECT_STORE_IFACE, impl);
-	if (found == NULL)
+	if (!os->routine->size(os, name, &size))
+	{
+		if (!pg_strong_random(&id, sizeof(id)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not make an object store's identity")));
+		snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) id);
+		/* (two making it at once: one put refused, the other's read) */
+		os->routine->put(os, name, buf, 16);
+	}
+	if (!os->routine->size(os, name, &size) || size != 16)
 		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("there is no object store \"%s\"", impl)));
-	id = ((const ObjectStoreRoutine *) found->routine)->identity(location);
-	both = psprintf("%s:%s", impl, id);
-	pfree(id);
-	return both;
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("object store's identity is not 16 bytes")));
+	os->routine->read(os, name, 0, buf, 16);
+	buf[16] = '\0';
+	return psprintf("%s:%s", impl, buf);
 }
 
 List *
@@ -158,23 +166,6 @@ dir_path(DirectoryStore *ds, const char *name)
 		if (*c == '/')
 			*c = '#';
 	return path;
-}
-
-/* a directory's path, absolute (from the data directory) and canonical */
-static char *
-dir_identity(const char *location)
-{
-	char	   *path = make_absolute_path(location);
-	char	   *id;
-
-	if (path == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory")));
-	canonicalize_path(path);
-	id = pstrdup(path);
-	free(path);
-	return id;
 }
 
 static ObjectStore *
@@ -488,7 +479,6 @@ dir_remove(ObjectStore *os, const char *name)
 
 const ObjectStoreRoutine DirectoryObjectStore = {
 	.open = dir_open,
-	.identity = dir_identity,
 	.close = dir_close,
 	.put = dir_put,
 	.read = dir_read,

@@ -47,12 +47,6 @@ typedef struct ObjectStoreRoutine
 	/* The store at location (for "directory", a directory), palloc'd. */
 	ObjectStore *(*open) (const char *location);
 
-	/*
-	 * What names the store at location, whatever it is spelled: two
-	 * locations of one store, one identity (for "directory", its path made
-	 * absolute and canonical), palloc'd.
-	 */
-	char	   *(*identity) (const char *location);
 
 	/* Lets go of what open made. */
 	void		(*close) (ObjectStore *os);
@@ -97,8 +91,12 @@ extern PGDLLIMPORT const ObjectStoreRoutine DirectoryObjectStore;
 /* The store of implementation impl at location; an error if none is impl. */
 extern ObjectStore *ObjectStoreOpen(const char *impl, const char *location);
 
-/* The store's identity: the implementation's name and its identity. */
-extern char *ObjectStoreIdentity(const char *impl, const char *location);
+/*
+ * The store's identity, whatever its location is spelled or mounted as: an
+ * object of its own ("store-identity", a random number, made the first
+ * time it is asked for), with the implementation's name; palloc'd.
+ */
+extern char *ObjectStoreIdentity(ObjectStore *os, const char *impl);
 
 /* The implementations registered (ProllyImplementation), in order. */
 extern List *ObjectStoreList(void);

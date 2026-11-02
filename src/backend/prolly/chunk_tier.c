@@ -300,6 +300,9 @@ pack_name(uint64 stamp, uint64 owner, uint32 id)
  * The store the tier keeps its packs in, opened once a backend (again if
  * the settings change)
  */
+/* bumped as the store is opened again: what is kept of it, asked again */
+static uint64 os_generation = 0;
+
 static ObjectStore *
 tier_objects(void)
 {
@@ -325,6 +328,7 @@ tier_objects(void)
 		os = NULL;
 	}
 	os = ObjectStoreOpen(history_tier_store, history_tier_location);
+	os_generation++;
 	os_store = pstrdup(history_tier_store);
 	os_location = pstrdup(history_tier_location);
 	MemoryContextSwitchTo(old);
@@ -502,17 +506,28 @@ remove_marker(Relation rel, const TierMeta *meta)
 }
 
 /*
- * The store and place set now: a hash of the store's identity (the same
- * however the place is spelled), never 0
+ * The store and place set now: a hash of the store's identity (an object
+ * of its own: the same however the place is spelled, or mounted), never 0;
+ * kept as the store's handle is (tier_objects), asked again as it is
+ * opened again
  */
 static uint64
 current_place(void)
 {
-	char	   *both = ObjectStoreIdentity(history_tier_store, history_tier_location);
-	uint64		h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
+	static uint64 for_generation = 0;
+	static uint64 place = 0;
+	ObjectStore *os = tier_objects();
 
-	pfree(both);
-	return h != 0 ? h : 1;
+	if (for_generation != os_generation)
+	{
+		char	   *both = ObjectStoreIdentity(os, history_tier_store);
+		uint64		h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
+
+		pfree(both);
+		place = h != 0 ? h : 1;
+		for_generation = os_generation;
+	}
+	return place;
 }
 
 /* whether the tier has no pack not removed, a manifest's or a chunks' */
@@ -1699,7 +1714,9 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 
 		lock_marker(rel, ExclusiveLock);
 		now = read_meta(rel);
-		if (now.next_pack == meta.next_pack && now.dboid == MyDatabaseId)
+		/* (a marker made meanwhile elsewhere than the settings say: left) */
+		if (now.next_pack == meta.next_pack && now.dboid == MyDatabaseId &&
+			!place_differs(&now))
 			remove_marker(rel, &now);
 		unlock_marker(rel, ExclusiveLock);
 	}
