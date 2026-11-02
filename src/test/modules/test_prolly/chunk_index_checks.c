@@ -395,7 +395,7 @@ test_chunk_read_bench(PG_FUNCTION_ARGS)
 	{
 		for (int i = 0; i < nplaces; i++)
 		{
-			ChunkLog->read(log, places[i].loc, buf, places[i].len);
+			ChunkLogOf(log)->read(log, places[i].loc, buf, places[i].len);
 			found++;
 			bytes += places[i].len;
 			for (uint32 j = 0; j < places[i].len; j++)
