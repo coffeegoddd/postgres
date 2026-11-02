@@ -14,6 +14,7 @@ backend_sources += files(
   'chunk_pointers.c',
   'chunk_region.c',
   'chunk_store.c',
+  'chunk_tier.c',
   'chunkstore.c',
   'object_store.c',
   'registry.c',

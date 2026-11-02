@@ -139,6 +139,27 @@ typedef struct ChunkLogRoutine
 								  ChunkLogSegments *out);
 
 	/*
+	 * For VACUUM of the log's index: its pass begun (what the log keeps for
+	 * its end, or NULL), and ended: the log's own upkeep (letting go of
+	 * what no live backend holds; with truncate, cutting off its free end),
+	 * and what it finds of its segments in *out, those with bytes of chunks
+	 * freed kept for snapshots (pending, a bit a segment, of the first
+	 * npending) passed by.  Between them the pass counts bytes dead.
+	 */
+	void	   *(*vacuum_begin) (Relation rel);
+	void		(*vacuum_end) (Relation rel, void *state, bool truncate,
+							   double fraction, const uint8 *pending,
+							   uint64 npending, ChunkLogSegments *out);
+
+	/*
+	 * For audits: whether no part of the log counts bytes of the chunks
+	 * given (at locs, lens long) dead, and it has room for all it counts;
+	 * what is wrong in *why if not.  O(log).
+	 */
+	bool		(*check_live) (Relation rel, int n, const uint64 *locs,
+							   const uint32 *lens, char **why);
+
+	/*
 	 * Binds the log to the one chunk index naming its bytes (the first to
 	 * ask), or errors if it is another's: a tail cut, by that index's
 	 * VACUUM, needs every entry naming the log's bytes to have been seen.
@@ -249,5 +270,13 @@ extern BlockNumber ChunkLogTruncateTail(Relation rel);
 
 /* The prolly_chunks table access method's relations are a PageChunkLog's. */
 extern bool RelationIsChunkLog(Relation rel);
+
+/* A chunk log of either kind: the pages', or a tier's (prolly/chunk_tier.h). */
+extern bool RelationIsTierLog(Relation rel);
+static inline bool
+RelationIsAnyChunkLog(Relation rel)
+{
+	return RelationIsChunkLog(rel) || RelationIsTierLog(rel);
+}
 
 #endif							/* PROLLY_CHUNK_LOG_H */

@@ -31,6 +31,7 @@ register_stores(void)
 	if (registered)
 		return;
 	ProllyRegisterImplementation(CHUNK_STORE_IFACE, "pages", &PagesChunkStore);
+	ProllyRegisterImplementation(CHUNK_STORE_IFACE, "tier", &TierChunkStore);
 	ProllyRegisterImplementation(CHUNK_STORE_IFACE, "memory", &MemoryChunkStore);
 	registered = true;
 }
@@ -56,23 +57,54 @@ ChunkStoreList(void)
 	return ProllyListImplementations(CHUNK_STORE_IFACE);
 }
 
-/* ------------------------------------------------------------- pages */
+/* --------------------------------------------------------- pages, tier */
 
-static ChunkStore pages_store = {.routine = &PagesChunkStore};
+/*
+ * A store of a chunk log and its index, pg_history's: "pages", the log in
+ * the relation's own pages, and "tier", the tier's, whose bytes are in
+ * pack objects off the server (prolly/chunk_tier.h).  Both are the same
+ * but for their relations.
+ */
+typedef struct RelationsStore
+{
+	ChunkStore	store;
+	Oid			(*log_relid) (void);
+	Oid			(*index_relid) (void);
+} RelationsStore;
+
+static RelationsStore pages_store = {
+	.store = {.routine = &PagesChunkStore},
+	.log_relid = ChunkStoreLogRelid,
+	.index_relid = ChunkStoreIndexRelid,
+};
+
+static RelationsStore tier_store = {
+	.store = {.routine = &TierChunkStore},
+	.log_relid = ChunkStoreTierLogRelid,
+	.index_relid = ChunkStoreTierIndexRelid,
+};
 
 static ChunkStore *
 pages_open(void)
 {
-	return &pages_store;
+	return &pages_store.store;
+}
+
+static ChunkStore *
+tier_open(void)
+{
+	return &tier_store.store;
 }
 
 /* the store's relations, locked as a reader or a writer */
 static void
-open_store(LOCKMODE mode, Relation *log, Relation *idx)
+open_store(ChunkStore *cs, LOCKMODE mode, Relation *log, Relation *idx)
 {
+	RelationsStore *rs = (RelationsStore *) cs;
+
 	if (log)
-		*log = relation_open(ChunkStoreLogRelid(), mode);
-	*idx = relation_open(ChunkStoreIndexRelid(), mode);
+		*log = relation_open(rs->log_relid(), mode);
+	*idx = relation_open(rs->index_relid(), mode);
 }
 
 static void
@@ -89,7 +121,7 @@ pages_has(ChunkStore *cs, const uint8 *hash)
 	Relation	idx;
 	bool		has;
 
-	open_store(AccessShareLock, NULL, &idx);
+	open_store(cs, AccessShareLock, NULL, &idx);
 	has = ChunkStoreHas(NULL, idx, hash);
 	close_store(NULL, idx);
 	return has;
@@ -102,7 +134,7 @@ pages_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 				idx;
 	void	   *data;
 
-	open_store(AccessShareLock, &log, &idx);
+	open_store(cs, AccessShareLock, &log, &idx);
 	data = ChunkStoreGet(log, idx, hash, len);
 	close_store(log, idx);
 	return data;
@@ -115,7 +147,7 @@ pages_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out,
 	Relation	log,
 				idx;
 
-	open_store(AccessShareLock, &log, &idx);
+	open_store(cs, AccessShareLock, &log, &idx);
 	ChunkStoreGetMany(log, idx, hashes, n, out, lens);
 	close_store(log, idx);
 }
@@ -127,7 +159,7 @@ pages_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 				idx;
 	bool		stored;
 
-	open_store(RowExclusiveLock, &log, &idx);
+	open_store(cs, RowExclusiveLock, &log, &idx);
 	stored = ChunkStorePutData(log, idx, data, len, hash);
 	close_store(log, idx);
 	return stored;
@@ -141,19 +173,19 @@ pages_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 				idx;
 	uint64		stored;
 
-	open_store(RowExclusiveLock, &log, &idx);
+	open_store(cs, RowExclusiveLock, &log, &idx);
 	stored = ChunkStorePutMany(log, idx, n, hashes, datas, lens);
 	close_store(log, idx);
 	return stored;
 }
 
 static void
-pages_root(const uint8 *hash, bool ref)
+pages_root(ChunkStore *cs, const uint8 *hash, bool ref)
 {
 	Relation	idx;
 	ChunkIndexEntry e;
 
-	open_store(RowExclusiveLock, NULL, &idx);
+	open_store(cs, RowExclusiveLock, NULL, &idx);
 	if (ref)
 		ChunkStoreRefRoot(idx, hash, &e);
 	else
@@ -164,13 +196,13 @@ pages_root(const uint8 *hash, bool ref)
 static void
 pages_ref_root(ChunkStore *cs, const uint8 *hash)
 {
-	pages_root(hash, true);
+	pages_root(cs, hash, true);
 }
 
 static void
 pages_unref_root(ChunkStore *cs, const uint8 *hash)
 {
-	pages_root(hash, false);
+	pages_root(cs, hash, false);
 }
 
 static bool
@@ -180,7 +212,7 @@ pages_counts(ChunkStore *cs, const uint8 *hash, ChunkCounts *out)
 	ChunkIndexEntry e;
 	bool		found;
 
-	open_store(AccessShareLock, NULL, &idx);
+	open_store(cs, AccessShareLock, NULL, &idx);
 	found = ChunkIndex->lookup(idx, hash, &e);
 	close_store(NULL, idx);
 	if (found)
@@ -198,7 +230,7 @@ pages_free(ChunkStore *cs, const uint8 *hashes, int n)
 				idx;
 	uint64		freed;
 
-	open_store(RowExclusiveLock, &log, &idx);
+	open_store(cs, RowExclusiveLock, &log, &idx);
 	freed = ChunkStoreFree(log, idx, hashes, n);
 	close_store(log, idx);
 	return freed;
@@ -211,7 +243,7 @@ pages_free_unheld(ChunkStore *cs)
 				idx;
 	uint64		freed;
 
-	open_store(RowExclusiveLock, &log, &idx);
+	open_store(cs, RowExclusiveLock, &log, &idx);
 	freed = ChunkStoreFreeUnheld(log, idx);
 	close_store(log, idx);
 	return freed;
@@ -223,7 +255,7 @@ pages_hold(ChunkStore *cs, const uint8 *hash)
 	Relation	idx;
 	bool		held;
 
-	open_store(RowExclusiveLock, NULL, &idx);
+	open_store(cs, RowExclusiveLock, NULL, &idx);
 	held = ChunkStoreHold(idx, hash);
 	close_store(NULL, idx);
 	return held;
@@ -250,7 +282,7 @@ pages_visit(ChunkStore *cs, ChunkVisitFn fn, void *arg)
 	Relation	idx;
 	PagesVisit	v = {.fn = fn, .arg = arg};
 
-	open_store(AccessShareLock, NULL, &idx);
+	open_store(cs, AccessShareLock, NULL, &idx);
 	ChunkIndex->visit(idx, pages_visit_entry, &v);
 	close_store(NULL, idx);
 }
@@ -266,26 +298,31 @@ pages_check(ChunkStore *cs, uint64 *chunks, uint64 *unheld, char **why)
 	 * (under the ShareLock the audit takes, at once, not upgraded to it from
 	 * a reader's: so on a primary only)
 	 */
-	open_store(ShareLock, &log, &idx);
+	open_store(cs, ShareLock, &log, &idx);
 	ok = ChunkStoreCheck(log, idx, chunks, unheld, why);
 	close_store(log, idx);
 	return ok;
 }
 
-const ChunkStoreRoutine PagesChunkStore = {
-	.transactional = true,
-	.open = pages_open,
-	.has = pages_has,
-	.get = pages_get,
-	.get_many = pages_get_many,
-	.put = pages_put,
-	.put_many = pages_put_many,
-	.ref_root = pages_ref_root,
-	.unref_root = pages_unref_root,
-	.counts = pages_counts,
-	.free = pages_free,
-	.free_unheld = pages_free_unheld,
-	.hold = pages_hold,
-	.visit = pages_visit,
-	.check = pages_check,
-};
+#define RELATIONS_STORE_ROUTINE(open_fn) \
+{ \
+	.open = open_fn, \
+	.transactional = true, \
+	.has = pages_has, \
+	.get = pages_get, \
+	.get_many = pages_get_many, \
+	.put = pages_put, \
+	.put_many = pages_put_many, \
+	.ref_root = pages_ref_root, \
+	.unref_root = pages_unref_root, \
+	.counts = pages_counts, \
+	.free = pages_free, \
+	.free_unheld = pages_free_unheld, \
+	.hold = pages_hold, \
+	.visit = pages_visit, \
+	.check = pages_check, \
+}
+
+const ChunkStoreRoutine PagesChunkStore = RELATIONS_STORE_ROUTINE(pages_open);
+const ChunkStoreRoutine TierChunkStore = RELATIONS_STORE_ROUTINE(tier_open);
+

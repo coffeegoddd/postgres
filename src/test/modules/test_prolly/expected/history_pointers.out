@@ -13,7 +13,9 @@ WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1
  chunk_index | prolly_chunk_index
  chunks      | prolly_chunks
  pointers    | heap
-(3 rows)
+ tier_chunks | prolly_tier
+ tier_index  | prolly_chunk_index
+(5 rows)
 
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';

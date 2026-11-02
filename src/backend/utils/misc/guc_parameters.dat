@@ -1304,6 +1304,21 @@
   boot_val => 'NULL',
 },
 
+{ name => 'history_tier_location', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets where the history store\'s tier keeps its packs.',
+  long_desc => 'For the directory object store, a directory: absolute, or relative to the data directory. Empty means no tier.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_SUPERUSER_ONLY',
+  variable => 'history_tier_location',
+  boot_val => '""',
+},
+
+{ name => 'history_tier_store', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the object store the history store\'s tier keeps its packs in.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'history_tier_store',
+  boot_val => '"directory"',
+},
+
 { name => 'hosts_file', type => 'string', context => 'PGC_POSTMASTER', group => 'FILE_LOCATIONS',
   short_desc => 'Sets the server\'s "hosts" configuration file.',
   flags => 'GUC_SUPERUSER_ONLY',

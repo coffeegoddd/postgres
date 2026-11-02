@@ -1291,7 +1291,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	OldHeapDesc = RelationGetDescr(OldHeap);
 
 	/* (a chunk log's bytes are no tuples: a rewrite would leave it empty) */
-	if (RelationIsChunkLog(OldHeap) || RelationIsChunkIndex(OldHeap))
+	if (RelationIsAnyChunkLog(OldHeap) || RelationIsChunkIndex(OldHeap))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot rewrite history store relation \"%s\"",
