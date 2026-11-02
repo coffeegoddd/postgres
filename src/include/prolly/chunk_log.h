@@ -64,6 +64,8 @@ typedef struct ChunkLogRun
 	uint32		generation;		/* the log's, the bytes' (mark_dead's) */
 } ChunkLogRun;
 
+typedef struct ChunkLogSegments ChunkLogSegments;
+
 typedef struct ChunkLogRoutine
 {
 	/*
@@ -130,6 +132,13 @@ typedef struct ChunkLogRoutine
 	uint64		(*segment_bytes) (Relation rel);
 
 	/*
+	 * What VACUUM would find of the log's segments (ChunkLogRecordFree),
+	 * none passed by, the free space map left as it is.  For tests.
+	 */
+	void		(*find_segments) (Relation rel, double fraction,
+								  ChunkLogSegments *out);
+
+	/*
 	 * Binds the log to the one chunk index naming its bytes (the first to
 	 * ask), or errors if it is another's: a tail cut, by that index's
 	 * VACUUM, needs every entry naming the log's bytes to have been seen.
@@ -192,7 +201,7 @@ extern void ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep);
  * one after another, aligned), and compacted so: what VACUUM finds of its
  * segments.
  */
-typedef struct ChunkLogSegments
+struct ChunkLogSegments
 {
 	uint32		segments;		/* the log's */
 	uint32		free;			/* every byte of every page dead */
@@ -205,19 +214,19 @@ typedef struct ChunkLogSegments
 								 * snapshots still */
 	BlockNumber grow;			/* the pages compaction may grow the log by:
 								 * a segment's if none is free */
-} ChunkLogSegments;
+};
 
 /*
  * Puts every segment free in the free space map (O(log); VACUUM's), and
- * what it found of the segments in *out, those with bytes of the chunks
- * freed kept for snapshots (npending, at plocs, plens long) passed by.
- * FindSegments finds the same (none passed by), the map as it is.
+ * what it found of the segments in *out, those with bytes of chunks freed
+ * kept for snapshots (pending, a bit a segment, of the first npending)
+ * passed by: not counted to compact, evacuation's count stopping at them.
+ * (A freer started for others finds its own, not knowing these: it moves
+ * nothing off them, their chunks moved already or kept.)
  */
-extern void ChunkLogRecordFree(Relation rel, double fraction, int npending,
-							   const uint64 *plocs, const uint32 *plens,
+extern void ChunkLogRecordFree(Relation rel, double fraction,
+							   const uint8 *pending, uint64 npending,
 							   ChunkLogSegments *out);
-extern void ChunkLogFindSegments(Relation rel, double fraction,
-								 ChunkLogSegments *out);
 
 
 /*
