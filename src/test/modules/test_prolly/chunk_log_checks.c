@@ -54,7 +54,7 @@ test_chunk_log_append(PG_FUNCTION_ARGS)
 	bytea	   *data = PG_GETARG_BYTEA_PP(1);
 	uint64		loc;
 
-	loc = ChunkLog->append(rel, VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data));
+	loc = ChunkLogOf(rel)->append(rel, VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data));
 	relation_close(rel, NoLock);
 	PG_RETURN_INT64((int64) loc);
 }
@@ -74,7 +74,7 @@ test_chunk_log_read(PG_FUNCTION_ARGS)
 				 errmsg("a chunk log's place and length are not negative, nor the length too large")));
 	out = palloc(VARHDRSZ + len);
 	SET_VARSIZE(out, VARHDRSZ + len);
-	ChunkLog->read(rel, (uint64) loc, VARDATA(out), (size_t) len);
+	ChunkLogOf(rel)->read(rel, (uint64) loc, VARDATA(out), (size_t) len);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_BYTEA_P(out);
 }
@@ -84,7 +84,7 @@ Datum
 test_chunk_log_end(PG_FUNCTION_ARGS)
 {
 	Relation	rel = open_log(PG_GETARG_OID(0), AccessShareLock);
-	uint64		end = ChunkLog->end(rel);
+	uint64		end = ChunkLogOf(rel)->end(rel);
 
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) end);

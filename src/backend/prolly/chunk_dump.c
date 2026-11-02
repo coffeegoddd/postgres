@@ -129,7 +129,7 @@ read_as_of(Relation log, Relation idx, Snapshot snap, const uint8 *hash,
 				 errmsg("the history store has no chunk %s, which another references",
 						ChunkHashText(hash))));
 	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
-	ChunkLog->read(log, e.loc, data, e.len);
+	ChunkLogOf(log)->read(log, e.loc, data, e.len);
 	*len = e.len;
 	return data;
 }

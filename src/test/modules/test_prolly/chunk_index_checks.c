@@ -484,8 +484,8 @@ test_chunk_compact(PG_FUNCTION_ARGS)
 	Datum		values[3];
 	bool		nulls[3] = {false, false, false};
 
-	n = evacuate ? ChunkLog->evacuable(log, lengthof(starts), starts, ends) :
-		ChunkLog->compactable(log, fraction, lengthof(starts), starts, ends);
+	n = evacuate ? ChunkLogOf(log)->evacuable(log, lengthof(starts), starts, ends) :
+		ChunkLogOf(log)->compactable(log, fraction, lengthof(starts), starts, ends);
 	c = ChunkStoreCompactBegin(log, idx, n, starts, ends, CurrentMemoryContext);
 	for (;;)
 	{

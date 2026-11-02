@@ -103,7 +103,7 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 	 * (not checked against its name: a page's checksum covers a read, and
 	 * the audit, and a put of bytes from elsewhere, check names)
 	 */
-	ChunkLog->read(log, e.loc, data, e.len);
+	ChunkLogOf(log)->read(log, e.loc, data, e.len);
 	*len = e.len;
 	return data;
 }
@@ -158,7 +158,7 @@ ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes, int n,
 		void	   *data = palloc_extended(Max(pl->len, 1), MCXT_ALLOC_HUGE);
 
 		CHECK_FOR_INTERRUPTS();
-		ChunkLog->read(log, pl->loc, data, pl->len);
+		ChunkLogOf(log)->read(log, pl->loc, data, pl->len);
 		out[pl->at] = data;
 		lens[pl->at] = pl->len;
 	}
@@ -273,7 +273,7 @@ check_refs(Relation idx, const uint8 *chunk, const RefList *refs, HTAB *pack,
 static void
 bind_store(Relation log, Relation idx)
 {
-	uint64		stamp = ChunkLog->stamp(log);
+	uint64		stamp = ChunkLogOf(log)->stamp(log);
 	uint64		bound_stamp;
 	Oid			bound = ChunkIndex->log_of(idx, &bound_stamp);
 
@@ -281,7 +281,7 @@ bind_store(Relation log, Relation idx)
 	if (OidIsValid(bound) &&
 		(bound != RelationGetRelid(log) || bound_stamp != stamp))
 		ChunkIndex->bind_log(idx, RelationGetRelid(log), stamp);
-	ChunkLog->bind_index(log, RelationGetRelid(idx));
+	ChunkLogOf(log)->bind_index(log, RelationGetRelid(idx));
 	ChunkIndex->bind_log(idx, RelationGetRelid(log), stamp);
 }
 
@@ -328,7 +328,7 @@ reserve_place(void *arg, ChunkIndexEntry *entry)
 	PlaceArg   *place = arg;
 
 	entry->loc = entry->len > 0 ?
-		ChunkLog->reserve(place->log, place->run, entry->len) : 0;
+		ChunkLogOf(place->log)->reserve(place->log, place->run, entry->len) : 0;
 	entry->log_gen = place->run->generation;
 }
 
@@ -393,7 +393,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	 * written after: every wait and failure is before the place is taken,
 	 * and bytes reserved are the entry's, which (aborted) counts them dead
 	 */
-	ChunkLog->prepare(log, len, &run);
+	ChunkLogOf(log)->prepare(log, len, &run);
 	place.log = log;
 	place.run = &run;
 	for (;;)
@@ -407,7 +407,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 		/* (another put it meanwhile: nothing reserved; gone again, put it) */
 		if (found_held(idx, hash))
 		{
-			ChunkLog->release(log, &run);
+			ChunkLogOf(log)->release(log, &run);
 			for (int i = 0; i < refs.n; i++)
 				count_ref(idx, hash, refs.hashes + i * CHUNK_HASH_LEN, -1);
 			return false;
@@ -415,8 +415,8 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	}
 	INJECTION_POINT("chunk-put-entered", NULL);
 	if (len > 0)
-		ChunkLog->write(log, e.loc, data, len);
-	ChunkLog->release(log, &run);
+		ChunkLogOf(log)->write(log, e.loc, data, len);
+	ChunkLogOf(log)->release(log, &run);
 
 	if (refs.hashes)
 		pfree(refs.hashes);
@@ -556,14 +556,14 @@ write_pack(Relation log, const PackOrder *order, int from, int to,
 			(!next || locs[i] != run_loc + run_len ||
 			 run_len + lens[i] > PACK_WRITE_RUN))
 		{
-			ChunkLog->write(log, run_loc, run, run_len);
+			ChunkLogOf(log)->write(log, run_loc, run, run_len);
 			run_len = 0;
 		}
 		if (!next)
 			continue;
 		if (lens[i] > PACK_WRITE_RUN)
 		{
-			ChunkLog->write(log, locs[i], datas[i], lens[i]);
+			ChunkLogOf(log)->write(log, locs[i], datas[i], lens[i]);
 			continue;
 		}
 		if (run == NULL)
@@ -688,13 +688,13 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			 * still to write; else they are written before it is let go of)
 			 */
 			if (!have_run ||
-				(run.limit - run.next < lens[i] && !ChunkLog->extend(log, &run, lens[i])))
+				(run.limit - run.next < lens[i] && !ChunkLogOf(log)->extend(log, &run, lens[i])))
 			{
 				write_pack(log, order, unwritten, k, fresh, locs, datas, lens);
 				unwritten = k;
 				if (have_run)
-					ChunkLog->release(log, &run);
-				ChunkLog->prepare(log, lens[i], &run);
+					ChunkLogOf(log)->release(log, &run);
+				ChunkLogOf(log)->prepare(log, lens[i], &run);
 				have_run = true;
 			}
 			for (;;)
@@ -721,7 +721,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		INJECTION_POINT("chunk-put-entered", NULL);
 		write_pack(log, order, unwritten, nfresh, fresh, locs, datas, lens);
 		if (have_run)
-			ChunkLog->release(log, &run);
+			ChunkLogOf(log)->release(log, &run);
 		pfree(order);
 	}
 
@@ -808,7 +808,7 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 			continue;
 		INJECTION_POINT("chunk-free-marked", NULL);
 		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
-		ChunkLog->read(log, e.loc, data, e.len);
+		ChunkLogOf(log)->read(log, e.loc, data, e.len);
 		check_hash(h, data, e.len, log, e.loc);
 		ChunkFormat->refs(data, e.len, add_ref, &kids);
 		pfree(data);
@@ -968,11 +968,11 @@ ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
 		 * looks; else it is passed by)
 		 */
 		if (may_grow)
-			ChunkLog->prepare(log, e->len, &run);
-		else if (!ChunkLog->prepare_free(log, e->len, below, &run))
+			ChunkLogOf(log)->prepare(log, e->len, &run);
+		else if (!ChunkLogOf(log)->prepare_free(log, e->len, below, &run))
 		{
-			ChunkLog->release(log, &run);
-			if (e->len > ChunkLog->segment_bytes(log))
+			ChunkLogOf(log)->release(log, &run);
+			if (e->len > ChunkLogOf(log)->segment_bytes(log))
 			{
 				c->next++;
 				looked++;
@@ -993,15 +993,15 @@ ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
 		if (ChunkIndex->move(idx, e, &moved, reserve_place, &place))
 		{
 			data = palloc_extended(e->len, MCXT_ALLOC_HUGE);
-			ChunkLog->read(log, e->loc, data, e->len);
+			ChunkLogOf(log)->read(log, e->loc, data, e->len);
 			check_hash(e->hash, data, e->len, log, e->loc);
 			INJECTION_POINT("chunk-compact-moved", NULL);
-			ChunkLog->write(log, moved.loc, data, e->len);
+			ChunkLogOf(log)->write(log, moved.loc, data, e->len);
 			pfree(data);
 			(*chunks)++;
 			*bytes += e->len;
 		}
-		ChunkLog->release(log, &run);
+		ChunkLogOf(log)->release(log, &run);
 		c->next++;
 		looked++;
 		CHECK_FOR_INTERRUPTS();
@@ -1110,7 +1110,7 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 		locs[nlive] = a->loc;
 		lens[nlive++] = a->len;
 
-		ChunkLog->read(log, a->loc, data, a->len);
+		ChunkLogOf(log)->read(log, a->loc, data, a->len);
 		check_hash(a->hash, data, a->len, log, a->loc);
 		es.from = a->hash;
 		ChunkFormat->refs(data, a->len, audit_edge, &es);

@@ -1828,7 +1828,7 @@ open_bound_log(Relation idx)
 	log = try_relation_open(logid, RowExclusiveLock);
 	if (log == NULL)
 		return NULL;
-	if (!RelationIsChunkLog(log) || ChunkLog->stamp(log) != stamp)
+	if (!RelationIsChunkLog(log) || ChunkLogOf(log)->stamp(log) != stamp)
 	{
 		ereport(WARNING,
 				(errmsg("chunk index \"%s\" is of chunk log \"%s\" as it was: the bytes of chunks it takes out are not counted dead",
@@ -2649,7 +2649,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		/* the bytes of the chunks taken out, dead in their log */
 		if (ndead > 0 && log != NULL)
 			for (int i = 0; i < ndead; i++)
-				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len, dead[i].log_gen);
+				ChunkLogOf(log)->mark_dead(log, dead[i].loc, dead[i].len, dead[i].log_gen);
 		ndead = 0;
 		RESUME_INTERRUPTS();
 	}
