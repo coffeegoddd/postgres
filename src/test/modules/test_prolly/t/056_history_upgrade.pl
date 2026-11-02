@@ -84,6 +84,25 @@ for my $run ([ '--copy', 0, '_copy' ], [ '--copy', 1, '_copy_own' ],
 		REINDEX TABLE pg_history.bundles;
 		VACUUM FREEZE pg_history.pointers;
 	});
+	# (the store's indexes not reindexed concurrently, which would give
+	# them OIDs anew: refused named, passed by in a database's)
+	if ($mode eq '--link')
+	{
+		my $toast_index = $old->safe_psql('postgres', q{SELECT i.indexrelid::regclass::text
+			FROM pg_class c JOIN pg_index i ON i.indrelid = c.reltoastrelid
+			WHERE c.oid = 'pg_history.bundles'::regclass});
+		for my $what ('INDEX pg_history.pointers_pkey', 'TABLE pg_history.bundles',
+			"INDEX $toast_index", 'SCHEMA pg_history')
+		{
+			my ($kind, $name) = split / /, $what;
+			my ($ret, $out, $err) = $old->psql('postgres', "REINDEX $kind CONCURRENTLY $name");
+			like($err, qr/cannot reindex system catalogs concurrently/,
+				"$mode: REINDEX $kind CONCURRENTLY $name refused, or passed by");
+		}
+		my ($ret, $out, $err) = $old->psql('postgres', 'REINDEX DATABASE CONCURRENTLY postgres');
+		is($ret, 0, "$mode: REINDEX DATABASE CONCURRENTLY, the store passed by");
+		$old->safe_psql('postgres', 'REINDEX TABLE pg_history.pointers');
+	}
 	my $old_sysid = $old->safe_psql('postgres', 'SELECT system_identifier FROM pg_control_system()');
 	my $files = q{SELECT string_agg(c.relname || ':' || (c.relfilenode <> c.oid), ',' ORDER BY c.relname)
 		FROM pg_class c WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind IN ('r', 'i')};
@@ -358,7 +377,7 @@ my $check = sub {
 		CREATE TABLE pg_history.mine (a int);
 	});
 	$old->stop;
-	like($check->($old, $new), qr/has a relation of its own in schema pg_history, "mine"/,
+	like($check->($old, $new), qr/has a relation in schema pg_history that initdb did not make,\n"?mine/,
 		'a relation of a user\'s in pg_history refused');
 
 }
