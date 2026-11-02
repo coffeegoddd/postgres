@@ -75,6 +75,11 @@ RESET allow_system_table_mods;
 
 -- a push aborted: nothing pushed, nothing let go of
 SELECT test_cs_ref_root('pages', pg_temp.h('\x0a1199'));
+-- (a transaction pushes one bundle)
+BEGIN;
+SELECT pg_history_push('b4', ARRAY[pg_temp.h('\x0a1199')]) AS copied;
+SELECT pg_history_push('b5', ARRAY[pg_temp.h('\x0a1199')]);
+ROLLBACK;
 BEGIN;
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]) AS copied;
 ROLLBACK;

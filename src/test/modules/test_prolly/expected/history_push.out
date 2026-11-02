@@ -180,6 +180,18 @@ SELECT test_cs_ref_root('pages', pg_temp.h('\x0a1199'));
  
 (1 row)
 
+-- (a transaction pushes one bundle)
+BEGIN;
+SELECT pg_history_push('b4', ARRAY[pg_temp.h('\x0a1199')]) AS copied;
+ copied 
+--------
+      1
+(1 row)
+
+SELECT pg_history_push('b5', ARRAY[pg_temp.h('\x0a1199')]);
+ERROR:  a transaction pushes one bundle of history at most
+HINT:  Push each bundle in a transaction of its own.
+ROLLBACK;
 BEGIN;
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]) AS copied;
  copied 
