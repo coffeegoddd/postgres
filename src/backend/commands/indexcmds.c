@@ -23,6 +23,7 @@
 #include "access/reloptions.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
@@ -2996,6 +2997,23 @@ ChooseIndexExpressionName_walker(Node *node,
 }
 
 /*
+ * Whether relid is not to be reindexed concurrently: a system catalog, or
+ * a relation of the version-control history store (schema pg_history's,
+ * or a TOAST table initdb made, which is a catalog's or the store's).
+ * pg_upgrade carries the store's relations over by their OIDs, which a
+ * concurrent reindex would give its indexes anew.
+ */
+static bool
+ReindexConcurrentlyRefused(Oid relid)
+{
+	if (IsCatalogRelationOid(relid))
+		return true;
+	if (get_rel_namespace(relid) == PG_HISTORY_NAMESPACE)
+		return true;
+	return relid < FirstNormalObjectId && get_rel_relkind(relid) == RELKIND_TOASTVALUE;
+}
+
+/*
  * ExecReindex
  *
  * Primary entry point for manual REINDEX commands.  This is mainly a
@@ -3429,7 +3447,7 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 		 * concurrently (and it would likely fail if we tried).
 		 */
 		if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
-			IsCatalogRelationOid(relid))
+			ReindexConcurrentlyRefused(relid))
 		{
 			if (!concurrent_warning)
 				ereport(WARNING,
@@ -3826,7 +3844,7 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 
 				MemoryContextSwitchTo(oldcontext);
 
-				if (IsCatalogRelationOid(relationOid))
+				if (ReindexConcurrentlyRefused(relationOid))
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot reindex system catalogs concurrently")));
@@ -3956,7 +3974,7 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 				if (!OidIsValid(heapId))
 					break;
 
-				if (IsCatalogRelationOid(heapId))
+				if (ReindexConcurrentlyRefused(heapId))
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot reindex system catalogs concurrently")));

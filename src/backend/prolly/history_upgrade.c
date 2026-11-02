@@ -6,8 +6,10 @@
  * pg_upgrade transfers each database's history store (the relations of
  * schema pg_history, their TOAST tables and indexes) as it transfers the
  * relations users made: their files, the old cluster's, in place of the
- * new cluster's.  initdb made the new cluster's, of the same OIDs (the
- * same server makes both); the schema pg_dump --binary-upgrade restores
+ * new cluster's.  initdb made the new cluster's, matched to the old ones'
+ * by OID (pg_upgrade --check refuses relations of the store not the new
+ * cluster's: no concurrent reindex gives the store's indexes new OIDs);
+ * the schema pg_dump --binary-upgrade restores
  * gives each the old one's file number first
  * (binary_upgrade_set_history_relfilenode), and its relfrozenxid and
  * relminmxid.  A tier's pack objects stay where they are, the new
@@ -69,6 +71,8 @@ set_relfilenode(Oid relid, char relkind, RelFileNumber relfilenumber)
 
 	if (rel->rd_rel->relkind != relkind)
 		elog(ERROR, "relation \"%s\" is not of kind '%c'", RelationGetRelationName(rel), relkind);
+	if (RelationIsMapped(rel))
+		elog(ERROR, "relation \"%s\" is mapped", RelationGetRelationName(rel));
 	if (rel->rd_rel->relfilenode != relfilenumber)
 	{
 		Relation	pg_class = table_open(RelationRelationId, RowExclusiveLock);

@@ -487,7 +487,8 @@ get_rel_infos_query(void)
 	 * pg_largeobject contains user data that does not appear in pg_dump
 	 * output, so we have to copy that system table.  So does each
 	 * database's version-control history store, the tables of schema
-	 * pg_history (initdb's, of the same OIDs in both clusters), whose
+	 * pg_history (initdb's, matched by OID, which --check finds the same in
+	 * both clusters), whose
 	 * relfilenodes pg_dump --binary-upgrade keeps as it keeps
 	 * pg_largeobject's.  It's easiest to do that
 	 * by treating it as a user table.  We can do the same for

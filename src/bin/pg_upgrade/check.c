@@ -1363,8 +1363,9 @@ check_for_branches(ClusterInfo *cluster)
 
 /*
  * The history store's relations of the database conn is to, as pg_upgrade
- * matches them (by OID): each one's OID, name, kind, access method and
- * TOAST table, if any; NULL if it has no store.
+ * matches them (by OID): each one's OID, name, kind, access method, and
+ * its TOAST table's OID and that one's index's (0: none); NULL if it has
+ * no store.
  */
 static char *
 history_store_rels(PGconn *conn)
@@ -1376,11 +1377,13 @@ history_store_rels(PGconn *conn)
 							"SELECT pg_catalog.string_agg(c.oid::pg_catalog.text || ' ' || c.relname::pg_catalog.text || ' ' || "
 							"                  c.relkind::pg_catalog.text || ' ' || "
 							"                  coalesce(a.amname::pg_catalog.text, '-') || ' ' || "
-							"                  (c.reltoastrelid <> 0)::pg_catalog.text, "
+							"                  c.reltoastrelid::pg_catalog.text || ' ' || "
+							"                  coalesce(i.indexrelid::pg_catalog.text, '0'), "
 							"                  ', ' ORDER BY c.oid) "
 							"FROM pg_catalog.pg_class c "
 							"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
 							"LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam "
+							"LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.reltoastrelid "
 							"WHERE n.nspname = 'pg_history' AND c.relkind IN ('r', 'i')");
 	if (!PQgetisnull(res, 0, 0))
 		rels = pg_strdup(PQgetvalue(res, 0, 0));
@@ -1445,15 +1448,21 @@ check_for_history(ClusterInfo *cluster)
 				pg_fatal("The old cluster's version-control history store is of a format\n"
 						 "this pg_upgrade does not know.");
 		}
+		/* (its TOAST tables and their indexes too) */
 		res = executeQueryOrDie(conn,
-								"SELECT c.relname FROM pg_catalog.pg_class c "
+								"SELECT r.relname FROM pg_catalog.pg_class c "
 								"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-								"WHERE n.nspname = 'pg_history' AND c.oid >= %u::pg_catalog.oid "
+								"LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.reltoastrelid, "
+								"LATERAL (VALUES (c.oid, c.relname::pg_catalog.text), "
+								"                (c.reltoastrelid, 'TOAST table of ' || c.relname), "
+								"                (i.indexrelid, 'TOAST table index of ' || c.relname)) r(oid, relname) "
+								"WHERE n.nspname = 'pg_history' AND r.oid >= %u::pg_catalog.oid "
 								"ORDER BY c.oid LIMIT 1",
 								FirstNormalObjectId);
 		if (PQntuples(res) > 0)
-			pg_fatal("Database \"%s\" has a relation of its own in schema pg_history, \"%s\",\n"
-					 "which the upgrade would leave out.  Move it to another schema first.",
+			pg_fatal("Database \"%s\" has a relation in schema pg_history that initdb did not make,\n"
+					 "%s, which the upgrade cannot match to the new cluster's.\n"
+					 "A relation of a user's: move it to another schema.",
 					 active_db->db_name, PQgetvalue(res, 0, 0));
 		PQclear(res);
 

@@ -12106,7 +12106,7 @@
   proparallel => 'u', prorettype => 'int8', proargtypes => '',
   prosrc => 'binary_upgrade_history_tier_place' },
 { oid => '9783', descr => 'for use by pg_upgrade',
-  proname => 'binary_upgrade_history_formats', provolatile => 'i',
+  proname => 'binary_upgrade_history_formats', provolatile => 'v',
   proparallel => 'u', prorettype => 'text', proargtypes => '',
   prosrc => 'binary_upgrade_history_formats' },
 { oid => '9782', descr => 'for use by pg_upgrade',

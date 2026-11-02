@@ -88,6 +88,7 @@ patch src/backend/catalog/toasting.c  1b  a TOAST table's storage manager is its
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one; also (2) refuses to drop, or copy as a template, a database whose history store tier has packs
 patch src/backend/commands/extension.c  1b  an extension name resolves to a shared extension or the session's branch's; refuses one of the other kind beside it, and moves between kinds
 patch src/backend/commands/functioncmds.c  1b  a procedure that runs on another branch than the caller's is atomic
+patch src/backend/commands/indexcmds.c  2  the version-control history store's relations, and the TOAST tables initdb made, not reindexed concurrently (pg_upgrade carries the store over by OID)
 patch src/backend/commands/publicationcmds.c  1b  ALTER PUBLICATION ... SET leaves another branch's tables and schemas
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager; also (2) a chunk log relation, the pages' or a tier's, is never rewritten (make_new_heap)
 patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema

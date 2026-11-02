@@ -531,6 +531,15 @@ remove_marker(Relation rel, const TierMeta *meta)
 	pfree(name);
 }
 
+/* a place: a hash of a store's identity, never 0 */
+static uint64
+place_of(const char *identity)
+{
+	uint64		h = hash_bytes_extended((const unsigned char *) identity, strlen(identity), 0);
+
+	return h != 0 ? h : 1;
+}
+
 /*
  * The store and place set now: a hash of the store's identity (an object
  * of its own: the same however the place is spelled, or mounted), never 0;
@@ -547,10 +556,9 @@ current_place(void)
 	if (for_generation != os_generation)
 	{
 		char	   *both = ObjectStoreIdentity(os, history_tier_store);
-		uint64		h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
 
+		place = place_of(both);
 		pfree(both);
-		place = h != 0 ? h : 1;
 		for_generation = os_generation;
 	}
 	return place;
@@ -708,9 +716,9 @@ ChunkTierPlace(void)
 	both = ObjectStoreIdentityIfAny(tier_objects(), history_tier_store);
 	if (both == NULL)
 		return 0;
-	h = hash_bytes_extended((const unsigned char *) both, strlen(both), 0);
+	h = place_of(both);
 	pfree(both);
-	return h != 0 ? h : 1;
+	return h;
 }
 
 uint32
