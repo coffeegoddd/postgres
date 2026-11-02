@@ -33,6 +33,9 @@ chunk_free_in_background = off
 history_tier_location = '$tier'
 # (no flush of the WAL but what the tier and commits ask)
 wal_writer_delay = 10000
+# (the WAL kept for the standby across the crashes below: each recovery's
+# checkpoint recycles segments, which it may not have streamed yet)
+wal_keep_size = 256MB
 });
 $node->start;
 $node->safe_psql('postgres', q{
