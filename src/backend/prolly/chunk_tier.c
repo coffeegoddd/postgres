@@ -738,13 +738,14 @@ tier_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 
 /*
  * Whether every standby connected (a physical walsender) has replayed past
- * lsn: one starting, or taking a base backup (a standby being made), has
- * not.  One streaming that has never said how far it replayed is no hot
- * standby's (pg_receivewal's, a base backup's stream of WAL; or a
- * standby's at wal_receiver_status_interval 0, its readers not waited for).
+ * lsn: one starting, taking a base backup (a standby being made), or that
+ * has not yet replied (a standby just connected), has not.  One that has
+ * replied with no place replayed is no hot standby's (pg_receivewal's, a
+ * base backup's stream of WAL).  If not, the walsender waited for in
+ * *blocker, and what it is doing in *why.
  */
 static bool
-standbys_replayed(XLogRecPtr lsn)
+standbys_replayed(XLogRecPtr lsn, pid_t *blocker, const char **why)
 {
 	if (WalSndCtl == NULL)
 		return true;
@@ -755,19 +756,33 @@ standbys_replayed(XLogRecPtr lsn)
 		pid_t		pid;
 		ReplicationKind kind;
 		WalSndState st;
+		TimestampTz replied;
 
 		SpinLockAcquire(&w->mutex);
 		pid = w->pid;
 		apply = w->apply;
 		kind = w->kind;
 		st = w->state;
+		replied = w->replyTime;
 		SpinLockRelease(&w->mutex);
 		if (pid == 0 || kind != REPLICATION_KIND_PHYSICAL)
 			continue;
+		*blocker = pid;
 		if (st == WALSNDSTATE_STARTUP || st == WALSNDSTATE_BACKUP)
+		{
+			*why = st == WALSNDSTATE_STARTUP ? "is starting" : "is taking a base backup";
 			return false;
+		}
+		if (replied == 0)
+		{
+			*why = "has not yet replied";
+			return false;
+		}
 		if (apply != InvalidXLogRecPtr && apply < lsn)
+		{
+			*why = "has not replayed past where they died";
 			return false;
+		}
 	}
 	return true;
 }
@@ -785,7 +800,8 @@ to_settle(const TierPack *p)
  * an orphan, or committed and all dead, every standby past where it died
  */
 static bool
-to_remove(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p)
+to_remove(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
+		  int *held, pid_t *blocker, const char **why)
 {
 	if (!((meta->owner_tli == tli && p->owner == meta->owner) || id < meta->adopted))
 		return false;
@@ -793,10 +809,9 @@ to_remove(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p)
 		return true;
 	if (!(p->state == PACK_COMMITTED && p->size > 0 && p->dead >= p->size))
 		return false;
-	if (standbys_replayed(p->dead_lsn))
+	if (standbys_replayed(p->dead_lsn, blocker, why))
 		return true;
-	elog(DEBUG1, "tier pack %u all dead, kept until standbys replay past %X/%08X",
-		 id, LSN_FORMAT_ARGS(p->dead_lsn));
+	(*held)++;
 	return false;
 }
 
@@ -812,6 +827,9 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 	TierMeta	meta = read_meta(rel);
 	TimeLineID	tli = GetWALInsertionTimeLine();
 	uint32	   *gone = palloc_array(uint32, PACKS_PER_PAGE);
+	int			held = 0;
+	pid_t		blocker = 0;
+	const char *why = NULL;
 
 	*frozen = RecentXmin;
 	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
@@ -848,7 +866,7 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 
 			if (p->state == PACK_MADE && TransactionIdPrecedes(p->xid, *frozen))
 				*frozen = p->xid;
-			if (remove && to_remove(&meta, tli, id, p))
+			if (remove && to_remove(&meta, tli, id, p, &held, &blocker, &why))
 				gone[ngone++] = id;
 		}
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -886,6 +904,11 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 		ReleaseBuffer(buf);
 	}
 	pfree(gone);
+	if (held > 0)
+		ereport(LOG,
+				(errmsg("%d packs of tier \"%s\" all dead are kept for standbys",
+						held, RelationGetRelationName(rel)),
+				 errdetail("Walsender %d %s.", (int) blocker, why)));
 }
 
 /*
