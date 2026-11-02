@@ -2208,7 +2208,7 @@ ChunkLogOf(Relation rel)
 	if (!RelationIsChunkLog(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a chunk log", RelationGetRelationName(rel))));
+				 errmsg("\"%s\" is not a chunk log relation", RelationGetRelationName(rel))));
 	return &PageChunkLog;
 }
 
