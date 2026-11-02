@@ -267,7 +267,7 @@ test_chunk_format_define_setting(void)
 {
 	DefineCustomBoolVariable("test_prolly.chunk_format_refs",
 							 "Chunks of the test format, with references, for every session.",
-							 NULL, &format_refs_setting, false, PGC_SUSET, 0,
+							 NULL, &format_refs_setting, false, PGC_SIGHUP, 0,
 							 NULL, assign_format_refs, NULL);
 }
 

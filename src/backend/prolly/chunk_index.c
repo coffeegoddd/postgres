@@ -323,8 +323,8 @@ page_meta(Relation rel, Page page)
 	if (meta->ndir == 0 || meta->ndir > MAX_DIR || meta->nmarks > MAX_MARKS)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("chunk index \"%s\" has a meta page of %u directory pages",
-						RelationGetRelationName(rel), meta->ndir)));
+				 errmsg("chunk index \"%s\" has a meta page of %u directory pages and %u marks' pages",
+						RelationGetRelationName(rel), meta->ndir, meta->nmarks)));
 	if (meta->version != CHUNK_INDEX_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -431,7 +431,6 @@ idir_set(Page page, uint32 slot, BlockNumber blk)
 										(slot + 1) * sizeof(BlockNumber));
 }
 
-/* a split made public, in the meta page */
 /* a marks' page, the nth, no bucket marked */
 static void
 imarks_init(Page page, uint32 nth)
@@ -470,6 +469,7 @@ imeta_add_marks(Page page, uint32 nth, BlockNumber blk)
 	meta->next_block = blk + 1;
 }
 
+/* a split made public, in the meta page */
 static void
 imeta_split(Page page, const xl_chunk_index_split *x)
 {
@@ -1122,7 +1122,7 @@ split_bucket(Relation rel)
  * buckets marked, not the index.  A bucket is marked and unmarked with its
  * first page locked exclusively, so an unmark sees every change made before
  * it; a split marks the new bucket of a bucket marked, the old one's first
- * page locked.  The marks are a bitmap, a bit a bucket, on pages the meta
+ * page locked (not the new one's: a mark more is only a look more).  The marks are a bitmap, a bit a bucket, on pages the meta
  * page lists, made as buckets reach them (locks: a bucket's first page,
  * the meta page, a marks' page).
  */
@@ -1223,6 +1223,7 @@ is_marked(Relation idx, uint32 b)
 	if (!BufferIsValid(buf))
 		return false;
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_ipage(idx, BufferGetBlockNumber(buf), BufferGetPage(buf), INDEX_PAGE_MARKS);
 	on = imarks_get(BufferGetPage(buf), b % MARK_BITS);
 	UnlockReleaseBuffer(buf);
 	return on;
@@ -1284,7 +1285,7 @@ count_changes(Relation rel, Buffer primary, int mode,
 			  const ChunkIndexEntry *chunk, uint32 bucket,
 			  const IndexCache *masks, bool any_running, int64 *drefs,
 			  int64 *droots, TransactionId *running, BlockNumber *own_blk,
-			  int *own_at, bool *any_own)
+			  int *own_at, bool *any_own, TransactionId *other)
 {
 	Buffer		cur = primary;
 	TransactionId mine = own_blk ? GetCurrentTransactionIdIfAny() : InvalidTransactionId;
@@ -1292,6 +1293,8 @@ count_changes(Relation rel, Buffer primary, int mode,
 	*drefs = *droots = 0;
 	if (running)
 		*running = InvalidTransactionId;
+	if (other)
+		*other = InvalidTransactionId;
 	if (any_own)
 		*any_own = false;
 	if (own_blk)
@@ -1324,6 +1327,8 @@ count_changes(Relation rel, Buffer primary, int mode,
 				case ENTRY_IN_PROGRESS:
 					if (running && (any_running || (int32) e->roots < 0))
 						*running = e->xmin;
+					if (other)
+						*other = e->xmin;
 					break;
 				case ENTRY_DEAD:
 					break;
@@ -1579,7 +1584,7 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	if (found != primary)
 		UnlockReleaseBuffer(found);
 	count_changes(idx, primary, BUFFER_LOCK_SHARE, out, bucket, &masks,
-				  false, &drefs, &droots, NULL, NULL, NULL, NULL);
+				  false, &drefs, &droots, NULL, NULL, NULL, NULL, NULL);
 	UnlockReleaseBuffer(primary);
 	if (!counts_add(out, drefs, droots))
 		ereport(ERROR,
@@ -1682,9 +1687,11 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	int64		crefs,
 				croots;
 	TransactionId running;
+	TransactionId other;
 	BlockNumber own_blk;
 	int			own_at;
 	bool		any_own;
+	bool		marked = false;
 
 	PreventCommandIfReadOnly("change a chunk index");
 	memset(&change, 0, sizeof(change));
@@ -1715,12 +1722,12 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		if (found != primary)
 			UnlockReleaseBuffer(found);
 		/*
-		 * (a reference let go of: whether another transaction changes the
-		 * chunk's counts, which may be letting go of its last but this one)
+		 * (and whether another transaction changes the chunk's counts: one
+		 * letting go of a hold of it, its last but this one's, perhaps)
 		 */
 		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
-					  drefs < 0 && droots == 0, &crefs, &croots, &running, &own_blk,
-					  &own_at, &any_own);
+					  false, &crefs, &croots, &running, &own_blk, &own_at, &any_own,
+					  &other);
 
 		/*
 		 * (a root let go of waits for another's, as a row's update waits for
@@ -1805,12 +1812,13 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	 * commit starts)
 	 */
 	if ((drefs < 0 || droots < 0) &&
-		((out->refs == 0 && out->roots == 0) || TransactionIdIsValid(running)))
+		((out->refs == 0 && out->roots == 0) || TransactionIdIsValid(other)))
 	{
 		set_mark(idx, bucket, true);
-		ChunkFreerWanted(idx);
+		marked = true;
 	}
 	UnlockReleaseBuffer(primary);
+	ChunkFreerChanged(idx, marked);
 	return true;
 }
 
@@ -1853,7 +1861,7 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uin
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_UNLOCK);
 	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
-				  true, &drefs, &droots, &running, NULL, NULL, NULL);
+				  true, &drefs, &droots, &running, NULL, NULL, NULL, NULL);
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_EXCLUSIVE);
 	/*
@@ -2325,7 +2333,7 @@ page_move(Relation idx, const ChunkIndexEntry *seen, ChunkIndexEntry *moved,
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_UNLOCK);
 	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, &e, bucket, &masks,
-				  true, &drefs, &droots, &running, NULL, NULL, NULL);
+				  true, &drefs, &droots, &running, NULL, NULL, NULL, NULL);
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_EXCLUSIVE);
 	if (e.xmin != seen->xmin || e.loc != seen->loc || e.len != seen->len ||
@@ -2997,7 +3005,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 									 (unsigned long long) unheld, segs.compactable,
 									 segs.worth ? "" : " (not worth it)",
 									 segs.evacuable, segs.pending)));
-			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx),
+			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx), false,
 									segs.compactable > 0 && segs.worth,
 									segs.evacuable > 0,
 									chunk_compact_dead_fraction, segs.grow);
