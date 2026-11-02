@@ -31,6 +31,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -228,6 +229,71 @@ check_pusher(void)
 				 errmsg("only a superuser may push or release history in the history store's tier")));
 }
 
+/* whether this transaction pushed a bundle */
+static bool pushed_in_xact = false;
+static bool push_callback_registered = false;
+
+static void
+forget_push(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+		event == XACT_EVENT_PREPARE || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_PARALLEL_ABORT)
+		pushed_in_xact = false;
+}
+
+bool
+ChunkStorePushedInTransaction(void)
+{
+	return pushed_in_xact;
+}
+
+/*
+ * A push is a transaction's alone: one bundle, and no pointer changed
+ * before it or after.  (So a pusher never holds a pointer's change as it
+ * waits for the pointers, and a pointer's change never waits for a
+ * pusher holding them: no deadlock between them.)
+ */
+static void
+check_alone(void)
+{
+	if (pushed_in_xact)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a transaction pushes one bundle of history at most"),
+				 errhint("Push each bundle in a transaction of its own.")));
+	if (CheckRelationOidLockedByMe(ChunkStorePointersRelid(), RowExclusiveLock, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot push history in a transaction that changed the history store's pointers"),
+				 errhint("Push in a transaction of its own.")));
+	if (!push_callback_registered)
+	{
+		RegisterXactCallback(forget_push, NULL);
+		push_callback_registered = true;
+	}
+	pushed_in_xact = true;
+}
+
+/*
+ * The pushes of roots locked: a lock of each part of hashes the roots are
+ * in (their first byte's), in order, until the transaction ends, so that
+ * a push of a root another is pushing waits for it, and then counts what
+ * it left (two counting at once could each take the last root not a
+ * pointer's)
+ */
+static void
+lock_roots(const uint8 *roots, int n)
+{
+	bool		part[256] = {false};
+
+	for (int i = 0; i < n; i++)
+		part[roots[(Size) i * CHUNK_HASH_LEN]] = true;
+	for (int p = 0; p < 256; p++)
+		if (part[p])
+			LockDatabaseObject(ChunkStoreBundlesRelid(), (Oid) p, 0, ExclusiveLock);
+}
+
 /*
  * The pointers naming each of roots, in counts[]: as of now, the pointers
  * locked (those changing them waited for, and none changing them until
@@ -295,6 +361,8 @@ pg_history_push(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a bundle has a root at least")));
+	check_alone();
+	lock_roots(roots, n);
 	SPI_connect();
 	if (bundle_exists(bundle))
 		ereport(ERROR,
@@ -308,11 +376,11 @@ pg_history_push(PG_FUNCTION_ARGS)
 	/*
 	 * (each root one the caller holds, not a pointer's: a pointer's root is
 	 * let go of as its row is, which would then be one too many.  The
-	 * pointers counted as of now, and the roots, and the caller's roots
-	 * let go of, with no pointer changed meanwhile: then the pointers
-	 * unlocked, a pointer's change since composing with the push's.  So a
-	 * transaction that changed pointers and then pushes waits for others
-	 * changing them, and two such may deadlock, one cancelled.)
+	 * pointers counted as of now, and the roots, with no pointer changed
+	 * meanwhile (those changing them waited for), and no other push of
+	 * these roots (locked above); then the pointers unlocked, and the
+	 * caller's roots let go of: a pointer's change since only takes or
+	 * lets go of its own root.)
 	 */
 	pointers = palloc_array(uint64, n);
 	pointers_of(PG_GETARG_ARRAYTYPE_P(1), roots, n, pointers);
@@ -339,9 +407,9 @@ pg_history_push(PG_FUNCTION_ARGS)
 					 errmsg("chunk %s has no root to push but its pointers'", ChunkHashText(root)),
 					 errhint("Take a root of it to push (a bundle takes it), or delete the pointers.")));
 	}
+	UnlockRelationOid(ChunkStorePointersRelid(), ShareLock);
 	for (int i = 0; i < n; i++)
 		cs_unref_root(ps.from, roots + (Size) i * CHUNK_HASH_LEN);
-	UnlockRelationOid(ChunkStorePointersRelid(), ShareLock);
 
 	ps.cap = 64;
 	ps.stack = palloc_array(PushFrame, ps.cap);
