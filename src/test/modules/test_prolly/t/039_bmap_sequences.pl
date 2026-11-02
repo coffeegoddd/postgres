@@ -75,8 +75,10 @@ sql(q{SELECT last_value FROM pg_sequences WHERE sequencename = 's';
 	SELECT pg_sequence_last_value('s'); SELECT * FROM pg_get_sequence_data('s')});
 is(sql(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 0}), $phys2,
 	'reading a shared sequence\'s value leaves its page shared');
-is(sql(qq{SELECT pg_current_wal_insert_lsn() = '$lsn'}), 't',
-	'and logs nothing');
+# (the position read as it was before, compared here: a comparison in SQL
+# looks up its operator as it is planned, which a first lookup's hints
+# can log)
+is(sql(q{SELECT pg_current_wal_insert_lsn()}), $lsn, 'and logs nothing');
 sql(qq{SELECT test_bmap_unlink($copy2)});
 
 $primary->wait_for_replay_catchup($standby);
