@@ -20,7 +20,6 @@
 #define PROLLY_CHUNK_STORE_H
 
 #include "prolly/chunk_index.h"
-#include "storage/lockdefs.h"
 
 /*
  * A chunk's name: the first CHUNK_HASH_LEN bytes of the SHA-256 of its
@@ -41,15 +40,6 @@ extern Oid	ChunkStoreTierIndexRelid(void);
 extern Oid	ChunkStorePointersRelid(void);
 extern Oid	ChunkStoreBundlesRelid(void);
 
-/*
- * A lock on the pointers to the chunk hash (a lock of an object, by the
- * pointers' table and the hash's first bytes: two hashes alike there
- * share it, which only waits more).  A pointer's change takes
- * RowExclusiveLock (pointers' changes wait for none of each other's); a
- * push, ShareLock on each of its roots (it waits for those changing their
- * pointers, and they for it, until its transaction ends).
- */
-extern void ChunkStoreLockPointersTo(const uint8 *hash, LOCKMODE mode);
 
 /* A chunk's name, in hex, palloc'd: for messages. */
 extern char *ChunkHashText(const uint8 *hash);

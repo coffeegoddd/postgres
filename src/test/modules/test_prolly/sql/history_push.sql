@@ -83,6 +83,15 @@ SELECT test_cs_has('pages', pg_temp.h('\x0a1199')) AS kept,
 	test_cs_has('tier', pg_temp.h('\x0a1199')) AS not_in_tier,
 	(SELECT count(*) FROM pg_history.bundles WHERE name = 'b3') AS no_rows;
 
+-- pointers made and dropped many at once, in one statement each (more
+-- distinct chunks than the shared lock table holds locks for: pointers
+-- take no lock a chunk)
+SELECT count(*) FROM generate_series(1, 20000) g,
+	LATERAL test_cs_put('pages', int4send(g));
+INSERT INTO pg_history.pointers SELECT 'many' || g, pg_temp.h(int4send(g)) FROM generate_series(1, 20000) g;
+DELETE FROM pg_history.pointers WHERE name LIKE 'many%';
+SELECT test_cs_free('pages', ARRAY(SELECT pg_temp.h(int4send(g)) FROM generate_series(1, 20000) g)) AS freed;
+
 -- releases: the tier frees what nothing else holds (the shared leaf, held
 -- by the other bundle's parent, at the second)
 SELECT pg_history_release('b1') AS freed;

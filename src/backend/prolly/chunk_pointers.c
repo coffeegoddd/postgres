@@ -35,6 +35,7 @@
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/fmgrprotos.h"
+#include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -87,17 +88,6 @@ Oid
 ChunkStoreBundlesRelid(void)
 {
 	return store_relid("bundles");
-}
-
-void
-ChunkStoreLockPointersTo(const uint8 *hash, LOCKMODE mode)
-{
-	uint32		objid;
-	uint16		subid;
-
-	memcpy(&objid, hash, sizeof(objid));
-	memcpy(&subid, hash + sizeof(objid), sizeof(subid));
-	LockDatabaseObject(ChunkStorePointersRelid(), objid, subid, mode);
 }
 
 /*
@@ -170,16 +160,13 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 				 errmsg("pg_history_pointer_changed is pg_history.pointers' trigger alone")));
 
 	idx = relation_open(ChunkStoreIndexRelid(), RowExclusiveLock);
-	/* (each chunk's pointers locked: a push of it waits, or is waited for) */
 	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
 	{
-		ChunkStoreLockPointersTo(row_hash(td, td->tg_trigtuple), RowExclusiveLock);
 		refuse_pushed(idx, row_hash(td, td->tg_trigtuple));
 		ChunkStoreRefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
 	}
 	else if (TRIGGER_FIRED_BY_DELETE(td->tg_event))
 	{
-		ChunkStoreLockPointersTo(row_hash(td, td->tg_trigtuple), RowExclusiveLock);
 		ChunkStoreUnrefRoot(idx, row_hash(td, td->tg_trigtuple), &e);
 	}
 	else
@@ -190,8 +177,6 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 		/* (the new chunk's first: a pointer moved to itself keeps it) */
 		if (memcmp(old, new, CHUNK_HASH_LEN) != 0)
 		{
-			ChunkStoreLockPointersTo(new, RowExclusiveLock);
-			ChunkStoreLockPointersTo(old, RowExclusiveLock);
 			refuse_pushed(idx, new);
 			ChunkStoreRefRoot(idx, new, &e);
 			INJECTION_POINT("history-pointer-moving", NULL);
@@ -243,6 +228,7 @@ pg_history_bundle_changed(PG_FUNCTION_ARGS)
 		Datum	   *elems;
 		bool	   *nulls;
 		int			n;
+		HTAB	   *given = NULL;
 
 		if (attnum <= 0)
 			elog(ERROR, "\"%s\" has no column \"roots\"", RelationGetRelationName(td->tg_relation));
@@ -251,6 +237,16 @@ pg_history_bundle_changed(PG_FUNCTION_ARGS)
 			elog(ERROR, "a bundle has no roots");
 		deconstruct_array(DatumGetArrayTypeP(d), BYTEAOID, -1, false, TYPALIGN_INT,
 						  &elems, &nulls, &n);
+		if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+		{
+			HASHCTL		ctl;
+
+			ctl.keysize = CHUNK_HASH_LEN;
+			ctl.entrysize = CHUNK_HASH_LEN;
+			ctl.hcxt = CurrentMemoryContext;
+			given = hash_create("bundle roots", Max(n, 16), &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		}
 		for (int i = 0; i < n; i++)
 		{
 			bytea	   *b;
@@ -263,11 +259,16 @@ pg_history_bundle_changed(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("a chunk's hash is %d bytes", CHUNK_HASH_LEN)));
 			/* (a root once: a bundle holds each of its roots once) */
-			for (int j = 0; j < i && TRIGGER_FIRED_BY_INSERT(td->tg_event); j++)
-				if (memcmp(VARDATA_ANY(DatumGetByteaPP(elems[j])), VARDATA_ANY(b), CHUNK_HASH_LEN) == 0)
+			if (given != NULL)
+			{
+				bool		found;
+
+				(void) hash_search(given, VARDATA_ANY(b), HASH_ENTER, &found);
+				if (found)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("a bundle's root is given twice")));
+			}
 			if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
 				ChunkStoreRefRoot(idx, (const uint8 *) VARDATA_ANY(b), &e);
 			else
