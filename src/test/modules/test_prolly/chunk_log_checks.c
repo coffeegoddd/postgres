@@ -35,6 +35,7 @@ PG_FUNCTION_INFO_V1(test_chunk_log_space);
 PG_FUNCTION_INFO_V1(test_chunk_log_segments);
 PG_FUNCTION_INFO_V1(test_chunk_log_let_go);
 PG_FUNCTION_INFO_V1(test_tier_packs);
+PG_FUNCTION_INFO_V1(test_tier_pack_table);
 PG_FUNCTION_INFO_V1(test_chunk_log_regions);
 
 static Relation
@@ -183,6 +184,42 @@ test_tier_packs(PG_FUNCTION_ARGS)
 		};
 		bool		nulls[5] = {false, false, false, false, false};
 
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * test_tier_pack_table(rel, id) returns setof (hash, off, len): the table
+ * at the end of a written pack, in its order
+ */
+Datum
+test_tier_pack_table(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	ChunkTierPackEntry *entries;
+	uint64		data_len;
+	int			n;
+
+	if (!RelationIsTierLog(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a tier of the history store", RelationGetRelationName(rel))));
+	n = ChunkTierPackTable(rel, (uint32) PG_GETARG_INT64(1), &entries, &data_len);
+	relation_close(rel, AccessShareLock);
+	InitMaterializedSRF(fcinfo, 0);
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *hash = palloc(VARHDRSZ + CHUNK_HASH_LEN);
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+
+		SET_VARSIZE(hash, VARHDRSZ + CHUNK_HASH_LEN);
+		memcpy(VARDATA(hash), entries[i].hash, CHUNK_HASH_LEN);
+		values[0] = PointerGetDatum(hash);
+		values[1] = Int64GetDatum(entries[i].off);
+		values[2] = Int64GetDatum(entries[i].len);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;

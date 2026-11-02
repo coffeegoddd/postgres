@@ -33,11 +33,50 @@
 #ifndef PROLLY_CHUNK_TIER_H
 #define PROLLY_CHUNK_TIER_H
 
+#include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
+#include "prolly/object_store.h"
 #include "storage/smgr.h"
 
 /* The bytes a pack has at most, but for one chunk longer, alone in its own. */
 #define TIER_PACK_BYTES		((uint64) 64 * 1024 * 1024)
+
+/*
+ * A pack's object: its chunks' bytes one after another, then its table (an
+ * entry a chunk, by hash, then by offset), then its footer.  So a pack says
+ * what it has without the server's index.  Numbers are in the byte order
+ * of the server that wrote it: one of the other order reads its magic
+ * wrong, and refuses it.
+ */
+#define CHUNK_TIER_PACK_MAGIC	UINT64CONST(0x4b4341505952504c)	/* "LPRYPACK" */
+#define CHUNK_TIER_PACK_VERSION	1
+
+typedef struct ChunkTierPackEntry
+{
+	uint8		hash[CHUNK_HASH_LEN];
+	uint32		off;
+	uint32		len;
+} ChunkTierPackEntry;
+
+typedef struct ChunkTierPackFooter
+{
+	uint32		nentries;
+	uint32		version;
+	uint64		data_len;		/* the chunks' bytes, before the table */
+	uint64		magic;
+} ChunkTierPackFooter;
+
+/*
+ * The table of the pack name (palloc'd, in *entries), and the length of
+ * its chunks' bytes in *data_len; answers its entries.  An error if it is
+ * not there, or not a pack of this format, or its footer does not fit it.
+ */
+extern int	ChunkTierReadPackTable(ObjectStore *os, const char *name,
+								   ChunkTierPackEntry **entries, uint64 *data_len);
+
+/* The table of the tier's pack id (written), as ChunkTierReadPackTable. */
+extern int	ChunkTierPackTable(Relation rel, uint32 id, ChunkTierPackEntry **entries,
+							   uint64 *data_len);
 
 extern PGDLLIMPORT char *history_tier_store;
 extern PGDLLIMPORT char *history_tier_location;

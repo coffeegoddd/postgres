@@ -68,6 +68,22 @@ SELECT ok FROM test_cs_check('tier');
 -- a dump refuses the tier's chunks, not yet dumped
 SELECT count(*) FROM pg_history_export();
 
+-- a pack's table, at its end: each chunk in it, by hash, its bytes there
+-- hashing to it
+SELECT count(*) FROM generate_series(1, 7) g,
+	LATERAL test_cs_put('tier', convert_to(repeat('table' || g, g * 10), 'UTF8'));
+SELECT max(id) AS last_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
+SELECT count(*) AS entries,
+	count(*) FILTER (WHERE test_cs_get('tier', t.hash) IS NOT NULL
+		AND substr(sha256(test_cs_get('tier', t.hash)), 1, 20) = t.hash
+		AND length(test_cs_get('tier', t.hash)) = t.len) AS each_its_chunk,
+	bool_and(t.hash IN (SELECT substr(sha256(convert_to(repeat('table' || g, g * 10), 'UTF8')), 1, 20)
+		FROM generate_series(1, 7) g)) AS all_put,
+	(SELECT bool_and(a < b) FROM (SELECT hash a, lead(hash) OVER (ORDER BY ord) b
+		FROM test_tier_pack_table('pg_history.tier_chunks', :last_pack) WITH ORDINALITY x(hash, off, len, ord)) y
+		WHERE b IS NOT NULL) AS by_hash
+FROM test_tier_pack_table('pg_history.tier_chunks', :last_pack) t;
+
 -- a tier the test makes: its stamp, in its packs' names, a new one after
 -- TRUNCATE (the one kept in the relcache let go)
 CREATE TABLE my_tier () USING prolly_tier;
