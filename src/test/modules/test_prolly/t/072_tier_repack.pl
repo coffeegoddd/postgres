@@ -6,8 +6,9 @@
 # the chunk freer VACUUM starts, their live chunks moved a pack's worth a
 # transaction (into one pack, here: the pages' batch of chunks would take
 # two), and the old packs, all dead then, removed; more live than a pack
-# makes two packs, none of one chunk; and a pack with a chunk freed that a
-# snapshot keeps is passed by.
+# makes two packs, none of one chunk; a pack with a chunk freed that a
+# snapshot keeps is passed by; and packs repacked as a snapshot is held
+# are passed by, so the next repack reaches others.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -123,6 +124,30 @@ $offset = -s $node->logfile;
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 ok($node->log_contains(qr/a freer to start: [1-9]\d* chunks unheld, \d+ segments to compact.*, [1-9]\d* passed by for snapshots/, $offset),
 	'its pack passed by for the snapshot');
+$snap->quit;
+
+# packs repacked while a snapshot is held stay pending (the bytes moved
+# from kept for it): passed by, so the next repack reaches the packs after
+# them, not the same ones again (a repack is of 64 at most)
+$node->safe_psql('postgres', q{
+	DO $$BEGIN
+		FOR i IN 1 .. 65 LOOP
+			PERFORM test_cs_put('tier', blob(30000 + 2 * i));
+			PERFORM test_cs_put('tier', blob(30001 + 2 * i));
+			PERFORM test_cs_ref_root('tier', h(blob(30001 + 2 * i)));
+			COMMIT;
+		END LOOP;
+	END$$;
+	SELECT test_cs_free('tier', ARRAY(SELECT h(blob(30000 + 2 * i)) FROM generate_series(1, 65) i));
+	VACUUM pg_history.tier_index;
+});
+$snap = $node->background_psql('postgres');
+$snap->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$snap->query_safe(q{SELECT length(test_cs_get('tier', h(blob(30003))))});
+my $compact = q{SELECT segments || ' ' || chunks FROM test_chunk_compact('pg_history.tier_chunks', 'pg_history.tier_index', 0.4, false)};
+like($node->safe_psql('postgres', $compact), qr/^64 [1-9]/, 'a repack of 64 packs');
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+like($node->safe_psql('postgres', $compact), qr/^\d+ [1-9]/, 'the next moves chunks: the packs after them');
 $snap->quit;
 
 $node->stop;

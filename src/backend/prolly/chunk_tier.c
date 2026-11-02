@@ -80,7 +80,7 @@ char	   *history_tier_store = NULL;
 char	   *history_tier_location = NULL;
 
 #define TIER_MAGIC			0x54494552	/* "TIER" */
-#define TIER_VERSION		3
+#define TIER_VERSION		4
 #define TIER_META_BLOCK		0
 
 typedef struct TierMeta
@@ -109,7 +109,15 @@ typedef struct TierPack
 	uint64		size;			/* its bytes, once written */
 	uint64		dead;			/* of them, no chunk's any more */
 	XLogRecPtr	dead_lsn;		/* where the last of them died */
+	uint32		flags;			/* PACK_PENDING */
+	uint32		unused;
 } TierPack;
+
+/*
+ * chunks freed on it kept for snapshots, as the last VACUUM found: not to
+ * repack (its live chunks moved already, maybe) until that passes
+ */
+#define PACK_PENDING		0x01
 
 #define PACKS_PER_PAGE \
 	((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) / sizeof(TierPack))
@@ -400,6 +408,7 @@ begin_pack(Relation rel)
 	p->size = 0;
 	p->dead = 0;
 	p->dead_lsn = InvalidXLogRecPtr;
+	p->flags = 0;
 	stamp = meta->stamp;
 	owner = meta->owner;
 	GenericXLogFinish(state);
@@ -916,10 +925,10 @@ tier_bind_index(Relation rel, Oid index)
  * bounded so, a freer's memory), ascending, each a segment, its places
  * from its first byte to its last.  Compaction moves their live chunks
  * into this backend's pack, a chunk read a time from its pack's object;
- * the pack, all dead then, is removed.  Those with chunks freed kept for
- * snapshots (pending, which VACUUM counts apart) are among them, as in
- * the pages' log: a freer moves nothing off them it should not, the
- * entries freed not the chunks' any more.
+ * the pack, all dead then, is removed.  Those VACUUM found with chunks
+ * freed kept for snapshots (pending, marked so) are passed by: their live
+ * chunks may be moved already, the bytes moved from not dead yet, and
+ * they would fill each repack, moving nothing, while a snapshot lasts.
  */
 static int
 tier_compactable(Relation rel, double fraction, int max, uint64 *starts,
@@ -980,11 +989,12 @@ tier_segment_bytes(Relation rel)
  * (committed and not removed), all dead ("free", for VACUUM to remove), to
  * repack (those with chunks freed kept for snapshots, pending, passed
  * by), worth it once their dead bytes come to half a pack's (a pack
- * written, the more of it live)
+ * written, the more of it live); and if mark (VACUUM's), each pack's
+ * pending flag set as it found, or cleared
  */
 static void
-count_packs(Relation rel, double fraction, const uint8 *pending_bits, uint64 npending,
-			ChunkLogSegments *out)
+count_packs(Relation rel, double fraction, bool mark, const uint8 *pending_bits,
+			uint64 npending, ChunkLogSegments *out)
 {
 	TierMeta	meta = read_meta(rel);
 	TimeLineID	tli = GetWALInsertionTimeLine();
@@ -993,29 +1003,46 @@ count_packs(Relation rel, double fraction, const uint8 *pending_bits, uint64 npe
 	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
 	{
 		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
-		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
+		Buffer		buf = pack_buffer(rel, first, mark ? BUFFER_LOCK_EXCLUSIVE : BUFFER_LOCK_SHARE);
+		GenericXLogState *state = NULL;
+		Page		page = BufferGetPage(buf);
 
 		for (uint32 id = first; id < last; id++)
 		{
-			TierPack   *p = pack_entry(BufferGetPage(buf), id);
+			TierPack   *p = pack_entry(page, id);
+			bool		pending = pending_bits != NULL && id < npending &&
+				(pending_bits[id / 8] & (1 << (id % 8)));
 
 			if (p->state != PACK_COMMITTED || p->size == 0)
 				continue;
+
+			/* (VACUUM's: pending marked as it found, WAL-logged) */
+			if (mark && pending != ((p->flags & PACK_PENDING) != 0))
+			{
+				if (state == NULL)
+				{
+					state = GenericXLogStart(rel);
+					page = GenericXLogRegisterBuffer(state, buf, 0);
+					p = pack_entry(page, id);
+				}
+				p->flags = pending ? (p->flags | PACK_PENDING) : (p->flags & ~PACK_PENDING);
+			}
 			out->segments++;
 			if (p->dead >= p->size)
 				out->free++;
+			else if (pending)
+			{
+				if (p->dead > 0 && (double) p->dead >= fraction * (double) p->size)
+					out->pending++;
+			}
 			else if (to_repack(&meta, tli, id, p, fraction))
 			{
-				if (pending_bits != NULL && id < npending &&
-					(pending_bits[id / 8] & (1 << (id % 8))))
-					out->pending++;
-				else
-				{
-					out->compactable++;
-					out->compactable_dead += p->dead;
-				}
+				out->compactable++;
+				out->compactable_dead += p->dead;
 			}
 		}
+		if (state != NULL)
+			GenericXLogFinish(state);
 		UnlockReleaseBuffer(buf);
 	}
 	out->worth = out->compactable_dead >= TIER_PACK_BYTES / 2;
@@ -1024,7 +1051,7 @@ count_packs(Relation rel, double fraction, const uint8 *pending_bits, uint64 npe
 static void
 tier_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 {
-	count_packs(rel, fraction, NULL, 0, out);
+	count_packs(rel, fraction, false, NULL, 0, out);
 }
 
 /*
@@ -1098,7 +1125,7 @@ to_repack(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
 {
 	return pack_ours(meta, tli, id, p) && p->state == PACK_COMMITTED &&
 		p->size > 0 && p->dead > 0 && p->dead < p->size &&
-		(double) p->dead >= fraction * (double) p->size;
+		(double) p->dead >= fraction * (double) p->size && !(p->flags & PACK_PENDING);
 }
 
 /*
@@ -1261,7 +1288,7 @@ tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
 
 	walk_packs(rel, true, &frozen);
 	advance_frozen(rel, frozen, false);
-	count_packs(rel, fraction, pending_bits, npending, out);
+	count_packs(rel, fraction, true, pending_bits, npending, out);
 }
 
 /*

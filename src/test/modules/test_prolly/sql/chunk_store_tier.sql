@@ -217,12 +217,20 @@ SELECT test_cs_unref_root('tier', substr(sha256(pg_temp.rp(31)), 1, 20)),
 	test_cs_unref_root('tier', substr(sha256(pg_temp.rp(32)), 1, 20));
 SELECT test_cs_free('tier', ARRAY[substr(sha256(pg_temp.rp(31)), 1, 20), substr(sha256(pg_temp.rp(32)), 1, 20)]) AS freed;
 VACUUM pg_history.tier_index;
+SELECT dead AS dead_before FROM test_tier_packs('pg_history.tier_chunks') WHERE id = :ab_pack;
 BEGIN;
 SELECT segments, chunks FROM test_chunk_compact('pg_history.tier_chunks', 'pg_history.tier_index', 0.5, false);
 ROLLBACK;
 VACUUM pg_history.tier_index;
 SELECT state FROM test_tier_packs('pg_history.tier_chunks') WHERE id = :ab_pack;
 SELECT count(*) AS orphans_left FROM test_tier_packs('pg_history.tier_chunks') WHERE id > :ab_pack AND state IN ('made', 'orphaned');
+-- (the repack's pack was begun, an orphan, never written: an abort writes
+-- none, and removed; the chunks' pack as it was)
+SELECT count(*) AS begun_removed FROM test_tier_packs('pg_history.tier_chunks')
+WHERE id > :ab_pack AND state = 'removed' AND size = 0;
+SELECT dead FROM test_tier_packs('pg_history.tier_chunks') WHERE id = :ab_pack;
+SELECT count(*) AS still_in_its_table FROM test_tier_pack_table('pg_history.tier_chunks', :ab_pack)
+WHERE hash IN (SELECT substr(sha256(pg_temp.rp(g)), 1, 20) FROM generate_series(33, 34) g);
 SELECT count(*) FILTER (WHERE test_cs_get('tier', substr(sha256(pg_temp.rp(g)), 1, 20)) = pg_temp.rp(g)) AS read_back
 FROM generate_series(33, 34) g;
 SELECT ok FROM test_cs_check('tier');
