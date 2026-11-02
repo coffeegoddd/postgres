@@ -682,9 +682,11 @@ SELECT pg_history_push('b13', ARRAY[pg_temp.h('\x0a1905')]) AS copied;
 INSERT INTO pg_history.bundles VALUES ('b14', ARRAY[pg_temp.h('\x0a1905')], -5);
 ERROR:  new row for relation "bundles" violates check constraint "bundles_manifest_check"
 DETAIL:  Failing row contains (b14, {"\\xd01b9feb632a10bb88f2d64afb1fc8bfe7509946"}, -5).
+-- (terse: the number another bundle's, whatever it is)
+\set VERBOSITY terse
 INSERT INTO pg_history.bundles SELECT 'b14', roots, manifest FROM pg_history.bundles WHERE name = 'b13';
 ERROR:  duplicate key value violates unique constraint "bundles_manifest_key"
-DETAIL:  Key (manifest)=(120) already exists.
+\set VERBOSITY default
 SELECT kind FROM test_tier_packs('pg_history.tier_chunks')
 WHERE id = (SELECT manifest FROM pg_history.bundles WHERE name = 'b13');
    kind   
@@ -704,6 +706,23 @@ SELECT test_os_put('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp
 SELECT count(*) FROM pg_history_tier_bundles();
 ERROR:  a bundle's manifest of 25 bytes does not hold its name and 0 roots
 SELECT test_os_remove('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000000');
+ test_os_remove 
+----------------
+ 
+(1 row)
+
+-- (and one naming its bundle with a NUL)
+SELECT test_os_put('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000001',
+	int8send(5498985688337368140) || int4send(1) || int4send(2) || int4send(1) || int4send(0) || '\x4100'::bytea ||
+	substr(sha256('\x01'), 1, 20));
+ test_os_put 
+-------------
+ 
+(1 row)
+
+SELECT count(*) FROM pg_history_tier_bundles();
+ERROR:  a bundle's manifest names it with a NUL, or not in the database's encoding
+SELECT test_os_remove('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000001');
  test_os_remove 
 ----------------
  

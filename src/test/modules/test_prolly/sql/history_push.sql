@@ -236,7 +236,10 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1904')]) AS freed;
 SELECT (test_cs_put('pages', '\x0a1905')).stored, (test_cs_put('pages', '\x0a1906')).stored;
 SELECT pg_history_push('b13', ARRAY[pg_temp.h('\x0a1905')]) AS copied;
 INSERT INTO pg_history.bundles VALUES ('b14', ARRAY[pg_temp.h('\x0a1905')], -5);
+-- (terse: the number another bundle's, whatever it is)
+\set VERBOSITY terse
 INSERT INTO pg_history.bundles SELECT 'b14', roots, manifest FROM pg_history.bundles WHERE name = 'b13';
+\set VERBOSITY default
 SELECT kind FROM test_tier_packs('pg_history.tier_chunks')
 WHERE id = (SELECT manifest FROM pg_history.bundles WHERE name = 'b13');
 
@@ -246,6 +249,12 @@ SELECT test_os_put('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp
 	int8send(5498985688337368140) || int4send(1) || int4send(1) || int4send(0) || int4send(0) || '\x41'::bytea);
 SELECT count(*) FROM pg_history_tier_bundles();
 SELECT test_os_remove('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000000');
+-- (and one naming its bundle with a NUL)
+SELECT test_os_put('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000001',
+	int8send(5498985688337368140) || int4send(1) || int4send(2) || int4send(1) || int4send(0) || '\x4100'::bytea ||
+	substr(sha256('\x01'), 1, 20));
+SELECT count(*) FROM pg_history_tier_bundles();
+SELECT test_os_remove('directory', 'pg_test_history_tier', 'manifests/' || :'mstamp' || '/0000000000000000/4000000001');
 SELECT pg_history_release('b13') AS freed;
 VACUUM pg_history.tier_index;
 

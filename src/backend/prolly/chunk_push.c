@@ -114,12 +114,15 @@ decode_manifest(const char *data, size_t len, char **name, uint8 **roots, int *n
 	namelen = pg_ntoh32(h.namelen);
 	*n = (int) pg_ntoh32(h.nroots);
 	if (*n <= 0 || namelen > len - sizeof(h) ||
-		(uint64) *n * CHUNK_HASH_LEN != len - sizeof(h) - namelen ||
-		memchr(data + sizeof(h), '\0', namelen) != NULL ||
-		!pg_verifymbstr(data + sizeof(h), namelen, true))
+		(uint64) *n * CHUNK_HASH_LEN != len - sizeof(h) - namelen)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("a bundle's manifest of %zu bytes does not hold its name and %d roots", len, *n)));
+	if (memchr(data + sizeof(h), '\0', namelen) != NULL ||
+		!pg_verifymbstr(data + sizeof(h), namelen, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a bundle's manifest names it with a NUL, or not in the database's encoding")));
 	*name = pnstrdup(data + sizeof(h), namelen);
 	*roots = palloc((Size) Max(*n, 1) * CHUNK_HASH_LEN);
 	memcpy(*roots, data + sizeof(h) + namelen, (Size) *n * CHUNK_HASH_LEN);

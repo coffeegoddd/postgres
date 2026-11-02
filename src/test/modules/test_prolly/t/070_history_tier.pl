@@ -131,6 +131,8 @@ is($node->safe_psql('postgres', q{
 # a hot standby at the same tier reads them
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $kept), '20', 'the standby reads the tier\'s chunks');
+is($standby->safe_psql('postgres', q{SELECT count(*) FROM pg_history_tier_bundles()}), '0',
+	'and lists the tier\'s bundles, from the store');
 
 # a pack all dead, the standby's replay paused before: its object kept
 # (the standby's readers may read it) until the standby replays past
