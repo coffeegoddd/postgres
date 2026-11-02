@@ -27,9 +27,11 @@ SELECT pg_relation_size('cl') AS size_written \gset
 -- nothing to compact if more must be dead
 SELECT segments, chunks FROM test_chunk_compact('cl', 'ci', 0.9, false);
 
--- compacted: the kept chunks on the 15 segments written full moved (into
--- segments new, none free), read back, their counts the same, the audit
--- clean (the old entries freed, their bytes the store's still until VACUUM)
+-- compacted: the kept chunks on the segments done with moved (into segments
+-- new, none free; all but the last two: this backend's region, still
+-- published from where it last grew), read back, their counts the same,
+-- the audit clean (the old entries freed, their bytes the store's still
+-- until VACUUM)
 SELECT segments, chunks, bytes FROM test_chunk_compact('cl', 'ci', 0.4, false);
 SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('a' || g))) = blob('a' || g)) AS read_back
 FROM generate_series(2, 2000, 2) g;
@@ -37,16 +39,18 @@ SELECT count(*) FILTER (WHERE refs = 0 AND roots = 1) AS counts_kept
 FROM generate_series(2, 2000, 2) g, LATERAL test_chunk_index_entry('ci', h(blob('a' || g)));
 SELECT ok, chunks FROM test_chunk_check('cl', 'ci');
 
--- VACUUM takes the old entries out: the 15 segments compacted free, none
--- left to compact; the end (the chunks moved) not to evacuate while this
--- backend's region, its last segment, may be appended to still
+-- VACUUM takes the old entries out: the segments compacted free; the end
+-- (the chunks moved) not to evacuate while this backend's region, its last
+-- segment, may be appended to still
 VACUUM ci;
 SELECT segments, free, compactable, worth, evacuable FROM test_chunk_log_segments('cl', 0.4);
 
 -- once it exited, and VACUUM let its region go, the end is to evacuate:
 -- the chunks there moved into the free segments below; VACUUM then cuts
 -- the end off, the log smaller than it was written, and every chunk there
+SELECT pg_backend_pid() AS old_pid \gset
 \c
+SELECT test_wait_backend_gone(:old_pid) AS old_gone;
 SET chunk_free_in_background = off;
 VACUUM ci;
 SELECT segments, free, compactable, worth, evacuable FROM test_chunk_log_segments('cl', 0.4);
@@ -58,17 +62,59 @@ SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('a' || g))) = bl
 FROM generate_series(2, 2000, 2) g;
 SELECT ok, chunks FROM test_chunk_check('cl', 'ci');
 
--- 100 more go into the free segment left (the log cut to a segment more
--- than its live chunks need): the file no bigger
+-- 100 more: the log, cut to its live chunks, no segment free, grows by a
+-- segment for them, no more
 \c
 SET chunk_free_in_background = off;
 SELECT segments, free FROM test_chunk_log_segments('cl', 0.4);
 SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(blob('b' || g)), blob('b' || g))) AS put_again
 FROM generate_series(1, 100) g;
-SELECT pg_relation_size('cl') = :size_compacted AS no_bigger;
+SELECT pg_relation_size('cl') - :size_compacted <= 32 * current_setting('block_size')::int AS a_segment_more;
 SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('b' || g))) = blob('b' || g)) AS new_read
 FROM generate_series(1, 100) g;
 SELECT ok, chunks FROM test_chunk_check('cl', 'ci');
 
 DROP TABLE cl, ci;
-DROP FUNCTION h(bytea), blob(text);
+
+-- chunks of a little over half a segment, a log of them written in one go:
+-- on across the segments' pages (the region going on into each claim, not
+-- let go of at each segment's end with its rest dead): 12 segments, as the
+-- bytes need, not 20 (a chunk a segment, nearly half of each dead the
+-- moment it is written), and none to compact
+CREATE TABLE cl2 () USING prolly_chunks;
+CREATE TABLE ci2 () USING prolly_chunk_index;
+CREATE FUNCTION wide(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad(tag, 150000, '.'), 'UTF8')$$;
+SELECT count(*) FILTER (WHERE test_chunk_put('cl2', 'ci2', h(wide('w' || g)), wide('w' || g))) AS put
+FROM generate_series(1, 20) g;
+SELECT segments, free, compactable FROM test_chunk_log_segments('cl2', 0.3);
+DROP TABLE cl2, ci2;
+
+-- chunks longer than a segment, half of them freed: compacted (pages new
+-- for them), and the end evacuated into the segments free below, one after
+-- another for each, then cut off
+CREATE TABLE cl3 () USING prolly_chunks;
+CREATE TABLE ci3 () USING prolly_chunk_index;
+CREATE FUNCTION long(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad(tag, 300000, '.'), 'UTF8')$$;
+SELECT count(*) FILTER (WHERE test_chunk_put('cl3', 'ci3', h(long('l' || g)), long('l' || g))) AS put
+FROM generate_series(1, 16) g;
+SELECT count(*) FROM generate_series(2, 16, 2) g, LATERAL test_chunk_ref_root('ci3', h(long('l' || g)));
+SELECT sum(test_chunk_free('cl3', 'ci3', h(long('l' || g)))) AS freed FROM generate_series(1, 16, 2) g;
+SELECT test_chunk_log_let_go('cl3');
+VACUUM ci3;
+VACUUM ci3;
+SELECT pg_relation_size('cl3') AS size3_written \gset
+SELECT segments, chunks FROM test_chunk_compact('cl3', 'ci3', 0.3, false);
+SELECT test_chunk_log_let_go('cl3');
+VACUUM ci3;
+VACUUM ci3;
+SELECT segments > 0 AS some, chunks FROM test_chunk_compact('cl3', 'ci3', 0.3, true);
+VACUUM ci3;
+VACUUM ci3;
+SELECT pg_relation_size('cl3') < :size3_written * 0.7 AS long_ones_cut;
+SELECT count(*) FILTER (WHERE test_chunk_get('cl3', 'ci3', h(long('l' || g))) = long('l' || g)) AS read_back
+FROM generate_series(2, 16, 2) g;
+SELECT ok, chunks FROM test_chunk_check('cl3', 'ci3');
+DROP TABLE cl3, ci3;
+DROP FUNCTION h(bytea), blob(text), wide(text), long(text);

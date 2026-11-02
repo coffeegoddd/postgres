@@ -393,6 +393,23 @@ CREATE FUNCTION test_chunk_log_segments(rel regclass, fraction float8,
 	OUT evacuable int8, OUT grow int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- This backend's region in the log let go of, for VACUUM.
+CREATE FUNCTION test_chunk_log_let_go(rel regclass) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Waits (up to a minute) for the backend pid to be gone: a session that
+-- reconnects (psql's \\c) closes the old connection only after the new.
+CREATE FUNCTION test_wait_backend_gone(pid int) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. 6000 LOOP
+		IF NOT EXISTS (SELECT FROM pg_stat_activity a WHERE a.pid = test_wait_backend_gone.pid) THEN
+			RETURN true;
+		END IF;
+		PERFORM pg_sleep(0.01);
+	END LOOP;
+	RETURN false;
+END $$;
+
 -- The regions of the log that live backends hold.
 CREATE FUNCTION test_chunk_log_regions(rel regclass)
 RETURNS int4

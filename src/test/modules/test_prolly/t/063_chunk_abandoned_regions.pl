@@ -251,6 +251,9 @@ $a->query_safe('COMMIT');
 # (and so after a put that failed in a subtransaction, rolled back to)
 $a->query_safe(q{BEGIN});
 $a->query_safe(q{SELECT test_chunk_put('gl', 'gi', h(blob(421)), blob(421))});
+# (another's region after it: the region not at the log's end, which would
+# go on into pages new, but let go of for the next)
+$primary->safe_psql('postgres', q{SELECT test_chunk_put('gl', 'gi', h(blob(422)), blob(422))});
 $a->query_safe(q{SAVEPOINT s});
 $a->query_safe(q{SELECT injection_points_set_local()});
 $a->query_safe(q{SELECT injection_points_attach('chunk-log-region-sealed', 'error')});

@@ -52,8 +52,8 @@ cmp_ok($node->safe_psql('postgres',
 	'>', 10, 'nearly every segment to compact');
 
 # a snapshot held as a freer moves chunks: VACUUM keeps the entries moved
-# for it, and starts no freer while it does (one would find the chunks of
-# the segments to compact moved already, and move nothing)
+# for it, and passes by the segments they are on (a freer would find their
+# chunks moved already), but compacts the rest, frees kept or not
 my $snap = $node->background_psql('postgres');
 $snap->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $snap->query_safe('SELECT 1');
@@ -62,9 +62,10 @@ $node->safe_psql('postgres', 'VACUUM ci');
 $node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, and moved [1-9]/, $offset);
 $offset = -s $node->logfile;
 $node->safe_psql('postgres', 'VACUUM ci');
-sleep(1);
-unlike(slurp_file($node->logfile, $offset), qr/chunk freer freed/,
-	'no freer while a snapshot holds the entries moved');
+like(slurp_file($node->logfile, $offset),
+	qr/a freer to start: \d+ chunks unheld, [1-9]\d* segments to compact, \d+ to evacuate, [1-9]\d* passed by for snapshots/,
+	'a snapshot holding entries moved: their segments passed by, the rest compacted');
+$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, and moved/, $offset);
 $snap->query_safe('COMMIT');
 $snap->quit;
 

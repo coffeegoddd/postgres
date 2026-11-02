@@ -46,14 +46,17 @@
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/rel.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
 bool		chunk_free_in_background = true;
 double		chunk_compact_dead_fraction = 0.5;
 
-/* the segments a freer compacts (or evacuates) at most, and the chunks it
- * moves to a transaction */
+/*
+ * the segments a freer compacts (or evacuates) at most, and the chunks it
+ * moves to a transaction
+ */
 #define COMPACT_SEGMENTS	4096
 #define COMPACT_BATCH		256
 
@@ -140,6 +143,8 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 	Relation	idx;
 	bool		done = false;
 
+	if (op == FREER_STEP)
+		INJECTION_POINT("chunk-freer-step", NULL);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (ConditionalLockDatabaseObject(RelationRelationId, args->idx, 0,
@@ -178,8 +183,7 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 					break;
 				case FREER_STEP:
 					fs->looked = ChunkStoreCompactStep(log, idx, fs->c, COMPACT_BATCH,
-													   fs->below,
-													   fs->below == 0 && nblocks < fs->limit,
+													   fs->below, fs->limit,
 													   &fs->chunks, &fs->bytes);
 					break;
 			}

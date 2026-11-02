@@ -34,7 +34,14 @@ SELECT pages, full_pages, dead FROM test_chunk_log_space('al');
 (1 row)
 
 -- a backend gone: its region's last page full, its rest dead
+SELECT pg_backend_pid() AS old_pid \gset
 \c
+SELECT test_wait_backend_gone(:old_pid) AS old_gone;
+ old_gone 
+----------
+ t
+(1 row)
+
 SET chunk_free_in_background = off;
 VACUUM ai;
 SELECT pages, full_pages, dead > 0 AS rest_dead FROM test_chunk_log_space('al');
@@ -70,7 +77,14 @@ SELECT test_chunk_put('al2', 'ai2', ah(repeat('y', 40 * 8192)::bytea), repeat('y
  t
 (1 row)
 
+SELECT pg_backend_pid() AS old_pid \gset
 \c
+SELECT test_wait_backend_gone(:old_pid) AS old_gone;
+ old_gone 
+----------
+ t
+(1 row)
+
 SET chunk_free_in_background = off;
 SELECT pages, free_pages FROM test_chunk_log_space('al2');
  pages | free_pages 

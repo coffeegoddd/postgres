@@ -493,7 +493,8 @@ test_chunk_compact(PG_FUNCTION_ARGS)
 					bytes;
 		int			looked = ChunkStoreCompactStep(log, idx, c, 256,
 												   evacuate && n > 0 ? starts[0] : 0,
-												   !evacuate, &chunks, &bytes);
+												   evacuate ? 0 : MaxBlockNumber,
+												   &chunks, &bytes);
 
 		moved += chunks;
 		moved_bytes += bytes;

@@ -56,7 +56,7 @@
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	6
+#define CHUNK_LOG_VERSION	7
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
@@ -75,7 +75,6 @@
  * segments.
  */
 #define SEGMENT_PAGES		32
-#define REGION_PAGES		SEGMENT_PAGES
 #define SEGMENT_BYTES		((uint64) SEGMENT_PAGES * AREA)
 
 /* The special space of each of the log's pages. */
@@ -491,15 +490,19 @@ map_mark(Relation rel, uint64 first, uint64 n, bool set)
 	}
 }
 
+static BlockNumber region_from(const ChunkLogRegion *region);
+
 /*
  * Claims npages new data pages for this backend's appends, from the meta
  * page: the one place appends meet, for one short record per claim.  The
  * pages are this backend's region's (published) and marked open before
  * they are the log's: VACUUM finds none of them unheld and not open.
- * Answers the first.
+ * Answers the first.  With after, the region they are to go on from: only
+ * if it ends where the claim begins (published from region_from on), and
+ * -1, nothing claimed, if it does not.
  */
-static uint64
-claim_pages(Relation rel, uint64 npages)
+static int64
+claim_pages(Relation rel, uint64 npages, const ChunkLogRegion *after)
 {
 	Buffer		mbuf;
 	ChunkLogMetaData *meta;
@@ -531,12 +534,102 @@ claim_pages(Relation rel, uint64 npages)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_REL(rel), MAIN_FORKNUM, NULL, 0,
 										  map_end, RBM_NORMAL));
 	}
-	ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), meta->generation,
-					   DATA_BLOCK(first), DATA_BLOCK(first + npages - 1) + 1);
+	if (after != NULL)
+	{
+		BlockNumber from = region_from(after);
+
+		if (after->limit != first * AREA || after->generation != meta->generation)
+		{
+			UnlockReleaseBuffer(mbuf);
+			return -1;
+		}
+		ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), meta->generation,
+						   from, DATA_BLOCK(first + npages - 1) + 1);
+	}
+	else
+		ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), meta->generation,
+						   DATA_BLOCK(first), DATA_BLOCK(first + npages - 1) + 1);
 	map_mark(rel, first, npages, true);
 	set_next_block(rel, mbuf, DATA_BLOCK(first + npages - 1) + 1, false);
 	UnlockReleaseBuffer(mbuf);
-	return first;
+	return (int64) first;
+}
+
+/* the data pages the log's claims have reached (its meta page's next one) */
+static uint64
+claimed_pages(Relation rel)
+{
+	Buffer		buf = ReadBuffer(rel, META_BLOCK);
+	uint64		d;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	d = pages_below(page_meta(rel, BufferGetPage(buf))->next_block);
+	UnlockReleaseBuffer(buf);
+	return d;
+}
+
+/* whether data page d's bit in the open-page map is set */
+static bool
+map_bit(Relation rel, uint64 d)
+{
+	BlockNumber blk = MAP_BLOCK(d);
+	Buffer		buf;
+	bool		set = false;
+
+	if (blk >= RelationGetNumberOfBlocks(rel))
+		return false;
+	buf = ReadBuffer(rel, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!PageIsNew(BufferGetPage(buf)))
+		set = (((uint8 *) PageGetContents(BufferGetPage(buf)))[MAP_BIT(d) / 8] &
+			   (1 << (MAP_BIT(d) % 8))) != 0;
+	UnlockReleaseBuffer(buf);
+	return set;
+}
+
+/*
+ * Whether data page d, its page given (locked), is unused: free (every
+ * byte written and dead), or never written though below where the log's
+ * claims have reached (claimed) and in no region, its open-page bit clear
+ * (a page a crash left between a tail cut and the meta page's next one
+ * set after it, never to be claimed again).
+ */
+static bool
+page_unused(Relation rel, Page page, uint64 d, uint64 claimed)
+{
+	if (!PageIsNew(page))
+		return page_free(page);
+	return d < claimed && !map_bit(rel, d);
+}
+
+/*
+ * A segment the free space map has, wholly before data page below if that
+ * is not 0, for prepare to take: its first data page, or -1 if none is
+ * found in a few tries.  (A hint: take_free_segment checks it.)
+ */
+static int64
+free_segment_hint(Relation rel, uint64 below)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+
+	for (int tries = 0; tries < 8; tries++)
+	{
+		BlockNumber blk = GetPageWithFreeSpace(rel, AREA / 2);
+		uint64		first;
+
+		if (!BlockNumberIsValid(blk) || blk == META_BLOCK || blk >= nblocks)
+			return -1;
+		if (IS_MAP_BLOCK(blk))
+		{
+			RecordPageWithFreeSpace(rel, blk, 0);
+			continue;
+		}
+		first = pages_below(blk) / SEGMENT_PAGES * SEGMENT_PAGES;
+		if (below > 0 && first + SEGMENT_PAGES > below)
+			continue;
+		return (int64) first;
+	}
+	return -1;
 }
 
 /*
@@ -549,36 +642,47 @@ claim_pages(Relation rel, uint64 npages)
  * made afresh.
  */
 static int64
-take_free_segment(Relation rel, uint32 generation, uint64 below)
+take_free_segment(Relation rel, uint32 generation, uint64 below, int64 hint)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	uint64		claimed = claimed_pages(rel);
 
 	for (int tries = 0; tries < 8; tries++)
 	{
-		/*
-		 * (the map keeps space in steps, a whole page rounding past what a
-		 * page can have: half of one finds the segments recorded free)
-		 */
-		BlockNumber blk = GetPageWithFreeSpace(rel, AREA / 2);
 		Buffer		bufs[SEGMENT_PAGES];
 		uint64		first;
+		BlockNumber blk;
 		int			locked = 0;
 		bool		all_free = true;
 
-		if (!BlockNumberIsValid(blk) || blk == META_BLOCK || blk >= nblocks)
-			return -1;
-		if (IS_MAP_BLOCK(blk))
+		/* (the hint first, then what the map finds) */
+		if (tries == 0 && hint >= 0)
 		{
-			RecordPageWithFreeSpace(rel, blk, 0);
-			continue;
+			first = (uint64) hint;
+			blk = DATA_BLOCK(first);
 		}
-		first = pages_below(blk) / SEGMENT_PAGES * SEGMENT_PAGES;
+		else
+		{
+			/*
+			 * (the map keeps space in steps, a whole page rounding past what
+			 * a page can have: half of one finds the segments recorded free)
+			 */
+			blk = GetPageWithFreeSpace(rel, AREA / 2);
+			if (!BlockNumberIsValid(blk) || blk == META_BLOCK || blk >= nblocks)
+				return -1;
+			if (IS_MAP_BLOCK(blk))
+			{
+				RecordPageWithFreeSpace(rel, blk, 0);
+				continue;
+			}
+			first = pages_below(blk) / SEGMENT_PAGES * SEGMENT_PAGES;
+		}
+		/* (one past where room may be: others may be under it) */
 		if (below > 0 && first + SEGMENT_PAGES > below)
-			return -1;
+			continue;
 		for (int j = 0; j < SEGMENT_PAGES; j++)
 		{
 			BlockNumber b = DATA_BLOCK(first + j);
-			Page		page;
 
 			if (b >= nblocks)
 			{
@@ -588,8 +692,7 @@ take_free_segment(Relation rel, uint32 generation, uint64 below)
 			bufs[j] = ReadBuffer(rel, b);
 			LockBuffer(bufs[j], BUFFER_LOCK_EXCLUSIVE);
 			locked++;
-			page = BufferGetPage(bufs[j]);
-			if (PageIsNew(page) || !page_free(page))
+			if (!page_unused(rel, BufferGetPage(bufs[j]), first + j, claimed))
 			{
 				all_free = false;
 				break;
@@ -621,56 +724,64 @@ take_free_segment(Relation rel, uint32 generation, uint64 below)
 	return -1;
 }
 
-static void page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation);
+/*
+ * Where a region grown is published from: the segment its next append goes
+ * in (every byte before it written: those segments VACUUM may take for
+ * done with), or, for a pack's whose bytes reserved before may not be
+ * written yet, which VACUUM must not take for a region let go of, the
+ * region's first page still (ChunkRegionMineFirst).
+ */
+static BlockNumber
+region_from(const ChunkLogRegion *region)
+{
+	uint64		d = (region->next < region->limit ? region->next : region->limit - 1) / AREA;
+
+	return DATA_BLOCK(d / SEGMENT_PAGES * SEGMENT_PAGES);
+}
 
 /*
  * The region grown over the segment just after it, if every page of it is
- * free (every byte dead) and len bytes need no more past the region's end:
- * its pages locked in order, each checked free, published as this
- * backend's region's (from the region's first page still) and marked
- * open, then made afresh.  False, nothing done, if not, or if the region
- * would reach below (a data page, if not 0).
+ * unused (free, or a crash's hole): its pages locked in order, each
+ * checked, published as this backend's region's (from the block from on:
+ * see region_from) and marked open, then made afresh.  False, nothing
+ * done, if not, or if the region would reach below (a data page, if not
+ * 0).  (Called again as long as the bytes need, for a chunk longer than a
+ * segment.)
  */
 static bool
-extend_region(Relation rel, ChunkLogRegion *region, size_t len, uint64 below)
+extend_region(Relation rel, ChunkLogRegion *region, uint64 below,
+			  BlockNumber from)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
-	uint64		room = region->limit - region->next;
 	uint64		first = region->limit / AREA;
+	uint64		claimed = claimed_pages(rel);
 	Buffer		bufs[SEGMENT_PAGES];
 	int			locked = 0;
-	BlockNumber from = ChunkRegionMineFirst(rel->rd_locator);
 
-	if (len - room > SEGMENT_BYTES || region->limit % SEGMENT_BYTES != 0 ||
-		!BlockNumberIsValid(from) || (below > 0 && first + SEGMENT_PAGES > below))
+	if (region->limit % SEGMENT_BYTES != 0 || !BlockNumberIsValid(from) ||
+		(below > 0 && first + SEGMENT_PAGES > below))
 		return false;
 	for (int j = 0; j < SEGMENT_PAGES; j++)
 	{
 		BlockNumber b = DATA_BLOCK(first + j);
-		Page		page;
 
 		if (b >= nblocks)
 			break;
 		bufs[j] = ReadBuffer(rel, b);
 		LockBuffer(bufs[j], BUFFER_LOCK_EXCLUSIVE);
 		locked++;
-		page = BufferGetPage(bufs[j]);
-		if (PageIsNew(page) || !page_free(page))
+		if (!page_unused(rel, BufferGetPage(bufs[j]), first + j, claimed))
+		{
+			locked = -locked;
 			break;
+		}
 	}
-	if (locked < SEGMENT_PAGES ||
-		PageIsNew(BufferGetPage(bufs[SEGMENT_PAGES - 1])) ||
-		!page_free(BufferGetPage(bufs[SEGMENT_PAGES - 1])))
+	if (locked != SEGMENT_PAGES)
 	{
-		for (int j = 0; j < locked; j++)
+		for (int j = 0; j < (locked < 0 ? -locked : locked); j++)
 			UnlockReleaseBuffer(bufs[j]);
 		return false;
 	}
-	/*
-	 * (published from the region's first page still: a pack's bytes reserved
-	 * on its pages before may not be written yet, which VACUUM must not take
-	 * for a region let go of)
-	 */
 	ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), region->generation,
 					   from, DATA_BLOCK(first + SEGMENT_PAGES - 1) + 1);
 	map_mark(rel, first, SEGMENT_PAGES, true);
@@ -758,7 +869,7 @@ claim_run(Relation rel, uint64 len, uint64 npages, ChunkLogRegion *run)
 
 	npages = Max(npages, (len + AREA - 1) / AREA);
 	npages = (npages + SEGMENT_PAGES - 1) / SEGMENT_PAGES * SEGMENT_PAGES;
-	first = claim_pages(rel, npages);
+	first = (uint64) claim_pages(rel, npages, NULL);
 	run->relnumber = rel->rd_locator.relNumber;
 	run->next = first * AREA;
 	run->limit = run->next + (uint64) npages * AREA;
@@ -857,11 +968,14 @@ check_writer(Relation rel)
 }
 
 /*
- * Room for len bytes in this backend's region: what is left of it, or
- * else a new one (a run of pages freed, if the bytes fit no more than a
- * region's pages, or new pages, more if the bytes are longer than a
- * region), what was left of the old one
- * let go of.  The region, kept in the relation's rd_amcache too, in *run.
+ * Room for len bytes in this backend's region: what is left of it, grown
+ * over the segments just after it if they are unused, or else a new one:
+ * a segment free (and as many unused after it as the bytes need), or new
+ * pages, whole segments (the region going on into them if it ends where
+ * they begin, else what was left of it let go of).  Unless may_grow, no new
+ * pages; with below (a data page, not 0), room wholly before it alone.
+ * False, the region as it is in *run (for release), if there is no room
+ * so.  The region, kept in the relation's rd_amcache too, in *run.
  */
 static bool
 prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow,
@@ -897,16 +1011,17 @@ prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow,
 		if (cached != NULL && cached->relnumber == region.relnumber)
 			cached->next = cached->limit = 0;
 	}
+
 	/*
-	 * (a region grown over the free pages just after it, if they are free,
-	 * as far as the bytes need: chunks go on across them as across pages
-	 * new, where a region of a page alone would leave each page's rest the
-	 * next chunk does not fit dead, and a region of many taken at once
-	 * would keep from others pages its backend may never use)
+	 * (a region grown over the unused segments just after it, as far as the
+	 * bytes need: chunks go on across them as across pages new, where a
+	 * new region would leave what was left of this one dead)
 	 */
-	if (region.limit > 0 && region.limit - region.next < len &&
-		extend_region(rel, &region, len, below))
+	while (region.limit > 0 && region.limit - region.next < len &&
+		   (below == 0 || region.limit <= below * AREA) &&
+		   extend_region(rel, &region, below, region_from(&region)))
 		keep_region(rel, &region);
+
 	/*
 	 * (a region reaching below is let go of, for one under it: what is
 	 * moved there is to leave what is above)
@@ -914,27 +1029,45 @@ prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow,
 	if (region.limit - region.next < len ||
 		(below > 0 && region.limit > below * AREA))
 	{
-		uint64		npages;
+		uint64		npages = Max((len + AREA - 1) / AREA, 1);
+		int64		hint = -1;
 		int64		first;
 		uint32		generation;
 
 		/*
-		 * (not to grow the log, and the free space map with no segment
-		 * free for it: no room, the region kept as it is, for release)
+		 * (a segment free looked for first; for a chunk longer than a
+		 * segment, only if the log is not to grow: one longer goes on pages
+		 * new alone, unless segments free lie one after another for it)
 		 */
-		if (!may_grow || below > 0)
+		if (npages <= SEGMENT_PAGES || !may_grow || below > 0)
+			hint = free_segment_hint(rel, below);
+		if (hint < 0)
 		{
-			BlockNumber blk = GetPageWithFreeSpace(rel, AREA / 2);
-
-			if (!BlockNumberIsValid(blk) ||
-				(below > 0 &&
-				 pages_below(blk) / SEGMENT_PAGES * SEGMENT_PAGES + SEGMENT_PAGES > below))
+			/* (no segment free and the log not to grow: no room) */
+			if (!may_grow || below > 0)
 			{
 				run->relnumber = region.relnumber;
 				run->next = region.next;
 				run->limit = region.limit;
 				run->generation = region.generation;
 				return false;
+			}
+
+			/*
+			 * (pages new: the region going on into them if it ends where
+			 * they begin, nothing of it left dead)
+			 */
+			if (region.limit > 0 && region.limit - region.next < len)
+			{
+				uint64		more = ((len - (region.limit - region.next) + AREA - 1) / AREA +
+									SEGMENT_PAGES - 1) / SEGMENT_PAGES * SEGMENT_PAGES;
+
+				if (claim_pages(rel, more, &region) >= 0)
+				{
+					region.limit += more * AREA;
+					keep_region(rel, &region);
+					goto done;
+				}
 			}
 		}
 
@@ -946,6 +1079,7 @@ prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow,
 			cached->next = cached->limit = 0;
 		if (region.limit > 0)
 			seal_region(rel, region.next, region.limit);
+		region.next = region.limit = 0;
 		INJECTION_POINT("chunk-log-region-sealed", NULL);
 
 		/*
@@ -954,35 +1088,43 @@ prepare_run(Relation rel, size_t len, ChunkLogRun *run, bool may_grow,
 		 * invalidation has every backend forget its region)
 		 */
 		generation = log_generation(rel, NULL);
-		/*
-		 * (pages freed first, as many as the bytes need, if no more than a
-		 * region's: a run of them found where the map has one free; the
-		 * region then grows over free pages after it as appends reach them)
-		 */
-		npages = (len + AREA - 1) / AREA;
-		first = npages <= SEGMENT_PAGES ?
-			take_free_segment(rel, generation, below) : -1;
+		first = hint >= 0 ? take_free_segment(rel, generation, below, hint) : -1;
 		if (first >= 0)
 		{
 			region.relnumber = rel->rd_locator.relNumber;
 			region.next = (uint64) first * AREA;
 			region.limit = region.next + SEGMENT_BYTES;
+			region.generation = generation;
+			keep_region(rel, &region);
+			while (region.limit - region.next < len &&
+				   extend_region(rel, &region, below, region_from(&region)))
+				keep_region(rel, &region);
+			/* (not room enough: the segments taken kept, for the next) */
+			if (region.limit - region.next < len)
+			{
+				run->relnumber = region.relnumber;
+				run->next = region.next;
+				run->limit = region.limit;
+				run->generation = region.generation;
+				return false;
+			}
 		}
 		else if (may_grow && below == 0)
+		{
 			claim_run(rel, len, SEGMENT_PAGES, &region);
+			region.generation = generation;
+			keep_region(rel, &region);
+		}
 		else
 		{
-			/* (none free, and the log not to grow: no room, no region) */
-			region.next = region.limit = 0;
+			/* (none free after all, and the log not to grow: no room) */
 			run->relnumber = region.relnumber;
 			run->next = run->limit = 0;
 			run->generation = generation;
 			return false;
 		}
-
-		region.generation = generation;
-		keep_region(rel, &region);
 	}
+done:
 	run->relnumber = region.relnumber;
 	run->next = region.next;
 	run->limit = region.limit;
@@ -1094,14 +1236,17 @@ page_extend(Relation rel, ChunkLogRun *run, size_t len)
 	};
 
 	check_writer(rel);
-	if (run->relnumber != rel->rd_locator.relNumber ||
-		run->limit - run->next >= len ||
-		!extend_region(rel, &region, len, 0))
+	if (run->relnumber != rel->rd_locator.relNumber)
 		return run->limit - run->next >= len;
-	keep_region(rel, &region);
-	run->limit = region.limit;
-	INJECTION_POINT("chunk-log-extended", NULL);
-	return true;
+	while (region.limit - region.next < len &&
+		   BlockNumberIsValid(ChunkRegionMineFirst(rel->rd_locator)) &&
+		   extend_region(rel, &region, 0, ChunkRegionMineFirst(rel->rd_locator)))
+	{
+		keep_region(rel, &region);
+		run->limit = region.limit;
+		INJECTION_POINT("chunk-log-extended", NULL);
+	}
+	return run->limit - run->next >= len;
 }
 
 /* The region kept once more, should an invalidation have forgotten it. */
@@ -1201,8 +1346,9 @@ page_read(Relation rel, uint64 loc, void *dst, size_t len)
 }
 
 /*
- * Counts len bytes from loc dead, a page at a time; a page all of whose
- * bytes are dead then goes in the free space map, to be used again.
+ * Counts len bytes from loc dead, a page at a time; a segment all of whose
+ * pages' bytes are dead then goes in the free space map, as VACUUM ends
+ * (ChunkLogRecordFree), to be used again.
  */
 static void
 page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation)
@@ -1663,7 +1809,8 @@ page_stamp(Relation rel)
 /*
  * What a segment of the log is: its pages' dead bytes; whether it is done
  * with, every page it has written full and none in a live backend's region
- * (the end of the last may be past the file's, never written); free.
+ * (the end of the last may be past the file's, never written); free; and
+ * whether chunks freed with bytes on it are kept for snapshots still.
  */
 typedef struct SegmentState
 {
@@ -1671,23 +1818,32 @@ typedef struct SegmentState
 	uint32		pages;			/* the file has */
 	bool		written;
 	bool		free;			/* every byte of every page dead */
+	bool		pending;		/* bytes of chunks freed, dead only later */
 } SegmentState;
 
-/* each segment's state, read a page at a time (O(log)); how many */
+/*
+ * each segment's state, read a page at a time (O(log), through a ring of
+ * buffers of its own), the chunks freed and kept (npending, at plocs,
+ * plens long) marking theirs; how many
+ */
 static uint32
-scan_segments(Relation rel, SegmentState **out)
+scan_segments(Relation rel, int npending, const uint64 *plocs,
+			  const uint32 *plens, SegmentState **out)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 	uint64		npages = pages_below(nblocks);
+	uint64		claimed = claimed_pages(rel);
 	uint32		nseg = (uint32) ((npages + SEGMENT_PAGES - 1) / SEGMENT_PAGES);
-	SegmentState *st = palloc_array(SegmentState, Max(nseg, 1));
+	SegmentState *st = palloc0_array(SegmentState, Max(nseg, 1));
 	ChunkRegionSet *live = ChunkRegionLive(rel->rd_locator, ChunkLogGeneration(rel));
+	BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
 
 	for (uint32 g = 0; g < nseg; g++)
 	{
-		st[g].dead = 0;
-		st[g].pages = 0;
 		st[g].written = st[g].free = true;
+		/* (a region is whole segments: its first page tells) */
+		if (ChunkRegionSetHas(live, DATA_BLOCK((uint64) g * SEGMENT_PAGES)))
+			st[g].written = false;
 		for (int j = 0; j < SEGMENT_PAGES; j++)
 		{
 			uint64		d = (uint64) g * SEGMENT_PAGES + j;
@@ -1700,14 +1856,19 @@ scan_segments(Relation rel, SegmentState **out)
 				st[g].free = false;
 				break;
 			}
-			if (ChunkRegionSetHas(live, DATA_BLOCK(d)))
-				st[g].written = false;
 			st[g].pages++;
-			buf = ReadBuffer(rel, DATA_BLOCK(d));
+			buf = ReadBufferExtended(rel, MAIN_FORKNUM, DATA_BLOCK(d), RBM_NORMAL,
+									 strategy);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			if (PageIsNew(page))
-				st[g].written = st[g].free = false;
+			{
+				/* (a crash's hole: no region's, never to be: all dead) */
+				if (st[g].written && page_unused(rel, page, d, claimed))
+					st[g].dead += AREA;
+				else
+					st[g].written = st[g].free = false;
+			}
 			else
 			{
 				if (((PageHeader) page)->pd_lower != AREA_START + AREA)
@@ -1720,18 +1881,25 @@ scan_segments(Relation rel, SegmentState **out)
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
+	for (int k = 0; k < npending; k++)
+		for (uint64 g = plocs[k] / SEGMENT_BYTES;
+			 g < nseg && g <= (plocs[k] + Max(plens[k], 1) - 1) / SEGMENT_BYTES; g++)
+			st[g].pending = true;
+	FreeAccessStrategy(strategy);
 	*out = st;
 	return nseg;
 }
 
 /*
  * a segment to compact: done with, fraction of the bytes of the pages it
- * has dead, not all
+ * has dead, not all, and none of its chunks freed kept for snapshots still
+ * (their bytes dead later; its chunks moved already, maybe, the entries
+ * left for those snapshots)
  */
 static inline bool
 segment_compactable(const SegmentState *st, double fraction)
 {
-	return st->written && !st->free && st->dead > 0 &&
+	return st->written && !st->free && !st->pending && st->dead > 0 &&
 		st->dead >= fraction * st->pages * AREA;
 }
 
@@ -1741,8 +1909,10 @@ segment_compactable(const SegmentState *st, double fraction)
  * moved, the tail is free and cut off): from the last segment written down
  * (the free tail passed by), as long as their live bytes fit in nine
  * tenths of the free segments below the lowest (each one's end part
- * unused); the lowest, or nseg if none.  Stops at a segment not written
- * full (a region a backend appends to).
+ * unused); the lowest, or nseg if none.  Stops at a segment not done with
+ * (a region a backend appends to, an idle one's too, until it exits or
+ * forgets it), or with chunks freed kept for snapshots: no end beyond it is
+ * cut until they are gone.
  */
 static uint32
 evacuable_from(const SegmentState *st, uint32 nseg)
@@ -1761,7 +1931,7 @@ evacuable_from(const SegmentState *st, uint32 nseg)
 	{
 		if (st[g].free)
 			continue;
-		if (!st[g].written)
+		if (!st[g].written || st[g].pending)
 			break;
 		live += (uint64) st[g].pages * AREA - st[g].dead;
 		if (live > (uint64) free_below[g] * SEGMENT_BYTES / 10 * 9)
@@ -1772,11 +1942,13 @@ evacuable_from(const SegmentState *st, uint32 nseg)
 	return from;
 }
 
-void
-ChunkLogRecordFree(Relation rel, double fraction, ChunkLogSegments *out)
+/* what is found of the segments, the free ones put in the map if record */
+static void
+find_segments(Relation rel, double fraction, int npending, const uint64 *plocs,
+			  const uint32 *plens, bool record, ChunkLogSegments *out)
 {
 	SegmentState *st;
-	uint32		nseg = scan_segments(rel, &st);
+	uint32		nseg = scan_segments(rel, npending, plocs, plens, &st);
 	uint32		from = evacuable_from(st, nseg);
 
 	memset(out, 0, sizeof(*out));
@@ -1787,8 +1959,11 @@ ChunkLogRecordFree(Relation rel, double fraction, ChunkLogSegments *out)
 		{
 			/* (a segment free: its first page alone in the map, for whole) */
 			out->free++;
-			RecordPageWithFreeSpace(rel, DATA_BLOCK((uint64) g * SEGMENT_PAGES), AREA);
+			if (record)
+				RecordPageWithFreeSpace(rel, DATA_BLOCK((uint64) g * SEGMENT_PAGES), AREA);
 		}
+		if (st[g].pending && st[g].written && !st[g].free)
+			out->pending++;
 		if (segment_compactable(&st[g], fraction))
 		{
 			out->compactable++;
@@ -1797,7 +1972,8 @@ ChunkLogRecordFree(Relation rel, double fraction, ChunkLogSegments *out)
 		if (g >= from && !st[g].free)
 			out->evacuable++;
 	}
-	FreeSpaceMapVacuum(rel);
+	if (record)
+		FreeSpaceMapVacuum(rel);
 
 	/*
 	 * (to compact only if the dead bytes come to a segment's: fewer gain
@@ -1809,12 +1985,25 @@ ChunkLogRecordFree(Relation rel, double fraction, ChunkLogSegments *out)
 	pfree(st);
 }
 
+void
+ChunkLogRecordFree(Relation rel, double fraction, int npending,
+				   const uint64 *plocs, const uint32 *plens, ChunkLogSegments *out)
+{
+	find_segments(rel, fraction, npending, plocs, plens, true, out);
+}
+
+void
+ChunkLogFindSegments(Relation rel, double fraction, ChunkLogSegments *out)
+{
+	find_segments(rel, fraction, 0, NULL, NULL, false, out);
+}
+
 static int
 page_compactable_segments(Relation rel, double fraction, int max,
 						  uint64 *starts, uint64 *ends)
 {
 	SegmentState *st;
-	uint32		nseg = scan_segments(rel, &st);
+	uint32		nseg = scan_segments(rel, 0, NULL, NULL, &st);
 	int			n = 0;
 
 	for (uint32 g = 0; g < nseg && n < max; g++)
@@ -1828,21 +2017,35 @@ page_compactable_segments(Relation rel, double fraction, int max,
 	return n;
 }
 
+/*
+ * (the highest up to max, from the end down, given ascending: the end
+ * evacuated first, which is what lets the log be cut)
+ */
 static int
 page_evacuable_segments(Relation rel, int max, uint64 *starts, uint64 *ends)
 {
 	SegmentState *st;
-	uint32		nseg = scan_segments(rel, &st);
+	uint32		nseg = scan_segments(rel, 0, NULL, NULL, &st);
 	uint32		from = evacuable_from(st, nseg);
 	int			n = 0;
 
-	for (uint32 g = from; g < nseg && n < max; g++)
+	for (int64 g = (int64) nseg - 1; g >= (int64) from && n < max; g--)
 		if (!st[g].free)
 		{
 			starts[n] = (uint64) g * SEGMENT_BYTES;
 			ends[n] = starts[n] + SEGMENT_BYTES;
 			n++;
 		}
+	for (int k = 0; k < n / 2; k++)
+	{
+		uint64		t = starts[k];
+
+		starts[k] = starts[n - 1 - k];
+		starts[n - 1 - k] = t;
+		t = ends[k];
+		ends[k] = ends[n - 1 - k];
+		ends[n - 1 - k] = t;
+	}
 	pfree(st);
 	return n;
 }
