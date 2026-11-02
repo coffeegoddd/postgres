@@ -37,9 +37,11 @@ $node->safe_psql('postgres', q{
 	CREATE FUNCTION commit_to(branch text, a int, b int, c int) RETURNS void LANGUAGE plpgsql AS $$
 	BEGIN
 		PERFORM test_chunk_format_refs(true);
-		PERFORM test_cs_put('pages', leaf(a));
-		PERFORM test_cs_put('pages', leaf(b));
-		PERFORM test_cs_put('pages', leaf(c));
+		-- (the leaves in their names' order, as a pack puts them: two
+		-- commits putting two leaves new to the store each in the other's
+		-- order would wait for each other's, as inserts into a unique index)
+		PERFORM test_cs_put('pages', d)
+			FROM (SELECT leaf(x) AS d FROM unnest(ARRAY[a, b, c]) x) l ORDER BY h(d);
 		PERFORM test_cs_put('pages', node(leaf(a), leaf(b), leaf(c)));
 		UPDATE pg_history.pointers SET hash = h(node(leaf(a), leaf(b), leaf(c))) WHERE name = branch;
 	END$$;
