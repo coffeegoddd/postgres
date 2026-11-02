@@ -58,7 +58,6 @@ double		chunk_compact_dead_fraction = 0.5;
  * moves to a transaction
  */
 #define COMPACT_SEGMENTS	4096
-#define COMPACT_BATCH		256
 
 typedef struct ChunkFreerArgs
 {
@@ -160,6 +159,8 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 			uint64		starts[COMPACT_SEGMENTS];
 			uint64		ends[COMPACT_SEGMENTS];
 			int			n;
+			int			batch;
+			uint64		batch_bytes;
 
 			done = true;
 			switch (op)
@@ -182,7 +183,8 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 					fs->below = op == FREER_BEGIN_EVACUATE && n > 0 ? starts[0] : 0;
 					break;
 				case FREER_STEP:
-					fs->looked = ChunkStoreCompactStep(log, idx, fs->c, COMPACT_BATCH,
+					ChunkLogOf(log)->compact_batch(log, &batch, &batch_bytes);
+					fs->looked = ChunkStoreCompactStep(log, idx, fs->c, batch, batch_bytes,
 													   fs->below, fs->limit,
 													   &fs->chunks, &fs->bytes);
 					break;

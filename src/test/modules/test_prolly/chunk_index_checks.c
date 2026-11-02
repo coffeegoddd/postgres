@@ -491,7 +491,12 @@ test_chunk_compact(PG_FUNCTION_ARGS)
 	{
 		uint64		chunks,
 					bytes;
-		int			looked = ChunkStoreCompactStep(log, idx, c, 256,
+		int			batch;
+		uint64		batch_bytes;
+		int			looked;
+
+		ChunkLogOf(log)->compact_batch(log, &batch, &batch_bytes);
+		looked = ChunkStoreCompactStep(log, idx, c, batch, batch_bytes,
 												   evacuate && n > 0 ? starts[0] : 0,
 												   evacuate ? 0 : MaxBlockNumber,
 												   &chunks, &bytes);

@@ -132,6 +132,14 @@ typedef struct ChunkLogRoutine
 	uint64		(*segment_bytes) (Relation rel);
 
 	/*
+	 * How much compaction moves a transaction: up to *chunks chunks, and
+	 * (*bytes not 0) up to *bytes of them; a log whose moved bytes are
+	 * written as its transactions commit (the tier's, a pack a
+	 * transaction) moves a pack's worth.
+	 */
+	void		(*compact_batch) (Relation rel, int *chunks, uint64 *bytes);
+
+	/*
 	 * What VACUUM would find of the log's segments (ChunkLogRecordFree),
 	 * none passed by, the free space map left as it is.  For tests.
 	 */
