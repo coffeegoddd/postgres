@@ -3,8 +3,11 @@
 # A crash between the records of each step the history store makes of
 # several: a chunk's bytes appended a page at a time; a put's references
 # counted one at a time; a free's chunk marked, then its references let
-# go of; a pointer moved, its new root taken, then its old let go of.
-# Each step is its transaction's: after the crash, the store is as before
+# go of; a pointer moved, its new root taken, then its old let go of; a
+# bucket split, its new pages made, published, then the entries moved out
+# of the old (the split no transaction's: after the crash the index is
+# whole, every chunk found once).  Each step but the split is its
+# transaction's: after the crash, the store is as before
 # it (the audit clean, counts and roots as they were), and so after
 # VACUUM takes out what the crash cut short.  Replay is checked page for
 # page (wal_consistency_checking).
@@ -114,6 +117,25 @@ is($q->(q{SELECT hash = h(p1()) FROM pg_history.pointers WHERE name = 'main'}), 
 is($q->(q{SELECT (SELECT roots FROM test_cs_counts('pages', h(p1()))) || ',' ||
 	(SELECT roots FROM test_cs_counts('pages', h(p2())))}), '1,0', 'pointer move: the roots as they were');
 $after->('pointer move');
+
+# 5. a split of a bucket: its new pages made, then published (the meta
+# page's masks, the directory), then the entries moved out of the old one
+$q->(q{SELECT count(*) FROM generate_series(1, 600) i, LATERAL test_cs_put('pages', leaf(1000 + i))});
+my $found = q{SELECT count(*) FILTER (WHERE test_cs_has('pages', h(leaf(1000 + i)))) FROM generate_series(1, 600) i};
+my $n = 0;
+for my $point ('chunk-index-split-copied', 'chunk-index-split-published')
+{
+	$n++;
+	$crash_at->($point, qq{SELECT count(*) FROM generate_series(1, 3000) i,
+		LATERAL test_cs_put('pages', leaf(${n}0000 + i))});
+	is($q->($found), '600', "split ($point): every chunk committed before found");
+	is($q->(qq{SELECT count(*) FILTER (WHERE test_cs_has('pages', h(leaf(${n}0000 + i))))
+		FROM generate_series(1, 3000) i}), '0', "split ($point): none of the crashed put's");
+	$after->("split ($point)");
+	is($q->(qq{SELECT count(*) FILTER (WHERE (test_cs_put('pages', leaf(${n}0000 + i))).stored)
+		FROM generate_series(1, 3000) i}), '3000', "split ($point): puts after, splits with them");
+	is($audit->(), 'true ', "split ($point): the audit clean after");
+}
 
 $node->stop;
 done_testing();
