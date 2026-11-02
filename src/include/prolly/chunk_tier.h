@@ -143,6 +143,21 @@ extern void ChunkTierCheckIndex(Relation idx, const char *what);
 extern bool ChunkTierDatabaseHasPacks(Oid dboid);
 
 /*
+ * The place the settings say the tier's objects are, a hash of the store's
+ * identity (an object of its own): 0 with none set.  pg_upgrade refuses a
+ * new cluster whose place is not the old one's.
+ */
+extern uint64 ChunkTierPlace(void);
+
+/*
+ * A tier pg_upgrade carried over (its files the old cluster's, old_sysid's)
+ * marked as this system's: with packs, their marker named by this system
+ * made and the mark set; the old system's marker removed.  Marker lock
+ * held as both are.
+ */
+extern void ChunkTierMarkUpgraded(Relation rel, uint64 old_sysid);
+
+/*
  * A bundle's manifest (prolly/chunk_push.c's, its bytes the tier's to
  * keep, not to read), in the tier: an entry of the catalog of its own kind,
  * this transaction's, its object written now under manifests/, the entry's

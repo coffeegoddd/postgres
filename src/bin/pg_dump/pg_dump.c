@@ -375,6 +375,7 @@ static void getLOs(Archive *fout);
 static void dumpLO(Archive *fout, const LoInfo *loinfo);
 static int	dumpLOs(Archive *fout, const void *arg);
 static void getHistory(Archive *fout);
+static void dumpHistoryUpgrade(Archive *fout);
 static int	dumpHistoryData(Archive *fout, const void *arg);
 static void dumpPolicy(Archive *fout, const PolicyInfo *polinfo);
 static void dumpPublication(Archive *fout, const PublicationInfo *pubinfo);
@@ -3746,6 +3747,8 @@ dumpDatabase(Archive *fout)
 		destroyPQExpBuffer(lomHorizonQry);
 		destroyPQExpBuffer(loOutQry);
 		destroyPQExpBuffer(lomOutQry);
+
+		dumpHistoryUpgrade(fout);
 	}
 
 	PQclear(res);
@@ -4154,6 +4157,79 @@ dumpLO(Archive *fout, const LoInfo *loinfo)
 	}
 
 	destroyPQExpBuffer(cquery);
+}
+
+/*
+ * dumpHistoryUpgrade:
+ *	For binary upgrade, the version-control history store's relations
+ *	(schema pg_history's tables and indexes, and their TOAST tables) come
+ *	from the old cluster intact, as pg_largeobject does: each given its
+ *	relfilenode, and each table its relfrozenxid and relminmxid.
+ */
+static void
+dumpHistoryUpgrade(Archive *fout)
+{
+	PGresult   *res;
+	PQExpBuffer q;
+
+	res = ExecuteSqlQuery(fout,
+						  "SELECT c.relname, c.relkind, c.relfilenode, c.relfrozenxid, c.relminmxid, "
+						  "  coalesce(t.relfilenode, 0) AS toast, t.relfrozenxid AS toast_frozenxid, "
+						  "  t.relminmxid AS toast_minmxid, coalesce(ti.relfilenode, 0) AS toast_index "
+						  "FROM pg_catalog.pg_class c "
+						  "  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+						  "  LEFT JOIN pg_catalog.pg_class t ON t.oid = c.reltoastrelid "
+						  "  LEFT JOIN pg_catalog.pg_index i ON i.indrelid = t.oid "
+						  "  LEFT JOIN pg_catalog.pg_class ti ON ti.oid = i.indexrelid "
+						  "WHERE n.nspname = 'pg_history' AND c.relkind IN ('r', 'i') "
+						  "ORDER BY c.relkind DESC, c.relname",
+						  PGRES_TUPLES_OK);
+	if (PQntuples(res) == 0)
+	{
+		PQclear(res);
+		return;
+	}
+	q = createPQExpBuffer();
+	appendPQExpBufferStr(q, "\n-- For binary upgrade, preserve the history store's relfilenodes, relfrozenxids and relminmxids\n");
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		const char *relname = PQgetvalue(res, i, 0);
+		bool		table = PQgetvalue(res, i, 1)[0] == 'r';
+		const char *toast = PQgetvalue(res, i, 5);
+		PQExpBuffer qualified = createPQExpBuffer();
+
+		appendPQExpBuffer(qualified, "pg_history.%s", fmtId(relname));
+		appendPQExpBuffer(q, "SELECT pg_catalog.binary_upgrade_set_history_relfilenode(");
+		appendStringLiteralAH(q, qualified->data, fout);
+		appendPQExpBuffer(q, "::pg_catalog.regclass, '%s', '%s', '%s');\n",
+						  PQgetvalue(res, i, 2), toast, PQgetvalue(res, i, 8));
+		if (table)
+		{
+			appendPQExpBuffer(q, "UPDATE pg_catalog.pg_class\n"
+							  "SET relfrozenxid = '%s', relminmxid = '%s'\n"
+							  "WHERE oid = ",
+							  PQgetvalue(res, i, 3), PQgetvalue(res, i, 4));
+			appendStringLiteralAH(q, qualified->data, fout);
+			appendPQExpBufferStr(q, "::pg_catalog.regclass;\n");
+			if (strcmp(toast, "0") != 0)
+			{
+				appendPQExpBuffer(q, "UPDATE pg_catalog.pg_class\n"
+								  "SET relfrozenxid = '%s', relminmxid = '%s'\n"
+								  "WHERE oid = (SELECT reltoastrelid FROM pg_catalog.pg_class WHERE oid = ",
+								  PQgetvalue(res, i, 6), PQgetvalue(res, i, 7));
+				appendStringLiteralAH(q, qualified->data, fout);
+				appendPQExpBufferStr(q, "::pg_catalog.regclass);\n");
+			}
+		}
+		destroyPQExpBuffer(qualified);
+	}
+	ArchiveEntry(fout, nilCatalogId, createDumpId(),
+				 ARCHIVE_OPTS(.tag = "pg_history",
+							  .description = "pg_history",
+							  .section = SECTION_PRE_DATA,
+							  .createStmt = q->data));
+	destroyPQExpBuffer(q);
+	PQclear(res);
 }
 
 /*

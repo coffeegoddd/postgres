@@ -707,6 +707,15 @@ disable_old_cluster(transferMode transfer_mode)
 		pg_log(PG_REPORT, "\n"
 			   "Because \"swap\" mode was used, the old cluster can no longer be\n"
 			   "safely started.");
+	else if (old_cluster.ntier_dbs > 0)
+		/* translator: %s/%s is the file path of the control file */
+		pg_log(PG_REPORT, "\n"
+			   "If you want to start the old cluster, you will need to remove\n"
+			   "the \".old\" suffix from \"%s/%s.old\".\n"
+			   "Because the old cluster's history stores' tiers are the new\n"
+			   "cluster's, their objects where they were, the old cluster cannot be\n"
+			   "safely started once the new cluster has been started.",
+			   old_cluster.pgdata, XLOG_CONTROL_FILE);
 	else
 		pg_fatal("unrecognized transfer mode");
 }

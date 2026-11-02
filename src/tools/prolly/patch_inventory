@@ -129,7 +129,7 @@ patch src/backend/utils/adt/ri_triggers.c  1b  a foreign key's queries resolve n
 patch src/backend/utils/adt/ruleutils.c  1b  a constraint rebuilt by DDL is looked up with a catalog snapshot
 patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per branch
 patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
-patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
+patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table; also (2) a TOAST table's new relfilenumber in binary upgrade, for the history store's
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h)
@@ -140,16 +140,18 @@ patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced inst
 patch src/bin/pg_dump/parallel.c  2  a worker locks no relation for the history store's data (HISTORY DATA)
 patch src/bin/pg_dump/pg_backup.h  2  --no-history (DumpOptions.no_history)
 patch src/bin/pg_dump/pg_backup_archiver.c  2  restores the history store's data (HISTORY DATA) as a COPY of its own, no table's triggers, owner or truncation
-patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA ... VERSIONED; turns catalog_branch_filter on, and warns of the versioned schemas a dump on no branch leaves out; writes a subscription's catalog_branch; also (2) dumps the history store (HISTORY DATA: its chunks, then its pointers), --no-history
+patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA ... VERSIONED; turns catalog_branch_filter on, and warns of the versioned schemas a dump on no branch leaves out; writes a subscription's catalog_branch; also (2) dumps the history store (HISTORY DATA: its chunks, then its pointers), --no-history; and for binary upgrade keeps its relations' relfilenodes and horizons, as pg_largeobject's
 patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch; also (2) DO_HISTORY_DATA, HistoryDataInfo
 patch src/bin/pg_dump/pg_dump_sort.c  2  DO_HISTORY_DATA's place in the data section
 patch src/bin/pg_dump/pg_dumpall.c  2  --no-history, passed to pg_dump
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
-patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) a cluster whose history store holds chunks or pointers, or whose tier has packs, is refused
+patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) notes the databases whose history store's tier has packs, and refuses a new cluster whose tiers' place is another; the history store's relations are no sign of a new cluster not empty
+patch src/bin/pg_upgrade/controldata.c  2  the old cluster disabled when its history stores' tiers are the new one's, whatever the transfer mode
 patch src/bin/pg_upgrade/dump.c  1a  dumps no sequence data when sequences' files are transferred (TRANSFER_SEQUENCES)
-patch src/bin/pg_upgrade/info.c  1a  transfers sequences' files from a cluster of version 20 or later, whose sequences may be block-mapped
-patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences' files are transferred
+patch src/bin/pg_upgrade/info.c  1a  transfers sequences' files from a cluster of version 20 or later, whose sequences may be block-mapped; also (2) transfers the history store's relations, as pg_largeobject's
+patch src/bin/pg_upgrade/pg_upgrade.c  2  the old cluster disabled when its history stores' tiers have packs; their markers the new system's after the transfer
+patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences' files are transferred; also (2) the old cluster's history stores' tiers, their place and its system identifier
 patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and each database's page store whole in every tablespace that has one, even one no relation names (kept in --swap)
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source; also (2) the history store's (chunkdesc.c)
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager; also (2) prolly/chunk_xlog.h
@@ -173,7 +175,7 @@ patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced 
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.dat  2  pg_history, the history store's schema
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
-patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler; also (2) prolly_chunk_index_tableam_handler(), prolly_tier_tableam_handler(), pg_history_pointer_changed(); also (2) pg_history_export(), pg_history_has_chunks(), pg_history_chunk_restore()
+patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler; also (2) prolly_chunk_index_tableam_handler(), prolly_tier_tableam_handler(), pg_history_pointer_changed(); also (2) pg_history_export(), pg_history_has_chunks(), pg_history_chunk_restore(); also (2) binary_upgrade_set_history_relfilenode(), binary_upgrade_history_tier_place(), binary_upgrade_history_tier_mark()
 patch src/include/catalog/pg_subscription.h  1b  pg_subscription.subcatalogbranch
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly

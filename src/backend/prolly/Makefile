@@ -30,6 +30,7 @@ OBJS = \
 	chunk_store.o \
 	chunk_tier.o \
 	chunkstore.o \
+	history_upgrade.o \
 	object_store.o \
 	registry.o
 
