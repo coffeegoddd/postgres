@@ -17753,9 +17753,11 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 		 * Conflict log tables are system-managed for logical replication and
 		 * cannot be altered directly, so skip them as well; otherwise a
 		 * single such table in the source tablespace would abort the whole
-		 * bulk move.
+		 * bulk move.  So are the version-control history store's relations
+		 * (schema pg_history's, the system's).
 		 */
 		if (IsCatalogNamespace(relForm->relnamespace) ||
+			relForm->relnamespace == PG_HISTORY_NAMESPACE ||
 			relForm->relisshared ||
 			isAnyTempNamespace(relForm->relnamespace) ||
 			IsToastNamespace(relForm->relnamespace) ||

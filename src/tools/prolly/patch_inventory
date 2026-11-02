@@ -94,7 +94,7 @@ patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old h
 patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
 patch src/backend/commands/subscriptioncmds.c  1b  the catalog_branch option: the subscriber's branch a subscription replicates into, its tables looked up there
-patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's; also (1b) refuses SET UNLOGGED in a versioned schema; also (2) a tier of the history store is not moved out of pg_history
+patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's; also (1b) refuses SET UNLOGGED in a versioned schema; also (2) a tier of the history store is not moved out of pg_history; also (2) ALTER TABLE ALL IN TABLESPACE passes the history store's relations by
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/commands/vacuum.c  1a  its own pages frozen eagerly for storage that shares pages, the freeze age the normal one (freezes_eagerly); lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
 patch src/backend/executor/execMain.c  1b  a query runs on the branch it started on (es_catalog_branch, CatalogBranchEnter())
@@ -136,6 +136,7 @@ patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, bloc
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h)
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
+patch src/bin/pg_amcheck/t/002_nonesuch.pl  2  schema exclusion patterns exclude pg_history too, for no relations to check
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_dump/parallel.c  2  a worker locks no relation for the history store's data (HISTORY DATA)
