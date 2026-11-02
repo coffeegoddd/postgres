@@ -29,6 +29,7 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/vacuum.h"
@@ -2753,7 +2754,17 @@ tier_relation_set_new_filelocator(Relation rel,
 {
 	SMgrRelation srel;
 
+	/*
+	 * (a tier is pg_history's alone: one made elsewhere would be one more
+	 * store of objects to account for)
+	 */
+	if (!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) &&
+		RelationGetNamespace(rel) != PG_HISTORY_NAMESPACE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a tier of the history store is made in pg_history alone")));
 	ChunkTierNewStorage(rel);
+	ChunkTierCheckEmpty(rel, "truncate", false);
 	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 	/* (its packs' entries name the transactions that made them) */
 	*freezeXid = RecentXmin;
@@ -2773,6 +2784,8 @@ tier_relation_vacuum(Relation rel, const VacuumParams *params,
 static void
 tier_relation_nontransactional_truncate(Relation rel)
 {
+	/* (this backend's pack being filled is let go of with it: no object) */
+	ChunkTierCheckEmpty(rel, "truncate", true);
 	RelationTruncate(rel, 0);
 	ChunkTierInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
 	ChunkTierTruncated(rel);

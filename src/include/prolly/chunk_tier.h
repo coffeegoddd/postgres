@@ -109,6 +109,15 @@ extern void ChunkTierTruncated(Relation rel);
 extern void ChunkTierNewStorage(Relation rel);
 
 /*
+ * For DROP and TRUNCATE: refused while the tier has a pack not removed (an
+ * object of it there, or that may be), which the storage going would leave
+ * in the store, named by no catalog; this backend's pack being filled, not
+ * written, aside if pending_ok.  Release its bundles and VACUUM its index,
+ * and it is empty.
+ */
+extern void ChunkTierCheckEmpty(Relation rel, const char *what, bool pending_ok);
+
+/*
  * For the access method: VACUUM of a tier log, every pack whose transaction
  * ended settled (committed, or orphaned) and its relfrozenxid advanced; no
  * object is touched (VACUUM of its index removes them).

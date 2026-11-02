@@ -70,6 +70,7 @@
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 #include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -549,6 +550,40 @@ ChunkTierReadPackTable(ObjectStore *os, const char *name,
 	*entries = e;
 	*data_len = len;
 	return (int) n;
+}
+
+void
+ChunkTierCheckEmpty(Relation rel, const char *what, bool pending_ok)
+{
+	TierMeta	meta;
+
+	/* (a tier being made has no storage yet: none to leave) */
+	if (!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ||
+		RelationGetNumberOfBlocks(rel) == 0)
+		return;
+	meta = read_meta(rel);
+	for (uint32 id = 1; id < meta.next_pack; id++)
+	{
+		Buffer		buf;
+		TierPack	p;
+
+		if (PACK_SLOT(id) == 0)
+			CHECK_FOR_INTERRUPTS();
+		buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
+		p = *pack_entry(BufferGetPage(buf), id);
+		UnlockReleaseBuffer(buf);
+		if (p.state == PACK_REMOVED)
+			continue;
+		if (pending_ok && id == pending.id &&
+			pending.relnumber == rel->rd_locator.relNumber)
+			continue;
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot %s tier \"%s\": it has packs", what,
+						RelationGetRelationName(rel)),
+				 errdetail("Pack %u is not removed: its object would be left in the tier's store.", id),
+				 errhint("Release its bundles, free its chunks, and VACUUM its index until it has none.")));
+	}
 }
 
 void
