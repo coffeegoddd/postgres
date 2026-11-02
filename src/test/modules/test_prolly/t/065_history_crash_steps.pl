@@ -137,5 +137,27 @@ for my $point ('chunk-index-split-copied', 'chunk-index-split-published')
 	is($audit->(), 'true ', "split ($point): the audit clean after");
 }
 
+# 6. a move of compaction: a chunk's entry freed and a new one put, the
+# crash before its bytes are written; the chunks where they were, each
+# read back, its counts as they were
+$q->(q{CREATE FUNCTION mid(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT 'L'::bytea || convert_to(rpad('m' || i, 2000, '.'), 'UTF8')$$});
+$q->(q{SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', mid(i))});
+$q->(q{SELECT count(*) FROM generate_series(2, 400, 2) i, LATERAL test_cs_ref_root('pages', h(mid(i)))});
+$q->(q{SELECT test_cs_free('pages', ARRAY(SELECT h(mid(i)) FROM generate_series(1, 400, 2) i))});
+# (twice: the regions of the sessions before let go of, made full)
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+my $kept = q{SELECT count(*) FILTER (WHERE test_cs_get('pages', h(mid(i))) = mid(i)
+	AND (SELECT roots FROM test_cs_counts('pages', h(mid(i)))) = 1) FROM generate_series(2, 400, 2) i};
+$crash_at->('chunk-compact-moved', q{SELECT chunks FROM test_chunk_compact('pg_history.chunks',
+	'pg_history.chunk_index', 0.4, false)});
+is($q->($kept), '200', 'move: every chunk kept there, its counts as they were');
+$after->('move');
+cmp_ok($q->(q{SELECT chunks FROM test_chunk_compact('pg_history.chunks', 'pg_history.chunk_index', 0.4, false)}),
+	'>', 0, 'move: compacted after');
+is($q->($kept), '200', 'move: and every chunk kept there after');
+$after->('move after');
+
 $node->stop;
 done_testing();

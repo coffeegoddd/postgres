@@ -11,9 +11,10 @@ CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 CREATE FUNCTION blob(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT convert_to(rpad(tag, 2000, '.'), 'UTF8')$$;
 
--- 200 chunks of 2000 bytes, about four a page
+-- 400 chunks of 2000 bytes, about four a page: three segments and a little
+-- (the log's space is used again a segment at a time, every page of it free)
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('a' || g)), blob('a' || g))) AS put
-FROM generate_series(1, 200) g;
+FROM generate_series(1, 400) g;
 -- and one with a root, at the log's end, so that VACUUM doesn't cut the
 -- freed pages off (see below), and they are used again
 SELECT test_chunk_put('ql', 'qi', h(blob('anchor')), blob('anchor')) AS anchor;
@@ -22,34 +23,36 @@ SELECT pages, full_pages, dead, free_pages FROM test_chunk_log_space('ql');
 SELECT pg_relation_size('ql') AS size_full \gset
 
 -- freed, then VACUUM takes their entries out: their bytes dead, the full
--- pages free
+-- pages free (the three segments before the anchor's)
 SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 VACUUM qi;
-SELECT pages, full_pages, dead >= 200 * 2000 AS all_dead, free_pages = full_pages AS full_ones_free
+SELECT pages, full_pages, dead >= 400 * 2000 AS all_dead, free_pages = full_pages AS full_ones_free
 FROM test_chunk_log_space('ql');
 
--- 150 more, from a backend with no region of its own (one with a region
--- fills it first), go into the pages freed: the file no bigger
+-- 300 more, from a backend with no region of its own (one with a region
+-- fills it first), go into the segments freed: the file no bigger
 \c
 SET chunk_free_in_background = off;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('b' || g)), blob('b' || g))) AS put_again
-FROM generate_series(1, 150) g;
+FROM generate_series(1, 300) g;
 SELECT pg_relation_size('ql') = :size_full AS no_bigger;
 SELECT count(*) FILTER (WHERE test_chunk_get('ql', 'qi', h(blob('b' || g))) = blob('b' || g)) AS read_back
-FROM generate_series(1, 150) g;
+FROM generate_series(1, 300) g;
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
 
 -- and again: pages used again are freed again (a page a region leaves
--- part written is made full, its rest dead), and used a third time.  The
--- first backend's last page, the anchor's, made full too, once it exited:
--- every full page free but that one
+-- part written is made full, its rest dead), and used a third time: 250,
+-- in the two segments wholly free (the third is the region of the backend
+-- that put them, which VACUUM ran in).  The first backend's last page, the
+-- anchor's, made full too, once it exited: every full page free but that
+-- one
 SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 VACUUM qi;
 SELECT full_pages - free_pages AS full_not_free FROM test_chunk_log_space('ql');
 \c
 SET chunk_free_in_background = off;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('c' || g)), blob('c' || g))) AS put_third
-FROM generate_series(1, 150) g;
+FROM generate_series(1, 250) g;
 SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
 
@@ -136,14 +139,15 @@ DROP TABLE ql3, qi3;
 DROP FUNCTION big(text);
 
 -- chunks of half a page and a little more, freed, and others as long put
--- again: into the run of pages freed (not a page at a time, which would
--- leave each page's rest, too short for the next, dead), the file no bigger
+-- again: into the segments freed, on across their pages (not a page at a
+-- time, which would leave each page's rest, too short for the next, dead),
+-- the file no bigger
 CREATE TABLE ql4 () USING prolly_chunks;
 CREATE TABLE qi4 () USING prolly_chunk_index;
 CREATE FUNCTION mid(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT convert_to(rpad(tag, 4100, '.'), 'UTF8')$$;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql4', 'qi4', h(mid('a' || g)), mid('a' || g))) AS put
-FROM generate_series(1, 60) g;
+FROM generate_series(1, 240) g;
 SELECT test_chunk_put('ql4', 'qi4', h(mid('anchor')), mid('anchor')) AS anchor;
 SELECT roots FROM test_chunk_ref_root('qi4', h(mid('anchor')));
 SELECT pg_relation_size('ql4') AS size4 \gset
@@ -152,7 +156,7 @@ VACUUM qi4;
 \c
 SET chunk_free_in_background = off;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql4', 'qi4', h(mid('b' || g)), mid('b' || g))) AS put_again
-FROM generate_series(1, 55) g;
+FROM generate_series(1, 180) g;
 SELECT pg_relation_size('ql4') = :size4 AS no_bigger_run;
 SELECT ok, chunks FROM test_chunk_check('ql4', 'qi4');
 DROP TABLE ql4, qi4;

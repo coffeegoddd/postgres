@@ -96,10 +96,13 @@ for store in rows pages; do
 	else
 		# compacted: a VACUUM with no freer takes out the entries moved,
 		# and the next starts a freer to move more, waited for to its end
+		# (the half kept held by roots first, not timed: a freer frees what
+		# nothing holds)
+		q -c "SELECT count(test_cs_ref_root('pages', hash)) FROM hashes WHERE pos > $(( N / 2 ))" >/dev/null
 		w0=$(lsn); t0=$(ms); rounds=0
 		while :; do
 			q -c "VACUUM pg_history.chunk_index" >/dev/null
-			left=$(q -c "SELECT pages FROM test_chunk_log_compactable('pg_history.chunks', current_setting('chunk_compact_dead_fraction')::float8)")
+			left=$(q -c "SELECT (CASE WHEN worth THEN compactable ELSE 0 END) + evacuable FROM test_chunk_log_segments('pg_history.chunks', current_setting('chunk_compact_dead_fraction')::float8)")
 			[ "$left" = 0 ] && break
 			before=$(grep -c "chunk freer freed" "$D/log" || true)
 			q -c "SET chunk_free_in_background = on" -c "VACUUM pg_history.chunk_index" >/dev/null
@@ -119,6 +122,7 @@ for store in rows pages; do
 		t1=$(ms)
 		row pages "put again" $((t1 - t0)) "-" "$(mb "$disk")"
 		echo "  pages audit: $(q -c "SELECT ok || ' ' || chunks || ' chunks' FROM test_cs_check('pages')")"
+		echo "  pages kept read back: $(q -c "SELECT count(*) FROM hashes WHERE pos > $(( N / 2 )) AND $get(hash) IS NOT NULL")"
 	fi
 done
 "$B/pg_ctl" -D "$D" -m fast stop >/dev/null

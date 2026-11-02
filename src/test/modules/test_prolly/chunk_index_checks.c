@@ -462,9 +462,10 @@ test_chunk_read_bench(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_chunk_compact(log, idx, fraction, room, OUT pages, OUT chunks,
- * OUT bytes): the log's pages to compact compacted, from its start on, in
- * this transaction, until room bytes are moved (0: every page)
+ * test_chunk_compact(log, idx, fraction, evacuate, OUT segments, OUT chunks,
+ * OUT bytes): the log's segments to compact compacted (the log growing as
+ * it must), or its end evacuated into the free segments below, in this
+ * transaction
  */
 Datum
 test_chunk_compact(PG_FUNCTION_ARGS)
@@ -472,33 +473,39 @@ test_chunk_compact(PG_FUNCTION_ARGS)
 	Relation	log = open_log(PG_GETARG_OID(0), RowExclusiveLock);
 	Relation	idx = open_index(PG_GETARG_OID(1), RowExclusiveLock);
 	double		fraction = PG_GETARG_FLOAT8(2);
-	int64		room = PG_GETARG_INT64(3);
-	uint64		from = 0;
-	int64		pages = 0;
+	bool		evacuate = PG_GETARG_BOOL(3);
+	uint64		starts[4096];
+	uint64		ends[4096];
+	int			n;
+	ChunkCompaction *c;
 	uint64		moved = 0,
 				moved_bytes = 0;
 	TupleDesc	desc;
 	Datum		values[3];
 	bool		nulls[3] = {false, false, false};
 
-	while (room == 0 || moved_bytes < (uint64) room)
+	n = evacuate ? ChunkLog->evacuable(log, lengthof(starts), starts, ends) :
+		ChunkLog->compactable(log, fraction, lengthof(starts), starts, ends);
+	c = ChunkStoreCompactBegin(log, idx, n, starts, ends, CurrentMemoryContext);
+	for (;;)
 	{
 		uint64		chunks,
 					bytes;
-		int			found = ChunkStoreCompact(log, idx, fraction, &from, 32, true,
-											  &chunks, &bytes);
+		int			looked = ChunkStoreCompactStep(log, idx, c, 256,
+												   evacuate && n > 0 ? starts[0] : 0,
+												   !evacuate, &chunks, &bytes);
 
-		if (found == 0)
-			break;
-		pages += found;
 		moved += chunks;
 		moved_bytes += bytes;
+		if (looked <= 0)
+			break;
 	}
+	ChunkStoreCompactEnd(c);
 	relation_close(idx, NoLock);
 	relation_close(log, NoLock);
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	values[0] = Int64GetDatum(pages);
+	values[0] = Int64GetDatum((int64) n);
 	values[1] = Int64GetDatum((int64) moved);
 	values[2] = Int64GetDatum((int64) moved_bytes);
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));

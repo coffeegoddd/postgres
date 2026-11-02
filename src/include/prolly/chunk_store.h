@@ -115,7 +115,9 @@ extern void ChunkStoreUnrefRoot(Relation idx, const uint8 *hash,
  * freeing is this transaction's: the chunks are gone as it commits, and
  * nothing is if it aborts.  Time is the chunks freed's.  A chunk whose last
  * references two transactions let go of at once is freed by neither (each
- * sees the other's reference left): VACUUM's freer finds it.
+ * sees the other's reference left): VACUUM's freer finds it.  So is one
+ * being moved by compaction as it is to be freed (its entry being freed by
+ * the move's transaction), and the chunks it alone holds.
  */
 extern uint64 ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes,
 							 int n);
@@ -124,23 +126,34 @@ extern uint64 ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes,
 extern uint64 ChunkStoreFreeUnheld(Relation log, Relation idx);
 
 /*
- * Compaction: the chunks with bytes on the log's next pages to compact
- * (prolly/chunk_log.h's ChunkLogCompactable), up to npages of them from
- * the place *from on, moved: their bytes read, checked, and put elsewhere
- * in the log, their entries moved (prolly/chunk_index.h's move), in this
- * transaction.  A chunk a transaction holds or changes is passed by.  The
- * old bytes are dead once VACUUM takes the old entries out, after this
- * transaction commits and no snapshot might read them: the pages, then
- * free, are used again.  Unless may_grow, the chunks go only where the
- * log has room (this backend's region, pages free), and it stops once
- * there is none, answering -1.  Sets *from past the pages looked at, and
- * answers how many there were (none: no more from there on); the chunks
- * moved and their bytes in *chunks and *bytes.  O(store) (a visit of the
- * index).
+ * Compaction: the chunks with bytes on segments of the log given (from
+ * prolly/chunk_log.h's compactable or evacuable), moved:
+ * their bytes read, checked, and put elsewhere in the log, their entries
+ * moved (prolly/chunk_index.h's move).  The old bytes are dead once VACUUM
+ * takes the old entries out, after the move commits and no snapshot might
+ * read them: the segments, then free, are used again, or (at the end) cut
+ * off.
+ *
+ * Begin finds the chunks, in one visit of the index (O(store)), kept in
+ * cxt; each step then moves the next max of them, in log order, in the
+ * transaction it is in (a chunk a transaction holds or changes is passed
+ * by), into this backend's region, a segment free, or (may_grow) pages
+ * new; with below (not 0) into room wholly before it alone.  A step
+ * answers the chunks it looked at, none if all are, or -1 if there is no
+ * room for the next (a chunk longer than a segment is passed by then);
+ * the chunks it moved and their bytes in *chunks and *bytes.
  */
-extern int	ChunkStoreCompact(Relation log, Relation idx, double fraction,
-							  uint64 *from, int npages, bool may_grow,
-							  uint64 *chunks, uint64 *bytes);
+typedef struct ChunkCompaction ChunkCompaction;
+
+extern ChunkCompaction *ChunkStoreCompactBegin(Relation log, Relation idx,
+											   int n, const uint64 *starts,
+											   const uint64 *ends,
+											   MemoryContext cxt);
+extern int	ChunkStoreCompactStep(Relation log, Relation idx,
+								  ChunkCompaction *c, int max, uint64 below,
+								  bool may_grow, uint64 *chunks,
+								  uint64 *bytes);
+extern void ChunkStoreCompactEnd(ChunkCompaction *c);
 
 /*
  * The audit: every chunk's bytes are its own, every chunk it references is

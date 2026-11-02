@@ -365,7 +365,7 @@ CREATE FUNCTION test_chunk_read_bench(log regclass, idx regclass, hashes bytea[]
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_chunk_compact(log regclass, idx regclass, fraction float8,
-	room int8, OUT pages int8, OUT chunks int8, OUT bytes int8)
+	evacuate bool, OUT segments int8, OUT chunks int8, OUT bytes int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 -- Freeing: chunks nothing holds, and those their references held; pins.
@@ -385,10 +385,12 @@ CREATE FUNCTION test_chunk_log_space(rel regclass,
 	OUT pages int4, OUT full_pages int4, OUT dead int8, OUT free_pages int4)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
 
--- The log's pages VACUUM would compact, fraction of their bytes dead, and
--- the pages it would let the freer grow the log by.
-CREATE FUNCTION test_chunk_log_compactable(rel regclass, fraction float8,
-	OUT pages int8, OUT grow int8)
+-- What VACUUM finds of the log's segments: free, to compact (fraction of
+-- their bytes dead; worth it if those come to a segment's), to evacuate
+-- from the end, and the pages compaction may grow the log by.
+CREATE FUNCTION test_chunk_log_segments(rel regclass, fraction float8,
+	OUT segments int8, OUT free int8, OUT compactable int8, OUT worth bool,
+	OUT evacuable int8, OUT grow int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 -- The regions of the log that live backends hold.

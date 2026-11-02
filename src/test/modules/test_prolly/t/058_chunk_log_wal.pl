@@ -3,9 +3,10 @@
 # The chunk log's own WAL records, replayed: with wal_consistency_checking
 # on, every page a standby and crash recovery replay is the primary's.
 # Appends that begin, go on in, and span pages, and runs of their own;
-# regions sealed; bytes counted dead and pages freed; freed pages made
-# afresh and used again; the tail cut off.  A standby promoted has the
-# free space map the replay kept, and uses the freed pages again.
+# regions sealed; bytes counted dead and segments freed; freed pages made
+# afresh and used again; the tail cut off.  A standby promoted has its
+# freed segments put in the free space map by its first VACUUM, and uses
+# them again.
 
 use strict;
 use warnings FATAL => 'all';
@@ -53,12 +54,13 @@ for my $s (0 .. 3)
 		"SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i > 200 AND i % 4 = $s");
 }
 
-# half of them freed: bytes dead, pages freed, the tail cut; then more put,
-# into the pages freed
+# half of them freed (the first session's, and the last of the others'):
+# bytes dead, pages and segments freed, the tail cut; then more put, into a
+# segment freed (the log's space is used again a segment at a time)
 $primary->safe_psql('postgres', q{
 	SELECT sum(test_chunk_free('pg_history.chunks', 'pg_history.chunk_index',
-		h(chunk(i, len)))) FROM sums WHERE i % 2 = 0 OR i > 300;
-	DELETE FROM sums WHERE i % 2 = 0 OR i > 300;
+		h(chunk(i, len)))) FROM sums WHERE i <= 200 OR i > 300;
+	DELETE FROM sums WHERE i <= 200 OR i > 300;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 my $space = q{SELECT pages || ' ' || free_pages FROM test_chunk_log_space('pg_history.chunks')};
@@ -68,7 +70,7 @@ $primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i > 1000;
 });
 my ($pages_after) = split / /, $primary->safe_psql('postgres', $space);
-cmp_ok($pages_after, '<=', $pages_before, 'chunks put after the freeing go into pages freed');
+cmp_ok($pages_after, '<=', $pages_before, 'chunks put after the freeing go into a segment freed');
 
 my $all = q{SELECT md5(string_agg(encode(test_chunk_get('pg_history.chunks',
 	'pg_history.chunk_index', h(chunk(i, len))), 'hex'), ',' ORDER BY i)) FROM sums};
@@ -84,21 +86,24 @@ $primary->stop('immediate');
 $primary->start;
 is($primary->safe_psql('postgres', $all), $want, 'and crash recovery');
 
-# a standby promoted: the free space map its replay kept has the pages
-# freed, found from its root.  A standby from a backup whose map has no
-# page free (every one used, and VACUUM telling the map's root); then pages
-# freed in the log's middle, its tail kept: no truncation replayed, whose
-# map vacuum would tell the root too.
+# a standby promoted, from a backup whose log has no segment free (every one
+# used); then segments freed in the log's middle, its tail kept (no
+# truncation replayed).  The free space map has segments freed only from
+# VACUUM, not replay (which takes out of it the pages made afresh), so once
+# promoted, its first VACUUM puts them in, and puts use them again.
 $standby->stop;
-# (the regions of the sessions before let go of, their pages free counted)
+my $segs = q{SELECT segments || ' ' || free FROM test_chunk_log_segments('pg_history.chunks', 0.5)};
+# (the regions of the sessions before let go of, twice: the second makes
+# full the last pages the first counted bytes dead on as it went)
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
-my (undef, $nfree) = split / /, $primary->safe_psql('postgres', $space);
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+my (undef, $nfree) = split / /, $primary->safe_psql('postgres', $segs);
 $primary->safe_psql('postgres', qq{
-	INSERT INTO sums SELECT i, 900 FROM generate_series(4001, 4000 + $nfree * 9 + 20) i;
+	INSERT INTO sums SELECT i, 900 FROM generate_series(4001, 4000 + $nfree * 32 * 9 + 20) i;
 	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i > 4000;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
-is((split / /, $primary->safe_psql('postgres', $space))[1], '0', 'every page in use');
+is((split / /, $primary->safe_psql('postgres', $segs))[1], '0', 'every segment in use');
 $primary->backup('mid');
 my $standby2 = PostgreSQL::Test::Cluster->new('log_wal_standby2');
 $standby2->init_from_backup($primary, 'mid', has_streaming => 1);
@@ -117,19 +122,19 @@ $primary->safe_psql('postgres', q{
 	DELETE FROM sums WHERE i > 4000;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index; CREATE TABLE flush ()');
-my ($pages, $free) = split / /, $primary->safe_psql('postgres', $space);
-is($primary->safe_psql('postgres', $size), $size_kept, 'no tail cut: the pages freed are in the log\'s middle');
+is($primary->safe_psql('postgres', $size), $size_kept, 'no tail cut: the segments freed are in the log\'s middle');
 $primary->wait_for_replay_catchup($standby2);
 $standby2->promote;
-($pages, $free) = split / /, $standby2->safe_psql('postgres', $space);
-cmp_ok($free, '>', 0, 'the promoted standby has pages freed');
+$standby2->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+my ($nseg, $free) = split / /, $standby2->safe_psql('postgres', $segs);
+cmp_ok($free, '>', 0, 'the promoted standby has segments freed, once VACUUM puts them in');
 $standby2->safe_psql('postgres', q{
 	INSERT INTO sums SELECT i, 900 FROM generate_series(2001, 2005) i;
 	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i BETWEEN 2001 AND 2005;
 });
-my ($pages2, $free2) = split / /, $standby2->safe_psql('postgres', $space);
-is($pages2, $pages, 'and puts there use them again, the log not growing');
-cmp_ok($free2, '<', $free, 'fewer pages free');
+my ($nseg2, $free2) = split / /, $standby2->safe_psql('postgres', $segs);
+is($nseg2, $nseg, 'and puts there use them again, the log not growing');
+cmp_ok($free2, '<', $free, 'fewer segments free');
 
 # a pack of small chunks: their bytes written a page at a time, a record
 # a page, not one a chunk
