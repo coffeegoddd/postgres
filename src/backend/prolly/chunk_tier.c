@@ -767,22 +767,16 @@ standbys_replayed(XLogRecPtr lsn, pid_t *blocker, const char **why)
 		SpinLockRelease(&w->mutex);
 		if (pid == 0 || kind != REPLICATION_KIND_PHYSICAL)
 			continue;
-		*blocker = pid;
 		if (st == WALSNDSTATE_STARTUP || st == WALSNDSTATE_BACKUP)
-		{
 			*why = st == WALSNDSTATE_STARTUP ? "is starting" : "is taking a base backup";
-			return false;
-		}
-		if (replied == 0)
-		{
+		else if (replied == 0)
 			*why = "has not yet replied";
-			return false;
-		}
-		if (apply != InvalidXLogRecPtr && apply < lsn)
-		{
+		else if (apply != InvalidXLogRecPtr && apply < lsn)
 			*why = "has not replayed past where they died";
-			return false;
-		}
+		else
+			continue;
+		*blocker = pid;
+		return false;
 	}
 	return true;
 }
