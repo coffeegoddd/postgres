@@ -124,6 +124,14 @@ extern void ChunkTierCheckEmpty(Relation rel, const char *what);
 extern void ChunkTierCheckIndex(Relation idx, const char *what);
 
 /*
+ * Whether the database dboid's tiers have packs (a marker of each that has,
+ * in the store): for DROP DATABASE, and CREATE DATABASE from it as a
+ * template, refused while they have.  The place set now is the one looked
+ * in.
+ */
+extern bool ChunkTierDatabaseHasPacks(Oid dboid);
+
+/*
  * For the access method: VACUUM of a tier log, every pack whose transaction
  * ended settled (committed, or orphaned) and its relfrozenxid advanced; no
  * object is touched (VACUUM of its index removes them).

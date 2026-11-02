@@ -59,6 +59,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "commands/vacuum.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "prolly/chunk_index.h"
@@ -83,7 +84,7 @@ char	   *history_tier_store = NULL;
 char	   *history_tier_location = NULL;
 
 #define TIER_MAGIC			0x54494552	/* "TIER" */
-#define TIER_VERSION		4
+#define TIER_VERSION		5
 #define TIER_META_BLOCK		0
 
 typedef struct TierMeta
@@ -96,6 +97,8 @@ typedef struct TierMeta
 	uint64		owner;			/* the packs this server begins are its */
 	Oid			index;			/* the chunk index bound to it */
 	uint32		adopted;		/* packs numbered below are this server's */
+	Oid			dboid;			/* the database its objects are named for (a
+								 * copy's, another's, until its first pack) */
 } TierMeta;
 
 /* a pack's states */
@@ -209,6 +212,7 @@ ChunkTierInitStorage(SMgrRelation srel, bool use_wal)
 	meta->version = TIER_VERSION;
 	meta->next_pack = 1;
 	meta->index = InvalidOid;
+	meta->dboid = MyDatabaseId;
 	if (!pg_strong_random(&meta->stamp, sizeof(meta->stamp)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -229,6 +233,28 @@ read_meta(Relation rel)
 	meta = *tier_meta(rel, BufferGetPage(buf));
 	UnlockReleaseBuffer(buf);
 	return meta;
+}
+
+/*
+ * The stamp the tier's objects are named by: its storage's, made one of
+ * the database they are named for, so that a copy of the tier (CREATE
+ * DATABASE's template), named for its own from its first pack, names none
+ * of the other's objects.  (A copy whose tier has packs is refused:
+ * prolly/chunk_tier.h's ChunkTierDatabaseHasPacks.)  An index is bound to
+ * the storage's stamp, the copies' alike.
+ */
+static uint64
+stamp_for(uint64 stamp, Oid dboid)
+{
+	uint64		s = hash_combine64(stamp, hash_bytes_uint32_extended(dboid, stamp));
+
+	return s != 0 ? s : 1;
+}
+
+static uint64
+meta_stamp(const TierMeta *meta)
+{
+	return stamp_for(meta->stamp, meta->dboid);
 }
 
 /* pack id's entry's page, locked in mode */
@@ -308,7 +334,9 @@ cached_stamp(Relation rel)
 	{
 		uint64	   *stamp = MemoryContextAlloc(CacheMemoryContext, sizeof(uint64));
 
-		*stamp = read_meta(rel).stamp;
+		TierMeta	meta = read_meta(rel);
+
+		*stamp = meta_stamp(&meta);
 		rel->rd_amcache = stamp;
 	}
 	return *(uint64 *) rel->rd_amcache;
@@ -325,10 +353,98 @@ pack_live(const TierPack *p)
 /* ------------------------------------------------------------ packs */
 
 static void tier_xact_callback(XactEvent event, void *arg);
+static void ensure_marker(uint64 stamp);
+static void refuse_copied(Relation rel, const TierMeta *meta);
+static uint64 tier_stamp(Relation rel);
+static void note_object(void *arg, const char *name, uint64 size);
 static bool pack_ours(const TierMeta *meta, TimeLineID tli, uint32 id,
 					  const TierPack *p);
 static bool to_repack(const TierMeta *meta, TimeLineID tli, uint32 id,
 					  const TierPack *p, double fraction);
+
+/*
+ * A database's tier with packs has a marker in the store, named by the
+ * system, the database and the tier's stamp: DROP DATABASE, and CREATE
+ * DATABASE from it, are refused while one is there (prolly/chunk_tier.h's
+ * ChunkTierDatabaseHasPacks).  Made as a pack is begun, and removed by
+ * VACUUM once the tier has none, under the meta page's lock both.
+ */
+static char *
+marker_prefix(Oid dboid)
+{
+	return psprintf("databases/%016llx/%u/",
+					(unsigned long long) GetSystemIdentifier(), dboid);
+}
+
+static char *
+marker_name(uint64 stamp)
+{
+	char	   *prefix = marker_prefix(MyDatabaseId);
+	char	   *name = psprintf("%s%016llx", prefix, (unsigned long long) stamp);
+
+	pfree(prefix);
+	return name;
+}
+
+static void
+ensure_marker(uint64 stamp)
+{
+	ObjectStore *os = tier_objects();
+	char	   *name = marker_name(stamp);
+	uint64		size;
+
+	if (!os->routine->size(os, name, &size))
+		os->routine->put(os, name, "", 0);
+	pfree(name);
+}
+
+/*
+ * A tier named for another database (a copy of its tier, meta its meta
+ * page's, locked) about to be named for this one: with packs not removed,
+ * refused (they are that one's; the copy is refused with them, which this
+ * guards)
+ */
+static void
+refuse_copied(Relation rel, const TierMeta *meta)
+{
+	for (uint32 first = 1; first < meta->next_pack; first += PACKS_PER_PAGE)
+	{
+		uint32		last = Min(first + PACKS_PER_PAGE, meta->next_pack);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
+
+		for (uint32 id = first; id < last; id++)
+			if (pack_entry(BufferGetPage(buf), id)->state != PACK_REMOVED)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("tier \"%s\" was copied from another database's, with its packs",
+								RelationGetRelationName(rel)),
+						 errdetail("Its pack %u is that database's.", id)));
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+static void
+note_object(void *arg, const char *name, uint64 size)
+{
+	*(bool *) arg = true;
+}
+
+bool
+ChunkTierDatabaseHasPacks(Oid dboid)
+{
+	ObjectStore *os;
+	char	   *prefix;
+	bool		any = false;
+
+	/* (no place set: no pack could have been put) */
+	if (history_tier_location == NULL || history_tier_location[0] == '\0')
+		return false;
+	os = tier_objects();
+	prefix = marker_prefix(dboid);
+	os->routine->list(os, prefix, note_object, &any);
+	pfree(prefix);
+	return any;
+}
 
 /* the pack begun: a number from the meta page, its entry this transaction's */
 static void
@@ -357,6 +473,16 @@ begin_pack(Relation rel)
 				 errmsg("could not make a tier's owner")));
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = tier_meta(rel, BufferGetPage(mbuf));
+
+	/*
+	 * (a tier copied from another database's, CREATE DATABASE's template:
+	 * its packs, if it has any, are that one's, and its stamp names that
+	 * one's objects; refused with packs, else a stamp of its own taken, and
+	 * an owner, before any object of it is named)
+	 */
+	if (meta->dboid != MyDatabaseId)
+		refuse_copied(rel, meta);
+	ensure_marker(stamp_for(meta->stamp, MyDatabaseId));
 	id = meta->next_pack;
 	if (id == PG_UINT32_MAX)
 		ereport(ERROR,
@@ -398,6 +524,8 @@ begin_pack(Relation rel)
 	}
 	meta = (TierMeta *) PageGetContents(mpage);
 	meta->next_pack = id + 1;
+	/* (named for this database, from its first pack: a copy's, its own) */
+	meta->dboid = MyDatabaseId;
 	/* (the first pack begun on this timeline: this server's own owner) */
 	if (meta->owner_tli != tli)
 	{
@@ -412,7 +540,7 @@ begin_pack(Relation rel)
 	p->dead = 0;
 	p->dead_lsn = InvalidXLogRecPtr;
 	p->flags = 0;
-	stamp = meta->stamp;
+	stamp = meta_stamp(meta);
 	owner = meta->owner;
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(pbuf);
@@ -604,7 +732,7 @@ ChunkTierCheckIndex(Relation idx, const char *what)
 	tier = try_relation_open(log, AccessShareLock);
 	if (tier == NULL)
 		return;
-	if (RelationIsTierLog(tier) && read_meta(tier).stamp == stamp)
+	if (RelationIsTierLog(tier) && tier_stamp(tier) == stamp)
 	{
 		char	   *verb = psprintf("%s index \"%s\" of", what, RelationGetRelationName(idx));
 
@@ -1253,6 +1381,7 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 	TierMeta	meta = read_meta(rel);
 	TimeLineID	tli = GetWALInsertionTimeLine();
 	uint32	   *gone = palloc_array(uint32, PACKS_PER_PAGE);
+	uint32		live = 0;
 	int			held = 0;
 	pid_t		blocker = 0;
 	const char *why = NULL;
@@ -1294,6 +1423,8 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 				*frozen = p->xid;
 			if (remove && to_remove(&meta, tli, id, p, &held, &blocker, &why))
 				gone[ngone++] = id;
+			else if (p->state != PACK_REMOVED)
+				live++;
 		}
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
@@ -1315,7 +1446,7 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 				p = *pack_entry(BufferGetPage(buf), gone[i]);
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				name = pack_name(meta.stamp, p.owner, gone[i]);
+				name = pack_name(meta_stamp(&meta), p.owner, gone[i]);
 				os->routine->remove(os, name);
 				pfree(name);
 			}
@@ -1330,6 +1461,27 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 		ReleaseBuffer(buf);
 	}
 	pfree(gone);
+
+	/*
+	 * (none left: the database's marker removed, under the meta page's lock,
+	 * no pack begun since the walk began; a pack begun makes it again)
+	 */
+	if (remove && live == 0 &&
+		history_tier_location != NULL && history_tier_location[0] != '\0')
+	{
+		Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
+
+		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+		if (tier_meta(rel, BufferGetPage(mbuf))->next_pack == meta.next_pack)
+		{
+			ObjectStore *os = tier_objects();
+			char	   *name = marker_name(meta_stamp(&meta));
+
+			os->routine->remove(os, name);
+			pfree(name);
+		}
+		UnlockReleaseBuffer(mbuf);
+	}
 	if (held > 0)
 		ereport(LOG,
 				(errmsg("%d packs of tier \"%s\" all dead are kept for standbys",
@@ -1511,7 +1663,7 @@ ChunkTierPackTable(Relation rel, uint32 id, ChunkTierPackEntry **entries, uint64
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("tier \"%s\"'s pack %u is not written, or removed",
 						RelationGetRelationName(rel), id)));
-	name = pack_name(meta.stamp, p.owner, id);
+	name = pack_name(meta_stamp(&meta), p.owner, id);
 	n = ChunkTierReadPackTable(tier_objects(), name, entries, data_len);
 	if (*data_len != p.size)
 		ereport(ERROR,
