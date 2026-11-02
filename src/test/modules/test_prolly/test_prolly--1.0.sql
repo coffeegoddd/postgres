@@ -509,6 +509,12 @@ CREATE FUNCTION test_os_read(store text, location text, name text, off int8, len
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- The table of a pack object, as the history store's tier reads it.
+CREATE FUNCTION test_os_pack_table(store text, location text, name text,
+	OUT hash bytea, OUT off int8, OUT len int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_os_size(store text, location text, name text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

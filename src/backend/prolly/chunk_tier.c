@@ -60,6 +60,7 @@
 #include "access/xlog.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "port/pg_bswap.h"
 #include "prolly/chunk_store.h"
 #include "prolly/chunk_tier.h"
 #include "prolly/object_store.h"
@@ -123,12 +124,17 @@ typedef struct TierPack
  * This backend's pack, its transaction's chunks gathered, written as the
  * transaction commits (or once full)
  */
-/* a chunk written in this backend's pack: where */
+/* a chunk reserved in this backend's pack: where, and if written */
 typedef struct TierSlot
 {
 	uint32		off;
 	uint32		len;
+	bool		written;
 } TierSlot;
+
+/* the room a pack's table and footer take, of n entries */
+#define TABLE_ROOM(n) \
+	((uint64) (n) * sizeof(ChunkTierPackEntry) + sizeof(ChunkTierPackFooter))
 
 typedef struct TierPending
 {
@@ -140,9 +146,10 @@ typedef struct TierPending
 	char	   *buf;
 	uint64		len;
 	uint64		cap;
-	TierSlot   *slots;			/* the chunks written, for the pack's table */
+	TierSlot   *slots;			/* the chunks reserved, for the pack's table */
 	int			nslots;
 	int			slots_cap;
+	uint64		table_len;		/* the table's and footer's, once appended */
 } TierPending;
 
 static TierPending pending;
@@ -419,36 +426,46 @@ entry_cmp(const void *a, const void *b)
 }
 
 /*
- * The pack's table appended to its bytes: each chunk written, by hash
- * (each re-hashed here, from the bytes going out), then the footer
+ * The pack's table appended to its bytes: each chunk reserved and written,
+ * by hash (each re-hashed here, from the bytes going out), then the
+ * footer; numbers in network byte order.  (Its room is prepared.)
  */
 static void
 append_table(void)
 {
 	ChunkTierPackEntry *entries = palloc_array(ChunkTierPackEntry, Max(pending.nslots, 1));
 	ChunkTierPackFooter footer;
-	uint64		table = (uint64) pending.nslots * sizeof(ChunkTierPackEntry);
-	uint64		total = pending.len + table + sizeof(footer);
+	int			n = 0;
+	char	   *at;
 
 	for (int i = 0; i < pending.nslots; i++)
 	{
-		ChunkHash(pending.buf + pending.slots[i].off, pending.slots[i].len, entries[i].hash);
-		entries[i].off = pending.slots[i].off;
-		entries[i].len = pending.slots[i].len;
+		if (!pending.slots[i].written)
+			continue;
+		ChunkHash(pending.buf + pending.slots[i].off, pending.slots[i].len, entries[n].hash);
+		entries[n].off = pending.slots[i].off;
+		entries[n].len = pending.slots[i].len;
+		n++;
 	}
-	qsort(entries, pending.nslots, sizeof(ChunkTierPackEntry), entry_cmp);
-	if (total > pending.cap)
+	qsort(entries, n, sizeof(ChunkTierPackEntry), entry_cmp);
+	Assert(pending.len + TABLE_ROOM(n) <= pending.cap);
+	at = pending.buf + pending.len;
+	for (int i = 0; i < n; i++)
 	{
-		pending.buf = repalloc_huge(pending.buf, total);
-		pending.cap = total;
+		ChunkTierPackEntry e = entries[i];
+
+		e.off = pg_hton32(e.off);
+		e.len = pg_hton32(e.len);
+		memcpy(at, &e, sizeof(e));
+		at += sizeof(e);
 	}
-	memcpy(pending.buf + pending.len, entries, table);
 	memset(&footer, 0, sizeof(footer));
-	footer.nentries = pending.nslots;
-	footer.version = CHUNK_TIER_PACK_VERSION;
-	footer.data_len = pending.len;
-	footer.magic = CHUNK_TIER_PACK_MAGIC;
-	memcpy(pending.buf + pending.len + table, &footer, sizeof(footer));
+	footer.nentries = pg_hton32(n);
+	footer.version = pg_hton32(CHUNK_TIER_PACK_VERSION);
+	footer.data_len = pg_hton64(pending.len);
+	footer.magic = pg_hton64(CHUNK_TIER_PACK_MAGIC);
+	memcpy(at, &footer, sizeof(footer));
+	pending.table_len = TABLE_ROOM(n);
 	pfree(entries);
 }
 
@@ -458,7 +475,9 @@ ChunkTierReadPackTable(ObjectStore *os, const char *name,
 {
 	uint64		size;
 	ChunkTierPackFooter footer;
-	uint64		table;
+	uint32		n;
+	uint64		len;
+	ChunkTierPackEntry *e;
 
 	if (!os->routine->size(os, name, &size))
 		ereport(ERROR,
@@ -470,27 +489,46 @@ ChunkTierReadPackTable(ObjectStore *os, const char *name,
 				 errmsg("pack \"%s\" is %llu bytes, too few for its footer",
 						name, (unsigned long long) size)));
 	os->routine->read(os, name, size - sizeof(footer), &footer, sizeof(footer));
-	if (footer.magic != CHUNK_TIER_PACK_MAGIC)
+	if (pg_ntoh64(footer.magic) != CHUNK_TIER_PACK_MAGIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("\"%s\" is not a pack", name)));
-	if (footer.version != CHUNK_TIER_PACK_VERSION)
+	if (pg_ntoh32(footer.version) != CHUNK_TIER_PACK_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("pack \"%s\" has format version %u, not %u",
-						name, footer.version, CHUNK_TIER_PACK_VERSION)));
-	table = (uint64) footer.nentries * sizeof(ChunkTierPackEntry);
-	if (footer.data_len + table + sizeof(footer) != size)
+						name, pg_ntoh32(footer.version), CHUNK_TIER_PACK_VERSION)));
+	n = pg_ntoh32(footer.nentries);
+	len = pg_ntoh64(footer.data_len);
+	/* (each part checked against what is left: no sum to wrap) */
+	if (len > size - sizeof(footer) ||
+		(uint64) n > (size - sizeof(footer) - len) / sizeof(ChunkTierPackEntry) ||
+		(uint64) n * sizeof(ChunkTierPackEntry) != size - sizeof(footer) - len)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("pack \"%s\" is %llu bytes, not its footer's %llu",
-						name, (unsigned long long) size,
-						(unsigned long long) (footer.data_len + table + sizeof(footer)))));
-	*entries = palloc_array(ChunkTierPackEntry, Max(footer.nentries, 1));
-	if (table > 0)
-		os->routine->read(os, name, footer.data_len, *entries, table);
-	*data_len = footer.data_len;
-	return (int) footer.nentries;
+				 errmsg("pack \"%s\" is %llu bytes, which its footer's %u entries and %llu bytes of chunks do not fill",
+						name, (unsigned long long) size, n, (unsigned long long) len)));
+	e = palloc_array(ChunkTierPackEntry, Max(n, 1));
+	if (n > 0)
+		os->routine->read(os, name, len, e, (size_t) n * sizeof(ChunkTierPackEntry));
+	for (uint32 i = 0; i < n; i++)
+	{
+		e[i].off = pg_ntoh32(e[i].off);
+		e[i].len = pg_ntoh32(e[i].len);
+		if ((uint64) e[i].off + e[i].len > len || e[i].len == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("pack \"%s\"'s entry %u, of bytes %u to %llu, is not in its %llu bytes of chunks",
+							name, i, e[i].off, (unsigned long long) e[i].off + e[i].len,
+							(unsigned long long) len)));
+		if (i > 0 && entry_cmp(&e[i - 1], &e[i]) > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("pack \"%s\"'s entries are not in order at %u", name, i)));
+	}
+	*entries = e;
+	*data_len = len;
+	return (int) n;
 }
 
 void
@@ -536,9 +574,7 @@ write_pack(Relation rel)
 		/* (no lock held as it is written: its entry is this transaction's) */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		append_table();
-		os->routine->put(os, name, pending.buf,
-						 pending.len + (uint64) pending.nslots * sizeof(ChunkTierPackEntry) +
-						 sizeof(ChunkTierPackFooter));
+		os->routine->put(os, name, pending.buf, pending.len + pending.table_len);
 		pfree(name);
 		INJECTION_POINT("chunk-tier-pack-written", NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -635,16 +671,28 @@ tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	if (pending.id == 0)
 		begin_pack(rel);
 
-	/* (room made now: reserve, which must not fail, takes it) */
-	if (pending.len + len > pending.cap)
+	/*
+	 * (room made now: reserve, which must not fail, takes it, and a slot
+	 * for it; and room for the table, so that writing the pack copies
+	 * nothing)
+	 */
+	if (pending.len + len + TABLE_ROOM(pending.nslots + 1) > pending.cap)
 	{
-		uint64		cap = Max(pending.len + len, Max(pending.cap * 2, 1024 * 1024));
+		uint64		need = pending.len + len + TABLE_ROOM(pending.nslots + 1);
+		uint64		cap = Max(need, Max(pending.cap * 2, 1024 * 1024));
 
-		cap = Min(cap, Max(TIER_PACK_BYTES, pending.len + len));
+		cap = Min(cap, Max(TIER_PACK_BYTES + TABLE_ROOM(pending.nslots + 1), need));
 		pending.buf = pending.buf ?
 			repalloc_huge(pending.buf, cap) :
 			MemoryContextAllocHuge(TopMemoryContext, cap);
 		pending.cap = cap;
+	}
+	if (pending.nslots == pending.slots_cap)
+	{
+		pending.slots_cap = Max(pending.slots_cap * 2, 64);
+		pending.slots = pending.slots ?
+			repalloc_huge(pending.slots, pending.slots_cap * sizeof(TierSlot)) :
+			MemoryContextAllocHuge(TopMemoryContext, pending.slots_cap * sizeof(TierSlot));
 	}
 	/* (zeroed: bytes reserved and never written are no memory's) */
 	memset(pending.buf + pending.len, 0, len);
@@ -677,7 +725,16 @@ tier_reserve(Relation rel, ChunkLogRun *run, size_t len)
 		elog(PANIC, "tier \"%s\": %zu bytes reserved past the room prepared",
 			 RelationGetRelationName(rel), len);
 	run->next += len;
+	/* (a run is a chunk's: the next one prepares its own room, and slot) */
+	run->limit = run->next;
 	pending.len = Max(pending.len, (uint64) LOC_OFF(loc) + len);
+	if (len > 0)
+	{
+		pending.slots[pending.nslots].off = LOC_OFF(loc);
+		pending.slots[pending.nslots].len = len;
+		pending.slots[pending.nslots].written = false;
+		pending.nslots++;
+	}
 	return loc;
 }
 
@@ -688,16 +745,31 @@ tier_write(Relation rel, uint64 loc, const void *data, size_t len)
 		elog(ERROR, "tier \"%s\": bytes written at %llu where none were reserved",
 			 RelationGetRelationName(rel), (unsigned long long) loc);
 	memcpy(pending.buf + LOC_OFF(loc), data, len);
-	if (pending.nslots == pending.slots_cap)
+
+	/*
+	 * (the chunks reserved whose bytes these are written: one write may be
+	 * of several, one after another; slots are in the order of their
+	 * offsets)
+	 */
 	{
-		pending.slots_cap = Max(pending.slots_cap * 2, 64);
-		pending.slots = pending.slots ?
-			repalloc_huge(pending.slots, pending.slots_cap * sizeof(TierSlot)) :
-			MemoryContextAllocHuge(TopMemoryContext, pending.slots_cap * sizeof(TierSlot));
+		uint64		start = LOC_OFF(loc);
+		uint64		end = start + len;
+		int			lo = 0,
+					hi = pending.nslots;
+
+		while (lo < hi)
+		{
+			int			mid = lo + (hi - lo) / 2;
+
+			if (pending.slots[mid].off < start)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		for (int i = lo; i < pending.nslots && pending.slots[i].off < end; i++)
+			if ((uint64) pending.slots[i].off + pending.slots[i].len <= end)
+				pending.slots[i].written = true;
 	}
-	pending.slots[pending.nslots].off = LOC_OFF(loc);
-	pending.slots[pending.nslots].len = len;
-	pending.nslots++;
 }
 
 static void
@@ -1186,8 +1258,18 @@ ChunkTierPackTable(Relation rel, uint32 id, ChunkTierPackEntry **entries, uint64
 	buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
 	p = *pack_entry(BufferGetPage(buf), id);
 	UnlockReleaseBuffer(buf);
+	if (p.state == PACK_REMOVED || p.size == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("tier \"%s\"'s pack %u is not written, or removed",
+						RelationGetRelationName(rel), id)));
 	name = pack_name(meta.stamp, p.owner, id);
 	n = ChunkTierReadPackTable(tier_objects(), name, entries, data_len);
+	if (*data_len != p.size)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pack \"%s\" has %llu bytes of chunks, its entry %llu",
+						name, (unsigned long long) *data_len, (unsigned long long) p.size)));
 	pfree(name);
 	return n;
 }

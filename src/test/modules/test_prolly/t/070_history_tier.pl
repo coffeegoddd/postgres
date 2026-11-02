@@ -121,6 +121,12 @@ $node->safe_psql('postgres', q{
 is($packs->() - $p0, 2, 'some 75 MB in two packs');
 is($node->safe_psql('postgres', q{SELECT count(*) FILTER (WHERE test_cs_get('tier', h(blob('big' || g, 250000))) = blob('big' || g, 250000)) FROM generate_series(1, 300) g}),
 	'300', 'every one read back');
+is($node->safe_psql('postgres', q{
+	SELECT count(DISTINCT t.hash) FROM test_tier_packs('pg_history.tier_chunks') p,
+		LATERAL test_tier_pack_table('pg_history.tier_chunks', p.id) t
+	WHERE p.state <> 'removed' AND p.size > 0
+		AND t.hash IN (SELECT h(blob('big' || g, 250000)) FROM generate_series(1, 300) g)}),
+	'300', 'each in its pack\'s table, the first pack written full as the transaction went on');
 
 # a hot standby at the same tier reads them
 $node->wait_for_replay_catchup($standby);

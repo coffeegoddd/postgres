@@ -15,6 +15,7 @@
 
 #include "fmgr.h"
 #include "funcapi.h"
+#include "prolly/chunk_tier.h"
 #include "prolly/object_store.h"
 #include "prolly/registry.h"
 #include "utils/builtins.h"
@@ -23,6 +24,7 @@
 
 PG_FUNCTION_INFO_V1(test_os_stores);
 PG_FUNCTION_INFO_V1(test_os_put);
+PG_FUNCTION_INFO_V1(test_os_pack_table);
 PG_FUNCTION_INFO_V1(test_os_read);
 PG_FUNCTION_INFO_V1(test_os_size);
 PG_FUNCTION_INFO_V1(test_os_list);
@@ -133,4 +135,36 @@ test_os_remove(PG_FUNCTION_ARGS)
 	os->routine->remove(os, text_to_cstring(PG_GETARG_TEXT_PP(2)));
 	os->routine->close(os);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_os_pack_table(store, location, name) returns setof (hash, off, len):
+ * the table of a pack object, as the tier reads it (its checks of it too)
+ */
+Datum
+test_os_pack_table(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ObjectStore *os = store_arg(fcinfo);
+	ChunkTierPackEntry *entries;
+	uint64		data_len;
+	int			n;
+
+	n = ChunkTierReadPackTable(os, text_to_cstring(PG_GETARG_TEXT_PP(2)), &entries, &data_len);
+	os->routine->close(os);
+	InitMaterializedSRF(fcinfo, 0);
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *hash = palloc(VARHDRSZ + CHUNK_HASH_LEN);
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+
+		SET_VARSIZE(hash, VARHDRSZ + CHUNK_HASH_LEN);
+		memcpy(VARDATA(hash), entries[i].hash, CHUNK_HASH_LEN);
+		values[0] = PointerGetDatum(hash);
+		values[1] = Int64GetDatum(entries[i].off);
+		values[2] = Int64GetDatum(entries[i].len);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
 }
