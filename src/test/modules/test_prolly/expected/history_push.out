@@ -52,9 +52,9 @@ SELECT pg_history_push('b1', ARRAY[pg_temp.h(pg_temp.p1())]) AS copied;
       3
 (1 row)
 
-SELECT name, hash = pg_temp.h(pg_temp.p1()) AS its_root FROM pg_history.bundles;
- name | its_root 
-------+----------
+SELECT name, roots = ARRAY[pg_temp.h(pg_temp.p1())] AS its_roots FROM pg_history.bundles;
+ name | its_roots 
+------+-----------
  b1   | t
 (1 row)
 
@@ -114,17 +114,25 @@ SELECT test_cs_get('pages', pg_temp.h('\x0a11ff'));
 (1 row)
 
 -- a second bundle sharing what the first has: only what the tier has not
--- copied (the parent and its leaf; the shared leaf is the tier's)
+-- copied (the parent and its leaf; the shared leaf is the tier's), and the
+-- shared leaf let go of here (the push's holding it in the tier holds
+-- nothing here), nothing left unheld
 SELECT pg_history_push('b2', ARRAY[pg_temp.h(pg_temp.p2())]) AS copied;
  copied 
 --------
       2
 (1 row)
 
-SELECT test_cs_has('pages', pg_temp.h('\x0a11ff')) AS shared_let_go;
- shared_let_go 
----------------
- t
+SELECT test_cs_has('pages', pg_temp.h('\x0a11ff')) AS shared_kept;
+ shared_kept 
+-------------
+ f
+(1 row)
+
+SELECT ok, unheld FROM test_cs_check('pages');
+ ok | unheld 
+----+--------
+ t  |      0
 (1 row)
 
 -- refused: a bundle there already, a root given twice, none, a root the
@@ -152,12 +160,16 @@ SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]);
 ERROR:  chunk 554f980c5247a07ece9379bfd7e4c4f336caf002 has no root to push but its pointers'
 HINT:  Take a root of it to push (a bundle takes it), or delete the pointers.
 DELETE FROM pg_history.pointers WHERE name = 'main';
--- the bundles' rows are not changed, nor truncated
+-- the bundles' rows are not changed, nor truncated (the table a system
+-- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
 ERROR:  cannot change a bundle's roots
 HINT:  Push another bundle, and release this one.
+SET allow_system_table_mods = on;
 TRUNCATE pg_history.bundles;
-ERROR:  permission denied: "bundles" is a system catalog
+ERROR:  cannot truncate the history store's bundles
+HINT:  Release them: each holds its roots in the tier.
+RESET allow_system_table_mods;
 -- a push aborted: nothing pushed, nothing let go of
 SELECT test_cs_ref_root('pages', pg_temp.h('\x0a1199'));
  test_cs_ref_root 

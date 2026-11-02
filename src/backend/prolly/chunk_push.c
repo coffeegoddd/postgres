@@ -38,11 +38,13 @@
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_store.h"
 #include "prolly/chunkstore.h"
+#include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "varatt.h"
 
 /* the bytes of chunks put into the tier at once */
@@ -182,12 +184,19 @@ array_hashes(ArrayType *arr, int *n)
 	Datum	   *elems;
 	bool	   *nulls;
 	uint8	   *hashes;
+	HASHCTL		ctl;
+	HTAB	   *given;
 
 	deconstruct_array(arr, BYTEAOID, -1, false, TYPALIGN_INT, &elems, &nulls, n);
 	hashes = palloc((Size) Max(*n, 1) * CHUNK_HASH_LEN);
+	ctl.keysize = CHUNK_HASH_LEN;
+	ctl.entrysize = CHUNK_HASH_LEN;
+	ctl.hcxt = CurrentMemoryContext;
+	given = hash_create("bundle roots", Max(*n, 16), &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	for (int i = 0; i < *n; i++)
 	{
 		bytea	   *b;
+		bool		found;
 
 		if (nulls[i])
 			ereport(ERROR,
@@ -199,14 +208,14 @@ array_hashes(ArrayType *arr, int *n)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a chunk's hash is %d bytes", CHUNK_HASH_LEN)));
 		memcpy(hashes + (Size) i * CHUNK_HASH_LEN, VARDATA_ANY(b), CHUNK_HASH_LEN);
-		for (int j = 0; j < i; j++)
-			if (memcmp(hashes + (Size) j * CHUNK_HASH_LEN,
-					   hashes + (Size) i * CHUNK_HASH_LEN, CHUNK_HASH_LEN) == 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("root %s is given twice",
-								ChunkHashText(hashes + (Size) i * CHUNK_HASH_LEN))));
+		(void) hash_search(given, VARDATA_ANY(b), HASH_ENTER, &found);
+		if (found)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("root %s is given twice",
+							ChunkHashText(hashes + (Size) i * CHUNK_HASH_LEN))));
 	}
+	hash_destroy(given);
 	return hashes;
 }
 
@@ -219,24 +228,36 @@ check_pusher(void)
 				 errmsg("only a superuser may push or release history in the history store's tier")));
 }
 
-/* how many pointers name hash */
-static uint64
-pointers_naming(const uint8 *hash)
+/*
+ * The pointers naming each of roots, in counts[]: as of now, with no
+ * pointer made or dropped until this transaction ends (the pointers
+ * locked), so that the roots counted with them are as these are
+ */
+static void
+pointers_of(ArrayType *roots_arr, const uint8 *roots, int n, uint64 *counts)
 {
-	Oid			types[1] = {BYTEAOID};
-	bytea	   *h = palloc(VARHDRSZ + CHUNK_HASH_LEN);
-	Datum		values[1];
-	bool		isnull;
-	int64		n;
+	Oid			types[1] = {BYTEAARRAYOID};
+	Datum		values[1] = {PointerGetDatum(roots_arr)};
+	SPIPlanPtr	plan;
 
-	SET_VARSIZE(h, VARHDRSZ + CHUNK_HASH_LEN);
-	memcpy(VARDATA(h), hash, CHUNK_HASH_LEN);
-	values[0] = PointerGetDatum(h);
-	if (SPI_execute_with_args("SELECT count(*) FROM pg_history.pointers WHERE hash = $1",
-							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
-		elog(ERROR, "could not count a chunk's pointers");
-	n = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
-	return (uint64) n;
+	LockRelationOid(ChunkStorePointersRelid(), ShareLock);
+	plan = SPI_prepare("SELECT hash, count(*) FROM pg_history.pointers "
+					   "WHERE hash = ANY($1) GROUP BY hash", 1, types);
+	if (plan == NULL ||
+		SPI_execute_snapshot(plan, values, NULL, GetLatestSnapshot(), InvalidSnapshot,
+							 true, false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not count roots' pointers");
+	memset(counts, 0, sizeof(uint64) * n);
+	for (uint64 r = 0; r < SPI_processed; r++)
+	{
+		bool		isnull;
+		bytea	   *h = DatumGetByteaPP(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull));
+		int64		c = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull));
+
+		for (int i = 0; i < n; i++)
+			if (memcmp(roots + (Size) i * CHUNK_HASH_LEN, VARDATA_ANY(h), CHUNK_HASH_LEN) == 0)
+				counts[i] = (uint64) c;
+	}
 }
 
 /* whether the bundle has rows */
@@ -265,7 +286,8 @@ pg_history_push(PG_FUNCTION_ARGS)
 	PushState	ps = {0};
 	HASHCTL		ctl;
 	HTAB	   *seen;
-	Oid			types[2] = {TEXTOID, BYTEAOID};
+	Oid			types[2] = {TEXTOID, BYTEAARRAYOID};
+	uint64	   *pointers;
 
 	check_pusher();
 	if (n == 0)
@@ -284,13 +306,16 @@ pg_history_push(PG_FUNCTION_ARGS)
 
 	/*
 	 * (each root one the caller holds, not a pointer's: a pointer's root is
-	 * let go of as its row is, which would then be one too many)
+	 * let go of as its row is, which would then be one too many.  The
+	 * pointers counted as of now, none made or dropped until this
+	 * transaction ends, as the roots are counted.)
 	 */
+	pointers = palloc_array(uint64, n);
+	pointers_of(PG_GETARG_ARRAYTYPE_P(1), roots, n, pointers);
 	for (int i = 0; i < n; i++)
 	{
 		const uint8 *root = roots + (Size) i * CHUNK_HASH_LEN;
 		ChunkCounts c;
-		uint64		pointers;
 
 		if (!cs_counts(ps.from, root, &c))
 		{
@@ -302,11 +327,10 @@ pg_history_push(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("the history store has no chunk %s to push", ChunkHashText(root))));
 		}
-		pointers = pointers_naming(root);
-		if (c.roots <= pointers)
+		if (c.roots <= pointers[i])
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 pointers == 0 ?
+					 pointers[i] == 0 ?
 					 errmsg("chunk %s has no root to push", ChunkHashText(root)) :
 					 errmsg("chunk %s has no root to push but its pointers'", ChunkHashText(root)),
 					 errhint("Take a root of it to push (a bundle takes it), or delete the pointers.")));
@@ -325,19 +349,16 @@ pg_history_push(PG_FUNCTION_ARGS)
 		copy_reached(&ps, seen, roots + (Size) i * CHUNK_HASH_LEN);
 	flush_batch(&ps);
 
-	/* (the bundle's rows hold its roots in the tier: their trigger) */
-	for (int i = 0; i < n; i++)
+	/*
+	 * (the bundle's row holds its roots in the tier: its trigger.  Its name
+	 * the key: a push of the same name at once waits, and fails.)
+	 */
 	{
-		bytea	   *h = palloc(VARHDRSZ + CHUNK_HASH_LEN);
-		Datum		values[2];
+		Datum		values[2] = {PointerGetDatum(bundle), PointerGetDatum(PG_GETARG_ARRAYTYPE_P(1))};
 
-		SET_VARSIZE(h, VARHDRSZ + CHUNK_HASH_LEN);
-		memcpy(VARDATA(h), roots + (Size) i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
-		values[0] = PointerGetDatum(bundle);
-		values[1] = PointerGetDatum(h);
-		if (SPI_execute_with_args("INSERT INTO pg_history.bundles (name, hash) VALUES ($1, $2)",
+		if (SPI_execute_with_args("INSERT INTO pg_history.bundles (name, roots) VALUES ($1, $2)",
 								  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
-			elog(ERROR, "could not insert a bundle's root");
+			elog(ERROR, "could not insert a bundle");
 	}
 	SPI_finish();
 
@@ -359,31 +380,29 @@ pg_history_release(PG_FUNCTION_ARGS)
 	Oid			types[1] = {TEXTOID};
 	Datum		values[1] = {PointerGetDatum(bundle)};
 	uint8	   *roots;
-	uint64		n;
+	int			n;
 	uint64		freed;
 
 	check_pusher();
 	SPI_connect();
-	if (SPI_execute_with_args("DELETE FROM pg_history.bundles WHERE name = $1 RETURNING hash",
+	if (SPI_execute_with_args("DELETE FROM pg_history.bundles WHERE name = $1 RETURNING roots",
 							  1, types, values, NULL, false, 0) != SPI_OK_DELETE_RETURNING)
-		elog(ERROR, "could not delete a bundle's roots");
-	n = SPI_processed;
-	if (n == 0)
+		elog(ERROR, "could not delete a bundle");
+	if (SPI_processed == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("there is no bundle \"%s\" in the history store's tier",
 						text_to_cstring(bundle))));
-	/* (in the caller's memory: SPI_finish lets go of SPI's) */
-	roots = SPI_palloc(n * CHUNK_HASH_LEN);
-	for (uint64 i = 0; i < n; i++)
 	{
 		bool		isnull;
-		bytea	   *h = DatumGetByteaPP(SPI_getbinval(SPI_tuptable->vals[i],
-													  SPI_tuptable->tupdesc, 1, &isnull));
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+		uint8	   *found = array_hashes(DatumGetArrayTypeP(d), &n);
 
-		memcpy(roots + i * CHUNK_HASH_LEN, VARDATA_ANY(h), CHUNK_HASH_LEN);
+		/* (in the caller's memory: SPI_finish lets go of SPI's) */
+		roots = SPI_palloc((Size) Max(n, 1) * CHUNK_HASH_LEN);
+		memcpy(roots, found, (Size) n * CHUNK_HASH_LEN);
 	}
 	SPI_finish();
-	freed = cs_free(ChunkStoreOpen("tier"), roots, (int) n);
+	freed = cs_free(ChunkStoreOpen("tier"), roots, n);
 	PG_RETURN_INT64((int64) freed);
 }

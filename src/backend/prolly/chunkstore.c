@@ -132,12 +132,13 @@ pages_has(ChunkStore *cs, const uint8 *hash)
 }
 
 /*
- * A chunk the store has not, but its index's entry: if it was pushed (the
- * index history is pushed to has it), its bytes as of the reader's
- * snapshot, when it is older than the push (they are kept until no
- * snapshot could find them), and else an error, until it is fetched back.
- * NULL if it was not pushed.  For a root taken (asof false), an error if
- * it was pushed.
+ * A chunk the store has not now: if pushed history may be read (asof, a
+ * store history is pushed from), its bytes as of the reader's snapshot,
+ * when that is older than its freeing (they are kept until no snapshot
+ * could find them), whatever came of it since; else, if it was pushed
+ * (the index history is pushed to has it), an error, until it is fetched
+ * back; NULL if it was not.  For a root taken (asof false), only the
+ * error.
  */
 static void *
 pushed_chunk(ChunkStore *cs, Relation log, Relation idx, const uint8 *hash,
@@ -150,13 +151,14 @@ pushed_chunk(ChunkStore *cs, Relation log, Relation idx, const uint8 *hash,
 
 	if (rs->pushed_relid == NULL)
 		return NULL;
+	if (asof && ActiveSnapshotSet() &&
+		(data = ChunkStoreGetAsOf(log, idx, hash, GetActiveSnapshot(), len)) != NULL)
+		return data;
 	tier = relation_open(rs->pushed_relid(), AccessShareLock);
 	pushed = ChunkStoreHas(NULL, tier, hash);
 	relation_close(tier, NoLock);
 	if (!pushed)
 		return NULL;
-	if (asof && (data = ChunkStoreGetAsOf(log, idx, hash, GetActiveSnapshot(), len)) != NULL)
-		return data;
 	ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("chunk %s was pushed to the history store's tier", ChunkHashText(hash)),

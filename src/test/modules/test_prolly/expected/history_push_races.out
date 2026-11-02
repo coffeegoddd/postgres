@@ -1,0 +1,46 @@
+Parsed test spec with 2 sessions
+
+starting permutation: p_rr q_pointer p_push1 p_rollback
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1 AS snapshot;
+snapshot
+--------
+       1
+(1 row)
+
+step q_pointer: INSERT INTO pg_history.pointers VALUES ('hr_ptr', hr_h('\x0a3101'));
+step p_push1: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3101')]) AS copied;
+ERROR:  chunk 6c531dff94610c28ed645085bb8fc4809f2beba2 has no root to push but its pointers'
+step p_rollback: ROLLBACK;
+test_cs_free
+------------
+           3
+(1 row)
+
+
+starting permutation: p_begin p_push2 q_push p_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_begin: BEGIN;
+step p_push2: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+copied
+------
+     1
+(1 row)
+
+step q_push: SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3103')]) AS copied; <waiting ...>
+step p_commit: COMMIT;
+step q_push: <... completed>
+ERROR:  duplicate key value violates unique constraint "bundles_pkey"
+test_cs_free
+------------
+           2
+(1 row)
+

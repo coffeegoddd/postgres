@@ -22,7 +22,7 @@ SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p2()));
 
 -- the push: three copied (the parent, its leaf, the shared leaf)
 SELECT pg_history_push('b1', ARRAY[pg_temp.h(pg_temp.p1())]) AS copied;
-SELECT name, hash = pg_temp.h(pg_temp.p1()) AS its_root FROM pg_history.bundles;
+SELECT name, roots = ARRAY[pg_temp.h(pg_temp.p1())] AS its_roots FROM pg_history.bundles;
 SELECT (test_cs_counts('tier', pg_temp.h(pg_temp.p1()))).roots AS tier_roots;
 SELECT test_cs_has('tier', pg_temp.h(pg_temp.p1())) AS p1,
 	test_cs_has('tier', pg_temp.h('\x0a1101')) AS leaf1,
@@ -45,9 +45,12 @@ SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p1()));
 SELECT test_cs_get('pages', pg_temp.h('\x0a11ff'));
 
 -- a second bundle sharing what the first has: only what the tier has not
--- copied (the parent and its leaf; the shared leaf is the tier's)
+-- copied (the parent and its leaf; the shared leaf is the tier's), and the
+-- shared leaf let go of here (the push's holding it in the tier holds
+-- nothing here), nothing left unheld
 SELECT pg_history_push('b2', ARRAY[pg_temp.h(pg_temp.p2())]) AS copied;
-SELECT test_cs_has('pages', pg_temp.h('\x0a11ff')) AS shared_let_go;
+SELECT test_cs_has('pages', pg_temp.h('\x0a11ff')) AS shared_kept;
+SELECT ok, unheld FROM test_cs_check('pages');
 
 -- refused: a bundle there already, a root given twice, none, a root the
 -- caller does not hold, one the store has not
@@ -61,9 +64,12 @@ SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1198')]);
 INSERT INTO pg_history.pointers VALUES ('main', pg_temp.h('\x0a1199'));
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199')]);
 DELETE FROM pg_history.pointers WHERE name = 'main';
--- the bundles' rows are not changed, nor truncated
+-- the bundles' rows are not changed, nor truncated (the table a system
+-- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
+SET allow_system_table_mods = on;
 TRUNCATE pg_history.bundles;
+RESET allow_system_table_mods;
 
 -- a push aborted: nothing pushed, nothing let go of
 SELECT test_cs_ref_root('pages', pg_temp.h('\x0a1199'));

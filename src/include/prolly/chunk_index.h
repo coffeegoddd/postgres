@@ -154,10 +154,10 @@ typedef struct ChunkIndexRoutine
 	 * Marks the chunk's entry freed by this transaction, its entry (counts
 	 * and all) in *out, if nothing holds it: its counts zero, no other
 	 * transaction changing them, this transaction not putting it, and
-	 * held(hash) false (this transaction's own holds).  False otherwise.
+	 * held(idx, hash) false (this transaction's own holds).  False otherwise.
 	 */
 	bool		(*free) (Relation idx, const uint8 *hash,
-						 bool (*held) (const uint8 *hash),
+						 bool (*held) (Relation idx, const uint8 *hash),
 						 ChunkIndexEntry *out);
 
 	/*
