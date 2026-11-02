@@ -550,8 +550,9 @@ probe_free(Relation rel, uint64 d, BlockNumber nblocks)
  * none are found (a region of them grows a page at a time as its appends
  * reach its end: see extend_region).  A page the map has is looked at with
  * those before it, for where a run of free pages begins; the run's pages
- * are then locked in order, each checked free, and made afresh.  The map is a hint, not WAL-logged: a
- * page it has wrongly is passed by, and taken out of it.
+ * are then locked in order, each checked free, and made afresh.  The map
+ * is a hint, not WAL-logged: a page it has wrongly is passed by, and taken
+ * out of it.
  */
 static int64
 take_free_pages(Relation rel, uint32 generation, int npages)
@@ -638,9 +639,9 @@ static void page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generati
 /*
  * The region grown over the data pages just after it, as many as len bytes
  * need past its end, if they are free (every byte dead): locked in order,
- * each checked free, published as this backend's region's (from its page
- * now on) and marked open, then made afresh.  False, nothing done, if they
- * are not all free, or more than a region's.  (Its first page as before.)
+ * each checked free, published as this backend's region's (from the
+ * region's first page still) and marked open, then made afresh.  False,
+ * nothing done, if they are not all free, or more than a region's.
  */
 static bool
 extend_region(Relation rel, ChunkLogRegion *region, size_t len)
