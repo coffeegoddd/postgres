@@ -130,6 +130,40 @@ my $end_lsn = $primary->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()
 like($stdout, qr/rmgr: ChunkIndex .*desc: VACUUM snapshotConflictHorizon: [1-9]\d*, nentries: \d+/,
 	'pg_waldump describes VACUUM\'s records, with their conflict horizons');
 
+# an entry frozen is seen by every snapshot: a standby's query whose
+# snapshot did not see its insert conflicts with its freezing (else, read
+# as of its snapshot, the store would have a chunk put after it).  No
+# feedback, so that the primary's VACUUM freezes it at once.
+$standby->append_conf('postgresql.conf', 'hot_standby_feedback = off');
+$standby->reload;
+$primary->poll_query_until('postgres',
+	q{SELECT count(*) = 1 AND bool_and(backend_xmin IS NULL) FROM pg_stat_replication})
+  or die 'the standby\'s feedback still holds the primary back';
+$primary->safe_psql('postgres', q{
+	SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h('\x0e0e'), '\x0e0e');
+});
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+$primary->wait_for_replay_catchup($standby);
+my $frozen_reader = $standby->background_psql('postgres', on_error_stop => 0);
+$frozen_reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $count_before = $frozen_reader->query_safe('SELECT count(*) FROM pg_history_export()');
+$primary->safe_psql('postgres', q{
+	SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h('\x0f0f'), '\x0f0f');
+});
+$primary->safe_psql('postgres', "VACUUM pg_history.chunk_index; $flush");
+is($primary->safe_psql('postgres', q{SELECT test_chunk_index_unfrozen('pg_history.chunk_index')}), '0',
+	'the chunk put after the standby query\'s snapshot frozen on the primary');
+$primary->wait_for_replay_catchup($standby);
+# (the reader idle in its transaction: the conflict ends its session)
+my $new = q{SELECT count(*) FROM pg_history_export() WHERE hash = h('\x0f0f')};
+my $count_after = eval { $frozen_reader->query($new) };
+my $ended = $@ ne '' || $frozen_reader->{stderr} =~ /conflict with recovery/;
+my $count_seen = (defined $count_after && $count_after =~ /^(\d+)/) ? $1 : '';
+ok($ended || $count_seen eq '0',
+	"a chunk frozen after a standby query's snapshot: the query ended by the conflict, or not seeing it ('$count_seen')");
+is($standby->safe_psql('postgres', $new), '1', 'a snapshot after it sees it');
+eval { $frozen_reader->quit; };
+
 $standby->stop;
 $primary->stop;
 done_testing();

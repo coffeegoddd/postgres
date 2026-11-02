@@ -2163,7 +2163,8 @@ ipage_vacuum(Page page, const uint8 *fates, int n)
 }
 
 /*
- * Each transaction id an entry names on its own: xmin, committed, is
+ * Each transaction id an entry names on its own: xmin, committed and before
+ * the horizon (frozen: the oldest any snapshot running might not see), is
  * frozen whatever xmax is (a freeing running leaves it, being past the
  * horizon); xmax, committed, makes the entry dead, aborted, gone
  */
@@ -2369,6 +2370,16 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 					(!TransactionIdIsValid(horizon) ||
 					 TransactionIdFollows(page_entry(page, i)->xmax, horizon)))
 					horizon = page_entry(page, i)->xmax;
+
+				/*
+				 * (an entry frozen is seen by every snapshot: a hot
+				 * standby's query whose snapshot did not see its insert
+				 * conflicts with its freezing, as with heap's)
+				 */
+				if ((fates[i] == FATE_FREEZE || fates[i] == FATE_FREEZE_CLEAR) &&
+					(!TransactionIdIsValid(horizon) ||
+					 TransactionIdFollows(page_entry(page, i)->xmin, horizon)))
+					horizon = page_entry(page, i)->xmin;
 			}
 			if (change)
 			{
