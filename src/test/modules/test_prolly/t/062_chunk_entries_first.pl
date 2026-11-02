@@ -87,6 +87,9 @@ is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 my $r = $primary->background_psql('postgres', on_error_stop => 0);
 $r->query_safe(q{SELECT injection_points_set_local()});
 $r->query_safe(q{SELECT (test_cs_put('pages', blob(1501))).stored});
+# (another's region after it: the region not at the log's end, which would
+# go on into pages new, but let go of for the next)
+$primary->safe_psql('postgres', q{SELECT (test_cs_put('pages', blob(1599))).stored});
 $r->query_safe(q{SELECT injection_points_attach('chunk-log-region-sealed', 'error')});
 $r->query(q{SELECT test_cs_put('pages', huge(1502))});
 like($r->{stderr}, qr/error triggered for injection point chunk-log-region-sealed/,

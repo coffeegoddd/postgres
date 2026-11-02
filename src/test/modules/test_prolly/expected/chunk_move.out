@@ -1,6 +1,11 @@
 Parsed test spec with 4 sessions
 
 starting permutation: c_compact v_vacuum v_check
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
 sum
 ---
   6
@@ -27,6 +32,11 @@ t |     6|        6|      1
 
 
 starting permutation: h_begin h_hold c_compact h_commit v_vacuum v_check
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
 sum
 ---
   6
@@ -61,6 +71,11 @@ t |     6|        6|      1
 
 
 starting permutation: c_begin c_compact r_root c_commit v_vacuum v_check
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
 sum
 ---
   6
@@ -96,6 +111,11 @@ t |     6|        6|      2
 
 
 starting permutation: c_begin c_compact r_put c_commit v_check
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
 sum
 ---
   6
@@ -130,6 +150,11 @@ t |     6|        6|      1
 
 
 starting permutation: c_begin c_compact r_read c_rollback v_vacuum v_check
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
 sum
 ---
   6
@@ -164,6 +189,11 @@ t |     6|        6|      1
 
 
 starting permutation: c_begin c_compact r_read c_commit v_vacuum v_check
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
 sum
 ---
   6

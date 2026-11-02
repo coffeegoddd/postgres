@@ -31,11 +31,13 @@
  * Every page keeps the standard page layout (a page header, pd_lower at the
  * end of the bytes, the unused rest a hole) with a ChunkPageOpaque in its
  * special space marking it as a page of this log, which a read checks, and
- * counting the page's bytes no chunk's any more.  A page written full and
- * all of it dead goes in the relation's free space map, and an append
- * that needs a page takes one from there before claiming new ones.  (A
- * page a region did not fill stays: its backend may go on appending to
- * it.)
+ * counting the page's bytes no chunk's any more.  The log's space is
+ * handed out, taken back and compacted a segment at a time (32 data pages,
+ * aligned): a region is whole segments, a claim at the end is too, and a
+ * segment every page of which is written full and all dead goes in the
+ * relation's free space map (its first page), which an append that needs
+ * room takes from before claiming new pages.  (A page a region did not
+ * fill stays: its backend may go on appending to it.)
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -93,18 +95,19 @@ typedef struct ChunkLogRoutine
 	void		(*release) (Relation rel, const ChunkLogRun *run);
 
 	/*
-	 * The run prepared, grown in place over the pages after it to room for
-	 * len bytes more, if they are free; false if not (the run as it was).
+	 * The run prepared, grown in place over the unused segments after it
+	 * until it has room for len bytes; false if it has not (grown as far
+	 * as they went).
 	 * Nothing of the run is let go of either way: bytes reserved in it and
 	 * not yet written may stay so (a pack's, written after).
 	 */
 	bool		(*extend) (Relation rel, ChunkLogRun *run, size_t len);
 
 	/*
-	 * prepare, but only in the room this backend's region has, or in a
-	 * segment free, and (below not 0) wholly before the place below: false,
-	 * no room made (the run empty, for release), if it would have to grow
-	 * the log.
+	 * prepare, but only in the room this backend's region has, or in
+	 * segments free, and (below not 0) wholly before the place below:
+	 * false, if it would have to grow the log, the run (for release) the
+	 * region as it is, with too little room, or none.
 	 */
 	bool		(*prepare_free) (Relation rel, size_t len, uint64 below,
 								 ChunkLogRun *run);
@@ -198,16 +201,23 @@ typedef struct ChunkLogSegments
 	bool		worth;			/* those come to a segment's */
 	uint32		evacuable;		/* at the end, their live chunks fitting in
 								 * the free segments below */
+	uint32		pending;		/* passed by: chunks freed on them kept for
+								 * snapshots still */
 	BlockNumber grow;			/* the pages compaction may grow the log by:
 								 * a segment's if none is free */
 } ChunkLogSegments;
 
 /*
  * Puts every segment free in the free space map (O(log); VACUUM's), and
- * what it found of the segments in *out.
+ * what it found of the segments in *out, those with bytes of the chunks
+ * freed kept for snapshots (npending, at plocs, plens long) passed by.
+ * FindSegments finds the same (none passed by), the map as it is.
  */
-extern void ChunkLogRecordFree(Relation rel, double fraction,
+extern void ChunkLogRecordFree(Relation rel, double fraction, int npending,
+							   const uint64 *plocs, const uint32 *plens,
 							   ChunkLogSegments *out);
+extern void ChunkLogFindSegments(Relation rel, double fraction,
+								 ChunkLogSegments *out);
 
 
 /*

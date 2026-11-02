@@ -20,6 +20,7 @@
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_pin.h"
 #include "prolly/chunk_store.h"
+#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -862,25 +863,25 @@ ChunkStoreFreeUnheld(Relation log, Relation idx)
 
 typedef struct CompactState
 {
-	const uint64 *starts;		/* the pages to compact, ascending */
+	const uint64 *starts;		/* the segments to compact, ascending */
 	const uint64 *ends;
-	int			npages;
+	int			nsegments;
 	ChunkIndexEntry *entries;	/* the chunks with bytes on any */
 	int			n;
 	int			cap;
 } CompactState;
 
-/* a chunk's entry kept if its bytes are on any page to compact */
+/* a chunk's entry kept if its bytes are on any segment to compact */
 static void
 collect_compact(void *arg, const ChunkIndexEntry *e)
 {
 	CompactState *st = arg;
 	int			lo = 0,
-				hi = st->npages;
+				hi = st->nsegments;
 
 	if (e->len == 0)
 		return;
-	/* (the first page ending past the chunk's start: on it, or past it) */
+	/* (the first segment ending past the chunk's start: on it, or past it) */
 	while (lo < hi)
 	{
 		int			mid = (lo + hi) / 2;
@@ -890,7 +891,7 @@ collect_compact(void *arg, const ChunkIndexEntry *e)
 		else
 			hi = mid;
 	}
-	if (lo == st->npages || st->starts[lo] >= e->loc + e->len)
+	if (lo == st->nsegments || st->starts[lo] >= e->loc + e->len)
 		return;
 	if (st->n == st->cap)
 	{
@@ -911,7 +912,6 @@ entry_loc_cmp(const void *a, const void *b)
 
 struct ChunkCompaction
 {
-	MemoryContext cxt;
 	ChunkIndexEntry *entries;	/* the chunks to move, in log order */
 	int			n;
 	int			next;			/* the next to move */
@@ -927,10 +927,9 @@ ChunkStoreCompactBegin(Relation log, Relation idx, int n, const uint64 *starts,
 
 	if (!HaveRegisteredOrActiveSnapshot())
 		elog(ERROR, "cannot compact the history store without an active snapshot");
-	c->cxt = cxt;
 	st.starts = starts;
 	st.ends = ends;
-	st.npages = n;
+	st.nsegments = n;
 	if (n > 0)
 		ChunkIndex->visit(idx, collect_compact, &st);
 	if (st.n > 1)
@@ -943,7 +942,8 @@ ChunkStoreCompactBegin(Relation log, Relation idx, int n, const uint64 *starts,
 
 int
 ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
-					  uint64 below, bool may_grow, uint64 *chunks, uint64 *bytes)
+					  uint64 below, BlockNumber grow_to, uint64 *chunks,
+					  uint64 *bytes)
 {
 	int			looked = 0;
 
@@ -959,46 +959,49 @@ ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
 		ChunkLogRun run;
 		PlaceArg	place;
 		void	   *data;
+		bool		may_grow = below == 0 &&
+			RelationGetNumberOfBlocks(log) < grow_to;
 
 		/*
-		 * (read under this transaction's snapshot: the bytes stay until no
-		 * snapshot might read them, whatever frees the chunk meanwhile; the
-		 * move then finds whether the entry is the chunk's still)
+		 * (a chunk longer than a segment, with the log not to grow: room for
+		 * it only where segments free lie one after another, prepare_free
+		 * looks; else it is passed by)
 		 */
-		data = palloc_extended(e->len, MCXT_ALLOC_HUGE);
-		ChunkLog->read(log, e->loc, data, e->len);
-		check_hash(e->hash, data, e->len, log, e->loc);
-
-		if (may_grow && below == 0)
+		if (may_grow)
 			ChunkLog->prepare(log, e->len, &run);
 		else if (!ChunkLog->prepare_free(log, e->len, below, &run))
 		{
 			ChunkLog->release(log, &run);
-			pfree(data);
-
-			/*
-			 * (no room for a chunk longer than a segment, which goes on pages
-			 * new alone: passed by; for another, none for any: done for now)
-			 */
 			if (e->len > ChunkLog->segment_bytes(log))
 			{
 				c->next++;
 				looked++;
 				continue;
 			}
+			/* (no room for any: done for now) */
 			return -1;
 		}
+
+		/*
+		 * The entry moved first, then the bytes read where it was: the move
+		 * finds whether the entry seen (collected in another transaction)
+		 * is the chunk's still, and once it is moved by this transaction no
+		 * VACUUM takes it out, so its bytes stay until this one ends
+		 */
 		place.log = log;
 		place.run = &run;
 		if (ChunkIndex->move(idx, e, &moved, reserve_place, &place))
 		{
+			data = palloc_extended(e->len, MCXT_ALLOC_HUGE);
+			ChunkLog->read(log, e->loc, data, e->len);
+			check_hash(e->hash, data, e->len, log, e->loc);
 			INJECTION_POINT("chunk-compact-moved", NULL);
 			ChunkLog->write(log, moved.loc, data, e->len);
+			pfree(data);
 			(*chunks)++;
 			*bytes += e->len;
 		}
 		ChunkLog->release(log, &run);
-		pfree(data);
 		c->next++;
 		looked++;
 		CHECK_FOR_INTERRUPTS();

@@ -16,10 +16,9 @@ setup
 		AS 'SELECT substr(sha256(mc_d(i)), 1, 20)';
 	SELECT count(*) FROM generate_series(1, 12) i, LATERAL test_chunk_put('mcl', 'mci', mc_h(i), mc_d(i));
 	SELECT count(*) FROM generate_series(2, 12, 2) i, LATERAL test_chunk_ref_root('mci', mc_h(i));
-	-- (the region this backend put them in let go of, by an invalidation of
-	-- the log's relcache entry, for VACUUM to make its rest dead: the
-	-- segment is then done with, to compact)
-	ALTER TABLE mcl SET (vacuum_truncate = on);
+	-- (the region this backend put them in let go of, for VACUUM to make
+	-- its rest dead: the segment is then done with, to compact)
+	SELECT test_chunk_log_let_go('mcl');
 }
 
 # (freed in a transaction of their own, and their entries taken out: the

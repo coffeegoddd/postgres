@@ -1284,6 +1284,7 @@ find_moved(Relation rel, Buffer primary, int mode, const uint8 *hash,
 				!belongs(e, bucket, masks))
 				continue;
 			if (TransactionIdEquals(e->xmin, xid) &&
+				!TransactionIdEquals(e->xmax, xid) &&
 				!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
 				put = true;
 			else if (TransactionIdEquals(e->xmax, xid) && !BufferIsValid(old_buf))
@@ -1301,6 +1302,7 @@ find_moved(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		CHECK_FOR_INTERRUPTS();
 		cur = ReadBuffer(rel, next);
 		LockBuffer(cur, mode);
+		check_ipage(rel, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
 	}
 	if (!put || !BufferIsValid(old_buf))
 	{
@@ -2469,7 +2471,11 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	ChunkLogSweep *sweep = NULL;
 	uint64		unheld = 0;
 	ChunkLogSegments segs = {0};
-	uint64		freed_kept = 0;
+	/* (chunks freed kept for snapshots: their places, their segments passed by) */
+	int			npending = 0,
+				pending_cap = 0;
+	uint64	   *plocs = NULL;
+	uint32	   *plens = NULL;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
 				dead_cap = 0;
@@ -2550,9 +2556,22 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				 */
 				if ((fates[i] == FATE_KEEP || fates[i] == FATE_FREEZE) &&
 					page_entry(page, i)->kind == CHUNK_KIND_CHUNK &&
+					page_entry(page, i)->len > 0 &&
 					TransactionIdIsValid(page_entry(page, i)->xmax) &&
 					!(page_entry(page, i)->flags & CHUNK_ENTRY_XMAX_ABORTED))
-					freed_kept++;
+				{
+					if (npending == pending_cap)
+					{
+						pending_cap = Max(64, pending_cap * 2);
+						plocs = plocs ? repalloc_array(plocs, uint64, pending_cap) :
+							palloc_array(uint64, pending_cap);
+						plens = plens ? repalloc_array(plens, uint32, pending_cap) :
+							palloc_array(uint32, pending_cap);
+					}
+					plocs[npending] = page_entry(page, i)->loc;
+					plens[npending] = page_entry(page, i)->len;
+					npending++;
+				}
 				if (fates[i] == FATE_REMOVE_FREED &&
 					(!TransactionIdIsValid(horizon) ||
 					 TransactionIdFollows(page_entry(page, i)->xmax, horizon)))
@@ -2635,14 +2654,6 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		INJECTION_POINT("chunk-index-vacuum-sweep", NULL);
 		if (sweep != NULL)
 			ChunkLogSweepEnd(log, sweep);
-		ChunkLogRecordFree(log, chunk_compact_dead_fraction, &segs);
-		/*
-		 * (none while chunks freed, or moved, are kept for snapshots that
-		 * might read them: their bytes are dead later, and a freer now
-		 * would find a segment's chunks moved already, and move nothing)
-		 */
-		if (freed_kept > 0)
-			segs.compactable = segs.evacuable = 0;
 		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
 		/*
 		 * (unless VACUUM is not to truncate, or the log's own
@@ -2655,14 +2666,32 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 			(void) ChunkLogTruncateTail(log);
 
 		/*
+		 * The segments free put in the free space map once the free end is
+		 * cut (not before: puts would take the end from the cut); those with
+		 * chunks freed kept for snapshots passed by (their bytes dead
+		 * later, and the chunks a freer moved off them, maybe, moved
+		 * already: a freer now would find nothing there to move)
+		 */
+		ChunkLogRecordFree(log, chunk_compact_dead_fraction, npending, plocs,
+						   plens, &segs);
+
+		/*
 		 * chunks nothing holds, segments to compact, or the end to evacuate:
 		 * a freer frees them, and what they held, compacts, and evacuates
 		 */
 		if (unheld > 0 || (segs.compactable > 0 && segs.worth) || segs.evacuable > 0)
+		{
+			ereport(DEBUG1,
+					(errmsg_internal("chunk index \"%s\": a freer to start: %llu chunks unheld, %u segments to compact%s, %u to evacuate, %u passed by for snapshots",
+									 RelationGetRelationName(idx),
+									 (unsigned long long) unheld, segs.compactable,
+									 segs.worth ? "" : " (not worth it)",
+									 segs.evacuable, segs.pending)));
 			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx),
 									segs.compactable > 0 && segs.worth,
 									segs.evacuable > 0,
 									chunk_compact_dead_fraction, segs.grow);
+		}
 		relation_close(log, NoLock);
 	}
 

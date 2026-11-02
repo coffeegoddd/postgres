@@ -137,11 +137,14 @@ extern uint64 ChunkStoreFreeUnheld(Relation log, Relation idx);
  * Begin finds the chunks, in one visit of the index (O(store)), kept in
  * cxt; each step then moves the next max of them, in log order, in the
  * transaction it is in (a chunk a transaction holds or changes is passed
- * by), into this backend's region, a segment free, or (may_grow) pages
- * new; with below (not 0) into room wholly before it alone.  A step
- * answers the chunks it looked at, none if all are, or -1 if there is no
- * room for the next (a chunk longer than a segment is passed by then);
- * the chunks it moved and their bytes in *chunks and *bytes.
+ * by), into this backend's region, segments free, or pages new while the
+ * log has fewer than grow_to pages (0: never); with below (not 0) into
+ * room wholly before it alone, never new.  Each chunk is moved before its
+ * bytes are read where it was (the entry seen checked the chunk's still,
+ * and kept, by the move, until the transaction ends).  A step answers the
+ * chunks it looked at, none if all are, or -1 if there is no room for the
+ * next (a chunk longer than a segment is passed by then); the chunks it
+ * moved and their bytes in *chunks and *bytes.
  */
 typedef struct ChunkCompaction ChunkCompaction;
 
@@ -151,7 +154,7 @@ extern ChunkCompaction *ChunkStoreCompactBegin(Relation log, Relation idx,
 											   MemoryContext cxt);
 extern int	ChunkStoreCompactStep(Relation log, Relation idx,
 								  ChunkCompaction *c, int max, uint64 below,
-								  bool may_grow, uint64 *chunks,
+								  BlockNumber grow_to, uint64 *chunks,
 								  uint64 *bytes);
 extern void ChunkStoreCompactEnd(ChunkCompaction *c);
 

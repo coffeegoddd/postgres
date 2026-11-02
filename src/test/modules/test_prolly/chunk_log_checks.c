@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
+
 #include "access/relation.h"
 #include "access/htup_details.h"
 #include "fmgr.h"
@@ -19,6 +21,7 @@
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_region.h"
 #include "storage/lmgr.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "varatt.h"
@@ -28,6 +31,7 @@ PG_FUNCTION_INFO_V1(test_chunk_log_read);
 PG_FUNCTION_INFO_V1(test_chunk_log_end);
 PG_FUNCTION_INFO_V1(test_chunk_log_space);
 PG_FUNCTION_INFO_V1(test_chunk_log_segments);
+PG_FUNCTION_INFO_V1(test_chunk_log_let_go);
 PG_FUNCTION_INFO_V1(test_chunk_log_regions);
 
 static Relation
@@ -114,7 +118,7 @@ test_chunk_log_space(PG_FUNCTION_ARGS)
 /*
  * test_chunk_log_segments(rel, fraction, OUT segments, OUT free, OUT
  * compactable, OUT worth, OUT evacuable, OUT grow): what VACUUM finds of
- * the log's segments (and the free ones put in the free space map)
+ * the log's segments (none passed by; the free space map as it is)
  */
 Datum
 test_chunk_log_segments(PG_FUNCTION_ARGS)
@@ -125,7 +129,7 @@ test_chunk_log_segments(PG_FUNCTION_ARGS)
 	Datum		values[6];
 	bool		nulls[6] = {false, false, false, false, false, false};
 
-	ChunkLogRecordFree(rel, PG_GETARG_FLOAT8(1), &segs);
+	ChunkLogFindSegments(rel, PG_GETARG_FLOAT8(1), &segs);
 	relation_close(rel, AccessShareLock);
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -136,6 +140,18 @@ test_chunk_log_segments(PG_FUNCTION_ARGS)
 	values[4] = Int64GetDatum((int64) segs.evacuable);
 	values[5] = Int64GetDatum((int64) segs.grow);
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
+}
+
+/*
+ * test_chunk_log_let_go(rel): this backend's region in the log forgotten,
+ * as a relcache invalidation of the log has it (for VACUUM to let go of)
+ */
+Datum
+test_chunk_log_let_go(PG_FUNCTION_ARGS)
+{
+	CacheInvalidateRelcacheByRelid(PG_GETARG_OID(0));
+	CommandCounterIncrement();
+	PG_RETURN_VOID();
 }
 
 /* test_chunk_log_regions(rel): the regions live backends hold in the log */

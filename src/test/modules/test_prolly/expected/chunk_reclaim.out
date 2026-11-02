@@ -37,7 +37,7 @@ SELECT roots FROM test_chunk_ref_root('qi', h(blob('anchor')));
 SELECT pages, full_pages, dead, free_pages FROM test_chunk_log_space('ql');
  pages | full_pages | dead | free_pages 
 -------+------------+------+------------
-    99 |         98 | 2592 |          0
+    99 |         98 |    0 |          0
 (1 row)
 
 SELECT pg_relation_size('ql') AS size_full \gset
