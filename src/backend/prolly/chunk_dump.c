@@ -134,14 +134,6 @@ read_as_of(Relation log, Relation idx, Snapshot snap, const uint8 *hash,
 	return data;
 }
 
-/*
- * pg_history_export(): the store as of the snapshot, its chunks each after
- * those it references, then its pointers.  Each chunk is visited once (a set
- * of those out, or on the way), by a walk down from each in turn, a chunk
- * out once the chunks it names are.  O(store), in memory a set of the
- * chunks' names (the rows themselves go to the function's tuplestore,
- * which spills to disk).
- */
 static bool note_chunk(void *arg, const ChunkIndexEntry *e);
 
 /* whether the tier's index has a chunk, as of the active snapshot */
@@ -156,6 +148,14 @@ tier_has_chunks(void)
 	return any;
 }
 
+/*
+ * pg_history_export(): the store as of the snapshot, its chunks each after
+ * those it references, then its pointers.  Each chunk is visited once (a set
+ * of those out, or on the way), by a walk down from each in turn, a chunk
+ * out once the chunks it names are.  O(store), in memory a set of the
+ * chunks' names (the rows themselves go to the function's tuplestore,
+ * which spills to disk).
+ */
 Datum
 pg_history_export(PG_FUNCTION_ARGS)
 {

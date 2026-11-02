@@ -6,9 +6,11 @@
 # removed by VACUUM; a crash after the catalog's file is extended for a
 # pack's entry, before the entry's record, leaves a page the next pack
 # makes; a transaction's chunks past a pack's size go in packs one after
-# another; a hot standby, at the same tier, reads them; and a pack all
-# dead keeps its object until the standby has replayed past where it
-# died.
+# another; a hot standby, at the same tier, reads them; a pack all dead
+# keeps its object until the standby has replayed past where it died (or
+# while a standby is being made); the store is opened again once its setting
+# changes; and standbys promoted apart name their packs apart, and
+# remove the packs from before only once adopted.
 
 use strict;
 use warnings FATAL => 'all';
@@ -142,6 +144,111 @@ $node->wait_for_replay_catchup($standby);
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $p1 - 1, 'and removed once it has');
 
-$standby->stop;
+# a standby being made (a base backup running, its walsender not yet
+# told how far anything replayed): not past
+my $dead_pack = sub {
+	my ($tag) = @_;
+	$node->safe_psql('postgres', qq{
+		SELECT count(*) FROM generate_series(1, 5) g,
+			LATERAL test_cs_put('tier', blob('$tag' || g, 3000));
+		SELECT count(*) FROM generate_series(1, 5) g,
+			LATERAL test_cs_ref_root('tier', h(blob('$tag' || g, 3000)));
+	});
+	$node->safe_psql('postgres', qq{
+		SELECT count(*) FROM generate_series(1, 5) g,
+			LATERAL test_cs_unref_root('tier', h(blob('$tag' || g, 3000)));
+		SELECT test_cs_free('tier', ARRAY(SELECT h(blob('$tag' || g, 3000)) FROM generate_series(1, 5) g));
+	});
+};
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+my $backup_dir = PostgreSQL::Test::Utils::tempdir . '/made';
+my $bb = IPC::Run::start(
+	[ 'pg_basebackup', '--no-sync', '--max-rate=32', '--wal-method=none',
+	  '--pgdata' => $backup_dir, '--dbname' => $node->connstr('postgres') ],
+	'>' => \my $bb_out, '2>' => \my $bb_err);
+$node->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_stat_replication WHERE state = 'backup'})
+  or die 'no base backup running';
+$dead_pack->('quiet');
+my $p2 = $packs->();
+# (the first VACUUM counts them dead; the standby streaming then past it)
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p2, 'all dead, kept while a standby is being made');
+$bb->kill_kill;
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_replication WHERE state = 'backup'})
+  or die 'the base backup runs still';
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p2 - 1, 'and removed once it is not');
+
+# the store opened again once the settings change: a pack after a reload
+# where they say
+my $tier2 = PostgreSQL::Test::Utils::tempdir;
+$node->safe_psql('postgres', qq{
+	SELECT (test_cs_put('tier', blob('there', 100))).stored;
+	ALTER SYSTEM SET history_tier_location = '$tier2';
+	SELECT pg_reload_conf();
+	SELECT pg_sleep(0.5);
+	SELECT (test_cs_put('tier', blob('moved', 100))).stored;
+	ALTER SYSTEM RESET history_tier_location;
+	SELECT pg_reload_conf();
+});
+opendir(my $dh2, $tier2) or die;
+is(scalar(grep(/^packs#/, readdir($dh2))), 1, 'a pack where the setting says, after a reload');
+closedir($dh2);
+
+# two standbys promoted apart, the primary stopped: each on timeline 2,
+# each its own owner, so their packs' names are not each other's
+$node->backup('b2');
+my $standby2 = PostgreSQL::Test::Cluster->new('tier_standby2');
+$standby2->init_from_backup($node, 'b2', has_streaming => 1);
+$standby2->append_conf('postgresql.conf', qq{history_tier_location = '$tier'});
+$standby2->start;
+$node->wait_for_replay_catchup($standby2);
+$node->wait_for_replay_catchup($standby);
 $node->stop;
+$standby->promote;
+$standby2->promote;
+my $tli = q{SELECT substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)};
+is($standby->safe_psql('postgres', $tli), $standby2->safe_psql('postgres', $tli),
+	'both promoted to the same timeline');
+my $p3 = $packs->();
+my $owner = q{SELECT owner FROM test_tier_packs('pg_history.tier_chunks') ORDER BY id DESC LIMIT 1};
+my $old_owner = $standby->safe_psql('postgres', $owner);
+for my $n ($standby, $standby2)
+{
+	$n->safe_psql('postgres', q{
+		SELECT (test_cs_put('tier', blob('promoted', 100))).stored;
+		SELECT test_cs_ref_root('tier', h(blob('promoted', 100)));
+	});
+}
+my ($o1, $o2) = map { $_->safe_psql('postgres', $owner) } ($standby, $standby2);
+ok($o1 ne $o2 && $o1 ne $old_owner && $o2 ne $old_owner, 'three owners');
+is($packs->(), $p3 + 2, 'two packs, of two names');
+is($standby->safe_psql('postgres', q{SELECT convert_from(test_cs_get('tier', h(blob('promoted', 100))), 'UTF8') = rpad('promoted', 100, '.')}),
+	't', 'each reads its own');
+is($standby2->safe_psql('postgres', q{SELECT convert_from(test_cs_get('tier', h(blob('promoted', 100))), 'UTF8') = rpad('promoted', 100, '.')}),
+	't', 'and so does the other');
+$standby2->stop;
+
+# the packs from before the promotion, dead: not removed, until adopted
+$standby->safe_psql('postgres', q{
+	SELECT count(*) FROM generate_series(1, 300) g,
+		LATERAL test_cs_unref_root('tier', h(blob('big' || g, 250000)));
+	SELECT test_cs_free('tier', ARRAY(SELECT h(blob('big' || g, 250000)) FROM generate_series(1, 300) g));
+});
+$p3 = $packs->();
+$standby->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p3, 'packs dead from before the promotion: kept');
+ok($standby->safe_psql('postgres', 'SELECT pg_history_tier_adopt()') > 0, 'adopted');
+$standby->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p3 - 2, 'and then removed');
+is($standby->safe_psql('postgres', q{SELECT convert_from(test_cs_get('tier', h(blob('promoted', 100))), 'UTF8') = rpad('promoted', 100, '.')}),
+	't', 'its own read still');
+
+$standby->stop;
 done_testing();

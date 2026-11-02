@@ -2765,6 +2765,7 @@ tier_relation_nontransactional_truncate(Relation rel)
 {
 	RelationTruncate(rel, 0);
 	ChunkTierInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+	ChunkTierTruncated(rel);
 	/* (its stamp a new one) */
 	if (rel->rd_amcache != NULL)
 	{

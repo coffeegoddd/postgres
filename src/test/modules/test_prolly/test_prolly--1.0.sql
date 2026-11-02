@@ -410,9 +410,9 @@ BEGIN
 	RETURN false;
 END $$;
 
--- A tier's packs: their states, sizes and dead bytes.
+-- A tier's packs: their states, sizes, dead bytes and owners.
 CREATE FUNCTION test_tier_packs(rel regclass, OUT id int8, OUT state text, OUT size int8,
-	OUT dead int8)
+	OUT dead int8, OUT owner text)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 

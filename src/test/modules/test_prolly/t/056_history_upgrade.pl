@@ -1,8 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # pg_upgrade carries over only the relations users made, not the history
-# store initdb makes: a cluster whose store holds chunks or pointers is
-# refused, and one whose stores are empty is not.
+# store initdb makes: a cluster whose store holds chunks or pointers, or
+# whose tier has packs, is refused, and one whose stores are empty is not.
 
 use strict;
 use warnings FATAL => 'all';
@@ -53,5 +53,29 @@ $old->safe_psql('postgres', q{
 });
 $old->stop;
 $refused->('and one with a pointer');
+
+# and one whose tier alone has a pack (its objects named by its stamp)
+my $old2 = PostgreSQL::Test::Cluster->new('history_old2');
+$old2->init;
+my $tier = PostgreSQL::Test::Utils::tempdir;
+$old2->append_conf('postgresql.conf', qq{history_tier_location = '$tier'});
+$old2->start;
+$old2->safe_psql('postgres', q{
+	CREATE EXTENSION test_prolly;
+	SELECT (test_cs_put('tier', '\x02')).stored;
+});
+$old2->stop;
+my ($stdout, $stderr) = run_command([
+	'pg_upgrade', '--no-sync', '--check',
+	'--old-datadir' => $old2->data_dir,
+	'--new-datadir' => $new->data_dir,
+	'--old-bindir' => $bindir,
+	'--new-bindir' => $bindir,
+	'--socketdir' => $new->host,
+	'--old-port' => $old2->port,
+	'--new-port' => $new->port]);
+like($stdout . $stderr,
+	qr/Database "postgres" has version-control history, which cannot be upgraded yet/,
+	'and one whose tier has a pack');
 
 done_testing();
