@@ -135,7 +135,10 @@ extern void ChunkTierCheckIndex(Relation idx, const char *what);
  * Whether the database dboid's tiers have packs (a marker of each that has,
  * in the store): for DROP DATABASE, and CREATE DATABASE from it as a
  * template, refused while they have.  The place set now is the one looked
- * in.
+ * in: with none set, or another than its packs were put at, nothing is
+ * found (a tier's own puts and VACUUMs refuse another place; changing
+ * history_tier_location while packs are there, and then dropping their
+ * database, is not supported).
  */
 extern bool ChunkTierDatabaseHasPacks(Oid dboid);
 

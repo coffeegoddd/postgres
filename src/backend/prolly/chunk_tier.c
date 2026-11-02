@@ -99,7 +99,9 @@ typedef struct TierMeta
 	uint32		adopted;		/* packs numbered below are this server's */
 	Oid			dboid;			/* the database its objects are named for (a
 								 * copy's, another's, until its first pack) */
-	uint32		marked;			/* the database's marker made, not removed */
+	TimeLineID	marked_tli;		/* the timeline the marker was made on */
+	uint64		marked_place;	/* the place it was made at (0: none made, or
+								 * removed) */
 	uint64		place;			/* the store and place its objects are in
 								 * (their hash; 0: none yet) */
 } TierMeta;
@@ -409,23 +411,44 @@ unlock_marker(Relation rel, LOCKMODE mode)
 	UnlockDatabaseObject(RelationRelationId, RelationGetRelid(rel), MARKER_LOCK_SUBID, mode);
 }
 
-/* the meta page's marked set (WAL-logged, flushed if cleared) */
+static uint64 current_place(void);
+static void check_place(Relation rel, const TierMeta *meta);
+
+/*
+ * The meta page's mark set: the marker made, at the place set now, on
+ * this timeline; or (place 0) none (WAL-logged, flushed if cleared)
+ */
 static void
-set_marked(Relation rel, bool marked)
+set_marked(Relation rel, uint64 place)
 {
 	Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
 	GenericXLogState *state;
+	TierMeta   *meta;
 	XLogRecPtr	lsn;
 
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	state = GenericXLogStart(rel);
-	tier_meta(rel, GenericXLogRegisterBuffer(state, mbuf, 0))->marked = marked;
+	meta = tier_meta(rel, GenericXLogRegisterBuffer(state, mbuf, 0));
+	meta->marked_place = place;
+	meta->marked_tli = place != 0 ? GetWALInsertionTimeLine() : 0;
 	lsn = GenericXLogFinish(state);
 	UnlockReleaseBuffer(mbuf);
 
 	/* (cleared before the marker is removed: after a crash, no stale mark) */
-	if (!marked)
+	if (place == 0)
 		XLogFlush(lsn);
+}
+
+/*
+ * Whether the mark says the marker is there: made at the place set now,
+ * on this timeline (a recovery to a point in time, onto another, may be
+ * to before its removal), for this database
+ */
+static bool
+marked_here(const TierMeta *meta)
+{
+	return meta->marked_place != 0 && meta->marked_place == current_place() &&
+		meta->marked_tli == GetWALInsertionTimeLine() && meta->dboid == MyDatabaseId;
 }
 
 /*
@@ -442,19 +465,22 @@ ensure_marker(Relation rel)
 
 	lock_marker(rel, ShareLock);
 	meta = read_meta(rel);
-	if (meta.marked && meta.dboid == MyDatabaseId)
+	/* (objects elsewhere than the settings say: nothing made, refused) */
+	check_place(rel, &meta);
+	if (marked_here(&meta))
 		return ShareLock;
 	unlock_marker(rel, ShareLock);
 	lock_marker(rel, ExclusiveLock);
 	meta = read_meta(rel);
-	if (meta.marked && meta.dboid == MyDatabaseId)
+	check_place(rel, &meta);
+	if (marked_here(&meta))
 		return ExclusiveLock;
 	os = tier_objects();
 	name = marker_name(stamp_for(meta.stamp, MyDatabaseId));
 	if (!os->routine->size(os, name, &size))
 		os->routine->put(os, name, "", 0);
 	pfree(name);
-	set_marked(rel, true);
+	set_marked(rel, current_place());
 	return ExclusiveLock;
 }
 
@@ -465,7 +491,7 @@ remove_marker(Relation rel, const TierMeta *meta)
 	ObjectStore *os = tier_objects();
 	char	   *name = marker_name(meta_stamp(meta));
 
-	set_marked(rel, false);
+	set_marked(rel, 0);
 	os->routine->remove(os, name);
 	pfree(name);
 }
@@ -833,6 +859,8 @@ ChunkTierForgetMarker(Relation rel)
 		return;
 	lock_marker(rel, ExclusiveLock);
 	meta = read_meta(rel);
+	/* (its marker elsewhere than the settings say: not dropped, nor truncated) */
+	check_place(rel, &meta);
 	if (meta.dboid == MyDatabaseId)
 		remove_marker(rel, &meta);
 	unlock_marker(rel, ExclusiveLock);
@@ -1504,9 +1532,19 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 	pid_t		blocker = 0;
 	const char *why = NULL;
 
-	/* (objects elsewhere than the settings say: none removed, none counted gone) */
-	if (remove)
-		check_place(rel, &meta);
+	/*
+	 * (objects elsewhere than the settings say: none removed, none counted
+	 * gone, nor the marker; the rest of VACUUM done)
+	 */
+	if (remove && meta.place != 0 && meta.place != current_place())
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("tier \"%s\"'s objects are in another place than history_tier_store and history_tier_location say: none removed",
+						RelationGetRelationName(rel)),
+				 errhint("Set them back to where its packs were put.")));
+		remove = false;
+	}
 	gone = palloc_array(uint32, PACKS_PER_PAGE);
 
 	*frozen = RecentXmin;
