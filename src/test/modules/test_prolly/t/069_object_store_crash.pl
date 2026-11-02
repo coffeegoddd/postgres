@@ -41,7 +41,9 @@ $s->{run}->finish;
 $node->start;
 is($node->safe_psql('postgres', qq{SELECT test_os_size('directory', '$loc', 'p/cut') IS NULL}),
 	't', 'one cut short is not there');
-ok(grep(/\.tmp\./, glob($node->data_dir . "/$loc/p/*")), 'its temporary file left');
+opendir(my $dh, $node->data_dir . "/$loc") or die "no directory: $!";
+ok(grep(/^~/, readdir($dh)), 'its temporary file left');
+closedir($dh);
 is($node->safe_psql('postgres', qq{SELECT string_agg(name, ',' ORDER BY name) FROM test_os_list('directory', '$loc', '')}),
 	'p/kept', 'listings pass it by');
 $node->safe_psql('postgres', qq{SELECT test_os_put('directory', '$loc', 'p/cut', '\\x05')});

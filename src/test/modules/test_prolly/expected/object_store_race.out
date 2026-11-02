@@ -1,0 +1,44 @@
+Parsed test spec with 3 sessions
+
+starting permutation: a_put b_put o_wake a_detach b_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step a_put: SELECT test_os_put('directory', 'pg_test_object_race', 'r/x', '\x0a0a'::bytea); <waiting ...>
+step b_put: SELECT test_os_put('directory', 'pg_test_object_race', 'r/x', '\x0b0b0b'::bytea);
+test_os_put
+-----------
+           
+(1 row)
+
+step o_wake: SELECT injection_points_wakeup('object-store-written');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step a_put: <... completed>
+ERROR:  object "r/x" is there already
+step a_detach: SELECT injection_points_detach('object-store-written');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step b_check: 
+	SELECT test_os_read('directory', 'pg_test_object_race', 'r/x', 0, 3) AS bytes,
+		(SELECT string_agg(name, ',') FROM test_os_list('directory', 'pg_test_object_race', '')) AS listed,
+		(SELECT string_agg(f, ',') FROM pg_ls_dir('pg_test_object_race') f) AS files;
+
+bytes   |listed|files
+--------+------+-----
+\x0b0b0b|r/x   |r#x  
+(1 row)
+
+test_os_remove
+--------------
+              
+(1 row)
+

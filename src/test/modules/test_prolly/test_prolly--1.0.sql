@@ -507,5 +507,10 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_os_remove(store text, location text, name text)
-RETURNS bool
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- (they read and write files where the server may: not for every role)
+REVOKE ALL ON FUNCTION test_os_put(text, text, text, bytea),
+	test_os_read(text, text, text, int8, int4), test_os_size(text, text, text),
+	test_os_list(text, text, text), test_os_remove(text, text, text) FROM PUBLIC;
