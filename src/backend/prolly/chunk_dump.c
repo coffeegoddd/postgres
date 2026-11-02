@@ -5,16 +5,21 @@
  *
  * pg_history_export() is the store as of the transaction's snapshot: every
  * chunk it had then, each after the chunks it references (as ChunkFormat
- * finds them), then every pointer, as rows (hash, data, name): a chunk's
- * with no name, a pointer's with no data.  A chunk freed since the
- * snapshot is the store's still to it (its entry and bytes are taken out
- * once no snapshot might find it), so the chunks and the pointers are one
- * moment's.  pg_history.chunk_restore is a view of no rows whose INSERT
- * puts a chunk (its bytes checked against its name), or inserts a pointer
- * (which takes its root, by the pointers' trigger): pg_restore COPYs the
- * rows into it in one statement, one transaction, so no chunk restored is
- * freed before the pointers holding it are.  pg_history_has_chunks() says
- * whether the store has a chunk (a pointer names one), for pg_dump.
+ * finds them); then every chunk of its tier's bundles (the tier's, each
+ * after those it references, one the store has too out once); then every
+ * pointer; then every bundle: as rows (hash, data, name, roots), a chunk's
+ * with no name, a pointer's with no data, a bundle's with no hash (its
+ * name and roots).  A chunk freed since the snapshot is the store's still
+ * to it (its entry and bytes are taken out once no snapshot might find
+ * it), so the chunks, the pointers and the bundles are one moment's.
+ * pg_history.chunk_restore is a view of no rows whose INSERT puts a chunk
+ * (its bytes checked against its name) in the store, inserts a pointer
+ * (which takes its root, by the pointers' trigger), or pushes a bundle
+ * (pg_history_push: its chunks, put in the store before it, copied to the
+ * tier the target has): pg_restore COPYs the rows into it in one
+ * statement, one transaction, so no chunk restored is freed before the
+ * pointers holding it are, or the push taking it.  pg_history_has_chunks()
+ * says whether the store, or its tier, has a chunk, for pg_dump.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -37,6 +42,7 @@
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_store.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -102,14 +108,15 @@ to_bytea(const void *data, uint32 len)
 static void
 emit_chunk(ReturnSetInfo *rsinfo, const DumpFrame *f)
 {
-	Datum		values[3];
-	bool		nulls[3] = {false, false, true};
+	Datum		values[4];
+	bool		nulls[4] = {false, false, true, true};
 	bytea	   *h = to_bytea(f->hash, CHUNK_HASH_LEN);
 	bytea	   *d = to_bytea(f->data, f->len);
 
 	values[0] = PointerGetDatum(h);
 	values[1] = PointerGetDatum(d);
 	values[2] = (Datum) 0;
+	values[3] = (Datum) 0;
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	pfree(h);
 	pfree(d);
@@ -156,6 +163,67 @@ tier_has_chunks(void)
  * chunks' names (the rows themselves go to the function's tuplestore,
  * which spills to disk).
  */
+/*
+ * The chunks root reaches the store of log and idx had as of snap, not out
+ * yet (seen), each after those it references
+ */
+static void
+export_from(ReturnSetInfo *rsinfo, Relation log, Relation idx, Snapshot snap,
+			HTAB *seen, const uint8 *root)
+{
+	DumpFrame  *stack;
+	int			cap = 16;
+	int			depth;
+	bool		found;
+
+	(void) hash_search(seen, root, HASH_ENTER, &found);
+	if (found)
+		return;
+	stack = palloc(cap * sizeof(DumpFrame));
+
+	/* (a chunk pushed is seen: one named again is out, or on the way) */
+	memcpy(stack[0].hash, root, CHUNK_HASH_LEN);
+	stack[0].data = NULL;
+	depth = 1;
+	while (depth > 0)
+	{
+		DumpFrame  *f = &stack[depth - 1];
+
+		CHECK_FOR_INTERRUPTS();
+		if (f->data == NULL)
+		{
+			f->data = read_as_of(log, idx, snap, f->hash, &f->len);
+			memset(&f->refs, 0, sizeof(f->refs));
+			ChunkFormat->refs(f->data, f->len, collect_ref, &f->refs);
+			f->next = 0;
+		}
+		if (f->next < f->refs.n)
+		{
+			const uint8 *kid = f->refs.hashes + (Size) f->next++ * CHUNK_HASH_LEN;
+
+			(void) hash_search(seen, kid, HASH_ENTER, &found);
+			if (found)
+				continue;
+			if (depth == cap)
+			{
+				cap *= 2;
+				stack = repalloc(stack, cap * sizeof(DumpFrame));
+				f = &stack[depth - 1];
+			}
+			memcpy(stack[depth].hash, kid, CHUNK_HASH_LEN);
+			stack[depth].data = NULL;
+			depth++;
+			continue;
+		}
+		emit_chunk(rsinfo, f);
+		pfree(f->data);
+		if (f->refs.hashes)
+			pfree(f->refs.hashes);
+		depth--;
+	}
+	pfree(stack);
+}
+
 Datum
 pg_history_export(PG_FUNCTION_ARGS)
 {
@@ -164,17 +232,11 @@ pg_history_export(PG_FUNCTION_ARGS)
 	Relation	log;
 	Relation	idx;
 	HashList	all = {0};
+	HashList	bundle_roots = {0};
 	HASHCTL		ctl;
 	HTAB	   *seen;
-	DumpFrame  *stack;
-	int			cap = 16;
+	MemoryContext outer;
 
-	/* (the tier's chunks are not dumped yet: a dump would leave them out) */
-	if (tier_has_chunks())
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("the history store's tier has chunks, which cannot be dumped yet"),
-				 errhint("Dump without history (--no-history).")));
 	InitMaterializedSRF(fcinfo, 0);
 	log = relation_open(ChunkStoreLogRelid(), AccessShareLock);
 	idx = relation_open(ChunkStoreIndexRelid(), AccessShareLock);
@@ -185,74 +247,76 @@ pg_history_export(PG_FUNCTION_ARGS)
 	ctl.hcxt = CurrentMemoryContext;
 	seen = hash_create("history export", Max(all.n, 16), &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	stack = palloc(cap * sizeof(DumpFrame));
 	for (int i = 0; i < all.n; i++)
-	{
-		const uint8 *root = all.hashes + (Size) i * CHUNK_HASH_LEN;
-		int			depth;
-		bool		found;
-
-		(void) hash_search(seen, root, HASH_ENTER, &found);
-		if (found)
-			continue;
-
-		/* (a chunk pushed is seen: one named again is out, or on the way) */
-		memcpy(stack[0].hash, root, CHUNK_HASH_LEN);
-		stack[0].data = NULL;
-		depth = 1;
-		while (depth > 0)
-		{
-			DumpFrame  *f = &stack[depth - 1];
-
-			CHECK_FOR_INTERRUPTS();
-			if (f->data == NULL)
-			{
-				f->data = read_as_of(log, idx, snap, f->hash, &f->len);
-				memset(&f->refs, 0, sizeof(f->refs));
-				ChunkFormat->refs(f->data, f->len, collect_ref, &f->refs);
-				f->next = 0;
-			}
-			if (f->next < f->refs.n)
-			{
-				const uint8 *kid = f->refs.hashes + (Size) f->next++ * CHUNK_HASH_LEN;
-
-				(void) hash_search(seen, kid, HASH_ENTER, &found);
-				if (found)
-					continue;
-				if (depth == cap)
-				{
-					cap *= 2;
-					stack = repalloc(stack, cap * sizeof(DumpFrame));
-					f = &stack[depth - 1];
-				}
-				memcpy(stack[depth].hash, kid, CHUNK_HASH_LEN);
-				stack[depth].data = NULL;
-				depth++;
-				continue;
-			}
-			emit_chunk(rsinfo, f);
-			pfree(f->data);
-			if (f->refs.hashes)
-				pfree(f->refs.hashes);
-			depth--;
-		}
-	}
+		export_from(rsinfo, log, idx, snap, seen, all.hashes + (Size) i * CHUNK_HASH_LEN);
 	relation_close(idx, AccessShareLock);
 	relation_close(log, AccessShareLock);
 
-	/* the pointers, read under the same snapshot */
+	/*
+	 * the tier's bundles' chunks, read from the tier under the same snapshot
+	 * (each once: one the store has out already)
+	 */
+	outer = CurrentMemoryContext;
+	SPI_connect();
+	if (SPI_execute("SELECT name, roots FROM pg_history.bundles ORDER BY name", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the history store's bundles");
+	for (uint64 r = 0; r < SPI_processed; r++)
+	{
+		MemoryContext spi_cxt;
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			n;
+
+		deconstruct_array(DatumGetArrayTypeP(d), BYTEAOID, -1, false, TYPALIGN_INT,
+						  &elems, &nulls, &n);
+		/* (in the function's memory: SPI_finish lets go of SPI's) */
+		spi_cxt = MemoryContextSwitchTo(outer);
+		for (int i = 0; i < n; i++)
+			hash_list_add(&bundle_roots, (const uint8 *) VARDATA_ANY(DatumGetByteaPP(elems[i])));
+		MemoryContextSwitchTo(spi_cxt);
+	}
+	SPI_finish();
+	if (bundle_roots.n > 0)
+	{
+		log = relation_open(ChunkStoreTierLogRelid(), AccessShareLock);
+		idx = relation_open(ChunkStoreTierIndexRelid(), AccessShareLock);
+		for (int i = 0; i < bundle_roots.n; i++)
+			export_from(rsinfo, log, idx, snap, seen,
+						bundle_roots.hashes + (Size) i * CHUNK_HASH_LEN);
+		relation_close(idx, AccessShareLock);
+		relation_close(log, AccessShareLock);
+	}
+
+	/* the pointers, and the bundles, read under the same snapshot */
 	SPI_connect();
 	if (SPI_execute("SELECT name, hash FROM pg_history.pointers ORDER BY name", true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the history store's pointers");
 	for (uint64 r = 0; r < SPI_processed; r++)
 	{
-		Datum		values[3];
-		bool		nulls[3] = {false, true, false};
+		Datum		values[4];
+		bool		nulls[4] = {false, true, false, true};
 		bool		isnull;
 
 		values[2] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull);
 		values[0] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull);
 		values[1] = (Datum) 0;
+		values[3] = (Datum) 0;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	if (SPI_execute("SELECT name, roots FROM pg_history.bundles ORDER BY name", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the history store's bundles");
+	for (uint64 r = 0; r < SPI_processed; r++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {true, true, false, false};
+		bool		isnull;
+
+		values[0] = (Datum) 0;
+		values[1] = (Datum) 0;
+		values[2] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull);
+		values[3] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	SPI_finish();
@@ -295,10 +359,12 @@ pg_history_chunk_restore(PG_FUNCTION_ARGS)
 	TupleDesc	desc;
 	Datum		hash_d,
 				data_d,
-				name_d;
+				name_d,
+				roots_d;
 	bool		hash_null,
 				data_null,
-				name_null;
+				name_null,
+				roots_null;
 	bytea	   *hash;
 
 	if (!CALLED_AS_TRIGGER(fcinfo) || !TRIGGER_FIRED_INSTEAD(td->tg_event) ||
@@ -312,6 +378,25 @@ pg_history_chunk_restore(PG_FUNCTION_ARGS)
 	hash_d = heap_getattr(tuple, 1, desc, &hash_null);
 	data_d = heap_getattr(tuple, 2, desc, &data_null);
 	name_d = heap_getattr(tuple, 3, desc, &name_null);
+	roots_d = heap_getattr(tuple, 4, desc, &roots_null);
+
+	/* (a bundle's: pushed, its chunks put before it, to the tier the target has) */
+	if (!roots_null)
+	{
+		Oid			types[2] = {TEXTOID, BYTEAARRAYOID};
+		Datum		args[2] = {name_d, roots_d};
+
+		if (!hash_null || !data_null || name_null)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a bundle's row restored has its name and roots alone")));
+		SPI_connect();
+		if (SPI_execute_with_args("SELECT pg_catalog.pg_history_push($1, $2)",
+								  2, types, args, NULL, false, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not restore a history store's bundle");
+		SPI_finish();
+		return PointerGetDatum(tuple);
+	}
 	if (hash_null || VARSIZE_ANY_EXHDR(DatumGetByteaPP(hash_d)) != CHUNK_HASH_LEN)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

@@ -1656,10 +1656,12 @@ REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_tier_bundles() FROM PUBLIC;
 -- of the snapshot, its chunks (each after those it references) and then its
 -- pointers, and pg_history.chunk_restore a view of none whose INSERT
 -- (pg_restore's COPY, one statement) puts a chunk, its bytes checked
--- against its name, or inserts a pointer, which takes its root.
+-- against its name, inserts a pointer, which takes its root, or pushes a
+-- bundle to the tier, its chunks put before it.
 --
 CREATE VIEW pg_history.chunk_restore AS
-	SELECT NULL::bytea AS hash, NULL::bytea AS data, NULL::text AS name WHERE false;
+	SELECT NULL::bytea AS hash, NULL::bytea AS data, NULL::text AS name,
+		NULL::bytea[] AS roots WHERE false;
 CREATE TRIGGER chunk_restore_put
 	INSTEAD OF INSERT ON pg_history.chunk_restore
 	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_chunk_restore();

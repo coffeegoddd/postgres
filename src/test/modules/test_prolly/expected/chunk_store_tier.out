@@ -944,10 +944,14 @@ SELECT ok FROM test_cs_check('tier');
  t
 (1 row)
 
--- a dump refuses the tier's chunks, not yet dumped
-SELECT count(*) FROM pg_history_export();
-ERROR:  the history store's tier has chunks, which cannot be dumped yet
-HINT:  Dump without history (--no-history).
+-- a dump of the tier's chunks: no bundle, none of them (a bundle's chunks
+-- are dumped from the tier, and the bundle after them)
+SELECT count(*) FILTER (WHERE roots IS NOT NULL) AS bundles FROM pg_history_export();
+ bundles 
+---------
+       0
+(1 row)
+
 -- a pack's table, at its end: each chunk in it, by hash, its bytes there
 -- hashing to it
 SELECT count(*) FROM generate_series(1, 7) g,

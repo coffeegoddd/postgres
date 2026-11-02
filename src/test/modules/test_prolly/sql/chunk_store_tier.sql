@@ -65,8 +65,9 @@ SELECT convert_from(test_cs_get('tier', substr(sha256(convert_to('tier-sub-kept'
 	test_cs_has('tier', substr(sha256(convert_to('tier-sub-gone', 'UTF8')), 1, 20)) AS gone;
 SELECT ok FROM test_cs_check('tier');
 
--- a dump refuses the tier's chunks, not yet dumped
-SELECT count(*) FROM pg_history_export();
+-- a dump of the tier's chunks: no bundle, none of them (a bundle's chunks
+-- are dumped from the tier, and the bundle after them)
+SELECT count(*) FILTER (WHERE roots IS NOT NULL) AS bundles FROM pg_history_export();
 
 -- a pack's table, at its end: each chunk in it, by hash, its bytes there
 -- hashing to it
