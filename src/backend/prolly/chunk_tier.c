@@ -37,7 +37,12 @@
  * a point in time, may be another server's still, until it is said they
  * are not.  A server that goes on as primary after another is promoted
  * (the two sharing the tier's place) is not supported: it removes its own
- * packs, which the other's catalog has too.
+ * packs, which the other's catalog has too.  Nor are two servers started
+ * from a copy of one's files, on its timeline: they share its owner.
+ *
+ * What is not removed: the objects of a tier dropped, or of its storage
+ * before a TRUNCATE (their names of its stamp then), are left in the
+ * store, no catalog naming them.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -390,6 +395,16 @@ forget_pending(void)
 }
 
 void
+ChunkTierNewStorage(Relation rel)
+{
+	if (pending.id != 0 && pending.relid == RelationGetRelid(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot truncate tier \"%s\" in a transaction that put chunks in it",
+						RelationGetRelationName(rel))));
+}
+
+void
 ChunkTierTruncated(Relation rel)
 {
 	if (pending.id != 0 && pending.relid == RelationGetRelid(rel))
@@ -723,8 +738,10 @@ tier_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 
 /*
  * Whether every standby connected (a physical walsender) has replayed past
- * lsn: one not yet streaming, or that has not said how far it replayed
- * (wal_receiver_status_interval 0, or no reply yet), has not
+ * lsn: one starting, or taking a base backup (a standby being made), has
+ * not.  One streaming that has never said how far it replayed is no hot
+ * standby's (pg_receivewal's, a base backup's stream of WAL; or a
+ * standby's at wal_receiver_status_interval 0, its readers not waited for).
  */
 static bool
 standbys_replayed(XLogRecPtr lsn)
@@ -737,15 +754,19 @@ standbys_replayed(XLogRecPtr lsn)
 		XLogRecPtr	apply;
 		pid_t		pid;
 		ReplicationKind kind;
+		WalSndState st;
 
 		SpinLockAcquire(&w->mutex);
 		pid = w->pid;
 		apply = w->apply;
 		kind = w->kind;
+		st = w->state;
 		SpinLockRelease(&w->mutex);
 		if (pid == 0 || kind != REPLICATION_KIND_PHYSICAL)
 			continue;
-		if (apply == InvalidXLogRecPtr || apply < lsn)
+		if (st == WALSNDSTATE_STARTUP || st == WALSNDSTATE_BACKUP)
+			return false;
+		if (apply != InvalidXLogRecPtr && apply < lsn)
 			return false;
 	}
 	return true;
@@ -770,8 +791,13 @@ to_remove(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p)
 		return false;
 	if (p->state == PACK_ORPHANED)
 		return true;
-	return p->state == PACK_COMMITTED && p->size > 0 && p->dead >= p->size &&
-		standbys_replayed(p->dead_lsn);
+	if (!(p->state == PACK_COMMITTED && p->size > 0 && p->dead >= p->size))
+		return false;
+	if (standbys_replayed(p->dead_lsn))
+		return true;
+	elog(DEBUG1, "tier pack %u all dead, kept until standbys replay past %X/%08X",
+		 id, LSN_FORMAT_ARGS(p->dead_lsn));
+	return false;
 }
 
 /*
@@ -927,7 +953,10 @@ pg_history_tier_adopt(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot adopt the history store's tier's packs during recovery")));
-	/* (VACUUM of the index, which removes, waits) */
+	/*
+	 * (not waiting for VACUUM of the index, which takes the tier's
+	 * RowExclusiveLock: a walk with the meta page from before removes less)
+	 */
 	rel = relation_open(ChunkStoreTierLogRelid(), ShareUpdateExclusiveLock);
 	n = ChunkTierAdopt(rel);
 	relation_close(rel, ShareUpdateExclusiveLock);

@@ -55,6 +55,14 @@ extern void ChunkTierInitStorage(SMgrRelation srel, bool use_wal);
 extern void ChunkTierTruncated(Relation rel);
 
 /*
+ * For the access method: a tier log about to have new storage (TRUNCATE),
+ * refused while this backend has a pack of it not yet written: the pack's
+ * entry is the storage's now, and a subtransaction's rollback would bring
+ * it back.
+ */
+extern void ChunkTierNewStorage(Relation rel);
+
+/*
  * For the access method: VACUUM of a tier log, every pack whose transaction
  * ended settled (committed, or orphaned) and its relfrozenxid advanced; no
  * object is touched (VACUUM of its index removes them).
@@ -76,7 +84,9 @@ extern int	ChunkTierPacks(Relation rel, ChunkTierPackInfo **out);
 /*
  * Every pack the tier has made so far this server's to remove, whatever
  * its owner (those from before a promotion, or a recovery to a point in
- * time): for when no other server uses them.  Answers how many it took.
+ * time): for when no other server uses them.  Not transactional (WAL-logged
+ * at once).  Answers how many packs' numbers it covers that it did not
+ * before, removed ones and this server's own included.
  */
 extern int	ChunkTierAdopt(Relation rel);
 

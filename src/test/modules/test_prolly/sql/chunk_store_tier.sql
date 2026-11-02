@@ -99,6 +99,13 @@ SELECT test_chunk_get('my_tier2', 'my_tier2_index', substr(sha256('\x0e'), 1, 20
 SELECT id, state FROM test_tier_packs('my_tier2');
 DROP TABLE my_tier2, my_tier2_index;
 
+-- TRUNCATE (new storage) in a transaction that put chunks in the tier:
+-- refused (its pack's entry is the storage's)
+BEGIN;
+SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0f'), 1, 20), '\x0f');
+TRUNCATE my_tier, my_tier_index;
+ROLLBACK;
+
 -- a tier dropped in the transaction that put chunks in it: named as it
 -- commits
 BEGIN;

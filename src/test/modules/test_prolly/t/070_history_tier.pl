@@ -17,6 +17,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 if ($ENV{enable_injection_points} ne 'yes')
 {
@@ -164,7 +165,7 @@ $node->safe_psql('postgres', 'CHECKPOINT');
 $node->wait_for_replay_catchup($standby);
 my $backup_dir = PostgreSQL::Test::Utils::tempdir . '/made';
 my $bb = IPC::Run::start(
-	[ 'pg_basebackup', '--no-sync', '--max-rate=32', '--wal-method=none',
+	[ 'pg_basebackup', '--no-sync', '--max-rate=32', '--wal-method=none', '--checkpoint=fast',
 	  '--pgdata' => $backup_dir, '--dbname' => $node->connstr('postgres') ],
 	'>' => \my $bb_out, '2>' => \my $bb_err);
 $node->poll_query_until('postgres',
@@ -185,18 +186,44 @@ $node->poll_query_until('postgres',
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $p2 - 1, 'and removed once it is not');
 
+# pg_receivewal streaming, no standby's (it never says how far it
+# replayed): not waited for
+my $wal_dir = PostgreSQL::Test::Utils::tempdir;
+my $rw = IPC::Run::start(
+	[ 'pg_receivewal', '--no-loop', '--directory' => $wal_dir,
+	  '--dbname' => $node->connstr('postgres') . ' application_name=pg_receivewal' ],
+	'>' => \my $rw_out, '2>' => \my $rw_err);
+$node->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_stat_replication WHERE application_name = 'pg_receivewal' AND state = 'streaming'})
+  or die "no pg_receivewal streaming: $rw_err";
+$dead_pack->('received');
+my $p4 = $packs->();
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p4 - 1, 'all dead, removed with pg_receivewal streaming');
+$rw->kill_kill;
+
 # the store opened again once the settings change: a pack after a reload
 # where they say
 my $tier2 = PostgreSQL::Test::Utils::tempdir;
-$node->safe_psql('postgres', qq{
-	SELECT (test_cs_put('tier', blob('there', 100))).stored;
-	ALTER SYSTEM SET history_tier_location = '$tier2';
-	SELECT pg_reload_conf();
-	SELECT pg_sleep(0.5);
-	SELECT (test_cs_put('tier', blob('moved', 100))).stored;
-	ALTER SYSTEM RESET history_tier_location;
-	SELECT pg_reload_conf();
-});
+my $r = $node->background_psql('postgres');
+$r->query_safe(q{SELECT (test_cs_put('tier', blob('there', 100))).stored});
+$r->query_safe(qq{ALTER SYSTEM SET history_tier_location = '$tier2'});
+$r->query_safe('SELECT pg_reload_conf()');
+# (the session's settings changed between its statements)
+my $seen = 0;
+for (1 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
+{
+	last if ($seen = $r->query_safe(q{SELECT current_setting('history_tier_location')}) eq $tier2);
+	usleep(100_000);
+}
+ok($seen, 'the session has the new setting');
+$r->query_safe(q{SELECT (test_cs_put('tier', blob('moved', 100))).stored});
+$r->query_safe('ALTER SYSTEM RESET history_tier_location');
+$r->query_safe('SELECT pg_reload_conf()');
+$r->quit;
 opendir(my $dh2, $tier2) or die;
 is(scalar(grep(/^packs#/, readdir($dh2))), 1, 'a pack where the setting says, after a reload');
 closedir($dh2);
