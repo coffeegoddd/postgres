@@ -91,7 +91,8 @@ typedef void (*ChunkReserveFn) (void *arg, ChunkIndexEntry *entry);
 
 #define CHUNK_ENTRY_COMMITTED	0x01	/* xmin committed (a hint) */
 #define CHUNK_ENTRY_ABORTED		0x02	/* xmin aborted, or crashed (a hint) */
-#define CHUNK_ENTRY_FROZEN		0x04	/* xmin committed, WAL-logged by VACUUM */
+#define CHUNK_ENTRY_FROZEN		0x04	/* xmin committed, before every snapshot
+										 * running: WAL-logged by VACUUM */
 #define CHUNK_ENTRY_XMAX_COMMITTED	0x08	/* xmax committed (a hint) */
 #define CHUNK_ENTRY_XMAX_ABORTED	0x10	/* xmax aborted, or crashed (a hint) */
 
@@ -177,7 +178,9 @@ typedef struct ChunkIndexRoutine
 	 * its insert committed before the snapshot and its freeing not (a chunk
 	 * freed since is the store's still, to a snapshot that could find it:
 	 * its entry and bytes are taken out once none could).  Counts are not
-	 * asked of: an entry's own, alone.  For a dump, under its snapshot.
+	 * asked of: an entry's own, alone.  A visit meeting a bucket's split
+	 * may call fn with a chunk twice (copied to the new bucket after it
+	 * passed the old).  For a dump, under its snapshot.
 	 */
 	bool		(*lookup_as_of) (Relation idx, const uint8 *hash,
 								 Snapshot snap, ChunkIndexEntry *out);
