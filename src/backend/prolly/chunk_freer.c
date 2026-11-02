@@ -7,14 +7,18 @@
  * of counts, freezing), counts the chunks nothing holds; if there are any,
  * it starts a chunk freer, a background worker connected to the database,
  * which frees them (ChunkStoreFreeUnheld()) in a transaction of its own,
- * and those their references alone held with them.  If the log has pages
- * chunk_compact_dead_fraction of whose bytes are dead, VACUUM counting
- * them too, it then compacts them (ChunkStoreCompact()), a few pages to a
- * transaction, until the log has grown by more than VACUUM let it (none
- * if a region's pages are free, which what it moves goes on, else a
- * region's): the pages it empties are free once the next VACUUM takes out
- * the entries it moved, for the next freer's.  Then it exits.  A freeing or compaction a crash
- * or a deadlock stops is done again after the next VACUUM.
+ * and those their references alone held with them.  The log's space is
+ * handed out and taken back a segment at a time (prolly/chunk_log.h);
+ * if it has segments chunk_compact_dead_fraction of whose bytes are dead,
+ * VACUUM counting them too, the freer then compacts them: their chunks
+ * found in one visit of the index, and moved (ChunkStoreCompactStep()) a
+ * batch to a transaction, into segments free, or (none free) a segment
+ * new, filled whole.  And if the live chunks of the log's last segments
+ * fit in the free segments below them, it evacuates them there, so that
+ * the end is free, for VACUUM to cut off.  The segments it empties are
+ * free once the next VACUUM takes out the entries it moved.  Then it
+ * exits.  A freeing or compaction a crash or a deadlock stops is done
+ * again after the next VACUUM.
  * chunk_free_in_background turns it off.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -42,13 +46,16 @@
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/rel.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
 bool		chunk_free_in_background = true;
 double		chunk_compact_dead_fraction = 0.5;
 
-/* the pages compacted to a transaction */
-#define COMPACT_PAGES	8
+/* the segments a freer compacts (or evacuates) at most, and the chunks it
+ * moves to a transaction */
+#define COMPACT_SEGMENTS	4096
+#define COMPACT_BATCH		256
 
 typedef struct ChunkFreerArgs
 {
@@ -56,13 +63,14 @@ typedef struct ChunkFreerArgs
 	Oid			log;
 	Oid			idx;
 	bool		compact;
+	bool		evacuate;
 	double		fraction;
 	BlockNumber grow;
 } ChunkFreerArgs;
 
 bool
-ChunkFreerLaunch(Oid log, Oid idx, bool compact, double fraction,
-				 BlockNumber grow)
+ChunkFreerLaunch(Oid log, Oid idx, bool compact, bool evacuate,
+				 double fraction, BlockNumber grow)
 {
 	BackgroundWorker bgw;
 	ChunkFreerArgs args;
@@ -89,6 +97,7 @@ ChunkFreerLaunch(Oid log, Oid idx, bool compact, double fraction,
 	args.log = log;
 	args.idx = idx;
 	args.compact = compact;
+	args.evacuate = evacuate;
 	args.fraction = fraction;
 	args.grow = grow;
 	StaticAssertStmt(sizeof(args) <= BGW_EXTRALEN, "chunk freer arguments fit");
@@ -98,14 +107,34 @@ ChunkFreerLaunch(Oid log, Oid idx, bool compact, double fraction,
 	return RegisterDynamicBackgroundWorker(&bgw, NULL);
 }
 
+/* what the freer does in a transaction */
+typedef enum FreerOp
+{
+	FREER_FREE,					/* free the chunks nothing holds */
+	FREER_BEGIN_COMPACT,		/* find the segments to compact, their chunks */
+	FREER_BEGIN_EVACUATE,		/* find the segments to evacuate, their chunks */
+	FREER_STEP,					/* move the next batch */
+} FreerOp;
+
+typedef struct FreerState
+{
+	MemoryContext cxt;			/* for the compaction, across transactions */
+	ChunkCompaction *c;
+	BlockNumber limit;			/* the log's pages it may grow to */
+	uint64		below;			/* where room for moves must end before */
+	int			looked;			/* the step's chunks looked at, or -1 */
+	uint64		freed;
+	uint64		chunks;
+	uint64		bytes;
+} FreerState;
+
 /*
  * One step of the freer's in a transaction of its own, the index locked
  * (one freer of an index at a time: another would do the same again);
  * false if another freer has it, or the relations are gone.
  */
 static bool
-freer_step(const ChunkFreerArgs *args, uint64 *from, BlockNumber *limit,
-		   int *found, uint64 *freed, uint64 *chunks, uint64 *bytes)
+freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 {
 	Relation	log;
 	Relation	idx;
@@ -117,24 +146,42 @@ freer_step(const ChunkFreerArgs *args, uint64 *from, BlockNumber *limit,
 									  ExclusiveLock))
 	{
 		/* (compaction appends to the log) */
-		log = try_relation_open(args->log, from == NULL ? AccessShareLock : RowExclusiveLock);
+		log = try_relation_open(args->log, op == FREER_FREE ? AccessShareLock : RowExclusiveLock);
 		idx = try_relation_open(args->idx, RowExclusiveLock);
 		if (log != NULL && idx != NULL && RelationIsChunkLog(log) &&
 			RelationIsChunkIndex(idx))
 		{
 			BlockNumber nblocks = RelationGetNumberOfBlocks(log);
+			uint64		starts[COMPACT_SEGMENTS];
+			uint64		ends[COMPACT_SEGMENTS];
+			int			n;
 
 			done = true;
-			if (from == NULL)
-				*freed = ChunkStoreFreeUnheld(log, idx);
-			else
+			switch (op)
 			{
-				/* (the log grown by no more than it may: then room or none) */
-				if (!BlockNumberIsValid(*limit))
-					*limit = nblocks + args->grow;
-				*found = ChunkStoreCompact(log, idx, args->fraction, from,
-										   COMPACT_PAGES, nblocks < *limit,
-										   chunks, bytes);
+				case FREER_FREE:
+					fs->freed = ChunkStoreFreeUnheld(log, idx);
+					break;
+				case FREER_BEGIN_COMPACT:
+				case FREER_BEGIN_EVACUATE:
+					n = op == FREER_BEGIN_COMPACT ?
+						ChunkLog->compactable(log, args->fraction, COMPACT_SEGMENTS, starts, ends) :
+						ChunkLog->evacuable(log, COMPACT_SEGMENTS, starts, ends);
+					fs->c = ChunkStoreCompactBegin(log, idx, n, starts, ends, fs->cxt);
+
+					/*
+					 * (compacting, the log grown by no more than it may;
+					 * evacuating, into room below the end alone, never new)
+					 */
+					fs->limit = op == FREER_BEGIN_COMPACT ? nblocks + args->grow : 0;
+					fs->below = op == FREER_BEGIN_EVACUATE && n > 0 ? starts[0] : 0;
+					break;
+				case FREER_STEP:
+					fs->looked = ChunkStoreCompactStep(log, idx, fs->c, COMPACT_BATCH,
+													   fs->below,
+													   fs->below == 0 && nblocks < fs->limit,
+													   &fs->chunks, &fs->bytes);
+					break;
 			}
 		}
 		if (idx)
@@ -147,42 +194,60 @@ freer_step(const ChunkFreerArgs *args, uint64 *from, BlockNumber *limit,
 	return done;
 }
 
+/* a compaction, or an evacuation, begun and stepped through to its end */
+static void
+freer_compact(const ChunkFreerArgs *args, FreerOp begin, FreerState *fs,
+			  uint64 *moved, uint64 *moved_bytes)
+{
+	if (!freer_step(args, begin, fs))
+		return;
+	for (;;)
+	{
+		fs->looked = 0;
+		fs->chunks = fs->bytes = 0;
+		if (!freer_step(args, FREER_STEP, fs))
+			break;
+		*moved += fs->chunks;
+		*moved_bytes += fs->bytes;
+		if (fs->looked <= 0)
+			break;
+	}
+	ChunkStoreCompactEnd(fs->c);
+	fs->c = NULL;
+}
+
 void
 ChunkFreerMain(Datum main_arg)
 {
 	ChunkFreerArgs args;
-	uint64		freed = 0;
+	FreerState	fs = {0};
 	uint64		moved = 0;
 	uint64		moved_bytes = 0;
 
 	memcpy(&args, MyBgworkerEntry->bgw_extra, sizeof(args));
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(args.dboid, BOOTSTRAP_SUPERUSERID, 0);
+	fs.cxt = AllocSetContextCreate(TopMemoryContext, "chunk freer",
+								   ALLOCSET_DEFAULT_SIZES);
 
 	pgstat_report_activity(STATE_RUNNING, "freeing chunks nothing holds");
-	if (freer_step(&args, NULL, NULL, NULL, &freed, NULL, NULL) && args.compact)
+	if (freer_step(&args, FREER_FREE, &fs))
 	{
-		uint64		from = 0;
-		BlockNumber limit = InvalidBlockNumber;
-
-		pgstat_report_activity(STATE_RUNNING, "compacting the chunk log");
-		for (;;)
+		if (args.compact)
 		{
-			int			found = 0;
-			uint64		chunks = 0;
-			uint64		bytes = 0;
-
-			if (!freer_step(&args, &from, &limit, &found, NULL, &chunks, &bytes) ||
-				found <= 0)
-				break;
-			moved += chunks;
-			moved_bytes += bytes;
+			pgstat_report_activity(STATE_RUNNING, "compacting the chunk log");
+			freer_compact(&args, FREER_BEGIN_COMPACT, &fs, &moved, &moved_bytes);
+		}
+		if (args.evacuate)
+		{
+			pgstat_report_activity(STATE_RUNNING, "evacuating the chunk log's end");
+			freer_compact(&args, FREER_BEGIN_EVACUATE, &fs, &moved, &moved_bytes);
 		}
 	}
 	pgstat_report_stat(true);
 	ereport(DEBUG1,
 			(errmsg_internal("chunk freer freed %llu chunks of chunk index %u, and moved %llu (%llu bytes)",
-							 (unsigned long long) freed, args.idx,
+							 (unsigned long long) fs.freed, args.idx,
 							 (unsigned long long) moved,
 							 (unsigned long long) moved_bytes)));
 	proc_exit(0);

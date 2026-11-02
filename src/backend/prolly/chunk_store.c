@@ -909,40 +909,52 @@ entry_loc_cmp(const void *a, const void *b)
 					  ((const ChunkIndexEntry *) b)->loc);
 }
 
-int
-ChunkStoreCompact(Relation log, Relation idx, double fraction, uint64 *from,
-				  int npages, bool may_grow, uint64 *chunks, uint64 *bytes)
+struct ChunkCompaction
 {
+	MemoryContext cxt;
+	ChunkIndexEntry *entries;	/* the chunks to move, in log order */
+	int			n;
+	int			next;			/* the next to move */
+};
+
+ChunkCompaction *
+ChunkStoreCompactBegin(Relation log, Relation idx, int n, const uint64 *starts,
+					   const uint64 *ends, MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	ChunkCompaction *c = palloc0_object(ChunkCompaction);
 	CompactState st = {0};
-	uint64	   *starts = palloc(npages * sizeof(uint64));
-	uint64	   *ends = palloc(npages * sizeof(uint64));
-	int			found;
+
+	if (!HaveRegisteredOrActiveSnapshot())
+		elog(ERROR, "cannot compact the history store without an active snapshot");
+	c->cxt = cxt;
+	st.starts = starts;
+	st.ends = ends;
+	st.npages = n;
+	if (n > 0)
+		ChunkIndex->visit(idx, collect_compact, &st);
+	if (st.n > 1)
+		qsort(st.entries, st.n, sizeof(ChunkIndexEntry), entry_loc_cmp);
+	c->entries = st.entries;
+	c->n = st.n;
+	MemoryContextSwitchTo(old);
+	return c;
+}
+
+int
+ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
+					  uint64 below, bool may_grow, uint64 *chunks, uint64 *bytes)
+{
+	int			looked = 0;
 
 	PreventCommandIfReadOnly("compact the history store");
 	if (!HaveRegisteredOrActiveSnapshot())
 		elog(ERROR, "cannot compact the history store without an active snapshot");
 	*chunks = *bytes = 0;
-	found = ChunkLogCompactable(log, fraction, *from, npages, starts, ends);
-	if (found == 0)
-	{
-		pfree(starts);
-		pfree(ends);
-		return 0;
-	}
-	*from = ends[found - 1];
-
-	st.starts = starts;
-	st.ends = ends;
-	st.npages = found;
-	ChunkIndex->visit(idx, collect_compact, &st);
-
-	/* (in the order they are in the log: read so, and put so) */
-	if (st.n > 1)
-		qsort(st.entries, st.n, sizeof(ChunkIndexEntry), entry_loc_cmp);
 	(void) GetCurrentTransactionId();
-	for (int i = 0; i < st.n; i++)
+	while (c->next < c->n && looked < max)
 	{
-		ChunkIndexEntry *e = &st.entries[i];
+		ChunkIndexEntry *e = &c->entries[c->next];
 		ChunkIndexEntry moved;
 		ChunkLogRun run;
 		PlaceArg	place;
@@ -957,15 +969,24 @@ ChunkStoreCompact(Relation log, Relation idx, double fraction, uint64 *from,
 		ChunkLog->read(log, e->loc, data, e->len);
 		check_hash(e->hash, data, e->len, log, e->loc);
 
-		if (may_grow)
+		if (may_grow && below == 0)
 			ChunkLog->prepare(log, e->len, &run);
-		else if (!ChunkLog->prepare_free(log, e->len, &run))
+		else if (!ChunkLog->prepare_free(log, e->len, below, &run))
 		{
-			/* (no room but in pages new: done, as far as it may go) */
 			ChunkLog->release(log, &run);
 			pfree(data);
-			found = -1;
-			break;
+
+			/*
+			 * (no room for a chunk longer than a segment, which goes on pages
+			 * new alone: passed by; for another, none for any: done for now)
+			 */
+			if (e->len > ChunkLog->segment_bytes(log))
+			{
+				c->next++;
+				looked++;
+				continue;
+			}
+			return -1;
 		}
 		place.log = log;
 		place.run = &run;
@@ -978,13 +999,19 @@ ChunkStoreCompact(Relation log, Relation idx, double fraction, uint64 *from,
 		}
 		ChunkLog->release(log, &run);
 		pfree(data);
+		c->next++;
+		looked++;
 		CHECK_FOR_INTERRUPTS();
 	}
-	if (st.entries)
-		pfree(st.entries);
-	pfree(starts);
-	pfree(ends);
-	return found;
+	return looked;
+}
+
+void
+ChunkStoreCompactEnd(ChunkCompaction *c)
+{
+	if (c->entries)
+		pfree(c->entries);
+	pfree(c);
 }
 
 /* ------------------------------------------------------- the audit */

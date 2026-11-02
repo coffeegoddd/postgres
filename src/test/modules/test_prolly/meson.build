@@ -45,10 +45,11 @@ test_prolly_isolation = [
   'chunk_hold',
   'chunk_run_seal',
   'chunk_free_order',
+  'chunk_move',
 ]
 # (these need injection points)
 if get_option('injection_points')
-  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend', 'chunk_move']
+  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend']
 endif
 
 tests += {

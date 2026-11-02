@@ -1,8 +1,9 @@
 # Compaction moves a chunk's entry, freeing the old in its transaction and
 # putting a new one: a chunk another transaction holds is passed by; a
-# change of its counts, a put of it, or a read, as it is moved waits for
-# the move (as for a freeing) and then is the new entry's; and a move
-# rolled back leaves the old entry the chunk's.
+# change of its counts, or a put of it, as it is moved waits for the move
+# (as for a freeing) and then is the new entry's; a read does not wait, and
+# reads the chunk where it was (its bytes there until no snapshot might
+# read them); and a move rolled back leaves the old entry the chunk's.
 
 setup
 {
@@ -15,14 +16,21 @@ setup
 		AS 'SELECT substr(sha256(mc_d(i)), 1, 20)';
 	SELECT count(*) FROM generate_series(1, 12) i, LATERAL test_chunk_put('mcl', 'mci', mc_h(i), mc_d(i));
 	SELECT count(*) FROM generate_series(2, 12, 2) i, LATERAL test_chunk_ref_root('mci', mc_h(i));
+	-- (the region this backend put them in let go of, by an invalidation of
+	-- the log's relcache entry, for VACUUM to make its rest dead: the
+	-- segment is then done with, to compact)
+	ALTER TABLE mcl SET (vacuum_truncate = on);
 }
 
 # (freed in a transaction of their own, and their entries taken out: the
-# log's first two pages half dead)
+# log's segment half dead)
 setup
 {
 	SELECT sum(test_chunk_free('mcl', 'mci', mc_h(i))) FROM generate_series(1, 12, 2) i;
 }
+setup		{ VACUUM mci; }
+# (and again: the region's last page, which the first marked bytes dead on
+# as it went, made full, the segment done with)
 setup		{ VACUUM mci; }
 
 teardown
@@ -34,7 +42,7 @@ teardown
 session c
 setup		{ SET chunk_free_in_background = off; }
 step c_begin	{ BEGIN; }
-step c_compact	{ SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0); }
+step c_compact	{ SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false); }
 step c_commit	{ COMMIT; }
 step c_rollback	{ ROLLBACK; }
 
@@ -69,8 +77,8 @@ permutation h_begin h_hold c_compact h_commit v_vacuum v_check
 permutation c_begin c_compact r_root c_commit v_vacuum v_check
 # a put of it as it is moved waits, and finds it
 permutation c_begin c_compact r_put c_commit v_check
-# a read as it is moved waits; a move rolled back leaves the old entries
-# the chunks'
+# a read as it is moved does not wait; a move rolled back leaves the old
+# entries the chunks'
 permutation c_begin c_compact r_read c_rollback v_vacuum v_check
 # ... or committed, the new
 permutation c_begin c_compact r_read c_commit v_vacuum v_check

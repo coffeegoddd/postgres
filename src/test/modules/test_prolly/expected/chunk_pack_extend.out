@@ -8,7 +8,7 @@ test_cs_ref_root
 
 test_cs_free
 ------------
-          40
+         400
 (1 row)
 
 injection_points_set_local
@@ -24,8 +24,8 @@ injection_points_attach
 (1 row)
 
 step p_pack: 
-	SELECT test_cs_put_many('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(101, 112) i),
-		ARRAY(SELECT pe_d(i) FROM generate_series(101, 112) i)) AS stored;
+	SELECT test_cs_put_many('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(1001, 1300) i),
+		ARRAY(SELECT pe_d(i) FROM generate_series(1001, 1300) i)) AS stored;
  <waiting ...>
 step o_wake: SELECT injection_points_wakeup('chunk-log-extended');
 injection_points_wakeup
@@ -43,7 +43,7 @@ injection_points_wakeup
 step p_pack: <... completed>
 stored
 ------
-    12
+   300
 (1 row)
 
 step p_detach: SELECT injection_points_detach('chunk-log-extended');
@@ -54,15 +54,15 @@ injection_points_detach
 
 step v_check: 
 	SELECT ok, count(*) FILTER (WHERE test_cs_get('pages', pe_h(pe_d(i))) = pe_d(i)) AS read_back
-	FROM test_cs_check('pages'), generate_series(101, 112) i GROUP BY ok;
+	FROM test_cs_check('pages'), generate_series(1001, 1300) i GROUP BY ok;
 
 ok|read_back
 --+---------
-t |       12
+t |      300
 (1 row)
 
 test_cs_free_unheld
 -------------------
-                 13
+                301
 (1 row)
 

@@ -101,11 +101,30 @@ typedef struct ChunkLogRoutine
 	bool		(*extend) (Relation rel, ChunkLogRun *run, size_t len);
 
 	/*
-	 * prepare, but only in the room this backend's region has, or on pages
-	 * free: false, no room made (the run empty, for release), if it would
-	 * have to grow the log.
+	 * prepare, but only in the room this backend's region has, or in a
+	 * segment free, and (below not 0) wholly before the place below: false,
+	 * no room made (the run empty, for release), if it would have to grow
+	 * the log.
 	 */
-	bool		(*prepare_free) (Relation rel, size_t len, ChunkLogRun *run);
+	bool		(*prepare_free) (Relation rel, size_t len, uint64 below,
+								 ChunkLogRun *run);
+
+	/*
+	 * For compaction (prolly/chunk_store.h's ChunkStoreCompactBegin), the
+	 * log's space handed out and taken back a segment at a time: the
+	 * segments to compact, up to max, ascending (done with, fraction of
+	 * their bytes dead, not all), and the segments at the end to evacuate
+	 * (their live chunks fit in the free segments below the lowest, and
+	 * moved there, with prepare_free's below the lowest's start, leave the
+	 * end free to cut): the places each begins and ends at, in starts and
+	 * ends; how many.  O(log).  And a segment's bytes: a chunk longer goes
+	 * on pages new alone.
+	 */
+	int			(*compactable) (Relation rel, double fraction, int max,
+								uint64 *starts, uint64 *ends);
+	int			(*evacuable) (Relation rel, int max, uint64 *starts,
+							  uint64 *ends);
+	uint64		(*segment_bytes) (Relation rel);
 
 	/*
 	 * Binds the log to the one chunk index naming its bytes (the first to
@@ -166,22 +185,30 @@ extern ChunkLogSweep *ChunkLogSweepBegin(Relation rel);
 extern void ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep);
 
 /*
- * Puts every page free in the free space map (O(log); VACUUM's); answers
- * the pages to compact, written full and fraction of their bytes dead (not
- * all), if their dead bytes come to a region's (else none), and in *grow
- * the pages compaction may grow the log by: none if a region's are free,
- * else a region's.
+ * The log's space is handed out and taken back a segment at a time (pages
+ * one after another, aligned), and compacted so: what VACUUM finds of its
+ * segments.
  */
-extern uint32 ChunkLogRecordFree(Relation rel, double fraction,
-								 BlockNumber *grow);
+typedef struct ChunkLogSegments
+{
+	uint32		segments;		/* the log's */
+	uint32		free;			/* every byte of every page dead */
+	uint32		compactable;	/* written full, fraction of their bytes dead */
+	uint64		compactable_dead;	/* their dead bytes */
+	bool		worth;			/* those come to a segment's */
+	uint32		evacuable;		/* at the end, their live chunks fitting in
+								 * the free segments below */
+	BlockNumber grow;			/* the pages compaction may grow the log by:
+								 * a segment's if none is free */
+} ChunkLogSegments;
 
 /*
- * The pages to compact from the place from on, up to max, ascending: the
- * places each begins and ends at, in starts and ends; how many.  A chunk
- * with bytes on any is to be put elsewhere (O(the pages looked at)).
+ * Puts every segment free in the free space map (O(log); VACUUM's), and
+ * what it found of the segments in *out.
  */
-extern int	ChunkLogCompactable(Relation rel, double fraction, uint64 from,
-								int max, uint64 *starts, uint64 *ends);
+extern void ChunkLogRecordFree(Relation rel, double fraction,
+							   ChunkLogSegments *out);
+
 
 /*
  * For audits: whether no page counts bytes of the chunks given (at locs,

@@ -1,4 +1,4 @@
-# A run of pages freed, taken for a chunk another put first (the run left
+# A segment freed, taken for a chunk another put first (the segment left
 # made afresh, never written), let go of when its backend next needs more
 # room than it has: its pages made all dead, free again at once.
 
@@ -41,7 +41,8 @@ step b_free		{ SELECT free_pages FROM test_chunk_log_space('rl'); }
 step b_put		{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('x', 20000)), rs_big('x', 20000)) AS put; }
 step b_put_more	{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 330000)), rs_big('z', 330000)) AS put; }
 
-# b's put takes a run of three pages freed, waits for a's, and finds the
-# chunk a's: the run left afresh.  Its next, longer than a region (pages new
-# for it), lets the run go: its three pages free again
+# a's put takes a segment freed, and b's another (32 pages each, of the 73
+# free), waits for a's, and finds the chunk a's: b's segment left afresh.
+# Its next, longer than a segment (pages new for it), lets the segment go:
+# its 32 pages free again
 permutation b_vacuum b_free a_begin a_put b_put a_commit b_free b_put_more b_free

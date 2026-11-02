@@ -1,20 +1,15 @@
 Parsed test spec with 4 sessions
 
 starting permutation: c_compact v_vacuum v_check
-count
------
-    6
-(1 row)
-
 sum
 ---
   6
 (1 row)
 
-step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0);
+step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false);
 chunks
 ------
-     4
+     6
 (1 row)
 
 step v_vacuum: VACUUM mci;
@@ -32,11 +27,6 @@ t |     6|        6|      1
 
 
 starting permutation: h_begin h_hold c_compact h_commit v_vacuum v_check
-count
------
-    6
-(1 row)
-
 sum
 ---
   6
@@ -49,10 +39,10 @@ held
 t   
 (1 row)
 
-step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0);
+step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false);
 chunks
 ------
-     3
+     5
 (1 row)
 
 step h_commit: COMMIT;
@@ -71,21 +61,16 @@ t |     6|        6|      1
 
 
 starting permutation: c_begin c_compact r_root c_commit v_vacuum v_check
-count
------
-    6
-(1 row)
-
 sum
 ---
   6
 (1 row)
 
 step c_begin: BEGIN;
-step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0);
+step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false);
 chunks
 ------
-     4
+     6
 (1 row)
 
 step r_root: SELECT roots FROM test_chunk_ref_root('mci', mc_h(4)); <waiting ...>
@@ -111,21 +96,16 @@ t |     6|        6|      2
 
 
 starting permutation: c_begin c_compact r_put c_commit v_check
-count
------
-    6
-(1 row)
-
 sum
 ---
   6
 (1 row)
 
 step c_begin: BEGIN;
-step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0);
+step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false);
 chunks
 ------
-     4
+     6
 (1 row)
 
 step r_put: SELECT test_chunk_put('mcl', 'mci', mc_h(4), mc_d(4)) AS stored; <waiting ...>
@@ -150,31 +130,25 @@ t |     6|        6|      1
 
 
 starting permutation: c_begin c_compact r_read c_rollback v_vacuum v_check
-count
------
-    6
-(1 row)
-
 sum
 ---
   6
 (1 row)
 
 step c_begin: BEGIN;
-step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0);
+step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false);
 chunks
 ------
-     4
+     6
 (1 row)
 
-step r_read: SELECT test_chunk_get('mcl', 'mci', mc_h(4)) = mc_d(4) AS read; <waiting ...>
-step c_rollback: ROLLBACK;
-step r_read: <... completed>
+step r_read: SELECT test_chunk_get('mcl', 'mci', mc_h(4)) = mc_d(4) AS read;
 read
 ----
 t   
 (1 row)
 
+step c_rollback: ROLLBACK;
 step v_vacuum: VACUUM mci;
 step v_check: 
 	SELECT ok, chunks,
@@ -190,31 +164,25 @@ t |     6|        6|      1
 
 
 starting permutation: c_begin c_compact r_read c_commit v_vacuum v_check
-count
------
-    6
-(1 row)
-
 sum
 ---
   6
 (1 row)
 
 step c_begin: BEGIN;
-step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, 0);
+step c_compact: SELECT chunks FROM test_chunk_compact('mcl', 'mci', 0.4, false);
 chunks
 ------
-     4
+     6
 (1 row)
 
-step r_read: SELECT test_chunk_get('mcl', 'mci', mc_h(4)) = mc_d(4) AS read; <waiting ...>
-step c_commit: COMMIT;
-step r_read: <... completed>
+step r_read: SELECT test_chunk_get('mcl', 'mci', mc_h(4)) = mc_d(4) AS read;
 read
 ----
 t   
 (1 row)
 
+step c_commit: COMMIT;
 step v_vacuum: VACUUM mci;
 step v_check: 
 	SELECT ok, chunks,
