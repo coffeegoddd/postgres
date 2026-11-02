@@ -128,18 +128,13 @@ $node->poll_query_until('d1', qq{SELECT current_setting('history_tier_location')
 $node->safe_psql('d1', 'VACUUM pg_history.tier_index');
 is($node->safe_psql('d1', q{SELECT test_cs_get('tier', h('\x0a7302'))}), '\x0a7302', 'set back: read as it was');
 
-# a tier emptied (its marker removed), then a put where its packs are not,
-# refused: nothing made there, its mark as it was; set back, the next pack
-# makes the marker again, and its database is not dropped
+# a tier with a pack, then a put where its packs are not, refused: nothing
+# made there, its mark as it was; set back, a put goes, and its database is
+# not dropped
 $node->safe_psql('postgres', 'CREATE DATABASE d3');
 $node->safe_psql('d3', $setup . q{
 	SELECT (test_cs_put('tier', '\x0a7311')).stored;
 	SELECT test_cs_ref_root('tier', h('\x0a7311'));
-});
-$node->safe_psql('d3', q{
-	SELECT test_cs_unref_root('tier', h('\x0a7311'));
-	SELECT test_cs_free('tier', ARRAY[h('\x0a7311')]);
-	VACUUM pg_history.tier_index;
 });
 my $tier3 = PostgreSQL::Test::Utils::tempdir;
 $node->append_conf('postgresql.conf', qq{history_tier_location = '$tier3'});
@@ -160,7 +155,53 @@ $node->safe_psql('d3', q{
 	SELECT test_cs_ref_root('tier', h('\x0a7312'));
 });
 ($ret, $out, $err) = $node->psql('postgres', 'DROP DATABASE d3');
-like($err, qr/its history store's tier has packs/, 'set back: a pack, its marker made again, d3 not dropped');
+like($err, qr/its history store's tier has packs/, 'set back: its packs where they were, d3 not dropped');
+
+# a tier emptied, its marker removed, takes another place set: its packs
+# and marker there; and its database not dropped while it has one
+my $reload_to = sub {
+	my ($loc, $db) = @_;
+	$node->append_conf('postgresql.conf', qq{history_tier_location = '$loc'});
+	$node->reload;
+	$node->poll_query_until($db, qq{SELECT current_setting('history_tier_location') = '$loc'})
+	  or die 'location not reloaded';
+};
+$node->safe_psql('postgres', 'CREATE DATABASE d4');
+$node->safe_psql('d4', $setup . q{
+	SELECT (test_cs_put('tier', '\x0a7321')).stored;
+	SELECT test_cs_ref_root('tier', h('\x0a7321'));
+});
+$node->safe_psql('d4', q{
+	SELECT test_cs_unref_root('tier', h('\x0a7321'));
+	SELECT test_cs_free('tier', ARRAY[h('\x0a7321')]);
+	VACUUM pg_history.tier_index;
+});
+my $tier4 = PostgreSQL::Test::Utils::tempdir;
+$reload_to->($tier4, 'd4');
+$node->safe_psql('d4', q{
+	SELECT (test_cs_put('tier', '\x0a7322')).stored;
+	SELECT test_cs_ref_root('tier', h('\x0a7322'));
+});
+opendir(my $dh4, $tier4) or die;
+my @there = grep(!/^\./, readdir($dh4));
+closedir($dh4);
+is(scalar(grep(/^databases#/, @there)) . ' ' . scalar(grep(/^packs#/, @there)), '1 1',
+	'an empty tier takes the place set now: its marker and pack there');
+($ret, $out, $err) = $node->psql('postgres', 'DROP DATABASE d4');
+like($err, qr/its history store's tier has packs/, 'and its database, with a pack there, not dropped');
+$node->safe_psql('d4', q{
+	SELECT test_cs_unref_root('tier', h('\x0a7322'));
+	SELECT test_cs_free('tier', ARRAY[h('\x0a7322')]);
+	VACUUM pg_history.tier_index;
+});
+$node->safe_psql('postgres', 'DROP DATABASE d4');
+pass('emptied there, dropped');
+
+# the same place spelled otherwise: the same place
+$reload_to->("$tier/./", 'd1');
+is($node->safe_psql('d1', q{SELECT (test_cs_put('tier', '\x0a7305')).stored}), 't',
+	'the same directory spelled otherwise: a put there');
+$reload_to->($tier, 'd1');
 
 $node->stop;
 done_testing();
