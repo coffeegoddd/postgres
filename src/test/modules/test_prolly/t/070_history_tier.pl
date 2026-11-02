@@ -210,6 +210,8 @@ is($packs->(), $p4 - 1, 'all dead, removed with pg_receivewal streaming');
 # a pack kept for a standby replaying, and one after it removed (with
 # pg_receivewal, looked at after the standby, streaming still): the
 # standby's walsender named
+# (the standby's walsender in the first slot, taken when it reconnected
+# with no other sender; pg_receivewal's after it)
 my $make = sub {
 	my ($tag) = @_;
 	$node->safe_psql('postgres', qq{
@@ -258,6 +260,8 @@ $node->poll_query_until('postgres',
 # (the walsender not asking it for a reply)
 $node->safe_psql('postgres', 'ALTER SYSTEM SET wal_sender_timeout = 0');
 $node->reload;
+$node->poll_query_until('postgres', q{SELECT current_setting('wal_sender_timeout') = '0'})
+  or die 'wal_sender_timeout not reloaded';
 my $wal_dir2 = PostgreSQL::Test::Utils::tempdir;
 my $rw2 = IPC::Run::start(
 	[ 'pg_receivewal', '--no-loop', '--status-interval=0', '--directory' => $wal_dir2,
