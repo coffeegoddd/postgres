@@ -207,3 +207,38 @@ SELECT ok FROM test_cs_check('tier');
 SELECT count(*) FROM generate_series(7, 10) g,
 	LATERAL test_cs_unref_root('tier', substr(sha256(pg_temp.rp(g)), 1, 20));
 SELECT test_cs_free('tier', ARRAY(SELECT substr(sha256(pg_temp.rp(g)), 1, 20) FROM generate_series(7, 10) g)) AS freed;
+
+-- a repack aborted: its pack an orphan, removed; the chunks where they were
+SELECT count(*) FROM generate_series(31, 34) g, LATERAL test_cs_put('tier', pg_temp.rp(g));
+SELECT count(*) FROM generate_series(31, 34) g,
+	LATERAL test_cs_ref_root('tier', substr(sha256(pg_temp.rp(g)), 1, 20));
+SELECT max(id) AS ab_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
+SELECT test_cs_unref_root('tier', substr(sha256(pg_temp.rp(31)), 1, 20)),
+	test_cs_unref_root('tier', substr(sha256(pg_temp.rp(32)), 1, 20));
+SELECT test_cs_free('tier', ARRAY[substr(sha256(pg_temp.rp(31)), 1, 20), substr(sha256(pg_temp.rp(32)), 1, 20)]) AS freed;
+VACUUM pg_history.tier_index;
+BEGIN;
+SELECT segments, chunks FROM test_chunk_compact('pg_history.tier_chunks', 'pg_history.tier_index', 0.5, false);
+ROLLBACK;
+VACUUM pg_history.tier_index;
+SELECT state FROM test_tier_packs('pg_history.tier_chunks') WHERE id = :ab_pack;
+SELECT count(*) AS orphans_left FROM test_tier_packs('pg_history.tier_chunks') WHERE id > :ab_pack AND state IN ('made', 'orphaned');
+SELECT count(*) FILTER (WHERE test_cs_get('tier', substr(sha256(pg_temp.rp(g)), 1, 20)) = pg_temp.rp(g)) AS read_back
+FROM generate_series(33, 34) g;
+SELECT ok FROM test_cs_check('tier');
+
+-- a repack of at most 64 packs: 66 packs partly dead, 64 compacted
+CREATE PROCEDURE pg_temp.small_packs() LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. 66 LOOP
+		PERFORM test_cs_put('tier', pg_temp.rp(1000 + 2 * i));
+		PERFORM test_cs_put('tier', pg_temp.rp(1001 + 2 * i));
+		PERFORM test_cs_ref_root('tier', substr(sha256(pg_temp.rp(1001 + 2 * i)), 1, 20));
+		COMMIT;
+	END LOOP;
+END $$;
+CALL pg_temp.small_packs();
+SELECT test_cs_free('tier', ARRAY(SELECT substr(sha256(pg_temp.rp(1000 + 2 * i)), 1, 20) FROM generate_series(1, 66) i)) AS freed;
+VACUUM pg_history.tier_index;
+SELECT compactable >= 66 AS candidates FROM test_chunk_log_segments('pg_history.tier_chunks', 0.4);
+SELECT segments FROM test_chunk_compact('pg_history.tier_chunks', 'pg_history.tier_index', 0.4, false);
