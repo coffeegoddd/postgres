@@ -2,8 +2,8 @@
 
 # A commit's chunks and its pointer's move are one: a crash with the
 # transaction open leaves neither, a committed one survives it, and a hot
-# standby has them as the commit replays.  Dropping the pointer has the
-# store's background freer free the chunk.
+# standby has them as the commit replays.  Moving or dropping the pointer
+# has the freer its commit starts free the chunk it let go of.
 
 use strict;
 use warnings FATAL => 'all';
@@ -75,11 +75,15 @@ $mid->query_safe(q{COMMIT});
 $mid->quit;
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $at3), 'true true', 'its commit replayed: both');
-$node->safe_psql('postgres', q{UPDATE pg_history.pointers SET hash = h('\x01') WHERE name = 'main'});
+# (the chunk the move let go of freed as it committed: put again)
+ok($node->poll_query_until('postgres',
+		q{SELECT test_chunk_has('pg_history.chunks', 'pg_history.chunk_index', h('\x01'))}, 'f'),
+	'the chunk the pointer moved off freed as the move committed');
+$node->safe_psql('postgres', q{SELECT put('\x01');
+	UPDATE pg_history.pointers SET hash = h('\x01') WHERE name = 'main'});
 
-# the pointer dropped, VACUUM of the store's index has a freer free the chunk
+# the pointer dropped, the freer its commit starts frees the chunk: no VACUUM
 $node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'main'});
-$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 ok($node->poll_query_until('postgres',
 		q{SELECT test_chunk_has('pg_history.chunks', 'pg_history.chunk_index', h('\x01'))}, 'f'),
 	'the pointer dropped, the store frees its chunk in the background');

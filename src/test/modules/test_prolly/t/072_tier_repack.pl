@@ -55,8 +55,8 @@ $node->safe_psql('postgres', q{
 # VACUUM counts them dead, finds the packs to repack, and starts a freer
 my $offset = -s $node->logfile;
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
-$node->wait_for_log(qr/a freer to start: \d+ chunks unheld, 2 segments to compact/, $offset);
-$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, and moved 500 \(/, $offset);
+$node->wait_for_log(qr/a freer to start: \d+ buckets of chunks unheld, 2 segments to compact/, $offset);
+$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, looking in \d+ buckets marked, and moved 500 \(/, $offset);
 
 # the next VACUUM takes out the entries moved: the old packs all dead, removed
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
@@ -90,7 +90,7 @@ $node->safe_psql('postgres', q{
 });
 $offset = -s $node->logfile;
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
-$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, and moved 1500 \(/, $offset);
+$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, looking in \d+ buckets marked, and moved 1500 \(/, $offset);
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 my %old2 = map { $_ => 1 } split(/,/, $before2);
 my @new2 = grep { !$old2{$_} } split(/,/, $node->safe_psql('postgres', $packs));
@@ -122,7 +122,7 @@ $node->safe_psql('postgres', q{
 });
 $offset = -s $node->logfile;
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
-ok($node->log_contains(qr/a freer to start: [1-9]\d* chunks unheld, \d+ segments to compact.*, [1-9]\d* passed by for snapshots/, $offset),
+ok($node->log_contains(qr/a freer to start: [1-9]\d* buckets of chunks unheld, \d+ segments to compact.*, [1-9]\d* passed by for snapshots/, $offset),
 	'its pack passed by for the snapshot');
 $snap->quit;
 

@@ -31,6 +31,8 @@
 #include "varatt.h"
 
 PG_FUNCTION_INFO_V1(test_chunk_put);
+PG_FUNCTION_INFO_V1(test_chunk_index_marked);
+PG_FUNCTION_INFO_V1(test_chunk_index_buckets);
 PG_FUNCTION_INFO_V1(test_chunk_get);
 PG_FUNCTION_INFO_V1(test_chunk_has);
 PG_FUNCTION_INFO_V1(test_chunk_index_entry);
@@ -257,6 +259,7 @@ static void
 assign_format_refs(bool newval, void *extra)
 {
 	ChunkFormat = newval ? &TestChunkFormat : &LeafChunkFormat;
+	ChunkFormatConfigured = ChunkFormat;
 }
 
 void
@@ -552,4 +555,34 @@ test_chunk_hold(PG_FUNCTION_ARGS)
 
 	relation_close(idx, NoLock);
 	PG_RETURN_BOOL(held);
+}
+
+/* test_chunk_index_marked(idx) returns int8: the buckets marked */
+Datum
+test_chunk_index_marked(PG_FUNCTION_ARGS)
+{
+	Relation	idx = open_index(PG_GETARG_OID(0), AccessShareLock);
+	uint32		buckets[1024];
+	uint32		from = 0;
+	int64		total = 0;
+	int			n;
+
+	while ((n = ChunkIndex->marked(idx, from, lengthof(buckets), buckets)) > 0)
+	{
+		total += n;
+		from = buckets[n - 1] + 1;
+	}
+	relation_close(idx, AccessShareLock);
+	PG_RETURN_INT64(total);
+}
+
+/* test_chunk_index_buckets(idx) returns int8: its buckets */
+Datum
+test_chunk_index_buckets(PG_FUNCTION_ARGS)
+{
+	Relation	idx = open_index(PG_GETARG_OID(0), AccessShareLock);
+	int64		n = ChunkIndexBuckets(idx);
+
+	relation_close(idx, AccessShareLock);
+	PG_RETURN_INT64(n);
 }

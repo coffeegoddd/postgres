@@ -132,8 +132,10 @@ typedef struct ChunkIndexRoutine
 	 * references waits for none: its caller lets go of only references
 	 * that are its alone (of a chunk it frees, which no other may, or its
 	 * own increase taken back).  So two letting go of a chunk's last
-	 * references at once may each see one left, and leave it with none,
-	 * for VACUUM's freer to find.  A subtransaction's
+	 * references at once may each see one left, and leave it with none.
+	 * A decrease that leaves the chunk no hold, or is made as another
+	 * transaction changes its counts, marks its bucket (see marked), and
+	 * asks for a freer when this transaction commits.  A subtransaction's
 	 * changes of one chunk's counts are one change.  Adding nothing holds
 	 * the chunk: no other transaction frees it while this one runs (a
 	 * change is written, unless this transaction, or one it is part of,
@@ -149,6 +151,21 @@ typedef struct ChunkIndexRoutine
 	void		(*visit) (Relation idx,
 						  void (*fn) (void *arg, const ChunkIndexEntry *e),
 						  void *arg);
+
+	/*
+	 * The buckets that may hold a chunk nothing holds, marked as a hold of
+	 * one is let go of: up to max of them from bucket from, in buckets[]
+	 * (how many answered); each's chunks, as visit's; and bucket b
+	 * unmarked, if it holds no chunk nothing holds, nor a change of counts
+	 * or a freeing of a transaction running (that one in *wait, the bucket
+	 * left marked, false answered).  So the chunks nothing holds are found
+	 * at the cost of the buckets they are in, not of the index.
+	 */
+	int			(*marked) (Relation idx, uint32 from, int max, uint32 *buckets);
+	void		(*visit_bucket) (Relation idx, uint32 b,
+								 void (*fn) (void *arg, const ChunkIndexEntry *e),
+								 void *arg);
+	bool		(*unmark) (Relation idx, uint32 b, TransactionId *wait);
 
 	/*
 	 * Marks the chunk's entry freed by this transaction, its entry (counts
@@ -221,6 +238,9 @@ extern void ChunkIndexVacuum(Relation idx, bool truncate);
 
 /* The chunk index's format, its meta page's version: for pg_upgrade. */
 extern uint32 ChunkIndexFormatVersion(void);
+
+/* The index's buckets (for tests). */
+extern uint32 ChunkIndexBuckets(Relation idx);
 
 /* For tests: the entries on the buckets' pages not frozen. */
 extern uint64 ChunkIndexUnfrozen(Relation idx);
