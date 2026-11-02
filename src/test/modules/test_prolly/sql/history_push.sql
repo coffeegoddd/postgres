@@ -147,6 +147,30 @@ SELECT pg_history_fetch('b7') AS copied_again;
 SELECT pg_history_release('b7') AS freed;
 SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_still;
 SELECT pg_history_fetch('b7');
+-- a fetch stops at what the store has (the leaf p7 holds here), and puts
+-- again what was freed here but not taken out yet
+CREATE FUNCTION pg_temp.p8() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x5202'::bytea || pg_temp.h('\x0a1701') || pg_temp.h('\x0a1801')$$;
+SELECT (test_cs_put('pages', '\x0a1801')).stored, (test_cs_put('pages', pg_temp.p8())).stored;
+SELECT pg_history_push('b8', ARRAY[pg_temp.h(pg_temp.p8())]) AS copied;
+SELECT pg_history_fetch('b8') AS copied_but_the_leaf_here;
+SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p8())]) AS freed_here;
+SELECT pg_history_fetch('b8') AS put_again;
+SELECT test_cs_get('pages', pg_temp.h(pg_temp.p8())) = pg_temp.p8() AS read_here;
+-- (a fetch in a read-only transaction, and by one not a superuser, granted
+-- it: refused)
+BEGIN READ ONLY;
+SELECT pg_history_fetch('b8');
+ROLLBACK;
+CREATE ROLE regress_history_fetcher;
+GRANT EXECUTE ON FUNCTION pg_history_fetch(text) TO regress_history_fetcher;
+SET ROLE regress_history_fetcher;
+SELECT pg_history_fetch('b8');
+RESET ROLE;
+DROP OWNED BY regress_history_fetcher;
+DROP ROLE regress_history_fetcher;
+SELECT pg_history_release('b8') AS freed;
+SELECT test_cs_free_unheld('pages') >= 0 AS cleared;
 SELECT test_cs_unref_root('pages', pg_temp.h(pg_temp.p7()));
 SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p7())]) AS freed;
 
