@@ -46,6 +46,8 @@ my $idle = sub {
 			AND query <> 'waiting on transactions holding chunks to free'}),
 		$name // '(no freer running)');
 };
+my $waiting = q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'chunk freer'
+	AND query = 'waiting on transactions holding chunks to free'};
 my $gone = sub {
 	my ($hash_sql, $name) = @_;
 	ok($node->poll_query_until('postgres',
@@ -254,7 +256,7 @@ SKIP:
 # (it ended), asked again
 SKIP:
 {
-	skip 'injection points not supported by this build', 9
+	skip 'injection points not supported by this build', 20
 		if $ENV{enable_injection_points} ne 'yes';
 	my $race = sub {
 		my ($tag, $ending) = @_;
@@ -297,11 +299,62 @@ SKIP:
 	$t1->query_safe(q{BEGIN; SELECT test_cs_free('pages', ARRAY[h(node(leaf(85001), leaf(85002)))])});
 	$t3->query_safe(q{BEGIN; SELECT test_cs_ref_root('pages', h(leaf(85001)))});
 	$node->safe_psql('postgres', q{DELETE FROM pg_history.pointers WHERE name = 'z'});
+	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'a waiter on them');
 	$t1->query_safe('COMMIT');
 	$t3->query_safe('ROLLBACK');
 	$t1->quit;
 	$t3->quit;
 	$gone->(q{h(leaf(85001))}, 'two running there, one committed, one aborted: freed');
+
+	# a transaction that marks and is prepared: a pass as it prepares, the
+	# waiter on it until it is committed (no commit after asking)
+	$node->safe_psql('postgres', q{
+		SELECT test_cs_put('pages', leaf(88001));
+		INSERT INTO pg_history.pointers VALUES ('pp', h(leaf(88001)));
+	});
+	$idle->();
+	$node->safe_psql('postgres', q{BEGIN; DELETE FROM pg_history.pointers WHERE name = 'pp';
+		PREPARE TRANSACTION 'pp'});
+	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'prepared: a waiter on it');
+	$node->safe_psql('postgres', q{COMMIT PREPARED 'pp'});
+	$gone->(q{h(leaf(88001))}, 'the prepared drop committed: freed, nothing else asking');
+
+	# one waited on long, another noted after and ended: the other's freed
+	# while the long one runs
+	my $hold = sub {
+		my ($tag) = @_;
+		$node->safe_psql('postgres', qq{
+			SELECT count(*) FROM generate_series(${tag}1, ${tag}2) i, LATERAL test_cs_put('pages', leaf(i));
+			SELECT test_cs_put('pages', node(leaf(${tag}1), leaf(${tag}2)));
+			INSERT INTO pg_history.pointers VALUES ('h$tag', h(leaf(${tag}1))), ('k$tag', h(leaf(${tag}2)));
+		});
+		$idle->();
+		my $sess = $node->background_psql('postgres');
+		$sess->query_safe(qq{BEGIN; SELECT test_cs_free('pages', ARRAY[h(node(leaf(${tag}1), leaf(${tag}2)))])});
+		$node->safe_psql('postgres', qq{DELETE FROM pg_history.pointers WHERE name = 'h$tag'});
+		return $sess;
+	};
+	my $long = $hold->(8901);
+	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'a waiter on the long one');
+	my $short = $hold->(8902);
+	$idle->();
+	$short->query_safe('COMMIT');
+	$short->quit;
+	$gone->(q{h(leaf(89021))}, 'the short one ended: freed, the long one running');
+	$long->query_safe('COMMIT');
+	$long->quit;
+	$gone->(q{h(leaf(89011))}, 'the long one ended: freed');
+	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 0"), 'no waiter left');
+
+	# a waiter stopped: the next freer waits in its stead
+	my $t = $hold->(8903);
+	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'a waiter');
+	$node->safe_psql('postgres', qq{SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE backend_type = 'chunk freer' AND query = 'waiting on transactions holding chunks to free'});
+	ok($node->poll_query_until('postgres', "SELECT ($waiting) = 1"), 'another waiting in its stead');
+	$t->query_safe('COMMIT');
+	$t->quit;
+	$gone->(q{h(leaf(89031))}, 'the waiter stopped, the transaction ended: freed');
 
 	# a freer stopped by an error lets the freeing go: the next commit's
 	# freer frees
