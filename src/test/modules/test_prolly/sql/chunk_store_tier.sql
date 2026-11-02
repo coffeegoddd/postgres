@@ -86,7 +86,7 @@ FROM test_tier_pack_table('pg_history.tier_chunks', :last_pack) t;
 
 -- pack objects malformed: each refused by the reader of tables (a footer:
 -- entries, version, bytes of chunks, magic; an entry: hash, offset, length)
-CREATE FUNCTION pg_temp.footer(n int, version int, data_len int8, magic int8 DEFAULT 5423250189635965004)
+CREATE FUNCTION pg_temp.footer(n int, version int, data_len int8, magic int8 DEFAULT 5498985688571396939)
 RETURNS bytea LANGUAGE sql AS 'SELECT int4send(n) || int4send(version) || int8send(data_len) || int8send(magic)';
 CREATE FUNCTION pg_temp.entry(d bytea, off int, len int) RETURNS bytea LANGUAGE sql
 	AS 'SELECT substr(sha256(d), 1, 20) || int4send(off) || int4send(len)';

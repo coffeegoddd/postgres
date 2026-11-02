@@ -679,9 +679,15 @@ tier_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	if (pending.len + len + TABLE_ROOM(pending.nslots + 1) > pending.cap)
 	{
 		uint64		need = pending.len + len + TABLE_ROOM(pending.nslots + 1);
-		uint64		cap = Max(need, Max(pending.cap * 2, 1024 * 1024));
+		uint64		cap = Max(pending.cap * 2, 1024 * 1024);
 
-		cap = Min(cap, Max(TIER_PACK_BYTES + TABLE_ROOM(pending.nslots + 1), need));
+		/*
+		 * (doubling, to a pack's bytes and an eighth more for its table;
+		 * past that, an eighth more than is needed at once, so a table of
+		 * many small chunks grows in few steps)
+		 */
+		cap = Min(cap, TIER_PACK_BYTES + TIER_PACK_BYTES / 8);
+		cap = Max(cap, need + need / 8);
 		pending.buf = pending.buf ?
 			repalloc_huge(pending.buf, cap) :
 			MemoryContextAllocHuge(TopMemoryContext, cap);
