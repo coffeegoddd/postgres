@@ -51,6 +51,20 @@ open_log(Oid relid, LOCKMODE mode)
 	return rel;
 }
 
+/* a chunk log of either kind: the pages', or a tier's */
+static Relation
+open_any_log(Oid relid, LOCKMODE mode)
+{
+	Relation	rel = relation_open(relid, mode);
+
+	if (!RelationIsAnyChunkLog(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a chunk log relation",
+						RelationGetRelationName(rel))));
+	return rel;
+}
+
 /* test_chunk_log_append(rel regclass, data bytea) returns int8 */
 Datum
 test_chunk_log_append(PG_FUNCTION_ARGS)
@@ -127,7 +141,7 @@ test_chunk_log_space(PG_FUNCTION_ARGS)
 Datum
 test_chunk_log_segments(PG_FUNCTION_ARGS)
 {
-	Relation	rel = open_log(PG_GETARG_OID(0), AccessShareLock);
+	Relation	rel = open_any_log(PG_GETARG_OID(0), AccessShareLock);
 	ChunkLogSegments segs;
 	TupleDesc	desc;
 	Datum		values[6];

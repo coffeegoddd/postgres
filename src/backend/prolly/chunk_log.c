@@ -2199,6 +2199,14 @@ page_vacuum_begin(Relation rel)
  * if truncate, then the segments free recorded (not before: puts would
  * take the end from the cut), and what is found of them in *out
  */
+/* (a step's batch: its chunks' changes of the index, a transaction's) */
+static void
+page_compact_batch(Relation rel, int *chunks, uint64 *bytes)
+{
+	*chunks = 256;
+	*bytes = 0;
+}
+
 static void
 page_vacuum_end(Relation rel, void *state, bool truncate, double fraction,
 				const uint8 *pending, uint64 npending, ChunkLogSegments *out)
@@ -2222,6 +2230,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.compactable = page_compactable_segments,
 	.evacuable = page_evacuable_segments,
 	.segment_bytes = page_segment_bytes,
+	.compact_batch = page_compact_batch,
 	.find_segments = page_find_segments,
 	.vacuum_begin = page_vacuum_begin,
 	.vacuum_end = page_vacuum_end,

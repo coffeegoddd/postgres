@@ -307,6 +307,10 @@ pack_live(const TierPack *p)
 /* ------------------------------------------------------------ packs */
 
 static void tier_xact_callback(XactEvent event, void *arg);
+static bool pack_ours(const TierMeta *meta, TimeLineID tli, uint32 id,
+					  const TierPack *p);
+static bool to_repack(const TierMeta *meta, TimeLineID tli, uint32 id,
+					  const TierPack *p, double fraction);
 
 /* the pack begun: a number from the meta page, its entry this transaction's */
 static void
@@ -900,11 +904,47 @@ tier_bind_index(Relation rel, Oid index)
 }
 
 /* (packs are not compacted, nor the tier evacuated, yet: none to) */
+/*
+ * Repacking: the packs to repack, up to max, ascending, each a segment, its
+ * places from its first byte to its last (compaction moves their live
+ * chunks into this backend's pack, and the pack, all dead then, is
+ * removed)
+ */
 static int
-tier_no_segments(Relation rel, double fraction, int max, uint64 *starts,
+tier_compactable(Relation rel, double fraction, int max, uint64 *starts,
 				 uint64 *ends)
 {
-	return 0;
+	TierMeta	meta = read_meta(rel);
+	TimeLineID	tli = GetWALInsertionTimeLine();
+	int			n = 0;
+
+	for (uint32 first = 1; first < meta.next_pack && n < max; first += PACKS_PER_PAGE)
+	{
+		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
+
+		for (uint32 id = first; id < last && n < max; id++)
+		{
+			TierPack   *p = pack_entry(BufferGetPage(buf), id);
+
+			if (to_repack(&meta, tli, id, p, fraction))
+			{
+				starts[n] = PACK_LOC(id, 0);
+				ends[n] = PACK_LOC(id, p->size);
+				n++;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	return n;
+}
+
+/* (a pack's worth a transaction: a pack written each) */
+static void
+tier_compact_batch(Relation rel, int *chunks, uint64 *bytes)
+{
+	*chunks = INT_MAX;
+	*bytes = TIER_PACK_BYTES;
 }
 
 static int
@@ -920,10 +960,56 @@ tier_segment_bytes(Relation rel)
 	return (uint64) 1 << 32;
 }
 
+/*
+ * What VACUUM finds of the packs, each a segment: those this server has
+ * (committed and not removed), all dead ("free", for VACUUM to remove), to
+ * repack (those with chunks freed kept for snapshots, pending, passed
+ * by), worth it once their dead bytes come to half a pack's (a pack
+ * written, the more of it live)
+ */
+static void
+count_packs(Relation rel, double fraction, const uint8 *pending_bits, uint64 npending,
+			ChunkLogSegments *out)
+{
+	TierMeta	meta = read_meta(rel);
+	TimeLineID	tli = GetWALInsertionTimeLine();
+
+	memset(out, 0, sizeof(*out));
+	for (uint32 first = 1; first < meta.next_pack; first += PACKS_PER_PAGE)
+	{
+		uint32		last = Min(first + PACKS_PER_PAGE, meta.next_pack);
+		Buffer		buf = pack_buffer(rel, first, BUFFER_LOCK_SHARE);
+
+		for (uint32 id = first; id < last; id++)
+		{
+			TierPack   *p = pack_entry(BufferGetPage(buf), id);
+
+			if (p->state != PACK_COMMITTED || p->size == 0)
+				continue;
+			out->segments++;
+			if (p->dead >= p->size)
+				out->free++;
+			else if (to_repack(&meta, tli, id, p, fraction))
+			{
+				if (pending_bits != NULL && id < npending &&
+					(pending_bits[id / 8] & (1 << (id % 8))))
+					out->pending++;
+				else
+				{
+					out->compactable++;
+					out->compactable_dead += p->dead;
+				}
+			}
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	out->worth = out->compactable_dead >= TIER_PACK_BYTES / 2;
+}
+
 static void
 tier_find_segments(Relation rel, double fraction, ChunkLogSegments *out)
 {
-	memset(out, 0, sizeof(*out));
+	count_packs(rel, fraction, NULL, 0, out);
 }
 
 /*
@@ -979,6 +1065,27 @@ to_settle(const TierPack *p)
 		!TransactionIdIsInProgress(p->xid);
 }
 
+/* whether a pack is this server's: its owner's, or adopted */
+static bool
+pack_ours(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p)
+{
+	return (meta->owner_tli == tli && p->owner == meta->owner) || id < meta->adopted;
+}
+
+/*
+ * Whether a pack is to be repacked: this server's, committed and written,
+ * not all dead (all dead, it is removed), fraction of its bytes dead or
+ * more, and not this backend's pack being made
+ */
+static bool
+to_repack(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
+		  double fraction)
+{
+	return pack_ours(meta, tli, id, p) && p->state == PACK_COMMITTED &&
+		p->size > 0 && p->dead > 0 && p->dead < p->size &&
+		(double) p->dead >= fraction * (double) p->size && id != pending.id;
+}
+
 /*
  * Whether a pack is to be removed: this server's (its owner's, or adopted),
  * an orphan, or committed and all dead, every standby past where it died
@@ -987,7 +1094,7 @@ static bool
 to_remove(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
 		  int *held, pid_t *blocker, const char **why)
 {
-	if (!((meta->owner_tli == tli && p->owner == meta->owner) || id < meta->adopted))
+	if (!pack_ours(meta, tli, id, p))
 		return false;
 	if (p->state == PACK_ORPHANED)
 		return true;
@@ -1137,9 +1244,9 @@ tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
 {
 	TransactionId frozen;
 
-	memset(out, 0, sizeof(*out));
 	walk_packs(rel, true, &frozen);
 	advance_frozen(rel, frozen, false);
+	count_packs(rel, fraction, pending_bits, npending, out);
 }
 
 /*
@@ -1314,9 +1421,10 @@ const ChunkLogRoutine TierChunkLog = {
 	.release = tier_release,
 	.extend = tier_extend,
 	.prepare_free = tier_prepare_free,
-	.compactable = tier_no_segments,
+	.compactable = tier_compactable,
 	.evacuable = tier_no_evacuable,
 	.segment_bytes = tier_segment_bytes,
+	.compact_batch = tier_compact_batch,
 	.find_segments = tier_find_segments,
 	.vacuum_begin = tier_vacuum_begin,
 	.vacuum_end = tier_vacuum_end,

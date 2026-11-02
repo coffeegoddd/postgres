@@ -177,3 +177,33 @@ SELECT test_chunk_put('my_tier', 'my_tier_index', substr(sha256('\x0c'), 1, 20),
 DROP TABLE my_tier;
 COMMIT;
 DROP TABLE my_tier, my_tier_index;
+
+-- repacking: a pack with more than the fraction of its bytes dead is a
+-- segment to compact; compaction moves its live chunks into a pack of its
+-- transaction, and the old one, all dead then, is removed
+CREATE FUNCTION pg_temp.rp(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad('repack' || i, 1000, '.'), 'UTF8')$$;
+SELECT count(*) FROM generate_series(1, 10) g, LATERAL test_cs_put('tier', pg_temp.rp(g));
+SELECT max(id) AS rp_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
+SELECT count(*) FROM generate_series(1, 10) g,
+	LATERAL test_cs_ref_root('tier', substr(sha256(pg_temp.rp(g)), 1, 20));
+SELECT count(*) FROM generate_series(1, 6) g,
+	LATERAL test_cs_unref_root('tier', substr(sha256(pg_temp.rp(g)), 1, 20));
+SELECT test_cs_free('tier', ARRAY(SELECT substr(sha256(pg_temp.rp(g)), 1, 20) FROM generate_series(1, 6) g)) AS freed;
+VACUUM pg_history.tier_index;
+SELECT state, size, dead FROM test_tier_packs('pg_history.tier_chunks') WHERE id = :rp_pack;
+SELECT compactable, worth FROM test_chunk_log_segments('pg_history.tier_chunks', 0.5);
+SELECT compactable AS above_fraction FROM test_chunk_log_segments('pg_history.tier_chunks', 0.7);
+SELECT segments, chunks, bytes FROM test_chunk_compact('pg_history.tier_chunks', 'pg_history.tier_index', 0.5, false);
+VACUUM pg_history.tier_index;
+SELECT state FROM test_tier_packs('pg_history.tier_chunks') WHERE id = :rp_pack;
+SELECT count(*) FILTER (WHERE test_cs_get('tier', substr(sha256(pg_temp.rp(g)), 1, 20)) = pg_temp.rp(g)) AS live_read
+FROM generate_series(7, 10) g;
+SELECT count(*) AS entries FROM test_tier_packs('pg_history.tier_chunks') p,
+	LATERAL test_tier_pack_table('pg_history.tier_chunks', p.id) t
+WHERE p.id > :rp_pack AND p.state <> 'removed' AND p.size > 0
+	AND t.hash IN (SELECT substr(sha256(pg_temp.rp(g)), 1, 20) FROM generate_series(7, 10) g);
+SELECT ok FROM test_cs_check('tier');
+SELECT count(*) FROM generate_series(7, 10) g,
+	LATERAL test_cs_unref_root('tier', substr(sha256(pg_temp.rp(g)), 1, 20));
+SELECT test_cs_free('tier', ARRAY(SELECT substr(sha256(pg_temp.rp(g)), 1, 20) FROM generate_series(7, 10) g)) AS freed;

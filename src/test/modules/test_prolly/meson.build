@@ -170,6 +170,7 @@ tests += {
       't/069_object_store_crash.pl',
       't/070_history_tier.pl',
       't/071_wait_backend_gone.pl',
+      't/072_tier_repack.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

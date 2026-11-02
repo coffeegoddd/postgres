@@ -962,8 +962,8 @@ ChunkStoreCompactBegin(Relation log, Relation idx, int n, const uint64 *starts,
 
 int
 ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
-					  uint64 below, BlockNumber grow_to, uint64 *chunks,
-					  uint64 *bytes)
+					  uint64 max_bytes, uint64 below, BlockNumber grow_to,
+					  uint64 *chunks, uint64 *bytes)
 {
 	int			looked = 0;
 
@@ -972,7 +972,7 @@ ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
 		elog(ERROR, "cannot compact the history store without an active snapshot");
 	*chunks = *bytes = 0;
 	(void) GetCurrentTransactionId();
-	while (c->next < c->n && looked < max)
+	while (c->next < c->n && looked < max && (max_bytes == 0 || *bytes < max_bytes))
 	{
 		ChunkIndexEntry *e = &c->entries[c->next];
 		ChunkIndexEntry moved;
