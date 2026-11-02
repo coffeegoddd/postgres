@@ -84,7 +84,7 @@ char	   *history_tier_store = NULL;
 char	   *history_tier_location = NULL;
 
 #define TIER_MAGIC			0x54494552	/* "TIER" */
-#define TIER_VERSION		6
+#define TIER_VERSION		7
 #define TIER_META_BLOCK		0
 
 typedef struct TierMeta
@@ -120,8 +120,9 @@ typedef struct TierPack
 	uint64		size;			/* its bytes, once written */
 	uint64		dead;			/* of them, no chunk's any more */
 	XLogRecPtr	dead_lsn;		/* where the last of them died */
-	uint32		flags;			/* PACK_PENDING */
-	uint32		unused;
+	uint32		flags;			/* PACK_PENDING, PACK_MANIFEST */
+	TransactionId release_xid;	/* a manifest's: the release that let it go,
+								 * until settled */
 } TierPack;
 
 /*
@@ -129,6 +130,11 @@ typedef struct TierPack
  * repack (its live chunks moved already, maybe) until that passes
  */
 #define PACK_PENDING		0x01
+/*
+ * an object of the tier's own, not of chunks: a bundle's manifest, under
+ * manifests/ (prolly/chunk_tier.h's ChunkTierWriteManifest)
+ */
+#define PACK_MANIFEST		0x02
 
 #define PACKS_PER_PAGE \
 	((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) / sizeof(TierPack))
@@ -294,6 +300,22 @@ pack_name(uint64 stamp, uint64 owner, uint32 id)
 {
 	return psprintf("packs/%016llx/%016llx/%u", (unsigned long long) stamp,
 					(unsigned long long) owner, id);
+}
+
+/* a manifest's: the same, under manifests/ */
+static char *
+manifest_name(uint64 stamp, uint64 owner, uint32 id)
+{
+	return psprintf("manifests/%016llx/%016llx/%u", (unsigned long long) stamp,
+					(unsigned long long) owner, id);
+}
+
+/* an entry's object's name, as its kind is */
+static char *
+entry_name(uint64 stamp, const TierPack *p, uint32 id)
+{
+	return (p->flags & PACK_MANIFEST) ? manifest_name(stamp, p->owner, id) :
+		pack_name(stamp, p->owner, id);
 }
 
 /*
@@ -623,6 +645,28 @@ note_object(void *arg, const char *name, uint64 size)
 	*(bool *) arg = true;
 }
 
+/* the names a listing found */
+typedef struct ManifestList
+{
+	char	  **names;
+	int			n;
+	int			cap;
+} ManifestList;
+
+static void
+collect_name(void *arg, const char *name, uint64 size)
+{
+	ManifestList *ml = arg;
+
+	if (ml->n == ml->cap)
+	{
+		ml->cap = Max(ml->cap * 2, 16);
+		ml->names = ml->names ? repalloc_array(ml->names, char *, ml->cap) :
+			palloc_array(char *, ml->cap);
+	}
+	ml->names[ml->n++] = pstrdup(name);
+}
+
 bool
 ChunkTierDatabaseHasPacks(Oid dboid)
 {
@@ -640,9 +684,14 @@ ChunkTierDatabaseHasPacks(Oid dboid)
 	return any;
 }
 
-/* the pack begun: a number from the meta page, its entry this transaction's */
-static void
-begin_pack(Relation rel)
+/*
+ * An entry made: a number from the meta page, its entry this transaction's
+ * (flags its kind), the stamp and owner its object is named by in
+ * *stamp_out and *owner_out, the entry's record in *lsn_out
+ */
+static uint32
+make_entry(Relation rel, uint32 flags, uint64 *stamp_out, uint64 *owner_out,
+		   XLogRecPtr *lsn_out)
 {
 	Buffer		mbuf = ReadBuffer(rel, TIER_META_BLOCK);
 	Buffer		pbuf;
@@ -739,13 +788,27 @@ begin_pack(Relation rel)
 	p->size = 0;
 	p->dead = 0;
 	p->dead_lsn = InvalidXLogRecPtr;
-	p->flags = 0;
+	p->flags = flags;
+	p->release_xid = InvalidTransactionId;
 	stamp = meta_stamp(meta);
 	owner = meta->owner;
-	GenericXLogFinish(state);
+	*lsn_out = GenericXLogFinish(state);
 	UnlockReleaseBuffer(pbuf);
 	UnlockReleaseBuffer(mbuf);
 	unlock_marker(rel, marker_mode);
+	*stamp_out = stamp;
+	*owner_out = owner;
+	return id;
+}
+
+/* the pack begun: an entry made, this backend's pack */
+static void
+begin_pack(Relation rel)
+{
+	uint64		stamp;
+	uint64		owner;
+	XLogRecPtr	lsn;
+	uint32		id = make_entry(rel, 0, &stamp, &owner, &lsn);
 
 	pending.id = id;
 	pending.relid = RelationGetRelid(rel);
@@ -1472,6 +1535,8 @@ count_packs(Relation rel, double fraction, bool mark, const uint8 *pending_bits,
 				}
 				p->flags = pending ? (p->flags | PACK_PENDING) : (p->flags & ~PACK_PENDING);
 			}
+			if (p->flags & PACK_MANIFEST)
+				continue;
 			out->segments++;
 			if (p->dead >= p->size)
 				out->free++;
@@ -1547,10 +1612,25 @@ standbys_replayed(XLogRecPtr lsn, pid_t *blocker, const char **why)
 
 /* whether a pack's transaction ended, and the pack is to be settled */
 static bool
-to_settle(const TierPack *p)
+to_settle_made(const TierPack *p)
 {
 	return p->state == PACK_MADE && !TransactionIdIsCurrentTransactionId(p->xid) &&
 		!TransactionIdIsInProgress(p->xid);
+}
+
+/* (a manifest's release ended: committed, the manifest all dead) */
+static bool
+to_settle_release(const TierPack *p)
+{
+	return TransactionIdIsValid(p->release_xid) &&
+		!TransactionIdIsCurrentTransactionId(p->release_xid) &&
+		!TransactionIdIsInProgress(p->release_xid);
+}
+
+static bool
+to_settle(const TierPack *p)
+{
+	return to_settle_made(p) || to_settle_release(p);
 }
 
 /* whether a pack is this server's: its owner's, or adopted */
@@ -1570,6 +1650,7 @@ to_repack(const TierMeta *meta, TimeLineID tli, uint32 id, const TierPack *p,
 		  double fraction)
 {
 	return pack_ours(meta, tli, id, p) && p->state == PACK_COMMITTED &&
+		!(p->flags & PACK_MANIFEST) &&
 		p->size > 0 && p->dead > 0 && p->dead < p->size &&
 		(double) p->dead >= fraction * (double) p->size && !(p->flags & PACK_PENDING);
 }
@@ -1651,8 +1732,20 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 			{
 				TierPack   *p = pack_entry(page, id);
 
-				if (to_settle(p))
+				if (!to_settle(p))
+					continue;
+				if (p->state == PACK_MADE && to_settle_made(p))
 					p->state = TransactionIdDidCommit(p->xid) ? PACK_COMMITTED : PACK_ORPHANED;
+				/* (a manifest's release, in the same pass) */
+				if (p->state != PACK_MADE && to_settle_release(p))
+				{
+					if (TransactionIdDidCommit(p->release_xid))
+					{
+						p->dead = p->size;
+						p->dead_lsn = GetXLogInsertRecPtr();
+					}
+					p->release_xid = InvalidTransactionId;
+				}
 			}
 			GenericXLogFinish(state);
 		}
@@ -1662,6 +1755,9 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 
 			if (p->state == PACK_MADE && TransactionIdPrecedes(p->xid, *frozen))
 				*frozen = p->xid;
+			if (TransactionIdIsValid(p->release_xid) &&
+				TransactionIdPrecedes(p->release_xid, *frozen))
+				*frozen = p->release_xid;
 			if (remove && to_remove(&meta, tli, id, p, &held, &blocker, &why))
 				gone[ngone++] = id;
 			else if (p->state != PACK_REMOVED)
@@ -1687,7 +1783,7 @@ walk_packs(Relation rel, bool remove, TransactionId *frozen)
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 				p = *pack_entry(BufferGetPage(buf), gone[i]);
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				name = pack_name(meta_stamp(&meta), p.owner, gone[i]);
+				name = entry_name(meta_stamp(&meta), &p, gone[i]);
 				os->routine->remove(os, name);
 				pfree(name);
 			}
@@ -1880,6 +1976,107 @@ tier_check_live(Relation rel, int n, const uint64 *locs, const uint32 *lens,
 	return ok;
 }
 
+uint32
+ChunkTierWriteManifest(Relation rel, const void *data, size_t len)
+{
+	uint64		stamp;
+	uint64		owner;
+	XLogRecPtr	lsn;
+	uint32		id;
+	Buffer		buf;
+	GenericXLogState *state;
+	TierPack   *p;
+	char	   *name;
+	ObjectStore *os = tier_objects();
+
+	check_writer(rel);
+	if (rel->rd_createSubid != InvalidSubTransactionId ||
+		rel->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot write a manifest in tier \"%s\" in the transaction that made or truncated it",
+						RelationGetRelationName(rel))));
+	id = make_entry(rel, PACK_MANIFEST, &stamp, &owner, &lsn);
+
+	/*
+	 * (the entry's record flushed before the object is written: after a
+	 * crash the catalog knows every object there may be, an orphan's for
+	 * VACUUM; the push aborted, the same)
+	 */
+	XLogFlush(lsn);
+	name = manifest_name(stamp, owner, id);
+	os->routine->put(os, name, data, len);
+	pfree(name);
+	buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
+	state = GenericXLogStart(rel);
+	p = pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id);
+	p->size = len;
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+	return id;
+}
+
+void
+ChunkTierDropManifest(Relation rel, uint32 id)
+{
+	TierMeta	meta = read_meta(rel);
+	Buffer		buf;
+	GenericXLogState *state;
+	TierPack   *p;
+
+	if (id == 0 || id >= meta.next_pack)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("tier \"%s\" has no manifest %u", RelationGetRelationName(rel), id)));
+	buf = pack_buffer(rel, id, BUFFER_LOCK_EXCLUSIVE);
+	p = pack_entry(BufferGetPage(buf), id);
+	if (!(p->flags & PACK_MANIFEST) || p->state == PACK_REMOVED ||
+		TransactionIdIsValid(p->release_xid) || p->dead > 0)
+	{
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("tier \"%s\"'s entry %u is no manifest to let go of",
+						RelationGetRelationName(rel), id)));
+	}
+
+	/*
+	 * (the release's: committed, VACUUM counts the manifest all dead and
+	 * removes it as a pack all dead; aborted, it is the bundle's still)
+	 */
+	state = GenericXLogStart(rel);
+	p = pack_entry(GenericXLogRegisterBuffer(state, buf, 0), id);
+	p->release_xid = GetTopTransactionId();
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+}
+
+void
+ChunkTierListManifests(Relation rel, void (*fn) (void *arg, const char *data, size_t len),
+					   void *arg)
+{
+	TierMeta	meta = read_meta(rel);
+	ObjectStore *os = tier_objects();
+	char	   *prefix = psprintf("manifests/%016llx/", (unsigned long long) meta_stamp(&meta));
+	ManifestList ml = {0};
+
+	os->routine->list(os, prefix, collect_name, &ml);
+	for (int i = 0; i < ml.n; i++)
+	{
+		uint64		size;
+		char	   *data;
+
+		/* (one removed since it was listed: gone) */
+		if (!os->routine->size(os, ml.names[i], &size))
+			continue;
+		data = palloc_extended(Max(size, 1), MCXT_ALLOC_HUGE);
+		os->routine->read(os, ml.names[i], 0, data, size);
+		fn(arg, data, size);
+		pfree(data);
+	}
+	pfree(prefix);
+}
+
 int
 ChunkTierPackTable(Relation rel, uint32 id, ChunkTierPackEntry **entries, uint64 *data_len)
 {
@@ -1896,10 +2093,10 @@ ChunkTierPackTable(Relation rel, uint32 id, ChunkTierPackEntry **entries, uint64
 	buf = pack_buffer(rel, id, BUFFER_LOCK_SHARE);
 	p = *pack_entry(BufferGetPage(buf), id);
 	UnlockReleaseBuffer(buf);
-	if (p.state == PACK_REMOVED || p.size == 0)
+	if (p.state == PACK_REMOVED || p.size == 0 || (p.flags & PACK_MANIFEST))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("tier \"%s\"'s pack %u is not written, or removed",
+				 errmsg("tier \"%s\"'s pack %u is not written, or removed, or a manifest",
 						RelationGetRelationName(rel), id)));
 	name = pack_name(meta_stamp(&meta), p.owner, id);
 	n = ChunkTierReadPackTable(tier_objects(), name, entries, data_len);

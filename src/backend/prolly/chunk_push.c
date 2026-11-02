@@ -34,13 +34,17 @@
  */
 #include "postgres.h"
 
+#include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
+#include "port/pg_bswap.h"
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_store.h"
+#include "prolly/chunk_tier.h"
 #include "prolly/chunkstore.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
@@ -49,7 +53,74 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 #include "varatt.h"
+
+/*
+ * A bundle's manifest, an object in the tier (prolly/chunk_tier.h's
+ * ChunkTierWriteManifest): its magic and version, its name's length and
+ * its roots' number, then its name and its roots; numbers in network byte
+ * order.  So the tier says what bundles it has without the server.
+ */
+#define MANIFEST_MAGIC		UINT64CONST(0x4c505259424e444c)	/* "LPRYBNDL" */
+#define MANIFEST_VERSION	1
+
+typedef struct ManifestHeader
+{
+	uint64		magic;
+	uint32		version;
+	uint32		namelen;
+	uint32		nroots;
+	uint32		unused;
+} ManifestHeader;
+
+/* the bytes the tier keeps */
+static char *
+encode_manifest(const char *name, const uint8 *roots, int n, size_t *len)
+{
+	ManifestHeader h = {0};
+	size_t		namelen = strlen(name);
+	char	   *buf;
+
+	*len = sizeof(h) + namelen + (size_t) n * CHUNK_HASH_LEN;
+	buf = palloc(*len);
+	h.magic = pg_hton64(MANIFEST_MAGIC);
+	h.version = pg_hton32(MANIFEST_VERSION);
+	h.namelen = pg_hton32((uint32) namelen);
+	h.nroots = pg_hton32((uint32) n);
+	memcpy(buf, &h, sizeof(h));
+	memcpy(buf + sizeof(h), name, namelen);
+	memcpy(buf + sizeof(h) + namelen, roots, (size_t) n * CHUNK_HASH_LEN);
+	return buf;
+}
+
+/* the bytes the tier kept: their name and roots; an error if not a manifest */
+static void
+decode_manifest(const char *data, size_t len, char **name, uint8 **roots, int *n)
+{
+	ManifestHeader h;
+	uint32		namelen;
+
+	if (len < sizeof(h))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a bundle's manifest of %zu bytes is too short", len)));
+	memcpy(&h, data, sizeof(h));
+	if (pg_ntoh64(h.magic) != MANIFEST_MAGIC || pg_ntoh32(h.version) != MANIFEST_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("an object under manifests/ is no bundle's manifest of this format")));
+	namelen = pg_ntoh32(h.namelen);
+	*n = (int) pg_ntoh32(h.nroots);
+	if (namelen > len - sizeof(h) ||
+		(uint64) *n * CHUNK_HASH_LEN != len - sizeof(h) - namelen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a bundle's manifest of %zu bytes does not hold its name and %d roots", len, *n)));
+	*name = pnstrdup(data + sizeof(h), namelen);
+	*roots = palloc((Size) Max(*n, 1) * CHUNK_HASH_LEN);
+	memcpy(*roots, data + sizeof(h) + namelen, (Size) *n * CHUNK_HASH_LEN);
+}
 
 /* the bytes of chunks put into the tier at once */
 #define PUSH_BATCH_BYTES	(16 * 1024 * 1024)
@@ -263,7 +334,7 @@ pg_history_push(PG_FUNCTION_ARGS)
 	PushState	ps = {0};
 	HASHCTL		ctl;
 	HTAB	   *seen;
-	Oid			types[2] = {TEXTOID, BYTEAARRAYOID};
+	Oid			types[3] = {TEXTOID, BYTEAARRAYOID, INT8OID};
 
 	check_pusher("pg_history_push()");
 	if (n == 0)
@@ -296,14 +367,22 @@ pg_history_push(PG_FUNCTION_ARGS)
 	flush_batch(&ps);
 
 	/*
-	 * (the bundle's row holds its roots in the tier: its trigger.  Its name
-	 * the key: a push of the same name at once waits, and fails.)
+	 * (its manifest written to the tier, then the bundle's row, which holds
+	 * its roots there, its trigger's, and names the manifest.  Its name the
+	 * key: a push of the same name at once waits, and fails, its manifest
+	 * an orphan.)
 	 */
 	{
-		Datum		values[2] = {PointerGetDatum(bundle), PointerGetDatum(PG_GETARG_ARRAYTYPE_P(1))};
+		Relation	tier = relation_open(ChunkStoreTierLogRelid(), RowExclusiveLock);
+		size_t		mlen;
+		char	   *manifest = encode_manifest(text_to_cstring(bundle), roots, n, &mlen);
+		int64		id = ChunkTierWriteManifest(tier, manifest, mlen);
+		Datum		values[3] = {PointerGetDatum(bundle), PointerGetDatum(PG_GETARG_ARRAYTYPE_P(1)),
+		Int64GetDatum(id)};
 
-		if (SPI_execute_with_args("INSERT INTO pg_history.bundles (name, roots) VALUES ($1, $2)",
-								  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		relation_close(tier, NoLock);
+		if (SPI_execute_with_args("INSERT INTO pg_history.bundles (name, roots, manifest) VALUES ($1, $2, $3)",
+								  3, types, values, NULL, false, 0) != SPI_OK_INSERT)
 			elog(ERROR, "could not insert a bundle");
 	}
 	SPI_finish();
@@ -330,10 +409,11 @@ pg_history_release(PG_FUNCTION_ARGS)
 	uint8	   *roots;
 	int			n;
 	uint64		freed;
+	int64		manifest = 0;
 
 	check_pusher("pg_history_release()");
 	SPI_connect();
-	if (SPI_execute_with_args("DELETE FROM pg_history.bundles WHERE name = $1 RETURNING roots",
+	if (SPI_execute_with_args("DELETE FROM pg_history.bundles WHERE name = $1 RETURNING roots, manifest",
 							  1, types, values, NULL, false, 0) != SPI_OK_DELETE_RETURNING)
 		elog(ERROR, "could not delete a bundle");
 	if (SPI_processed == 0)
@@ -349,9 +429,16 @@ pg_history_release(PG_FUNCTION_ARGS)
 		/* (in the caller's memory: SPI_finish lets go of SPI's) */
 		roots = SPI_palloc((Size) Max(n, 1) * CHUNK_HASH_LEN);
 		memcpy(roots, found, (Size) n * CHUNK_HASH_LEN);
+		manifest = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
 	}
 	SPI_finish();
 	freed = cs_free(ChunkStoreOpen("tier"), roots, n);
+	{
+		Relation	tier = relation_open(ChunkStoreTierLogRelid(), RowExclusiveLock);
+
+		ChunkTierDropManifest(tier, (uint32) manifest);
+		relation_close(tier, NoLock);
+	}
 	PG_RETURN_INT64((int64) freed);
 }
 
@@ -425,4 +512,56 @@ pg_history_fetch(PG_FUNCTION_ARGS)
 		copy_reached(&ps, seen, roots + (Size) i * CHUNK_HASH_LEN);
 	flush_batch(&ps);
 	PG_RETURN_INT64((int64) ps.copied);
+}
+
+typedef struct BundlesListed
+{
+	ReturnSetInfo *rsinfo;
+} BundlesListed;
+
+static void
+list_bundle(void *arg, const char *data, size_t len)
+{
+	BundlesListed *bl = arg;
+	char	   *name;
+	uint8	   *roots;
+	int			n;
+	Datum	   *elems;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	decode_manifest(data, len, &name, &roots, &n);
+	elems = palloc_array(Datum, Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *h = palloc(VARHDRSZ + CHUNK_HASH_LEN);
+
+		SET_VARSIZE(h, VARHDRSZ + CHUNK_HASH_LEN);
+		memcpy(VARDATA(h), roots + (Size) i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
+		elems[i] = PointerGetDatum(h);
+	}
+	values[0] = CStringGetTextDatum(name);
+	values[1] = PointerGetDatum(construct_array(elems, n, BYTEAOID, -1, false, TYPALIGN_INT));
+	tuplestore_putvalues(bl->rsinfo->setResult, bl->rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * pg_history_tier_bundles() returns setof (name text, roots bytea[]): the
+ * bundles the tier's store has manifests of, read from it alone (a bundle
+ * released and not yet VACUUMed there still; one aborted, until VACUUM
+ * removes its manifest, too)
+ */
+Datum
+pg_history_tier_bundles(PG_FUNCTION_ARGS)
+{
+	BundlesListed bl;
+	Relation	tier;
+
+	check_pusher("pg_history_tier_bundles()");
+	InitMaterializedSRF(fcinfo, 0);
+	bl.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	tier = relation_open(ChunkStoreTierLogRelid(), AccessShareLock);
+	ChunkTierListManifests(tier, list_bundle, &bl);
+	relation_close(tier, AccessShareLock);
+	PG_RETURN_VOID();
 }

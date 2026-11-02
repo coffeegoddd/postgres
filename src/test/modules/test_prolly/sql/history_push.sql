@@ -77,7 +77,7 @@ SELECT test_cs_get('pages', pg_temp.h('\x0a1199')) AS read_here,
 DELETE FROM pg_history.pointers WHERE name = 'main';
 SELECT pg_history_release('b6') AS freed;
 -- (a bundle's row of a root twice: refused, its roots each once)
-INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')]);
+INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')], 0);
 -- the bundles' rows are not changed, nor truncated (the table a system
 -- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
@@ -179,5 +179,30 @@ SELECT pg_history_release('b8') AS freed;
 SELECT test_cs_free_unheld('pages') >= 0 AS cleared;
 SELECT test_cs_unref_root('pages', pg_temp.h(pg_temp.p7()));
 SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p7())]) AS freed;
+
+-- manifests: each bundle's, in the tier's store, which lists the bundles
+-- from it alone; a push aborted leaves an orphan, removed by VACUUM; a
+-- release's manifest stays until VACUUM, its release committed, removes it
+SELECT (test_cs_put('pages', '\x0a1901')).stored, (test_cs_put('pages', '\x0a1902')).stored;
+SELECT pg_history_push('b9', ARRAY[pg_temp.h('\x0a1901')]) AS copied;
+SELECT name, roots = ARRAY[pg_temp.h('\x0a1901')] AS its_roots FROM pg_history_tier_bundles() ORDER BY name;
+SELECT manifest > 0 AS has_manifest FROM pg_history.bundles WHERE name = 'b9';
+BEGIN;
+SELECT pg_history_push('b10', ARRAY[pg_temp.h('\x0a1902')]) AS copied;
+ROLLBACK;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+VACUUM pg_history.tier_index;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+-- (a release aborted: its manifest kept)
+BEGIN;
+SELECT pg_history_release('b9') AS freed;
+ROLLBACK;
+VACUUM pg_history.tier_index;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+SELECT pg_history_release('b9') AS freed;
+SELECT name FROM pg_history_tier_bundles() ORDER BY name;
+VACUUM pg_history.tier_index;
+SELECT count(*) AS left_after_vacuum FROM pg_history_tier_bundles();
+SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1902')]) AS freed;
 
 SELECT test_chunk_format_refs(false);
