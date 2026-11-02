@@ -2077,9 +2077,15 @@ ChunkTierListManifests(Relation rel, void (*fn) (void *arg, const char *data, si
 	ObjectStore *os = tier_objects();
 	char	   *prefix = psprintf("manifests/%016llx/", (unsigned long long) meta_stamp(&meta));
 	ManifestList ml = {0};
+	bool		locked = OidIsValid(meta.index) && !RecoveryInProgress();
 
-	/* (VACUUM of the index, which removes them, waited for, and waits) */
-	if (OidIsValid(meta.index))
+	/*
+	 * (on a primary, VACUUM of the index, which removes them, waited for,
+	 * and waiting, until listed; a standby takes no such lock, and a
+	 * manifest the primary's VACUUM removes as it is read is an error:
+	 * listed again, it is gone)
+	 */
+	if (locked)
 		LockRelationOid(meta.index, ShareUpdateExclusiveLock);
 
 	os->routine->list(os, prefix, collect_name, &ml);
@@ -2101,6 +2107,8 @@ ChunkTierListManifests(Relation rel, void (*fn) (void *arg, const char *data, si
 		fn(arg, data, size);
 		pfree(data);
 	}
+	if (locked)
+		UnlockRelationOid(meta.index, ShareUpdateExclusiveLock);
 	pfree(prefix);
 }
 
