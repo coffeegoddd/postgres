@@ -67,7 +67,11 @@ SELECT commit_to('b' || :branch, :a, :b, :c);
 		'066_free@1' => q{
 SELECT test_chunk_format_refs(true), test_cs_free_unheld('pages');
 },
+		# (VACUUM's session of the test format too: a session of the leaf
+		# format would start a freer of it, which frees a parent letting go
+		# of none of its references, which stay counted)
 		'066_vacuum@1' => q{
+SELECT test_chunk_format_refs(true);
 VACUUM pg_history.chunk_index;
 },
 	});
