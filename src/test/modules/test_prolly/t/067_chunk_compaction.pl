@@ -112,4 +112,39 @@ cmp_ok($node->safe_psql('postgres', "SELECT pg_relation_size('cl')"),
 is($node->safe_psql('postgres', "SELECT ok, chunks FROM test_chunk_check('cl', 'ci')"),
 	't|2000', 'the audit clean, every chunk there');
 
+# a freer to compact, leaving a bucket for a transaction running there,
+# stopped by an error as it compacts (before it waits): the transaction is
+# left to the next freer, which waits on it, and frees its chunk as it ends
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+		if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', q{
+		CREATE EXTENSION injection_points;
+		SELECT count(*) FROM generate_series(1, 2000) g,
+			LATERAL test_chunk_put('cl', 'ci', h(blob('c' || g)), blob('c' || g));
+		SELECT count(*) FROM generate_series(2, 2000, 2) g,
+			LATERAL test_chunk_ref_root('ci', h(blob('c' || g)));
+		SELECT sum(test_chunk_free('cl', 'ci', h(blob('c' || g)))) FROM generate_series(1, 2000, 2) g;
+		SELECT test_chunk_put('cl', 'ci', h(blob('x')), blob('x'));
+		SELECT test_chunk_ref_root('ci', h(blob('x')));
+	});
+	# (a transaction taking a root of x, running; another letting go of the
+	# root x had, x's bucket marked, its commit starting no freer)
+	my $t = $node->background_psql('postgres');
+	$t->query_safe(q{BEGIN; SELECT test_chunk_ref_root('ci', h(blob('x')))});
+	$node->safe_psql('postgres', q{SET chunk_free_in_background = off;
+		SELECT test_chunk_unref_root('ci', h(blob('x')))});
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('chunk-freer-step', 'error')});
+	my $offset = -s $node->logfile;
+	$node->safe_psql('postgres', 'VACUUM ci');
+	$node->wait_for_log(qr/error triggered for injection point chunk-freer-step/, $offset);
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('chunk-freer-step')});
+	$t->query_safe('ROLLBACK');
+	$t->quit;
+	ok($node->poll_query_until('postgres', q{SELECT NOT test_chunk_has('cl', 'ci', h(blob('x')))}),
+		'the compacting freer stopped: the transaction it left ended, its chunk freed by the next');
+	is($node->safe_psql('postgres', "SELECT ok FROM test_chunk_check('cl', 'ci')"), 't', 'the audit clean');
+}
+
 done_testing();

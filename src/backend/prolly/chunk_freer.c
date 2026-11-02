@@ -359,6 +359,7 @@ static Oid	exit_log = InvalidOid;
 static uint32 exit_generation = 0;
 static bool exit_freeing = false;
 static bool exit_waiting = false;
+static bool exit_wait_after = false;	/* to wait after compacting */
 static bool exit_registered = false;
 
 static void
@@ -366,7 +367,7 @@ freer_exit(int code, Datum arg)
 {
 	FreerEntry *e;
 
-	if (!exit_freeing && !exit_waiting)
+	if (!exit_freeing && !exit_waiting && !exit_wait_after)
 		return;
 	e = freer_entry(MyDatabaseId, exit_idx, false);
 	if (e)
@@ -381,6 +382,13 @@ freer_exit(int code, Datum arg)
 			e->waiter_proc = INVALID_PROC_NUMBER;
 			left = e->nwaiting > 0;
 		}
+
+		/*
+		 * (stopped compacting, the waiting not taken yet: none waiting, the
+		 * transactions left to the next)
+		 */
+		else if (exit_wait_after)
+			left = !e->waiter && e->nwaiting > 0;
 		dshash_release_lock(freer_table(), e);
 
 		/*
@@ -390,7 +398,7 @@ freer_exit(int code, Datum arg)
 		if (left)
 			freer_ask(MyDatabaseId, exit_log, exit_idx);
 	}
-	exit_freeing = exit_waiting = false;
+	exit_freeing = exit_waiting = exit_wait_after = false;
 }
 
 /* what the freer does in a transaction */
@@ -739,7 +747,7 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 			 * other has it)
 			 */
 			if (fs->nrunning > 0 && !e->waiter && (args->compact || args->evacuate))
-				fs->wait_after = true;
+				fs->wait_after = exit_wait_after = true;
 			else if (fs->nrunning > 0 && !e->waiter)
 			{
 				e->waiter = true;
@@ -831,6 +839,7 @@ ChunkFreerMain(Datum main_arg)
 			}
 			if (e)
 				dshash_release_lock(freer_table(), e);
+			exit_wait_after = false;
 		}
 		if (fs.wait)
 			freer_wait(&args);
