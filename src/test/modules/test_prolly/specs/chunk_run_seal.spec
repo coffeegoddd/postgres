@@ -39,9 +39,9 @@ setup		{ SET chunk_free_in_background = off; }
 step b_vacuum	{ VACUUM ri; }
 step b_free		{ SELECT free_pages FROM test_chunk_log_space('rl'); }
 step b_put		{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('x', 20000)), rs_big('x', 20000)) AS put; }
-step b_put_more	{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 30000)), rs_big('z', 30000)) AS put; }
+step b_put_more	{ SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 330000)), rs_big('z', 330000)) AS put; }
 
-# b's put takes a run of three pages, waits for a's, and finds the chunk
-# a's: the run left afresh.  Its next, of four pages, lets the run go: its
-# three pages free again (the four taken from the pages freed)
+# b's put takes a run of the pages freed (a region's), waits for a's, and
+# finds the chunk a's: the run left afresh.  Its next, longer than a region
+# (pages new for it), lets the run go: its pages free again
 permutation b_vacuum b_free a_begin a_put b_put a_commit b_free b_put_more b_free

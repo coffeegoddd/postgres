@@ -155,8 +155,8 @@ is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 # before both cuts freed (two generations old); everything freed, the log
 # back to its meta page
 $primary->safe_psql('postgres', q{
-	SELECT count(*) FILTER (WHERE (test_cs_put('pages', big(i))).stored) FROM generate_series(3001, 3020) i;
-	SELECT test_cs_free('pages', ARRAY(SELECT h(big(i)) FROM generate_series(3001, 3020) i));
+	SELECT count(*) FILTER (WHERE (test_cs_put('pages', huge(i))).stored) FROM generate_series(3001, 3004) i;
+	SELECT test_cs_free('pages', ARRAY(SELECT h(huge(i)) FROM generate_series(3001, 3004) i));
 });
 my $grown = $primary->safe_psql('postgres', $size);
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');

@@ -546,14 +546,15 @@ probe_free(Relation rel, uint64 d, BlockNumber nblocks)
 
 /*
  * npages data pages one after another the free space map has as free (every
- * byte dead), made afresh for this backend's appends; the first, or -1 if
- * none are found.  A page the map has is looked at with those before it, for
+ * byte dead), and the free ones after them up to a region's, made afresh
+ * for this backend's appends; the first, or -1 if none are found, and how
+ * many in *taken.  A page the map has is looked at with those before it, for
  * where a run of free pages begins; the run's pages are then locked in order,
  * each checked free, and made afresh.  The map is a hint, not WAL-logged: a
  * page it has wrongly is passed by, and taken out of it.
  */
 static int64
-take_free_pages(Relation rel, uint32 generation, int npages)
+take_free_pages(Relation rel, uint32 generation, int npages, int *taken)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 
@@ -614,6 +615,30 @@ take_free_pages(Relation rel, uint32 generation, int npages)
 				RecordPageWithFreeSpace(rel, blk, 0);
 			continue;
 		}
+
+		/*
+		 * (and the free pages after them, as far as a region goes: chunks
+		 * after go on across them as across pages new, where a page alone
+		 * would leave each chunk's rest that the next does not fit dead)
+		 */
+		while (npages < REGION_PAGES)
+		{
+			BlockNumber b = DATA_BLOCK(first + npages);
+			Page		page;
+
+			if (b >= nblocks)
+				break;
+			bufs[npages] = ReadBuffer(rel, b);
+			LockBuffer(bufs[npages], BUFFER_LOCK_EXCLUSIVE);
+			page = BufferGetPage(bufs[npages]);
+			if (PageIsNew(page) || !page_free(page))
+			{
+				UnlockReleaseBuffer(bufs[npages]);
+				break;
+			}
+			npages++;
+		}
+		*taken = npages;
 
 		/* (this backend's region's, and open, before they are made to use) */
 		ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), generation,
@@ -858,6 +883,7 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	{
 		uint64		npages;
 		int64		first;
+		int			taken = 0;
 		uint32		generation;
 
 		/*
@@ -882,12 +908,12 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 		 */
 		npages = (len + AREA - 1) / AREA;
 		first = npages <= REGION_PAGES ?
-			take_free_pages(rel, generation, Max(npages, 1)) : -1;
+			take_free_pages(rel, generation, Max(npages, 1), &taken) : -1;
 		if (first >= 0)
 		{
 			region.relnumber = rel->rd_locator.relNumber;
 			region.next = (uint64) first * AREA;
-			region.limit = region.next + (uint64) Max(npages, 1) * AREA;
+			region.limit = region.next + (uint64) taken * AREA;
 		}
 		else
 			claim_run(rel, len, REGION_PAGES, &region);

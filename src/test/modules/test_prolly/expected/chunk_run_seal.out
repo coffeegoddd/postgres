@@ -36,10 +36,10 @@ f
 step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
 free_pages
 ----------
-        67
+         9
 (1 row)
 
-step b_put_more: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 30000)), rs_big('z', 30000)) AS put;
+step b_put_more: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 330000)), rs_big('z', 330000)) AS put;
 put
 ---
 t  
@@ -48,6 +48,6 @@ t
 step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
 free_pages
 ----------
-        66
+        41
 (1 row)
 
