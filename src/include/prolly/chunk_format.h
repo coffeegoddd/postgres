@@ -32,6 +32,14 @@ typedef struct ChunkFormatRoutine
 } ChunkFormatRoutine;
 
 extern PGDLLIMPORT const ChunkFormatRoutine *ChunkFormat;
+
+/*
+ * The format every backend starts with, as the settings say (the leaf
+ * format, unless a module preloaded sets another): a background worker's,
+ * a chunk freer's.  A session may use another (ChunkFormat); it starts no
+ * freer, which would free by this one.
+ */
+extern PGDLLIMPORT const ChunkFormatRoutine *ChunkFormatConfigured;
 extern PGDLLIMPORT const ChunkFormatRoutine LeafChunkFormat;
 
 #endif							/* PROLLY_CHUNK_FORMAT_H */

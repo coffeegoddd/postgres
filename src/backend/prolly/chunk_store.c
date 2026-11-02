@@ -209,6 +209,7 @@ const ChunkFormatRoutine LeafChunkFormat = {
 };
 
 const ChunkFormatRoutine *ChunkFormat = &LeafChunkFormat;
+const ChunkFormatRoutine *ChunkFormatConfigured = &LeafChunkFormat;
 
 typedef struct RefList
 {

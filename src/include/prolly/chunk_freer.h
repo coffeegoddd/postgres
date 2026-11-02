@@ -14,6 +14,7 @@
 
 #include "postmaster/bgworker.h"
 #include "storage/block.h"
+#include "utils/relcache.h"
 
 extern PGDLLIMPORT bool chunk_free_in_background;
 extern PGDLLIMPORT double chunk_compact_dead_fraction;
@@ -28,6 +29,13 @@ extern PGDLLIMPORT double chunk_compact_dead_fraction;
  */
 extern bool ChunkFreerLaunch(Oid log, Oid idx, bool compact, bool evacuate,
 							 double fraction, BlockNumber grow);
+
+/*
+ * This transaction marked a bucket of idx (prolly/chunk_index.h's marked):
+ * a freer started for it as the transaction commits, unless one is freeing
+ * its chunks already, which looks again once it is done.
+ */
+extern void ChunkFreerWanted(Relation idx);
 
 /* The chunk freer's main function. */
 pg_noreturn extern void ChunkFreerMain(Datum main_arg);

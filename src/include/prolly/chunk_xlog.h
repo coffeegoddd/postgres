@@ -124,6 +124,9 @@ extern void chunk_log_mask(char *pagedata, BlockNumber blkno);
 											 * first page, 2: the directory
 											 * page (if not new) */
 #define XLOG_CHUNK_INDEX_BIND_LOG	0xA0	/* 0: meta */
+#define XLOG_CHUNK_INDEX_MARK		0xB0	/* 0: the marks' page */
+#define XLOG_CHUNK_INDEX_ADD_MARKS	0xC0	/* 0: meta, 1: the new marks'
+											 * page */
 
 typedef struct xl_chunk_index_vacuum
 {
@@ -189,6 +192,18 @@ typedef struct xl_chunk_index_bind_log
 	Oid			log;
 	uint32		unused;
 } xl_chunk_index_bind_log;
+
+typedef struct xl_chunk_index_mark
+{
+	uint32		bit;			/* the bucket's bit on the page */
+	uint32		on;				/* marked, or unmarked */
+} xl_chunk_index_mark;
+
+typedef struct xl_chunk_index_add_marks
+{
+	uint32		nth;			/* which of the marks' pages */
+	uint32		unused;
+} xl_chunk_index_add_marks;
 
 extern void chunk_index_redo(XLogReaderState *record);
 extern void chunk_index_desc(StringInfo buf, XLogReaderState *record);

@@ -44,6 +44,7 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "tcop/tcopprot.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -82,11 +83,11 @@ ChunkFreerLaunch(Oid log, Oid idx, bool compact, bool evacuate,
 		return false;
 
 	/*
-	 * (the freer frees by the leaf format, the only one a backend starts
-	 * with: from a session using another it would let go of no chunk's
-	 * references, which would stay counted)
+	 * (the freer frees by the format a backend starts with: from a session
+	 * using another it would let go of no chunk's references, which would
+	 * stay counted)
 	 */
-	if (ChunkFormat != &LeafChunkFormat)
+	if (ChunkFormat != ChunkFormatConfigured)
 		return false;
 	memset(&bgw, 0, sizeof(bgw));
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -110,10 +111,94 @@ ChunkFreerLaunch(Oid log, Oid idx, bool compact, bool evacuate,
 	return RegisterDynamicBackgroundWorker(&bgw, NULL);
 }
 
+/*
+ * The freeing of an index's chunks nothing holds is one freer's at a time:
+ * its lock, a session's, taken by the freer as it starts to free and let
+ * go of as it is done (a commit asking for a freer while one has it starts
+ * none: that one, let go of it, looks again for buckets marked).
+ */
+#define FREER_LOCK_SUBID	1
+
+static void
+freer_locktag(LOCKTAG *tag, Oid dboid, Oid idx)
+{
+	SET_LOCKTAG_OBJECT(*tag, dboid, RelationRelationId, idx, FREER_LOCK_SUBID);
+}
+
+/* the indexes this transaction marked a bucket of, a freer asked for each */
+typedef struct WantedFreer
+{
+	Oid			log;
+	Oid			idx;
+} WantedFreer;
+
+static WantedFreer *wanted = NULL;
+static int	nwanted = 0;
+static int	wanted_cap = 0;
+
+static void
+freer_xact_callback(XactEvent event, void *arg)
+{
+	int			n = nwanted;
+
+	/*
+	 * (asked for until the transaction ends: a root is let go of as it
+	 * commits, its pre-commit's)
+	 */
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PARALLEL_ABORT && event != XACT_EVENT_PREPARE)
+		return;
+	nwanted = 0;
+	if (event != XACT_EVENT_COMMIT)
+		return;
+	for (int i = 0; i < n; i++)
+	{
+		LOCKTAG		tag;
+
+		/* (one has it: it looks again once it lets go) */
+		freer_locktag(&tag, MyDatabaseId, wanted[i].idx);
+		if (LockAcquire(&tag, ExclusiveLock, true, true) == LOCKACQUIRE_NOT_AVAIL)
+			continue;
+		LockRelease(&tag, ExclusiveLock, true);
+		(void) ChunkFreerLaunch(wanted[i].log, wanted[i].idx, false, false,
+								chunk_compact_dead_fraction, 0);
+	}
+}
+
+void
+ChunkFreerWanted(Relation idx)
+{
+	static bool registered = false;
+	uint64		stamp;
+	Oid			log = ChunkIndex->log_of(idx, &stamp);
+
+	if (!OidIsValid(log))
+		return;
+	for (int i = 0; i < nwanted; i++)
+		if (wanted[i].idx == RelationGetRelid(idx))
+			return;
+	if (!registered)
+	{
+		RegisterXactCallback(freer_xact_callback, NULL);
+		registered = true;
+	}
+	if (nwanted == wanted_cap)
+	{
+		wanted_cap = Max(4, wanted_cap * 2);
+		wanted = wanted ? repalloc(wanted, wanted_cap * sizeof(*wanted)) :
+			MemoryContextAlloc(TopMemoryContext, wanted_cap * sizeof(*wanted));
+	}
+	wanted[nwanted].log = log;
+	wanted[nwanted].idx = RelationGetRelid(idx);
+	nwanted++;
+}
+
 /* what the freer does in a transaction */
 typedef enum FreerOp
 {
-	FREER_FREE,					/* free the chunks nothing holds */
+	FREER_FREE,					/* free the chunks nothing holds, of the
+								 * buckets marked */
+	FREER_UNMARK,				/* unmark the buckets freed */
 	FREER_BEGIN_COMPACT,		/* find the segments to compact, their chunks */
 	FREER_BEGIN_EVACUATE,		/* find the segments to evacuate, their chunks */
 	FREER_STEP,					/* move the next batch */
@@ -129,7 +214,32 @@ typedef struct FreerState
 	uint64		freed;
 	uint64		chunks;
 	uint64		bytes;
+	/* freeing: the buckets marked from this one, those being freed */
+	uint32		from;
+	uint32	   *buckets;
+	int			nbuckets;
+	uint64		buckets_looked; /* the buckets looked in */
+	int			kept;			/* the buckets left marked, a pass's */
+	TransactionId *waits;		/* transactions running there */
+	int			nwaits;
 } FreerState;
+
+#define FREE_BUCKETS		1024
+
+/* a chunk of a bucket marked, its holds none: to free */
+static void
+note_unheld(void *arg, const ChunkIndexEntry *e)
+{
+	List	  **unheld = arg;
+
+	if (e->refs == 0 && e->roots == 0)
+	{
+		uint8	   *h = palloc(CHUNK_HASH_LEN);
+
+		memcpy(h, e->hash, CHUNK_HASH_LEN);
+		*unheld = lappend(*unheld, h);
+	}
+}
 
 /*
  * One step of the freer's in a transaction of its own, the index locked
@@ -147,7 +257,10 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 		INJECTION_POINT("chunk-freer-step", NULL);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	if (ConditionalLockDatabaseObject(RelationRelationId, args->idx, 0,
+	/* (freeing waits for another freer's compaction step; compacting, not) */
+	if (op == FREER_FREE || op == FREER_UNMARK ?
+		(LockDatabaseObject(RelationRelationId, args->idx, 0, ExclusiveLock), true) :
+		ConditionalLockDatabaseObject(RelationRelationId, args->idx, 0,
 									  ExclusiveLock))
 	{
 		/* (compaction appends to the log) */
@@ -167,7 +280,39 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 			switch (op)
 			{
 				case FREER_FREE:
-					fs->freed = ChunkStoreFreeUnheld(log, idx);
+					{
+						List	   *unheld = NIL;
+						uint8	   *hashes;
+						int			i = 0;
+
+						fs->nbuckets = ChunkIndex->marked(idx, fs->from, FREE_BUCKETS,
+														  fs->buckets);
+						for (int b = 0; b < fs->nbuckets; b++)
+							ChunkIndex->visit_bucket(idx, fs->buckets[b], note_unheld, &unheld);
+						fs->buckets_looked += fs->nbuckets;
+						hashes = palloc(Max(list_length(unheld), 1) * CHUNK_HASH_LEN);
+						foreach_ptr(uint8, h, unheld)
+							memcpy(hashes + (Size) i++ * CHUNK_HASH_LEN, h, CHUNK_HASH_LEN);
+						if (i > 0)
+							fs->freed += ChunkStoreFree(log, idx, hashes, i);
+						list_free_deep(unheld);
+						pfree(hashes);
+						break;
+					}
+				case FREER_UNMARK:
+					fs->nwaits = 0;
+					for (int b = 0; b < fs->nbuckets; b++)
+					{
+						TransactionId w;
+
+						if (!ChunkIndex->unmark(idx, fs->buckets[b], &w))
+						{
+							if (TransactionIdIsValid(w))
+								fs->waits[fs->nwaits++] = w;
+							else
+								fs->kept++;
+						}
+					}
 					break;
 				case FREER_BEGIN_COMPACT:
 				case FREER_BEGIN_EVACUATE:
@@ -199,6 +344,78 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	return done;
+}
+
+/*
+ * The chunks nothing holds freed, those of the buckets marked, and what
+ * they alone held: a batch of buckets a transaction, then each unmarked in
+ * another that holds none now; one with a transaction running there waited
+ * for, and freed again.  The freeing's lock let go of, the buckets marked
+ * looked at again: one marked since, as it was held, is freed too.  False
+ * if the index is gone, or another freer has it.
+ */
+static bool
+freer_free(const ChunkFreerArgs *args, FreerState *fs)
+{
+	LOCKTAG		tag;
+
+	freer_locktag(&tag, args->dboid, args->idx);
+	fs->buckets = MemoryContextAlloc(fs->cxt, FREE_BUCKETS * sizeof(uint32));
+	fs->waits = MemoryContextAlloc(fs->cxt, FREE_BUCKETS * sizeof(TransactionId));
+
+	/* (another frees them: this one compacts, if it is to) */
+	if (LockAcquire(&tag, ExclusiveLock, true, true) == LOCKACQUIRE_NOT_AVAIL)
+		return true;
+	for (;;)
+	{
+		int			left;
+
+		fs->from = 0;
+		fs->kept = 0;
+		for (;;)
+		{
+			if (!freer_step(args, FREER_FREE, fs))
+			{
+				LockRelease(&tag, ExclusiveLock, true);
+				return false;
+			}
+			if (fs->nbuckets == 0)
+				break;
+			if (!freer_step(args, FREER_UNMARK, fs))
+			{
+				LockRelease(&tag, ExclusiveLock, true);
+				return false;
+			}
+			if (fs->nwaits > 0)
+			{
+				/* (the transactions there ended, the batch freed again) */
+				StartTransactionCommand();
+				for (int i = 0; i < fs->nwaits; i++)
+					XactLockTableWait(fs->waits[i], NULL, NULL, XLTW_None);
+				CommitTransactionCommand();
+				continue;
+			}
+			fs->from = fs->buckets[fs->nbuckets - 1] + 1;
+		}
+		LockRelease(&tag, ExclusiveLock, true);
+
+		/*
+		 * (marked since, by a commit that found the lock held: looked at
+		 * again, unless the lock is another's now)
+		 */
+		StartTransactionCommand();
+		{
+			Relation	idx = try_relation_open(args->idx, AccessShareLock);
+
+			left = idx ? ChunkIndex->marked(idx, 0, fs->kept + 1, fs->buckets) : 0;
+			if (idx)
+				relation_close(idx, AccessShareLock);
+		}
+		CommitTransactionCommand();
+		if (left <= fs->kept ||
+			LockAcquire(&tag, ExclusiveLock, true, true) == LOCKACQUIRE_NOT_AVAIL)
+			return true;
+	}
 }
 
 /* a compaction, or an evacuation, begun and stepped through to its end */
@@ -238,7 +455,7 @@ ChunkFreerMain(Datum main_arg)
 								   ALLOCSET_DEFAULT_SIZES);
 
 	pgstat_report_activity(STATE_RUNNING, "freeing chunks nothing holds");
-	if (freer_step(&args, FREER_FREE, &fs))
+	if (freer_free(&args, &fs))
 	{
 		if (args.compact)
 		{
@@ -253,8 +470,9 @@ ChunkFreerMain(Datum main_arg)
 	}
 	pgstat_report_stat(true);
 	ereport(DEBUG1,
-			(errmsg_internal("chunk freer freed %llu chunks of chunk index %u, and moved %llu (%llu bytes)",
+			(errmsg_internal("chunk freer freed %llu chunks of chunk index %u, looking in %llu buckets marked, and moved %llu (%llu bytes)",
 							 (unsigned long long) fs.freed, args.idx,
+							 (unsigned long long) fs.buckets_looked,
 							 (unsigned long long) moved,
 							 (unsigned long long) moved_bytes)));
 	proc_exit(0);

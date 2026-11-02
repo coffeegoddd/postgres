@@ -100,7 +100,7 @@ my $waldump = sub {
 my $out = $waldump->($start_lsn);
 my %seen = map { $_ => 1 } ($out =~ /desc: ([A-Z_]+)/g);
 is(join(' ', sort keys %seen),
-	'ADD_ENTRY ADD_PAGE BIND_LOG FOLD INIT_PAGE KEEP REMOVE_SLOT SET_COUNTS SET_XMAX SPLIT VACUUM',
+	'ADD_ENTRY ADD_MARKS ADD_PAGE BIND_LOG FOLD INIT_PAGE KEEP MARK REMOVE_SLOT SET_COUNTS SET_XMAX SPLIT VACUUM',
 	'every record of the index\'s is among them');
 
 # crash recovery too

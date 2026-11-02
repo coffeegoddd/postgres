@@ -64,12 +64,13 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	6
+#define CHUNK_INDEX_VERSION	7
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
 #define INDEX_PAGE_BUCKET	3			/* a bucket's first page */
 #define INDEX_PAGE_OVERFLOW	4			/* a later page of its chain */
+#define INDEX_PAGE_MARKS	5			/* buckets marked, a bit each */
 
 #define META_BLOCK			0
 #define INIT_BUCKETS		8			/* a power of two */
@@ -101,6 +102,8 @@ typedef struct IndexMetaData
 	BlockNumber next_block;		/* the first page not in use */
 	Oid			log;			/* the chunk log the entries are of, or 0 */
 	uint64		log_stamp;		/* and its storage's stamp */
+	uint32		nmarks;			/* the marks' pages */
+	BlockNumber marks[64];		/* MAX_MARKS */
 	uint32		ndir;			/* the directory's pages */
 	BlockNumber dir[FLEXIBLE_ARRAY_MEMBER];
 } IndexMetaData;
@@ -109,6 +112,12 @@ typedef struct IndexMetaData
 						 sizeof(BlockNumber))
 #define DIR_PER_PAGE	(CONTENTS_SIZE / sizeof(BlockNumber))
 #define PER_PAGE		(CONTENTS_SIZE / sizeof(ChunkIndexEntry))
+#define MAX_MARKS		64
+#define MARK_BITS		((uint32) (CONTENTS_SIZE * 8))
+
+/* (a bit for every bucket there can be) */
+StaticAssertDecl((uint64) MAX_MARKS * MARK_BITS >= (uint64) MAX_DIR * DIR_PER_PAGE,
+				 "the marks' pages have a bit for each bucket");
 
 /* A backend's copy of the meta page, in the relation's rd_amcache. */
 typedef struct IndexCache
@@ -119,6 +128,8 @@ typedef struct IndexCache
 	uint32		maxbucket;
 	uint32		lowmask;
 	uint32		highmask;
+	uint32		nmarks;
+	BlockNumber marks[MAX_MARKS];
 	uint32		ndir;
 	BlockNumber dir[MAX_DIR];
 } IndexCache;
@@ -309,7 +320,7 @@ page_meta(Relation rel, Page page)
 
 	check_ipage(rel, META_BLOCK, page, INDEX_PAGE_META);
 	meta = (IndexMetaData *) PageGetContents(page);
-	if (meta->ndir == 0 || meta->ndir > MAX_DIR)
+	if (meta->ndir == 0 || meta->ndir > MAX_DIR || meta->nmarks > MAX_MARKS)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("chunk index \"%s\" has a meta page of %u directory pages",
@@ -421,6 +432,44 @@ idir_set(Page page, uint32 slot, BlockNumber blk)
 }
 
 /* a split made public, in the meta page */
+/* a marks' page, the nth, no bucket marked */
+static void
+imarks_init(Page page, uint32 nth)
+{
+	init_ipage(page, INDEX_PAGE_MARKS, nth, 0);
+	memset(PageGetContents(page), 0, CONTENTS_SIZE);
+	/* (no hole: its image is the bits, every one) */
+	((PageHeader) page)->pd_lower = ((PageHeader) page)->pd_upper;
+}
+
+static inline bool
+imarks_get(Page page, uint32 bit)
+{
+	return (((uint8 *) PageGetContents(page))[bit / 8] >> (bit % 8)) & 1;
+}
+
+static void
+imarks_set(Page page, uint32 bit, bool on)
+{
+	uint8	   *bits = (uint8 *) PageGetContents(page);
+
+	if (on)
+		bits[bit / 8] |= (uint8) (1 << (bit % 8));
+	else
+		bits[bit / 8] &= (uint8) ~(1 << (bit % 8));
+}
+
+/* the meta page's nth marks' page, blk */
+static void
+imeta_add_marks(Page page, uint32 nth, BlockNumber blk)
+{
+	IndexMetaData *meta = (IndexMetaData *) PageGetContents(page);
+
+	meta->marks[nth] = blk;
+	meta->nmarks = nth + 1;
+	meta->next_block = blk + 1;
+}
+
 static void
 imeta_split(Page page, const xl_chunk_index_split *x)
 {
@@ -592,6 +641,8 @@ load_cache(Relation rel)
 	cache.maxbucket = meta->maxbucket;
 	cache.lowmask = meta->lowmask;
 	cache.highmask = meta->highmask;
+	cache.nmarks = meta->nmarks;
+	memcpy(cache.marks, meta->marks, meta->nmarks * sizeof(BlockNumber));
 	cache.ndir = meta->ndir;
 	memcpy(cache.dir, meta->dir, meta->ndir * sizeof(BlockNumber));
 	UnlockReleaseBuffer(mbuf);
@@ -836,6 +887,10 @@ release_found(Buffer primary, Buffer found)
  * Splits the next bucket in order in two (if no other backend has since
  * the caller looked).
  */
+static void set_mark(Relation idx, uint32 b, bool on);
+static bool is_marked(Relation idx, uint32 b);
+static int	page_marked(Relation idx, uint32 from, int max, uint32 *buckets);
+
 static void
 split_bucket(Relation rel)
 {
@@ -1021,6 +1076,10 @@ split_bucket(Relation rel)
 	}
 	UnlockReleaseBuffer(mbuf);
 
+	/* (a bucket marked: the new one, which some of its chunks are now, too) */
+	if (is_marked(rel, old_b))
+		set_mark(rel, new_b, true);
+
 	INJECTION_POINT("chunk-index-split-published", NULL);
 
 	/* and then out of the old bucket */
@@ -1050,6 +1109,162 @@ split_bucket(Relation rel)
 	UnlockReleaseBuffer(primary);
 	if (moving)
 		pfree(moving);
+}
+
+/* ------------------------------------------------------- marks */
+
+/*
+ * A bucket marked may hold a chunk nothing holds: one whose last hold a
+ * transaction let go of, or whose counts another transaction was changing
+ * as one let go of one (neither then sees the last go).  The freer frees
+ * what nothing holds in the buckets marked, and unmarks each that then holds
+ * none, nor a change or entry of a transaction running: freeing costs the
+ * buckets marked, not the index.  A bucket is marked and unmarked with its
+ * first page locked exclusively, so an unmark sees every change made before
+ * it; a split marks the new bucket of a bucket marked, the old one's first
+ * page locked.  The marks are a bitmap, a bit a bucket, on pages the meta
+ * page lists, made as buckets reach them (locks: a bucket's first page,
+ * the meta page, a marks' page).
+ */
+
+/* the marks' pages up to the kth made (a bucket's first page locked) */
+static void
+add_marks(Relation idx, uint32 k)
+{
+	Buffer		mbuf = ReadBuffer(idx, META_BLOCK);
+	IndexMetaData *meta;
+
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = page_meta(idx, BufferGetPage(mbuf));
+	while (meta->nmarks <= k)
+	{
+		BlockNumber blk = meta->next_block;
+		xl_chunk_index_add_marks xlrec = {.nth = meta->nmarks};
+		Buffer		nbuf;
+		LoggedPage	lps[2];
+
+		if (meta->nmarks >= MAX_MARKS || blk >= MaxBlockNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("chunk index \"%s\" is full", RelationGetRelationName(idx))));
+		nbuf = new_page_buffer(idx, blk);
+		lps[0] = (LoggedPage) {.buf = mbuf};
+		lps[1] = (LoggedPage) {.buf = nbuf, .will_init = true};
+		START_CRIT_SECTION();
+		imeta_add_marks(BufferGetPage(mbuf), xlrec.nth, blk);
+		imarks_init(BufferGetPage(nbuf), xlrec.nth);
+		log_index_change(idx, XLOG_CHUNK_INDEX_ADD_MARKS, &xlrec, sizeof(xlrec), lps, 2,
+						 InvalidBuffer);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(nbuf);
+	}
+	UnlockReleaseBuffer(mbuf);
+}
+
+/* the marks' page of bucket b, pinned; none if it is not made and not to be */
+static Buffer
+marks_page(Relation idx, uint32 b, bool make)
+{
+	uint32		k = b / MARK_BITS;
+	IndexCache *cache = get_cache(idx);
+
+	if (k >= cache->nmarks)
+		cache = load_cache(idx);
+	if (k >= cache->nmarks)
+	{
+		if (!make)
+			return InvalidBuffer;
+		add_marks(idx, k);
+		cache = load_cache(idx);
+	}
+	return ReadBuffer(idx, cache->marks[k]);
+}
+
+/* bucket b marked, or unmarked, WAL-logged (its first page locked) */
+static void
+set_mark(Relation idx, uint32 b, bool on)
+{
+	Buffer		buf = marks_page(idx, b, on);
+	uint32		bit = b % MARK_BITS;
+	xl_chunk_index_mark xlrec = {.bit = bit, .on = on};
+	LoggedPage	lp;
+
+	if (!BufferIsValid(buf))
+		return;
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_ipage(idx, BufferGetBlockNumber(buf), BufferGetPage(buf), INDEX_PAGE_MARKS);
+	if (imarks_get(BufferGetPage(buf), bit) == on)
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	if (imarks_get(BufferGetPage(buf), bit) == on)
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	lp = (LoggedPage) {.buf = buf};
+	START_CRIT_SECTION();
+	imarks_set(BufferGetPage(buf), bit, on);
+	log_index_change(idx, XLOG_CHUNK_INDEX_MARK, &xlrec, sizeof(xlrec), &lp, 1, InvalidBuffer);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+}
+
+/* whether bucket b is marked (as it was read: nothing locked) */
+static bool
+is_marked(Relation idx, uint32 b)
+{
+	Buffer		buf = marks_page(idx, b, false);
+	bool		on;
+
+	if (!BufferIsValid(buf))
+		return false;
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	on = imarks_get(BufferGetPage(buf), b % MARK_BITS);
+	UnlockReleaseBuffer(buf);
+	return on;
+}
+
+/*
+ * The buckets marked from bucket from, up to max of them, in buckets[];
+ * how many.  The marks' pages read, each in share lock alone.
+ */
+static int
+page_marked(Relation idx, uint32 from, int max, uint32 *buckets)
+{
+	IndexCache	cache = *load_cache(idx);
+	uint32		nbuckets = cache.maxbucket + 1;
+	int			n = 0;
+
+	for (uint32 k = from / MARK_BITS; k < cache.nmarks && n < max; k++)
+	{
+		Buffer		buf = ReadBuffer(idx, cache.marks[k]);
+		const uint8 *bits;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_ipage(idx, cache.marks[k], BufferGetPage(buf), INDEX_PAGE_MARKS);
+		bits = (const uint8 *) PageGetContents(BufferGetPage(buf));
+		for (uint32 bit = k == from / MARK_BITS ? from % MARK_BITS : 0;
+			 bit < MARK_BITS && n < max; bit++)
+		{
+			uint32		b = k * MARK_BITS + bit;
+
+			if (b >= nbuckets)
+				break;
+			if (bit % 8 == 0 && bits[bit / 8] == 0)
+			{
+				bit += 7;
+				continue;
+			}
+			if ((bits[bit / 8] >> (bit % 8)) & 1)
+				buckets[n++] = b;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	return n;
 }
 
 /* ------------------------------------------------------- the routine */
@@ -1499,8 +1714,13 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		*out = *page_entry(BufferGetPage(found), at);
 		if (found != primary)
 			UnlockReleaseBuffer(found);
+		/*
+		 * (a reference let go of: whether another transaction changes the
+		 * chunk's counts, which may be letting go of its last but this one)
+		 */
 		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
-					  false, &crefs, &croots, &running, &own_blk, &own_at, &any_own);
+					  drefs < 0 && droots == 0, &crefs, &croots, &running, &own_blk,
+					  &own_at, &any_own);
 
 		/*
 		 * (a root let go of waits for another's, as a row's update waits for
@@ -1577,6 +1797,18 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		chain_room(idx, primary, &space, &last);
 		(void) add_entry(idx, primary, bucket, space, last, &change, NULL, NULL);
 		pgstat_count_heap_insert(idx, 1);
+	}
+
+	/*
+	 * (a hold let go of, and none left, or another transaction changing the
+	 * counts: the bucket marked, for the freer, which this transaction's
+	 * commit starts)
+	 */
+	if ((drefs < 0 || droots < 0) &&
+		((out->refs == 0 && out->roots == 0) || TransactionIdIsValid(running)))
+	{
+		set_mark(idx, bucket, true);
+		ChunkFreerWanted(idx);
 	}
 	UnlockReleaseBuffer(primary);
 	return true;
@@ -1701,99 +1933,167 @@ page_remove(Relation idx, const uint8 *hash)
 	return removed;
 }
 
+/* a bucket's chunks this transaction sees, their counts added up */
+typedef struct BucketChunks
+{
+	ChunkIndexEntry *chunks;
+	int			n;
+	int			cap;
+} BucketChunks;
+
+/*
+ * Bucket b's first page, read and locked in mode, its chunks this
+ * transaction sees in *bc, each's counts its own and its changes' it sees
+ * added; in *wait (if given) a transaction running that changes a chunk's
+ * counts there, or frees one (none: InvalidTransactionId).
+ */
+static Buffer
+read_bucket(Relation idx, uint32 b, int mode, BucketChunks *bc, TransactionId *wait)
+{
+	IndexCache	masks = *get_cache(idx);
+	BlockNumber blk = bucket_block(idx, &masks, b);
+	Buffer		primary = ReadBuffer(idx, blk);
+	Buffer		cur;
+	ChunkIndexEntry *changes = NULL;
+	int			nchanges = 0,
+				cap2 = 0;
+
+	bc->n = 0;
+	if (wait)
+		*wait = InvalidTransactionId;
+	LockBuffer(primary, mode);
+	check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
+	if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
+		masks = *load_cache(idx);
+	cur = primary;
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			n = page_entries(page);
+
+		for (int i = 0; i < n; i++)
+		{
+			ChunkIndexEntry *e = page_entry(page, i);
+			TransactionId running = InvalidTransactionId;
+			EntryState	st;
+
+			if (!belongs(e, b, &masks))
+				continue;
+			st = entry_state_wait(e, cur, &running);
+			/* (a chunk's put running: not a change of counts, nor a freeing) */
+			if (st == ENTRY_IN_PROGRESS && wait &&
+				(e->kind == CHUNK_KIND_CHANGE || running == e->xmax))
+				*wait = running;
+			if (st != ENTRY_VISIBLE)
+				continue;
+			if (e->kind == CHUNK_KIND_CHUNK)
+			{
+				if (bc->n == bc->cap)
+				{
+					bc->cap = bc->cap ? bc->cap * 2 : 64;
+					bc->chunks = bc->chunks ? repalloc(bc->chunks, bc->cap * sizeof(*bc->chunks)) :
+						palloc(bc->cap * sizeof(*bc->chunks));
+				}
+				bc->chunks[bc->n++] = *e;
+			}
+			else
+			{
+				if (nchanges == cap2)
+				{
+					cap2 = cap2 ? cap2 * 2 : 64;
+					changes = changes ? repalloc(changes, cap2 * sizeof(*changes)) :
+						palloc(cap2 * sizeof(*changes));
+				}
+				changes[nchanges++] = *e;
+			}
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (!BlockNumberIsValid(next))
+			break;
+		cur = ReadBuffer(idx, next);
+		LockBuffer(cur, mode);
+		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+
+	for (int i = 0; i < bc->n; i++)
+	{
+		int64		drefs = 0,
+					droots = 0;
+
+		/* (summed first: in no order, they may dip below zero midway) */
+		for (int j = 0; j < nchanges; j++)
+			if (change_of(&changes[j], &bc->chunks[i]))
+			{
+				drefs += (int32) changes[j].refs;
+				droots += (int32) changes[j].roots;
+			}
+		if (!counts_add(&bc->chunks[i], drefs, droots))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a chunk's reference counts are out of range")));
+	}
+	if (changes)
+		pfree(changes);
+	return primary;
+}
+
 /*
  * Each chunk's entry this transaction sees, a bucket at a time: its counts
  * added up on the bucket's pages, and fn called with the bucket unlocked.
  */
 static void
 page_visit(Relation idx, void (*fn) (void *arg, const ChunkIndexEntry *e),
-			 void *arg)
+		   void *arg)
 {
+	BucketChunks bc = {0};
+
 	for (uint32 b = 0; b <= load_cache(idx)->maxbucket; b++)
 	{
-		IndexCache	masks = *(IndexCache *) idx->rd_amcache;
-		BlockNumber blk = bucket_block(idx, &masks, b);
-		Buffer		primary = ReadBuffer(idx, blk);
-		Buffer		cur;
-		ChunkIndexEntry *chunks = NULL;
-		ChunkIndexEntry *changes = NULL;
-		int			nchunks = 0,
-					nchanges = 0,
-					cap1 = 0,
-					cap2 = 0;
-
-		LockBuffer(primary, BUFFER_LOCK_SHARE);
-		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
-		if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
-			masks = *load_cache(idx);
-		cur = primary;
-		for (;;)
-		{
-			Page		page = BufferGetPage(cur);
-			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
-			int			n = page_entries(page);
-
-			for (int i = 0; i < n; i++)
-			{
-				ChunkIndexEntry *e = page_entry(page, i);
-
-				if (!belongs(e, b, &masks) || entry_state(e, cur) != ENTRY_VISIBLE)
-					continue;
-				if (e->kind == CHUNK_KIND_CHUNK)
-				{
-					if (nchunks == cap1)
-					{
-						cap1 = cap1 ? cap1 * 2 : 64;
-						chunks = chunks ? repalloc(chunks, cap1 * sizeof(*chunks)) :
-							palloc(cap1 * sizeof(*chunks));
-					}
-					chunks[nchunks++] = *e;
-				}
-				else
-				{
-					if (nchanges == cap2)
-					{
-						cap2 = cap2 ? cap2 * 2 : 64;
-						changes = changes ? repalloc(changes, cap2 * sizeof(*changes)) :
-							palloc(cap2 * sizeof(*changes));
-					}
-					changes[nchanges++] = *e;
-				}
-			}
-			if (cur != primary)
-				UnlockReleaseBuffer(cur);
-			if (!BlockNumberIsValid(next))
-				break;
-			cur = ReadBuffer(idx, next);
-			LockBuffer(cur, BUFFER_LOCK_SHARE);
-			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
-		}
-		UnlockReleaseBuffer(primary);
-
-		for (int i = 0; i < nchunks; i++)
-		{
-			int64		drefs = 0,
-						droots = 0;
-
-			/* (summed first: in no order, they may dip below zero midway) */
-			for (int j = 0; j < nchanges; j++)
-				if (change_of(&changes[j], &chunks[i]))
-				{
-					drefs += (int32) changes[j].refs;
-					droots += (int32) changes[j].roots;
-				}
-			if (!counts_add(&chunks[i], drefs, droots))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("a chunk's reference counts are out of range")));
-			fn(arg, &chunks[i]);
-		}
-		if (chunks)
-			pfree(chunks);
-		if (changes)
-			pfree(changes);
+		UnlockReleaseBuffer(read_bucket(idx, b, BUFFER_LOCK_SHARE, &bc, NULL));
+		for (int i = 0; i < bc.n; i++)
+			fn(arg, &bc.chunks[i]);
 		CHECK_FOR_INTERRUPTS();
 	}
+	if (bc.chunks)
+		pfree(bc.chunks);
+}
+
+/* each chunk's entry of bucket b, as page_visit's */
+static void
+page_visit_bucket(Relation idx, uint32 b,
+				  void (*fn) (void *arg, const ChunkIndexEntry *e), void *arg)
+{
+	BucketChunks bc = {0};
+
+	UnlockReleaseBuffer(read_bucket(idx, b, BUFFER_LOCK_SHARE, &bc, NULL));
+	for (int i = 0; i < bc.n; i++)
+		fn(arg, &bc.chunks[i]);
+	if (bc.chunks)
+		pfree(bc.chunks);
+}
+
+/*
+ * Bucket b unmarked, if it holds no chunk nothing holds, nor a change of a
+ * chunk's counts or a freeing of a transaction running (then that one's
+ * in *wait); whether it was
+ */
+static bool
+page_unmark(Relation idx, uint32 b, TransactionId *wait)
+{
+	BucketChunks bc = {0};
+	Buffer		primary = read_bucket(idx, b, BUFFER_LOCK_EXCLUSIVE, &bc, wait);
+	bool		unheld = false;
+
+	for (int i = 0; i < bc.n && !unheld; i++)
+		unheld = bc.chunks[i].refs == 0 && bc.chunks[i].roots == 0;
+	if (!unheld && !TransactionIdIsValid(*wait))
+		set_mark(idx, b, false);
+	UnlockReleaseBuffer(primary);
+	if (bc.chunks)
+		pfree(bc.chunks);
+	return !unheld && !TransactionIdIsValid(*wait);
 }
 
 static Oid
@@ -2073,6 +2373,9 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.bind_log = page_bind_log,
 	.remove = page_remove,
 	.visit = page_visit,
+	.visit_bucket = page_visit_bucket,
+	.marked = page_marked,
+	.unmark = page_unmark,
 	.lookup_as_of = page_lookup_as_of,
 	.visit_as_of = page_visit_as_of,
 	.move = page_move,
@@ -2103,6 +2406,7 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	meta->next_block = 2 + INIT_BUCKETS;
 	meta->log = InvalidOid;
 	meta->log_stamp = 0;
+	meta->nmarks = 0;
 	meta->ndir = 1;
 	meta->dir[0] = 1;
 	set_meta_lower(page, meta);
@@ -2464,6 +2768,7 @@ count_unheld(Relation idx, Buffer primary)
 void
 ChunkIndexVacuum(Relation idx, bool truncate)
 {
+	uint32		first_marked;
 	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
 	TimestampTz starttime = GetCurrentTimestamp();
 	double		kept_entries = 0;
@@ -2643,7 +2948,12 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
 		}
 		fold_changes(idx, primary, b, &masks);
-		unheld += count_unheld(idx, primary);
+		/* (chunks nothing holds: the bucket marked, for the freer) */
+		if (count_unheld(idx, primary) > 0)
+		{
+			unheld++;
+			set_mark(idx, b, true);
+		}
 		UnlockReleaseBuffer(primary);
 
 		/* the bytes of the chunks taken out, dead in their log */
@@ -2678,10 +2988,11 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		 * chunks nothing holds, segments to compact, or the end to evacuate:
 		 * a freer frees them, and what they held, compacts, and evacuates
 		 */
-		if (unheld > 0 || (segs.compactable > 0 && segs.worth) || segs.evacuable > 0)
+		if (unheld > 0 || page_marked(idx, 0, 1, &first_marked) > 0 ||
+			(segs.compactable > 0 && segs.worth) || segs.evacuable > 0)
 		{
 			ereport(DEBUG1,
-					(errmsg_internal("chunk index \"%s\": a freer to start: %llu chunks unheld, %u segments to compact%s, %u to evacuate, %u passed by for snapshots",
+					(errmsg_internal("chunk index \"%s\": a freer to start: %llu buckets of chunks unheld, %u segments to compact%s, %u to evacuate, %u passed by for snapshots",
 									 RelationGetRelationName(idx),
 									 (unsigned long long) unheld, segs.compactable,
 									 segs.worth ? "" : " (not worth it)",
@@ -3010,6 +3321,24 @@ chunk_index_redo(XLogReaderState *record)
 				}
 				break;
 			}
+		case XLOG_CHUNK_INDEX_MARK:
+			page = redo_page(&rp, 0);
+			if (page)
+				imarks_set(page, ((xl_chunk_index_mark *) rec)->bit,
+						   ((xl_chunk_index_mark *) rec)->on != 0);
+			break;
+		case XLOG_CHUNK_INDEX_ADD_MARKS:
+			{
+				xl_chunk_index_add_marks *xlrec = (xl_chunk_index_add_marks *) rec;
+				BlockNumber blk;
+
+				XLogRecGetBlockTag(record, 1, NULL, NULL, &blk);
+				page = redo_page(&rp, 0);
+				if (page)
+					imeta_add_marks(page, xlrec->nth, blk);
+				imarks_init(redo_init_page(&rp, 1), xlrec->nth);
+				break;
+			}
 		default:
 			elog(PANIC, "chunk_index_redo: unknown op code %u", info);
 	}
@@ -3047,4 +3376,10 @@ uint32
 ChunkIndexFormatVersion(void)
 {
 	return CHUNK_INDEX_VERSION;
+}
+
+uint32
+ChunkIndexBuckets(Relation idx)
+{
+	return load_cache(idx)->maxbucket + 1;
 }

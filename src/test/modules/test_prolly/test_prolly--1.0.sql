@@ -321,6 +321,16 @@ CREATE FUNCTION test_chunk_has(log regclass, idx regclass, hash bytea)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
 
+-- A chunk index's buckets.
+CREATE FUNCTION test_chunk_index_buckets(idx regclass)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- The buckets of a chunk index marked, which may hold chunks nothing holds.
+CREATE FUNCTION test_chunk_index_marked(idx regclass)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_chunk_index_entry(idx regclass, hash bytea,
 	OUT len int4, OUT loc int8, OUT refs int8, OUT roots int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;

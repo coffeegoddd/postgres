@@ -174,6 +174,7 @@ tests += {
       't/073_tier_databases.pl',
       't/074_tier_manifest_crash.pl',
       't/075_history_dump_tier.pl',
+      't/076_chunk_free_marked.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

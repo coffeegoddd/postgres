@@ -79,10 +79,10 @@ $node->safe_psql('postgres', q{
 	SELECT injection_points_detach('chunk-freer-step');
 	SELECT injection_points_wakeup('chunk-freer-step');
 });
-$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, and moved/, $offset);
+$node->wait_for_log(qr/chunk freer freed \d+ chunks of chunk index \d+, looking in \d+ buckets marked, and moved/, $offset);
 my $log = slurp_file($node->logfile, $offset);
 unlike($log, qr/does not match its hash/, 'no chunk read where another\'s bytes are');
-like($log, qr/chunk freer freed \d+ chunks of chunk index \d+, and moved [01] /,
+like($log, qr/chunk freer freed \d+ chunks of chunk index \d+, looking in \d+ buckets marked, and moved [01] /,
 	'none of them moved (but the one held at the end, maybe)');
 is( $node->safe_psql('postgres', q{
 		SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(blob('b' || g))) = blob('b' || g))

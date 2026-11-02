@@ -152,6 +152,13 @@ chunk_index_desc(StringInfo buf, XLogReaderState *record)
 							 ((xl_chunk_index_bind_log *) rec)->log,
 							 ((xl_chunk_index_bind_log *) rec)->stamp);
 			break;
+		case XLOG_CHUNK_INDEX_MARK:
+			appendStringInfo(buf, "bit: %u, %s", ((xl_chunk_index_mark *) rec)->bit,
+							 ((xl_chunk_index_mark *) rec)->on ? "marked" : "unmarked");
+			break;
+		case XLOG_CHUNK_INDEX_ADD_MARKS:
+			appendStringInfo(buf, "marks' page: %u", ((xl_chunk_index_add_marks *) rec)->nth);
+			break;
 	}
 }
 
@@ -182,6 +189,10 @@ chunk_index_identify(uint8 info)
 			return "SPLIT";
 		case XLOG_CHUNK_INDEX_BIND_LOG:
 			return "BIND_LOG";
+		case XLOG_CHUNK_INDEX_MARK:
+			return "MARK";
+		case XLOG_CHUNK_INDEX_ADD_MARKS:
+			return "ADD_MARKS";
 	}
 	return NULL;
 }
