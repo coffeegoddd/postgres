@@ -142,6 +142,20 @@ read_as_of(Relation log, Relation idx, Snapshot snap, const uint8 *hash,
  * chunks' names (the rows themselves go to the function's tuplestore,
  * which spills to disk).
  */
+static bool note_chunk(void *arg, const ChunkIndexEntry *e);
+
+/* whether the tier's index has a chunk, as of the active snapshot */
+static bool
+tier_has_chunks(void)
+{
+	Relation	idx = relation_open(ChunkStoreTierIndexRelid(), AccessShareLock);
+	bool		any = false;
+
+	ChunkIndex->visit_as_of(idx, GetActiveSnapshot(), note_chunk, &any);
+	relation_close(idx, AccessShareLock);
+	return any;
+}
+
 Datum
 pg_history_export(PG_FUNCTION_ARGS)
 {
@@ -155,6 +169,12 @@ pg_history_export(PG_FUNCTION_ARGS)
 	DumpFrame  *stack;
 	int			cap = 16;
 
+	/* (the tier's chunks are not dumped yet: a dump would leave them out) */
+	if (tier_has_chunks())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the history store's tier has chunks, which cannot be dumped yet"),
+				 errhint("Dump without history (--no-history).")));
 	InitMaterializedSRF(fcinfo, 0);
 	log = relation_open(ChunkStoreLogRelid(), AccessShareLock);
 	idx = relation_open(ChunkStoreIndexRelid(), AccessShareLock);
@@ -258,7 +278,8 @@ pg_history_has_chunks(PG_FUNCTION_ARGS)
 
 	ChunkIndex->visit_as_of(idx, GetActiveSnapshot(), note_chunk, &any);
 	relation_close(idx, AccessShareLock);
-	PG_RETURN_BOOL(any);
+	/* (its tier's too: its export refuses those, not yet dumped) */
+	PG_RETURN_BOOL(any || tier_has_chunks());
 }
 
 /*

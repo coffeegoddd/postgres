@@ -19,10 +19,13 @@
 #include "funcapi.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_region.h"
+#include "prolly/chunk_tier.h"
 #include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/tuplestore.h"
 #include "varatt.h"
 
 PG_FUNCTION_INFO_V1(test_chunk_log_append);
@@ -31,6 +34,7 @@ PG_FUNCTION_INFO_V1(test_chunk_log_end);
 PG_FUNCTION_INFO_V1(test_chunk_log_space);
 PG_FUNCTION_INFO_V1(test_chunk_log_segments);
 PG_FUNCTION_INFO_V1(test_chunk_log_let_go);
+PG_FUNCTION_INFO_V1(test_tier_packs);
 PG_FUNCTION_INFO_V1(test_chunk_log_regions);
 
 static Relation
@@ -152,6 +156,35 @@ test_chunk_log_let_go(PG_FUNCTION_ARGS)
 	CacheInvalidateRelcacheByRelid(PG_GETARG_OID(0));
 	CommandCounterIncrement();
 	PG_RETURN_VOID();
+}
+
+/* test_tier_packs(rel) returns setof (id, state, size, dead): its packs */
+Datum
+test_tier_packs(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	ChunkTierPackInfo *packs;
+	int			n;
+
+	if (!RelationIsTierLog(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a tier of the history store", RelationGetRelationName(rel))));
+	n = ChunkTierPacks(rel, &packs);
+	relation_close(rel, AccessShareLock);
+	InitMaterializedSRF(fcinfo, 0);
+	for (int i = 0; i < n; i++)
+	{
+		Datum		values[4] = {
+			Int64GetDatum(packs[i].id), CStringGetTextDatum(packs[i].state),
+			Int64GetDatum((int64) packs[i].size), Int64GetDatum((int64) packs[i].dead)
+		};
+		bool		nulls[4] = {false, false, false, false};
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
 }
 
 /* test_chunk_log_regions(rel): the regions live backends hold in the log */

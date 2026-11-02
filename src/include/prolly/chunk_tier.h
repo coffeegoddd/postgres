@@ -47,4 +47,22 @@ extern PGDLLIMPORT const ChunkLogRoutine TierChunkLog;
 /* For the access method: a new tier log's first page, written to its storage. */
 extern void ChunkTierInitStorage(SMgrRelation srel, bool use_wal);
 
+/*
+ * For the access method: VACUUM of a tier log, every pack whose transaction
+ * ended settled (committed, or orphaned) and its relfrozenxid advanced; no
+ * object is touched (VACUUM of its index removes them).
+ */
+extern void ChunkTierVacuum(Relation rel);
+
+/* For tests: the tier's packs, a state each ("made", "committed", ...). */
+typedef struct ChunkTierPackInfo
+{
+	uint32		id;
+	const char *state;
+	uint64		size;
+	uint64		dead;
+} ChunkTierPackInfo;
+
+extern int	ChunkTierPacks(Relation rel, ChunkTierPackInfo **out);
+
 #endif							/* PROLLY_CHUNK_TIER_H */

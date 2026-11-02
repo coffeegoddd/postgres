@@ -1,10 +1,10 @@
 -- The chunk store conformance suite against "tier", the history store's
 -- tier: its index on the server, its chunks' bytes in pack objects (here a
--- directory in the data directory), and its transactional part.
+-- directory in the data directory, chunk_store.conf's), and its
+-- transactional part.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
-SET history_tier_location = 'pg_test_history_tier';
 \set store tier
 \getenv abs_srcdir PG_ABS_SRCDIR
 \set suite :abs_srcdir '/sql/chunk_store_suite.inc'
@@ -863,3 +863,88 @@ SELECT ok FROM test_cs_check('tier');
  t
 (1 row)
 
+-- packs settled by VACUUM, once: committed (no transaction's id kept), or
+-- orphaned and removed; the tier has a relfrozenxid (it had none), kept
+-- no older than they
+SELECT relfrozenxid AS frozen0 FROM pg_class WHERE oid = 'pg_history.tier_chunks'::regclass \gset
+SELECT count(*) FILTER (WHERE state = 'made') AS made FROM test_tier_packs('pg_history.tier_chunks');
+ made 
+------
+    0
+(1 row)
+
+SELECT state, count(*) FROM test_tier_packs('pg_history.tier_chunks') GROUP BY state ORDER BY state;
+  state  | count 
+---------+-------
+ removed |    23
+(1 row)
+
+SELECT relfrozenxid <> '0'::xid AS has_frozenxid, age(relfrozenxid) <= age(:'frozen0'::xid) AS not_older
+FROM pg_class WHERE oid = 'pg_history.tier_chunks'::regclass;
+ has_frozenxid | not_older 
+---------------+-----------
+ t             | t
+(1 row)
+
+-- and VACUUM of the tier itself settles them too
+SELECT (test_cs_put('tier', convert_to('tier-settle', 'UTF8'))).stored;
+ stored 
+--------
+ t
+(1 row)
+
+SELECT count(*) FILTER (WHERE state = 'made') AS made_before FROM test_tier_packs('pg_history.tier_chunks');
+ made_before 
+-------------
+           1
+(1 row)
+
+VACUUM pg_history.tier_chunks;
+SELECT count(*) FILTER (WHERE state = 'made') AS made_after FROM test_tier_packs('pg_history.tier_chunks');
+ made_after 
+------------
+          0
+(1 row)
+
+-- a pack begun in a subtransaction rolled back is the top transaction's:
+-- the chunks put after it, in it, committed, the pack kept
+BEGIN;
+SAVEPOINT s;
+SELECT (test_cs_put('tier', convert_to('tier-sub-gone', 'UTF8'))).stored;
+ stored 
+--------
+ t
+(1 row)
+
+ROLLBACK TO s;
+SELECT (test_cs_put('tier', convert_to('tier-sub-kept', 'UTF8'))).stored;
+ stored 
+--------
+ t
+(1 row)
+
+COMMIT;
+SELECT test_cs_ref_root('tier', substr(sha256(convert_to('tier-sub-kept', 'UTF8')), 1, 20));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+VACUUM pg_history.tier_index;
+SELECT convert_from(test_cs_get('tier', substr(sha256(convert_to('tier-sub-kept', 'UTF8')), 1, 20)), 'UTF8') AS kept,
+	test_cs_has('tier', substr(sha256(convert_to('tier-sub-gone', 'UTF8')), 1, 20)) AS gone;
+     kept      | gone 
+---------------+------
+ tier-sub-kept | f
+(1 row)
+
+SELECT ok FROM test_cs_check('tier');
+ ok 
+----
+ t
+(1 row)
+
+-- a dump refuses the tier's chunks, not yet dumped
+SELECT count(*) FROM pg_history_export();
+ERROR:  the history store's tier has chunks, which cannot be dumped yet
+HINT:  Dump without history (--no-history).

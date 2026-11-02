@@ -325,4 +325,3 @@ pages_check(ChunkStore *cs, uint64 *chunks, uint64 *unheld, char **why)
 
 const ChunkStoreRoutine PagesChunkStore = RELATIONS_STORE_ROUTINE(pages_open);
 const ChunkStoreRoutine TierChunkStore = RELATIONS_STORE_ROUTINE(tier_open);
-
