@@ -229,10 +229,10 @@ check_pusher(void)
 }
 
 /*
- * The pointers naming each of roots, in counts[]: as of now, with no
- * pointer to any of them made or dropped until this transaction ends (the
- * pointers to each locked: those changing them waited for), so that the
- * roots counted with them are as these are
+ * The pointers naming each of roots, in counts[]: as of now, the pointers
+ * locked (those changing them waited for, and none changing them until
+ * the caller unlocks them), so that the roots counted with them are as
+ * these are
  */
 static void
 pointers_of(ArrayType *roots_arr, const uint8 *roots, int n, uint64 *counts)
@@ -241,8 +241,7 @@ pointers_of(ArrayType *roots_arr, const uint8 *roots, int n, uint64 *counts)
 	Datum		values[1] = {PointerGetDatum(roots_arr)};
 	SPIPlanPtr	plan;
 
-	for (int i = 0; i < n; i++)
-		ChunkStoreLockPointersTo(roots + (Size) i * CHUNK_HASH_LEN, ShareLock);
+	LockRelationOid(ChunkStorePointersRelid(), ShareLock);
 	plan = SPI_prepare("SELECT hash, count(*) FROM pg_history.pointers "
 					   "WHERE hash = ANY($1) GROUP BY hash", 1, types);
 	if (plan == NULL ||
@@ -309,8 +308,11 @@ pg_history_push(PG_FUNCTION_ARGS)
 	/*
 	 * (each root one the caller holds, not a pointer's: a pointer's root is
 	 * let go of as its row is, which would then be one too many.  The
-	 * pointers counted as of now, none made or dropped until this
-	 * transaction ends, as the roots are counted.)
+	 * pointers counted as of now, and the roots, and the caller's roots
+	 * let go of, with no pointer changed meanwhile: then the pointers
+	 * unlocked, a pointer's change since composing with the push's.  So a
+	 * transaction that changed pointers and then pushes waits for others
+	 * changing them, and two such may deadlock, one cancelled.)
 	 */
 	pointers = palloc_array(uint64, n);
 	pointers_of(PG_GETARG_ARRAYTYPE_P(1), roots, n, pointers);
@@ -337,6 +339,10 @@ pg_history_push(PG_FUNCTION_ARGS)
 					 errmsg("chunk %s has no root to push but its pointers'", ChunkHashText(root)),
 					 errhint("Take a root of it to push (a bundle takes it), or delete the pointers.")));
 	}
+	for (int i = 0; i < n; i++)
+		cs_unref_root(ps.from, roots + (Size) i * CHUNK_HASH_LEN);
+	UnlockRelationOid(ChunkStorePointersRelid(), ShareLock);
+
 	ps.cap = 64;
 	ps.stack = palloc_array(PushFrame, ps.cap);
 	ps.ncap = 64;
@@ -364,9 +370,7 @@ pg_history_push(PG_FUNCTION_ARGS)
 	}
 	SPI_finish();
 
-	/* (the caller's roots let go of here, and what nothing else holds freed) */
-	for (int i = 0; i < n; i++)
-		cs_unref_root(ps.from, roots + (Size) i * CHUNK_HASH_LEN);
+	/* (what nothing else holds freed, the caller's roots let go of above) */
 	(void) cs_free(ps.from, roots, n);
 	PG_RETURN_INT64((int64) ps.copied);
 }
