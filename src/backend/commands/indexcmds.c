@@ -3010,6 +3010,11 @@ ReindexConcurrentlyRefused(Oid relid)
 		return true;
 	if (get_rel_namespace(relid) == PG_HISTORY_NAMESPACE)
 		return true;
+	/*
+	 * (a TOAST table initdb made: the store's, or a catalog's, or, refused
+	 * the same, one of information_schema's, which nothing tells apart from
+	 * the store's without its parent)
+	 */
 	return relid < FirstNormalObjectId && get_rel_relkind(relid) == RELKIND_TOASTVALUE;
 }
 
