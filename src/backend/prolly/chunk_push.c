@@ -66,6 +66,7 @@ typedef struct PushState
 	ChunkStore *from;
 	ChunkStore *to;
 	const char *verb;			/* "push" or "fetch", for errors */
+	const char *source;			/* the store read from, for errors */
 	PushFrame  *stack;
 	int			depth;
 	int			cap;
@@ -164,8 +165,8 @@ copy_reached(PushState *ps, HTAB *seen, const uint8 *root)
 		if (f->data == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("the history store has no chunk %s to %s",
-							ChunkHashText(f->hash), ps->verb)));
+					 errmsg("%s has no chunk %s to %s",
+							ps->source, ChunkHashText(f->hash), ps->verb)));
 		/* (an empty chunk's bytes, palloc'd for the batch to free) */
 		if (f->len == 0)
 		{
@@ -225,12 +226,13 @@ array_hashes(ArrayType *arr, int *n)
 }
 
 static void
-check_pusher(void)
+check_pusher(const char *fn)
 {
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("only a superuser may push or release history in the history store's tier")));
+				 errmsg("only a superuser may push, release or fetch history in the history store's tier")));
+	PreventCommandIfReadOnly(fn);
 }
 
 /* whether the bundle has rows */
@@ -263,7 +265,7 @@ pg_history_push(PG_FUNCTION_ARGS)
 	HTAB	   *seen;
 	Oid			types[2] = {TEXTOID, BYTEAARRAYOID};
 
-	check_pusher();
+	check_pusher("pg_history_push()");
 	if (n == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -278,6 +280,7 @@ pg_history_push(PG_FUNCTION_ARGS)
 	ps.from = ChunkStoreOpen("pages");
 	ps.to = ChunkStoreOpen("tier");
 	ps.verb = "push";
+	ps.source = "the history store";
 	ps.cap = 64;
 	ps.stack = palloc_array(PushFrame, ps.cap);
 	ps.ncap = 64;
@@ -328,7 +331,7 @@ pg_history_release(PG_FUNCTION_ARGS)
 	int			n;
 	uint64		freed;
 
-	check_pusher();
+	check_pusher("pg_history_release()");
 	SPI_connect();
 	if (SPI_execute_with_args("DELETE FROM pg_history.bundles WHERE name = $1 RETURNING roots",
 							  1, types, values, NULL, false, 0) != SPI_OK_DELETE_RETURNING)
@@ -360,7 +363,10 @@ pg_history_release(PG_FUNCTION_ARGS)
  * its copy, the bundle as it was.  A fetch takes no root: the chunks it
  * put are held until its transaction ends, and the caller takes its roots
  * in it (those it does not are freed after, as any unheld).  A push undone
- * is a fetch, the caller's roots taken, and a release.
+ * is a fetch, the caller's roots taken, and a release.  A release of the
+ * bundle waits for the fetch (its row locked).  Two fetches (or pushes)
+ * of bundles sharing chunks, in more than a batch, may wait on each
+ * other's puts of them and deadlock, one cancelled, to be run again.
  */
 Datum
 pg_history_fetch(PG_FUNCTION_ARGS)
@@ -374,10 +380,15 @@ pg_history_fetch(PG_FUNCTION_ARGS)
 	HASHCTL		ctl;
 	HTAB	   *seen;
 
-	check_pusher();
+	check_pusher("pg_history_fetch()");
 	SPI_connect();
-	if (SPI_execute_with_args("SELECT roots FROM pg_history.bundles WHERE name = $1",
-							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
+
+	/*
+	 * (the bundle's row locked: a release of it waits for the fetch, whose
+	 * walk the tier's freeing would cut short)
+	 */
+	if (SPI_execute_with_args("SELECT roots FROM pg_history.bundles WHERE name = $1 FOR KEY SHARE",
+							  1, types, values, NULL, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not look up a bundle");
 	if (SPI_processed == 0)
 		ereport(ERROR,
@@ -398,6 +409,8 @@ pg_history_fetch(PG_FUNCTION_ARGS)
 	ps.from = ChunkStoreOpen("tier");
 	ps.to = ChunkStoreOpen("pages");
 	ps.verb = "fetch";
+	/* (none it reaches missing but by corruption: the tier keeps what it names) */
+	ps.source = "the history store's tier";
 	ps.cap = 64;
 	ps.stack = palloc_array(PushFrame, ps.cap);
 	ps.ncap = 64;

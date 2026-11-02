@@ -202,3 +202,44 @@ test_cs_free
            2
 (1 row)
 
+
+starting permutation: p_push2 p_begin p_fetch q_release p_commit
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+step p_push2: 
+	SELECT test_cs_unref_root('pages', hr_h('\x0a3102'));
+	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3102')]) AS copied;
+
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+copied
+------
+     1
+(1 row)
+
+step p_begin: BEGIN;
+step p_fetch: SELECT pg_history_fetch('hr') AS copied;
+copied
+------
+     1
+(1 row)
+
+step q_release: SELECT pg_history_release('hr') AS freed; <waiting ...>
+step p_commit: COMMIT;
+step q_release: <... completed>
+freed
+-----
+    1
+(1 row)
+
+test_cs_free
+------------
+           3
+(1 row)
+

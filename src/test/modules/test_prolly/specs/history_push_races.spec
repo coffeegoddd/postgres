@@ -3,7 +3,8 @@
 # is freeing (which waits for the push, and finds it pushed); a chunk a
 # pointer made meanwhile holds stays; two pushes of one chunk compose; and
 # a bundle's name is one bundle's (a push of a name another is pushing
-# waits for it, and fails if it commits).
+# waits for it, and fails if it commits); and a release of a bundle being
+# fetched waits for the fetch.
 
 setup
 {
@@ -42,6 +43,7 @@ step p_push3	{
 	SELECT pg_history_push('hr', ARRAY[hr_h('\x0a3103')]) AS copied;
 }
 step p_commit	{ COMMIT; }
+step p_fetch	{ SELECT pg_history_fetch('hr') AS copied; }
 step p_kept		{ SELECT test_cs_has('pages', hr_h('\x0a3101')) AS kept, test_cs_has('pages', hr_h('\x0a3103')) AS kept3; }
 
 session q
@@ -56,6 +58,7 @@ step q_push3	{
 	SELECT pg_history_push('hr2', ARRAY[hr_h('\x0a3103')]) AS copied;
 }
 step q_commit	{ COMMIT; }
+step q_release	{ SELECT pg_history_release('hr') AS freed; }
 
 # a pointer made since the pusher's snapshot: the chunk it holds stays
 permutation p_rr q_pointer p_push1 p_commit p_kept
@@ -70,3 +73,5 @@ permutation p_begin p_push2 q_pointer_pushed p_commit
 permutation p_begin p_push3 q_begin q_push3 p_commit q_commit p_kept
 # a push of the name another is pushing: waits, and fails once it commits
 permutation p_begin p_push2 q_push p_commit
+# a release of a bundle being fetched: waits for the fetch
+permutation p_push2 p_begin p_fetch q_release p_commit
