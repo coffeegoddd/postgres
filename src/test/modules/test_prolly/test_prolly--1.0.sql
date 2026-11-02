@@ -359,6 +359,11 @@ CREATE FUNCTION test_chunk_check(log regclass, idx regclass,
 	OUT ok bool, OUT chunks int8, OUT unheld int8, OUT why text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- Chunks read from C, timed (how: 'lookup', 'read', 'get' or 'get_many').
+CREATE FUNCTION test_chunk_read_bench(log regclass, idx regclass, hashes bytea[],
+	how text, OUT chunks int8, OUT bytes int8, OUT ms float8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- Freeing: chunks nothing holds, and those their references held; pins.
 CREATE FUNCTION test_chunk_free(log regclass, idx regclass, hash bytea)
 RETURNS int8

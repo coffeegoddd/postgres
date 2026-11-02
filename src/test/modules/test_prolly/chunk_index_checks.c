@@ -16,12 +16,16 @@
 
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "portability/instr_time.h"
 #include "prolly/chunk_format.h"
+#include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_store.h"
 #include "storage/lmgr.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "varatt.h"
@@ -38,6 +42,7 @@ PG_FUNCTION_INFO_V1(test_chunk_format_refs);
 PG_FUNCTION_INFO_V1(test_chunk_ref_root);
 PG_FUNCTION_INFO_V1(test_chunk_unref_root);
 PG_FUNCTION_INFO_V1(test_chunk_check);
+PG_FUNCTION_INFO_V1(test_chunk_read_bench);
 PG_FUNCTION_INFO_V1(test_chunk_free);
 PG_FUNCTION_INFO_V1(test_chunk_free_unheld);
 PG_FUNCTION_INFO_V1(test_chunk_hold);
@@ -326,6 +331,132 @@ test_chunk_check(PG_FUNCTION_ARGS)
 		values[3] = CStringGetTextDatum(why);
 	else
 		nulls[3] = true;
+	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
+}
+
+/*
+ * test_chunk_read_bench(log, idx, hashes, how, OUT chunks, OUT bytes, OUT
+ * ms): the chunks named read from C, timed, one call each, in the order
+ * given ('lookup': the index alone; 'read': the log alone, the chunks'
+ * places found first, untimed; 'get': ChunkStoreGet), or ('get_many') a
+ * thousand to a ChunkStoreGetMany; every byte read summed, as a reader
+ * would touch it
+ */
+Datum
+test_chunk_read_bench(PG_FUNCTION_ARGS)
+{
+	Relation	log = open_log(PG_GETARG_OID(0), AccessShareLock);
+	Relation	idx = open_index(PG_GETARG_OID(1), AccessShareLock);
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(2);
+	char	   *how = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	Datum	   *elems;
+	int			n;
+	uint8	   *hashes;
+	ChunkIndexEntry *places = NULL;
+	int			nplaces = 0;
+	uint8	   *buf = NULL;
+	int64		found = 0;
+	uint64		bytes = 0,
+				sum = 0;
+	instr_time	start,
+				took;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	/* (a NULL element an error) */
+	deconstruct_array(arr, BYTEAOID, -1, false, TYPALIGN_INT, &elems, NULL, &n);
+	hashes = palloc((Size) Max(n, 1) * CHUNK_HASH_LEN);
+	for (int i = 0; i < n; i++)
+		memcpy(hashes + (Size) i * CHUNK_HASH_LEN,
+			   arg_hash(DatumGetByteaPP(elems[i])), CHUNK_HASH_LEN);
+
+	/* (the log alone: the places found first, untimed) */
+	if (strcmp(how, "read") == 0)
+	{
+		places = palloc_array(ChunkIndexEntry, Max(n, 1));
+		buf = palloc(1024 * 1024);
+		for (int i = 0; i < n; i++)
+			if (ChunkIndex->lookup(idx, hashes + (Size) i * CHUNK_HASH_LEN, &places[nplaces]) &&
+				places[nplaces].len <= 1024 * 1024)
+				nplaces++;
+	}
+
+	INSTR_TIME_SET_CURRENT(start);
+	if (strcmp(how, "lookup") == 0)
+	{
+		ChunkIndexEntry e;
+
+		for (int i = 0; i < n; i++)
+			found += ChunkIndex->lookup(idx, hashes + (Size) i * CHUNK_HASH_LEN, &e);
+	}
+	else if (strcmp(how, "read") == 0)
+	{
+		for (int i = 0; i < nplaces; i++)
+		{
+			ChunkLog->read(log, places[i].loc, buf, places[i].len);
+			found++;
+			bytes += places[i].len;
+			for (uint32 j = 0; j < places[i].len; j++)
+				sum += buf[j];
+		}
+	}
+	else if (strcmp(how, "get") == 0)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			uint32		len;
+			uint8	   *data = ChunkStoreGet(log, idx, hashes + (Size) i * CHUNK_HASH_LEN, &len);
+
+			if (data == NULL)
+				continue;
+			found++;
+			bytes += len;
+			for (uint32 j = 0; j < len; j++)
+				sum += data[j];
+			pfree(data);
+		}
+	}
+	else if (strcmp(how, "get_many") == 0)
+	{
+		void	  **out = palloc(1000 * sizeof(void *));
+		uint32	   *lens = palloc(1000 * sizeof(uint32));
+
+		for (int i = 0; i < n; i += 1000)
+		{
+			int			k = Min(1000, n - i);
+
+			ChunkStoreGetMany(log, idx, hashes + (Size) i * CHUNK_HASH_LEN, k, out, lens);
+			for (int m = 0; m < k; m++)
+			{
+				if (out[m] == NULL)
+					continue;
+				found++;
+				bytes += lens[m];
+				for (uint32 j = 0; j < lens[m]; j++)
+					sum += ((uint8 *) out[m])[j];
+				pfree(out[m]);
+			}
+		}
+	}
+	else
+		elog(ERROR, "unknown read \"%s\"", how);
+	INSTR_TIME_SET_CURRENT(took);
+	INSTR_TIME_SUBTRACT(took, start);
+	/* (the sum kept, lest the reads be optimized out) */
+	if (sum == UINT64_MAX)
+		elog(NOTICE, "sum %llu", (unsigned long long) sum);
+	if (found < n)
+		elog(NOTICE, "%lld of %d chunks not found (or, read, longer than 1 MB)",
+			 (long long) (n - found), n);
+
+	relation_close(idx, AccessShareLock);
+	relation_close(log, AccessShareLock);
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum(found);
+	values[1] = Int64GetDatum((int64) bytes);
+	values[2] = Float8GetDatum(INSTR_TIME_GET_MILLISEC(took));
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
 }
 
