@@ -193,7 +193,8 @@ main(int argc, char **argv)
 	 * old cluster at all.
 	 */
 	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
-		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
+		user_opts.transfer_mode == TRANSFER_MODE_SWAP ||
+		old_cluster.ntier_dbs > 0)
 		disable_old_cluster(user_opts.transfer_mode);
 
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
@@ -211,6 +212,27 @@ main(int argc, char **argv)
 			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
 			  new_cluster.pgdata);
 	check_ok();
+
+	/*
+	 * The history stores' tiers, carried over, the new system's: each one's
+	 * marker named by it, the old system's removed.
+	 */
+	if (old_cluster.ntier_dbs > 0)
+	{
+		prep_status("Marking the history stores' tiers as the new cluster's");
+		start_postmaster(&new_cluster, true);
+		for (int i = 0; i < old_cluster.ntier_dbs; i++)
+		{
+			PGconn	   *conn = connectToServer(&new_cluster, old_cluster.tier_dbs[i]);
+
+			PQclear(executeQueryOrDie(conn,
+									  "SELECT pg_catalog.binary_upgrade_history_tier_mark('%s'::pg_catalog.int8)",
+									  old_cluster.system_identifier));
+			PQfinish(conn);
+		}
+		stop_postmaster(false);
+		check_ok();
+	}
 
 	migrate_logical_slots = count_old_cluster_logical_slots();
 

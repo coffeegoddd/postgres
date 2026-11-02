@@ -87,9 +87,11 @@ gen_db_file_maps(DbInfo *old_db, DbInfo *new_db,
 			 * new_rel is unmatched.  This shouldn't really happen either, but
 			 * if it's a TOAST table, we can ignore it and continue
 			 * processing, assuming that the new server made a TOAST table
-			 * that wasn't needed.
+			 * that wasn't needed.  Nor if it is the history store's, of an
+			 * old cluster that has none: the new cluster's stays.
 			 */
-			if (strcmp(new_rel->nspname, "pg_toast") != 0)
+			if (strcmp(new_rel->nspname, "pg_toast") != 0 &&
+				strcmp(new_rel->nspname, "pg_history") != 0)
 			{
 				report_unmatched_relation(new_rel, new_db, true);
 				all_matched = false;
@@ -110,7 +112,8 @@ gen_db_file_maps(DbInfo *old_db, DbInfo *new_db,
 		else if (old_rel->reloid > new_rel->reloid)
 		{
 			/* new_rel is unmatched, see comment above */
-			if (strcmp(new_rel->nspname, "pg_toast") != 0)
+			if (strcmp(new_rel->nspname, "pg_toast") != 0 &&
+				strcmp(new_rel->nspname, "pg_history") != 0)
 			{
 				report_unmatched_relation(new_rel, new_db, true);
 				all_matched = false;
@@ -480,7 +483,11 @@ get_rel_infos_query(void)
 	 * redundant with the namespace-name exclusions, but let's be safe.)
 	 *
 	 * pg_largeobject contains user data that does not appear in pg_dump
-	 * output, so we have to copy that system table.  It's easiest to do that
+	 * output, so we have to copy that system table.  So does each
+	 * database's version-control history store, the tables of schema
+	 * pg_history (initdb's, of the same OIDs in both clusters), whose
+	 * relfilenodes pg_dump --binary-upgrade keeps as it keeps
+	 * pg_largeobject's.  It's easiest to do that
 	 * by treating it as a user table.  We can do the same for
 	 * pg_largeobject_metadata for upgrades from v16 and newer.  pg_upgrade
 	 * can't copy/link the files from older versions because aclitem (needed
@@ -500,7 +507,8 @@ get_rel_infos_query(void)
 					  "                        'binary_upgrade', 'pg_toast') AND "
 					  "      c.oid >= %u::pg_catalog.oid) OR "
 					  "     (n.nspname = 'pg_catalog' AND "
-					  "      relname IN ('pg_largeobject'%s) ))), ",
+					  "      relname IN ('pg_largeobject'%s) ) OR "
+					  "     n.nspname = 'pg_history')), ",
 					  TRANSFER_SEQUENCES() ?
 					  ", " CppAsString2(RELKIND_SEQUENCE) : "",
 					  FirstNormalObjectId,

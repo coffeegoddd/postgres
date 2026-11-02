@@ -25,6 +25,7 @@ static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
 static void check_for_branches(ClusterInfo *cluster);
 static void check_for_history(ClusterInfo *cluster);
+static void check_new_history_tiers(void);
 static void check_for_prepared_transactions(ClusterInfo *cluster);
 static void check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster);
 static void check_for_user_defined_postfix_ops(ClusterInfo *cluster);
@@ -750,6 +751,8 @@ check_new_cluster(void)
 	check_new_cluster_replication_slots();
 
 	check_new_cluster_subscription_configuration();
+
+	check_new_history_tiers();
 }
 
 
@@ -908,8 +911,14 @@ check_new_cluster_is_empty(void)
 		for (relnum = 0; relnum < rel_arr->nrels;
 			 relnum++)
 		{
-			/* pg_largeobject and its index should be skipped */
-			if (strcmp(rel_arr->rels[relnum].nspname, "pg_catalog") != 0)
+			/*
+			 * pg_largeobject and its index should be skipped, and the history
+			 * store's relations and their TOAST tables (a user's table would
+			 * be found itself)
+			 */
+			if (strcmp(rel_arr->rels[relnum].nspname, "pg_catalog") != 0 &&
+				strcmp(rel_arr->rels[relnum].nspname, "pg_history") != 0 &&
+				strcmp(rel_arr->rels[relnum].nspname, "pg_toast") != 0)
 				pg_fatal("New cluster database \"%s\" is not empty: found relation \"%s.%s\"",
 						 new_cluster.dbarr.dbs[dbnum].db_name,
 						 rel_arr->rels[relnum].nspname,
@@ -1337,51 +1346,83 @@ check_for_branches(ClusterInfo *cluster)
  * check_for_history()
  *
  * Each database's version-control history store (pg_history: its chunk
- * log, chunk index and pointers) is made by initdb, and the upgrade carries
- * over only the relations users made: the new cluster's stores would be
- * empty.  Until the upgrade carries them, a cluster in which any store has
- * a pointer, or a chunk log of more than its meta page, or any tier (a
- * relation of the prolly_tier access method) of more than its meta page
- * (packs made, their objects named by its stamp), is refused.
+ * log, chunk index, pointers, tier and bundles) is carried over as
+ * pg_largeobject is, its relations' files the old cluster's.  A tier's pack
+ * objects stay where they are, the new cluster's to read: the databases
+ * whose tiers have made packs (a tier of more than its meta page) are
+ * noted, with the place the old cluster's settings name (the new
+ * cluster's must name the same, check_new_history_tiers()) and the old
+ * system's identifier (their markers, named by it, the new system's once
+ * the files are there).
  */
 static void
 check_for_history(ClusterInfo *cluster)
 {
-	prep_status("Checking for history stores");
+	prep_status("Checking for history stores' tiers");
 
 	for (int dbnum = 0; dbnum < cluster->dbarr.ndbs; dbnum++)
 	{
 		DbInfo	   *active_db = &cluster->dbarr.dbs[dbnum];
 		PGconn	   *conn = connectToServer(cluster, active_db->db_name);
 		PGresult   *res;
-		bool		has_store;
 
 		res = executeQueryOrDie(conn,
-								"SELECT 1 FROM pg_catalog.pg_namespace "
-								"WHERE nspname = 'pg_history'");
-		has_store = PQntuples(res) > 0;
+								"SELECT 1 FROM pg_catalog.pg_class c "
+								"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+								"WHERE n.nspname = 'pg_history' AND c.relname = 'tier_chunks' AND "
+								"      pg_catalog.pg_relation_size(c.oid) > "
+								"      pg_catalog.current_setting('block_size')::pg_catalog.int8");
+		if (PQntuples(res) > 0)
+		{
+			cluster->tier_dbs = pg_realloc_array(cluster->tier_dbs, char *, cluster->ntier_dbs + 1);
+			cluster->tier_dbs[cluster->ntier_dbs++] = pg_strdup(active_db->db_name);
+		}
 		PQclear(res);
-		if (has_store)
+		if (cluster->ntier_dbs > 0 && cluster->tier_place == NULL)
 		{
 			res = executeQueryOrDie(conn,
-									"SELECT EXISTS (SELECT 1 FROM pg_history.pointers) OR "
-									"       pg_catalog.pg_relation_size('pg_history.chunks') > "
-									"       pg_catalog.current_setting('block_size')::pg_catalog.int8 OR "
-									"       EXISTS (SELECT 1 FROM pg_catalog.pg_class c "
-									"               JOIN pg_catalog.pg_am a ON a.oid = c.relam "
-									"               WHERE a.amname = 'prolly_tier' AND "
-									"                     pg_catalog.pg_relation_size(c.oid) > "
-									"                     pg_catalog.current_setting('block_size')::pg_catalog.int8)");
-			if (PQgetvalue(res, 0, 0)[0] == 't')
-				pg_fatal("Database \"%s\" has version-control history, which cannot be upgraded yet.\n"
-						 "Its history store (pg_history) holds chunks or pointers the upgrade\n"
-						 "would leave out.",
+									"SELECT pg_catalog.binary_upgrade_history_tier_place(), "
+									"       system_identifier FROM pg_catalog.pg_control_system()");
+			if (PQgetisnull(res, 0, 0))
+				pg_fatal("Database \"%s\"'s history store's tier has packs, but the old cluster's\n"
+						 "settings name no place for them (history_tier_location).",
 						 active_db->db_name);
+			cluster->tier_place = pg_strdup(PQgetvalue(res, 0, 0));
+			cluster->system_identifier = pg_strdup(PQgetvalue(res, 0, 1));
 			PQclear(res);
 		}
 		PQfinish(conn);
 	}
 
+	check_ok();
+}
+
+/*
+ * check_new_history_tiers()
+ *
+ * The old cluster's tiers' packs stay where they are: the new cluster's
+ * settings must name the same place (the same store: its identity's hash),
+ * else its tiers could read none of them.
+ */
+static void
+check_new_history_tiers(void)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+
+	if (old_cluster.ntier_dbs == 0)
+		return;
+	prep_status("Checking for the history stores' tiers' place");
+	conn = connectToServer(&new_cluster, "template1");
+	res = executeQueryOrDie(conn, "SELECT pg_catalog.binary_upgrade_history_tier_place()");
+	if (PQgetisnull(res, 0, 0) || strcmp(PQgetvalue(res, 0, 0), old_cluster.tier_place) != 0)
+		pg_fatal("Database \"%s\"'s history store's tier has packs, which stay where they are,\n"
+				 "and the new cluster's settings name %s.\n"
+				 "Set the new cluster's history_tier_store and history_tier_location to the old cluster's.",
+				 old_cluster.tier_dbs[0],
+				 PQgetisnull(res, 0, 0) ? "no place for them" : "another place");
+	PQclear(res);
+	PQfinish(conn);
 	check_ok();
 }
 

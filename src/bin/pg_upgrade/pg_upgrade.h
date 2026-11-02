@@ -289,6 +289,14 @@ typedef struct
 	int			nsubs;			/* number of subscriptions */
 	bool		sub_retain_dead_tuples; /* whether a subscription enables
 										 * retain_dead_tuples. */
+	char	  **tier_dbs;		/* databases whose history store's tier has
+								 * made packs */
+	int			ntier_dbs;
+	char	   *tier_place;		/* the place their objects are, as the
+								 * settings name it (a hash of the store's
+								 * identity) */
+	char	   *system_identifier;	/* the old cluster's, its tiers' markers
+									 * named by it */
 } ClusterInfo;
 
 

@@ -681,11 +681,66 @@ ChunkTierDatabaseHasPacks(Oid dboid)
 	/* (no place set: no pack could have been put) */
 	if (history_tier_location == NULL || history_tier_location[0] == '\0')
 		return false;
+
+	/*
+	 * (a binary upgrade's server: its stores initdb's until pg_upgrade
+	 * carries the old cluster's over, none with packs; the markers there
+	 * may be the old cluster's, a system of the same identifier)
+	 */
+	if (IsBinaryUpgrade)
+		return false;
 	os = tier_objects();
 	prefix = marker_prefix(dboid);
 	os->routine->list(os, prefix, note_object, &any);
 	pfree(prefix);
 	return any;
+}
+
+uint64
+ChunkTierPlace(void)
+{
+	if (history_tier_location == NULL || history_tier_location[0] == '\0')
+		return 0;
+	return current_place();
+}
+
+void
+ChunkTierMarkUpgraded(Relation rel, uint64 old_sysid)
+{
+	TierMeta	meta;
+	ObjectStore *os;
+	char	   *name;
+	uint64		size;
+	bool		empty;
+
+	lock_marker(rel, ExclusiveLock);
+	meta = read_meta(rel);
+	empty = tier_empty(rel, &meta);
+	if (empty && meta.marked_place == 0)
+	{
+		unlock_marker(rel, ExclusiveLock);
+		return;
+	}
+	os = tier_objects();
+	check_place(rel, &meta, false);
+	set_marked(rel, 0);
+	if (!empty)
+	{
+		name = marker_name(stamp_for(meta.stamp, MyDatabaseId));
+		if (!os->routine->size(os, name, &size))
+			os->routine->put(os, name, "", 0);
+		pfree(name);
+		set_marked(rel, current_place());
+	}
+	/* (a system of the same identifier: its marker this one's) */
+	if (old_sysid != GetSystemIdentifier())
+	{
+		name = psprintf("databases/%016llx/%u/%016llx", (unsigned long long) old_sysid,
+						MyDatabaseId, (unsigned long long) stamp_for(meta.stamp, MyDatabaseId));
+		os->routine->remove(os, name);
+		pfree(name);
+	}
+	unlock_marker(rel, ExclusiveLock);
 }
 
 /*
