@@ -942,6 +942,17 @@
   descr => 'make every pack the history store\'s tier has made this server\'s to remove',
   proname => 'pg_history_tier_adopt', provolatile => 'v', proparallel => 'u',
   prorettype => 'int4', proargtypes => '', prosrc => 'pg_history_tier_adopt' },
+{ oid => '9775', descr => 'push history to the history store\'s tier, as a bundle',
+  proname => 'pg_history_push', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => 'text _bytea',
+  proargnames => '{bundle,roots}', prosrc => 'pg_history_push' },
+{ oid => '9776', descr => 'release a bundle of history in the history store\'s tier',
+  proname => 'pg_history_release', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => 'text', proargnames => '{bundle}',
+  prosrc => 'pg_history_release' },
+{ oid => '9777', descr => 'trigger: a bundle\'s root held in the history store\'s tier',
+  proname => 'pg_history_bundle_changed', provolatile => 'v',
+  prorettype => 'trigger', proargtypes => '', prosrc => 'pg_history_bundle_changed' },
 
 # Index access method handlers
 { oid => '330', descr => 'btree index access method handler',

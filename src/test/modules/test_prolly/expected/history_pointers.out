@@ -10,12 +10,13 @@ SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1;
    relname   |       amname       
 -------------+--------------------
+ bundles     | heap
  chunk_index | prolly_chunk_index
  chunks      | prolly_chunks
  pointers    | heap
  tier_chunks | prolly_tier
  tier_index  | prolly_chunk_index
-(5 rows)
+(6 rows)
 
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';

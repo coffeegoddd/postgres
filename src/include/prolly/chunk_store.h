@@ -38,6 +38,7 @@ extern Oid	ChunkStoreIndexRelid(void);
 extern Oid	ChunkStoreTierLogRelid(void);
 extern Oid	ChunkStoreTierIndexRelid(void);
 extern Oid	ChunkStorePointersRelid(void);
+extern Oid	ChunkStoreBundlesRelid(void);
 
 /* A chunk's name, in hex, palloc'd: for messages. */
 extern char *ChunkHashText(const uint8 *hash);
@@ -59,6 +60,15 @@ extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
  * (a tree's level read at once reads its pages through once); a name asked
  * twice is read twice.
  */
+/*
+ * The chunk's bytes as of snap, palloc'd, and their length in *len: a
+ * chunk the store had then (its freeing not committed before snap, nor by
+ * this transaction), whose bytes are kept until no snapshot could find it;
+ * NULL if none.
+ */
+extern void *ChunkStoreGetAsOf(Relation log, Relation idx, const uint8 *hash,
+							   Snapshot snap, uint32 *len);
+
 extern void ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes,
 							  int n, void **out, uint32 *lens);
 

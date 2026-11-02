@@ -1629,6 +1629,25 @@ ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_no_truncate;
 -- take and let go of roots of any chunk)
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
 
+-- The bundles of history pushed to the tier: a row a root, which holds it
+-- there (pg_history_push and pg_history_release make and delete them).
+CREATE TABLE pg_history.bundles (
+	name text COLLATE "C" NOT NULL,
+	hash bytea NOT NULL CHECK (octet_length(hash) = 20),
+	PRIMARY KEY (name, hash)
+);
+CREATE TRIGGER bundles_roots
+	AFTER INSERT OR UPDATE OR DELETE ON pg_history.bundles
+	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_bundle_changed();
+CREATE TRIGGER bundles_no_truncate
+	BEFORE TRUNCATE ON pg_history.bundles
+	FOR EACH STATEMENT EXECUTE FUNCTION pg_catalog.pg_history_bundle_changed();
+ALTER TABLE pg_history.bundles ENABLE ALWAYS TRIGGER bundles_roots;
+ALTER TABLE pg_history.bundles ENABLE ALWAYS TRIGGER bundles_no_truncate;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_bundle_changed() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_push(text, bytea[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_release(text) FROM PUBLIC;
+
 --
 -- The history store dumped and restored: pg_history_export() the store as
 -- of the snapshot, its chunks (each after those it references) and then its

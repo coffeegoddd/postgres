@@ -22,6 +22,7 @@
 #include "prolly/chunkstore.h"
 #include "prolly/registry.h"
 #include "storage/lmgr.h"
+#include "utils/snapmgr.h"
 
 static void
 register_stores(void)
@@ -70,12 +71,15 @@ typedef struct RelationsStore
 	ChunkStore	store;
 	Oid			(*log_relid) (void);
 	Oid			(*index_relid) (void);
+	/* the index of where history is pushed to, if any ("pages": the tier's) */
+	Oid			(*pushed_relid) (void);
 } RelationsStore;
 
 static RelationsStore pages_store = {
 	.store = {.routine = &PagesChunkStore},
 	.log_relid = ChunkStoreLogRelid,
 	.index_relid = ChunkStoreIndexRelid,
+	.pushed_relid = ChunkStoreTierIndexRelid,
 };
 
 static RelationsStore tier_store = {
@@ -127,6 +131,39 @@ pages_has(ChunkStore *cs, const uint8 *hash)
 	return has;
 }
 
+/*
+ * A chunk the store has not, but its index's entry: if it was pushed (the
+ * index history is pushed to has it), its bytes as of the reader's
+ * snapshot, when it is older than the push (they are kept until no
+ * snapshot could find them), and else an error, until it is fetched back.
+ * NULL if it was not pushed.  For a root taken (asof false), an error if
+ * it was pushed.
+ */
+static void *
+pushed_chunk(ChunkStore *cs, Relation log, Relation idx, const uint8 *hash,
+			 bool asof, uint32 *len)
+{
+	RelationsStore *rs = (RelationsStore *) cs;
+	Relation	tier;
+	bool		pushed;
+	void	   *data;
+
+	if (rs->pushed_relid == NULL)
+		return NULL;
+	tier = relation_open(rs->pushed_relid(), AccessShareLock);
+	pushed = ChunkStoreHas(NULL, tier, hash);
+	relation_close(tier, NoLock);
+	if (!pushed)
+		return NULL;
+	if (asof && (data = ChunkStoreGetAsOf(log, idx, hash, GetActiveSnapshot(), len)) != NULL)
+		return data;
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("chunk %s was pushed to the history store's tier", ChunkHashText(hash)),
+			 errdetail("History pushed is not fetched back yet.")));
+	return NULL;				/* keep compiler quiet */
+}
+
 static void *
 pages_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 {
@@ -136,6 +173,8 @@ pages_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 
 	open_store(cs, AccessShareLock, &log, &idx);
 	data = ChunkStoreGet(log, idx, hash, len);
+	if (data == NULL)
+		data = pushed_chunk(cs, log, idx, hash, true, len);
 	close_store(log, idx);
 	return data;
 }
@@ -149,6 +188,9 @@ pages_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out,
 
 	open_store(cs, AccessShareLock, &log, &idx);
 	ChunkStoreGetMany(log, idx, hashes, n, out, lens);
+	for (int i = 0; i < n; i++)
+		if (out[i] == NULL)
+			out[i] = pushed_chunk(cs, log, idx, hashes + (Size) i * CHUNK_HASH_LEN, true, &lens[i]);
 	close_store(log, idx);
 }
 
@@ -186,6 +228,8 @@ pages_root(ChunkStore *cs, const uint8 *hash, bool ref)
 	ChunkIndexEntry e;
 
 	open_store(cs, RowExclusiveLock, NULL, &idx);
+	if (ref && !ChunkStoreHas(NULL, idx, hash))
+		(void) pushed_chunk(cs, NULL, idx, hash, false, NULL);
 	if (ref)
 		ChunkStoreRefRoot(idx, hash, &e);
 	else
