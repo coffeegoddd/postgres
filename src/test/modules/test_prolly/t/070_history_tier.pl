@@ -177,8 +177,11 @@ my $p2 = $packs->();
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 $node->safe_psql('postgres', 'CHECKPOINT');
 $node->wait_for_replay_catchup($standby);
+my $log_at = -s $node->logfile;
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $p2, 'all dead, kept while a standby is being made');
+ok($node->log_contains(qr/packs of tier "tier_chunks" all dead are kept for standbys\n.*DETAIL:  Walsender \d+ is taking a base backup/, $log_at),
+	'and said so');
 $bb->kill_kill;
 $node->poll_query_until('postgres',
 	q{SELECT count(*) = 0 FROM pg_stat_replication WHERE state = 'backup'})
@@ -204,6 +207,35 @@ $node->wait_for_replay_catchup($standby);
 $node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
 is($packs->(), $p4 - 1, 'all dead, removed with pg_receivewal streaming');
 $rw->kill_kill;
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_replication WHERE application_name = 'pg_receivewal'})
+  or die 'pg_receivewal runs still';
+
+# a sender that has not yet replied (as a standby just connected): waited
+# for
+my $wal_dir2 = PostgreSQL::Test::Utils::tempdir;
+my $rw2 = IPC::Run::start(
+	[ 'pg_receivewal', '--no-loop', '--status-interval=0', '--directory' => $wal_dir2,
+	  '--dbname' => $node->connstr('postgres') . ' application_name=quiet_receiver' ],
+	'>' => \my $rw2_out, '2>' => \my $rw2_err);
+$node->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_stat_replication WHERE application_name = 'quiet_receiver' AND state = 'streaming' AND reply_time IS NULL})
+  or die "no quiet pg_receivewal streaming: $rw2_err";
+$dead_pack->('unreplied');
+my $p5 = $packs->();
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->wait_for_replay_catchup($standby);
+$log_at = -s $node->logfile;
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p5, 'all dead, kept while a sender has not yet replied');
+ok($node->log_contains(qr/DETAIL:  Walsender \d+ has not yet replied/, $log_at), 'and said so');
+$rw2->kill_kill;
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_replication WHERE application_name = 'quiet_receiver'})
+  or die 'the quiet pg_receivewal runs still';
+$node->safe_psql('postgres', 'VACUUM pg_history.tier_index');
+is($packs->(), $p5 - 1, 'and removed once it is gone');
 
 # the store opened again once the settings change: a pack after a reload
 # where they say
