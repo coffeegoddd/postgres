@@ -297,6 +297,10 @@ typedef struct
 								 * identity) */
 	char	   *system_identifier;	/* the old cluster's, its tiers' markers
 									 * named by it */
+	char	  **store_rels;		/* each database's history store's
+								 * relations (dbarr's order; NULL: none) */
+	char	   *store_formats;	/* the history store's format versions */
+	char	   *tier_dir;		/* the tiers' directory, a directory store's */
 } ClusterInfo;
 
 

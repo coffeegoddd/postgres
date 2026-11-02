@@ -91,7 +91,8 @@ gen_db_file_maps(DbInfo *old_db, DbInfo *new_db,
 			 * old cluster that has none: the new cluster's stays.
 			 */
 			if (strcmp(new_rel->nspname, "pg_toast") != 0 &&
-				strcmp(new_rel->nspname, "pg_history") != 0)
+				!(strcmp(new_rel->nspname, "pg_history") == 0 &&
+				  new_rel->reloid < FirstNormalObjectId))
 			{
 				report_unmatched_relation(new_rel, new_db, true);
 				all_matched = false;
@@ -113,7 +114,8 @@ gen_db_file_maps(DbInfo *old_db, DbInfo *new_db,
 		{
 			/* new_rel is unmatched, see comment above */
 			if (strcmp(new_rel->nspname, "pg_toast") != 0 &&
-				strcmp(new_rel->nspname, "pg_history") != 0)
+				!(strcmp(new_rel->nspname, "pg_history") == 0 &&
+				  new_rel->reloid < FirstNormalObjectId))
 			{
 				report_unmatched_relation(new_rel, new_db, true);
 				all_matched = false;

@@ -149,6 +149,9 @@ extern bool ChunkTierDatabaseHasPacks(Oid dboid);
  */
 extern uint64 ChunkTierPlace(void);
 
+/* The tier's format, its meta page's version: for pg_upgrade. */
+extern uint32 ChunkTierFormatVersion(void);
+
 /*
  * A tier pg_upgrade carried over (its files the old cluster's, old_sysid's)
  * marked as this system's: with packs, their marker named by this system

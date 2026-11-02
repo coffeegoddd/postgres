@@ -85,6 +85,16 @@ ObjectStoreIdentity(ObjectStore *os, const char *impl)
 	return psprintf("%s:%s", impl, buf);
 }
 
+char *
+ObjectStoreIdentityIfAny(ObjectStore *os, const char *impl)
+{
+	uint64		size;
+
+	if (!os->routine->size(os, "store-identity", &size))
+		return NULL;
+	return ObjectStoreIdentity(os, impl);
+}
+
 List *
 ObjectStoreList(void)
 {

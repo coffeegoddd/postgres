@@ -25,7 +25,7 @@ static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
 static void check_for_branches(ClusterInfo *cluster);
 static void check_for_history(ClusterInfo *cluster);
-static void check_new_history_tiers(void);
+static void check_new_history(void);
 static void check_for_prepared_transactions(ClusterInfo *cluster);
 static void check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster);
 static void check_for_user_defined_postfix_ops(ClusterInfo *cluster);
@@ -752,7 +752,7 @@ check_new_cluster(void)
 
 	check_new_cluster_subscription_configuration();
 
-	check_new_history_tiers();
+	check_new_history();
 }
 
 
@@ -913,11 +913,12 @@ check_new_cluster_is_empty(void)
 		{
 			/*
 			 * pg_largeobject and its index should be skipped, and the history
-			 * store's relations and their TOAST tables (a user's table would
-			 * be found itself)
+			 * store's relations (initdb's) and their TOAST tables (a user's
+			 * table would be found itself)
 			 */
 			if (strcmp(rel_arr->rels[relnum].nspname, "pg_catalog") != 0 &&
-				strcmp(rel_arr->rels[relnum].nspname, "pg_history") != 0 &&
+				!(strcmp(rel_arr->rels[relnum].nspname, "pg_history") == 0 &&
+				  rel_arr->rels[relnum].reloid < FirstNormalObjectId) &&
 				strcmp(rel_arr->rels[relnum].nspname, "pg_toast") != 0)
 				pg_fatal("New cluster database \"%s\" is not empty: found relation \"%s.%s\"",
 						 new_cluster.dbarr.dbs[dbnum].db_name,
@@ -988,6 +989,24 @@ create_script_for_old_cluster_deletion(char **deletion_script_file_name)
 	{
 		pg_log(PG_WARNING,
 			   "\nWARNING:  new data directory should not be inside the old data directory, i.e. %s", old_cluster_pgdata);
+
+		/* Unlink file in case it is left over from a previous run. */
+		unlink(*deletion_script_file_name);
+		pfree(*deletion_script_file_name);
+		*deletion_script_file_name = NULL;
+		return;
+	}
+
+	/*
+	 * The history stores' tiers' pack objects, the new cluster's, in a
+	 * directory inside the old data directory (history_tier_location
+	 * relative to it): deleting the old cluster would delete them.
+	 */
+	if (old_cluster.tier_dir != NULL &&
+		path_is_prefix_of_path(old_cluster_pgdata, old_cluster.tier_dir))
+	{
+		pg_log(PG_WARNING,
+			   "\nWARNING:  the history stores' tiers' objects, now the new cluster's, are inside the old data directory, i.e. %s", old_cluster.tier_dir);
 
 		/* Unlink file in case it is left over from a previous run. */
 		unlink(*deletion_script_file_name);
@@ -1343,28 +1362,100 @@ check_for_branches(ClusterInfo *cluster)
 }
 
 /*
+ * The history store's relations of the database conn is to, as pg_upgrade
+ * matches them (by OID): each one's OID, name, kind, access method and
+ * TOAST table, if any; NULL if it has no store.
+ */
+static char *
+history_store_rels(PGconn *conn)
+{
+	PGresult   *res;
+	char	   *rels = NULL;
+
+	res = executeQueryOrDie(conn,
+							"SELECT pg_catalog.string_agg(c.oid::pg_catalog.text || ' ' || c.relname::pg_catalog.text || ' ' || "
+							"                  c.relkind::pg_catalog.text || ' ' || "
+							"                  coalesce(a.amname::pg_catalog.text, '-') || ' ' || "
+							"                  (c.reltoastrelid <> 0)::pg_catalog.text, "
+							"                  ', ' ORDER BY c.oid) "
+							"FROM pg_catalog.pg_class c "
+							"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+							"LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam "
+							"WHERE n.nspname = 'pg_history' AND c.relkind IN ('r', 'i')");
+	if (!PQgetisnull(res, 0, 0))
+		rels = pg_strdup(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	return rels;
+}
+
+/* the server's history store's format versions; NULL if it has no store */
+static char *
+history_store_formats(PGconn *conn)
+{
+	PGresult   *res;
+	char	   *formats = NULL;
+
+	res = executeQueryOrDie(conn,
+							"SELECT pg_catalog.binary_upgrade_history_formats() "
+							"WHERE pg_catalog.to_regprocedure('pg_catalog.binary_upgrade_history_formats()') IS NOT NULL");
+	if (PQntuples(res) > 0)
+		formats = pg_strdup(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	return formats;
+}
+
+/*
  * check_for_history()
  *
  * Each database's version-control history store (pg_history: its chunk
  * log, chunk index, pointers, tier and bundles) is carried over as
- * pg_largeobject is, its relations' files the old cluster's.  A tier's pack
+ * pg_largeobject is, its relations' files the old cluster's, matched to
+ * the new cluster's by OID: each database's relations are noted (the new
+ * cluster's must be the same, of the same formats, check_new_history()),
+ * and a relation a user made in pg_history is refused.  A tier's pack
  * objects stay where they are, the new cluster's to read: the databases
  * whose tiers have made packs (a tier of more than its meta page) are
- * noted, with the place the old cluster's settings name (the new
- * cluster's must name the same, check_new_history_tiers()) and the old
- * system's identifier (their markers, named by it, the new system's once
- * the files are there).
+ * noted, with the place the old cluster's settings name (the new cluster's
+ * must name the same), the old system's identifier (their markers, named
+ * by it, the new system's once the files are there) and, a directory
+ * store's, its directory (not to be deleted with the old cluster).
  */
 static void
 check_for_history(ClusterInfo *cluster)
 {
-	prep_status("Checking for history stores' tiers");
+	prep_status("Checking for history stores");
 
+	cluster->store_rels = pg_malloc0_array(char *, Max(cluster->dbarr.ndbs, 1));
 	for (int dbnum = 0; dbnum < cluster->dbarr.ndbs; dbnum++)
 	{
 		DbInfo	   *active_db = &cluster->dbarr.dbs[dbnum];
 		PGconn	   *conn = connectToServer(cluster, active_db->db_name);
 		PGresult   *res;
+
+		cluster->store_rels[dbnum] = history_store_rels(conn);
+		if (cluster->store_rels[dbnum] == NULL)
+		{
+			PQfinish(conn);
+			continue;
+		}
+		if (cluster->store_formats == NULL)
+		{
+			cluster->store_formats = history_store_formats(conn);
+			if (cluster->store_formats == NULL)
+				pg_fatal("The old cluster's version-control history store is of a format\n"
+						 "this pg_upgrade does not know.");
+		}
+		res = executeQueryOrDie(conn,
+								"SELECT c.relname FROM pg_catalog.pg_class c "
+								"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+								"WHERE n.nspname = 'pg_history' AND c.oid >= %u::pg_catalog.oid "
+								"ORDER BY c.oid LIMIT 1",
+								FirstNormalObjectId);
+		if (PQntuples(res) > 0)
+			pg_fatal("Database \"%s\" has a relation of its own in schema pg_history, \"%s\",\n"
+					 "which the upgrade would leave out.  Move it to another schema first.",
+					 active_db->db_name, PQgetvalue(res, 0, 0));
+		PQclear(res);
 
 		res = executeQueryOrDie(conn,
 								"SELECT 1 FROM pg_catalog.pg_class c "
@@ -1382,13 +1473,25 @@ check_for_history(ClusterInfo *cluster)
 		{
 			res = executeQueryOrDie(conn,
 									"SELECT pg_catalog.binary_upgrade_history_tier_place(), "
-									"       system_identifier FROM pg_catalog.pg_control_system()");
+									"       system_identifier, "
+									"       pg_catalog.current_setting('history_tier_store'), "
+									"       pg_catalog.current_setting('history_tier_location') "
+									"FROM pg_catalog.pg_control_system()");
 			if (PQgetisnull(res, 0, 0))
 				pg_fatal("Database \"%s\"'s history store's tier has packs, but the old cluster's\n"
 						 "settings name no place for them (history_tier_location).",
 						 active_db->db_name);
 			cluster->tier_place = pg_strdup(PQgetvalue(res, 0, 0));
 			cluster->system_identifier = pg_strdup(PQgetvalue(res, 0, 1));
+			/* (a directory store's place, relative to the data directory) */
+			if (strcmp(PQgetvalue(res, 0, 2), "directory") == 0)
+			{
+				const char *loc = PQgetvalue(res, 0, 3);
+
+				cluster->tier_dir = is_absolute_path(loc) ? pg_strdup(loc) :
+					psprintf("%s/%s", cluster->pgdata, loc);
+				canonicalize_path(cluster->tier_dir);
+			}
 			PQclear(res);
 		}
 		PQfinish(conn);
@@ -1398,30 +1501,65 @@ check_for_history(ClusterInfo *cluster)
 }
 
 /*
- * check_new_history_tiers()
+ * check_new_history()
  *
- * The old cluster's tiers' packs stay where they are: the new cluster's
- * settings must name the same place (the same store: its identity's hash),
- * else its tiers could read none of them.
+ * The old cluster's history stores' relations' files become the new
+ * cluster's, matched by OID: the new cluster's must be the same relations,
+ * of the same formats.  The old cluster's tiers' packs stay where they
+ * are: the new cluster's settings must name the same place (the same
+ * store: its identity's hash), else its tiers could read none of them.
  */
 static void
-check_new_history_tiers(void)
+check_new_history(void)
 {
 	PGconn	   *conn;
 	PGresult   *res;
+	char	   *rels;
+	char	   *formats;
+	bool		any = false;
 
-	if (old_cluster.ntier_dbs == 0)
+	for (int dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+		any |= old_cluster.store_rels != NULL && old_cluster.store_rels[dbnum] != NULL;
+	if (!any)
 		return;
-	prep_status("Checking for the history stores' tiers' place");
+	prep_status("Checking for the history stores' relations in the new cluster");
 	conn = connectToServer(&new_cluster, "template1");
-	res = executeQueryOrDie(conn, "SELECT pg_catalog.binary_upgrade_history_tier_place()");
-	if (PQgetisnull(res, 0, 0) || strcmp(PQgetvalue(res, 0, 0), old_cluster.tier_place) != 0)
-		pg_fatal("Database \"%s\"'s history store's tier has packs, which stay where they are,\n"
-				 "and the new cluster's settings name %s.\n"
-				 "Set the new cluster's history_tier_store and history_tier_location to the old cluster's.",
-				 old_cluster.tier_dbs[0],
-				 PQgetisnull(res, 0, 0) ? "no place for them" : "another place");
-	PQclear(res);
+	rels = history_store_rels(conn);
+	formats = history_store_formats(conn);
+	if (formats == NULL || strcmp(formats, old_cluster.store_formats) != 0)
+		pg_fatal("The old cluster's version-control history stores are of formats %s,\n"
+				 "the new cluster's of %s: they cannot be carried over.",
+				 old_cluster.store_formats, formats ? formats : "none");
+	for (int dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		const char *old_rels = old_cluster.store_rels[dbnum];
+
+		if (old_rels != NULL && (rels == NULL || strcmp(old_rels, rels) != 0))
+			pg_fatal("Database \"%s\"'s history store's relations are not the new cluster's:\n"
+					 "old: %s\n"
+					 "new: %s\n"
+					 "Its files, matched by OID, cannot be carried over.",
+					 old_cluster.dbarr.dbs[dbnum].db_name, old_rels, rels ? rels : "none");
+	}
+	if (old_cluster.ntier_dbs > 0)
+	{
+		res = executeQueryOrDie(conn, "SELECT pg_catalog.binary_upgrade_history_tier_place()");
+		if (PQgetisnull(res, 0, 0) || strcmp(PQgetvalue(res, 0, 0), old_cluster.tier_place) != 0)
+		{
+			PQExpBufferData dbs;
+
+			initPQExpBuffer(&dbs);
+			for (int i = 0; i < old_cluster.ntier_dbs; i++)
+				appendPQExpBuffer(&dbs, "%s\"%s\"", i > 0 ? ", " : "", old_cluster.tier_dbs[i]);
+			pg_fatal("The history stores' tiers of databases %s have packs, which stay where\n"
+					 "they are, and the new cluster's settings name %s.\n"
+					 "Set the new cluster's history_tier_store and history_tier_location to\n"
+					 "name the old cluster's place.",
+					 dbs.data,
+					 PQgetisnull(res, 0, 0) ? "no place holding them" : "another place");
+		}
+		PQclear(res);
+	}
 	PQfinish(conn);
 	check_ok();
 }

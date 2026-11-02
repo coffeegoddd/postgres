@@ -712,9 +712,9 @@ disable_old_cluster(transferMode transfer_mode)
 		pg_log(PG_REPORT, "\n"
 			   "If you want to start the old cluster, you will need to remove\n"
 			   "the \".old\" suffix from \"%s/%s.old\".\n"
-			   "Because the old cluster's history stores' tiers are the new\n"
-			   "cluster's, their objects where they were, the old cluster cannot be\n"
-			   "safely started once the new cluster has been started.",
+			   "Because the history stores' tiers' objects are the new cluster's\n"
+			   "once pg_upgrade has transferred the files, the old cluster cannot\n"
+			   "be safely started after that.",
 			   old_cluster.pgdata, XLOG_CONTROL_FILE);
 	else
 		pg_fatal("unrecognized transfer mode");

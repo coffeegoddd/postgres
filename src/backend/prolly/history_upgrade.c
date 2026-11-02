@@ -24,20 +24,26 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/table.h"
 #include "access/xact.h"
-#include "catalog/binary_upgrade.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "prolly/chunk_index.h"
+#include "prolly/chunk_log.h"
 #include "prolly/chunk_store.h"
 #include "prolly/chunk_tier.h"
 #include "storage/lmgr.h"
+#include "storage/smgr.h"
+#include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/relcache.h"
+#include "utils/syscache.h"
 
 static void
 check_binary_upgrade(void)
@@ -48,7 +54,14 @@ check_binary_upgrade(void)
 				 errmsg("function can only be called when server is in binary upgrade mode")));
 }
 
-/* the relation given the file number, if it has not that one */
+/*
+ * The relation given the file number, if it has not that one: its pg_class
+ * row's, and its storage of initdb's let go of now (as a binary upgrade's
+ * RelationSetNewRelfilenumber lets go of it).  None is made for it: the
+ * old cluster's files are put there, every one of them, before anything
+ * reads it, and an access method's storage made anew would read what it
+ * had.
+ */
 static void
 set_relfilenode(Oid relid, char relkind, RelFileNumber relfilenumber)
 {
@@ -58,13 +71,23 @@ set_relfilenode(Oid relid, char relkind, RelFileNumber relfilenumber)
 		elog(ERROR, "relation \"%s\" is not of kind '%c'", RelationGetRelationName(rel), relkind);
 	if (rel->rd_rel->relfilenode != relfilenumber)
 	{
-		if (relkind == RELKIND_INDEX)
-			binary_upgrade_next_index_pg_class_relfilenumber = relfilenumber;
-		else if (relkind == RELKIND_TOASTVALUE)
-			binary_upgrade_next_toast_pg_class_relfilenumber = relfilenumber;
-		else
-			binary_upgrade_next_heap_pg_class_relfilenumber = relfilenumber;
-		RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+		Relation	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+		HeapTuple	tuple = SearchSysCacheLockedCopy1(RELOID, ObjectIdGetDatum(relid));
+		ItemPointerData otid;
+		SMgrRelation srel;
+
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "could not find tuple for relation %u", relid);
+		otid = tuple->t_self;
+		((Form_pg_class) GETSTRUCT(tuple))->relfilenode = relfilenumber;
+		CatalogTupleUpdate(pg_class, &otid, tuple);
+		UnlockTuple(pg_class, &otid, InplaceUpdateTupleLock);
+		heap_freetuple(tuple);
+		table_close(pg_class, RowExclusiveLock);
+
+		srel = smgropen(rel->rd_locator, rel->rd_backend);
+		smgrdounlinkall(&srel, 1, false);
+		smgrclose(srel);
 		CommandCounterIncrement();
 	}
 	relation_close(rel, NoLock);
@@ -133,11 +156,32 @@ binary_upgrade_history_tier_place(PG_FUNCTION_ARGS)
 {
 	uint64		place;
 
-	/* (asked of a live old cluster too, by pg_upgrade --check) */
+	/*
+	 * (asked of a live old cluster too, by pg_upgrade --check; of settings
+	 * only superusers see)
+	 */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to read the history store's tier's place")));
 	place = ChunkTierPlace();
 	if (place == 0)
 		PG_RETURN_NULL();
 	PG_RETURN_INT64((int64) place);
+}
+
+/*
+ * binary_upgrade_history_formats(): the history store's formats this server
+ * makes and reads, its meta pages' versions (a store of other formats is
+ * not carried over)
+ */
+Datum
+binary_upgrade_history_formats(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("chunk log %u, chunk index %u, tier %u",
+											  ChunkLogFormatVersion(),
+											  ChunkIndexFormatVersion(),
+											  ChunkTierFormatVersion())));
 }
 
 /*
