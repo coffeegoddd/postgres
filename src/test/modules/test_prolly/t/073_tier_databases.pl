@@ -118,7 +118,7 @@ $node->reload;
 $node->poll_query_until('d1', qq{SELECT current_setting('history_tier_location') = '$tier2'})
   or die 'location not reloaded';
 ($ret, $out, $err) = $node->psql('d1', 'VACUUM pg_history.tier_index');
-like($err, qr/objects are in another place than history_tier_store and history_tier_location say/, 'VACUUM refused elsewhere');
+like($err, qr/WARNING:  tier "tier_chunks"'s objects are in another place than history_tier_store and history_tier_location say: none removed/, 'VACUUM elsewhere removes nothing, and says so');
 ($ret, $out, $err) = $node->psql('d1', q{SELECT (test_cs_put('tier', '\x0a7304')).stored});
 like($err, qr/objects are in another place/, 'and a put');
 $node->append_conf('postgresql.conf', qq{history_tier_location = '$tier'});
@@ -127,6 +127,40 @@ $node->poll_query_until('d1', qq{SELECT current_setting('history_tier_location')
   or die 'location not reloaded';
 $node->safe_psql('d1', 'VACUUM pg_history.tier_index');
 is($node->safe_psql('d1', q{SELECT test_cs_get('tier', h('\x0a7302'))}), '\x0a7302', 'set back: read as it was');
+
+# a tier emptied (its marker removed), then a put where its packs are not,
+# refused: nothing made there, its mark as it was; set back, the next pack
+# makes the marker again, and its database is not dropped
+$node->safe_psql('postgres', 'CREATE DATABASE d3');
+$node->safe_psql('d3', $setup . q{
+	SELECT (test_cs_put('tier', '\x0a7311')).stored;
+	SELECT test_cs_ref_root('tier', h('\x0a7311'));
+});
+$node->safe_psql('d3', q{
+	SELECT test_cs_unref_root('tier', h('\x0a7311'));
+	SELECT test_cs_free('tier', ARRAY[h('\x0a7311')]);
+	VACUUM pg_history.tier_index;
+});
+my $tier3 = PostgreSQL::Test::Utils::tempdir;
+$node->append_conf('postgresql.conf', qq{history_tier_location = '$tier3'});
+$node->reload;
+$node->poll_query_until('d3', qq{SELECT current_setting('history_tier_location') = '$tier3'})
+  or die 'location not reloaded';
+($ret, $out, $err) = $node->psql('d3', q{SELECT (test_cs_put('tier', '\x0a7312')).stored});
+like($err, qr/objects are in another place/, 'a put elsewhere refused');
+opendir(my $dh3, $tier3) or die;
+is(scalar(grep(!/^\./, readdir($dh3))), 0, 'nothing made there');
+closedir($dh3);
+$node->append_conf('postgresql.conf', qq{history_tier_location = '$tier'});
+$node->reload;
+$node->poll_query_until('d3', qq{SELECT current_setting('history_tier_location') = '$tier'})
+  or die 'location not reloaded';
+$node->safe_psql('d3', q{
+	SELECT (test_cs_put('tier', '\x0a7312')).stored;
+	SELECT test_cs_ref_root('tier', h('\x0a7312'));
+});
+($ret, $out, $err) = $node->psql('postgres', 'DROP DATABASE d3');
+like($err, qr/its history store's tier has packs/, 'set back: a pack, its marker made again, d3 not dropped');
 
 $node->stop;
 done_testing();
