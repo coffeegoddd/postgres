@@ -2521,8 +2521,8 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				log_tried = true;
 				if (log != NULL)
 				{
-					segment_bytes = ChunkLog->segment_bytes(log);
-					npending = ChunkLog->end(log) / segment_bytes + 1;
+					segment_bytes = ChunkLogOf(log)->segment_bytes(log);
+					npending = ChunkLogOf(log)->end(log) / segment_bytes + 1;
 					pending = palloc0((npending + 7) / 8);
 				}
 

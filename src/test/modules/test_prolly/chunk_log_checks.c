@@ -128,7 +128,7 @@ test_chunk_log_segments(PG_FUNCTION_ARGS)
 	Datum		values[6];
 	bool		nulls[6] = {false, false, false, false, false, false};
 
-	ChunkLog->find_segments(rel, PG_GETARG_FLOAT8(1), &segs);
+	ChunkLogOf(rel)->find_segments(rel, PG_GETARG_FLOAT8(1), &segs);
 	relation_close(rel, AccessShareLock);
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
