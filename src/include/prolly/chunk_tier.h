@@ -50,7 +50,7 @@
  * index entry gone), and a hash may be in two (a chunk put, its savepoint
  * rolled back, and put again): the index says which is live.
  */
-#define CHUNK_TIER_PACK_MAGIC	UINT64CONST(0x4b4341505952504c)	/* "LPRYPACK" */
+#define CHUNK_TIER_PACK_MAGIC	UINT64CONST(0x4c5052595041434b)	/* "LPRYPACK" */
 #define CHUNK_TIER_PACK_VERSION	1
 
 typedef struct ChunkTierPackEntry
