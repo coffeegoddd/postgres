@@ -4,14 +4,16 @@
  *	  History pushed to the history store's tier, in bundles, and bundles
  *	  released there.
  *
- * A push of a bundle, named, of roots (chunks a caller holds as roots in
- * the store, "pages") copies every chunk the roots reach that the tier has
- * not into the tier, through the ChunkStore interface: children before the
- * chunks naming them, the bytes checked against their names as they are
- * put.  The bundle's rows of pg_history.bundles, one a root, then hold the
- * roots in the tier (their trigger's), and the store lets go of the
- * caller's roots and frees what nothing else holds, all in the push's
- * transaction.  What other history still holds stays.
+ * A push of a bundle, named, of roots (chunks of the store, "pages")
+ * copies every chunk the roots reach that the tier has not into the tier,
+ * through the ChunkStore interface: children before the chunks naming
+ * them, the bytes checked against their names as they are put.  The
+ * bundle's row of pg_history.bundles then holds the roots in the tier (its
+ * trigger's), and the store frees what nothing holds any more, all in the
+ * push's transaction.  A push takes no root: the caller lets go of its
+ * own (in the push's transaction, before it, for them to be freed with
+ * it), and what anything else holds (a pointer, a root, a chunk naming
+ * it) stays.
  *
  * So the push's commit is where history moves: a transaction before it,
  * and one whose snapshot is older, reads it in the store still (its bytes
@@ -229,104 +231,6 @@ check_pusher(void)
 				 errmsg("only a superuser may push or release history in the history store's tier")));
 }
 
-/* whether this transaction pushed a bundle */
-static bool pushed_in_xact = false;
-static bool push_callback_registered = false;
-
-static void
-forget_push(XactEvent event, void *arg)
-{
-	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
-		event == XACT_EVENT_PREPARE || event == XACT_EVENT_PARALLEL_COMMIT ||
-		event == XACT_EVENT_PARALLEL_ABORT)
-		pushed_in_xact = false;
-}
-
-bool
-ChunkStorePushedInTransaction(void)
-{
-	return pushed_in_xact;
-}
-
-/*
- * A push is a transaction's alone: one bundle, and no pointer changed
- * before it or after.  (So a pusher never holds a pointer's change as it
- * waits for the pointers, and a pointer's change never waits for a
- * pusher holding them: no deadlock between them.)
- */
-static void
-check_alone(void)
-{
-	if (pushed_in_xact)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("a transaction pushes one bundle of history at most"),
-				 errhint("Push each bundle in a transaction of its own.")));
-	if (CheckRelationOidLockedByMe(ChunkStorePointersRelid(), RowExclusiveLock, true))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot push history in a transaction that changed the history store's pointers"),
-				 errhint("Push in a transaction of its own.")));
-	if (!push_callback_registered)
-	{
-		RegisterXactCallback(forget_push, NULL);
-		push_callback_registered = true;
-	}
-	pushed_in_xact = true;
-}
-
-/*
- * The pushes of roots locked: a lock of each part of hashes the roots are
- * in (their first byte's), in order, until the transaction ends, so that
- * a push of a root another is pushing waits for it, and then counts what
- * it left (two counting at once could each take the last root not a
- * pointer's)
- */
-static void
-lock_roots(const uint8 *roots, int n)
-{
-	bool		part[256] = {false};
-
-	for (int i = 0; i < n; i++)
-		part[roots[(Size) i * CHUNK_HASH_LEN]] = true;
-	for (int p = 0; p < 256; p++)
-		if (part[p])
-			LockDatabaseObject(ChunkStoreBundlesRelid(), (Oid) p, 0, ExclusiveLock);
-}
-
-/*
- * The pointers naming each of roots, in counts[]: as of now, the pointers
- * locked (those changing them waited for, and none changing them until
- * the caller unlocks them), so that the roots counted with them are as
- * these are
- */
-static void
-pointers_of(ArrayType *roots_arr, const uint8 *roots, int n, uint64 *counts)
-{
-	Oid			types[1] = {BYTEAARRAYOID};
-	Datum		values[1] = {PointerGetDatum(roots_arr)};
-	SPIPlanPtr	plan;
-
-	LockRelationOid(ChunkStorePointersRelid(), ShareLock);
-	plan = SPI_prepare("SELECT hash, count(*) FROM pg_history.pointers "
-					   "WHERE hash = ANY($1) GROUP BY hash", 1, types);
-	if (plan == NULL ||
-		SPI_execute_snapshot(plan, values, NULL, GetLatestSnapshot(), InvalidSnapshot,
-							 true, false, 0) != SPI_OK_SELECT)
-		elog(ERROR, "could not count roots' pointers");
-	memset(counts, 0, sizeof(uint64) * n);
-	for (uint64 r = 0; r < SPI_processed; r++)
-	{
-		bool		isnull;
-		bytea	   *h = DatumGetByteaPP(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull));
-		int64		c = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull));
-
-		for (int i = 0; i < n; i++)
-			if (memcmp(roots + (Size) i * CHUNK_HASH_LEN, VARDATA_ANY(h), CHUNK_HASH_LEN) == 0)
-				counts[i] = (uint64) c;
-	}
-}
-
 /* whether the bundle has rows */
 static bool
 bundle_exists(text *bundle)
@@ -354,15 +258,12 @@ pg_history_push(PG_FUNCTION_ARGS)
 	HASHCTL		ctl;
 	HTAB	   *seen;
 	Oid			types[2] = {TEXTOID, BYTEAARRAYOID};
-	uint64	   *pointers;
 
 	check_pusher();
 	if (n == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a bundle has a root at least")));
-	check_alone();
-	lock_roots(roots, n);
 	SPI_connect();
 	if (bundle_exists(bundle))
 		ereport(ERROR,
@@ -372,45 +273,6 @@ pg_history_push(PG_FUNCTION_ARGS)
 
 	ps.from = ChunkStoreOpen("pages");
 	ps.to = ChunkStoreOpen("tier");
-
-	/*
-	 * (each root one the caller holds, not a pointer's: a pointer's root is
-	 * let go of as its row is, which would then be one too many.  The
-	 * pointers counted as of now, and the roots, with no pointer changed
-	 * meanwhile (those changing them waited for), and no other push of
-	 * these roots (locked above); then the pointers unlocked, and the
-	 * caller's roots let go of: a pointer's change since only takes or
-	 * lets go of its own root.)
-	 */
-	pointers = palloc_array(uint64, n);
-	pointers_of(PG_GETARG_ARRAYTYPE_P(1), roots, n, pointers);
-	for (int i = 0; i < n; i++)
-	{
-		const uint8 *root = roots + (Size) i * CHUNK_HASH_LEN;
-		ChunkCounts c;
-
-		if (!cs_counts(ps.from, root, &c))
-		{
-			uint32		len;
-
-			/* (pushed already, it says so; else none to push) */
-			(void) cs_get(ps.from, root, &len);
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("the history store has no chunk %s to push", ChunkHashText(root))));
-		}
-		if (c.roots <= pointers[i])
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 pointers[i] == 0 ?
-					 errmsg("chunk %s has no root to push", ChunkHashText(root)) :
-					 errmsg("chunk %s has no root to push but its pointers'", ChunkHashText(root)),
-					 errhint("Take a root of it to push (a bundle takes it), or delete the pointers.")));
-	}
-	UnlockRelationOid(ChunkStorePointersRelid(), ShareLock);
-	for (int i = 0; i < n; i++)
-		cs_unref_root(ps.from, roots + (Size) i * CHUNK_HASH_LEN);
-
 	ps.cap = 64;
 	ps.stack = palloc_array(PushFrame, ps.cap);
 	ps.ncap = 64;
@@ -438,7 +300,11 @@ pg_history_push(PG_FUNCTION_ARGS)
 	}
 	SPI_finish();
 
-	/* (what nothing else holds freed, the caller's roots let go of above) */
+	/*
+	 * (what nothing holds here any more freed: the caller's roots, let go
+	 * of by the caller, not; what others hold, a pointer, a root, a chunk
+	 * referencing it, stays)
+	 */
 	(void) cs_free(ps.from, roots, n);
 	PG_RETURN_INT64((int64) ps.copied);
 }

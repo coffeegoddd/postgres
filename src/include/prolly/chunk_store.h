@@ -40,12 +40,6 @@ extern Oid	ChunkStoreTierIndexRelid(void);
 extern Oid	ChunkStorePointersRelid(void);
 extern Oid	ChunkStoreBundlesRelid(void);
 
-/*
- * Whether this transaction pushed history to the tier (prolly/chunk_push.c):
- * a transaction that did changes no pointer.
- */
-extern bool ChunkStorePushedInTransaction(void);
-
 
 /* A chunk's name, in hex, palloc'd: for messages. */
 extern char *ChunkHashText(const uint8 *hash);
