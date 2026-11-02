@@ -4205,8 +4205,8 @@ getHistory(Archive *fout)
 	 * its pointers, restored in one statement, so that none restored is
 	 * freed before the pointers holding it are)
 	 */
-	history->query = "COPY (SELECT hash, data, name FROM pg_catalog.pg_history_export()) TO stdout;";
-	history->copyStmt = "COPY pg_history.chunk_restore (hash, data, name) FROM stdin;\n";
+	history->query = "COPY (SELECT hash, data, name, roots FROM pg_catalog.pg_history_export()) TO stdout;";
+	history->copyStmt = "COPY pg_history.chunk_restore (hash, data, name, roots) FROM stdin;\n";
 	res = ExecuteSqlQueryForSingleRow(fout, "SELECT pg_relation_size('pg_history.chunks')");
 	history->size = (pgoff_t) strtoll(PQgetvalue(res, 0, 0), NULL, 10);
 	PQclear(res);
