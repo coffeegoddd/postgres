@@ -884,16 +884,6 @@ branch_write(VcRepo *r, const VcBranch *b)
 	char	   *ref = branch_ref(b->name);
 	PHash		h = branch_put(&r->ctx, b);
 
-	{
-		char		hx[PHASH_HEX_LEN + 1],
-					wx[PHASH_HEX_LEN + 1],
-					cx[PHASH_HEX_LEN + 1];
-
-		phash_hex(&h, hx);
-		phash_hex(&b->working, wx);
-		phash_hex(&b->head, cx);
-		elog(LOG, "TRACE vc branch %s chunk %s head %s working %s", b->name, hx, cx, wx);
-	}
 	vc_refs_set(r->refs, ref, &h);
 	pfree(ref);
 }
@@ -957,15 +947,6 @@ keep_commit(VcRepo *r, const PHash *root, const PHash *parents, uint32 np,
 {
 	PHash		h = vc_commit_write(&r->ctx, root, parents, np, now_us(r), msg);
 	char	   *ref = commit_ref(&h);
-
-	{
-		char		hx[PHASH_HEX_LEN + 1],
-					rx[PHASH_HEX_LEN + 1];
-
-		phash_hex(&h, hx);
-		phash_hex(root, rx);
-		elog(LOG, "TRACE vc commit %s root %s msg %s", hx, rx, msg);
-	}
 
 	vc_refs_set(r->refs, ref, &h);
 	pfree(ref);
