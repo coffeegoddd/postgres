@@ -26,11 +26,19 @@ text_field(const char *s)
 
 static const WsField null_field = {NULL, 0, true};
 
-/* Fields set to garbage: what decoding leaves in them is decoding's. */
+/*
+ * Fields set as if each had a value: a NULL, or a value, after decoding is
+ * decoding's doing.
+ */
 static void
 scribble(WsField *f, int n)
 {
-	memset(f, 0x7f, (size_t) n * sizeof(WsField));
+	for (int i = 0; i < n; i++)
+	{
+		f[i].p = (const uint8 *) "scribbled";
+		f[i].len = 9;
+		f[i].null = false;
+	}
 }
 
 static bool
@@ -228,6 +236,16 @@ test_keys(void)
 	buf_free(&v);
 }
 
+/* (the same tag twice, read for a tag past them) */
+static void
+cell_get_unordered(void *arg)
+{
+	const uint8 *p;
+	size_t		len;
+
+	(void) WsRowCodec->cell_get((const uint8 *) "\x01\x00\x01\x00", 4, 9, &p, &len);
+}
+
 static void
 test_cell_get(void)
 {
@@ -240,12 +258,13 @@ test_cell_get(void)
 	WsRowCodec->cells_encode(c, 2, &v);
 	CHECK_EQ(WsRowCodec->cells(v.data, v.len, out), 2);
 	CHECK(out[0].tag == 2 && out[1].tag == 9);
-	CHECK(ws_cell_get(v.data, v.len, 9, &p, &len));
+	CHECK(WsRowCodec->cell_get(v.data, v.len, 9, &p, &len));
 	CHECK(len == 4 && memcmp(p, "nine", 4) == 0);
-	CHECK(!ws_cell_get(v.data, v.len, 3, &p, &len));
-	CHECK(!ws_cell_get(v.data, v.len, 10, &p, &len));
-	CHECK(!ws_cell_get(v.data, 0, 2, &p, &len));
+	CHECK(!WsRowCodec->cell_get(v.data, v.len, 3, &p, &len));
+	CHECK(!WsRowCodec->cell_get(v.data, v.len, 10, &p, &len));
+	CHECK(!WsRowCodec->cell_get(v.data, 0, 2, &p, &len));
 	buf_free(&v);
+	expect_error(cell_get_unordered, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 }
 
 static void
@@ -417,6 +436,15 @@ split_too_many(void *arg)
 }
 
 static void
+split_none_expected(void *arg)
+{
+	WsField		f[1];
+	Buf			scratch = BUF_INIT;
+
+	ws_copy_split("\t", 1, f, 0, &scratch);
+}
+
+static void
 split_too_few(void *arg)
 {
 	WsField		f[2];
@@ -451,6 +479,7 @@ test_copy_text(void)
 	ws_row_shape_free(&s);
 	expect_error(split_too_many, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 	expect_error(split_too_few, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	expect_error(split_none_expected, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 
 	/* a line ending in a tab: a last field that is empty, no NULL */
 	ws_copy_split("a\t", 2, got, 2, &scratch);

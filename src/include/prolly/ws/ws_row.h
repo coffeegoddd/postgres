@@ -101,15 +101,15 @@ typedef struct WsRowCodecRoutine
 	void		(*cells_encode) (WsCell *c, int n, Buf *out);
 	/* A value's cells, at most WS_MAX_COLS: how many. */
 	int			(*cells) (const uint8 *v, size_t vl, WsCell *out);
+	/* A value's cell of this tag, if it has one (read only as far as it). */
+	bool		(*cell_get) (const uint8 *v, size_t vl, uint64 tag, const uint8 **p,
+							 size_t *len);
 } WsRowCodecRoutine;
 
 extern PGDLLIMPORT const WsRowCodecRoutine CellsWsRowCodec;
 
 /* The codec the working-set model uses. */
 extern PGDLLIMPORT const WsRowCodecRoutine *WsRowCodec;
-
-/* A value's cell of this tag, if it has one (read only as far as it). */
-extern bool ws_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *len);
 
 /* COPY text: a value escaped, a line split, and a line from a row's fields. */
 extern void ws_copy_escape(Buf *b, const uint8 *v, size_t len);

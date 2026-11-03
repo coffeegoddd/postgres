@@ -143,8 +143,8 @@ cells_parse(const uint8 *v, size_t vl, WsCell *out)
 	return n;
 }
 
-bool
-ws_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *len)
+static bool
+cells_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *len)
 {
 	const uint8 *q = v,
 			   *end = v + vl;
@@ -283,6 +283,7 @@ const WsRowCodecRoutine CellsWsRowCodec = {
 	.key_cells = cells_key_cells,
 	.cells_encode = cells_encode,
 	.cells = cells_parse,
+	.cell_get = cells_cell_get,
 };
 
 /* ------------------------------------------------------------ COPY text */
