@@ -23,11 +23,18 @@
  *
  * Calls that change a branch lock its reference first (for update), and
  * read it after, so two that change one branch take turns: two commits on
- * one branch both land, one after the other.  vc_set_working replaces the
- * working root it is given, whatever it was meanwhile: two sessions
- * writing one branch's working set without committing between them are
- * the working set's own concern, not this layer's.  Errors of the
- * caller's (an unknown or misnamed branch, uncommitted changes) are
+ * one branch both land, one after the other.  A change of the working set
+ * made from what it was (an edit: read, change, write back) reads it with
+ * vc_working_lock, which locks the branch as a commit does, so that two
+ * such edits take turns too and neither is lost; vc_set_working writes the
+ * root it is given, whatever the working set was meanwhile.  The one chunk
+ * commits on different branches can both write is a commit whose hash
+ * another branch's commit has: the same parents, root, time and message
+ * (two merges of one branch into two at one head, at one time: in one
+ * microsecond, or with the clock behind the parents', which puts a commit
+ * just after them); the second waits for the first's transaction there.
+ * Errors of the caller's (an unknown or misnamed branch, uncommitted
+ * changes) are
  * VC_ERR, and a name is any of 1 to NAMEDATALEN - 1 bytes; history a
  * call cannot reach is VC_ERR_SEVERED or VC_ERR_OUTSIDE_WINDOW, the commit
  * in ctx.err_hash; damage, of a tree or a commit, is raised.
@@ -188,6 +195,10 @@ extern int	vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
  */
 extern void vc_repo_open(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 						 const ChunkPolicy *policy);
+/* vc_repo_open with the clock commits read, the init's too (for tests). */
+extern void vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
+							   const ChunkPolicy *policy,
+							   uint64 (*now) (void *arg), void *now_arg);
 extern void vc_repo_free(VcRepo *r);
 /* The branch, false if there is none; vc_branch_free frees out's name. */
 extern bool vc_branch_get(VcRepo *r, const char *name, VcBranch *out);
@@ -197,6 +208,8 @@ extern void vc_branch_list(VcRepo *r, VcBranchFn fn, void *arg);
 /* The branch checked out. */
 extern void vc_head(VcRepo *r, VcBranch *out);
 extern PHash vc_working(VcRepo *r);
+/* The working root, its branch locked until the transaction ends: for an edit. */
+extern PHash vc_working_lock(VcRepo *r);
 extern void vc_set_working(VcRepo *r, const PHash *rv);
 /* A new branch at commit (NULL: the head checked out). */
 extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
@@ -216,6 +229,15 @@ extern PHash vc_commit(VcRepo *r, const char *msg);
  */
 extern PHash vc_commit_root(VcRepo *r, const PHash *root, const char *msg);
 extern int	vc_reset_hard(VcRepo *r, const PHash *commit);
+
+/*
+ * Moves the branch's head to commit and leaves its working root alone (a
+ * pending merge is let go of): what the working root has beyond commit is
+ * then uncommitted.  As every call that changes a branch, it locks the
+ * branch before it reads it: a commit made meanwhile is not lost to a
+ * head read before it.
+ */
+extern int	vc_reset_soft(VcRepo *r, const PHash *commit);
 extern int	vc_merge(VcRepo *r, const char *branch, VcMergeResult *res);
 extern void vc_merge_result_free(VcMergeResult *res);
 

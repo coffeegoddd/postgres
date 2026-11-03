@@ -1,0 +1,575 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_main s2_main s1_commit c_log c_s1_working
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_main: SELECT test_vc_commit('main', 's1');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_main: SELECT test_vc_commit('main', 's2'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_main: <... completed>
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main           |a        |b        |x|kept
+---------------+---------+---------+-+----
+s2 s1 base init|base init|base init| |t   
+(1 row)
+
+step c_s1_working: SELECT test_vc_working_has('main', 's1') AS has_s1;
+has_s1
+------
+t     
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_main s2_main s1_rollback c_log c_s1_working
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_main: SELECT test_vc_commit('main', 's1');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_main: SELECT test_vc_commit('main', 's2'); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_main: <... completed>
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main        |a        |b        |x|kept
+------------+---------+---------+-+----
+s2 base init|base init|base init| |t   
+(1 row)
+
+step c_s1_working: SELECT test_vc_working_has('main', 's1') AS has_s1;
+has_s1
+------
+f     
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_a s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_a: SELECT test_vc_commit('a', 's1a');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a            |b            |x|kept
+---------+-------------+-------------+-+----
+base init|s1a base init|s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_drop_a s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_drop_a: SELECT test_vc_branch_delete('a');
+test_vc_branch_delete
+---------------------
+t                    
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a|b            |x|kept
+---------+-+-------------+-+----
+base init| |s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_hard s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_hard: SELECT test_vc_reset('main', 'base', true);
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b            |x|kept
+---------+---------+-------------+-+----
+base init|base init|s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_make_x s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_make_x: SELECT test_vc_branch('x', 'main');
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b            |x        |kept
+---------+---------+-------------+---------+----
+base init|base init|s2b base init|base init|t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s2_rr s1_main s2_rr_main s1_commit s2_end c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s2_rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT test_vc_log('main');
+test_vc_log
+-----------
+base init  
+(1 row)
+
+step s1_main: SELECT test_vc_commit('main', 's1');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_rr_main: SELECT test_vc_commit('main', 's2'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_rr_main: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2_end: ROLLBACK;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main        |a        |b        |x|kept
+------------+---------+---------+-+----
+s1 base init|base init|base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_main s2_hard s1_commit c_log c_s1_working
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_main: SELECT test_vc_commit('main', 's1');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_hard: SELECT test_vc_reset('main', 'base', true); <waiting ...>
+step s1_commit: COMMIT;
+step s2_hard: <... completed>
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b        |x|kept
+---------+---------+---------+-+----
+base init|base init|base init| |t   
+(1 row)
+
+step c_s1_working: SELECT test_vc_working_has('main', 's1') AS has_s1;
+has_s1
+------
+f     
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_hard s2_main s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_hard: SELECT test_vc_reset('main', 'base', true);
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step s2_main: SELECT test_vc_commit('main', 's2'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_main: <... completed>
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main        |a        |b        |x|kept
+------------+---------+---------+-+----
+s2 base init|base init|base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_main s2_soft s1_commit c_log c_s1_working
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_main: SELECT test_vc_commit('main', 's1');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_soft: SELECT test_vc_reset('main', 'base', false); <waiting ...>
+step s1_commit: COMMIT;
+step s2_soft: <... completed>
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b        |x|kept
+---------+---------+---------+-+----
+base init|base init|base init| |t   
+(1 row)
+
+step c_s1_working: SELECT test_vc_working_has('main', 's1') AS has_s1;
+has_s1
+------
+t     
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_soft s2_main s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_soft: SELECT test_vc_reset('main', 'base', false);
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step s2_main: SELECT test_vc_commit('main', 's2'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_main: <... completed>
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main        |a        |b        |x|kept
+------------+---------+---------+-+----
+s2 base init|base init|base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_drop_b s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_drop_b: SELECT test_vc_branch_delete('b');
+test_vc_branch_delete
+---------------------
+t                    
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_b: <... completed>
+ERROR:  branch "b", checked out, is gone
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b|x|kept
+---------+---------+-+-+----
+base init|base init| | |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_drop_b s2_b s1_rollback c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_drop_b: SELECT test_vc_branch_delete('b');
+test_vc_branch_delete
+---------------------
+t                    
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b'); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_b: <... completed>
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b            |x|kept
+---------+---------+-------------+-+----
+base init|base init|s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_make_x s2_make_x s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_make_x: SELECT test_vc_branch('x', 'main');
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s2_make_x: SELECT test_vc_branch('x', 'main'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_make_x: <... completed>
+test_vc_branch
+--------------
+f             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b        |x        |kept
+---------+---------+---------+---------+----
+base init|base init|base init|base init|t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_make_x s2_make_x s1_rollback c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_make_x: SELECT test_vc_branch('x', 'main');
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s2_make_x: SELECT test_vc_branch('x', 'main'); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_make_x: <... completed>
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b        |x        |kept
+---------+---------+---------+---------+----
+base init|base init|base init|base init|t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+

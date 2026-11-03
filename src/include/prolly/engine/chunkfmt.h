@@ -35,8 +35,10 @@
  *			uvarint xmax, uvarint nxip, uvarint xip..., page map root (strong),
  *			relation map root (strong)
  * Branch:	tag, version, head commit hash (strong), working root value hash
- *			(strong), merging byte (0 or 1), [merge head commit hash (strong)]
- *			A branch's state, which its reference names.
+ *			(strong), merging byte (0 or 1), [merge head commit hash (strong)],
+ *			uvarint namelen, the branch's name
+ *			A branch's state, which its reference names; its name makes it
+ *			that branch's alone.
  *
  * EngineChunkFormat is these formats as the history store's ChunkFormat
  * (prolly/chunk_format.h): the strong references, those a store keeps a

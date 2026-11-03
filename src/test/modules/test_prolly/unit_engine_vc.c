@@ -498,6 +498,26 @@ ENGINE_TEST(test_reset_hard)
 	CHECK(phash_eq(&h, &c1));
 	CHECK_EQ(vc_reset_hard(&r, &c2), VC_OK);
 	CHECK_EQ(working_row(&r, "t", 1), 2);
+
+	/* soft: the head moves, the working root stays, its change uncommitted */
+	put_row(&r, "t", 1, 4);
+	CHECK_EQ(vc_reset_soft(&r, &c1), VC_OK);
+	h = head_of(&r);
+	CHECK(phash_eq(&h, &c1));
+	CHECK_EQ(working_row(&r, "t", 1), 4);
+	{
+		PHash		hr = head_root_of(&r);
+
+		CHECK_EQ(row_version(&r, &hr, "t", 1), 1);
+	}
+	h = vc_commit(&r, "over one");
+	{
+		VcCommit	cm;
+
+		CHECK(vc_commit_load(&r.ctx, &h, &cm));
+		CHECK(cm.nparents == 1 && phash_eq(&cm.parents[0], &c1));
+		vc_commit_release(&cm);
+	}
 	settle_and_check(cs);
 	vc_repo_free(&r);
 	cs_destroy(cs);
