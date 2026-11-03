@@ -36,8 +36,15 @@ my $commits = sub {
 };
 
 # the chunks the store holds once what nothing holds is freed
+# (what was let go of freed first, then no freer still running: a freer
+# VACUUM asks for may not have started when it returns)
 my $settled = sub {
 	$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+	ok( $node->poll_query_until(
+			'postgres',
+			q{SELECT unheld = 0 AND test_chunk_index_marked('pg_history.chunk_index') = 0
+			FROM test_cs_check('pages')}),
+		'what nothing holds freed');
 	ok( $node->poll_query_until(
 			'postgres',
 			q{SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'chunk freer'}),

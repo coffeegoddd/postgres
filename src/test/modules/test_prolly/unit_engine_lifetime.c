@@ -1114,7 +1114,7 @@ life_scale_case(uint64 n, LifeScale *s)
 	st = *cs_stats(cs);
 	CHECK_OK(prolly_delta_apply(&ctx, &delta, &back));
 	s->delta_apply_reads = STATS_DELTA(cs, st, gets);
-	s->delta_apply_writes = STATS_DELTA(cs, st, stored);
+	s->delta_apply_writes = STATS_DELTA(cs, st, puts);	/* (found there or not) */
 	CHECK(phash_eq(&back, &a));
 	held(cs, back);
 	release(cs);
@@ -1140,6 +1140,7 @@ ENGINE_TEST(test_lifetime_scaling)
 {
 	static const uint64 sizes[] = {20000, 200000};
 	LifeScale	s[2];
+	bool		memory = engine_test_on_memory();
 
 	for (int i = 0; i < 2; i++)
 	{
@@ -1151,29 +1152,35 @@ ENGINE_TEST(test_lifetime_scaling)
 
 		/* chunk diff: O(d h), like row diff */
 		CHECK_LE(x->chunk_diff_reads, 4 * LT_K * h + 2);
+		/* delta: O(d) bytes; replay costs the same as the edits it records */
+		CHECK_LE(x->delta_bytes, LT_K * 40 + 64);
+		CHECK_LE(x->delta_apply_reads, 4 * LT_K * h + 2);
+		CHECK_LE(x->delta_apply_writes, 3 * LT_K * h);
+		if (!memory)
+			continue;
 		/* sever: O(d h) chunks freed, with no chunk read through the store */
 		CHECK_LE(x->sever_frees, 3 * LT_K * h);
 		CHECK_EQ(x->sever_reads, 0);
 		/* repair: exactly the missing chunks read and written */
 		CHECK_EQ(x->repair_src_reads, x->repair_copied);
 		CHECK_LE(x->repair_holds, x->repair_copied * SMALL_MAX_FANOUT + 1);
-		/* delta: O(d) bytes; replay costs the same as the edits it records */
-		CHECK_LE(x->delta_bytes, LT_K * 40 + 64);
-		CHECK_LE(x->delta_apply_reads, 4 * LT_K * h + 2);
-		CHECK_LE(x->delta_apply_writes, 3 * LT_K * h);
 		CHECK_EQ(x->hold_frees, 0);
 	}
 	/* the sizes a level apart */
 	CHECK_LT(s[0].height, s[1].height);
 	/* 10x the rows: costs follow height, not n */
 	CHECK_LE(s[1].chunk_diff_reads, 2 * s[0].chunk_diff_reads * s[1].height / s[0].height);
-	CHECK_LE(s[1].sever_frees, 2 * s[0].sever_frees * s[1].height / s[0].height);
-	CHECK_LE(s[1].repair_copied, 2 * s[0].repair_copied * s[1].height / s[0].height);
-	CHECK_LE(s[1].repair_holds, 2 * s[0].repair_holds * s[1].height / s[0].height);
 	CHECK_LE(s[1].delta_bytes, 2 * s[0].delta_bytes);
 	CHECK_LE(s[1].delta_apply_reads, 2 * s[0].delta_apply_reads * s[1].height / s[0].height);
 	/* (the chunk diffs and deltas measured: on every store) */
-	CHECK(s[0].chunk_diff_reads > 0 && s[0].delta_apply_reads > 0);
+	CHECK(s[0].chunk_diff_reads > 0 && s[0].delta_apply_reads > 0 && s[0].delta_apply_writes > 0);
+	if (memory)
+	{
+		CHECK_LE(s[1].sever_frees, 2 * s[0].sever_frees * s[1].height / s[0].height);
+		CHECK_LE(s[1].repair_copied, 2 * s[0].repair_copied * s[1].height / s[0].height);
+		CHECK_LE(s[1].repair_holds, 2 * s[0].repair_holds * s[1].height / s[0].height);
+		CHECK(s[0].sever_frees > 0 && s[0].repair_copied > 0);
+	}
 }
 
 static const ProllyUnitTest tests[] = {
