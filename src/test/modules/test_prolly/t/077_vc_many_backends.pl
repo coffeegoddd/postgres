@@ -56,6 +56,16 @@ SELECT test_vc_commit('b' || (:client_id + 1), 'b' || (:client_id + 1) || '-lane
 }
 	});
 
+# (its backends gone, their lanes let go of as they exit: none made below)
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'pgbench'})
+  or die "the backends that made the lanes did not exit";
+my $lanes = sub {
+	return $node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_class WHERE relname ~ '_lane_[0-9]+$'});
+};
+my $lanes_made = $lanes->();
+
 # sixteen backends, a branch each: none waits for another's transaction
 my $log_at = -s $node->logfile;
 $node->pgbench(
@@ -69,6 +79,7 @@ $node->pgbench(
 SELECT test_vc_commit('b' || (:client_id + 1), 'b' || (:client_id + 1) || '-' || nextval('n'));
 }
 	});
+is($lanes->(), $lanes_made, 'the run took the lanes made before it, making none');
 my @lost = grep { $commits->("b$_") != 28 } 1 .. 16;
 is(scalar @lost, 0, 'each branch has its 25 commits, on its lane commit, base and init')
   or diag("branches short: @lost");
@@ -80,7 +91,7 @@ is(scalar @rows, 0, "each branch's head has its 26 commits' rows, and base's")
   or diag("branches short of rows: @rows");
 # (a wait's lines, with what waited and on what, shown if there is one)
 my $waits = slurp_file($node->logfile, $log_at);
-my @waited = grep { /still waiting/ ... /STATEMENT|^\S+ \S+ \S+ \[\d+\] .*: (?!DETAIL|CONTEXT)/ }
+my @waited = grep { /still waiting/ ... /STATEMENT|^\S+ \S+ \S+ \[\d+\] [^:]*: (?!DETAIL|CONTEXT)/ }
   split /\n/, $waits;
 # (each relation a wait was on, named: its oid differs between builds)
 my %rels = map { $_ => 1 } ($waits =~ /relation (\d+) of database/g);
