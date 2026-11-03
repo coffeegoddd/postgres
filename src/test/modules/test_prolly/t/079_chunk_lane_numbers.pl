@@ -109,13 +109,18 @@ my $q = $node->background_psql('postgres');
 $q->query_safe("BEGIN; SELECT (test_cs_put('pages', d(12))).stored; PREPARE TRANSACTION 'gone'");
 $q->quit;
 put_held(13);
-$node->safe_psql('postgres', "ROLLBACK PREPARED 'gone'");
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 put_held(14);
+is($node->safe_psql('postgres', $lanes),
+	'chunks_lane_1 chunks_lane_2 chunks_lane_3 chunks_lane_4 chunks_lane_5 chunks_lane_7 chunks_lane_8 chunks_lane_9',
+	'while prepared, its number (6) not given, a VACUUM pass between makings (8 and 9 new)');
+$node->safe_psql('postgres', "ROLLBACK PREPARED 'gone'");
+put_held(16);
 $node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 put_held(15);
 is($node->safe_psql('postgres', $lanes),
-	'chunks_lane_1 chunks_lane_2 chunks_lane_3 chunks_lane_4 chunks_lane_5 chunks_lane_6 chunks_lane_7 chunks_lane_8 chunks_lane_9',
-	'the rolled-back making\'s number (6) held while prepared (8 and 9 new), then given again');
+	'chunks_lane_1 chunks_lane_10 chunks_lane_2 chunks_lane_3 chunks_lane_4 chunks_lane_5 chunks_lane_6 chunks_lane_7 chunks_lane_8 chunks_lane_9',
+	'rolled back, its number (6) a hole, given again after a VACUUM pass (10 new before it)');
 is($node->safe_psql('postgres', q{SELECT test_cs_get('pages', h(d(15))) = d(15)}),
 	't', 'the chunk put in the reused lane reads back');
 $node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
