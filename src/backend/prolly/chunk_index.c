@@ -3557,18 +3557,19 @@ lane_merge(Relation idx, void (*dup) (void *arg, const ChunkIndexEntry *e), void
 }
 
 /*
- * xmax set on every entry of hash's chunk in rel (a lane, or the index)
- * present to this transaction, or (xid 0) cleared on those it set it on.
- * Setting it, false if one is being moved by a merger running (its copy,
- * made before, would not be freed: the freeing to be taken back), each
- * entry looked at under its page's lock, as the merger marks it
+ * xmax set on every entry in rel (a lane, or the index) of the chunk
+ * entries ids (their xmin and loc: a lane's entry and the index's copy of
+ * it alike, whatever a snapshot sees of the move), or (xid 0) cleared on
+ * those it set it on.  Setting it, false if one is being moved by a merger
+ * running (its copy, made before, would not be freed), or another is
+ * freeing it, or freed it since it was seen: the freeing to be taken back.
+ * Each entry looked at under its page's lock, as the merger marks it.
  */
 static bool
-rel_set_xmax(Relation rel, bool lane, const uint8 *hash, TransactionId xid, Snapshot snap,
-			 int *nset)
+rel_set_xmax(Relation rel, bool lane, const uint8 *hash, TransactionId xid,
+			 const ChunkIndexEntry *ids, int nids, int *nset)
 {
 	bool		ok = true;
-
 	uint32		bucket;
 	IndexCache	masks;
 	Buffer		primary = lock_bucket(rel, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
@@ -3584,51 +3585,44 @@ rel_set_xmax(Relation rel, bool lane, const uint8 *hash, TransactionId xid, Snap
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
 			xl_chunk_index_slot xlrec = {.slot = i, .xmax = xid};
+			bool		seen = false;
 
 			if (e->kind != CHUNK_KIND_CHUNK || memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
 				!belongs(e, bucket, &masks))
 				continue;
-			if (TransactionIdIsValid(xid) && TransactionIdIsValid(e->merge_xid) &&
+			if (!TransactionIdIsValid(xid))
+			{
+				if (TransactionIdIsValid(e->xmax) && TransactionIdIsCurrentTransactionId(e->xmax))
+				{
+					START_CRIT_SECTION();
+					ipage_set_xmax(page, i, InvalidTransactionId);
+					log_slot_change(rel, primary, cur, XLOG_CHUNK_INDEX_SET_XMAX, &xlrec);
+					END_CRIT_SECTION();
+				}
+				continue;
+			}
+			for (int k = 0; k < nids && !seen; k++)
+				seen = ids[k].xmin == e->xmin && ids[k].loc == e->loc;
+			if (!seen || xmin_state(e, cur) != ENTRY_VISIBLE ||
+				(!lane && TransactionIdIsValid(e->merge_xid) &&
+				 !TransactionIdIsCurrentTransactionId(e->merge_xid) &&
+				 !TransactionIdIsInProgress(e->merge_xid) &&
+				 !TransactionIdDidCommit(e->merge_xid)))
+				continue;
+			if (TransactionIdIsValid(e->merge_xid) &&
 				(TransactionIdIsCurrentTransactionId(e->merge_xid) ||
 				 TransactionIdIsInProgress(e->merge_xid)))
 			{
 				ok = false;
 				continue;
 			}
-
-			/*
-			 * (one another is freeing, or freed, whatever this one's snapshot
-			 * saw: this freeing taken back, two never freeing one chunk, each
-			 * letting go of its references)
-			 */
-			if (TransactionIdIsValid(xid) && xmin_state(e, cur) == ENTRY_VISIBLE &&
-				TransactionIdIsValid(e->xmax) && !(e->flags & CHUNK_ENTRY_XMAX_ABORTED) &&
+			if (TransactionIdIsValid(e->xmax) && !(e->flags & CHUNK_ENTRY_XMAX_ABORTED) &&
 				!TransactionIdIsCurrentTransactionId(e->xmax) &&
-				(TransactionIdIsInProgress(e->xmax) || TransactionIdDidCommit(e->xmax)) &&
-				!(!lane && TransactionIdIsValid(e->merge_xid) && !TransactionIdDidCommit(e->merge_xid)))
+				(TransactionIdIsInProgress(e->xmax) || TransactionIdDidCommit(e->xmax)))
 			{
 				ok = false;
 				continue;
 			}
-			/*
-			 * (setting: every copy of the chunk live, whether a snapshot sees
-			 * its move or not, a lane's and the index's alike: the one any
-			 * later snapshot counts is freed; not one inserted by a
-			 * transaction that aborted, nor the index's copy of a move that
-			 * aborted)
-			 */
-			if (TransactionIdIsValid(xid))
-			{
-				if (xmin_state(e, cur) != ENTRY_VISIBLE ||
-					(TransactionIdIsValid(e->xmax) && !(e->flags & CHUNK_ENTRY_XMAX_ABORTED) &&
-					 (TransactionIdIsCurrentTransactionId(e->xmax) ||
-					  TransactionIdIsInProgress(e->xmax) || TransactionIdDidCommit(e->xmax))) ||
-					(!lane && TransactionIdIsValid(e->merge_xid) &&
-					 !TransactionIdDidCommit(e->merge_xid)))
-					continue;
-			}
-			else if (!(TransactionIdIsValid(e->xmax) && TransactionIdIsCurrentTransactionId(e->xmax)))
-				continue;
 			START_CRIT_SECTION();
 			ipage_set_xmax(page, i, xid);
 			log_slot_change(rel, primary, cur, XLOG_CHUNK_INDEX_SET_XMAX, &xlrec);
@@ -3653,27 +3647,17 @@ rel_set_xmax(Relation rel, bool lane, const uint8 *hash, TransactionId xid, Snap
  * moving one, or another freeing one; how many set, in *nset
  */
 static bool
-lanes_set_xmax(Relation idx, const uint8 *hash, TransactionId xid, int *nset)
+lanes_set_xmax(Relation idx, const uint8 *hash, TransactionId xid,
+			   const ChunkIndexEntry *ids, int nids, int *nset)
 {
 	bool		ok = true;
-	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+	Relation   *lanes_;
+	int			nlanes_ = ChunkIndexLanesOpen(idx, RowExclusiveLock, &lanes_);
 
-	{
-		Relation   *lanes_;
-		int			nlanes_ = ChunkIndexLanesOpen(idx, RowExclusiveLock, &lanes_);
-
-		for (int l = 0; l < nlanes_; l++)
-		{
-			Relation	rel = lanes_[l];
-
-			if (rel == NULL)
-				continue;
-			ok = rel_set_xmax(rel, true, hash, xid, snap, nset) && ok;
-			}
-		ChunkIndexLanesClose(lanes_, nlanes_);
-	}
-	ok = rel_set_xmax(idx, false, hash, xid, snap, nset) && ok;
-	UnregisterSnapshot(snap);
+	for (int l = 0; l < nlanes_; l++)
+		ok = rel_set_xmax(lanes_[l], true, hash, xid, ids, nids, nset) && ok;
+	ChunkIndexLanesClose(lanes_, nlanes_);
+	ok = rel_set_xmax(idx, false, hash, xid, ids, nids, nset) && ok;
 	return ok;
 }
 
@@ -3695,6 +3679,8 @@ lane_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uin
 	LaneScan	s;
 	bool		there,
 				mine = false;
+	ChunkIndexEntry *ids;
+	int			nids;
 
 	if (log == NULL)
 		return page_free(idx, hash, held, out, copies);
@@ -3716,14 +3702,20 @@ lane_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uin
 		lanes_scan_free(&s);
 		return false;
 	}
+	nids = s.nchunks;
+	ids = palloc_array(ChunkIndexEntry, nids);
+	memcpy(ids, s.chunks, sizeof(ChunkIndexEntry) * nids);
 	lanes_scan_free(&s);
 	{
 		int			nset = 0;
+		bool		ok = lanes_set_xmax(idx, hash, GetCurrentTransactionId(), ids, nids, &nset);
+
+		pfree(ids);
 
 		/* (one set at least: none, and another freed it first) */
-		if (!lanes_set_xmax(idx, hash, GetCurrentTransactionId(), &nset) || nset == 0)
+		if (!ok || nset == 0)
 		{
-			(void) lanes_set_xmax(idx, hash, InvalidTransactionId, NULL);
+			(void) lanes_set_xmax(idx, hash, InvalidTransactionId, NULL, 0, NULL);
 			return false;
 		}
 	}
@@ -3734,7 +3726,7 @@ lane_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uin
 		if (there || TransactionIdIsValid(s.running))
 		{
 			lanes_scan_free(&s);
-			(void) lanes_set_xmax(idx, hash, InvalidTransactionId, NULL);
+			(void) lanes_set_xmax(idx, hash, InvalidTransactionId, NULL, 0, NULL);
 			return false;
 		}
 		lanes_scan_free(&s);
@@ -3884,10 +3876,7 @@ lane_move(Relation idx, const ChunkIndexEntry *seen, ChunkIndexEntry *moved,
 		return false;
 	if (changes_of(idx, &e))
 	{
-		Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
-
-		(void) rel_set_xmax(idx, false, seen->hash, InvalidTransactionId, snap, NULL);
-		UnregisterSnapshot(snap);
+		(void) rel_set_xmax(idx, false, seen->hash, InvalidTransactionId, NULL, 0, NULL);
 		return false;
 	}
 

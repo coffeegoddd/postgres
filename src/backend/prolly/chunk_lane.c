@@ -827,7 +827,8 @@ ChunkIndexLanesOpen(Relation idx, LOCKMODE lockmode, Relation **lanes_out)
 
 	if (nslots == 0)
 		nslots = slot_count();
-	named = palloc(sizeof(Oid) * nslots * LANES_PER_BACKEND);
+	/* (in the transaction's memory: not the caller's, which a scan leaves as it was) */
+	named = MemoryContextAlloc(TopTransactionContext, sizeof(Oid) * nslots * LANES_PER_BACKEND);
 	if (OidIsValid(log))
 	{
 		LWLockAcquire(ChunkLaneLock, LW_SHARED);
@@ -843,7 +844,7 @@ ChunkIndexLanesOpen(Relation idx, LOCKMODE lockmode, Relation **lanes_out)
 	AcceptInvalidationMessages();
 	map = lane_map(idx, true);
 	cap = map->n + nnamed + 1;
-	out = palloc(sizeof(Relation) * cap);
+	out = MemoryContextAlloc(TopTransactionContext, sizeof(Relation) * cap);
 	for (uint32 l = 0; l < map->n; l++)
 	{
 		Relation	rel = ChunkIndexLaneOpen(idx, l, lockmode);

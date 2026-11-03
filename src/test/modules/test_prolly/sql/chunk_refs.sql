@@ -58,13 +58,13 @@ SELECT ok, chunks, unheld, why FROM test_chunk_check('rl', 'ri');
 
 -- VACUUM adds every change into its chunk's entry: the counts the same,
 -- nothing left unfrozen, the audit still agreeing.  (The entries are in
--- the writer's lane: one VACUUM moves them into the index, in its own
--- transaction, and the next adds them up, once every snapshot sees the
--- move.  An insert leaves an aborted entry of its chunk in a lane for
--- VACUUM, where the index's own pages lose it to the insert.)
+-- the writer's lane: its freer moves them into the index, here the test's
+-- merge, and VACUUM adds them up once every snapshot sees the move.  An
+-- insert leaves an aborted entry of its chunk in a lane for VACUUM, where
+-- the index's own pages lose it to the insert.)
 SELECT test_chunk_ref_root('ri', h(node('q', '\x61', '\x61'))) IS NOT NULL AS q_rooted;
 SELECT entries AS entries_before FROM test_chunk_index_shape('ri');
-VACUUM ri;
+SELECT test_chunk_index_merge('ri') >= 0 AS merged;
 VACUUM ri;
 SELECT entries AS entries_after, test_chunk_index_unfrozen('ri') AS unfrozen
 FROM test_chunk_index_shape('ri');
@@ -98,7 +98,7 @@ FROM generate_series(1, 3000) g;
 SELECT buckets > :buckets_before AS split, (counts('\x62')).roots AS b_roots
 FROM test_chunk_index_shape('ri');
 SELECT ok, why FROM test_chunk_check('rl', 'ri');
-VACUUM ri;
+SELECT test_chunk_index_merge('ri') >= 0 AS merged;
 VACUUM ri;
 SELECT (counts('\x62')).roots AS b_roots, test_chunk_index_unfrozen('ri') AS unfrozen;
 SELECT ok, why FROM test_chunk_check('rl', 'ri');

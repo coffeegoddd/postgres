@@ -288,9 +288,15 @@ SELECT txid_current() IS NOT NULL AS advanced_xid;
  t
 (1 row)
 
-VACUUM ci3;
--- (one VACUUM moves the lane's entries in, in its own transaction; the
--- next takes the lane's copies out, the move seen by every snapshot)
+-- (the lane's entries moved in, as the freer moves them, here the test's
+-- merge; VACUUM takes the lane's copies out, the move seen by every
+-- snapshot)
+SELECT test_chunk_index_merge('ci3') >= 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
 VACUUM ci3;
 SELECT entries AS after_vacuum, test_chunk_index_unfrozen('ci3') AS unfrozen_after
 FROM test_chunk_index_shape('ci3');

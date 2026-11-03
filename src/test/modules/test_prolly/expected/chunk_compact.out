@@ -35,10 +35,15 @@ SELECT sum(test_chunk_free('cl', 'ci', h(blob('a' || g)))) AS freed FROM generat
   1000
 (1 row)
 
--- (the entries moved from the writer's lane into the index by one VACUUM,
--- their counts added up by the next: a chunk is compacted once all its
--- counts are in its entry)
-VACUUM ci;
+-- (the entries moved from the writer's lane into the index, as the freer
+-- moves them, here the test's merge; their counts added up by VACUUM: a
+-- chunk is compacted once all its counts are in its entry)
+SELECT test_chunk_index_merge('ci') >= 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
 VACUUM ci;
 SELECT segments, free, compactable, worth, evacuable, grow FROM test_chunk_log_segments('cl', 0.4);
  segments | free | compactable | worth | evacuable | grow 
@@ -231,6 +236,12 @@ SELECT test_chunk_log_let_go('cl3');
  test_chunk_log_let_go 
 -----------------------
  
+(1 row)
+
+SELECT test_chunk_index_merge('ci3') >= 0 AS merged;
+ merged 
+--------
+ t
 (1 row)
 
 VACUUM ci3;
