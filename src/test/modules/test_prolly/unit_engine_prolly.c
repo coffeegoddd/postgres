@@ -15,6 +15,7 @@
 
 #include "engine_test_util.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 
 
 /* ------------------------------------------------------------------ model */
@@ -130,10 +131,20 @@ ENGINE_TEST(test_sha256_vectors)
 		uint8		out[32];
 		char		hex[65];
 
-		sha256(vec[i].in, strlen(vec[i].in), out);
+		px_sha256(vec[i].in, strlen(vec[i].in), out);
 		for (int j = 0; j < 32; j++)
 			snprintf(hex + j * 2, 3, "%02x", out[j]);
 		CHECK(strcmp(hex, vec[i].hex) == 0);
+	}
+
+	/* a chunk's name: the first 20 bytes of the SHA-256 of its bytes */
+	{
+		PHash		h;
+		char		hex[PHASH_HEX_LEN + 1];
+
+		phash_compute("abc", 3, &h);
+		phash_hex(&h, hex);
+		CHECK_STR_EQ(hex, "ba7816bf8f01cfea414140de5dae2223b00361a3");
 	}
 }
 
@@ -907,8 +918,10 @@ ENGINE_TEST(test_structural_sharing)
 {
 	ChunkStore *cs = memstore_create();
 	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	/* (the store's bytes before: "pages" may hold others' chunks) */
+	uint64		before = store_bytes(cs);
 	PHash		root = build_even_rows(&ctx, 200000);
-	uint64	base_bytes = store_bytes(cs);
+	uint64		base_bytes = store_bytes(cs) - before;
 	uint64	h = (uint64) t_height(&ctx, &root);
 	EditBatch	b;
 
@@ -923,9 +936,134 @@ ENGINE_TEST(test_structural_sharing)
 		CHECK_LE(STATS_DELTA(cs, s, stored), 3 * 10 * h);
 	}
 	/* 100 versions cost a few full copies' worth, not 100 */
-	CHECK_LE(store_bytes(cs) - base_bytes, base_bytes * 5);
+	CHECK_LE(store_bytes(cs) - before - base_bytes, base_bytes * 5);
 	batch_free(&b);
 	prolly_ctx_free(&ctx);
+	cs_destroy(cs);
+}
+
+
+/* (the bytes a context's chunks in use take: its space, but its free space) */
+static Size
+context_used(MemoryContext cxt)
+{
+	MemoryContextCounters c;
+
+	MemoryContextMemConsumed(cxt, &c);
+	return c.totalspace - c.freespace;
+}
+
+/*
+ * A merge frees what it copied (its diffs' keys and values, and its
+ * conflicts' once its result is freed): merges one after another in one
+ * context take no more memory than the first.
+ */
+ENGINE_TEST(test_merge_frees_its_copies)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &small_policy);
+	PHash		base = build_even_rows(&ctx, 5000);
+	EditBatch	ob,
+				tb;
+	PHash		ours,
+				theirs;
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "merges",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
+	Size		first = 0;
+
+	batch_init(&ob, 2000);
+	batch_init(&tb, 2000);
+	for (uint64 k = 0; k < 2000; k++)
+	{
+		batch_put(&ob, k * 2, 1);
+		/* (the first 100 conflicts, both sides changing them differently) */
+		batch_put(&tb, k < 100 ? k * 2 : k * 2 + 4000, 2);
+	}
+	ours = t_apply(&ctx, &base, ob.e, ob.n);
+	theirs = t_apply(&ctx, &base, tb.e, tb.n);
+	old = MemoryContextSwitchTo(cxt);
+	for (int round = 0; round < 5; round++)
+	{
+		ProllyMergeResult mr;
+
+		CHECK_OK(prolly_merge(&ctx, &base, &ours, &theirs, &mr));
+		CHECK_EQ(mr.nconflicts, 100);
+		prolly_merge_result_free(&mr);
+		if (round == 0)
+			first = context_used(cxt);
+		else
+			CHECK_LE(context_used(cxt), first);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	batch_free(&ob);
+	batch_free(&tb);
+	cs_destroy(cs);
+}
+
+/*
+ * An iterator reads its nodes in the context it was opened in: a caller
+ * resetting its own context between calls (a scan's per-row context) frees
+ * none the cursor holds.
+ */
+ENGINE_TEST(test_iter_across_context_resets)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &small_policy);
+	PHash		root = build_even_rows(&ctx, 5000);
+	ProllyIter *it = t_iter(&ctx, &root, NULL, 0);
+	MemoryContext row = AllocSetContextCreate(CurrentMemoryContext, "row",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
+	const uint8 *k,
+			   *v;
+	size_t		kl,
+				vl;
+	uint64		n = 0;
+
+	for (;;)
+	{
+		bool		more;
+
+		old = MemoryContextSwitchTo(row);
+		more = t_next(it, &k, &kl, &v, &vl);
+		MemoryContextSwitchTo(old);
+		if (!more)
+			break;
+		CHECK_EQ(get_u64(k), n * 2);
+		CHECK_EQ(get_u64(v), n * 2);
+		n++;
+		MemoryContextReset(row);
+	}
+	CHECK_EQ(n, 5000);
+	prolly_iter_close(it);
+	MemoryContextDelete(row);
+	cs_destroy(cs);
+}
+
+/*
+ * A delta naming more edits than its bytes could hold (two bytes each at
+ * least) is no delta: refused as one, without allocating for its count.
+ */
+ENGINE_TEST(test_corrupt_delta_count)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &small_policy);
+	PHash		base = build_even_rows(&ctx, 10);
+	Buf			b = BUF_INIT;
+	PHash		delta,
+				out;
+
+	buf_append_byte(&b, CHUNK_TAG_DELTA);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	buf_append(&b, base.b, PHASH_LEN);
+	buf_append(&b, base.b, PHASH_LEN);
+	buf_append_uvarint(&b, UINT64CONST(1) << 40);
+	CHECK_OK(prolly_put_chunk(&ctx, b.data, b.len, &delta));
+	CHECK_EQ(prolly_delta_apply(&ctx, &delta, &out), PROLLY_ERR_BAD_DELTA);
+	CHECK(ctx.err_has_hash && phash_eq(&ctx.err_hash, &delta));
+	buf_free(&b);
 	cs_destroy(cs);
 }
 
@@ -942,6 +1080,9 @@ static const ProllyUnitTest tests[] = {
 	{"merge_grafts", test_merge_grafts},
 	{"structural_sharing", test_structural_sharing},
 	{"scaling", test_scaling},
+	{"merge_frees_its_copies", test_merge_frees_its_copies},
+	{"iter_across_context_resets", test_iter_across_context_resets},
+	{"corrupt_delta_count", test_corrupt_delta_count},
 };
 
 const ProllyUnitSuite unit_engine_prolly_suite = {"engine_prolly", tests, lengthof(tests)};
@@ -953,7 +1094,7 @@ PG_FUNCTION_INFO_V1(test_engine_build_finished);
 static bool build_finished = false;
 
 /*
- * test_engine_build(rows int8) returns int8: a map of rows rows built on
+ * test_engine_build(rows int8, cancel bool) returns int8: a map of rows rows built on
  * this backend's memory store (emptied first, and after), and rows; for a
  * cancel of a long build: test_engine_build_finished() says whether the
  * last one ran to its end (a cancel raised only after it, by the executor,
@@ -975,6 +1116,16 @@ test_engine_build(PG_FUNCTION_ARGS)
 
 		build_finished = false;
 		engine_test_store = "memory";
+
+		/*
+		 * (cancelled, if asked, at the build's first check for interrupts,
+		 * however fast it runs: its own statement's cancel, as a user's)
+		 */
+		if (PG_GETARG_BOOL(1))
+		{
+			QueryCancelPending = true;
+			InterruptPending = true;
+		}
 		cs = memstore_create();
 		ctx = t_ctx(cs, &prolly_default_policy);
 		root = build_even_rows(&ctx, (uint64) rows);

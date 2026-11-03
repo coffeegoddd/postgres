@@ -16,7 +16,7 @@
 #include "prolly/engine/phash.h"
 
 void
-sha256(const void *data, size_t len, uint8 out[32])
+px_sha256(const void *data, size_t len, uint8 out[32])
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
 

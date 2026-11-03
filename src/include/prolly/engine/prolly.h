@@ -53,6 +53,7 @@
 #define PROLLY_NOT_FOUND 1
 #define PROLLY_ERR_MISSING (-1)	/* a chunk not in the store */
 #define PROLLY_ERR_CORRUPT (-2)	/* bytes not a node, or not of this tree */
+#define PROLLY_ERR_BAD_DELTA (-3)	/* bytes not a delta, or not of its trees */
 
 extern const ChunkPolicy prolly_default_policy;
 
@@ -61,6 +62,7 @@ typedef struct ProllyCtx
 	ChunkStore *cs;
 	ChunkPolicy policy;			/* for trees built from scratch */
 	int			err;
+	bool		err_has_hash;	/* a chunk at fault, err_hash */
 	PHash		err_hash;
 } ProllyCtx;
 
@@ -131,7 +133,7 @@ extern void prolly_ctx_free(ProllyCtx *ctx);
 /* The context's error (ctx->err, at ctx->err_hash) raised. */
 pg_noreturn extern void prolly_report(ProllyCtx *ctx);
 
-/* Stores a chunk of any kind, pinned like the trees an operation writes. */
+/* Stores a chunk of any kind, held like the trees an operation writes. */
 extern int	prolly_put_chunk(ProllyCtx *ctx, const uint8 *data, size_t len,
 							 PHash *out);
 

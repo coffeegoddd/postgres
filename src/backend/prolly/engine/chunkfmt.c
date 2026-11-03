@@ -14,13 +14,13 @@
 #include "prolly/engine/chunkfmt.h"
 
 bool
-policy_valid(const ChunkPolicy *p)
+engine_policy_valid(const ChunkPolicy *p)
 {
 	return p->min_bytes < p->target_bytes && p->target_bytes <= p->max_bytes;
 }
 
 bool
-node_header_parse(const uint8 *data, size_t len, NodeHeader *h)
+engine_node_header_parse(const uint8 *data, size_t len, NodeHeader *h)
 {
 	const uint8 *p = data;
 	const uint8 *end = data + len;
@@ -36,7 +36,7 @@ node_header_parse(const uint8 *data, size_t len, NodeHeader *h)
 	h->policy.min_bytes = (uint32) v[0];
 	h->policy.target_bytes = (uint32) v[1];
 	h->policy.max_bytes = (uint32) v[2];
-	if (!policy_valid(&h->policy) || end - p < 2)
+	if (!engine_policy_valid(&h->policy) || end - p < 2)
 		return false;
 	h->level = p[0];
 	h->vrefs = p[1];
@@ -50,7 +50,7 @@ node_header_parse(const uint8 *data, size_t len, NodeHeader *h)
 }
 
 void
-node_header_write(Buf *b, const ChunkPolicy *p, int level, uint8 vrefs,
+engine_node_header_write(Buf *b, const ChunkPolicy *p, int level, uint8 vrefs,
 				  uint32 count)
 {
 	buf_append_byte(b, CHUNK_TAG_NODE);
@@ -79,7 +79,7 @@ node_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 	NodeHeader	h;
 	const uint8 *p;
 
-	if (!node_header_parse(data, len, &h))
+	if (!engine_node_header_parse(data, len, &h))
 		return false;
 	p = h.items;
 	for (uint32 i = 0; i < h.count; i++)
@@ -245,7 +245,7 @@ image_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 }
 
 bool
-chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
+engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 {
 	if (len < 2 || data[1] != CHUNK_FORMAT_VERSION)
 		return false;
@@ -292,7 +292,7 @@ engine_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
 {
 	StrongRefs	s = {fn, arg};
 
-	if (!chunk_refs(data, len, strong_ref, &s))
+	if (!engine_chunk_refs(data, len, strong_ref, &s))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("a chunk of %zu bytes is no chunk of the engine's formats", len)));

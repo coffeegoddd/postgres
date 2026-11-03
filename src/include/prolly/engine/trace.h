@@ -22,13 +22,17 @@
 #include "portability/instr_time.h"
 #include "utils/elog.h"
 
-extern PGDLLIMPORT int trace_depth;
+extern PGDLLIMPORT int prolly_trace_depth;
+
+/* (the depth reset to 0 as each transaction ends: an error skips ends) */
+extern void prolly_trace_started(void);
 
 typedef struct TraceSpan
 {
 	const char *name;
 	instr_time	t0;
 	bool		on;
+	int			depth;			/* the depth before it */
 } TraceSpan;
 
 static inline TraceSpan
@@ -38,8 +42,9 @@ trace_begin(const char *name)
 
 	if (s.on)
 	{
+		prolly_trace_started();
 		INSTR_TIME_SET_CURRENT(s.t0);
-		trace_depth++;
+		s.depth = prolly_trace_depth++;
 	}
 	return s;
 }
@@ -54,10 +59,10 @@ trace_begin(const char *name)
 			char		detail_[256]; \
 			INSTR_TIME_SET_CURRENT(now_); \
 			INSTR_TIME_SUBTRACT(now_, s_->t0); \
-			trace_depth--; \
+			prolly_trace_depth = s_->depth; \
 			snprintf(detail_, sizeof(detail_), " " __VA_ARGS__); \
-			elog(DEBUG2, "trace %*s%-*s %9.4f s%s", trace_depth * 2, "", \
-				 32 - trace_depth * 2, s_->name, INSTR_TIME_GET_DOUBLE(now_), \
+			elog(DEBUG2, "trace %*s%-*s %9.4f s%s", prolly_trace_depth * 2, "", \
+				 32 - prolly_trace_depth * 2, s_->name, INSTR_TIME_GET_DOUBLE(now_), \
 				 detail_); \
 		} \
 	} while (0)

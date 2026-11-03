@@ -12,11 +12,30 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "prolly/engine/prolly.h"
 #include "prolly/engine/trace.h"
 
-int			trace_depth = 0;
+int			prolly_trace_depth = 0;
+
+static void
+trace_reset(XactEvent event, void *arg)
+{
+	prolly_trace_depth = 0;
+}
+
+void
+prolly_trace_started(void)
+{
+	static bool registered = false;
+
+	if (!registered)
+	{
+		RegisterXactCallback(trace_reset, NULL);
+		registered = true;
+	}
+}
 
 #define REF_VAL_MAX (PHASH_LEN + 10)
 
@@ -39,8 +58,11 @@ static int
 fail(ProllyCtx *ctx, int err, const PHash *h)
 {
 	ctx->err = err;
+	ctx->err_has_hash = h != NULL;
 	if (h)
 		ctx->err_hash = *h;
+	else
+		memset(&ctx->err_hash, 0, sizeof(ctx->err_hash));
 	return err;
 }
 
@@ -50,10 +72,18 @@ prolly_report(ProllyCtx *ctx)
 	char		hex[PHASH_HEX_LEN + 1];
 
 	phash_hex(&ctx->err_hash, hex);
+	if (!ctx->err_has_hash)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a leaf's value holds fewer chunk references than its tree's nodes say")));
 	if (ctx->err == PROLLY_ERR_MISSING)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("chunk %s of a tree is not in the store", hex)));
+	if (ctx->err == PROLLY_ERR_BAD_DELTA)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk %s is not a delta of the trees it names", hex)));
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
 			 errmsg("chunk %s is not a node of the tree read", hex)));
@@ -122,7 +152,7 @@ node_decode(const PHash *h, const uint8 *data, size_t len)
 	PNode	   *n;
 	char	   *mem;
 
-	if (!node_header_parse(data, len, &hdr) || hdr.level >= PROLLY_MAX_HEIGHT)
+	if (!engine_node_header_parse(data, len, &hdr) || hdr.level >= PROLLY_MAX_HEIGHT)
 		return NULL;
 	mem = px_malloc(sizeof(PNode) +
 					hdr.count * (2 * sizeof(const uint8 *) + 2 * sizeof(uint32)));
@@ -363,7 +393,7 @@ write_node(ProllyCtx *ctx, Buf *scratch, const TreeShape *shape, int level,
 		   uint32 nitems, const uint8 *items, size_t ilen, PHash *out)
 {
 	scratch->len = 0;
-	node_header_write(scratch, &shape->policy, level, shape->vrefs, nitems);
+	engine_node_header_write(scratch, &shape->policy, level, shape->vrefs, nitems);
 	buf_append(scratch, items, ilen);
 	return prolly_put_chunk(ctx, scratch->data, scratch->len, out);
 }
@@ -745,6 +775,7 @@ struct ProllyIter
 {
 	Cursor		c;
 	int			err;
+	MemoryContext cxt;			/* opened in: its nodes are read into it */
 	Buf			key;			/* the item returned last, its own copy: the */
 	Buf			val;			/* cursor frees a leaf as it leaves it */
 };
@@ -758,6 +789,7 @@ prolly_iter_open(ProllyCtx *ctx, const PHash *root, const uint8 *start,
 
 	it->key = (Buf) BUF_INIT;
 	it->val = (Buf) BUF_INIT;
+	it->cxt = CurrentMemoryContext;
 	rc = cursor_seek(&it->c, ctx, root, 0, start, slen);
 
 	if (rc == PROLLY_OK && !it->c.end && it->c.i[0] >= it->c.n[0]->count)
@@ -782,12 +814,20 @@ prolly_iter_next(ProllyIter *it, const uint8 **key, size_t *klen,
 {
 	Cursor	   *c = &it->c;
 	PNode	   *n;
-	uint32	i;
+	uint32		i;
+	MemoryContext caller;
 
 	if (it->err != PROLLY_OK)
 		return it->err;
 	if (c->end)
 		return 0;
+
+	/*
+	 * (the nodes the cursor reads, and the item's copy, in the context the
+	 * iterator was opened in: a caller's context reset between calls would
+	 * free a node the cursor holds)
+	 */
+	caller = MemoryContextSwitchTo(it->cxt);
 	n = c->n[0];
 	i = c->i[0];
 
@@ -804,15 +844,19 @@ prolly_iter_next(ProllyIter *it, const uint8 **key, size_t *klen,
 	*val = it->val.data;
 	*vlen = n->vl[i];
 	it->err = cursor_next_item(c);
+	MemoryContextSwitchTo(caller);
 	return 1;
 }
 
 void
 prolly_iter_close(ProllyIter *it)
 {
+	MemoryContext caller = MemoryContextSwitchTo(it->cxt);
+
 	cursor_close(&it->c);
 	buf_free(&it->key);
 	buf_free(&it->val);
+	MemoryContextSwitchTo(caller);
 	px_free(it);
 }
 
@@ -1525,6 +1569,12 @@ prolly_diff_collect(ProllyCtx *ctx, const PHash *from, const PHash *to,
 void
 prolly_diff_list_free(ProllyDiffList *l)
 {
+	for (size_t i = 0; i < l->n; i++)
+	{
+		px_free((void *) l->v[i].key);
+		px_free((void *) l->v[i].from);
+		px_free((void *) l->v[i].to);
+	}
 	px_free(l->v);
 	memset(l, 0, sizeof(*l));
 }
@@ -1652,13 +1702,14 @@ prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 			px_grow((void **) &out->conflicts, &conflict_cap,
 					out->nconflicts + 1, sizeof(ProllyConflict));
 			c = &out->conflicts[out->nconflicts++];
-			c->key = t->key;
+			/* (copies, the result's: the diffs are freed as the merge ends) */
+			c->key = px_memdup(t->key, t->klen);
 			c->klen = t->klen;
-			c->base = t->from;
+			c->base = t->from ? px_memdup(t->from, t->flen) : NULL;
 			c->blen = t->flen;
-			c->ours = o->to;
+			c->ours = o->to ? px_memdup(o->to, o->tlen) : NULL;
 			c->olen = o->tlen;
-			c->theirs = t->to;
+			c->theirs = t->to ? px_memdup(t->to, t->tlen) : NULL;
 			c->tlen = t->tlen;
 		}
 		if (cmp == 0)
@@ -1691,6 +1742,13 @@ prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 void
 prolly_merge_result_free(ProllyMergeResult *r)
 {
+	for (size_t i = 0; i < r->nconflicts; i++)
+	{
+		px_free((void *) r->conflicts[i].key);
+		px_free((void *) r->conflicts[i].base);
+		px_free((void *) r->conflicts[i].ours);
+		px_free((void *) r->conflicts[i].theirs);
+	}
 	px_free(r->conflicts);
 	r->conflicts = NULL;
 	r->nconflicts = 0;
@@ -1770,7 +1828,8 @@ prolly_delta_apply(ProllyCtx *ctx, const PHash *delta, PHash *out)
 	memcpy(base.b, p, PHASH_LEN);
 	memcpy(target.b, p + PHASH_LEN, PHASH_LEN);
 	p += 2 * PHASH_LEN;
-	if (!read_uvarint(&p, end, &n) || n > len)
+	/* (an edit is two bytes at least: its op and its key's length) */
+	if (!read_uvarint(&p, end, &n) || n > (uint64) (end - p) / 2)
 		goto bad;
 	edits = px_malloc(n * sizeof(ProllyEdit));
 	for (uint64 i = 0; i < n; i++)
@@ -1805,11 +1864,11 @@ prolly_delta_apply(ProllyCtx *ctx, const PHash *delta, PHash *out)
 		return rc;
 	/* the rebuilt tree must be the very tree the delta was taken against */
 	if (!phash_eq(&got, &target))
-		return fail(ctx, PROLLY_ERR_CORRUPT, &target);
+		return fail(ctx, PROLLY_ERR_BAD_DELTA, delta);
 	*out = got;
 	return PROLLY_OK;
 bad:
 	px_free(edits);
 	px_free(d);
-	return fail(ctx, PROLLY_ERR_CORRUPT, delta);
+	return fail(ctx, PROLLY_ERR_BAD_DELTA, delta);
 }

@@ -8,7 +8,7 @@
  * reference is either strong (the target must be kept, and must exist
  * before the chunk naming it is stored) or weak (a link only, such as a
  * commit's parents).  Storage lifetime, sync and repair walk chunks only
- * through chunk_refs, so they need no knowledge of what a chunk means.
+ * through engine_chunk_refs, so they need no knowledge of what a chunk means.
  *
  * Node:	tag, version, uvarint min/target/max chunk bytes, level,
  *			vrefs, uvarint count, items (uvarint klen, key, uvarint vlen, value)
@@ -87,15 +87,15 @@ typedef struct NodeHeader
 	const uint8 *end;
 } NodeHeader;
 
-extern bool policy_valid(const ChunkPolicy *p);
-extern bool node_header_parse(const uint8 *data, size_t len, NodeHeader *h);
-extern void node_header_write(Buf *b, const ChunkPolicy *p, int level,
+extern bool engine_policy_valid(const ChunkPolicy *p);
+extern bool engine_node_header_parse(const uint8 *data, size_t len, NodeHeader *h);
+extern void engine_node_header_write(Buf *b, const ChunkPolicy *p, int level,
 							  uint8 vrefs, uint32 count);
 
 typedef void (*EngineRefFn) (void *arg, const PHash *h, bool strong);
 
 /* Reports every reference in the chunk; false if the bytes do not parse. */
-extern bool chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg);
+extern bool engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg);
 
 /* These formats as a store's ChunkFormat: the strong references. */
 extern PGDLLIMPORT const ChunkFormatRoutine EngineChunkFormat;

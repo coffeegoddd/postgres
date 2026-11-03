@@ -389,7 +389,7 @@ closure(ChunkStore *cs, const PHash *h, PHashMap *set)
 		return;
 	d = cs->routine->get(cs, h->b, &len);
 	CHECK(d != NULL);
-	CHECK(chunk_refs(d, len, node_walk_fn, &w));
+	CHECK(engine_chunk_refs(d, len, node_walk_fn, &w));
 	pfree(d);
 }
 

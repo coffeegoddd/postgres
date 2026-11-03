@@ -28,7 +28,7 @@ typedef struct PHash
 StaticAssertDecl(sizeof(PHash) == PHASH_LEN, "a PHash is its bytes");
 
 /* The full SHA-256 of the bytes (pg_cryptohash). */
-extern void sha256(const void *data, size_t len, uint8 out[32]);
+extern void px_sha256(const void *data, size_t len, uint8 out[32]);
 extern void phash_compute(const void *data, size_t len, PHash *out);
 extern void phash_hex(const PHash *h, char out[PHASH_HEX_LEN + 1]);
 

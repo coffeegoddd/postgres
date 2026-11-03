@@ -46,7 +46,10 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_prolly | merge_grafts                   | ok     | 
  engine_prolly | structural_sharing             | ok     | 
  engine_prolly | scaling                        | ok     | 
-(34 rows)
+ engine_prolly | merge_frees_its_copies         | ok     | 
+ engine_prolly | iter_across_context_resets     | ok     | 
+ engine_prolly | corrupt_delta_count            | ok     | 
+(37 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
@@ -70,17 +73,15 @@ SELECT count(*) AS failures FROM test_prolly_unit_tests() WHERE result <> 'ok';
 SELECT * FROM test_prolly_unit_tests('no_such_suite');
 ERROR:  unit test suite "no_such_suite" does not exist
 -- the engine's long operations check for interrupts: a build of many rows,
--- cancelled by a statement timeout
-SELECT test_engine_build(1000), test_engine_build_finished();
+-- cancelled as it begins, cut short (not run to its end)
+SELECT test_engine_build(1000, false), test_engine_build_finished();
  test_engine_build | test_engine_build_finished 
 -------------------+----------------------------
               1000 | t
 (1 row)
 
-SET statement_timeout = '100ms';
-SELECT test_engine_build(3000000);
-ERROR:  canceling statement due to statement timeout
-RESET statement_timeout;
+SELECT test_engine_build(100000, true);
+ERROR:  canceling statement due to user request
 SELECT test_engine_build_finished();
  test_engine_build_finished 
 ----------------------------
