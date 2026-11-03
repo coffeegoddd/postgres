@@ -123,12 +123,13 @@ typedef struct PNode
 
 /*
  * The nodes an operation loads, kept parsed for the rest of it, up to
- * ctx->memo_bytes of their chunks: an operation that reads a node again (a
- * merge reads base in both its diffs, and ours' paths once a graft level)
- * finds it here.  Chunks are immutable and the operation holds those it
- * reads, so none kept is ever stale.  Once full, the nodes loaded after are
- * not kept: those loaded first, the upper levels and the paths walked
- * again, are the ones read again.
+ * ctx->memo_bytes of memory (a node's chunk, its parsed arrays and its
+ * place in the memo): an operation that reads a node again (a merge reads
+ * base in both its diffs, and ours' paths once a graft level) finds it
+ * here.  Chunks are immutable and the operation holds those it reads, so
+ * none kept is ever stale.  A node that would take the memo past its bytes
+ * is not kept, so it fills with those loaded first, the upper levels and
+ * the paths walked again: the ones read again.
  */
 struct NodeMemo
 {
@@ -136,8 +137,17 @@ struct NodeMemo
 	struct PNode **nodes;
 	size_t		n,
 				cap;
-	size_t		used;			/* bytes of the nodes' chunks */
+	size_t		used;			/* bytes the nodes kept take */
 };
+
+/* What keeping a node of len bytes takes: its chunk, its arrays, its place. */
+static size_t
+memo_cost(const PNode *n, uint32 len)
+{
+	return len + sizeof(PNode) +
+		n->count * (2 * sizeof(const uint8 *) + 2 * sizeof(uint32)) +
+		sizeof(PNode *) + PHASH_LEN + sizeof(uint64);
+}
 
 static bool
 ref_decode(const uint8 *v, size_t vl, PHash *h, uint64 *total)
@@ -251,7 +261,7 @@ node_load(ProllyCtx *ctx, const PHash *h)
 		return NULL;
 	}
 	n->bytes = data;
-	if (ctx->memo != NULL && ctx->memo->used + len <= ctx->memo_bytes)
+	if (ctx->memo != NULL && ctx->memo->used + memo_cost(n, len) <= ctx->memo_bytes)
 	{
 		NodeMemo   *m = ctx->memo;
 		bool		created;
@@ -259,7 +269,7 @@ node_load(ProllyCtx *ctx, const PHash *h)
 		px_grow((void **) &m->nodes, &m->cap, m->n + 1, sizeof(PNode *));
 		m->nodes[m->n++] = n;
 		*phmap_ref(&m->map, h, &created) = m->n;
-		m->used += len;
+		m->used += memo_cost(n, len);
 		n->memo = true;
 	}
 	return n;

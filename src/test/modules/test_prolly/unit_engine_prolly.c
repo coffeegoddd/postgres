@@ -736,12 +736,33 @@ memo_merge(ProllyCtx *ctx, size_t memo_bytes, const PHash *base, const PHash *ou
 	return STATS_DELTA(ctx->cs, st, gets);
 }
 
+typedef struct MemoArgs
+{
+	ProllyCtx  *ctx;
+	const PHash *base,
+			   *ours,
+			   *theirs;
+} MemoArgs;
+
+/* (a merge cancelled at its first check for interrupts, its memo begun) */
+static void
+cancelled_merge(void *arg)
+{
+	MemoArgs   *a = arg;
+	ProllyMergeResult mr;
+
+	QueryCancelPending = true;
+	InterruptPending = true;
+	(void) prolly_merge(a->ctx, a->base, a->ours, a->theirs, &mr);
+}
+
 /*
  * A merge keeps the nodes it loads for the rest of it, up to its memo's
  * bytes: it reads base in both its diffs and ours' paths again as it
  * applies, and with the memo asks the store for a node once.  The result is
  * the same with any memo; a small one keeps the first nodes loaded, and is
- * worth some of it; and the memo goes with the merge, an error's too.
+ * worth some of it; and the memo goes with the merge, one that fails or is
+ * cancelled too.
  */
 ENGINE_TEST(test_merge_memo)
 {
@@ -777,6 +798,18 @@ ENGINE_TEST(test_merge_memo)
 	CHECK_LE(gets_all * 2, gets_none);
 	CHECK_LT(gets_all, gets_some);
 	CHECK_LT(gets_some, gets_none);
+
+	/* cancelled as it reads: no memo left on the context, which merges again */
+	{
+		MemoArgs	a = {&ctx, &base, &ours, &theirs};
+		PHash		again;
+
+		ctx.memo_bytes = 64 * 1024 * 1024;
+		expect_error(cancelled_merge, &a, ERRCODE_QUERY_CANCELED, NULL);
+		CHECK(ctx.memo == NULL);
+		(void) memo_merge(&ctx, 64 * 1024 * 1024, &base, &ours, &theirs, &again);
+		CHECK(phash_eq(&again, &none));
+	}
 
 	/* a merge that fails (a node of theirs gone) leaves no memo behind */
 	if (cs->routine == &MemoryChunkStore)
