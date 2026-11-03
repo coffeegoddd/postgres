@@ -43,28 +43,22 @@ my $commits = sub {
 		qq{SELECT cardinality(string_to_array(test_vc_log('$branch'), ' '))});
 };
 
-# the lanes made: as many backends as below commit once each first
-$node->pgbench(
-	'--no-vacuum --client=16 --jobs=4 --transactions=1',
-	0,
-	[qr{processed: 16/16}],
-	[qr{^$}],
-	'sixteen backends make their lanes',
-	{
-		'077_lanes' => q{
-SELECT test_vc_commit('b' || (:client_id + 1), 'b' || (:client_id + 1) || '-lane');
-}
-	});
-
-# (its backends gone, their lanes let go of as they exit: none made below)
+# the lanes made: as many backends as below, each commit holding its lane
+# while the others make theirs (a backend keeps its lane while it lives)
+my @makers = map { $node->background_psql('postgres') } 1 .. 16;
+$makers[ $_ - 1 ]->query_safe(qq{SELECT test_vc_commit('b$_', 'b$_-lane')}) for 1 .. 16;
+$_->quit for @makers;
+# (gone, their lanes let go of as they exit: none made below)
 $node->poll_query_until('postgres',
-	q{SELECT count(*) = 0 FROM pg_stat_activity WHERE application_name = 'pgbench'})
+	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'client backend'})
   or die "the backends that made the lanes did not exit";
 my $lanes = sub {
 	return $node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_class WHERE relname ~ '_lane_[0-9]+$'});
 };
 my $lanes_made = $lanes->();
+# (sixteen lanes: the log is the first, the rest relations of their own)
+is($lanes_made, 15, 'sixteen backends at once made sixteen lanes');
 
 # sixteen backends, a branch each: none waits for another's transaction
 my $log_at = -s $node->logfile;
