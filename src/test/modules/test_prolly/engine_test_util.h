@@ -6,8 +6,9 @@
  *	  prototype engine's tests' helpers, on the server's).
  *
  * A test runs on this backend's memory store, emptied first, and then on
- * the history store ("pages") in a subtransaction rolled back after it,
- * its chunks of the engine's formats (ENGINE_TEST sets the format for the
+ * the history store ("pages") in a subtransaction rolled back after it
+ * (ENGINE_TEST), or on the memory store alone (ENGINE_MEMORY_TEST),
+ * its chunks of the engine's formats (each sets the format for the
  * test, and puts back the one before, whatever the test does).
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -45,6 +46,29 @@ cs_destroy(ChunkStore *cs)
 		MemoryChunkStoreReset();
 }
 
+/* A test's own memory stores, destroyed as it ends, however it ends. */
+#define ENGINE_TEST_MAX_STORES 4
+static ChunkStore *engine_test_stores[ENGINE_TEST_MAX_STORES];
+static int	engine_test_nstores = 0;
+
+/* A memory store of the test's own, beside the backend's (one to copy from). */
+static inline ChunkStore *
+memstore_create_own(void)
+{
+	if (engine_test_nstores == ENGINE_TEST_MAX_STORES)
+		elog(ERROR, "a test makes at most %d stores of its own",
+			 ENGINE_TEST_MAX_STORES);
+	engine_test_stores[engine_test_nstores] = MemoryChunkStoreCreate();
+	return engine_test_stores[engine_test_nstores++];
+}
+
+static inline void
+engine_test_destroy_stores(void)
+{
+	while (engine_test_nstores > 0)
+		MemoryChunkStoreDestroy(engine_test_stores[--engine_test_nstores]);
+}
+
 /*
  * Runs body on the store named, with the engine's chunk format; on "pages"
  * in a subtransaction of its own, rolled back whatever the body does (an
@@ -76,6 +100,7 @@ engine_test_run(void (*body) (void), const char *store)
 		ChunkFormat = format;
 		engine_test_store = "memory";
 		MemoryContextSwitchTo(cxt);
+		engine_test_destroy_stores();
 		edata = CopyErrorData();
 		FlushErrorState();
 		if (own_xact)
@@ -89,6 +114,7 @@ engine_test_run(void (*body) (void), const char *store)
 		ReThrowError(edata);
 	}
 	PG_END_TRY();
+	engine_test_destroy_stores();
 	ChunkFormat = format;
 	engine_test_store = "memory";
 	if (own_xact)
@@ -110,6 +136,71 @@ engine_test_run(void (*body) (void), const char *store)
 	} \
 	static void \
 	name##_body(void)
+
+/*
+ * A unit test whose body runs on the memory store alone: one that ends its
+ * holds, or damages its store, by the memory store's hooks for tests.
+ */
+#define ENGINE_MEMORY_TEST(name) \
+	static void name##_body(void); \
+	static void \
+	name(void) \
+	{ \
+		engine_test_run(name##_body, "memory"); \
+	} \
+	static void \
+	name##_body(void)
+
+/*
+ * body(arg) raises an error of code code, its message naming the chunk h
+ * unless h is NULL; in a subtransaction, rolled back after it.
+ */
+static inline void
+expect_error(void (*body) (void *), void *arg, int code, const PHash *h)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *edata = NULL;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		body(arg);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (edata == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg_internal("CHECK failed: no error raised")));
+	if (edata->sqlerrcode != code)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg_internal("CHECK failed: error \"%s\", of code %s, not %s",
+								 edata->message, unpack_sql_state(edata->sqlerrcode),
+								 unpack_sql_state(code))));
+	if (h)
+	{
+		char		hex[PHASH_HEX_LEN + 1];
+
+		phash_hex(h, hex);
+		if (strstr(edata->message, hex) == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg_internal("CHECK failed: error \"%s\" names no chunk %s",
+									 edata->message, hex)));
+	}
+	FreeErrorData(edata);
+}
 
 /* (the bytes of every chunk the store has) */
 static void

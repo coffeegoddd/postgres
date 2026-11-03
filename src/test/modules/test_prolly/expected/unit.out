@@ -10,47 +10,63 @@ SELECT test_prolly_loaded_at_preload();
 (1 row)
 
 SELECT suite, test, result, detail FROM test_prolly_unit_tests();
-     suite     |              test              | result | detail 
----------------+--------------------------------+--------+--------
- harness       | checks_pass                    | ok     | 
- harness       | check_fails                    | ok     | 
- harness       | comparisons_fail_with_values   | ok     | 
- harness       | rng_sequence                   | ok     | 
- harness       | u64_keys_sort_as_bytes         | ok     | 
- bufmgr        | md_pages_are_not_shared        | ok     | 
- bufmgr        | cleanup_lock_unprepared        | ok     | 
- bufmgr        | lookup_cached_blocks           | ok     | 
- bufmgr        | flush_listed_blocks            | ok     | 
- bufmgr        | drop_one_block                 | ok     | 
- bufmgr        | drop_unlinked_relation_buffers | ok     | 
- registry      | register_and_look_up           | ok     | 
- registry      | names_are_copied               | ok     | 
- registry      | lists_in_registration_order    | ok     | 
- registry      | rejects_duplicates             | ok     | 
- registry      | rejects_bad_names_and_routines | ok     | 
- smgr          | md_is_chosen                   | ok     | 
- smgr          | md_pages_are_its_own           | ok     | 
- smgr          | md_refuses_shares              | ok     | 
- smgr          | md_hooks_do_nothing            | ok     | 
- branch_filter | rows_naming_objects            | ok     | 
- branch_filter | which_scans_filter             | ok     | 
- engine_prolly | sha256_vectors                 | ok     | 
- engine_prolly | empty_map                      | ok     | 
- engine_prolly | random_edits_small_chunks      | ok     | 
- engine_prolly | random_edits_default_chunks    | ok     | 
- engine_prolly | single_key_edits               | ok     | 
- engine_prolly | history_independence           | ok     | 
- engine_prolly | iter_from_key                  | ok     | 
- engine_prolly | diff_matches_model             | ok     | 
- engine_prolly | merge                          | ok     | 
- engine_prolly | merge_grafts                   | ok     | 
- engine_prolly | structural_sharing             | ok     | 
- engine_prolly | scaling                        | ok     | 
- engine_prolly | merge_frees_its_copies         | ok     | 
- engine_prolly | iter_across_context_resets     | ok     | 
- engine_prolly | corrupt_delta_count            | ok     | 
- engine_prolly | short_value_refused            | ok     | 
-(38 rows)
+      suite      |              test               | result | detail 
+-----------------+---------------------------------+--------+--------
+ harness         | checks_pass                     | ok     | 
+ harness         | check_fails                     | ok     | 
+ harness         | comparisons_fail_with_values    | ok     | 
+ harness         | rng_sequence                    | ok     | 
+ harness         | u64_keys_sort_as_bytes          | ok     | 
+ bufmgr          | md_pages_are_not_shared         | ok     | 
+ bufmgr          | cleanup_lock_unprepared         | ok     | 
+ bufmgr          | lookup_cached_blocks            | ok     | 
+ bufmgr          | flush_listed_blocks             | ok     | 
+ bufmgr          | drop_one_block                  | ok     | 
+ bufmgr          | drop_unlinked_relation_buffers  | ok     | 
+ registry        | register_and_look_up            | ok     | 
+ registry        | names_are_copied                | ok     | 
+ registry        | lists_in_registration_order     | ok     | 
+ registry        | rejects_duplicates              | ok     | 
+ registry        | rejects_bad_names_and_routines  | ok     | 
+ smgr            | md_is_chosen                    | ok     | 
+ smgr            | md_pages_are_its_own            | ok     | 
+ smgr            | md_refuses_shares               | ok     | 
+ smgr            | md_hooks_do_nothing             | ok     | 
+ branch_filter   | rows_naming_objects             | ok     | 
+ branch_filter   | which_scans_filter              | ok     | 
+ engine_prolly   | sha256_vectors                  | ok     | 
+ engine_prolly   | empty_map                       | ok     | 
+ engine_prolly   | random_edits_small_chunks       | ok     | 
+ engine_prolly   | random_edits_default_chunks     | ok     | 
+ engine_prolly   | single_key_edits                | ok     | 
+ engine_prolly   | history_independence            | ok     | 
+ engine_prolly   | iter_from_key                   | ok     | 
+ engine_prolly   | diff_matches_model              | ok     | 
+ engine_prolly   | merge                           | ok     | 
+ engine_prolly   | merge_grafts                    | ok     | 
+ engine_prolly   | structural_sharing              | ok     | 
+ engine_prolly   | scaling                         | ok     | 
+ engine_prolly   | merge_frees_its_copies          | ok     | 
+ engine_prolly   | iter_across_context_resets      | ok     | 
+ engine_prolly   | corrupt_delta_count             | ok     | 
+ engine_prolly   | short_value_refused             | ok     | 
+ engine_lifetime | edits_keep_tree_policy          | ok     | 
+ engine_lifetime | bad_chunks_rejected             | ok     | 
+ engine_lifetime | child_level_mismatch_is_corrupt | ok     | 
+ engine_lifetime | value_refs_hold_trees           | ok     | 
+ engine_lifetime | refcounts_random_versions       | ok     | 
+ engine_lifetime | reuse_race_holds                | ok     | 
+ engine_lifetime | failed_edit_leaves_no_garbage   | ok     | 
+ engine_lifetime | unheld_reclaimed                | ok     | 
+ engine_lifetime | missing_chunk_errors            | ok     | 
+ engine_lifetime | free_over_damage                | ok     | 
+ engine_lifetime | chunk_diff_exact                | ok     | 
+ engine_lifetime | sever_frees_chunk_diff          | ok     | 
+ engine_lifetime | repair_restores_severed_tree    | ok     | 
+ engine_lifetime | repair_rejects_bad_source       | ok     | 
+ engine_lifetime | rebuild_from_reverse_deltas     | ok     | 
+ engine_lifetime | lifetime_scaling                | ok     | 
+(54 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

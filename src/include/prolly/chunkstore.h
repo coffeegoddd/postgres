@@ -193,6 +193,20 @@ extern List *ChunkStoreList(void);
 extern void MemoryChunkStoreReset(void);
 extern void MemoryChunkStoreMiscount(const uint8 *hash);
 
+/*
+ * For tests, of a memory store: one of a test's own beside the backend's
+ * (a second store to copy from), and its end; its holds ended now, as its
+ * transaction's end would; a chunk dropped, nothing else changed (a store
+ * damaged: what referenced it dangles); a bit of a chunk's byte at
+ * changed (its bytes no longer its name's).
+ */
+extern ChunkStore *MemoryChunkStoreCreate(void);
+extern void MemoryChunkStoreDestroy(ChunkStore *cs);
+extern void MemoryChunkStoreEndHolds(ChunkStore *cs);
+extern void MemoryChunkStoreDrop(ChunkStore *cs, const uint8 *hash);
+extern void MemoryChunkStoreDamage(ChunkStore *cs, const uint8 *hash,
+									uint32 at);
+
 static inline bool
 cs_has(ChunkStore *cs, const uint8 *hash)
 {
@@ -294,6 +308,16 @@ cs_visit(ChunkStore *cs, ChunkVisitFn fn, void *arg)
 {
 	cs->routine->visit(cs, fn, arg);
 }
+
+/*
+ * Copies into to every chunk roots[0..n) reach (by ChunkFormat's
+ * references) that to has not, each after those it references, verified
+ * against its name as put_many verifies; how many it stored.  A chunk from
+ * has not is an error naming source (the store read) and verb (the copy).
+ * Memory: the walk's way down, and a batch of 16 MB (prolly/chunk_copy.c).
+ */
+extern uint64 cs_copy_closure(ChunkStore *from, ChunkStore *to, const uint8 *roots,
+							  int n, const char *verb, const char *source);
 
 /* What the store was asked since it was opened, or its counts reset. */
 static inline const ChunkStoreStats *

@@ -1874,3 +1874,12 @@ bad:
 	px_free(d);
 	return fail(ctx, PROLLY_ERR_BAD_DELTA, delta);
 }
+
+/* --------------------------------------------------------------- repair */
+
+uint64
+prolly_repair(ProllyCtx *ctx, ChunkStore *source, const PHash *root)
+{
+	return cs_copy_closure(source, ctx->cs, root->b, 1, "repair",
+						   "the store repaired from");
+}
