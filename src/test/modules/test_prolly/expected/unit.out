@@ -125,13 +125,14 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_remote   | detached_fetch_until_repaired        | ok     | 
  engine_remote   | detached_push_until_attached         | ok     | 
  engine_remote   | attach_at_cut_commit                 | ok     | 
+ engine_remote   | attach_at_exported_cut_commit        | ok     | 
  engine_remote   | discarded_returns_only_when_built_on | ok     | 
  engine_remote   | push_keeps_remote_work               | ok     | 
  engine_remote   | hints_named_once                     | ok     | 
  engine_remote   | pull_needs_named_remote              | ok     | 
  engine_remote   | transfer_reads_not_the_window        | ok     | 
  engine_remote   | transfer_costs                       | ok     | 
-(119 rows)
+(120 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

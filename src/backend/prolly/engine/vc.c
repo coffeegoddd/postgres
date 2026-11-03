@@ -3165,15 +3165,16 @@ vc_push(VcRepo *local, VcRepo *remote, const char *branch)
 
 	/*
 	 * A branch not there may have been made since (made, or pushed to, by
-	 * another that committed first): read again, its lock taken now.
+	 * another that committed first): read again, not locked (that would
+	 * take a branch after the repository's state), and refused if there
+	 * now: pushed again, it is locked first and checked as any.
 	 */
-	if (!had && (had = branch_read(remote, branch, VC_REF_UPDATE, &rb)) &&
-		(rc = push_target(&rb, &lb)) != 1)
+	if (!had && branch_read(remote, branch, VC_REF_READ, &rb))
 	{
 		side_close(&d);
 		vc_branch_free(&rb);
 		vc_branch_free(&lb);
-		return rc;
+		return VC_ERR;
 	}
 	side_open(&s, local, VC_REF_READ);
 	rc = plan_transfer(&s, &d, &lb.head, 1, 0, false, &p);

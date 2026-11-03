@@ -1265,6 +1265,45 @@ ENGINE_MEMORY_TEST(test_pull_needs_named_remote)
 	cs_destroy(ocs);
 }
 
+/*
+ * As attach_at_cut_commit, the segment exported before it is discarded:
+ * B, still named by C, is known as discarded by what the archive's
+ * manifest says of the segment, and a branch on it attaches there.
+ */
+ENGINE_MEMORY_TEST(test_attach_at_exported_cut_commit)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create_own(),
+			   *acs = memstore_create_own();
+	VcSource	cold = {"cold", acs};
+	VcRepo		origin,
+				laptop;
+	Linear		l;
+	uint32		seg;
+	PHash		x;
+
+	setup(&origin, ocs, "origin");
+	l = build_linear(&origin);
+	CHECK_EQ(clone(&laptop, lcs, &origin, 0), VC_OK);
+	CHECK_EQ(vc_sever(&origin, &depth2, &seg), VC_OK);
+	CHECK_EQ(vc_segment_export(&origin, seg, &cold), VC_OK);
+	CHECK_EQ(vc_segment_discard(&origin, seg, &cold), VC_OK);
+	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);
+
+	CHECK_EQ(vc_branch_create(&laptop, "hotfix", &l.b), VC_OK);
+	CHECK_EQ(vc_checkout(&laptop, "hotfix"), VC_OK);
+	x = commit_rows(&laptop, 300, 310, 90, "fix on B");
+	CHECK_EQ(vc_push(&laptop, &origin, "hotfix"), VC_OK);
+	CHECK(head_is(&origin, "hotfix", &x));
+	(void) release(ocs);
+	CHECK(!has(ocs, &l.b));
+	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);
+	settle_and_check(ocs);
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+}
+
 /* -------------------------------------------------------------- costs */
 
 #define RS_K 20
@@ -1358,6 +1397,7 @@ static const ProllyUnitTest tests[] = {
 	{"detached_fetch_until_repaired", test_detached_fetch_until_repaired},
 	{"detached_push_until_attached", test_detached_push_until_attached},
 	{"attach_at_cut_commit", test_attach_at_cut_commit},
+	{"attach_at_exported_cut_commit", test_attach_at_exported_cut_commit},
 	{"discarded_returns_only_when_built_on", test_discarded_returns_only_when_built_on},
 	{"push_keeps_remote_work", test_push_keeps_remote_work},
 	{"hints_named_once", test_hints_named_once},
