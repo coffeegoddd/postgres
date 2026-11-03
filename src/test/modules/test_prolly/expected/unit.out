@@ -157,7 +157,18 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_row          | shapes                               | ok     | 
  ws_row          | widest_row                           | ok     | 
  ws_row          | copy_text                            | ok     | 
-(145 rows)
+ ws_sql          | rows                                 | ok     | 
+ ws_sql          | attempt                              | ok     | 
+ ws_sql          | attempt_cancelled                    | ok     | 
+ ws_sql          | attempt_whose_error                  | ok     | 
+ ws_sql          | attempt_group                        | ok     | 
+ ws_sql          | attempt_in_spi                       | ok     | 
+ ws_sql          | encoding                             | ok     | 
+ ws_sql          | temp_does_not_shadow                 | ok     | 
+ ws_sql          | settings                             | ok     | 
+ ws_sql          | settings_after_errors                | ok     | 
+ ws_sql          | scope_not_superuser                  | ok     | 
+(156 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
