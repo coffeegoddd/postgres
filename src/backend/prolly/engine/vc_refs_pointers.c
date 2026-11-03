@@ -13,7 +13,10 @@
  * share, SELECT ... FOR SHARE.  Each
  * statement reads with a snapshot of its own (not read-only), so it sees
  * what the calls before it in the transaction changed.
- * The statements are planned once a backend.
+ * The statements are planned once a backend, and planned and run with
+ * sequential scans off: a name is found by the table's key, whatever its
+ * statistics say (a plan made while the table was small would otherwise
+ * read every row of it, for every reference, once it is large).
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -28,6 +31,7 @@
 #include "prolly/chunk_store.h"
 #include "prolly/engine/vc_refs.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "varatt.h"
 
 static VcRefs pointers_refs = {.routine = &PointersVcRefs};
@@ -66,16 +70,28 @@ pointers_open(ChunkStore *cs)
 	return &pointers_refs;
 }
 
-static void
+/*
+ * SPI connected, with sequential scans off until spi_end (a level of
+ * settings of the call's own: a listing's callback may ask of a reference
+ * in turn; an error's abort puts the settings back)
+ */
+static int
 spi_begin(void)
 {
+	int			level;
+
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
+	level = NewGUCNestLevel();
+	(void) set_config_option("enable_seqscan", "off", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	return level;
 }
 
 static void
-spi_end(void)
+spi_end(int level)
 {
+	AtEOXact_GUC(true, level);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 }
@@ -122,12 +138,13 @@ datum_hash(Datum d, PHash *out)
 static bool
 pointers_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
 {
+	int			level;
 	Oid			types[1] = {TEXTOID};
 	Datum		args[1] = {CStringGetTextDatum(name)};
 	bool		found;
 	int			rc;
 
-	spi_begin();
+	level = spi_begin();
 	rc = SPI_execute_plan(lock == VC_REF_UPDATE ?
 						  plan(&lock_plan, "SELECT hash FROM pg_history.pointers"
 							   " WHERE name = $1 FOR UPDATE", 1, types) :
@@ -146,7 +163,7 @@ pointers_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
 		datum_hash(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
 								 &isnull), out);
 	}
-	spi_end();
+	spi_end(level);
 	free_args(args, 1);
 	return found;
 }
@@ -154,17 +171,18 @@ pointers_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
 static void
 pointers_set(VcRefs *refs, const char *name, const PHash *hash)
 {
+	int			level;
 	Oid			types[2] = {TEXTOID, BYTEAOID};
 	Datum		args[2] = {CStringGetTextDatum(name), PointerGetDatum(hash_datum(hash))};
 	int			rc;
 
-	spi_begin();
+	level = spi_begin();
 	rc = SPI_execute_plan(plan(&set_plan, "INSERT INTO pg_history.pointers VALUES ($1, $2)"
 							   " ON CONFLICT (name) DO UPDATE SET hash = EXCLUDED.hash",
 							   2, types),
 						  args, NULL, false, 0);
 	check(rc, SPI_OK_INSERT, "a change");
-	spi_end();
+	spi_end(level);
 	free_args(args, 2);
 }
 
@@ -175,18 +193,19 @@ pointers_set(VcRefs *refs, const char *name, const PHash *hash)
 static bool
 pointers_add(VcRefs *refs, const char *name, const PHash *hash)
 {
+	int			level;
 	Oid			types[2] = {TEXTOID, BYTEAOID};
 	Datum		args[2] = {CStringGetTextDatum(name), PointerGetDatum(hash_datum(hash))};
 	bool		added;
 	int			rc;
 
-	spi_begin();
+	level = spi_begin();
 	rc = SPI_execute_plan(plan(&add_plan, "INSERT INTO pg_history.pointers VALUES ($1, $2)"
 							   " ON CONFLICT (name) DO NOTHING", 2, types),
 						  args, NULL, false, 0);
 	check(rc, SPI_OK_INSERT, "an addition");
 	added = SPI_processed == 1;
-	spi_end();
+	spi_end(level);
 	free_args(args, 2);
 	return added;
 }
@@ -194,18 +213,19 @@ pointers_add(VcRefs *refs, const char *name, const PHash *hash)
 static bool
 pointers_remove(VcRefs *refs, const char *name)
 {
+	int			level;
 	Oid			types[1] = {TEXTOID};
 	Datum		args[1] = {CStringGetTextDatum(name)};
 	bool		found;
 	int			rc;
 
-	spi_begin();
+	level = spi_begin();
 	rc = SPI_execute_plan(plan(&remove_plan, "DELETE FROM pg_history.pointers"
 							   " WHERE name = $1", 1, types),
 						  args, NULL, false, 0);
 	check(rc, SPI_OK_DELETE, "a removal");
 	found = SPI_processed == 1;
-	spi_end();
+	spi_end(level);
 	free_args(args, 1);
 	return found;
 }
@@ -218,6 +238,7 @@ pointers_remove(VcRefs *refs, const char *name)
 static void
 pointers_list(VcRefs *refs, const char *prefix, VcRefFn fn, void *arg)
 {
+	int			level;
 	Oid			types[2] = {TEXTOID, TEXTOID};
 	size_t		plen = strlen(prefix);
 	char	   *upper = pstrdup(prefix);
@@ -235,7 +256,7 @@ pointers_list(VcRefs *refs, const char *prefix, VcRefFn fn, void *arg)
 	}
 	args[0] = CStringGetTextDatum(prefix);
 	args[1] = plen ? CStringGetTextDatum(upper) : (Datum) 0;
-	spi_begin();
+	level = spi_begin();
 	portal = SPI_cursor_open(NULL,
 							 plan(&list_plan, "SELECT name, hash FROM pg_history.pointers"
 								  " WHERE name >= $1 AND ($2 IS NULL OR name < $2)"
@@ -265,7 +286,7 @@ pointers_list(VcRefs *refs, const char *prefix, VcRefFn fn, void *arg)
 		SPI_freetuptable(SPI_tuptable);
 	}
 	SPI_cursor_close(portal);
-	spi_end();
+	spi_end(level);
 	free_args(args, plen ? 2 : 1);
 	pfree(upper);
 }

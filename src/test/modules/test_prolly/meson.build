@@ -198,6 +198,7 @@ tests += {
       't/079_chunk_lane_numbers.pl',
       't/080_chunk_lane_compaction.pl',
       't/081_chunk_format_dump.pl',
+      't/084_vc_pointer_reads.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
