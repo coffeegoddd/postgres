@@ -148,8 +148,13 @@ get_uvarint(const uint8 **p, const uint8 *end)
 {
 	uint64		v = 0;
 
+	const uint8 *start = *p;
+
+	if (!read_uvarint(p, end, &v))
+		malformed("it ends early");
+	*p = start;
 	if (!ws_read_canonical_uvarint(p, end, &v))
-		malformed("it ends early, or a number is not in its shortest form");
+		malformed("a number is not in its shortest form");
 	return v;
 }
 
@@ -169,6 +174,8 @@ get_bytes(const uint8 **p, const uint8 *end, uint64 n)
 
 	if (n > (uint64) (end - *p))
 		malformed("a string runs past its end");
+	if (n > PG_INT32_MAX)
+		malformed("a string too long to be one");
 	if (memchr(*p, '\0', (size_t) n) != NULL)
 		malformed("a string with a NUL in it");
 	if (!pg_verifymbstr((const char *) *p, (int) n, true))
@@ -289,10 +296,13 @@ ws_schema_column_named(const WsTableSchema *s, const char *name)
 void
 ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape)
 {
-	uint64	   *tags = px_malloc((size_t) (s->nkey + s->ncols) * sizeof(uint64));
+	const char *problem = ws_schema_problem(s);
+	uint64	   *tags;
 	int			n = 0;
 
-	/* (a schema not yet checked, a merge's: ws_row_shape_init refuses too many) */
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	tags = px_malloc((size_t) (s->nkey + s->ncols) * sizeof(uint64));
 	for (int i = 0; i < s->nkey; i++)
 		tags[n++] = s->key[i];
 	for (int i = 0; i < s->ncols; i++)

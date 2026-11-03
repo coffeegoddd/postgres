@@ -173,10 +173,11 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_schema       | smallest                             | ok     | 
  ws_schema       | find                                 | ok     | 
  ws_schema       | row_shape                            | ok     | 
+ ws_schema       | row_shape_invalid                    | ok     | 
  ws_schema       | wide_and_odd                         | ok     | 
  ws_schema       | invalid                              | ok     | 
  ws_schema       | malformed                            | ok     | 
-(164 rows)
+(165 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

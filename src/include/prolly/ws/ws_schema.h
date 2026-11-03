@@ -95,7 +95,8 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 /*
  * The row codec's shape of the table: the key's columns, then the other
  * stored columns (generated or not) in attribute order, which is COPY's
- * order.  A virtual column has no value.
+ * order.  A virtual column has no value.  A schema with a problem (one a merge
+ * made, not yet checked) raises an error.
  */
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 

@@ -200,6 +200,27 @@ test_row_shape(void)
 	ws_row_shape_free(&shape);
 }
 
+static void
+shape_of_invalid(void *arg)
+{
+	WsColumn	cols[lengthof(example_cols)];
+	WsTableSchema s = example();
+	uint64		key[] = {8};
+	WsRowShape	shape;
+
+	memcpy(cols, example_cols, sizeof(cols));
+	s.cols = cols;
+	s.key = key;
+	ws_schema_row_shape(&s, &shape);
+}
+
+/* A schema with a problem, a merge's not yet checked, gives no shape. */
+static void
+test_row_shape_invalid(void)
+{
+	expect_error(shape_of_invalid, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+}
+
 /* The widest table there and back; names as they may be. */
 static void
 test_wide_and_odd(void)
@@ -495,7 +516,7 @@ test_malformed(void)
 		{"\x01" "\x01" "t" "p" "\x80\x00" "\x00", 7, "shortest form"},
 		{"\x01" "\x01" "t" "p" "\x00" "\x80\x80\x00", 8, "shortest form"},
 		/* a tag of bits past the 64th, dropped on reading */
-		{"\x01" "\x01" "t" "p" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00", 23, "shortest form"},
+		{"\x01" "\x01" "t" "p" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00", 25, "shortest form"},
 	};
 
 	WsSchemaCodec->encode(&s, &b);
@@ -525,6 +546,7 @@ static const ProllyUnitTest tests[] = {
 	{"smallest", test_smallest},
 	{"find", test_find},
 	{"row_shape", test_row_shape},
+	{"row_shape_invalid", test_row_shape_invalid},
 	{"wide_and_odd", test_wide_and_odd},
 	{"invalid", test_invalid},
 	{"malformed", test_malformed},
