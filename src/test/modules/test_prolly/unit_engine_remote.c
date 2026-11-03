@@ -544,6 +544,7 @@ ENGINE_MEMORY_TEST(test_deepen_from_remote)
 	VcSource	src = {"origin", ocs};
 	LogAcc		acc;
 	size_t		want;
+	RepoStateMark state;
 	int64	   *s9;
 
 	setup(&origin, ocs, "origin");
@@ -569,9 +570,10 @@ ENGINE_MEMORY_TEST(test_deepen_from_remote)
 
 	/* done looking: discard it, which frees exactly it; deepen again later */
 	want = expected_frees(&laptop, seg);
+	repo_state_mark(&laptop, &state);
 	CHECK_EQ(vc_segment_discard(&laptop, seg, NULL), VC_OK);
-	/* (the members' own chunks, the segment's; the map and repository's) */
-	CHECK_EQ(release(lcs), want + 1 + 2);
+	/* (the members' own chunks, the segment's, and the repository's own it left) */
+	CHECK_EQ(release(lcs), want + 1 + repo_state_unheld(&laptop, &state));
 	CHECK(vc_locate(&laptop, &c[9], NULL) == VC_LOC_DISCARDED);
 	CHECK_EQ(vc_deepen(&laptop, &src, &c[9], 0, &seg2), VC_OK);
 	CHECK_EQ(segment_size(&laptop, seg2), 10);	/* everything down to init */

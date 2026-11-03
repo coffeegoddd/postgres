@@ -486,6 +486,7 @@ ENGINE_MEMORY_TEST(test_discard_frees_exactly)
 	Linear		l;
 	uint32		seg;
 	size_t		want;
+	RepoStateMark state;
 	LogAcc		acc;
 	Snap		sd;
 
@@ -495,9 +496,10 @@ ENGINE_MEMORY_TEST(test_discard_frees_exactly)
 	CHECK_EQ(vc_sever(&r, &depth2, &seg), VC_OK);
 	release(cs);
 	want = expected_frees(&r, seg);
+	repo_state_mark(&r, &state);
 	CHECK_EQ(vc_segment_discard(&r, seg, NULL), VC_OK);
-	/* (the members' own chunks, the segment's; the map and repository's) */
-	CHECK_EQ(release(cs), want + 1 + 2);
+	/* (the members' own chunks, the segment's, and the repository's own it left) */
+	CHECK_EQ(release(cs), want + 1 + repo_state_unheld(&r, &state));
 	settle_and_check(cs);
 	/* C names B, so B is known as discarded; A, below it, is forgotten */
 	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_DISCARDED);
