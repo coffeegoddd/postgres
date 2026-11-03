@@ -67,6 +67,7 @@ extern const ProllyUnitSuite unit_engine_prolly_suite;
 extern const ProllyUnitSuite unit_engine_lifetime_suite;
 extern const ProllyUnitSuite unit_engine_vc_suite;
 extern const ProllyUnitSuite unit_engine_window_suite;
+extern const ProllyUnitSuite unit_engine_remote_suite;
 extern const ProllyConformanceSuite conformance_test_checksum_suite;
 extern const ProllyConformanceSuite conformance_branch_ids_suite;
 extern const ProllyConformanceSuite conformance_branch_map_suite;

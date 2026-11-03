@@ -75,6 +75,8 @@
 #define VC_ERR (-10)			/* bad argument or state */
 #define VC_ERR_SEVERED (-11)	/* needs a commit cut from local history */
 #define VC_ERR_OUTSIDE_WINDOW (-12)	/* stopped at the window's edge */
+#define VC_ERR_UNRELATED (-13)	/* the histories share no commit */
+#define VC_ERR_DETACHED (-14)	/* the sender's history is cut before it attaches */
 
 /* Stop at the window's edge: refuse any commit the window does not hold. */
 #define VC_WINDOW_ONLY 0x1
@@ -414,6 +416,52 @@ extern void vc_locations(VcRepo *r, VcLocFn fn, void *arg);
 
 /* The name the repository's manifests give it (and remotes, its hints). */
 extern void vc_repo_set_name(VcRepo *r, const char *name);
+
+/*
+ * Remotes: another repository with its own store and references.
+ *
+ * A transfer sends the commits the receiver lacks, each with its whole
+ * tree, stopping at any commit the receiver knows, wherever it is there:
+ * in its window, a segment, exported, a boundary, or a discarded parent of
+ * a commit it holds.  So exported history, and discarded history it still
+ * names, never comes back implicitly.  Discarded commits nothing held
+ * names are forgotten: a commit sent that builds on one brings it back,
+ * with what it needs beneath it.
+ *
+ * A transfer locks the receiver's state for update (it may record
+ * boundaries), so it takes turns with window operations there, never with
+ * commits.  Every call locks branches before the repository's state, so
+ * calls do not deadlock on the two.
+ *
+ * Fetch, push and pull require the histories to attach: walking back from
+ * the heads must reach a commit the receiver knows (a discarded one too:
+ * the same hash is the same history).  Otherwise they are refused with
+ * nothing kept: VC_ERR_UNRELATED if the walk reached roots, or
+ * VC_ERR_DETACHED if it reached the sender's own cut first (err_hash names
+ * it, vc_hint says where it is), which deepening or attaching repairs.
+ * Only a clone, into a store with no repository, starts unattached, at the
+ * given depth (0: everything the source has).
+ *
+ * Parents not sent become boundaries on the receiver, with a hint naming
+ * where their content can be found.  Push is checked for fast-forward by
+ * the receiver, its branch locked, and refused (VC_ERR) if that branch has
+ * work not committed or a merge under way.  Pull needs a named remote, its
+ * name the tracking branch's prefix.  Each repository applies its own
+ * window: nothing is severed on receipt.
+ */
+/* Where this repository says a commit it lacks is (palloc'd), or NULL. */
+extern char *vc_hint(VcRepo *r, const PHash *commit);
+extern int	vc_push(VcRepo *local, VcRepo *remote, const char *branch);
+extern int	vc_fetch(VcRepo *local, VcRepo *remote, const char *branch,
+					 PHash *head);
+extern int	vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRefs *refs,
+						  const ChunkPolicy *policy, VcRepo *src, uint32 depth);
+/* History past a cut, from any source, into a new local segment. */
+extern int	vc_deepen(VcRepo *r, const VcSource *src, const PHash *from,
+					  uint32 generations, uint32 *seg);
+/* Fetch into "<remote>/<branch>" and merge, deepening up to max_deepen. */
+extern int	vc_pull(VcRepo *local, VcRepo *remote, const char *branch,
+					uint32 max_deepen, VcMergeResult *res);
 
 /* Archives: list and read the manifests of segments exported there. */
 extern void vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n);

@@ -15,6 +15,7 @@ OBJS = \
 	unit_branch_filter.o \
 	unit_engine_lifetime.o \
 	unit_engine_prolly.o \
+	unit_engine_remote.o \
 	unit_engine_vc.o \
 	unit_engine_window.o \
 	vc_sql.o \

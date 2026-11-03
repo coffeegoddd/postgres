@@ -105,7 +105,12 @@ static inline void
 engine_test_destroy_stores(void)
 {
 	while (engine_test_nstores > 0)
-		MemoryChunkStoreDestroy(engine_test_stores[--engine_test_nstores]);
+	{
+		ChunkStore *cs = engine_test_stores[--engine_test_nstores];
+
+		MemoryVcRefsForget(cs);
+		MemoryChunkStoreDestroy(cs);
+	}
 }
 
 /*
@@ -568,6 +573,61 @@ set_equal(const PHashMap *a, const PHashMap *b)
 		if (a->used[i] && !phmap_find((PHashMap *) b, &a->keys[i]))
 			return false;
 	return true;
+}
+
+/*
+ * The repository's own state, the chunks its "vc/repo" reference holds:
+ * its chunk and its location map's nodes (how many depends on the map's
+ * shape, which commits' hashes, and so the clock, decide).
+ */
+static inline void
+repo_state_chunks(VcRepo *r, PHashMap *set)
+{
+	PHash		h;
+
+	phmap_init(set);
+	CHECK(vc_refs_get(r->refs, "vc/repo", VC_REF_READ, &h));
+	closure(r->ctx.cs, &h, set);
+}
+
+/* The repository's own state as a call begins, and what its store has stored. */
+typedef struct RepoStateMark
+{
+	PHashMap	chunks;
+	uint64		stored;
+} RepoStateMark;
+
+static inline void
+repo_state_mark(VcRepo *r, RepoStateMark *m)
+{
+	repo_state_chunks(r, &m->chunks);
+	m->stored = cs_stats(r->ctx.cs)->stored;
+}
+
+/*
+ * The chunks of the repository's own state a call since m leaves unheld:
+ * those of the state it replaced, and those it stored but kept in no
+ * state (a map node an edit wrote, then dropped as the map shrank).
+ */
+static inline size_t
+repo_state_unheld(VcRepo *r, RepoStateMark *m)
+{
+	PHashMap	now,
+				gone,
+				added;
+	uint64		stored = cs_stats(r->ctx.cs)->stored - m->stored;
+	size_t		n;
+
+	repo_state_chunks(r, &now);
+	set_minus(&m->chunks, &now, &gone);
+	set_minus(&now, &m->chunks, &added);
+	CHECK_LE(set_size(&added), stored);
+	n = set_size(&gone) + (size_t) (stored - set_size(&added));
+	phmap_free(&now);
+	phmap_free(&gone);
+	phmap_free(&added);
+	phmap_free(&m->chunks);
+	return n;
 }
 
 /* Small chunks make tall trees from few rows, exercising every level. */

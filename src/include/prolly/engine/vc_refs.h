@@ -95,9 +95,11 @@ extern VcRefs *VcRefsOpen(const char *name, ChunkStore *cs);
 
 /*
  * For tests: forgets every reference the memory implementation has (with
- * the memory store emptied, whose roots they were).
+ * the memory stores emptied, whose roots they were), or (Forget) those on
+ * one memory store, before it is destroyed.
  */
 extern void MemoryVcRefsReset(void);
+extern void MemoryVcRefsForget(ChunkStore *cs);
 
 static inline bool
 vc_refs_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
