@@ -40,9 +40,9 @@
  *			A branch's state, which its reference names; its name makes it
  *			that branch's alone.
  * Repo:	tag, version, commit-location map root (strong), uvarint next
- *			segment id, uvarint namelen, the repository's name, uvarint
- *			nhints, then each hint: uvarint len, where boundaries' content
- *			can be found
+ *			segment id, uvarint highest generation a discard forgot,
+ *			uvarint namelen, the repository's name, uvarint nhints, then
+ *			each hint: uvarint len, where boundaries' content can be found
  *			The repository's own state, which vc/repo names: where each
  *			commit outside the window is.
  * Segment: tag, version, exported byte (0 or 1), uvarint n, member commit

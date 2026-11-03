@@ -774,6 +774,7 @@ typedef struct RepoState
 {
 	PHash		loc_root;		/* where each commit outside the window is */
 	uint64		next_seg;
+	uint64		forgot_gen;		/* the highest generation a discard forgot */
 	char	   *name;
 	/* where boundaries' content can be found, as remotes said: their hints */
 	char	  **hints;
@@ -1037,6 +1038,7 @@ vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 
 			vc_must(&r->ctx, prolly_empty(&r->ctx, 0, &st.loc_root));
 			st.next_seg = 0;
+			st.forgot_gen = 0;
 			st.name = "";
 			st.hints = NULL;
 			st.nhints = 0;
@@ -1531,6 +1533,7 @@ repo_put(ProllyCtx *ctx, const RepoState *st)
 	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
 	buf_append(&b, st->loc_root.b, PHASH_LEN);
 	buf_append_uvarint(&b, st->next_seg);
+	buf_append_uvarint(&b, st->forgot_gen);
 	buf_append_uvarint(&b, strlen(st->name));
 	buf_append(&b, st->name, strlen(st->name));
 	buf_append_uvarint(&b, st->nhints);
@@ -1568,8 +1571,8 @@ repo_read(VcRepo *r, VcRefLock lock, RepoState *st)
 	memcpy(st->loc_root.b, d + 2, PHASH_LEN);
 	p = d + 2 + PHASH_LEN;
 	end = d + len;
-	if (!read_uvarint(&p, end, &st->next_seg) || !read_uvarint(&p, end, &nl) ||
-		nl > (uint64) (end - p))
+	if (!read_uvarint(&p, end, &st->next_seg) || !read_uvarint(&p, end, &st->forgot_gen) ||
+		!read_uvarint(&p, end, &nl) || nl > (uint64) (end - p))
 		goto bad;
 	st->name = pnstrdup((const char *) p, nl);
 	p += nl;
@@ -2346,6 +2349,40 @@ vc_segment_export(VcRepo *r, uint32 id, const VcSource *archive)
  * there holds.  Its members are forgotten: those that what is held still
  * names are found as discarded when asked (vc_locate).
  */
+/*
+ * The highest generation among a segment's members: from their commits
+ * (a local segment's), or from its manifest (an exported one's, whose
+ * commits are in the archive alone).
+ */
+static uint64
+segment_top_gen(VcRepo *r, const VcSegment *seg, const VcSource *archive)
+{
+	uint64		top = 0;
+
+	if (seg->exported)
+	{
+		VcManifest	m;
+
+		if (!vc_manifest_load(archive->cs, &seg->manifest, &m))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("segment %u's manifest is not in archive \"%s\"",
+							seg->id, archive->name)));
+		for (size_t i = 0; i < m.n; i++)
+			top = Max(top, m.gens[i]);
+		vc_manifest_free(&m);
+		return top;
+	}
+	for (size_t i = 0; i < seg->n; i++)
+	{
+		VcCommit	c = must_load_commit(&r->ctx, &seg->commits[i]);
+
+		top = Max(top, c.generation);
+		vc_commit_release(&c);
+	}
+	return top;
+}
+
 int
 vc_segment_discard(VcRepo *r, uint32 id, const VcSource *archive)
 {
@@ -2366,6 +2403,7 @@ vc_segment_discard(VcRepo *r, uint32 id, const VcSource *archive)
 		if (LOC_IS_SEG(loc_get(r, &st.loc_root, &seg.commits[i])))
 			loc_set(&le, &seg.commits[i], LOC_GONE);
 	st.loc_root = loc_apply(r, &st.loc_root, &le);
+	st.forgot_gen = Max(st.forgot_gen, segment_top_gen(r, &seg, archive));
 	repo_write(r, &st);
 	if (seg.exported)
 		cs_unref_root(archive->cs, seg.manifest.b);
@@ -2771,12 +2809,19 @@ side_close(Side *s)
  * what it holds that it discarded (the same hash is the same history).
  * Commits it discarded that nothing it holds names are forgotten, so not
  * known: a transfer sends them again if a commit sent builds on them.
+ *
+ * gen is the commit's generation (PG_UINT64_MAX if not known): one above
+ * every generation a discard forgot was never discarded, so the parents
+ * of what is held, found by reading every commit held, are found only for
+ * a commit that may be one.
  */
 static bool
-side_knows(Side *s, const PHash *h)
+side_knows(Side *s, const PHash *h, uint64 gen)
 {
 	if (vc_in_window(s->r, h) || loc_get(s->r, &s->st.loc_root, h) != LOC_GONE)
 		return true;
+	if (s->st.forgot_gen == 0 || (gen != PG_UINT64_MAX && gen > s->st.forgot_gen))
+		return false;			/* (none forgotten, or too new to be) */
 	if (!s->has_cut)
 	{
 		cut_parents(s->r, &s->cut);
@@ -2846,7 +2891,8 @@ plan_bound(Plan *p, const PHash *h, char *hint)
 /*
  * Plans what src must send so dst has heads.  It walks parents from each
  * head, stopping at any commit dst already knows, whatever its location
- * there: discarded or exported history is never sent back implicitly.
+ * there: exported history, and discarded history it still names, is
+ * never sent back implicitly.
  * With depth > 0, a path stops depth generations below its head; what lies
  * past becomes a boundary, hinting at src.  A parent src itself holds no
  * content for is a boundary too, hinting where src says it lives.
@@ -2858,7 +2904,8 @@ plan_walk(Side *src, Side *dst, const PHash *heads, size_t nheads,
 	PHashMap	seen,
 				planned;
 	PHash	   *stack = NULL;
-	uint64	   *sbound = NULL;
+	uint64	   *sbound = NULL,
+			   *sgen = NULL;
 	size_t		n = 0,
 				cap = 0;
 	bool		created;
@@ -2868,28 +2915,33 @@ plan_walk(Side *src, Side *dst, const PHash *heads, size_t nheads,
 	for (size_t i = 0; i < nheads; i++)
 	{
 		VcCommit	c;
-		uint64		b = 0;
+		uint64		b = 0,
+					g = PG_UINT64_MAX;
 
-		if (depth > 0 && side_has(src, &heads[i]) &&
-			vc_commit_load(&src->r->ctx, &heads[i], &c))
+		if (side_has(src, &heads[i]) && vc_commit_load(&src->r->ctx, &heads[i], &c))
 		{
-			b = c.generation > depth ? c.generation - depth : 0;
+			g = c.generation;
+			if (depth > 0)
+				b = c.generation > depth ? c.generation - depth : 0;
 			vc_commit_release(&c);
 		}
 		px_grow((void **) &stack, &cap, n + 1, sizeof(PHash));
 		sbound = px_realloc(sbound, cap * sizeof(uint64));
+		sgen = px_realloc(sgen, cap * sizeof(uint64));
 		stack[n] = heads[i];
+		sgen[n] = g;
 		sbound[n++] = b;
 	}
 	while (n > 0)
 	{
 		PHash		h = stack[--n];
 		uint64		b = sbound[n];
+		uint64		g = sgen[n];
 		uint64	   *v;
 		VcCommit	c;
 
 		CHECK_FOR_INTERRUPTS();
-		if (side_knows(dst, &h))
+		if (side_knows(dst, &h, g))
 		{
 			p->connected = true;
 			continue;
@@ -2920,10 +2972,12 @@ plan_walk(Side *src, Side *dst, const PHash *heads, size_t nheads,
 			{
 				px_grow((void **) &stack, &cap, n + 1, sizeof(PHash));
 				sbound = px_realloc(sbound, cap * sizeof(uint64));
+				sgen = px_realloc(sgen, cap * sizeof(uint64));
 				stack[n] = c.parents[i];
+				sgen[n] = c.parent_gen[i];
 				sbound[n++] = b;
 			}
-			else if (!side_knows(dst, &c.parents[i]))
+			else if (!side_knows(dst, &c.parents[i], c.parent_gen[i]))
 				plan_bound(p, &c.parents[i], pstrdup(src->st.name));
 		}
 		vc_commit_release(&c);
@@ -2946,6 +3000,8 @@ plan_walk(Side *src, Side *dst, const PHash *heads, size_t nheads,
 		px_free(stack);
 	if (sbound)
 		px_free(sbound);
+	if (sgen)
+		px_free(sgen);
 	phmap_free(&seen);
 	phmap_free(&planned);
 }
@@ -3063,6 +3119,21 @@ transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 }
 
 /*
+ * Whether a push may move the remote's branch rb to lb's head: 1 if so,
+ * VC_OK if it is there already, VC_ERR if work there not committed, or a
+ * merge under way, would be overwritten.
+ */
+static int
+push_target(const VcBranch *rb, const VcBranch *lb)
+{
+	if (phash_eq(&rb->head, &lb->head))
+		return VC_OK;
+	if (rb->merging || !phash_eq(&rb->working, &rb->head_root))
+		return VC_ERR;
+	return 1;
+}
+
+/*
  * The remote checks fast-forward itself, against its own history plus the
  * commits just received, so it never needs history the sender has cut.
  * A rejected push leaves nothing behind (what was copied, unheld, freed).
@@ -3084,20 +3155,26 @@ vc_push(VcRepo *local, VcRepo *remote, const char *branch)
 
 	/* (the receiver's branch first, then its state: every call's order) */
 	had = branch_read(remote, branch, VC_REF_UPDATE, &rb);
-	if (had && phash_eq(&rb.head, &lb.head))
+	if (had && (rc = push_target(&rb, &lb)) != 1)
 	{
 		vc_branch_free(&rb);
 		vc_branch_free(&lb);
-		return VC_OK;
-	}
-	/* work there not committed, or a merge under way, is not overwritten */
-	if (had && (rb.merging || !phash_eq(&rb.working, &rb.head_root)))
-	{
-		vc_branch_free(&rb);
-		vc_branch_free(&lb);
-		return VC_ERR;
+		return rc;
 	}
 	side_open(&d, remote, VC_REF_UPDATE);
+
+	/*
+	 * A branch not there may have been made since (made, or pushed to, by
+	 * another that committed first): read again, its lock taken now.
+	 */
+	if (!had && (had = branch_read(remote, branch, VC_REF_UPDATE, &rb)) &&
+		(rc = push_target(&rb, &lb)) != 1)
+	{
+		side_close(&d);
+		vc_branch_free(&rb);
+		vc_branch_free(&lb);
+		return rc;
+	}
 	side_open(&s, local, VC_REF_READ);
 	rc = plan_transfer(&s, &d, &lb.head, 1, 0, false, &p);
 	if (rc == VC_OK)
@@ -3189,6 +3266,7 @@ vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRefs *refs, const ChunkPolicy *poli
 
 		vc_must(&dst->ctx, prolly_empty(&dst->ctx, 0, &st.loc_root));
 		st.next_seg = 0;
+		st.forgot_gen = 0;
 		st.name = "";
 		st.hints = NULL;
 		st.nhints = 0;

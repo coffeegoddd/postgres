@@ -1115,6 +1115,65 @@ ENGINE_MEMORY_TEST(test_push_keeps_remote_work)
 	/* committed, the remote's branch has moved on: not a fast-forward */
 	vc_commit(&origin, "O");
 	CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_ERR);
+
+	/*
+	 * a merge under way there, its working set the head's (each side set
+	 * row 5, ours kept, the conflict recorded): not overwritten either
+	 */
+	{
+		VcMergeResult m;
+		VcBranch	b;
+		PHash		x;
+
+		CHECK_EQ(vc_branch_create(&origin, "x", NULL), VC_OK);
+		CHECK_EQ(vc_checkout(&origin, "x"), VC_OK);
+		x = commit_rows(&origin, 5, 6, 77, "x");
+		CHECK_EQ(vc_checkout(&origin, "main"), VC_OK);
+		before = commit_rows(&origin, 5, 6, 88, "main");
+		CHECK_EQ(vc_merge(&origin, "x", &m), VC_OK);
+		CHECK(m.status == VC_MERGE_CONFLICTS);
+		vc_merge_result_free(&m);
+		vc_head(&origin, &b);
+		CHECK(b.merging && phash_eq(&b.merge_head, &x));
+		CHECK(phash_eq(&b.working, &b.head_root));
+		vc_branch_free(&b);
+		CHECK_EQ(vc_pull(&laptop, &origin, "main", 0, &m), VC_OK);	/* attached */
+		vc_merge_result_free(&m);
+		commit_rows(&laptop, 220, 230, 3, "L2");
+		CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_ERR);
+		CHECK(head_is(&origin, "main", &before));
+	}
+	settle_and_check(ocs);
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+}
+
+/*
+ * A receiver finds the parents of what it holds (every commit it holds
+ * read) only for a commit as old as its history's discarded part: a push
+ * of new work after a discard reads what the push needs, not the window.
+ */
+ENGINE_MEMORY_TEST(test_transfer_reads_not_the_window)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create_own();
+	VcRepo		origin,
+				laptop;
+	uint32		seg;
+	uint64		gets;
+
+	setup(&origin, ocs, "origin");
+	for (int i = 0; i < 40; i++)
+		commit_rows(&origin, (uint64) i * 10, (uint64) i * 10 + 5, (uint64) i, "c");
+	CHECK_EQ(clone(&laptop, lcs, &origin, 0), VC_OK);
+	CHECK_EQ(vc_sever(&origin, &(VcWindow) {.depth = 30}, &seg), VC_OK);
+	CHECK_EQ(vc_segment_discard(&origin, seg, NULL), VC_OK);
+	commit_rows(&laptop, 900, 905, 99, "new");
+	gets = cs_stats(ocs)->gets;
+	CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_OK);
+	/* (the state, the branch, the fast-forward check: not 30 commits) */
+	CHECK_LT(cs_stats(ocs)->gets - gets, 20);
 	settle_and_check(ocs);
 	vc_repo_free(&origin);
 	vc_repo_free(&laptop);
@@ -1303,6 +1362,7 @@ static const ProllyUnitTest tests[] = {
 	{"push_keeps_remote_work", test_push_keeps_remote_work},
 	{"hints_named_once", test_hints_named_once},
 	{"pull_needs_named_remote", test_pull_needs_named_remote},
+	{"transfer_reads_not_the_window", test_transfer_reads_not_the_window},
 	{"transfer_costs", test_transfer_costs},
 };
 

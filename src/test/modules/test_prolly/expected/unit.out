@@ -129,8 +129,9 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_remote   | push_keeps_remote_work               | ok     | 
  engine_remote   | hints_named_once                     | ok     | 
  engine_remote   | pull_needs_named_remote              | ok     | 
+ engine_remote   | transfer_reads_not_the_window        | ok     | 
  engine_remote   | transfer_costs                       | ok     | 
-(118 rows)
+(119 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
