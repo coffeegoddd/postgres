@@ -105,7 +105,12 @@ static inline void
 engine_test_destroy_stores(void)
 {
 	while (engine_test_nstores > 0)
-		MemoryChunkStoreDestroy(engine_test_stores[--engine_test_nstores]);
+	{
+		ChunkStore *cs = engine_test_stores[--engine_test_nstores];
+
+		MemoryVcRefsForget(cs);
+		MemoryChunkStoreDestroy(cs);
+	}
 }
 
 /*

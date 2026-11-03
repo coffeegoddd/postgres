@@ -109,7 +109,24 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_window   | discarded_parent_still_named      | ok     | 
  engine_window   | sever_bounded                     | ok     | 
  engine_window   | archive_checked                   | ok     | 
-(97 rows)
+ engine_remote   | push_does_not_resurrect           | ok     | 
+ engine_remote   | shallow_clone_with_hints          | ok     | 
+ engine_remote   | clone_into_empty_only             | ok     | 
+ engine_remote   | fetch_connects_past_depth         | ok     | 
+ engine_remote   | push_ff_checked_by_receiver       | ok     | 
+ engine_remote   | deepen_from_remote                | ok     | 
+ engine_remote   | restore_from_archive_alone        | ok     | 
+ engine_remote   | export_to_remote_with_history     | ok     | 
+ engine_remote   | pull_deepens_for_merge_base       | ok     | 
+ engine_remote   | merge_parent_beyond_depth         | ok     | 
+ engine_remote   | explicit_restore_on_remote        | ok     | 
+ engine_remote   | branching_both_sides              | ok     | 
+ engine_remote   | unrelated_histories_rejected      | ok     | 
+ engine_remote   | detached_fetch_until_repaired     | ok     | 
+ engine_remote   | detached_push_until_attached      | ok     | 
+ engine_remote   | attach_at_cut_commit              | ok     | 
+ engine_remote   | transfer_costs                    | ok     | 
+(114 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

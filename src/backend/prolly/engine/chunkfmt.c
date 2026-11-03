@@ -282,15 +282,26 @@ repo_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 	const uint8 *p = data + 2;
 	const uint8 *end = data + len;
 	PHash		h;
-	uint64		v;
+	uint64		v,
+				n;
 
 	if (!read_hash(&p, end, &h))
 		return false;
 	fn(arg, &h, true);
+	/* (the next segment's id, the name, then the boundaries' hints) */
 	if (!read_uvarint(&p, end, &v) || !read_uvarint(&p, end, &v) ||
-		v != (uint64) (end - p))
+		v > (uint64) (end - p))
 		return false;
-	return true;
+	p += v;
+	if (!read_uvarint(&p, end, &n) || n > (uint64) (end - p))
+		return false;
+	for (uint64 i = 0; i < n; i++)
+	{
+		if (!read_uvarint(&p, end, &v) || v > (uint64) (end - p))
+			return false;
+		p += v;
+	}
+	return p == end;
 }
 
 static bool

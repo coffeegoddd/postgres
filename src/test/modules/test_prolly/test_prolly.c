@@ -56,6 +56,7 @@ static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_engine_lifetime_suite,
 	&unit_engine_vc_suite,
 	&unit_engine_window_suite,
+	&unit_engine_remote_suite,
 };
 
 static const ProllyConformanceSuite *const conformance_suites[] = {
