@@ -2,8 +2,8 @@
 
 # A chunk log's lanes: the number of a lane whose making aborted given
 # again once a VACUUM pass of the log's index has ended (not burnt); a lane
-# made in the log's tablespace, whatever the session's default; a log with
-# lanes, or a lane, not truncated.
+# made in the log's tablespace, whatever the session's default; a log
+# truncated truncating its lanes, a lane alone not.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -164,6 +164,41 @@ is($node->safe_psql('postgres', qq{SELECT test_chunk_log_read('tl', $loc, 1)}), 
 	'after crash recovery, the truncated lane\'s chunk reads back');
 $node->safe_psql('postgres', q{BEGIN; CREATE TABLE t2 () USING prolly_chunks; TRUNCATE t2; COMMIT; TRUNCATE t2});
 pass('a log without lanes truncates');
+# a log with its index bound, lanes and a hole among their numbers:
+# truncated in a savepoint rolled back, nothing gone; truncated twice in a
+# transaction (the second on storage made in it), every lane emptied, the
+# hole passed by, and the index refusing what it had
+$node->safe_psql('postgres', 'CREATE TABLE tq () USING prolly_chunks; CREATE TABLE tqi () USING prolly_chunk_index');
+my @q;
+for my $i (100 .. 102)
+{
+	my $s = $node->background_psql('postgres');
+	$s->query_safe("SELECT test_chunk_put('tq', 'tqi', h(d($i)), d($i))");
+	push @q, $s;
+}
+my $x = $node->background_psql('postgres');
+$x->query_safe("BEGIN; SELECT test_chunk_put('tq', 'tqi', h(d(200)), d(200)); ROLLBACK");
+$x->quit;
+my $y = $node->background_psql('postgres');
+$y->query_safe("SELECT test_chunk_put('tq', 'tqi', h(d(201)), d(201))");
+push @q, $y;
+my $tq_lanes = q{SELECT string_agg(relname || ':' || pg_relation_size(oid) / current_setting('block_size')::int, ' ' ORDER BY relname)
+	FROM pg_class WHERE relname LIKE 'tq\_lane\_%'};
+like($node->safe_psql('postgres', $tq_lanes), qr/^tq_lane_1:\d+ tq_lane_2:\d+ tq_lane_4:\d+$/,
+	'tq has lanes 1, 2 and 4, 3 a hole (its making rolled back)');
+$node->safe_psql('postgres', 'BEGIN; SAVEPOINT s; TRUNCATE tq; ROLLBACK TO s; COMMIT');
+is($node->safe_psql('postgres', q{SELECT string_agg((test_chunk_get('tq', 'tqi', h(d(i))) = d(i))::text, ' ' ORDER BY i)
+	FROM unnest(ARRAY[100, 101, 102, 201]) i}),
+	'true true true true', 'a truncation rolled back to its savepoint: every lane\'s chunk reads back');
+$node->safe_psql('postgres', 'BEGIN; TRUNCATE tq; TRUNCATE tq; COMMIT');
+is($node->safe_psql('postgres', $tq_lanes), 'tq_lane_1:1 tq_lane_2:1 tq_lane_4:1',
+	'truncated twice in a transaction: every lane its meta page alone, the hole passed by');
+($ret, $out, $err) = $node->psql('postgres', "SELECT test_chunk_put('tq', 'tqi', h(d(300)), d(300))");
+like($err, qr/storage before it was truncated/, 'the index refuses the log it had, its lanes with it');
+$node->safe_psql('postgres', 'VACUUM tqi');
+pass('VACUUM of the index, its entries of the log before');
+$_->quit for @q;
+
 $node->safe_psql('postgres', 'DROP TABLE tl');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_class WHERE relname LIKE 'tl_lane_%'}),
 	'0', 'the lane goes with its log');
