@@ -14,7 +14,7 @@
 
 #include "prolly/ws/ws_row.h"
 
-const WsRowCodec *WsRows = &WsCellsRowCodec;
+const WsRowCodecRoutine *WsRowCodec = &CellsWsRowCodec;
 
 pg_noreturn static void
 malformed(const char *what)
@@ -88,7 +88,12 @@ cell_cmp(const void *a, const void *b)
 static void
 cells_encode(WsCell *c, int n, Buf *out)
 {
+	if (n > WS_MAX_COLS)
+		elog(ERROR, "a row of %d cells", n);
 	qsort(c, (size_t) n, sizeof(WsCell), cell_cmp);
+	for (int i = 1; i < n; i++)
+		if (c[i].tag == c[i - 1].tag)
+			elog(ERROR, "a row with two cells of tag " UINT64_FORMAT, c[i].tag);
 	for (int i = 0; i < n; i++)
 	{
 		buf_append_uvarint(out, c[i].tag);
@@ -97,30 +102,43 @@ cells_encode(WsCell *c, int n, Buf *out)
 	}
 }
 
+/*
+ * The next cell at *p: false at the end.  prev is the tag before it, if
+ * has_prev.
+ */
+static bool
+cell_next(const uint8 **p, const uint8 *end, bool has_prev, uint64 prev, WsCell *c)
+{
+	uint64		tag = 0,
+				len = 0;
+
+	if (*p >= end)
+		return false;
+	if (!read_uvarint(p, end, &tag) || !read_uvarint(p, end, &len) ||
+		len > (uint64) (end - *p))
+		malformed("a cell runs past its end");
+	if (has_prev && tag <= prev)
+		malformed("its cells are not in order of their tags");
+	c->tag = tag;
+	c->p = *p;
+	c->len = (size_t) len;
+	*p += len;
+	return true;
+}
+
 static int
 cells_parse(const uint8 *v, size_t vl, WsCell *out)
 {
 	const uint8 *p = v,
 			   *end = v + vl;
+	WsCell		c;
 	int			n = 0;
 
-	while (p < end)
+	while (cell_next(&p, end, n > 0, n > 0 ? out[n - 1].tag : 0, &c))
 	{
-		uint64		tag = 0,
-					len = 0;
-
 		if (n == WS_MAX_COLS)
 			malformed("more cells than a table has columns");
-		if (!read_uvarint(&p, end, &tag) || !read_uvarint(&p, end, &len) ||
-			len > (uint64) (end - p))
-			malformed("a cell runs past its end");
-		if (n > 0 && tag <= out[n - 1].tag)
-			malformed("its cells are not in order of their tags");
-		out[n].tag = tag;
-		out[n].p = p;
-		out[n].len = (size_t) len;
-		p += len;
-		n++;
+		out[n++] = c;
 	}
 	return n;
 }
@@ -128,16 +146,24 @@ cells_parse(const uint8 *v, size_t vl, WsCell *out)
 bool
 ws_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *len)
 {
-	WsCell		c[WS_MAX_COLS];
-	int			n = WsRows->cells(v, vl, c);
+	const uint8 *q = v,
+			   *end = v + vl;
+	WsCell		c;
+	bool		has_prev = false;
+	uint64		prev = 0;
 
-	for (int i = 0; i < n; i++)
-		if (c[i].tag == tag)
+	/* (in order of their tags: past it, it is not there) */
+	while (cell_next(&q, end, has_prev, prev, &c) && c.tag <= tag)
+	{
+		if (c.tag == tag)
 		{
-			*p = c[i].p;
-			*len = c[i].len;
+			*p = c.p;
+			*len = c.len;
 			return true;
 		}
+		has_prev = true;
+		prev = c.tag;
+	}
 	return false;
 }
 
@@ -181,6 +207,35 @@ cells_row_encode(const WsRowShape *s, const WsField *f, Buf *key, Buf *val)
 }
 
 static void
+cells_key_fields(const WsRowShape *s, const uint8 *k, size_t kl, WsField *f)
+{
+	const uint8 *p = k,
+			   *end = k + kl;
+
+	for (int i = 0; i < s->nkey; i++)
+	{
+		uint64		len = 0;
+
+		if (!read_uvarint(&p, end, &len) || len > (uint64) (end - p))
+			malformed("a key's value runs past its end");
+		f[i].p = p;
+		f[i].len = (size_t) len;
+		f[i].null = false;
+		p += len;
+	}
+	if (p != end)
+		malformed("a key has bytes left over");
+}
+
+static int
+cells_key_cells(const uint8 *k, size_t kl, WsCell *out)
+{
+	if (kl == 0 || k[0] != 'r')
+		malformed("a keyless row's key has no mark");
+	return cells_parse(k + 1, kl - 1, out);
+}
+
+static void
 cells_row_decode(const WsRowShape *s, const uint8 *k, size_t kl, const uint8 *v, size_t vl,
 				 WsField *f)
 {
@@ -195,29 +250,10 @@ cells_row_decode(const WsRowShape *s, const uint8 *k, size_t kl, const uint8 *v,
 		f[i].null = true;
 	}
 	if (s->nkey == 0)
-	{
-		if (kl == 0 || k[0] != 'r')
-			malformed("a keyless row's key has no mark");
-		n = cells_parse(k + 1, kl - 1, c);
-	}
+		n = cells_key_cells(k, kl, c);
 	else
 	{
-		const uint8 *p = k,
-				   *end = k + kl;
-
-		for (int i = 0; i < s->nkey; i++)
-		{
-			uint64		len = 0;
-
-			if (!read_uvarint(&p, end, &len) || len > (uint64) (end - p))
-				malformed("a key's value runs past its end");
-			f[i].p = p;
-			f[i].len = (size_t) len;
-			f[i].null = false;
-			p += len;
-		}
-		if (p != end)
-			malformed("a key has bytes left over");
+		cells_key_fields(s, k, kl, f);
 		n = cells_parse(v, vl, c);
 	}
 
@@ -230,6 +266,8 @@ cells_row_decode(const WsRowShape *s, const uint8 *k, size_t kl, const uint8 *v,
 		{
 			WsField    *to = &f[s->by_tag[t].at];
 
+			if (s->by_tag[t].at < s->nkey)
+				malformed("a value has a cell for a key's column");
 			to->p = c[i].p;
 			to->len = c[i].len;
 			to->null = false;
@@ -237,10 +275,12 @@ cells_row_decode(const WsRowShape *s, const uint8 *k, size_t kl, const uint8 *v,
 	}
 }
 
-const WsRowCodec WsCellsRowCodec = {
+const WsRowCodecRoutine CellsWsRowCodec = {
 	.name = "cells",
 	.encode = cells_row_encode,
 	.decode = cells_row_decode,
+	.key_fields = cells_key_fields,
+	.key_cells = cells_key_cells,
 	.cells_encode = cells_encode,
 	.cells = cells_parse,
 };
@@ -296,6 +336,8 @@ ws_copy_split(const char *line, size_t len, WsField *f, int n, Buf *scratch)
 	int			i = 0;
 	size_t		start = 0;
 
+	if (n == 0 && len == 0)
+		return;
 	scratch->len = 0;
 	/* (room for them all at once: the fields point into it as they are made) */
 	buf_reserve(scratch, len + 1);

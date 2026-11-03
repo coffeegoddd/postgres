@@ -26,6 +26,13 @@ text_field(const char *s)
 
 static const WsField null_field = {NULL, 0, true};
 
+/* Fields set to garbage: what decoding leaves in them is decoding's. */
+static void
+scribble(WsField *f, int n)
+{
+	memset(f, 0x7f, (size_t) n * sizeof(WsField));
+}
+
 static bool
 bytes_are(const Buf *b, const char *want, size_t n)
 {
@@ -50,14 +57,14 @@ test_bytes(void)
 
 	/* keyed: the key's values length-prefixed; cells by tag, not by place */
 	ws_row_shape_init(&s, tags, 3, 1);
-	WsRows->encode(&s, f, &k, &v);
+	WsRowCodec->encode(&s, f, &k, &v);
 	CHECK(bytes_are(&k, "\x02" "ab", 3));
 	CHECK(bytes_are(&v, "\x05\x01q" "\xac\x02\x03xyz", 9));
 	ws_row_shape_free(&s);
 
 	/* keyless: the mark and all the cells; the value the caller's */
 	ws_row_shape_init(&s, tags, 3, 0);
-	WsRows->encode(&s, f, &k, &v);
+	WsRowCodec->encode(&s, f, &k, &v);
 	CHECK(bytes_are(&k, "r" "\x05\x01q" "\x07\x02" "ab" "\xac\x02\x03xyz", 14));
 	CHECK_EQ(v.len, 0);
 	ws_row_shape_free(&s);
@@ -79,8 +86,9 @@ test_round_trip(void)
 	for (int nkey = 0; nkey <= 2; nkey++)
 	{
 		ws_row_shape_init(&s, tags, 5, nkey);
-		WsRows->encode(&s, f, &k, &v);
-		WsRows->decode(&s, k.data, k.len, v.data, v.len, got);
+		WsRowCodec->encode(&s, f, &k, &v);
+		scribble(got, 5);
+		WsRowCodec->decode(&s, k.data, k.len, v.data, v.len, got);
 		CHECK(field_is(&got[0], "k1"));
 		CHECK(field_is(&got[1], ""));	/* an empty value is no NULL */
 		CHECK(field_is(&got[2], "three"));
@@ -118,14 +126,16 @@ test_schema_changes(void)
 	ws_row_shape_init(&s0, was, 3, 1);
 	ws_row_shape_init(&s1, added, 4, 1);
 	ws_row_shape_init(&s2, dropped, 2, 1);
-	WsRows->encode(&s0, f, &k0, &v0);
-	WsRows->encode(&s1, fa, &k1, &v1);
+	WsRowCodec->encode(&s0, f, &k0, &v0);
+	WsRowCodec->encode(&s1, fa, &k1, &v1);
 	CHECK(k0.len == k1.len && memcmp(k0.data, k1.data, k0.len) == 0);
 	CHECK(v0.len == v1.len && memcmp(v0.data, v1.data, v0.len) == 0);
 
-	WsRows->decode(&s1, k0.data, k0.len, v0.data, v0.len, got);
+	scribble(got, 4);
+	WsRowCodec->decode(&s1, k0.data, k0.len, v0.data, v0.len, got);
 	CHECK(field_is(&got[1], "three") && field_is(&got[2], "two") && got[3].null);
-	WsRows->decode(&s2, k0.data, k0.len, v0.data, v0.len, got);
+	scribble(got, 2);
+	WsRowCodec->decode(&s2, k0.data, k0.len, v0.data, v0.len, got);
 	CHECK(field_is(&got[0], "k") && field_is(&got[1], "three"));
 
 	ws_row_shape_free(&s0);
@@ -137,6 +147,87 @@ test_schema_changes(void)
 	buf_free(&v1);
 }
 
+/*
+ * The rows at the edges: a keyless row all NULL, its key the mark alone; a
+ * key-only row, its value empty and no buffer at all; the smallest and
+ * largest tags; a keyless row with a cell its shape has no column for.
+ */
+static void
+test_edge_rows(void)
+{
+	uint64		tags[] = {0, PG_UINT64_MAX};
+	uint64		one[] = {5};
+	WsField		nulls[] = {null_field, null_field};
+	WsField		f[] = {text_field("low"), text_field("high")};
+	WsField		got[2];
+	WsRowShape	s;
+	Buf			k = BUF_INIT,
+				v = BUF_INIT;
+
+	ws_row_shape_init(&s, tags, 2, 0);
+	WsRowCodec->encode(&s, nulls, &k, &v);
+	CHECK(bytes_are(&k, "r", 1));
+	scribble(got, 2);
+	WsRowCodec->decode(&s, k.data, k.len, NULL, 0, got);
+	CHECK(got[0].null && got[1].null);
+
+	WsRowCodec->encode(&s, f, &k, &v);
+	scribble(got, 2);
+	WsRowCodec->decode(&s, k.data, k.len, NULL, 0, got);
+	CHECK(field_is(&got[0], "low") && field_is(&got[1], "high"));
+	ws_row_shape_free(&s);
+
+	/* every column the key's: no cells, and no value */
+	ws_row_shape_init(&s, tags, 2, 2);
+	WsRowCodec->encode(&s, f, &k, &v);
+	CHECK_EQ(v.len, 0);
+	scribble(got, 2);
+	WsRowCodec->decode(&s, k.data, k.len, NULL, 0, got);
+	CHECK(field_is(&got[0], "low") && field_is(&got[1], "high"));
+	ws_row_shape_free(&s);
+
+	/* a keyless row read with a shape of one column: the other cells left out */
+	ws_row_shape_init(&s, tags, 2, 0);
+	WsRowCodec->encode(&s, f, &k, &v);
+	ws_row_shape_free(&s);
+	ws_row_shape_init(&s, one, 1, 0);
+	scribble(got, 1);
+	WsRowCodec->decode(&s, k.data, k.len, NULL, 0, got);
+	CHECK(got[0].null);
+	ws_row_shape_free(&s);
+	buf_free(&k);
+	buf_free(&v);
+}
+
+/* A key read on its own, through the codec: diff's way in. */
+static void
+test_keys(void)
+{
+	uint64		tags[] = {7, 8, 9};
+	WsField		f[] = {text_field("a"), text_field("bb"), text_field("v")};
+	WsField		got[3];
+	WsCell		c[WS_MAX_COLS];
+	WsRowShape	s;
+	Buf			k = BUF_INIT,
+				v = BUF_INIT;
+
+	ws_row_shape_init(&s, tags, 3, 2);
+	WsRowCodec->encode(&s, f, &k, &v);
+	scribble(got, 2);
+	WsRowCodec->key_fields(&s, k.data, k.len, got);
+	CHECK(field_is(&got[0], "a") && field_is(&got[1], "bb"));
+	ws_row_shape_free(&s);
+
+	ws_row_shape_init(&s, tags, 3, 0);
+	WsRowCodec->encode(&s, f, &k, &v);
+	CHECK_EQ(WsRowCodec->key_cells(k.data, k.len, c), 3);
+	CHECK(c[0].tag == 7 && c[1].tag == 8 && c[2].tag == 9);
+	CHECK(c[1].len == 2 && memcmp(c[1].p, "bb", 2) == 0);
+	ws_row_shape_free(&s);
+	buf_free(&k);
+	buf_free(&v);
+}
+
 static void
 test_cell_get(void)
 {
@@ -146,13 +237,43 @@ test_cell_get(void)
 	const uint8 *p;
 	size_t		len;
 
-	WsRows->cells_encode(c, 2, &v);
-	CHECK_EQ(WsRows->cells(v.data, v.len, out), 2);
+	WsRowCodec->cells_encode(c, 2, &v);
+	CHECK_EQ(WsRowCodec->cells(v.data, v.len, out), 2);
 	CHECK(out[0].tag == 2 && out[1].tag == 9);
 	CHECK(ws_cell_get(v.data, v.len, 9, &p, &len));
 	CHECK(len == 4 && memcmp(p, "nine", 4) == 0);
 	CHECK(!ws_cell_get(v.data, v.len, 3, &p, &len));
+	CHECK(!ws_cell_get(v.data, v.len, 10, &p, &len));
+	CHECK(!ws_cell_get(v.data, 0, 2, &p, &len));
 	buf_free(&v);
+}
+
+static void
+encode_twice(void *arg)
+{
+	WsCell		c[] = {{4, (const uint8 *) "a", 1}, {4, (const uint8 *) "b", 1}};
+	Buf			out = BUF_INIT;
+
+	WsRowCodec->cells_encode(c, 2, &out);
+}
+
+static void
+encode_too_many(void *arg)
+{
+	WsCell	   *c = palloc0_array(WsCell, WS_MAX_COLS + 1);
+	Buf			out = BUF_INIT;
+
+	for (int i = 0; i <= WS_MAX_COLS; i++)
+		c[i].tag = (uint64) i;
+	WsRowCodec->cells_encode(c, WS_MAX_COLS + 1, &out);
+}
+
+/* What cells would refuse to read is refused as it is written. */
+static void
+test_cells_encode_refuses(void)
+{
+	expect_error(encode_twice, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	expect_error(encode_too_many, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
 typedef struct Decoding
@@ -173,7 +294,7 @@ decode_it(void *arg)
 	WsRowShape	s;
 
 	ws_row_shape_init(&s, tags, 3, d->nkey);
-	WsRows->decode(&s, (const uint8 *) d->k, d->kl, (const uint8 *) d->v, d->vl, f);
+	WsRowCodec->decode(&s, (const uint8 *) d->k, d->kl, (const uint8 *) d->v, d->vl, f);
 }
 
 /* Malformed bytes are refused by name, whatever is wrong with them. */
@@ -193,10 +314,25 @@ test_malformed(void)
 		/* a keyless row without its mark, and an empty key */
 		{"x", 1, "", 0, 0},
 		{"", 0, "", 0, 0},
+		/* a value's cell for the key's column */
+		{"\x01" "a", 2, "\x01\x01q", 3, 1},
 	};
+	Buf			wide = BUF_INIT;
+	Decoding	d = {"\x01" "a", 2, NULL, 0, 1};
 
 	for (size_t i = 0; i < lengthof(bad); i++)
 		expect_error(decode_it, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+
+	/* one cell more than a table has columns */
+	for (int i = 0; i <= WS_MAX_COLS; i++)
+	{
+		buf_append_uvarint(&wide, (uint64) i + 10);
+		buf_append_uvarint(&wide, 0);
+	}
+	d.v = (const char *) wide.data;
+	d.vl = wide.len;
+	expect_error(decode_it, &d, ERRCODE_DATA_CORRUPTED, NULL);
+	buf_free(&wide);
 }
 
 static void
@@ -218,7 +354,7 @@ null_key(void *arg)
 				v = BUF_INIT;
 
 	ws_row_shape_init(&s, tags, 1, 1);
-	WsRows->encode(&s, f, &k, &v);
+	WsRowCodec->encode(&s, f, &k, &v);
 }
 
 static void
@@ -253,12 +389,17 @@ test_widest_row(void)
 		tags[i] = (uint64) (WS_MAX_COLS - i);
 		f[i] = text_field("x");
 	}
-	ws_row_shape_init(&s, tags, WS_MAX_COLS, 1);
-	WsRows->encode(&s, f, &k, &v);
-	WsRows->decode(&s, k.data, k.len, v.data, v.len, got);
-	for (int i = 0; i < WS_MAX_COLS; i++)
-		CHECK(field_is(&got[i], "x"));
-	ws_row_shape_free(&s);
+	/* (with no key: every column a cell, as many as the codec reads) */
+	for (int nkey = 0; nkey <= 1; nkey++)
+	{
+		ws_row_shape_init(&s, tags, WS_MAX_COLS, nkey);
+		WsRowCodec->encode(&s, f, &k, &v);
+		scribble(got, WS_MAX_COLS);
+		WsRowCodec->decode(&s, k.data, k.len, v.data, v.len, got);
+		for (int i = 0; i < WS_MAX_COLS; i++)
+			CHECK(field_is(&got[i], "x"));
+		ws_row_shape_free(&s);
+	}
 	buf_free(&k);
 	buf_free(&v);
 	pfree(tags);
@@ -298,24 +439,50 @@ test_copy_text(void)
 
 	ws_row_shape_init(&s, tags, 4, 0);
 	ws_copy_line(&s, f, &line);
-	CHECK_EQ(line.data[line.len - 1], '\n');
+	/* the line as a real COPY FROM reads it */
+	CHECK(bytes_are(&line,
+					"a\\\\b\\nc\\rd\\te\\bf\\fg\\vh\\\\N\t\\N\t\t\\\\N\n",
+					strlen("a\\\\b\\nc\\rd\\te\\bf\\fg\\vh\\\\N\t\\N\t\t\\\\N\n")));
 	ws_copy_split((const char *) line.data, line.len - 1, got, 4, &scratch);
 	CHECK(field_is(&got[0], hard));
 	CHECK(got[1].null);
 	CHECK(field_is(&got[2], ""));
 	CHECK(field_is(&got[3], "\\N"));
 	ws_row_shape_free(&s);
-	buf_free(&line);
-	buf_free(&scratch);
 	expect_error(split_too_many, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 	expect_error(split_too_few, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+
+	/* a line ending in a tab: a last field that is empty, no NULL */
+	ws_copy_split("a\t", 2, got, 2, &scratch);
+	CHECK(field_is(&got[0], "a") && field_is(&got[1], ""));
+	/* an empty line of one field: empty */
+	ws_copy_split("", 0, got, 1, &scratch);
+	CHECK(field_is(&got[0], ""));
+	/* a value ending in a backslash, there and back */
+	ws_row_shape_init(&s, tags, 1, 0);
+	f[0] = text_field("end\\");
+	ws_copy_line(&s, f, &line);
+	ws_copy_split((const char *) line.data, line.len - 1, got, 1, &scratch);
+	CHECK(field_is(&got[0], "end\\"));
+	ws_row_shape_free(&s);
+	/* a table with no stored columns: an empty line, of no fields */
+	ws_row_shape_init(&s, tags, 0, 0);
+	ws_copy_line(&s, f, &line);
+	CHECK(bytes_are(&line, "\n", 1));
+	ws_copy_split((const char *) line.data, line.len - 1, got, 0, &scratch);
+	ws_row_shape_free(&s);
+	buf_free(&line);
+	buf_free(&scratch);
 }
 
 static const ProllyUnitTest tests[] = {
 	{"bytes", test_bytes},
 	{"round_trip", test_round_trip},
 	{"schema_changes", test_schema_changes},
+	{"edge_rows", test_edge_rows},
+	{"keys", test_keys},
 	{"cell_get", test_cell_get},
+	{"cells_encode_refuses", test_cells_encode_refuses},
 	{"malformed", test_malformed},
 	{"shapes", test_shapes},
 	{"widest_row", test_widest_row},

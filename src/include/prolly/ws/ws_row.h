@@ -72,9 +72,10 @@ extern int	ws_row_shape_at(const WsRowShape *s, uint64 tag);
 
 /*
  * The row codec.  Malformed bytes (cells out of order, a length past the
- * end, a key with bytes left over) raise ERRCODE_DATA_CORRUPTED.
+ * end, a key with bytes left over, a value's cell for a key's column) raise
+ * ERRCODE_DATA_CORRUPTED.
  */
-typedef struct WsRowCodec
+typedef struct WsRowCodecRoutine
 {
 	const char *name;
 	/* A row's key and value (replacing theirs) from its fields. */
@@ -85,18 +86,29 @@ typedef struct WsRowCodec
 	 */
 	void		(*decode) (const WsRowShape *s, const uint8 *k, size_t kl,
 						   const uint8 *v, size_t vl, WsField *f);
-	/* Cells appended to out, sorted by tag (c is sorted in place). */
+	/*
+	 * A keyed row's key as its values (f[0] on, s->nkey of them), pointing
+	 * into it.
+	 */
+	void		(*key_fields) (const WsRowShape *s, const uint8 *k, size_t kl, WsField *f);
+	/* A keyless row's key as its cells, at most WS_MAX_COLS: how many. */
+	int			(*key_cells) (const uint8 *k, size_t kl, WsCell *out);
+	/*
+	 * Cells appended to out, sorted by tag (c is sorted in place).  A tag
+	 * given twice, or more cells than a table has columns, is an error: what
+	 * cells would then refuse to read.
+	 */
 	void		(*cells_encode) (WsCell *c, int n, Buf *out);
 	/* A value's cells, at most WS_MAX_COLS: how many. */
 	int			(*cells) (const uint8 *v, size_t vl, WsCell *out);
-} WsRowCodec;
+} WsRowCodecRoutine;
 
-extern PGDLLIMPORT const WsRowCodec WsCellsRowCodec;
+extern PGDLLIMPORT const WsRowCodecRoutine CellsWsRowCodec;
 
 /* The codec the working-set model uses. */
-extern PGDLLIMPORT const WsRowCodec *WsRows;
+extern PGDLLIMPORT const WsRowCodecRoutine *WsRowCodec;
 
-/* A value's cell of this tag, if it has one. */
+/* A value's cell of this tag, if it has one (read only as far as it). */
 extern bool ws_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *len);
 
 /* COPY text: a value escaped, a line split, and a line from a row's fields. */
@@ -104,7 +116,8 @@ extern void ws_copy_escape(Buf *b, const uint8 *v, size_t len);
 
 /*
  * A line (no newline) as n fields, unescaped into scratch, which they then
- * point into.  Any other number of fields is an error.
+ * point into.  Any other number of fields is an error.  (A table with no
+ * stored columns has empty lines, of no fields.)
  */
 extern void ws_copy_split(const char *line, size_t len, WsField *f, int n, Buf *scratch);
 /* The shape's fields as a line, with its newline (replacing line's). */
