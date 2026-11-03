@@ -15,11 +15,23 @@
  *	vc/commit/<hash>	a commit the window's history keeps, which it holds
  *						(a commit's parents are weak references: its row is
  *						what keeps it)
+ *	vc/repo				the repository's chunk: where each commit outside
+ *						the window is (a map), the next segment's id, and
+ *						the repository's name
+ *	vc/segment/<id>		commits severed from the window together, which a
+ *						local segment holds (an exported one's archive does)
  * A commit writes its own reference and moves its branch's, and nothing
  * else, so commits on different branches change different rows.  A VcRepo
  * is a backend's view of them: the branch it has checked out is its own,
  * and each call reads the references it needs, so opening one reads main's
  * reference, its chunk and head commit, however long the history.
+ *
+ * The window's own calls (sever, and a segment's export, discard and
+ * attach) lock vc/repo for update, and take turns; calls that point a
+ * branch at a commit they did not just write (a branch made, a reset, a
+ * merge) lock it for share, so that a sever cannot cut a commit they are
+ * moving a branch to.  A commit, and a working set's change, take only
+ * their branch's reference.
  *
  * Calls that change a branch lock its reference first (for update), and
  * read it after, so two that change one branch take turns: two commits on
@@ -257,6 +269,131 @@ extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
 							unsigned flags, VcTableChangeFn fn, void *arg);
 /* Whether the window's history keeps the commit (it has a reference). */
 extern bool vc_in_window(VcRepo *r, const PHash *commit);
+
+/*
+ * The window: every branch head (and pending merge head), each pinned
+ * commit, and each commit an ancestor of a head that the head's floors keep
+ * and its ceilings allow.  Measured from a head, a commit's
+ *	commits is how many generations it lies back (the head is 1),
+ *	bytes is the change bytes of it and every commit after it up to the head
+ *		(a commit's change bytes: the chunks its root has that its first
+ *		parent's root lacks),
+ *	age is how long ago it was committed.
+ * A floor keeps a commit while commits <= depth, or bytes from the commits
+ * after it < keep_bytes, or age < keep_seconds: any floor keeps it, and with
+ * no floor set everything is kept.  A ceiling cuts it once commits >
+ * max_commits, or bytes > max_bytes, or age >= max_seconds: any ceiling
+ * cuts it, and a ceiling wins over a floor.  Zero leaves a limit unset; a
+ * window with none set is refused.  Heads are always kept.
+ *
+ * Low marks.  Without them the window slides: each sever cuts a head's
+ * history back to exactly the window above (its high mark).  With any low
+ * mark set, a head's window grows until it reaches its high mark, which is
+ * when the window would let go of a commit still held; the sever then cuts
+ * that head's history back to its low mark, the window with the low marks
+ * as further ceilings, and it grows again.  low_commits = 1 keeps only the
+ * head (a tumbling window, history in batches); low marks at or past the
+ * ceilings slide as before.  A head short of its high mark keeps its whole
+ * window, so each branch fills and empties on its own.  A low mark needs a
+ * high mark: low marks alone are refused.
+ */
+typedef struct VcWindow
+{
+	uint32		depth;			/* floor: generations */
+	const PHash *pinned;
+	size_t		npinned;
+	uint64		keep_bytes;		/* floor */
+	uint64		keep_seconds;	/* floor */
+	uint64		max_commits;	/* ceiling */
+	uint64		max_bytes;		/* ceiling */
+	uint64		max_seconds;	/* ceiling */
+	uint64		low_commits;	/* low mark */
+	uint64		low_bytes;		/* low mark */
+	uint64		low_seconds;	/* low mark */
+} VcWindow;
+
+#define VC_NO_SEGMENT PG_UINT32_MAX
+
+/* A segment as its row names it: local, or exported to an archive. */
+typedef struct VcSegment
+{
+	uint32		id;
+	bool		exported;
+	PHash	   *commits;
+	size_t		n;
+	/* members that commits kept in the window name as parents */
+	PHash	   *edge;
+	size_t		nedge;
+	char	   *archive_name;	/* exported: where */
+	PHash		manifest;		/* exported: holds it there */
+} VcSegment;
+
+/*
+ * Anything chunks can be copied to or from by hash: an archive, a remote's
+ * store, another repository's.  Everything copied is checked against its
+ * name, so any will do.  The name is what a segment records of it.
+ */
+typedef struct VcSource
+{
+	const char *name;
+	ChunkStore *cs;
+} VcSource;
+
+/* What an archive says about a segment exported to it. */
+typedef struct VcManifest
+{
+	char	   *repo;			/* the repository that exported it */
+	PHash	   *members;
+	uint64	   *gens;
+	size_t		n;
+	PHash	   *bounds;			/* parents of members that are not members */
+	size_t		nb;
+} VcManifest;
+
+typedef enum VcLocation
+{
+	VC_LOC_UNKNOWN,
+	VC_LOC_WINDOW,				/* held by the window's history */
+	VC_LOC_SEGMENT,				/* in a local, detached segment */
+	VC_LOC_EXPORTED,			/* in a segment moved to an archive */
+	VC_LOC_DISCARDED,			/* a parent of a commit held, discarded here */
+	VC_LOC_BOUNDARY				/* named as a parent; never had locally */
+} VcLocation;
+
+/*
+ * Severing.  vc_sever moves every commit the window no longer covers into
+ * a new local segment, its id in *seg (or VC_NO_SEGMENT): only holds move,
+ * from the commits' references to the segment's, and no chunk is copied
+ * or freed.  A segment can then be exported (copied whole to an archive,
+ * then let go of here), discarded, or attached again.
+ *
+ * A discarded segment's commits are forgotten, so the repository's state
+ * stays the size of what it holds however much is cut.  What it still
+ * knows of them is what the commits it holds name: their parents, which
+ * vc_locate reports as discarded.  Deeper discarded commits are unknown
+ * again.
+ */
+extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg);
+extern int	vc_segment_export(VcRepo *r, uint32 seg, const VcSource *archive);
+/* archive: the one an exported segment is in (NULL for a local one). */
+extern int	vc_segment_discard(VcRepo *r, uint32 seg, ChunkStore *archive);
+extern int	vc_segment_attach(VcRepo *r, uint32 seg, ChunkStore *archive);
+/* The segment, false if it has no row (discarded, attached, or none). */
+extern bool vc_segment_get(VcRepo *r, uint32 seg, VcSegment *out);
+extern void vc_segment_free(VcSegment *seg);
+extern VcLocation vc_locate(VcRepo *r, const PHash *commit, uint32 *seg);
+
+/* Every commit the repository knows of and where it is (O(history); for tests). */
+typedef void (*VcLocFn) (void *arg, const PHash *commit, VcLocation where, uint32 seg);
+extern void vc_locations(VcRepo *r, VcLocFn fn, void *arg);
+
+/* The name the repository's manifests give it (and remotes, its hints). */
+extern void vc_repo_set_name(VcRepo *r, const char *name);
+
+/* Archives: list and read the manifests of segments exported there. */
+extern void vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n);
+extern bool vc_manifest_load(ChunkStore *archive, const PHash *h, VcManifest *m);
+extern void vc_manifest_free(VcManifest *m);
 
 /* The clock commits read, in microseconds since 1970 (for tests). */
 extern void vc_set_clock(VcRepo *r, uint64 (*now) (void *arg), void *arg);

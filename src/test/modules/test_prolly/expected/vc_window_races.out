@@ -1,0 +1,73 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_reset s2_sever s1_commit c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_reset: SELECT test_vc_reset('main', 'base', true);
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step s2_sever: SELECT test_vc_sever(1) AS cut; <waiting ...>
+step s1_commit: COMMIT;
+step s2_sever: <... completed>
+cut
+---
+  4
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|commits
+----+-------
+t   |      1
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_sever s2_reset s1_commit c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_sever: SELECT test_vc_sever(1) AS cut;
+cut
+---
+  4
+(1 row)
+
+step s2_reset: SELECT test_vc_reset('main', 'base', true); <waiting ...>
+step s1_commit: COMMIT;
+step s2_reset: <... completed>
+test_vc_reset
+-------------
+f            
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|commits
+----+-------
+t   |      1
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+

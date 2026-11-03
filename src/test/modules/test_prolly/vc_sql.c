@@ -39,6 +39,7 @@ PG_FUNCTION_INFO_V1(test_vc_working_has);
 PG_FUNCTION_INFO_V1(test_vc_head_in_window);
 PG_FUNCTION_INFO_V1(test_vc_clear);
 PG_FUNCTION_INFO_V1(test_vc_rows);
+PG_FUNCTION_INFO_V1(test_vc_sever);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -441,6 +442,34 @@ test_vc_rows(PG_FUNCTION_ARGS)
 		if (vc_table_get(&r.ctx, &b.head_root, "t", &t))
 			vc_must_ok(prolly_count(&r.ctx, &t.data, &n), &r.ctx);
 		vc_branch_free(&b);
+	});
+	PG_RETURN_INT64((int64) n);
+}
+
+/*
+ * test_vc_sever(depth int4) returns int8: every commit outside the window
+ * of that depth moved into a new segment; how many (0: none)
+ */
+Datum
+test_vc_sever(PG_FUNCTION_ARGS)
+{
+	int32		depth = PG_GETARG_INT32(0);
+	VcRepo		r;
+	uint64		n = 0;
+
+	VC_CALL(r, 0,
+	{
+		VcWindow	w = {.depth = (uint32) depth};
+		uint32		seg;
+		VcSegment	s;
+
+		if (vc_sever(&r, &w, &seg) != VC_OK)
+			elog(ERROR, "no window of depth %d", depth);
+		if (seg != VC_NO_SEGMENT && vc_segment_get(&r, seg, &s))
+		{
+			n = s.n;
+			vc_segment_free(&s);
+		}
 	});
 	PG_RETURN_INT64((int64) n);
 }

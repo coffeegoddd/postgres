@@ -82,7 +82,31 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_vc       | window_edge                       | ok     | 
  engine_vc       | vc_scaling                        | ok     | 
  engine_vc       | merge_base_cost                   | ok     | 
-(70 rows)
+ engine_window   | detach_moves_holds_only           | ok     | 
+ engine_window   | export_self_contained             | ok     | 
+ engine_window   | second_export_copies_diff         | ok     | 
+ engine_window   | discard_frees_exactly             | ok     | 
+ engine_window   | branches_cut_at_shared_ancestor   | ok     | 
+ engine_window   | stale_branch_head_stays           | ok     | 
+ engine_window   | merge_commit_parents_across_edge  | ok     | 
+ engine_window   | overlapping_branch_windows        | ok     | 
+ engine_window   | pinned_commit_stays               | ok     | 
+ engine_window   | refuse_outside_window             | ok     | 
+ engine_window   | window_scaling                    | ok     | 
+ engine_window   | state_does_not_grow_with_history  | ok     | 
+ engine_window   | many_branches                     | ok     | 
+ engine_window   | change_bytes                      | ok     | 
+ engine_window   | window_limits                     | ok     | 
+ engine_window   | window_policy_random              | ok     | 
+ engine_window   | marks_tumbling                    | ok     | 
+ engine_window   | marks_hysteresis                  | ok     | 
+ engine_window   | marks_at_high_slide               | ok     | 
+ engine_window   | marks_need_high                   | ok     | 
+ engine_window   | marks_floor_is_high               | ok     | 
+ engine_window   | marks_branches_independent        | ok     | 
+ engine_window   | marks_pinned                      | ok     | 
+ engine_window   | marks_random                      | ok     | 
+(94 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

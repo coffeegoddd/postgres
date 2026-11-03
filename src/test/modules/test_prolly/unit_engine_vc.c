@@ -239,21 +239,21 @@ ENGINE_TEST(test_refs_contract)
 	RefList		l = {0};
 	ChunkCounts counts;
 
-	CHECK(!vc_refs_get(refs, "test/x", false, &got));
+	CHECK(!vc_refs_get(refs, "test/x", VC_REF_READ, &got));
 	/* a name too long for any reference is none, on either implementation */
 	{
 		char		longname[300];
 
 		memset(longname, 'n', sizeof(longname) - 1);
 		longname[sizeof(longname) - 1] = '\0';
-		CHECK(!vc_refs_get(refs, longname, false, &got));
+		CHECK(!vc_refs_get(refs, longname, VC_REF_READ, &got));
 		CHECK(!vc_refs_remove(refs, longname));
 	}
 	CHECK(vc_refs_add(refs, "test/x", &a));
 	CHECK(!vc_refs_add(refs, "test/x", &b));
-	CHECK(vc_refs_get(refs, "test/x", true, &got) && phash_eq(&got, &a));
+	CHECK(vc_refs_get(refs, "test/x", VC_REF_UPDATE, &got) && phash_eq(&got, &a));
 	vc_refs_set(refs, "test/x", &b);
-	CHECK(vc_refs_get(refs, "test/x", false, &got) && phash_eq(&got, &b));
+	CHECK(vc_refs_get(refs, "test/x", VC_REF_READ, &got) && phash_eq(&got, &b));
 	vc_refs_set(refs, "test/y", &a);
 	vc_refs_set(refs, "tesu", &a);	/* (just past the prefix) */
 	CHECK(cs_counts(cs, a.b, &counts));
@@ -268,7 +268,7 @@ ENGINE_TEST(test_refs_contract)
 
 	CHECK(vc_refs_remove(refs, "test/x"));
 	CHECK(!vc_refs_remove(refs, "test/x"));
-	CHECK(!vc_refs_get(refs, "test/x", false, &got));
+	CHECK(!vc_refs_get(refs, "test/x", VC_REF_READ, &got));
 	CHECK(cs_counts(cs, b.b, &counts));
 	CHECK_EQ(counts.roots, 0);
 	CHECK(vc_refs_remove(refs, "test/y"));
@@ -1062,8 +1062,11 @@ ENGINE_MEMORY_TEST(test_vc_scaling)
 		vc_scale_case(sizes[i], x);
 		h = (uint64) x->height;
 
-		/* O(1): a branch's chunk and its head commit, read or written */
-		CHECK_LE(x->branch_reads, 2);
+		/*
+		 * O(1): a branch's chunk and its head commit, read or written (and
+		 * the repository's chunk, for a branch made)
+		 */
+		CHECK_LE(x->branch_reads, 3);
 		CHECK_EQ(x->branch_writes, 1);
 		CHECK_LE(x->checkout_reads, 2);
 		CHECK_EQ(x->checkout_writes, 0);
@@ -1071,8 +1074,8 @@ ENGINE_MEMORY_TEST(test_vc_scaling)
 		CHECK_EQ(x->commit_writes, 2);
 		/* O(k log n): a commit reads what changed, to measure its change bytes */
 		CHECK_LE(x->commit_reads, 4 * VC_K * h + 6);
-		/* the commit, and the branch's chunk and head */
-		CHECK_LE(x->reset_reads, 3);
+		/* the commit, the branch's chunk and head, and the repository's */
+		CHECK_LE(x->reset_reads, 4);
 		CHECK_EQ(x->log_reads, 3);
 		/* O(k log n); the +8 covers the root-value map, schema and branch */
 		CHECK_LE(x->edit_writes, 3 * VC_K * h + 8);
