@@ -25,7 +25,12 @@ $node->start;
 $node->safe_psql('postgres', q{
 	CREATE EXTENSION test_prolly;
 	CREATE SEQUENCE n;
-	CREATE TABLE put (h bytea, d bytea);
+	-- (a chunk's bytes from its number: nothing kept of the puts, so the
+	-- test itself grows no relation the writers share)
+	CREATE FUNCTION d(i int8) RETURNS bytea LANGUAGE sql IMMUTABLE
+		AS $$SELECT convert_to(repeat('lane chunk ' || i || ' ', 300), 'UTF8')$$;
+	CREATE FUNCTION h(b bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+		AS 'SELECT substr(sha256(b), 1, 20)';
 });
 
 # sixty-four backends, each putting chunks of a few kB (pages of their own
@@ -39,9 +44,7 @@ $node->pgbench(
 	'sixty-four backends write the history store at once',
 	{
 		'078_put' => q{
-INSERT INTO put SELECT substr(sha256(d), 1, 20), d
-  FROM (SELECT convert_to(repeat('lane chunk ' || nextval('n') || ' ', 300), 'UTF8') AS d) s
-  WHERE test_cs_put('pages', d) IS NOT NULL;
+SELECT (test_cs_put('pages', d(nextval('n')))).stored;
 }
 	});
 
@@ -58,10 +61,9 @@ is(scalar(grep { /still waiting/ } @waited), 0, 'no backend waited on another')
   or diag(join("\n", @named, @waited));
 
 # every chunk reads back, here, in one backend, from every lane
-is( $node->safe_psql('postgres',
-		q{SELECT count(*) FILTER (WHERE test_cs_get('pages', h) IS DISTINCT FROM d) FROM put}),
-	'0', 'every chunk reads back');
-is($node->safe_psql('postgres', q{SELECT count(*) FROM put}), '2560', 'every chunk put');
+my $read_back = q{SELECT count(*) FILTER (WHERE test_cs_get('pages', h(d(i))) IS DISTINCT FROM d(i))
+	FROM generate_series(1, 2560) i};
+is($node->safe_psql('postgres', $read_back), '0', 'every chunk reads back');
 
 # the lanes: relations of the log's own, each internally dependent on it
 my $lanes = $node->safe_psql('postgres',
@@ -77,9 +79,7 @@ is( $node->safe_psql('postgres',
 # after a restart (crash recovery replaying every lane's WAL) the same
 $node->stop('immediate');
 $node->start;
-is( $node->safe_psql('postgres',
-		q{SELECT count(*) FILTER (WHERE test_cs_get('pages', h) IS DISTINCT FROM d) FROM put}),
-	'0', 'every chunk reads back after crash recovery');
+is($node->safe_psql('postgres', $read_back), '0', 'every chunk reads back after crash recovery');
 is( $node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
 	't', "the store's audit passes");
 

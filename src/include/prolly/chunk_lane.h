@@ -19,7 +19,17 @@
  * in its own transaction (gone with it if that aborts, and the entry with
  * it).  A backend holds its lane until it exits (a crash lets go of them
  * all), so a log has as many lanes as it has had writers at once.  A
- * place in the log carries its lane in its top LANE_BITS bits.
+ * place in the log carries its lane in its top LANE_BITS bits.  A lane's
+ * number is never given again, even to a lane whose making aborted: the
+ * entries the aborted transaction left name it, and must name no lane; a
+ * log makes at most LANE_MAX lanes in its life.
+ *
+ * Each lane's free space is its own: a backend's appends reuse the
+ * segments freed in its own lane, never another's (that lane's holder
+ * alone may grow it).  Compaction moves chunks off any lane's tail into
+ * the compacting backend's lane, so that the tails of lanes no one writes
+ * to are cut off in turn.  A lane is made in its log's tablespace as it is
+ * then; moving the log's relation moves its own storage, not its lanes'.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
