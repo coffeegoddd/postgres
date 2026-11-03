@@ -658,21 +658,39 @@ free_unheld_body(void *arg)
 
 /*
  * Freeing a tree whose store is damaged below it is an error naming the
- * chunk gone, not a crash, nor counts gone wrong.
+ * chunk gone, not a crash, nor counts gone wrong: with the chunk put back,
+ * the audit passes and the rest frees.
  */
 ENGINE_MEMORY_TEST(test_free_over_damage)
 {
 	ChunkStore *cs = memstore_create();
 	ProllyCtx	ctx = t_ctx(cs, &small_policy);
 	PHash		a,
-				leaf;
+				leaf,
+				again;
 	FreeArg		fa = {cs};
+	uint32		len;
+	uint8	   *bytes;
 
 	a = build_even_rows(&ctx, 5000);	/* held, not rooted */
 	leaf = leaf_holding(&ctx, &a, 4000);
 	MemoryChunkStoreEndHolds(cs);
+	bytes = cs_get(cs, leaf.b, &len);
 	MemoryChunkStoreDrop(cs, leaf.b);	/* damage under a tree to free */
 	expect_error(free_unheld_body, &fa, ERRCODE_DATA_CORRUPTED, &leaf);
+
+	/*
+	 * The leaf put back, with the one reference to it its drop took (its
+	 * parent's, which the freeing stopped at)
+	 */
+	CHECK(cs_put(cs, bytes, len, again.b));
+	CHECK(phash_eq(&again, &leaf));
+	MemoryChunkStoreMiscount(leaf.b);
+	MemoryChunkStoreEndHolds(cs);
+	check_store(cs, store_count(cs));
+	CHECK(cs_free_unheld(cs) > 0);
+	CHECK_EQ(store_count(cs), 0);
+	pfree(bytes);
 	cs_destroy(cs);
 }
 
@@ -778,7 +796,7 @@ ENGINE_MEMORY_TEST(test_sever_frees_chunk_diff)
 ENGINE_MEMORY_TEST(test_repair_restores_severed_tree)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = MemoryChunkStoreCreate();
+	ChunkStore *archive = memstore_create_own();
 	ProllyCtx	ctx = t_ctx(cs, &small_policy);
 	PHash		a,
 				b;
@@ -826,7 +844,6 @@ ENGINE_MEMORY_TEST(test_repair_restores_severed_tree)
 	pfree(got);
 	batch_free(&eb);
 	cs_destroy(cs);
-	MemoryChunkStoreDestroy(archive);
 }
 
 typedef struct RepairArg
@@ -848,7 +865,7 @@ repair_body(void *arg)
 ENGINE_MEMORY_TEST(test_repair_rejects_bad_source)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = MemoryChunkStoreCreate();
+	ChunkStore *archive = memstore_create_own();
 	ProllyCtx	ctx = t_ctx(cs, &small_policy);
 	PHash		a,
 				b,
@@ -856,6 +873,7 @@ ENGINE_MEMORY_TEST(test_repair_rejects_bad_source)
 	EditBatch	eb;
 	PHashMap	only_a;
 	RepairArg	ra = {&ctx, archive, &a};
+	ChunkStoreStats st;
 	uint64		before;
 	uint32		len;
 	uint8	   *bytes;
@@ -874,10 +892,16 @@ ENGINE_MEMORY_TEST(test_repair_rejects_bad_source)
 	sever(cs, &a);
 	before = store_count(cs);
 
-	/* a flipped byte in the source is caught by its name */
-	bytes = cs_get(archive, victim.b, &len);
+	/*
+	 * a flipped byte in the source is caught by its name (the copy is one
+	 * batch, refused whole: nothing of it stored)
+	 */
+	bytes = cs_get(archive, victim.b, &len);	/* (for its length) */
+	pfree(bytes);
+	st = *cs_stats(cs);
 	MemoryChunkStoreDamage(archive, victim.b, len - 1);
 	expect_error(repair_body, &ra, ERRCODE_DATA_CORRUPTED, &victim);
+	CHECK_EQ(STATS_DELTA(cs, st, stored), 0);
 	CHECK(!cs_has(cs, a.b));
 	release(cs);
 	CHECK_EQ(store_count(cs), before);
@@ -885,18 +909,18 @@ ENGINE_MEMORY_TEST(test_repair_rejects_bad_source)
 	MemoryChunkStoreDamage(archive, victim.b, len - 1);
 
 	/* a chunk the source lacks is named */
+	st = *cs_stats(cs);
 	MemoryChunkStoreDrop(archive, victim.b);
 	expect_error(repair_body, &ra, ERRCODE_UNDEFINED_OBJECT, &victim);
+	CHECK_EQ(STATS_DELTA(cs, st, stored), 0);
 	CHECK(!cs_has(cs, a.b));
 	release(cs);
 	CHECK_EQ(store_count(cs), before);
 	check_store(cs, 0);
 
-	pfree(bytes);
 	phmap_free(&only_a);
 	batch_free(&eb);
 	cs_destroy(cs);
-	MemoryChunkStoreDestroy(archive);
 }
 
 /* --------------------------------------------------------- reverse deltas */
@@ -1018,7 +1042,7 @@ static void
 life_scale_case(uint64 n, LifeScale *s)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = MemoryChunkStoreCreate();
+	ChunkStore *archive = memstore_create_own();
 	ProllyCtx	ctx = t_ctx(cs, &small_policy);
 	PHash		a,
 				b,
@@ -1090,7 +1114,6 @@ life_scale_case(uint64 n, LifeScale *s)
 	phmap_free(&d);
 	batch_free(&eb);
 	cs_destroy(cs);
-	MemoryChunkStoreDestroy(archive);
 }
 
 /*

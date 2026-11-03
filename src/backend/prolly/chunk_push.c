@@ -128,7 +128,6 @@ decode_manifest(const char *data, size_t len, char **name, uint8 **roots, int *n
 	memcpy(*roots, data + sizeof(h) + namelen, (Size) *n * CHUNK_HASH_LEN);
 }
 
-
 /* the hashes of a bytea[] of roots, each a chunk's, none twice */
 static uint8 *
 array_hashes(ArrayType *arr, int *n)

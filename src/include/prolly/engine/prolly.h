@@ -193,8 +193,9 @@ extern int	prolly_delta_apply(ProllyCtx *ctx, const PHash *delta, PHash *out);
  * Repair: the chunks of the tree root the context's store has not, copied
  * into it from source, each checked against its name as it is put; how
  * many.  Those it has, root's own included, are held, not walked below.
- * A chunk source lacks, or bytes not their name's, is an error raised, and
- * what was copied before it stays, held until the transaction ends.
+ * A chunk source lacks, or bytes not their name's, is an error raised;
+ * what was copied before it stays as the store keeps a failed
+ * transaction's puts (the memory store keeps them, "pages" does not).
  */
 extern uint64 prolly_repair(ProllyCtx *ctx, ChunkStore *source,
 							const PHash *root);

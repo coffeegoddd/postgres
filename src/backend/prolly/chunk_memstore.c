@@ -4,11 +4,12 @@
  *	  "memory", a backend's chunk store in memory, for unit tests
  *	  (prolly/chunkstore.h).
  *
- * The chunks, their counts and its pins are the backend's alone, kept in a
- * hash table that lasts as long as the backend (or MemoryChunkStoreReset).
- * Tests may make stores of their own beside it (MemoryChunkStoreCreate: a
- * second store to copy from), end their holds before the transaction does,
- * and damage them (a chunk dropped, or its bytes changed).
+ * Each store's chunks, their counts and its pins are its own, kept in hash
+ * tables of its own: the backend's store's last as long as the backend (or
+ * MemoryChunkStoreReset), a test's own store's until it is destroyed
+ * (MemoryChunkStoreCreate: a second store to copy from).  Tests may end a
+ * store's holds before the transaction does, and damage it (a chunk
+ * dropped, or a byte of it changed).
  * Its lifetime rules are the interface's, made at once, not by
  * transactions: a put, a root's change or a free stands though its
  * transaction aborts.  Its pins are let go of as each transaction ends.
