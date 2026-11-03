@@ -22,6 +22,7 @@
 
 #include "access/htup_details.h"
 #include "common/hashfn.h"
+#include "common/pg_prng.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -59,6 +60,10 @@ PG_FUNCTION_INFO_V1(test_vc_bench_diff);
 PG_FUNCTION_INFO_V1(test_vc_bench_load);
 PG_FUNCTION_INFO_V1(test_vc_bench_edit);
 PG_FUNCTION_INFO_V1(test_vc_bench_merge);
+PG_FUNCTION_INFO_V1(test_backend_private_mb);
+PG_FUNCTION_INFO_V1(test_vc_bench_sever);
+PG_FUNCTION_INFO_V1(test_vc_bench_deep_probe);
+PG_FUNCTION_INFO_V1(test_vc_bench_deep_commits);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -810,8 +815,8 @@ us_since(TimestampTz start)
  * n rows of table t (made if the working set has none), first, first +
  * stride, ..., set to version, in one edit of the branch's working set
  */
-static void
-edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version);
+static void edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride,
+							uint64 version);
 
 static void
 edit_rows(VcRepo *r, uint64 lo, uint64 hi, uint64 version)
@@ -819,8 +824,9 @@ edit_rows(VcRepo *r, uint64 lo, uint64 hi, uint64 version)
 	edit_rows_every(r, lo, hi - lo, 1, version);
 }
 
+/* Rows ks (n, ascending) set to version, in one edit of the working set. */
 static void
-edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version)
+edit_keys(VcRepo *r, const uint64 *ks, uint64 n, uint64 version)
 {
 	PHash		rv = vc_working_lock(r),
 				out;
@@ -834,8 +840,8 @@ edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version
 		elog(ERROR, "could not make table t");
 	for (size_t i = 0; i < n; i++)
 	{
-		put_u64(keys + i * 8, first + i * stride);
-		put_u64(vals + i * 16, first + i * stride);
+		put_u64(keys + i * 8, ks[i]);
+		put_u64(vals + i * 16, ks[i]);
 		put_u64(vals + i * 16 + 8, version);
 		e[i].key = keys + i * 8;
 		e[i].klen = 8;
@@ -850,6 +856,17 @@ edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version
 	pfree(e);
 	pfree(keys);
 	pfree(vals);
+}
+
+static void
+edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version)
+{
+	uint64	   *ks = palloc_array(uint64, Max(n, 1));
+
+	for (uint64 i = 0; i < n; i++)
+		ks[i] = first + i * stride;
+	edit_keys(r, ks, n, version);
+	pfree(ks);
 }
 
 /*
@@ -1143,6 +1160,225 @@ test_vc_bench_edit(PG_FUNCTION_ARGS)
 		us = us_since(start);
 	});
 	PG_RETURN_FLOAT8(us);
+}
+
+static int
+cmp_u64(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a,
+				y = *(const uint64 *) b;
+
+	return x < y ? -1 : x > y;
+}
+
+/*
+ * test_vc_bench_deep_commits(branch text, n int4, changes int4, rows int8)
+ * returns float8: n commits on branch, each setting changes rows of the
+ * first rows (distinct, at random); microseconds a commit
+ */
+Datum
+test_vc_bench_deep_commits(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		n = PG_GETARG_INT32(1);
+	int32		changes = Max(PG_GETARG_INT32(2), 1);
+	int64		rows = Max(PG_GETARG_INT64(3), changes);
+	static uint64 version = 0;
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		uint64	   *ks = palloc_array(uint64, changes);
+		TimestampTz start;
+
+		checkout(&r, branch);
+		start = GetCurrentTimestamp();
+		for (int32 i = 0; i < n; i++)
+		{
+			int32		m = 0;
+
+			CHECK_FOR_INTERRUPTS();
+			while (m < changes)
+			{
+				uint64		k = pg_prng_uint64_range(&pg_global_prng_state, 0, (uint64) rows - 1);
+				bool		dup = false;
+
+				for (int32 j = 0; j < m; j++)
+					dup |= ks[j] == k;
+				if (!dup)
+					ks[m++] = k;
+			}
+			qsort(ks, changes, sizeof(uint64), cmp_u64);
+			edit_keys(&r, ks, changes, ++version);
+			(void) vc_commit(&r, "tx");
+		}
+		us = us_since(start) / Max(n, 1);
+		pfree(ks);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+/* (a commit's hashes collected, first parents, newest first) */
+typedef struct LineAcc
+{
+	PHash	   *v;
+	size_t		n,
+				cap;
+} LineAcc;
+
+static void
+line_fn(void *arg, const VcCommit *c)
+{
+	LineAcc    *a = arg;
+
+	if (a->n == a->cap)
+	{
+		a->cap = Max(a->cap * 2, 1024);
+		a->v = a->v ? repalloc_huge(a->v, a->cap * sizeof(PHash)) :
+			palloc_extended(a->cap * sizeof(PHash), MCXT_ALLOC_HUGE);
+	}
+	a->v[a->n++] = c->hash;
+}
+
+/* A row diff of the table between two commits: milliseconds, and its rows. */
+static double
+deep_diff(VcRepo *r, const PHash *a, const PHash *b, uint64 *rows)
+{
+	VcCommit	ca,
+				cb;
+	VcTable		ta,
+				tb;
+	DiffCount	dc = {&r->ctx, 0};
+	TimestampTz start = GetCurrentTimestamp();
+
+	if (!vc_commit_load(&r->ctx, a, &ca) || !vc_commit_load(&r->ctx, b, &cb) ||
+		!vc_table_get(&r->ctx, &ca.root, "t", &ta) || !vc_table_get(&r->ctx, &cb.root, "t", &tb))
+		elog(ERROR, "no table to diff");
+	vc_must_ok(prolly_diff(&r->ctx, &ta.data, &tb.data, count_row_fn, &dc), &r->ctx);
+	vc_commit_release(&ca);
+	vc_commit_release(&cb);
+	*rows = dc.rows;
+	return us_since(start) / 1000;
+}
+
+/*
+ * test_vc_bench_deep_probe(branch text, old text) returns (held int8,
+ * log100_us float8, mb_short_us float8, mb_long_ms float8, diff1_ms float8,
+ * diff1_rows int8, diff1k_ms float8, diff1k_rows int8, diffhalf_ms float8,
+ * diffhalf_rows int8): the branch's line (its commits, walked first and
+ * not timed); a log of 100; the merge base with a branch made one commit
+ * off ten commits back (and dropped again), and with old; and row diffs
+ * to the commits 1, 1,000 and half the line back
+ */
+Datum
+test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *old = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	TupleDesc	tupdesc;
+	Datum		values[10];
+	bool		nulls[10] = {false};
+	VcRepo		r;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	VC_CALL(r, 0,
+	{
+		VcBranch	b;
+		LineAcc		line = {0};
+		PHash		head,
+					base,
+					recent;
+		uint64		n = 0,
+					rows;
+		TimestampTz start;
+		size_t		back;
+
+		if (!vc_branch_get(&r, branch, &b))
+			elog(ERROR, "there is no branch \"%s\"", branch);
+		head = b.head;
+		vc_branch_free(&b);
+		(void) vc_log(&r, &head, SIZE_MAX, 0, line_fn, &line);
+		values[0] = Int64GetDatum((int64) line.n);
+
+		start = GetCurrentTimestamp();
+		(void) vc_log(&r, &head, 100, 0, count_log_fn, &n);
+		values[1] = Float8GetDatum(us_since(start));
+
+		back = Min(line.n - 1, 10);
+		if (vc_branch_create(&r, "deep-recent", &line.v[back]) != VC_OK)
+			elog(ERROR, "no branch made ten commits back");
+		recent = commit_msg(&r, "deep-recent", "recent");
+		start = GetCurrentTimestamp();
+		if (vc_merge_base_in(&r, &head, &recent, 0, &base) != 1 ||
+			!phash_eq(&base, &line.v[back]))
+			elog(ERROR, "the merge base ten commits back not found");
+		values[2] = Float8GetDatum(us_since(start));
+		checkout(&r, branch);
+		(void) vc_branch_delete(&r, "deep-recent");
+
+		if (!vc_branch_get(&r, old, &b))
+			elog(ERROR, "there is no branch \"%s\"", old);
+		start = GetCurrentTimestamp();
+		if (vc_merge_base_in(&r, &head, &b.head, 0, &base) != 1)
+			elog(ERROR, "no merge base with \"%s\"", old);
+		values[3] = Float8GetDatum(us_since(start) / 1000);
+		vc_branch_free(&b);
+
+		values[4] = Float8GetDatum(deep_diff(&r, &line.v[Min(line.n - 1, 1)], &head, &rows));
+		values[5] = Int64GetDatum((int64) rows);
+		values[6] = Float8GetDatum(deep_diff(&r, &line.v[Min(line.n - 1, 1000)], &head, &rows));
+		values[7] = Int64GetDatum((int64) rows);
+		values[8] = Float8GetDatum(deep_diff(&r, &line.v[line.n / 2], &head, &rows));
+		values[9] = Int64GetDatum((int64) rows);
+		pfree(line.v);
+	});
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * test_vc_bench_sever(depth int4) returns float8: a sever with a window of
+ * that depth, timed; microseconds
+ */
+Datum
+test_vc_bench_sever(PG_FUNCTION_ARGS)
+{
+	int32		depth = PG_GETARG_INT32(0);
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		VcWindow	w = {.depth = (uint32) depth};
+		uint32		seg;
+		TimestampTz start = GetCurrentTimestamp();
+
+		if (vc_sever(&r, &w, &seg) != VC_OK)
+			elog(ERROR, "no window of depth %d", depth);
+		us = us_since(start);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+/*
+ * test_backend_private_mb() returns float8: this backend's private resident
+ * memory (anonymous: not the shared buffers it has touched)
+ */
+Datum
+test_backend_private_mb(PG_FUNCTION_ARGS)
+{
+	FILE	   *f = fopen("/proc/self/status", "r");
+	char		line[256];
+	double		kb = 0;
+
+	if (f == NULL)
+		PG_RETURN_NULL();
+	while (fgets(line, sizeof(line), f))
+		if (strncmp(line, "RssAnon:", 8) == 0)
+			kb = strtod(line + 8, NULL);
+	fclose(f);
+	PG_RETURN_FLOAT8(kb / 1024);
 }
 
 /*

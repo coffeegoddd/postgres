@@ -700,6 +700,17 @@ CREATE FUNCTION test_vc_bench_load(branch text, rows int8, batch int4)
 RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_vc_bench_edit(branch text, first int8, n int8, stride int8, version int8)
 RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_deep_commits(branch text, n int4, changes int4, rows int8)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_deep_probe(branch text, old text,
+	OUT held int8, OUT log100_us float8, OUT mb_short_us float8, OUT mb_long_ms float8,
+	OUT diff1_ms float8, OUT diff1_rows int8, OUT diff1k_ms float8, OUT diff1k_rows int8,
+	OUT diffhalf_ms float8, OUT diffhalf_rows int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_sever(depth int4)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_backend_private_mb()
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_vc_bench_merge(branch text, other text,
 	OUT status text, OUT us float8, OUT gets int8, OUT puts int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
