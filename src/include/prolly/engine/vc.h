@@ -421,10 +421,17 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  * Remotes: another repository with its own store and references.
  *
  * A transfer sends the commits the receiver lacks, each with its whole
- * tree, stopping at any commit the receiver already knows, wherever it is
- * there, so discarded or exported history never comes back implicitly.
- * It locks the receiver's state for update (it may record boundaries), so
- * it takes turns with window operations there, never with commits.
+ * tree, stopping at any commit the receiver knows, wherever it is there:
+ * in its window, a segment, exported, a boundary, or a discarded parent of
+ * a commit it holds.  So exported history, and discarded history it still
+ * names, never comes back implicitly.  Discarded commits nothing held
+ * names are forgotten: a commit sent that builds on one brings it back,
+ * with what it needs beneath it.
+ *
+ * A transfer locks the receiver's state for update (it may record
+ * boundaries), so it takes turns with window operations there, never with
+ * commits.  Every call locks branches before the repository's state, so
+ * calls do not deadlock on the two.
  *
  * Fetch, push and pull require the histories to attach: walking back from
  * the heads must reach a commit the receiver knows (a discarded one too:
@@ -437,7 +444,9 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  *
  * Parents not sent become boundaries on the receiver, with a hint naming
  * where their content can be found.  Push is checked for fast-forward by
- * the receiver, its branch locked.  Each repository applies its own
+ * the receiver, its branch locked, and refused (VC_ERR) if that branch has
+ * work not committed or a merge under way.  Pull needs a named remote, its
+ * name the tracking branch's prefix.  Each repository applies its own
  * window: nothing is severed on receipt.
  */
 /* Where this repository says a commit it lacks is (palloc'd), or NULL. */

@@ -201,6 +201,13 @@ boundary_fn(void *arg, const PHash *h, VcLocation where, uint32 seg)
 		*(PHash *) arg = *h;
 }
 
+static void
+count_bounds_fn(void *arg, const PHash *h, VcLocation where, uint32 seg)
+{
+	if (where == VC_LOC_BOUNDARY)
+		(*(int *) arg)++;
+}
+
 static bool
 hint_is(VcRepo *r, const PHash *h, const char *want)
 {
@@ -443,10 +450,22 @@ ENGINE_MEMORY_TEST(test_clone_into_empty_only)
 				laptop,
 				again;
 
+	PHash		state,
+				head,
+				h;
+
 	setup(&origin, ocs, "origin");
 	commit_rows(&origin, 0, 100, 1, "A");
 	setup(&laptop, lcs, "laptop");
+	head = commit_rows(&laptop, 0, 100, 2, "L");
+	CHECK(vc_refs_get(laptop.refs, "vc/repo", VC_REF_READ, &state));
 	CHECK_EQ(clone(&again, lcs, &origin, 0), VC_ERR);
+	/* the repository there is as it was: its state, its branch, its name */
+	CHECK(vc_refs_get(laptop.refs, "vc/repo", VC_REF_READ, &h));
+	CHECK(phash_eq(&h, &state));
+	CHECK(head_is(&laptop, "main", &head));
+	CHECK(hint_is(&laptop, &head, "origin") == false);
+	settle_and_check(lcs);
 	vc_repo_free(&again);
 	vc_repo_free(&origin);
 	vc_repo_free(&laptop);
@@ -1026,6 +1045,167 @@ ENGINE_MEMORY_TEST(test_attach_at_cut_commit)
 	cs_destroy(ocs);
 }
 
+/*
+ * Discarded commits nothing held names are forgotten: a branch built on
+ * one alone does not attach (the receiver knows none of its history), and
+ * a commit sent that builds on one, and on what the receiver holds, brings
+ * it back with what it needs; discarded history it still names stays.
+ */
+ENGINE_MEMORY_TEST(test_discarded_returns_only_when_built_on)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create_own();
+	VcRepo		origin,
+				laptop;
+	Linear		l;
+	uint32		seg;
+	VcMergeResult m;
+
+	setup(&origin, ocs, "origin");
+	l = build_linear(&origin);
+	CHECK_EQ(clone(&laptop, lcs, &origin, 0), VC_OK);
+	CHECK_EQ(vc_sever(&origin, &depth2, &seg), VC_OK);	/* init, A, B cut */
+	CHECK_EQ(vc_segment_discard(&origin, seg, NULL), VC_OK);
+	(void) release(ocs);
+	CHECK(vc_locate(&origin, &l.a, NULL) == VC_LOC_UNKNOWN);	/* forgotten */
+	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);	/* C names it */
+
+	/* a branch on A alone: origin knows nothing of its history */
+	CHECK_EQ(vc_branch_create(&laptop, "side", &l.a), VC_OK);
+	CHECK_EQ(vc_checkout(&laptop, "side"), VC_OK);
+	commit_rows(&laptop, 400, 410, 50, "on A");
+	CHECK_EQ(vc_push(&laptop, &origin, "side"), VC_ERR_UNRELATED);
+	(void) release(ocs);
+	CHECK(!has(ocs, &l.a));
+
+	/* merged with D, which origin holds: it attaches, and A comes back */
+	CHECK_EQ(vc_merge(&laptop, "main", &m), VC_OK);
+	CHECK(m.status == VC_MERGE_COMMITTED);
+	vc_merge_result_free(&m);
+	CHECK_EQ(vc_push(&laptop, &origin, "side"), VC_OK);
+	CHECK(vc_locate(&origin, &l.a, NULL) == VC_LOC_WINDOW);
+	CHECK(vc_locate(&origin, &l.init, NULL) == VC_LOC_WINDOW);
+	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);	/* not sent */
+	settle_and_check(ocs);
+	CHECK(has(ocs, &l.a) && !has(ocs, &l.b));
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+}
+
+/* A push does not overwrite work not committed on the remote's branch. */
+ENGINE_MEMORY_TEST(test_push_keeps_remote_work)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create_own();
+	VcRepo		origin,
+				laptop;
+	PHash		before,
+				w;
+
+	setup(&origin, ocs, "origin");
+	before = commit_rows(&origin, 0, 100, 1, "A");
+	CHECK_EQ(clone(&laptop, lcs, &origin, 0), VC_OK);
+	put_rows(&origin, 500, 510, 7);		/* not committed */
+	commit_rows(&laptop, 200, 210, 2, "L");
+	CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_ERR);
+	CHECK(head_is(&origin, "main", &before));
+	w = vc_working(&origin);
+	CHECK_EQ(row_at(&origin, &w, 505), 7);
+	/* committed, the remote's branch has moved on: not a fast-forward */
+	vc_commit(&origin, "O");
+	CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_ERR);
+	settle_and_check(ocs);
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+}
+
+/* How many times a name is in the repository's state chunk. */
+static int
+state_names(VcRepo *r, const char *name)
+{
+	PHash		h;
+	uint32		len;
+	uint8	   *d;
+	size_t		nl = strlen(name);
+	int			n = 0;
+
+	CHECK(vc_refs_get(r->refs, "vc/repo", VC_REF_READ, &h));
+	d = cs_get(r->ctx.cs, h.b, &len);
+	CHECK(d != NULL);
+	for (uint32 i = 0; i + nl <= len; i++)
+		if (memcmp(d + i, name, nl) == 0)
+			n++;
+	pfree(d);
+	return n;
+}
+
+/* Boundaries share their hint: the state names each place history came from once. */
+ENGINE_MEMORY_TEST(test_hints_named_once)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create_own();
+	VcSource	osrc = {"origin", ocs};
+	VcRepo		origin,
+				laptop;
+	PHash	   *c;
+	uint32		seg;
+	int			bounds = 0;
+
+	setup(&origin, ocs, "origin");
+	c = build_main(&origin, 10);
+	CHECK_EQ(vc_branch_create(&origin, "feature", &c[5]), VC_OK);
+	CHECK_EQ(vc_checkout(&origin, "feature"), VC_OK);
+	commit_rows(&origin, 30000, 30100, 50, "f1");
+	CHECK_EQ(vc_checkout(&origin, "main"), VC_OK);
+
+	/* two branches cut at depth 1: two boundaries, both hinting at origin */
+	CHECK_EQ(clone(&laptop, lcs, &origin, 1), VC_OK);
+	CHECK(vc_locate(&laptop, &c[10], NULL) == VC_LOC_BOUNDARY);
+	CHECK(vc_locate(&laptop, &c[5], NULL) == VC_LOC_BOUNDARY);
+	CHECK(hint_is(&laptop, &c[10], "origin") && hint_is(&laptop, &c[5], "origin"));
+	CHECK_EQ(state_names(&laptop, "origin"), 1);
+	/* deepening from origin leaves a boundary further down, the same hint */
+	CHECK_EQ(vc_deepen(&laptop, &osrc, &c[10], 2, &seg), VC_OK);
+	CHECK(vc_locate(&laptop, &c[8], NULL) == VC_LOC_BOUNDARY);
+	CHECK(hint_is(&laptop, &c[8], "origin"));
+	CHECK_EQ(state_names(&laptop, "origin"), 1);
+	/* (c[10] is now the segment's, c[5] and c[8] the boundaries) */
+	vc_locations(&laptop, count_bounds_fn, &bounds);
+	CHECK_EQ(bounds, 2);
+	settle_and_check(lcs);
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+}
+
+/* Pull names its tracking branch after the remote: one without a name is refused. */
+ENGINE_MEMORY_TEST(test_pull_needs_named_remote)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create_own();
+	VcRepo		origin,
+				laptop;
+	VcMergeResult m;
+	VcBranch	tb;
+
+	setup(&origin, ocs, NULL);
+	commit_rows(&origin, 0, 100, 1, "A");
+	CHECK_EQ(clone(&laptop, lcs, &origin, 0), VC_OK);
+	commit_rows(&origin, 100, 200, 2, "B");
+	CHECK_EQ(vc_pull(&laptop, &origin, "main", 0, &m), VC_ERR);
+	CHECK(!vc_branch_get(&laptop, "/main", &tb));
+	vc_repo_set_name(&origin, "origin");
+	CHECK_EQ(vc_pull(&laptop, &origin, "main", 0, &m), VC_OK);
+	CHECK(m.status == VC_MERGE_FAST_FORWARD);
+	vc_merge_result_free(&m);
+	settle_and_check(lcs);
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+}
+
 /* -------------------------------------------------------------- costs */
 
 #define RS_K 20
@@ -1119,6 +1299,10 @@ static const ProllyUnitTest tests[] = {
 	{"detached_fetch_until_repaired", test_detached_fetch_until_repaired},
 	{"detached_push_until_attached", test_detached_push_until_attached},
 	{"attach_at_cut_commit", test_attach_at_cut_commit},
+	{"discarded_returns_only_when_built_on", test_discarded_returns_only_when_built_on},
+	{"push_keeps_remote_work", test_push_keeps_remote_work},
+	{"hints_named_once", test_hints_named_once},
+	{"pull_needs_named_remote", test_pull_needs_named_remote},
 	{"transfer_costs", test_transfer_costs},
 };
 
