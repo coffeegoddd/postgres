@@ -719,6 +719,80 @@ typedef struct ScaleResult
 
 #define SCALE_K 100
 
+/* (one merge of theirs into ours: its result, and the chunks it asked for) */
+static uint64
+memo_merge(ProllyCtx *ctx, size_t memo_bytes, const PHash *base, const PHash *ours,
+		   const PHash *theirs, PHash *root)
+{
+	ChunkStoreStats st = *cs_stats(ctx->cs);
+	ProllyMergeResult mr;
+
+	ctx->memo_bytes = memo_bytes;
+	CHECK_OK(prolly_merge(ctx, base, ours, theirs, &mr));
+	CHECK_EQ(mr.nconflicts, 0);
+	CHECK(ctx->memo == NULL);
+	*root = mr.root;
+	prolly_merge_result_free(&mr);
+	return STATS_DELTA(ctx->cs, st, gets);
+}
+
+/*
+ * A merge keeps the nodes it loads for the rest of it, up to its memo's
+ * bytes: it reads base in both its diffs and ours' paths again as it
+ * applies, and with the memo asks the store for a node once.  The result is
+ * the same with any memo; a small one keeps the first nodes loaded, and is
+ * worth some of it; and the memo goes with the merge, an error's too.
+ */
+ENGINE_TEST(test_merge_memo)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &small_policy);
+	PHash		base = build_even_rows(&ctx, 20000);
+	PHash		ours,
+				theirs,
+				none,
+				all,
+				some;
+	EditBatch	o,
+				t;
+	uint64		gets_none,
+				gets_all,
+				gets_some;
+
+	/* 200 rows each side, spread over the table, none changed by both */
+	batch_init(&o, 200);
+	batch_init(&t, 200);
+	for (uint64 i = 0; i < 200; i++)
+	{
+		batch_put(&o, i * 200, 1);
+		batch_put(&t, i * 200 + 100, 2);
+	}
+	ours = t_apply(&ctx, &base, o.e, o.n);
+	theirs = t_apply(&ctx, &base, t.e, t.n);
+
+	gets_none = memo_merge(&ctx, 0, &base, &ours, &theirs, &none);
+	gets_all = memo_merge(&ctx, 64 * 1024 * 1024, &base, &ours, &theirs, &all);
+	gets_some = memo_merge(&ctx, 4 * 1024, &base, &ours, &theirs, &some);
+	CHECK(phash_eq(&all, &none) && phash_eq(&some, &none));
+	CHECK_LE(gets_all * 2, gets_none);
+	CHECK_LT(gets_all, gets_some);
+	CHECK_LT(gets_some, gets_none);
+
+	/* a merge that fails (a node of theirs gone) leaves no memo behind */
+	if (cs->routine == &MemoryChunkStore)
+	{
+		ProllyMergeResult mr;
+
+		MemoryChunkStoreDrop(cs, theirs.b);
+		ctx.memo_bytes = 64 * 1024 * 1024;
+		CHECK_EQ(prolly_merge(&ctx, &base, &ours, &theirs, &mr), PROLLY_ERR_MISSING);
+		CHECK(ctx.memo == NULL);
+	}
+	batch_free(&o);
+	batch_free(&t);
+	cs_destroy(cs);
+}
+
 static void
 random_edits(EditBatch *b, uint64 n, size_t k, uint64 version)
 {
@@ -1112,6 +1186,7 @@ static const ProllyUnitTest tests[] = {
 	{"iter_from_key", test_iter_from_key},
 	{"diff_matches_model", test_diff_matches_model},
 	{"merge", test_merge},
+	{"merge_memo", test_merge_memo},
 	{"merge_grafts", test_merge_grafts},
 	{"structural_sharing", test_structural_sharing},
 	{"scaling", test_scaling},

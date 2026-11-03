@@ -118,7 +118,26 @@ typedef struct PNode
 	const uint8 **v;
 	uint32   *kl;
 	uint32   *vl;
+	bool		memo;			/* kept by the operation's memo, freed with it */
 } PNode;
+
+/*
+ * The nodes an operation loads, kept parsed for the rest of it, up to
+ * ctx->memo_bytes of their chunks: an operation that reads a node again (a
+ * merge reads base in both its diffs, and ours' paths once a graft level)
+ * finds it here.  Chunks are immutable and the operation holds those it
+ * reads, so none kept is ever stale.  Once full, the nodes loaded after are
+ * not kept: those loaded first, the upper levels and the paths walked
+ * again, are the ones read again.
+ */
+struct NodeMemo
+{
+	PHashMap	map;			/* a node's hash to 1 + its place in nodes */
+	struct PNode **nodes;
+	size_t		n,
+				cap;
+	size_t		used;			/* bytes of the nodes' chunks */
+};
 
 static bool
 ref_decode(const uint8 *v, size_t vl, PHash *h, uint64 *total)
@@ -159,6 +178,7 @@ node_decode(const PHash *h, const uint8 *data, size_t len)
 	mem = px_malloc(sizeof(PNode) +
 					hdr.count * (2 * sizeof(const uint8 *) + 2 * sizeof(uint32)));
 	n = (PNode *) mem;
+	n->memo = false;
 	n->hash = *h;
 	n->bytes = NULL;
 	n->level = hdr.level;
@@ -210,6 +230,13 @@ node_load(ProllyCtx *ctx, const PHash *h)
 	PNode	   *n;
 
 	CHECK_FOR_INTERRUPTS();
+	if (ctx->memo != NULL)
+	{
+		uint64	   *at = phmap_find(&ctx->memo->map, h);
+
+		if (at != NULL)
+			return ctx->memo->nodes[*at - 1];
+	}
 	data = cs_get(ctx->cs, h->b, &len);
 	if (data == NULL)
 	{
@@ -224,13 +251,24 @@ node_load(ProllyCtx *ctx, const PHash *h)
 		return NULL;
 	}
 	n->bytes = data;
+	if (ctx->memo != NULL && ctx->memo->used + len <= ctx->memo_bytes)
+	{
+		NodeMemo   *m = ctx->memo;
+		bool		created;
+
+		px_grow((void **) &m->nodes, &m->cap, m->n + 1, sizeof(PNode *));
+		m->nodes[m->n++] = n;
+		*phmap_ref(&m->map, h, &created) = m->n;
+		m->used += len;
+		n->memo = true;
+	}
 	return n;
 }
 
 static void
 node_free(PNode *n)
 {
-	if (n == NULL)
+	if (n == NULL || n->memo)
 		return;
 	px_free(n->bytes);
 	px_free(n);
@@ -1626,9 +1664,9 @@ same_change(const ProllyDiff *a, const ProllyDiff *b)
  * then theirs' row edits: each step an apply to the tree as the steps
  * before left it, so every rechunking reads the merged rows.
  */
-int
-prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
-			 const PHash *theirs, ProllyMergeResult *out)
+static int
+merge_core(ProllyCtx *ctx, const PHash *base, const PHash *ours,
+		   const PHash *theirs, ProllyMergeResult *out)
 {
 	ProllyDiffList dours = {0},
 				dtheirs = {0};
@@ -1738,6 +1776,38 @@ prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 	graftlist_free(&grafts);
 	if (rc != PROLLY_OK)
 		prolly_merge_result_free(out);
+	return rc;
+}
+
+/* The merge, with a memo of the nodes it loads (ctx->memo_bytes of them). */
+int
+prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
+			 const PHash *theirs, ProllyMergeResult *out)
+{
+	NodeMemo	memo = {0};
+	volatile int rc;
+
+	if (ctx->memo_bytes == 0 || ctx->memo != NULL)
+		return merge_core(ctx, base, ours, theirs, out);
+	phmap_init(&memo.map);
+	ctx->memo = &memo;
+	/* (an error leaves the nodes to its memory's reset, and no memo behind) */
+	PG_TRY();
+	{
+		rc = merge_core(ctx, base, ours, theirs, out);
+	}
+	PG_FINALLY();
+	{
+		ctx->memo = NULL;
+	}
+	PG_END_TRY();
+	for (size_t i = 0; i < memo.n; i++)
+	{
+		memo.nodes[i]->memo = false;
+		node_free(memo.nodes[i]);
+	}
+	px_free(memo.nodes);
+	phmap_free(&memo.map);
 	return rc;
 }
 

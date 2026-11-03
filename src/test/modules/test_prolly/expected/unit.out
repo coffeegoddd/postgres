@@ -43,6 +43,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_prolly   | iter_from_key                        | ok     | 
  engine_prolly   | diff_matches_model                   | ok     | 
  engine_prolly   | merge                                | ok     | 
+ engine_prolly   | merge_memo                           | ok     | 
  engine_prolly   | merge_grafts                         | ok     | 
  engine_prolly   | structural_sharing                   | ok     | 
  engine_prolly   | scaling                              | ok     | 

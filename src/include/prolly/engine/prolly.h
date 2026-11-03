@@ -58,6 +58,8 @@
 
 extern const ChunkPolicy prolly_default_policy;
 
+typedef struct NodeMemo NodeMemo;
+
 typedef struct ProllyCtx
 {
 	ChunkStore *cs;
@@ -65,6 +67,14 @@ typedef struct ProllyCtx
 	int			err;
 	bool		err_has_hash;	/* a chunk at fault, err_hash */
 	PHash		err_hash;
+
+	/*
+	 * An operation that reads nodes again (a merge) keeps those it loads
+	 * parsed for the rest of it, up to memo_bytes of their chunks (0: none);
+	 * memo is the operation's while it runs
+	 */
+	size_t		memo_bytes;
+	NodeMemo   *memo;
 } ProllyCtx;
 
 typedef struct ProllyKV
