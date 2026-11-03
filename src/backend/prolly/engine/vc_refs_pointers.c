@@ -43,6 +43,7 @@ static SPIPlanPtr set_plan = NULL;
 static SPIPlanPtr add_plan = NULL;
 static SPIPlanPtr remove_plan = NULL;
 static SPIPlanPtr list_plan = NULL;
+static SPIPlanPtr list_all_plan = NULL;
 
 static SPIPlanPtr
 plan(SPIPlanPtr *slot, const char *sql, int nargs, Oid *types)
@@ -243,25 +244,27 @@ pointers_list(VcRefs *refs, const char *prefix, VcRefFn fn, void *arg)
 	size_t		plen = strlen(prefix);
 	char	   *upper = pstrdup(prefix);
 	Datum		args[2];
-	char		nulls[2] = {' ', ' '};
 	Portal		portal;
 	MemoryContext cxt = CurrentMemoryContext;
 
-	if (plen == 0)
-		nulls[1] = 'n';
-	else
+	if (plen > 0)
 	{
 		Assert((unsigned char) upper[plen - 1] < 0xff);
 		upper[plen - 1]++;
+		args[0] = CStringGetTextDatum(prefix);
+		args[1] = CStringGetTextDatum(upper);
 	}
-	args[0] = CStringGetTextDatum(prefix);
-	args[1] = plen ? CStringGetTextDatum(upper) : (Datum) 0;
 	level = spi_begin();
-	portal = SPI_cursor_open(NULL,
-							 plan(&list_plan, "SELECT name, hash FROM pg_history.pointers"
-								  " WHERE name >= $1 AND ($2 IS NULL OR name < $2)"
-								  " ORDER BY name", 2, types),
-							 args, nulls, false);
+	/* (both bounds the index's, a plan kept or not: only the prefix's rows read) */
+	portal = plen > 0 ?
+		SPI_cursor_open(NULL,
+						plan(&list_plan, "SELECT name, hash FROM pg_history.pointers"
+							 " WHERE name >= $1 AND name < $2 ORDER BY name", 2, types),
+						args, NULL, false) :
+		SPI_cursor_open(NULL,
+						plan(&list_all_plan, "SELECT name, hash FROM pg_history.pointers"
+							 " ORDER BY name", 0, NULL),
+						NULL, NULL, false);
 	for (;;)
 	{
 		SPI_cursor_fetch(portal, true, 256);
@@ -287,7 +290,7 @@ pointers_list(VcRefs *refs, const char *prefix, VcRefFn fn, void *arg)
 	}
 	SPI_cursor_close(portal);
 	spi_end(level);
-	free_args(args, plen ? 2 : 1);
+	free_args(args, plen ? 2 : 0);
 	pfree(upper);
 }
 

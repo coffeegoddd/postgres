@@ -43,5 +43,36 @@ is($node->safe_psql('postgres', q{SELECT reltuples <= 0 FROM pg_class WHERE oid 
 	't', '(the table never analyzed)');
 is($lines[-1], '0|0|t', 'a commit and a log read the pointers by their key alone');
 
+# a listing reads its prefix's rows alone, its plan kept (a generic plan, not
+# knowing the prefix): the branch's rows here, not the thousands of commits'
+is( $node->safe_psql(
+		'postgres', q{
+	SET plan_cache_mode = force_generic_plan;
+	BEGIN;
+	SELECT test_vc_refs_count('vc/branch/') \\g /dev/null
+	SELECT test_vc_refs_count('vc/branch/') = 1, seq_scan, idx_tup_fetch <= 4
+	FROM pg_stat_xact_all_tables WHERE relid = 'pg_history.pointers'::regclass;
+	COMMIT;
+}),
+	't|0|t',
+	'a listing reads its prefix\'s rows alone');
+
+# the setting is the session's again after a call, and after a listing's error
+# caught as it runs
+is( $node->safe_psql(
+		'postgres', q{
+	DO $$
+	BEGIN
+		PERFORM test_vc_refs_count('vc/', true);
+		RAISE 'the listing did not fail';
+	EXCEPTION WHEN internal_error THEN
+		NULL;
+	END $$;
+	SELECT current_setting('enable_seqscan'), test_vc_refs_count('vc/branch/'),
+		current_setting('enable_seqscan');
+}),
+	'on|1|on',
+	'sequential scans on again for the session\'s own statements');
+
 $node->stop;
 done_testing();

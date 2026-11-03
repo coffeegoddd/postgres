@@ -35,6 +35,7 @@
 
 PG_FUNCTION_INFO_V1(test_vc_open);
 PG_FUNCTION_INFO_V1(test_vc_commit);
+PG_FUNCTION_INFO_V1(test_vc_refs_count);
 PG_FUNCTION_INFO_V1(test_vc_branch);
 PG_FUNCTION_INFO_V1(test_vc_branch_delete);
 PG_FUNCTION_INFO_V1(test_vc_reset);
@@ -461,6 +462,38 @@ test_vc_rows(PG_FUNCTION_ARGS)
 		vc_branch_free(&b);
 	});
 	PG_RETURN_INT64((int64) n);
+}
+
+typedef struct RefsCount
+{
+	uint64		n;
+	bool		fail;
+} RefsCount;
+
+static void
+refs_count_fn(void *arg, const char *name, const PHash *hash)
+{
+	RefsCount  *c = arg;
+
+	if (c->fail)
+		elog(ERROR, "failed at reference \"%s\"", name);
+	c->n++;
+}
+
+/*
+ * test_vc_refs_count(prefix text, fail bool) returns int8: the references
+ * under prefix, listed; with fail, an error at the first of them, as the
+ * listing runs
+ */
+Datum
+test_vc_refs_count(PG_FUNCTION_ARGS)
+{
+	char	   *prefix = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	RefsCount	c = {0, PG_GETARG_BOOL(1)};
+	ChunkStore *cs = ChunkStoreOpen("pages");
+
+	vc_refs_list(VcRefsOpen("pointers", cs), prefix, refs_count_fn, &c);
+	PG_RETURN_INT64((int64) c.n);
 }
 
 /*
