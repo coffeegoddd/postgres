@@ -779,13 +779,11 @@ commit_ref(const PHash *h)
 	return psprintf(COMMIT_REF_PREFIX "%s", hex);
 }
 
-static void
-check_branch_name(const char *name)
+/* Whether a branch may be named so: 1 to NAMEDATALEN - 1 bytes. */
+static bool
+branch_name_ok(const char *name)
 {
-	if (name[0] == '\0' || strlen(name) > NAMEDATALEN - 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("a branch's name is 1 to %d bytes", NAMEDATALEN - 1)));
+	return name[0] != '\0' && strlen(name) <= NAMEDATALEN - 1;
 }
 
 /* A branch's chunk, of its head, working root and merge state. */
@@ -844,9 +842,14 @@ branch_decode(ProllyCtx *ctx, const PHash *h, VcBranch *b)
 static bool
 branch_read(VcRepo *r, const char *name, bool for_update, VcBranch *out)
 {
-	char	   *ref = branch_ref(name);
+	char	   *ref;
 	PHash		h;
-	bool		found = vc_refs_get(r->refs, ref, for_update, &h);
+	bool		found;
+
+	if (!branch_name_ok(name))
+		return false;
+	ref = branch_ref(name);
+	found = vc_refs_get(r->refs, ref, for_update, &h);
 
 	pfree(ref);
 	if (!found)
@@ -962,9 +965,8 @@ vc_repo_open(VcRepo *r, ChunkStore *cs, VcRefs *refs, const ChunkPolicy *policy)
 		PHash		commit = vc_commit_write(&r->ctx, &root, NULL, 0, unique_clock(r),
 											 "init");
 		char	   *ref = commit_ref(&commit);
+		bool		added = vc_refs_add(r->refs, ref, &commit);
 
-		vc_refs_set(r->refs, ref, &commit);
-		pfree(ref);
 		main.name = pstrdup("main");
 		main.head = commit;
 		main.head_root = root;
@@ -972,14 +974,13 @@ vc_repo_open(VcRepo *r, ChunkStore *cs, VcRefs *refs, const ChunkPolicy *policy)
 		main.merging = false;
 		/*
 		 * (of two opening an empty repository at once, one makes "main";
-		 * the other's init commit is then let go of with its reference)
+		 * the other's init commit is then let go of with its reference,
+		 * unless the two wrote one commit, in one microsecond: then its
+		 * reference is the first's, and stays)
 		 */
-		if (!branch_add(r, &main))
-		{
-			ref = commit_ref(&commit);
+		if (!branch_add(r, &main) && added)
 			(void) vc_refs_remove(r->refs, ref);
-			pfree(ref);
-		}
+		pfree(ref);
 	}
 	vc_branch_free(&main);
 }
@@ -1086,7 +1087,8 @@ vc_branch_create(VcRepo *r, const char *name, const PHash *commit)
 				b;
 	bool		added;
 
-	check_branch_name(name);
+	if (!branch_name_ok(name))
+		return VC_ERR;
 	if (vc_branch_get(r, name, &cur))
 	{
 		vc_branch_free(&cur);
@@ -1126,7 +1128,9 @@ vc_branch_delete(VcRepo *r, const char *name)
 	char	   *ref;
 	bool		found;
 
-	if (strcmp(name, r->cur) == 0)
+	/* (main is never deleted: a repository's open finds it, or makes it) */
+	if (strcmp(name, r->cur) == 0 || strcmp(name, "main") == 0 ||
+		!branch_name_ok(name))
 		return VC_ERR;
 	ref = branch_ref(name);
 	found = vc_refs_remove(r->refs, ref);
@@ -1321,9 +1325,9 @@ vc_merge_base_in(VcRepo *r, const PHash *a, const PHash *b, unsigned flags,
 	 * The walk may name a base past the edge from parent links alone; in
 	 * window-only mode that is still outside, with the base in err_hash.
 	 */
-	if (rc == 1 && only)
-		rc = window_gate(r, out);
-	return rc == VC_OK ? 1 : rc;
+	if (rc == 1 && only && (rc = window_gate(r, out)) == VC_OK)
+		rc = 1;
+	return rc;
 }
 
 int

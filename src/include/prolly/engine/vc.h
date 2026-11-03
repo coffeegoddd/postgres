@@ -18,12 +18,17 @@
  * A commit writes its own reference and moves its branch's, and nothing
  * else, so commits on different branches change different rows.  A VcRepo
  * is a backend's view of them: the branch it has checked out is its own,
- * and each call reads the references it needs, so opening one reads
- * nothing however long the history.
+ * and each call reads the references it needs, so opening one reads main's
+ * reference, its chunk and head commit, however long the history.
  *
  * Calls that change a branch lock its reference first (for update), and
- * read it after, so two that change one branch take turns.  Errors of the
- * caller's (an unknown branch, uncommitted changes) are VC_ERR; history a
+ * read it after, so two that change one branch take turns: two commits on
+ * one branch both land, one after the other.  vc_set_working replaces the
+ * working root it is given, whatever it was meanwhile: two sessions
+ * writing one branch's working set without committing between them are
+ * the working set's own concern, not this layer's.  Errors of the
+ * caller's (an unknown or misnamed branch, uncommitted changes) are
+ * VC_ERR, and a name is any of 1 to NAMEDATALEN - 1 bytes; history a
  * call cannot reach is VC_ERR_SEVERED or VC_ERR_OUTSIDE_WINDOW, the commit
  * in ctx.err_hash; damage, of a tree or a commit, is raised.
  *
@@ -178,8 +183,8 @@ extern int	vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
 
 /*
  * Repositories and branches.  vc_repo_open views the repository the
- * references hold, with "main" checked out; one with no branch yet is
- * made, an "init" commit on "main".
+ * references hold, with "main" checked out; one without "main" (none yet:
+ * "main" is never deleted) is made, an "init" commit on "main".
  */
 extern void vc_repo_open(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 						 const ChunkPolicy *policy);
@@ -195,7 +200,10 @@ extern PHash vc_working(VcRepo *r);
 extern void vc_set_working(VcRepo *r, const PHash *rv);
 /* A new branch at commit (NULL: the head checked out). */
 extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
-/* Deletes a branch other than the one checked out; its working set goes. */
+/*
+ * Deletes a branch other than the one checked out, and other than "main";
+ * its working set goes.
+ */
 extern int	vc_branch_delete(VcRepo *r, const char *name);
 extern int	vc_checkout(VcRepo *r, const char *name);
 extern PHash vc_commit(VcRepo *r, const char *msg);

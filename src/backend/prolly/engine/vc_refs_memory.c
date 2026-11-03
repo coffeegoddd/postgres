@@ -68,7 +68,9 @@ mem_refs_get(VcRefs *refs, const char *name, bool for_update, PHash *out)
 {
 	MemRef	   *r;
 
-	check_name(name);
+	/* (a name too long to make is not there, as with the pointers) */
+	if (strlen(name) >= REF_NAME_MAX)
+		return false;
 	r = hash_search(refs_table, name, HASH_FIND, NULL);
 	if (r == NULL)
 		return false;
@@ -111,7 +113,8 @@ mem_refs_remove(VcRefs *refs, const char *name)
 {
 	MemRef	   *r;
 
-	check_name(name);
+	if (strlen(name) >= REF_NAME_MAX)
+		return false;
 	r = hash_search(refs_table, name, HASH_FIND, NULL);
 	if (r == NULL)
 		return false;

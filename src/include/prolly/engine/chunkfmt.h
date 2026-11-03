@@ -37,9 +37,6 @@
  * Branch:	tag, version, head commit hash (strong), working root value hash
  *			(strong), merging byte (0 or 1), [merge head commit hash (strong)]
  *			A branch's state, which its reference names.
- * Repo state: tag, version, then a repo's branches, commit locations,
- *			segments, hints and image holds (see vc_repo_save).  It names no
- *			chunk strongly: what it lists is held by the store's roots.
  *
  * EngineChunkFormat is these formats as the history store's ChunkFormat
  * (prolly/chunk_format.h): the strong references, those a store keeps a
@@ -64,7 +61,6 @@
 #define CHUNK_TAG_MANIFEST 0x4d
 #define CHUNK_TAG_PAGE 0x47
 #define CHUNK_TAG_IMAGE 0x49
-#define CHUNK_TAG_REPO 0x52
 #define CHUNK_TAG_BRANCH 0x42
 
 /*

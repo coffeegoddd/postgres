@@ -289,8 +289,6 @@ engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 			return true;
 		case CHUNK_TAG_IMAGE:
 			return image_refs(data, len, fn, arg);
-		case CHUNK_TAG_REPO:
-			return true;
 		case CHUNK_TAG_BRANCH:
 			return branch_refs(data, len, fn, arg);
 		default:

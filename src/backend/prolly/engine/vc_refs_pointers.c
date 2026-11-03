@@ -78,6 +78,17 @@ spi_end(void)
 		elog(ERROR, "SPI_finish failed");
 }
 
+/*
+ * (the arguments, freed as each call ends: a walk of history asks of a
+ * reference a commit)
+ */
+static void
+free_args(Datum *args, int n)
+{
+	for (int i = 0; i < n; i++)
+		pfree(DatumGetPointer(args[i]));
+}
+
 static void
 check(int rc, int want, const char *what)
 {
@@ -131,6 +142,7 @@ pointers_get(VcRefs *refs, const char *name, bool for_update, PHash *out)
 								 &isnull), out);
 	}
 	spi_end();
+	free_args(args, 1);
 	return found;
 }
 
@@ -148,6 +160,7 @@ pointers_set(VcRefs *refs, const char *name, const PHash *hash)
 						  args, NULL, false, 0);
 	check(rc, SPI_OK_INSERT, "a change");
 	spi_end();
+	free_args(args, 2);
 }
 
 /*
@@ -169,6 +182,7 @@ pointers_add(VcRefs *refs, const char *name, const PHash *hash)
 	check(rc, SPI_OK_INSERT, "an addition");
 	added = SPI_processed == 1;
 	spi_end();
+	free_args(args, 2);
 	return added;
 }
 
@@ -187,6 +201,7 @@ pointers_remove(VcRefs *refs, const char *name)
 	check(rc, SPI_OK_DELETE, "a removal");
 	found = SPI_processed == 1;
 	spi_end();
+	free_args(args, 1);
 	return found;
 }
 
@@ -240,11 +255,13 @@ pointers_list(VcRefs *refs, const char *prefix, VcRefFn fn, void *arg)
 			old = MemoryContextSwitchTo(cxt);
 			fn(arg, name, &h);
 			MemoryContextSwitchTo(old);
+			pfree(name);
 		}
 		SPI_freetuptable(SPI_tuptable);
 	}
 	SPI_cursor_close(portal);
 	spi_end();
+	free_args(args, plen ? 2 : 1);
 	pfree(upper);
 }
 

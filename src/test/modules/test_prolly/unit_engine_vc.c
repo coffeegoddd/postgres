@@ -182,6 +182,28 @@ count_branch_fn(void *arg, const VcBranch *b)
 	(*(int *) arg)++;
 }
 
+typedef struct LogAcc
+{
+	PHash		v[8];
+	int			n;
+} LogAcc;
+
+static void
+log_fn(void *arg, const VcCommit *c)
+{
+	LogAcc	   *a = arg;
+
+	CHECK(a->n < 8);
+	a->v[a->n++] = c->hash;
+}
+
+static int
+log_from(VcRepo *r, const PHash *start, size_t max, unsigned flags, LogAcc *acc)
+{
+	acc->n = 0;
+	return vc_log(r, start, max, flags, log_fn, acc);
+}
+
 /* ------------------------------------------------------------------ tests */
 
 typedef struct RefList
@@ -218,6 +240,15 @@ ENGINE_TEST(test_refs_contract)
 	ChunkCounts counts;
 
 	CHECK(!vc_refs_get(refs, "test/x", false, &got));
+	/* a name too long for any reference is none, on either implementation */
+	{
+		char		longname[300];
+
+		memset(longname, 'n', sizeof(longname) - 1);
+		longname[sizeof(longname) - 1] = '\0';
+		CHECK(!vc_refs_get(refs, longname, false, &got));
+		CHECK(!vc_refs_remove(refs, longname));
+	}
 	CHECK(vc_refs_add(refs, "test/x", &a));
 	CHECK(!vc_refs_add(refs, "test/x", &b));
 	CHECK(vc_refs_get(refs, "test/x", true, &got) && phash_eq(&got, &a));
@@ -284,6 +315,18 @@ ENGINE_TEST(test_commit_and_log)
 			break;
 	}
 	CHECK_EQ(n, 4);
+
+	/* vc_log: the same, newest first, as far as max, the root last */
+	{
+		LogAcc		acc;
+
+		CHECK_EQ(log_from(&r, &c[3], 8, VC_WINDOW_ONLY, &acc), VC_OK);
+		CHECK_EQ(acc.n, 4);
+		for (int i = 0; i < 4; i++)
+			CHECK(phash_eq(&acc.v[i], &c[3 - i]));
+		CHECK_EQ(log_from(&r, &c[3], 2, 0, &acc), VC_OK);
+		CHECK(acc.n == 2 && phash_eq(&acc.v[1], &c[2]));
+	}
 	CHECK(vc_commit_load(&r.ctx, &c[2], &cm));
 	CHECK(cm.msglen == 5 && memcmp(cm.msg, "row 1", 5) == 0);
 	vc_commit_release(&cm);
@@ -416,6 +459,11 @@ ENGINE_TEST(test_branch_checkout_isolation)
 
 	/* the branch checked out is not deleted; another is, its work with it */
 	CHECK_EQ(vc_branch_delete(&r, "feature"), VC_ERR);
+	/* main is never deleted, checked out or not; a misnamed one is none */
+	CHECK_EQ(vc_branch_delete(&r, "main"), VC_ERR);
+	CHECK_EQ(vc_branch_delete(&r, ""), VC_ERR);
+	CHECK_EQ(vc_branch_create(&r, "", NULL), VC_ERR);
+	CHECK_EQ(vc_checkout(&r, ""), VC_ERR);
 	CHECK_EQ(vc_checkout(&r, "main"), VC_OK);
 	CHECK_EQ(vc_branch_delete(&r, "feature"), VC_OK);
 	CHECK_EQ(vc_branch_delete(&r, "feature"), VC_ERR);
@@ -796,6 +844,37 @@ ENGINE_TEST(test_window_edge)
 	memset(absent.b, 0x3c, PHASH_LEN);
 	CHECK_EQ(vc_merge_base_in(&r, &absent, &c1, 0, &mb), VC_ERR_SEVERED);
 	CHECK(phash_eq(&r.ctx.err_hash, &absent));
+
+	/* log and diff stop at the edge, or at a commit not there */
+	{
+		LogAcc		acc;
+		int			n = 0;
+
+		CHECK_EQ(log_from(&r, &orphan, 8, VC_WINDOW_ONLY, &acc), VC_ERR_OUTSIDE_WINDOW);
+		CHECK(acc.n == 0 && phash_eq(&r.ctx.err_hash, &orphan));
+		CHECK_EQ(log_from(&r, &orphan, 8, 0, &acc), VC_OK);
+		CHECK(acc.n == 3 && phash_eq(&acc.v[1], &c1));
+		CHECK_EQ(log_from(&r, &absent, 8, 0, &acc), VC_ERR_SEVERED);
+		CHECK(phash_eq(&r.ctx.err_hash, &absent));
+		CHECK_EQ(vc_diff_commits(&r, &c1, &orphan, VC_WINDOW_ONLY,
+								 table_change_fn_count, &n), VC_ERR_OUTSIDE_WINDOW);
+		CHECK(phash_eq(&r.ctx.err_hash, &orphan));
+		CHECK_EQ(vc_diff_commits(&r, &c1, &orphan, 0, table_change_fn_count, &n), VC_OK);
+		CHECK_EQ(n, 0);
+		CHECK_EQ(vc_diff_commits(&r, &absent, &c1, 0, table_change_fn_count, &n),
+				 VC_ERR_SEVERED);
+		CHECK(phash_eq(&r.ctx.err_hash, &absent));
+	}
+
+	/* histories sharing no commit have no merge base, window-only or not */
+	{
+		PHash		other = vc_commit_write(&r.ctx, &root, NULL, 0, 1, "another root");
+
+		mb = absent;
+		CHECK_EQ(vc_merge_base_in(&r, &other, &orphan, 0, &mb), 0);
+		CHECK_EQ(vc_merge_base(&r.ctx, &other, &c1, &mb), 0);
+		CHECK(phash_eq(&mb, &absent));	/* (untouched) */
+	}
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -1047,8 +1126,40 @@ ENGINE_MEMORY_TEST(test_merge_base_cost)
 	CHECK_EQ(long_hist, short_hist);
 }
 
+/*
+ * Reading references frees what it asks with: a walk of history asks of
+ * one a commit, and a long one must not grow with it.
+ */
+ENGINE_TEST(test_refs_reads_free_their_memory)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		h;
+	MemoryContext cxt,
+				old;
+	MemoryContextCounters c;
+
+	repo_open(&r, cs, &small_policy);
+	h = head_of(&r);
+	(void) vc_in_window(&r, &h);	/* (its plan made) */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "refs reads",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	for (int i = 0; i < 2000; i++)
+		CHECK(vc_in_window(&r, &h));
+	MemoryContextSwitchTo(old);
+	memset(&c, 0, sizeof(c));
+	MemoryContextMemConsumed(cxt, &c);
+	/* (some 70 bytes a read, were the arguments kept) */
+	CHECK_LE(c.totalspace - c.freespace, 16 * 1024);
+	MemoryContextDelete(cxt);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 static const ProllyUnitTest tests[] = {
 	{"refs_contract", test_refs_contract},
+	{"refs_reads_free_their_memory", test_refs_reads_free_their_memory},
 	{"commit_and_log", test_commit_and_log},
 	{"working_set_churn_frees", test_working_set_churn_frees},
 	{"commit_root_keeps_later_changes", test_commit_root_keeps_later_changes},

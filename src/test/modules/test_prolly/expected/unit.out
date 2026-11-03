@@ -67,6 +67,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_lifetime | rebuild_from_reverse_deltas       | ok     | 
  engine_lifetime | lifetime_scaling                  | ok     | 
  engine_vc       | refs_contract                     | ok     | 
+ engine_vc       | refs_reads_free_their_memory      | ok     | 
  engine_vc       | commit_and_log                    | ok     | 
  engine_vc       | working_set_churn_frees           | ok     | 
  engine_vc       | commit_root_keeps_later_changes   | ok     | 
@@ -81,7 +82,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_vc       | window_edge                       | ok     | 
  engine_vc       | vc_scaling                        | ok     | 
  engine_vc       | merge_base_cost                   | ok     | 
-(69 rows)
+(70 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
