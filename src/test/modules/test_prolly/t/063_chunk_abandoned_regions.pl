@@ -248,12 +248,19 @@ $a->query_safe('SELECT 1');
 is($primary->safe_psql('postgres', q{SELECT test_chunk_log_regions('gl')}), '0',
 	'forgotten to another\'s invalidation, let go of at once');
 $a->query_safe('COMMIT');
-# (and so after a put that failed in a subtransaction, rolled back to)
+# (and so after a put that failed in a subtransaction, rolled back to; the
+# region not at its lane's end, which would go on into pages new, but let
+# go of for the next: a segment freed in the backend's own lane, a region
+# past it, the put's in the segment freed)
+$a->query_safe(q{SELECT test_chunk_put('gl', 'gi', h(blob(430)), blob(430))});
+$a->query_safe(q{SELECT test_chunk_log_let_go('gl')});
+$a->query_safe(q{SELECT test_chunk_put('gl', 'gi', h(blob(422)), blob(422))});
+$primary->safe_psql('postgres', q{SELECT test_chunk_free('gl', 'gi', h(blob(430)))});
+$primary->safe_psql('postgres', 'VACUUM gi');
+$primary->safe_psql('postgres', 'VACUUM gi');
+$a->query_safe(q{SELECT test_chunk_log_let_go('gl')});
 $a->query_safe(q{BEGIN});
 $a->query_safe(q{SELECT test_chunk_put('gl', 'gi', h(blob(421)), blob(421))});
-# (another's region after it: the region not at the log's end, which would
-# go on into pages new, but let go of for the next)
-$primary->safe_psql('postgres', q{SELECT test_chunk_put('gl', 'gi', h(blob(422)), blob(422))});
 $a->query_safe(q{SAVEPOINT s});
 $a->query_safe(q{SELECT injection_points_set_local()});
 $a->query_safe(q{SELECT injection_points_attach('chunk-log-region-sealed', 'error')});

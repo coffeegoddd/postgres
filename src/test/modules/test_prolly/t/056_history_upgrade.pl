@@ -78,6 +78,18 @@ for my $run ([ '--copy', 0, '_copy' ], [ '--copy', 1, '_copy_own' ],
 			pg_history.chunk_index, pg_history.chunks;
 	});
 	$old->safe_psql($_, $fns) for ('postgres', 'other');
+	# (a second writer at once: a chunk in a lane beside the log's, made
+	# as the backend wrote, not by initdb)
+	my $holder = $old->background_psql('postgres');
+	$holder->query_safe(q{SELECT (test_cs_put('pages', '\x0a7701')).stored});
+	$old->safe_psql('postgres', q{
+		SELECT (test_cs_put('pages', '\x0a7702')).stored;
+		SELECT test_cs_ref_root('pages', h('\x0a7702'));
+	});
+	$holder->quit;
+	is($old->safe_psql('postgres', q{SELECT count(*) > 0 FROM pg_class
+		WHERE relnamespace = 'pg_history'::regnamespace AND relname LIKE 'chunks_lane_%'}),
+		't', "$mode: the old store has a lane beside its log");
 	# (the pointers' and bundles' files numbered apart from their OIDs)
 	$old->safe_psql('postgres', q{
 		VACUUM FULL pg_history.pointers;
@@ -161,6 +173,15 @@ for my $run ([ '--copy', 0, '_copy' ], [ '--copy', 1, '_copy_own' ],
 	for my $db ('postgres', 'other')
 	{
 		is($new->safe_psql($db, $numbers), $old_numbers{$db}, "$mode, $db: the relations' file numbers kept");
+		if ($db eq 'postgres')
+		{
+			is($new->safe_psql($db, q{SELECT test_cs_get('pages', h('\x0a7702')) = '\x0a7702'}), 't',
+				"$mode: a chunk in a lane read back");
+			is($new->safe_psql($db, q{SELECT count(*) FROM pg_class c JOIN pg_depend d ON d.objid = c.oid
+				WHERE c.relname LIKE 'chunks_lane_%' AND d.deptype = 'i'
+					AND d.refobjid = 'pg_history.chunks'::regclass}) > 0 ? 't' : 'f', 't',
+				"$mode: the lanes their log's again");
+		}
 		is($new->safe_psql($db, $horizon), $old_horizon{$db}, "$mode, $db: their relfrozenxids and relminmxids kept");
 	}
 	is($new_sysid ne $old_sysid ? 1 : 0, $own, "$mode: the systems' identifiers");

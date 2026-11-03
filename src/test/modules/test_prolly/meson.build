@@ -178,6 +178,7 @@ tests += {
       't/074_tier_manifest_crash.pl',
       't/075_history_dump_tier.pl',
       't/076_chunk_free_marked.pl',
+      't/078_chunk_lanes.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

@@ -16,7 +16,11 @@
  * cluster's to read (pg_upgrade refuses one whose tier's place is not the
  * old one's, binary_upgrade_history_tier_place); its marker, named by the
  * system, is the new system's once the files are there
- * (binary_upgrade_history_tier_mark).
+ * (binary_upgrade_history_tier_mark).  A chunk log's lanes (prolly/
+ * chunk_lane.h), made as backends wrote, are not initdb's: pg_dump
+ * --binary-upgrade makes each again, its OID and file number the old
+ * cluster's, and binary_upgrade_history_lane makes it its log's again; its
+ * pages, its meta page naming it a lane, come with its files.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -30,6 +34,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
@@ -203,5 +208,30 @@ binary_upgrade_history_tier_mark(PG_FUNCTION_ARGS)
 	rel = relation_open(ChunkStoreTierLogRelid(), AccessExclusiveLock);
 	ChunkTierMarkUpgraded(rel, old_sysid);
 	relation_close(rel, NoLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * binary_upgrade_history_lane(lane, log): a lane of a chunk log, made again
+ * by pg_dump --binary-upgrade, made the log's again (internally dependent
+ * on it, as the lane's making made it)
+ */
+Datum
+binary_upgrade_history_lane(PG_FUNCTION_ARGS)
+{
+	Oid			lane = PG_GETARG_OID(0);
+	Oid			log = PG_GETARG_OID(1);
+	ObjectAddress laneaddr,
+				logaddr;
+
+	check_binary_upgrade();
+	if (get_rel_namespace(lane) != PG_HISTORY_NAMESPACE ||
+		get_rel_namespace(log) != PG_HISTORY_NAMESPACE)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("a lane and its log are relations of the history store")));
+	ObjectAddressSet(laneaddr, RelationRelationId, lane);
+	ObjectAddressSet(logaddr, RelationRelationId, log);
+	recordDependencyOn(&laneaddr, &logaddr, DEPENDENCY_INTERNAL);
 	PG_RETURN_VOID();
 }
