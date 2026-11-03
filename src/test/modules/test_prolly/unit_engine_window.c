@@ -841,7 +841,8 @@ ENGINE_TEST(test_pinned_commit_stays)
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
 	Linear		l;
-	uint32		seg;
+	uint32		seg,
+				refused;
 	VcWindow	w = {.depth = 1};
 
 	setup(&r, cs);
@@ -853,6 +854,11 @@ ENGINE_TEST(test_pinned_commit_stays)
 	CHECK(vc_locate(&r, &l.d, NULL) == VC_LOC_WINDOW);
 	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_SEGMENT);
 	CHECK(vc_locate(&r, &l.c, NULL) == VC_LOC_SEGMENT);
+	/* a pin of a commit cut already, though in a segment still, is refused */
+	w.pinned = &l.b;
+	CHECK_EQ(vc_sever(&r, &w, &refused), VC_ERR_SEVERED);
+	CHECK(phash_eq(&r.ctx.err_hash, &l.b));
+	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_WINDOW);
 	CHECK_EQ(vc_segment_discard(&r, seg, NULL), VC_OK);
 	settle_and_check(cs);
 	CHECK_EQ(vc_branch_create(&r, "tag-a", &l.a), VC_OK);

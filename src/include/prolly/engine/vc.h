@@ -315,7 +315,9 @@ extern bool vc_in_window(VcRepo *r, const PHash *commit);
  * no floor set everything is kept.  A ceiling cuts it once commits >
  * max_commits, or bytes > max_bytes, or age >= max_seconds: any ceiling
  * cuts it, and a ceiling wins over a floor.  Zero leaves a limit unset; a
- * window with none set is refused.  Heads are always kept.
+ * window with none set is refused.  Heads are always kept.  A pinned commit
+ * must be held: one cut already (in a segment, or discarded, its chunks
+ * freed or not) is refused, VC_ERR_SEVERED.
  *
  * Low marks.  Without them the window slides: each sever cuts a head's
  * history back to exactly the window above (its high mark).  With any low

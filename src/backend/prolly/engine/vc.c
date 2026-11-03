@@ -2547,6 +2547,7 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 	{
 		px_free(held.v);
 		phmap_free(&win);
+		locked_free(&locked);
 		repo_state_free(&st);
 		return rc;
 	}
