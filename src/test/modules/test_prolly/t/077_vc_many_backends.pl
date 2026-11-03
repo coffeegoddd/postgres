@@ -18,6 +18,7 @@ autovacuum = off
 max_connections = 40
 log_lock_waits = on
 deadlock_timeout = 10ms
+log_line_prefix = '%m [%p] %b %a: '
 });
 $node->start;
 $node->safe_psql('postgres', q{
@@ -57,8 +58,12 @@ my @rows = grep {
 } 1 .. 16;
 is(scalar @rows, 0, "each branch's head has its 25 commits' rows, and base's")
   or diag("branches short of rows: @rows");
+# (a wait's lines, with what waited and on what, shown if there is one)
 my $waits = slurp_file($node->logfile, $log_at);
-unlike($waits, qr/still waiting/, 'no commit waited on another branch\'s');
+my @waited = grep { /still waiting/ .. /STATEMENT|^\S+ \S+ \[\d+\] .*: (?!DETAIL|CONTEXT)/ }
+  split /\n/, $waits;
+is(scalar(grep { /still waiting/ } @waited), 0, 'no commit waited on another branch\'s')
+  or diag(join("\n", @waited));
 
 # eight backends on one branch: they take turns, and every commit lands
 $node->pgbench(
