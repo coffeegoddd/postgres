@@ -230,7 +230,7 @@ Datum
 test_chunk_index_merge(PG_FUNCTION_ARGS)
 {
 	Relation	idx = open_index(PG_GETARG_OID(0), ShareUpdateExclusiveLock);
-	uint64		n = ChunkIndex->merge ? ChunkIndex->merge(idx) : 0;
+	uint64		n = ChunkStoreMerge(idx);
 
 	relation_close(idx, NoLock);
 	PG_RETURN_INT64((int64) n);

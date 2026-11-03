@@ -182,10 +182,13 @@ typedef struct ChunkIndexRoutine
 	 * and all) in *out, if nothing holds it: its counts zero, no other
 	 * transaction changing them, this transaction not putting it, and
 	 * held(idx, hash) false (this transaction's own holds).  False otherwise.
+	 * How many entries of the chunk it freed that counted their references
+	 * (two putting it at once each counted them), in *copies: each's to
+	 * let go of.
 	 */
 	bool		(*free) (Relation idx, const uint8 *hash,
 						 bool (*held) (Relation idx, const uint8 *hash),
-						 ChunkIndexEntry *out);
+						 ChunkIndexEntry *out, uint32 *copies);
 
 	/*
 	 * The chunk log the index's entries are of (InvalidOid until it is
@@ -226,11 +229,16 @@ typedef struct ChunkIndexRoutine
 
 	/*
 	 * An index in lanes: the lanes' entries committed moved into the index
-	 * by this transaction, the buckets of chunks left with no counts
-	 * marked; how many moved.  NULL for an index of no lanes.  (Its freer
-	 * calls it before freeing.)
+	 * by this transaction, the buckets of chunks a hold let go of left with
+	 * no counts marked; how many moved.  dup called with each entry of a
+	 * chunk another entry of which the index had (two putting it at once):
+	 * its references, counted for each entry, are the caller's to let go of
+	 * (prolly/chunk_store.h's ChunkStoreMerge).  NULL for an index of no
+	 * lanes.
 	 */
-	uint64		(*merge) (Relation idx);
+	uint64		(*merge) (Relation idx,
+						  void (*dup) (void *arg, const ChunkIndexEntry *e),
+						  void *arg);
 	void		(*visit_as_of) (Relation idx, Snapshot snap,
 								bool (*fn) (void *arg, const ChunkIndexEntry *e),
 								void *arg);

@@ -97,4 +97,12 @@ extern Relation ChunkIndexLaneForWrite(Relation idx, Relation log, uint32 *lane)
 extern uint32 ChunkIndexLaneCount(Relation idx);
 extern void ChunkIndexLaneClose(Relation lane);
 
+/*
+ * Every lane of idx a reader is to look in, opened (a lane just made by a
+ * live backend included, whose catalogs this one may not see yet): how
+ * many, into *lanes; and those closed (their locks kept).
+ */
+extern int	ChunkIndexLanesOpen(Relation idx, LOCKMODE lockmode, Relation **lanes);
+extern void ChunkIndexLanesClose(Relation *lanes, int n);
+
 #endif							/* PROLLY_CHUNK_LANE_H */

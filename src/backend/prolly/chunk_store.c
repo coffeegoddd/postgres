@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "access/relation.h"
 #include "access/xact.h"
 #include "common/cryptohash.h"
 #include "common/int.h"
@@ -928,11 +929,12 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 		ChunkIndexEntry e;
 		RefList		kids = {0};
 		void	   *data;
+		uint32		copies;
 
 		CHECK_FOR_INTERRUPTS();
 
 		/* (one this transaction holds passed by: prolly/chunk_pin.h) */
-		if (!ChunkIndex->free(idx, h, ChunkPinned, &e))
+		if (!ChunkIndex->free(idx, h, ChunkPinned, &e, &copies))
 			continue;
 		INJECTION_POINT("chunk-free-marked", NULL);
 		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
@@ -940,9 +942,10 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 		check_hash(h, data, e.len, log, e.loc);
 		ChunkFormat->refs(data, e.len, add_ref, &kids);
 		pfree(data);
-		for (int k = 0; k < kids.n; k++)
+		/* (each copy put counted its references: each's let go of) */
+		for (int k = 0; k < kids.n * (int) copies; k++)
 		{
-			const uint8 *kid = kids.hashes + k * CHUNK_HASH_LEN;
+			const uint8 *kid = kids.hashes + (k % kids.n) * CHUNK_HASH_LEN;
 			ChunkIndexEntry ke;
 
 			if (!ChunkIndex->adjust(idx, kid, -1, 0, &ke))
@@ -1275,4 +1278,53 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 	pfree(lens);
 	*why = es.why;
 	return es.why == NULL;
+}
+
+/* ----------------------------------------------------------- merging */
+
+typedef struct MergeArg
+{
+	Relation	log;
+	Relation	idx;
+} MergeArg;
+
+/*
+ * (a chunk put twice at once, folded in as one: the references its second
+ * entry counted let go of, the edges being the chunk's once)
+ */
+static void
+merge_dup(void *arg, const ChunkIndexEntry *e)
+{
+	MergeArg   *m = arg;
+	RefList		refs = {0};
+	void	   *data;
+
+	if (e->len == 0)
+		return;
+	data = palloc_extended(e->len, MCXT_ALLOC_HUGE);
+	ChunkLogOf(m->log)->read(m->log, e->loc, data, e->len);
+	ChunkFormat->refs(data, e->len, add_ref, &refs);
+	for (int i = 0; i < refs.n; i++)
+		count_ref(m->idx, e->hash, refs.hashes + i * CHUNK_HASH_LEN, -1);
+	pfree(data);
+	if (refs.hashes)
+		pfree(refs.hashes);
+}
+
+uint64
+ChunkStoreMerge(Relation idx)
+{
+	uint64		stamp;
+	Oid			logid;
+	MergeArg	m = {.idx = idx};
+	uint64		n;
+
+	if (ChunkIndex->merge == NULL)
+		return 0;
+	logid = ChunkIndex->log_of(idx, &stamp);
+	if (!OidIsValid(logid) || (m.log = try_relation_open(logid, RowExclusiveLock)) == NULL)
+		return 0;
+	n = ChunkIndex->merge(idx, merge_dup, &m);
+	relation_close(m.log, NoLock);
+	return n;
 }

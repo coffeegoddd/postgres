@@ -54,6 +54,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #define LANES_PER_BACKEND	4
 
@@ -62,6 +63,11 @@ typedef struct LaneEntry
 	Oid			db;				/* InvalidOid: unused */
 	Oid			log;
 	uint32		lane;
+	Oid			index_lane;		/* the lane of the log's index this backend
+								 * writes, its relation, once known: set
+								 * before it writes there, so that a reader
+								 * finds it though its catalogs do not have
+								 * the lane yet */
 } LaneEntry;
 
 /* what this backend alone knows of its entries */
@@ -306,6 +312,8 @@ map_lanes(Relation log, bool index)
 	HeapTuple	tup;
 	uint32		n = index ? index_lane_count(log) : ChunkLogLanes(log);
 
+	/* (the catalogs as they are now: a lane made since the last look found) */
+	InvalidateCatalogSnapshot();
 	relids = MemoryContextAllocZero(TopMemoryContext, sizeof(Oid) * Max(n, 1));
 	checked = MemoryContextAllocZero(TopMemoryContext, sizeof(bool) * Max(n, 1));
 	if (!index)
@@ -672,6 +680,7 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	mine[slot].db = MyDatabaseId;
 	mine[slot].log = RelationGetRelid(log);
 	mine[slot].lane = lane;
+	mine[slot].index_lane = InvalidOid;
 	LWLockRelease(ChunkLaneLock);
 	pfree(held);
 	pfree(exists);
@@ -736,5 +745,142 @@ ChunkIndexLaneForWrite(Relation idx, Relation log, uint32 *lane_out)
 			elog(ERROR, "lane %u of chunk index \"%s\" made, and not found",
 				 lane, RelationGetRelationName(idx));
 	}
+
+	/* (named in this backend's entry before anything is written there) */
+	{
+		LaneEntry  *mine = my_entries();
+
+		for (int j = 0; j < LANES_PER_BACKEND; j++)
+			if (mine[j].db == MyDatabaseId && mine[j].log == RelationGetRelid(log) &&
+				mine[j].lane == lane && mine[j].index_lane != RelationGetRelid(ir))
+			{
+				LWLockAcquire(ChunkLaneLock, LW_EXCLUSIVE);
+				mine[j].index_lane = RelationGetRelid(ir);
+				LWLockRelease(ChunkLaneLock);
+			}
+	}
 	return ir;
+}
+
+/*
+ * relid opened in lockmode if it exists as the catalogs are now, else NULL:
+ * looked for afresh, not through the system caches, which may remember it
+ * missing from a look before its transaction committed.  Looked for before
+ * it is locked: a lane its maker has not committed is no lane yet, and its
+ * maker's lock on it is not to be waited for.
+ */
+static Relation
+open_fresh(Oid relid, LOCKMODE lockmode)
+{
+	Relation	pg_class;
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		exists;
+
+	InvalidateCatalogSnapshot();
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_class, ClassOidIndexId, true, NULL, 1, &key);
+	exists = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+	if (!exists)
+		return NULL;
+	LockRelationOid(relid, lockmode);
+	InvalidateCatalogSnapshot();
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_class, ClassOidIndexId, true, NULL, 1, &key);
+	exists = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+	if (!exists)
+	{
+		UnlockRelationOid(relid, lockmode);
+		return NULL;
+	}
+	return relation_open(relid, NoLock);
+}
+
+/*
+ * Every lane of idx a reader is to look in, opened in lockmode, into
+ * *lanes (palloc'd): how many.  Those this backend's map of them has (made
+ * again if the catalogs changed since: the invalidations taken in first),
+ * and those the live backends' entries name, which a lane is named in
+ * before anything is written there: a lane made by a transaction just
+ * committed, whose catalogs others may not see yet, is found so.  (The
+ * entries read first: a backend gone since had sent its invalidations.)
+ */
+int
+ChunkIndexLanesOpen(Relation idx, LOCKMODE lockmode, Relation **lanes_out)
+{
+	uint64		stamp;
+	Oid			log = PageChunkIndex.log_of(idx, &stamp);
+	Oid		   *named;
+	int			nnamed = 0;
+	LaneMap    *map;
+	Relation   *out;
+	int			nout = 0,
+				cap;
+
+	if (nslots == 0)
+		nslots = slot_count();
+	named = palloc(sizeof(Oid) * nslots * LANES_PER_BACKEND);
+	if (OidIsValid(log))
+	{
+		LWLockAcquire(ChunkLaneLock, LW_SHARED);
+		for (int i = 0; i < nslots * LANES_PER_BACKEND; i++)
+		{
+			LaneEntry  *e = &lanes[i];
+
+			if (e->db == MyDatabaseId && e->log == log && OidIsValid(e->index_lane))
+				named[nnamed++] = e->index_lane;
+		}
+		LWLockRelease(ChunkLaneLock);
+	}
+	AcceptInvalidationMessages();
+	map = lane_map(idx, true);
+	cap = map->n + nnamed + 1;
+	out = palloc(sizeof(Relation) * cap);
+	for (uint32 l = 0; l < map->n; l++)
+	{
+		Relation	rel = ChunkIndexLaneOpen(idx, l, lockmode);
+
+		if (rel != NULL)
+			out[nout++] = rel;
+	}
+	for (int i = 0; i < nnamed; i++)
+	{
+		bool		have = false;
+		Relation	rel;
+		uint32		number;
+		Oid			parent;
+
+		for (int j = 0; j < nout && !have; j++)
+			have = RelationGetRelid(out[j]) == named[i];
+		if (have)
+			continue;
+		rel = open_fresh(named[i], lockmode);
+		if (rel == NULL)
+			continue;
+		if (RelationIsChunkIndex(rel) && ChunkIndexLaneOf(rel, &number, &parent) &&
+			parent == RelationGetRelid(idx))
+			out[nout++] = rel;
+		else
+			relation_close(rel, lockmode);
+	}
+	pfree(named);
+	*lanes_out = out;
+	return nout;
+}
+
+void
+ChunkIndexLanesClose(Relation *lanes, int n)
+{
+	for (int i = 0; i < n; i++)
+		relation_close(lanes[i], NoLock);
+	if (lanes)
+		pfree(lanes);
 }

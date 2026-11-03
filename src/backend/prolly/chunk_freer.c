@@ -508,7 +508,7 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 			switch (op)
 			{
 				case FREER_MERGE:
-					fs->merged += ChunkIndex->merge ? ChunkIndex->merge(idx) : 0;
+					fs->merged += ChunkStoreMerge(idx);
 					break;
 				case FREER_FREE:
 					{

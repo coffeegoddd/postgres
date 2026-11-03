@@ -183,4 +183,11 @@ extern void ChunkStoreCompactEnd(ChunkCompaction *c);
 extern bool ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks,
 							uint64 *unheld, char **why);
 
+/*
+ * The index's lanes' entries moved into it (prolly/chunk_index.h's merge),
+ * by this transaction: a chunk put twice at once kept once, the references
+ * its second entry counted let go of.  How many moved.
+ */
+extern uint64 ChunkStoreMerge(Relation idx);
+
 #endif							/* PROLLY_CHUNK_STORE_H */
