@@ -39,6 +39,7 @@ SUBDIRS = \
 	postmaster \
 	prolly \
 	prolly/engine \
+	prolly/ws \
 	regex \
 	replication \
 	rewrite \

@@ -146,7 +146,18 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_rewrite  | mode_is_the_repository               | ok     | 
  engine_rewrite  | no_remotes                           | ok     | 
  engine_rewrite  | low_marks                            | ok     | 
-(134 rows)
+ ws_row          | bytes                                | ok     | 
+ ws_row          | round_trip                           | ok     | 
+ ws_row          | schema_changes                       | ok     | 
+ ws_row          | edge_rows                            | ok     | 
+ ws_row          | keys                                 | ok     | 
+ ws_row          | cell_get                             | ok     | 
+ ws_row          | cells_encode_refuses                 | ok     | 
+ ws_row          | malformed                            | ok     | 
+ ws_row          | shapes                               | ok     | 
+ ws_row          | widest_row                           | ok     | 
+ ws_row          | copy_text                            | ok     | 
+(145 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
