@@ -276,6 +276,63 @@ branch_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 	return true;
 }
 
+static bool
+repo_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
+{
+	const uint8 *p = data + 2;
+	const uint8 *end = data + len;
+	PHash		h;
+	uint64		v;
+
+	if (!read_hash(&p, end, &h))
+		return false;
+	fn(arg, &h, true);
+	if (!read_uvarint(&p, end, &v) || !read_uvarint(&p, end, &v) ||
+		v != (uint64) (end - p))
+		return false;
+	return true;
+}
+
+static bool
+segment_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
+{
+	const uint8 *p = data + 2;
+	const uint8 *end = data + len;
+	PHash		h;
+	uint64		n;
+	bool		exported;
+
+	if (p >= end || *p > 1)
+		return false;
+	exported = *p++ == 1;
+	if (!read_uvarint(&p, end, &n) || n > len)
+		return false;
+	for (uint64 i = 0; i < n; i++)
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, !exported);
+	}
+	if (exported)
+	{
+		if (!read_uvarint(&p, end, &n) || n > (uint64) (end - p))
+			return false;
+		p += n;
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, false);
+		if (!read_uvarint(&p, end, &n) || n > len)
+			return false;
+		for (uint64 i = 0; i < n; i++)
+		{
+			if (!read_hash(&p, end, &h))
+				return false;
+			fn(arg, &h, false);
+		}
+	}
+	return p == end;
+}
+
 bool
 engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 {
@@ -299,6 +356,10 @@ engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 			return image_refs(data, len, fn, arg);
 		case CHUNK_TAG_BRANCH:
 			return branch_refs(data, len, fn, arg);
+		case CHUNK_TAG_REPO:
+			return repo_refs(data, len, fn, arg);
+		case CHUNK_TAG_SEGMENT:
+			return segment_refs(data, len, fn, arg);
 		default:
 			return false;
 	}

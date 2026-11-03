@@ -64,7 +64,7 @@ check_name(const char *name)
 }
 
 static bool
-mem_refs_get(VcRefs *refs, const char *name, bool for_update, PHash *out)
+mem_refs_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
 {
 	MemRef	   *r;
 

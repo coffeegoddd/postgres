@@ -39,6 +39,16 @@
  *			uvarint namelen, the branch's name
  *			A branch's state, which its reference names; its name makes it
  *			that branch's alone.
+ * Repo:	tag, version, commit-location map root (strong), uvarint next
+ *			segment id, uvarint namelen, the repository's name
+ *			The repository's own state, which vc/repo names: where each
+ *			commit outside the window is.
+ * Segment: tag, version, exported byte (0 or 1), uvarint n, member commit
+ *			hash... (strong if not exported, else weak), [uvarint namelen,
+ *			archive name, manifest hash (weak), uvarint nb, bound commit
+ *			hash... (weak): the members' parents not members] (if exported)
+ *			Commits severed from the window together; a local segment
+ *			holds them, an exported one's archive does.
  *
  * EngineChunkFormat is these formats as the history store's ChunkFormat
  * (prolly/chunk_format.h): the strong references, those a store keeps a
@@ -64,6 +74,8 @@
 #define CHUNK_TAG_PAGE 0x47
 #define CHUNK_TAG_IMAGE 0x49
 #define CHUNK_TAG_BRANCH 0x42
+#define CHUNK_TAG_REPO 0x52
+#define CHUNK_TAG_SEGMENT 0x54
 
 /*
  * Covers the encodings and the chunk boundary function; anything that

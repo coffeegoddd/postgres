@@ -16,6 +16,7 @@ OBJS = \
 	unit_engine_lifetime.o \
 	unit_engine_prolly.o \
 	unit_engine_vc.o \
+	unit_engine_window.o \
 	vc_sql.o \
 	unit_bufmgr.o \
 	unit_harness.o \
@@ -62,4 +63,7 @@ endif
 # index splitting a bucket, and expect it to split where it does after
 # the tests before them; version control's commits, with chunks of their
 # own, would make it split elsewhere)
-ISOLATION += vc_branch_races vc_open_race
+ISOLATION += vc_branch_races vc_open_race vc_window_races
+ifeq ($(enable_injection_points),yes)
+ISOLATION += vc_sever_commit
+endif

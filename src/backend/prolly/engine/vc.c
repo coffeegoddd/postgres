@@ -22,8 +22,11 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "prolly/engine/vc.h"
+#include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/timestamp.h"
 
 #define ENTRY_LEN (2 * PHASH_LEN)
@@ -31,6 +34,8 @@
 
 #define BRANCH_REF_PREFIX "vc/branch/"
 #define COMMIT_REF_PREFIX "vc/commit/"
+#define REPO_REF "vc/repo"
+#define SEGMENT_REF_PREFIX "vc/segment/"
 
 /* A tree error, raised. */
 static void
@@ -764,6 +769,17 @@ vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b, PHash *out)
 
 /* ----------------------------------------------------------- references */
 
+/* The repository's own state, which vc/repo names. */
+typedef struct RepoState
+{
+	PHash		loc_root;		/* where each commit outside the window is */
+	uint64		next_seg;
+	char	   *name;
+} RepoState;
+
+static void repo_share(VcRepo *r);
+static PHash repo_put(ProllyCtx *ctx, const RepoState *st);
+
 static char *
 branch_ref(const char *name)
 {
@@ -855,11 +871,11 @@ branch_decode(ProllyCtx *ctx, const PHash *h, VcBranch *b)
 }
 
 /*
- * The branch's reference read, locked for this transaction if for_update;
+ * The branch's reference read, locked for this transaction as lock says;
  * false if there is none.
  */
 static bool
-branch_read(VcRepo *r, const char *name, bool for_update, VcBranch *out)
+branch_read(VcRepo *r, const char *name, VcRefLock lock, VcBranch *out)
 {
 	char	   *ref;
 	PHash		h;
@@ -868,7 +884,7 @@ branch_read(VcRepo *r, const char *name, bool for_update, VcBranch *out)
 	if (!branch_name_ok(name))
 		return false;
 	ref = branch_ref(name);
-	found = vc_refs_get(r->refs, ref, for_update, &h);
+	found = vc_refs_get(r->refs, ref, lock, &h);
 
 	pfree(ref);
 	if (!found)
@@ -904,7 +920,7 @@ branch_add(VcRepo *r, const VcBranch *b)
 static void
 lock_head(VcRepo *r, VcBranch *out)
 {
-	if (!branch_read(r, r->cur, true, out))
+	if (!branch_read(r, r->cur, VC_REF_UPDATE, out))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\", checked out, is gone", r->cur)));
@@ -915,7 +931,7 @@ vc_in_window(VcRepo *r, const PHash *commit)
 {
 	char	   *ref = commit_ref(commit);
 	PHash		h;
-	bool		found = vc_refs_get(r->refs, ref, false, &h);
+	bool		found = vc_refs_get(r->refs, ref, VC_REF_READ, &h);
 
 	pfree(ref);
 	return found;
@@ -988,7 +1004,7 @@ vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 	r->now = now;
 	r->now_arg = now_arg;
 	r->cur = pstrdup("main");
-	if (!branch_read(r, "main", false, &main))
+	if (!branch_read(r, "main", VC_REF_READ, &main))
 	{
 		PHash		root = vc_root_empty(&r->ctx);
 		PHash		commit = vc_commit_write(&r->ctx, &root, NULL, 0, unique_clock(r),
@@ -1001,6 +1017,18 @@ vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 		main.head_root = root;
 		main.working = root;
 		main.merging = false;
+		/* the repository's own state: no commit outside the window yet */
+		{
+			RepoState	st;
+			PHash		h;
+
+			vc_must(&r->ctx, prolly_empty(&r->ctx, 0, &st.loc_root));
+			st.next_seg = 0;
+			st.name = "";
+			h = repo_put(&r->ctx, &st);
+			(void) vc_refs_add(r->refs, REPO_REF, &h);
+		}
+
 		/*
 		 * (of two opening an empty repository at once, one makes "main";
 		 * the other's init commit is then let go of with its reference,
@@ -1025,7 +1053,7 @@ vc_repo_free(VcRepo *r)
 bool
 vc_branch_get(VcRepo *r, const char *name, VcBranch *out)
 {
-	return branch_read(r, name, false, out);
+	return branch_read(r, name, VC_REF_READ, out);
 }
 
 void
@@ -1066,7 +1094,7 @@ vc_branch_list(VcRepo *r, VcBranchFn fn, void *arg)
 void
 vc_head(VcRepo *r, VcBranch *out)
 {
-	if (!branch_read(r, r->cur, false, out))
+	if (!branch_read(r, r->cur, VC_REF_READ, out))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\", checked out, is gone", r->cur)));
@@ -1130,6 +1158,7 @@ vc_branch_create(VcRepo *r, const char *name, const PHash *commit)
 
 	if (!branch_name_ok(name))
 		return VC_ERR;
+	repo_share(r);
 	if (vc_branch_get(r, name, &cur))
 	{
 		vc_branch_free(&cur);
@@ -1239,6 +1268,7 @@ vc_reset_hard(VcRepo *r, const PHash *commit)
 	VcCommit	c;
 	int			rc;
 
+	repo_share(r);
 	if ((rc = reach_commit(r, commit, VC_WINDOW_ONLY, &c)) != VC_OK)
 		return rc;
 	lock_head(r, &b);
@@ -1259,6 +1289,7 @@ vc_reset_soft(VcRepo *r, const PHash *commit)
 	VcCommit	c;
 	int			rc;
 
+	repo_share(r);
 	if ((rc = reach_commit(r, commit, VC_WINDOW_ONLY, &c)) != VC_OK)
 		return rc;
 	lock_head(r, &b);
@@ -1285,6 +1316,7 @@ vc_merge(VcRepo *r, const char *branch, VcMergeResult *res)
 	int			rc;
 
 	memset(res, 0, sizeof(*res));
+	repo_share(r);
 	if (!vc_branch_get(r, branch, &other))
 		return VC_ERR;			/* unknown branch */
 	theirs = other.head;
@@ -1435,4 +1467,1162 @@ vc_log(VcRepo *r, const PHash *start, size_t max, unsigned flags,
 		vc_commit_release(&c);
 	}
 	return VC_OK;
+}
+
+/* ----------------------------------------------------------- repository */
+
+
+/*
+ * Where a commit outside the window is, in the repository's location map:
+ * a member of segment n, LOC_SEG_BASE + 2n, plus one if it is exported (so
+ * that where a commit is costs the map alone), or a parent never had here
+ * (LOC_BOUNDARY).  A commit in the window has its own reference instead,
+ * and a parent of a commit held that was discarded here is found from
+ * what is held when asked, not kept.
+ */
+#define LOC_GONE 0
+#define LOC_SEG_BASE 2
+#define LOC_BOUNDARY PG_UINT64_MAX
+#define LOC_SEG(id, exported) (LOC_SEG_BASE + 2 * (uint64) (id) + ((exported) ? 1 : 0))
+#define LOC_IS_SEG(v) ((v) >= LOC_SEG_BASE && (v) != LOC_BOUNDARY)
+#define LOC_SEG_ID(v) ((uint32) (((v) - LOC_SEG_BASE) / 2))
+#define LOC_SEG_EXPORTED(v) ((((v) - LOC_SEG_BASE) & 1) == 1)
+
+
+
+static PHash
+repo_put(ProllyCtx *ctx, const RepoState *st)
+{
+	Buf			b = BUF_INIT;
+	PHash		h;
+
+	buf_append_byte(&b, CHUNK_TAG_REPO);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	buf_append(&b, st->loc_root.b, PHASH_LEN);
+	buf_append_uvarint(&b, st->next_seg);
+	buf_append_uvarint(&b, strlen(st->name));
+	buf_append(&b, st->name, strlen(st->name));
+	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
+	buf_free(&b);
+	return h;
+}
+
+/* The repository's state, its reference locked as lock says. */
+static void
+repo_read(VcRepo *r, VcRefLock lock, RepoState *st)
+{
+	PHash		h;
+	uint32		len;
+	uint8	   *d;
+	const uint8 *p,
+			   *end;
+	uint64		nl;
+	char		hex[PHASH_HEX_LEN + 1];
+
+	if (!vc_refs_get(r->refs, REPO_REF, lock, &h))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the repository has no \"%s\" reference", REPO_REF)));
+	d = cs_get(r->ctx.cs, h.b, &len);
+	if (d == NULL || len < 2 + PHASH_LEN || d[0] != CHUNK_TAG_REPO ||
+		d[1] != CHUNK_FORMAT_VERSION)
+		goto bad;
+	memcpy(st->loc_root.b, d + 2, PHASH_LEN);
+	p = d + 2 + PHASH_LEN;
+	end = d + len;
+	if (!read_uvarint(&p, end, &st->next_seg) || !read_uvarint(&p, end, &nl) ||
+		nl != (uint64) (end - p))
+		goto bad;
+	st->name = pnstrdup((const char *) p, nl);
+	pfree(d);
+	return;
+bad:
+	phash_hex(&h, hex);
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("chunk %s, which \"%s\" names, is no repository", hex, REPO_REF)));
+}
+
+static void
+repo_write(VcRepo *r, const RepoState *st)
+{
+	PHash		h = repo_put(&r->ctx, st);
+
+	vc_refs_set(r->refs, REPO_REF, &h);
+}
+
+/* (for a call pointing a branch at a commit it did not write) */
+static void
+repo_share(VcRepo *r)
+{
+	RepoState	st;
+
+	repo_read(r, VC_REF_SHARE, &st);
+	pfree(st.name);
+}
+
+void
+vc_repo_set_name(VcRepo *r, const char *name)
+{
+	RepoState	st;
+
+	repo_read(r, VC_REF_UPDATE, &st);
+	pfree(st.name);
+	st.name = pstrdup(name);
+	repo_write(r, &st);
+	pfree(st.name);
+}
+
+/* (a commit's location in the map, LOC_GONE if none) */
+static uint64
+loc_get(VcRepo *r, const PHash *root, const PHash *h)
+{
+	const uint8 *val;
+	size_t		vl;
+	uint64		out = LOC_GONE;
+	int			rc = prolly_get(&r->ctx, root, h->b, PHASH_LEN, &val, &vl);
+
+	if (rc == PROLLY_NOT_FOUND)
+		return LOC_GONE;
+	vc_must(&r->ctx, rc);
+	{
+		const uint8 *p = val;
+
+		if (!read_uvarint(&p, val + vl, &out) || p != val + vl)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a commit's location is not a number")));
+	}
+	px_free((void *) val);
+	return out;
+}
+
+/* Changes to the location map, applied at once (LOC_GONE removes). */
+typedef struct LocEdits
+{
+	ProllyEdit *e;
+	uint8	   *keys;
+	uint8	   *vals;
+	size_t		n;
+	size_t		cap;
+} LocEdits;
+
+static void
+loc_set(LocEdits *le, const PHash *h, uint64 where)
+{
+	if (le->n == le->cap)
+	{
+		le->cap = Max(le->cap * 2, 16);
+		le->e = px_realloc(le->e, le->cap * sizeof(ProllyEdit));
+		le->keys = px_realloc(le->keys, le->cap * PHASH_LEN);
+		le->vals = px_realloc(le->vals, le->cap * 10);
+	}
+	memcpy(le->keys + le->n * PHASH_LEN, h->b, PHASH_LEN);
+	le->n++;
+	{
+		Buf			b = BUF_INIT;
+		size_t		i = le->n - 1;
+
+		buf_append_uvarint(&b, where);
+		memcpy(le->vals + i * 10, b.data, b.len);
+		le->e[i].vlen = b.len;
+		buf_free(&b);
+		le->e[i].del = where == LOC_GONE;
+	}
+}
+
+static PHash
+loc_apply(VcRepo *r, const PHash *root, LocEdits *le)
+{
+	PHash		out = *root;
+
+	for (size_t i = 0; i < le->n; i++)
+	{
+		le->e[i].key = le->keys + i * PHASH_LEN;
+		le->e[i].klen = PHASH_LEN;
+		le->e[i].val = le->e[i].del ? NULL : le->vals + i * 10;
+		if (le->e[i].del)
+			le->e[i].vlen = 0;
+	}
+	if (le->n)
+		vc_must(&r->ctx, prolly_apply(&r->ctx, root, le->e, le->n, &out));
+	px_free(le->e);
+	px_free(le->keys);
+	px_free(le->vals);
+	memset(le, 0, sizeof(*le));
+	return out;
+}
+
+/* ---------------------------------------------------------------- window */
+
+static bool
+depth_only(const VcWindow *w)
+{
+	return w->depth && !w->keep_bytes && !w->keep_seconds && !w->max_commits &&
+		!w->max_bytes && !w->max_seconds;
+}
+
+/* Whether a floor keeps a commit with these measures, against head H. */
+static bool
+floor_keeps(const VcWindow *w, const VcCommit *H, uint64 now, uint64 gen,
+			uint64 bytes, uint64 time)
+{
+	if (!w->depth && !w->keep_bytes && !w->keep_seconds)
+		return true;			/* no floor: the ceilings decide */
+	return (w->depth && gen + w->depth > H->generation) ||
+		(w->keep_bytes && bytes + w->keep_bytes > H->bytes) ||
+		(w->keep_seconds && time + w->keep_seconds * 1000000 > now);
+}
+
+/*
+ * Whether a ceiling cuts a commit; span is the change bytes of it and
+ * every commit after it up to H.
+ */
+static bool
+ceiling_cuts(const VcWindow *w, const VcCommit *H, uint64 now, uint64 gen,
+			 uint64 span, uint64 time)
+{
+	return (w->max_commits && gen + w->max_commits <= H->generation) ||
+		(w->max_bytes && span > w->max_bytes) ||
+		(w->max_seconds && time + w->max_seconds * 1000000 <= now);
+}
+
+typedef struct HashStack
+{
+	PHash	   *v;
+	size_t		n;
+	size_t		cap;
+} HashStack;
+
+static void
+stack_push(HashStack *s, const PHash *h)
+{
+	px_grow((void **) &s->v, &s->cap, s->n + 1, sizeof(PHash));
+	s->v[s->n++] = *h;
+}
+
+/*
+ * The window of one head under floors and ceilings.  Generation, change
+ * bytes and time only fall along history, so once a commit is out, all
+ * its ancestors are out on that path: the walk stops there.  A parent's
+ * measures are in its child, so a parent no floor keeps is never read; one
+ * a byte ceiling may cut is read for its own change bytes.
+ */
+static int
+window_add_policy(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
+				  PHashMap *below)
+{
+	VcCommit	H,
+				c;
+	PHashMap	seen;
+	HashStack	st = {0};
+	uint64		now = now_us(r);
+	int			rc = load_commit(&r->ctx, head, &H);
+	bool		created;
+
+	if (rc != VC_OK)
+		return rc;
+	phmap_init(&seen);
+	stack_push(&st, head);
+	while (st.n > 0)
+	{
+		PHash		h = st.v[--st.n];
+		uint64		pb = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		phmap_ref(&seen, &h, &created);
+		if (!created)
+			continue;
+		/* a wider window can reach commits already cut; they stay cut */
+		if (!vc_commit_load(&r->ctx, &h, &c))
+			continue;
+		for (uint32 i = 0; i < c.nparents; i++)
+			if (c.parent_bytes[i] > pb)
+				pb = c.parent_bytes[i];
+		if (!phash_eq(&h, head) &&
+			ceiling_cuts(w, &H, now, c.generation, H.bytes - pb, c.time))
+		{
+			if (below)
+				phmap_ref(below, &h, &created);
+			vc_commit_release(&c);
+			continue;
+		}
+		phmap_ref(win, &h, &created);
+		for (uint32 i = 0; i < c.nparents; i++)
+		{
+			if (!floor_keeps(w, &H, now, c.parent_gen[i], c.parent_bytes[i], c.parent_time[i]) ||
+				ceiling_cuts(w, &H, now, c.parent_gen[i], H.bytes - c.parent_bytes[i],
+							 c.parent_time[i]))
+			{
+				if (below)
+					phmap_ref(below, &c.parents[i], &created);
+				continue;
+			}
+			stack_push(&st, &c.parents[i]);
+		}
+		vc_commit_release(&c);
+	}
+	vc_commit_release(&H);
+	px_free(st.v);
+	phmap_free(&seen);
+	return VC_OK;
+}
+
+/*
+ * Adds to win every commit in head's window.  With only a depth, those
+ * with generation > gen(head) - depth on some path from it: win maps each
+ * commit to 1 + the lowest generation bound it was expanded under, so a
+ * commit reached again under a lower bound is expanded again, and heads
+ * sharing history share the walk.  Parent generations live in the child,
+ * so nothing outside the window is read.  below collects the parents the
+ * window stops at.
+ */
+static int
+window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHashMap *below)
+{
+	uint64		depth = w->depth;
+	VcCommit	c;
+	HashStack	st = {0};
+	uint64		bound;
+	int			rc;
+
+	if (!depth_only(w))
+		return window_add_policy(r, win, head, w, below);
+	if ((rc = load_commit(&r->ctx, head, &c)) != VC_OK)
+		return rc;
+	bound = c.generation > depth ? c.generation - depth : 0;
+	vc_commit_release(&c);
+	stack_push(&st, head);
+	while (st.n > 0)
+	{
+		PHash		h = st.v[--st.n];
+		bool		created;
+		uint64	   *v = phmap_ref(win, &h, &created);
+
+		CHECK_FOR_INTERRUPTS();
+		if (!created && *v <= bound + 1)
+			continue;
+		*v = bound + 1;
+		/* a wider window can reach commits already cut; they stay cut */
+		if (!vc_commit_load(&r->ctx, &h, &c))
+			continue;
+		for (uint32 i = 0; i < c.nparents; i++)
+			if (c.parent_gen[i] > bound)
+				stack_push(&st, &c.parents[i]);
+			else if (below)
+				phmap_ref(below, &c.parents[i], &created);
+		vc_commit_release(&c);
+	}
+	px_free(st.v);
+	return VC_OK;
+}
+
+static bool
+has_low_marks(const VcWindow *w)
+{
+	return w->low_commits || w->low_bytes || w->low_seconds;
+}
+
+static uint64
+tighter(uint64 limit, uint64 mark)
+{
+	if (mark == 0)
+		return limit;
+	if (limit == 0)
+		return mark;
+	return mark < limit ? mark : limit;
+}
+
+/* The window a head at its high mark is cut back to: the low marks as ceilings too. */
+static VcWindow
+low_window(const VcWindow *w)
+{
+	VcWindow	low = *w;
+
+	low.max_commits = tighter(w->max_commits, w->low_commits);
+	low.max_bytes = tighter(w->max_bytes, w->low_bytes);
+	low.max_seconds = tighter(w->max_seconds, w->low_seconds);
+	low.low_commits = low.low_bytes = low.low_seconds = 0;
+	return low;
+}
+
+/*
+ * Whether head's window has reached its high mark: it would let go of a
+ * commit still held (one it stops at, cut by a ceiling or past the floors).
+ */
+static int
+at_high_mark(VcRepo *r, const PHash *head, const VcWindow *w, bool *over)
+{
+	PHashMap	win,
+				below;
+	int			rc;
+
+	phmap_init(&win);
+	phmap_init(&below);
+	rc = window_add(r, &win, head, w, &below);
+	*over = false;
+	for (size_t i = 0; rc == VC_OK && i < below.cap && !*over; i++)
+		if (below.used[i] && !phmap_find(&win, &below.keys[i]) &&
+			vc_in_window(r, &below.keys[i]))
+			*over = true;
+	phmap_free(&win);
+	phmap_free(&below);
+	return rc;
+}
+
+/* Adds head's window to win: its high mark's, or its low mark's once it reached the high one. */
+static int
+window_add_marked(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
+				  PHashMap *below)
+{
+	VcWindow	high = *w,
+				low;
+	bool		over;
+	int			rc;
+
+	high.low_commits = high.low_bytes = high.low_seconds = 0;
+	if (!has_low_marks(w))
+		return window_add(r, win, head, &high, below);
+	if ((rc = at_high_mark(r, head, &high, &over)) != VC_OK)
+		return rc;
+	if (!over)
+		return window_add(r, win, head, &high, below);
+	low = low_window(w);
+	return window_add(r, win, head, &low, below);
+}
+
+/* (each branch's head and merge head, for the window) */
+typedef struct HeadsArg
+{
+	HashStack	heads;
+} HeadsArg;
+
+static void
+heads_fn(void *arg, const VcBranch *b)
+{
+	HeadsArg   *a = arg;
+
+	stack_push(&a->heads, &b->head);
+	if (b->merging)
+		stack_push(&a->heads, &b->merge_head);
+}
+
+static bool
+hex_hash(const char *hex, PHash *out)
+{
+	if (strlen(hex) != PHASH_HEX_LEN)
+		return false;
+	return hex_decode(hex, PHASH_HEX_LEN, (char *) out->b) == PHASH_LEN;
+}
+
+/* (every commit with a reference: the window's history) */
+static void
+held_fn(void *arg, const char *name, const PHash *hash)
+{
+	HashStack  *held = arg;
+	PHash		h;
+
+	if (!hex_hash(name + strlen(COMMIT_REF_PREFIX), &h) || !phash_eq(&h, hash))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("reference \"%s\" names another commit", name)));
+	stack_push(held, &h);
+}
+
+static char *
+segment_ref(uint32 id)
+{
+	return psprintf(SEGMENT_REF_PREFIX "%u", id);
+}
+
+/* A segment's chunk, of its members and (exported) its archive and bounds. */
+static PHash
+segment_put(ProllyCtx *ctx, const VcSegment *seg)
+{
+	Buf			b = BUF_INIT;
+	PHash		h;
+
+	buf_append_byte(&b, CHUNK_TAG_SEGMENT);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	buf_append_byte(&b, seg->exported ? 1 : 0);
+	buf_append_uvarint(&b, seg->n);
+	for (size_t i = 0; i < seg->n; i++)
+		buf_append(&b, seg->commits[i].b, PHASH_LEN);
+	if (seg->exported)
+	{
+		buf_append_uvarint(&b, strlen(seg->archive_name));
+		buf_append(&b, seg->archive_name, strlen(seg->archive_name));
+		buf_append(&b, seg->manifest.b, PHASH_LEN);
+		buf_append_uvarint(&b, seg->nbounds);
+		for (size_t i = 0; i < seg->nbounds; i++)
+			buf_append(&b, seg->bounds[i].b, PHASH_LEN);
+	}
+	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
+	buf_free(&b);
+	return h;
+}
+
+static void
+segment_write(VcRepo *r, const VcSegment *seg)
+{
+	char	   *ref = segment_ref(seg->id);
+	PHash		h = segment_put(&r->ctx, seg);
+
+	vc_refs_set(r->refs, ref, &h);
+	pfree(ref);
+}
+
+static bool
+read_hashes(const uint8 **p, const uint8 *end, PHash **out, size_t *n)
+{
+	uint64		count;
+
+	if (!read_uvarint(p, end, &count) || count > (uint64) (end - *p) / PHASH_LEN)
+		return false;
+	*out = palloc_array(PHash, Max(count, 1));
+	for (uint64 i = 0; i < count; i++)
+	{
+		memcpy((*out)[i].b, *p, PHASH_LEN);
+		*p += PHASH_LEN;
+	}
+	*n = (size_t) count;
+	return true;
+}
+
+static bool
+segment_decode(ChunkStore *cs, uint32 id, const PHash *h, VcSegment *out)
+{
+	uint32		len;
+	uint8	   *d;
+	const uint8 *p,
+			   *end;
+	char		hex[PHASH_HEX_LEN + 1];
+
+	memset(out, 0, sizeof(*out));
+	out->id = id;
+	d = cs_get(cs, h->b, &len);
+	if (d == NULL || len < 3 || d[0] != CHUNK_TAG_SEGMENT ||
+		d[1] != CHUNK_FORMAT_VERSION || d[2] > 1)
+		goto bad;
+	out->exported = d[2] == 1;
+	p = d + 3;
+	end = d + len;
+	if (!read_hashes(&p, end, &out->commits, &out->n))
+		goto bad;
+	if (out->exported)
+	{
+		uint64		nl;
+
+		if (!read_uvarint(&p, end, &nl) || nl > (uint64) (end - p))
+			goto bad;
+		out->archive_name = pnstrdup((const char *) p, nl);
+		p += nl;
+		if (end - p < PHASH_LEN)
+			goto bad;
+		memcpy(out->manifest.b, p, PHASH_LEN);
+		p += PHASH_LEN;
+		if (!read_hashes(&p, end, &out->bounds, &out->nbounds))
+			goto bad;
+	}
+	if (p != end)
+		goto bad;
+	pfree(d);
+	return true;
+bad:
+	phash_hex(h, hex);
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("chunk %s, which segment %u names, is no segment", hex, id)));
+}
+
+bool
+vc_segment_get(VcRepo *r, uint32 id, VcSegment *out)
+{
+	char	   *ref = segment_ref(id);
+	PHash		h;
+	bool		found = vc_refs_get(r->refs, ref, VC_REF_READ, &h);
+
+	pfree(ref);
+	if (!found)
+		return false;
+	return segment_decode(r->ctx.cs, id, &h, out);
+}
+
+void
+vc_segment_free(VcSegment *seg)
+{
+	if (seg->commits)
+		pfree(seg->commits);
+	if (seg->archive_name)
+		pfree(seg->archive_name);
+	if (seg->bounds)
+		pfree(seg->bounds);
+	memset(seg, 0, sizeof(*seg));
+}
+
+/* (the window's calls read the branches after their lock, so not in a snapshot taken before it) */
+static void
+window_call_isolation(const char *call)
+{
+	if (IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("%s needs a READ COMMITTED transaction", call),
+				 errdetail("It reads the branches after it locks the repository, which a snapshot taken before the lock would not show.")));
+}
+
+int
+vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
+{
+	RepoState	st;
+	PHashMap	win;
+	HeadsArg	ha = {{0}};
+	HashStack	held = {0};
+	VcSegment	seg = {0};
+	LocEdits	le = {0};
+	size_t		cap = 0;
+	int			rc = VC_OK;
+	uint64		max_cut = w->max_cut && w->max_cut < VC_SEVER_MAX ? w->max_cut : VC_SEVER_MAX;
+
+	*seg_out = VC_NO_SEGMENT;
+	if (!w->depth && !w->keep_bytes && !w->keep_seconds && !w->max_commits &&
+		!w->max_bytes && !w->max_seconds)
+		return VC_ERR;			/* no window at all, or low marks alone */
+	window_call_isolation("a sever");
+
+	/*
+	 * (locked first: a call moving a branch to a commit it did not write
+	 * holds this for share, so none is in flight while the heads are read)
+	 */
+	repo_read(r, VC_REF_UPDATE, &st);
+	if (st.next_seg >= VC_NO_SEGMENT)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("the repository has made its last segment")));
+
+	/*
+	 * The commits with references, listed before the heads are read: a
+	 * commit's reference and its branch's move become visible together,
+	 * as its transaction commits, so one committing after the listing is
+	 * not in it (nothing of it cut), and one committing before is in it
+	 * and its branch's move seen by the heads' read, which come after:
+	 * the head, or (if the branch has moved on since) behind it, where
+	 * the window decides as for any.  (Read the other way round, a commit
+	 * committing between would be listed but its head unseen: cut.)
+	 */
+	vc_refs_list(r->refs, COMMIT_REF_PREFIX, held_fn, &held);
+	INJECTION_POINT("vc-sever-listed", NULL);
+	phmap_init(&win);
+	vc_branch_list(r, heads_fn, &ha);
+	for (size_t i = 0; i < ha.heads.n && rc == VC_OK; i++)
+		rc = window_add_marked(r, &win, &ha.heads.v[i], w, NULL);
+	for (size_t i = 0; i < w->npinned && rc == VC_OK; i++)
+		rc = window_add(r, &win, &w->pinned[i], &(VcWindow) {.depth = 1}, NULL);
+	px_free(ha.heads.v);
+	if (rc != VC_OK)
+	{
+		px_free(held.v);
+		phmap_free(&win);
+		pfree(st.name);
+		return rc;
+	}
+
+	/*
+	 * everything the window's history holds that the window no longer
+	 * covers, as many as one sever cuts
+	 */
+	for (size_t i = 0; i < held.n && seg.n < max_cut; i++)
+	{
+		if (phmap_find(&win, &held.v[i]))
+			continue;
+		px_grow((void **) &seg.commits, &cap, seg.n + 1, sizeof(PHash));
+		seg.commits[seg.n++] = held.v[i];
+	}
+	px_free(held.v);
+	phmap_free(&win);
+	if (seg.n == 0)
+	{
+		pfree(st.name);
+		return VC_OK;
+	}
+
+	/*
+	 * Detached: the segment's reference holds them before theirs go, so no
+	 * chunk is read, copied or freed
+	 */
+	seg.id = (uint32) st.next_seg;
+	segment_write(r, &seg);
+	for (size_t i = 0; i < seg.n; i++)
+	{
+		char	   *ref = commit_ref(&seg.commits[i]);
+
+		(void) vc_refs_remove(r->refs, ref);
+		pfree(ref);
+		loc_set(&le, &seg.commits[i], LOC_SEG(seg.id, false));
+	}
+	st.loc_root = loc_apply(r, &st.loc_root, &le);
+	st.next_seg++;
+	repo_write(r, &st);
+	*seg_out = seg.id;
+	px_free(seg.commits);
+	pfree(st.name);
+	return VC_OK;
+}
+
+/* Commits of one segment that are not members: its boundary edges. */
+static void
+segment_bounds(ProllyCtx *ctx, const VcSegment *seg, PHash **out, size_t *nout)
+{
+	size_t		cap = 0;
+	PHashMap	mem,
+				seen;
+	bool		created;
+
+	phmap_init(&mem);
+	phmap_init(&seen);
+	for (size_t i = 0; i < seg->n; i++)
+		phmap_ref(&mem, &seg->commits[i], &created);
+	*out = NULL;
+	*nout = 0;
+	for (size_t i = 0; i < seg->n; i++)
+	{
+		VcCommit	c;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!vc_commit_load(ctx, &seg->commits[i], &c))
+			continue;
+		for (uint32 j = 0; j < c.nparents; j++)
+		{
+			if (phmap_find(&mem, &c.parents[j]))
+				continue;
+			phmap_ref(&seen, &c.parents[j], &created);
+			if (!created)
+				continue;
+			px_grow((void **) out, &cap, *nout + 1, sizeof(PHash));
+			(*out)[(*nout)++] = c.parents[j];
+		}
+		vc_commit_release(&c);
+	}
+	phmap_free(&mem);
+	phmap_free(&seen);
+}
+
+/*
+ * An archive a segment may go to, or come back from: another store, as
+ * transactional as the repository's (its roots change with the segment's
+ * row), and for an exported one, the one it went to
+ */
+static bool
+archive_ok(VcRepo *r, const VcSource *archive, const VcSegment *seg)
+{
+	if (archive == NULL || archive->cs == r->ctx.cs ||
+		archive->cs->routine->transactional != r->ctx.cs->routine->transactional)
+		return false;
+	return seg == NULL || !seg->exported || strcmp(seg->archive_name, archive->name) == 0;
+}
+
+/*
+ * Exports a segment: copies each member with its whole tree to the
+ * archive, then writes a manifest there that names the members, their
+ * generations, the segment's boundary and the source repository, and holds
+ * them.  Only then does the segment let go of them here, which truncates
+ * local history to the window.
+ */
+int
+vc_segment_export(VcRepo *r, uint32 id, const VcSource *archive)
+{
+	RepoState	st;
+	VcSegment	seg = {0};
+	LocEdits	le = {0};
+	Buf			b = BUF_INIT;
+	PHash		manifest;
+
+	window_call_isolation("an export");
+	if (!archive_ok(r, archive, NULL))
+		return VC_ERR;
+	repo_read(r, VC_REF_UPDATE, &st);
+	if (!vc_segment_get(r, id, &seg) || seg.exported)
+	{
+		vc_segment_free(&seg);
+		pfree(st.name);
+		return VC_ERR;
+	}
+	(void) cs_copy_closure(r->ctx.cs, archive->cs, seg.commits[0].b, (int) seg.n,
+						   "export", "the repository's store");
+	segment_bounds(&r->ctx, &seg, &seg.bounds, &seg.nbounds);
+	buf_append_byte(&b, CHUNK_TAG_MANIFEST);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	buf_append_uvarint(&b, strlen(st.name));
+	buf_append(&b, st.name, strlen(st.name));
+	buf_append_uvarint(&b, seg.n);
+	for (size_t i = 0; i < seg.n; i++)
+	{
+		VcCommit	c;
+
+		if (!vc_commit_load(&r->ctx, &seg.commits[i], &c))
+			commit_corrupt(&seg.commits[i]);
+		buf_append(&b, seg.commits[i].b, PHASH_LEN);
+		buf_append_uvarint(&b, c.generation);
+		vc_commit_release(&c);
+		loc_set(&le, &seg.commits[i], LOC_SEG(id, true));
+	}
+	buf_append_uvarint(&b, seg.nbounds);
+	for (size_t i = 0; i < seg.nbounds; i++)
+		buf_append(&b, seg.bounds[i].b, PHASH_LEN);
+	buf_append_uvarint(&b, 0);	/* (no keyframes) */
+	(void) cs_put(archive->cs, b.data, (uint32) b.len, manifest.b);
+	buf_free(&b);
+	cs_ref_root(archive->cs, manifest.b);
+
+	seg.exported = true;
+	seg.archive_name = pstrdup(archive->name);
+	seg.manifest = manifest;
+	segment_write(r, &seg);
+	st.loc_root = loc_apply(r, &st.loc_root, &le);
+	repo_write(r, &st);
+	vc_segment_free(&seg);
+	pfree(st.name);
+	return VC_OK;
+}
+
+/*
+ * Discards a segment.  A local one is let go of here; an exported one is
+ * let go of in its archive, which frees exactly what no other manifest
+ * there holds.  Its members are forgotten: those that what is held still
+ * names are found as discarded when asked (vc_locate).
+ */
+int
+vc_segment_discard(VcRepo *r, uint32 id, const VcSource *archive)
+{
+	RepoState	st;
+	VcSegment	seg = {0};
+	LocEdits	le = {0};
+	char	   *ref;
+
+	window_call_isolation("a discard");
+	repo_read(r, VC_REF_UPDATE, &st);
+	if (!vc_segment_get(r, id, &seg) || (seg.exported && !archive_ok(r, archive, &seg)))
+	{
+		vc_segment_free(&seg);
+		pfree(st.name);
+		return VC_ERR;
+	}
+	for (size_t i = 0; i < seg.n; i++)
+		if (LOC_IS_SEG(loc_get(r, &st.loc_root, &seg.commits[i])))
+			loc_set(&le, &seg.commits[i], LOC_GONE);
+	st.loc_root = loc_apply(r, &st.loc_root, &le);
+	repo_write(r, &st);
+	if (seg.exported)
+		cs_unref_root(archive->cs, seg.manifest.b);
+	ref = segment_ref(id);
+	(void) vc_refs_remove(r->refs, ref);
+	pfree(ref);
+	vc_segment_free(&seg);
+	pfree(st.name);
+	return VC_OK;
+}
+
+int
+vc_segment_attach(VcRepo *r, uint32 id, const VcSource *archive)
+{
+	RepoState	st;
+	VcSegment	seg = {0};
+	LocEdits	le = {0};
+	char	   *ref;
+
+	window_call_isolation("an attach");
+	repo_read(r, VC_REF_UPDATE, &st);
+	if (!vc_segment_get(r, id, &seg) || (seg.exported && !archive_ok(r, archive, &seg)))
+	{
+		vc_segment_free(&seg);
+		pfree(st.name);
+		return VC_ERR;
+	}
+	/* an exported one's chunks copied back first, each checked */
+	if (seg.exported)
+		(void) cs_copy_closure(archive->cs, r->ctx.cs, seg.commits[0].b, (int) seg.n,
+							   "attach", "the archive");
+	/* the holds move back to the window's history */
+	for (size_t i = 0; i < seg.n; i++)
+	{
+		ref = commit_ref(&seg.commits[i]);
+		vc_refs_set(r->refs, ref, &seg.commits[i]);
+		pfree(ref);
+		if (LOC_IS_SEG(loc_get(r, &st.loc_root, &seg.commits[i])))
+			loc_set(&le, &seg.commits[i], LOC_GONE);
+	}
+	st.loc_root = loc_apply(r, &st.loc_root, &le);
+	repo_write(r, &st);
+	if (seg.exported)
+		cs_unref_root(archive->cs, seg.manifest.b);
+	ref = segment_ref(id);
+	(void) vc_refs_remove(r->refs, ref);
+	pfree(ref);
+	vc_segment_free(&seg);
+	pfree(st.name);
+	return VC_OK;
+}
+
+/*
+ * The parents of what the repository holds, that it does not otherwise
+ * know: commits discarded here, at the edge of what is kept.  The window's
+ * commits and the local segments' members are read for theirs; an
+ * exported segment's are its bounds.  O(the window and local segments).
+ */
+typedef struct CutArg
+{
+	VcRepo	   *r;
+	PHashMap   *parents;
+} CutArg;
+
+static void
+cut_parents_of(CutArg *a, const PHash *h)
+{
+	VcCommit	c;
+	bool		created;
+
+	CHECK_FOR_INTERRUPTS();
+	if (!vc_commit_load(&a->r->ctx, h, &c))
+		return;
+	for (uint32 j = 0; j < c.nparents; j++)
+		phmap_ref(a->parents, &c.parents[j], &created);
+	vc_commit_release(&c);
+}
+
+static void
+cut_window_fn(void *arg, const char *name, const PHash *hash)
+{
+	cut_parents_of(arg, hash);
+}
+
+static void
+cut_segment_fn(void *arg, const char *name, const PHash *hash)
+{
+	CutArg	   *a = arg;
+	VcSegment	seg;
+	bool		created;
+
+	(void) segment_decode(a->r->ctx.cs, (uint32) strtoul(name + strlen(SEGMENT_REF_PREFIX), NULL, 10),
+						  hash, &seg);
+	if (seg.exported)
+		for (size_t i = 0; i < seg.nbounds; i++)
+			phmap_ref(a->parents, &seg.bounds[i], &created);
+	else
+		for (size_t i = 0; i < seg.n; i++)
+			cut_parents_of(a, &seg.commits[i]);
+	vc_segment_free(&seg);
+}
+
+static void
+cut_parents(VcRepo *r, PHashMap *parents)
+{
+	CutArg		a = {r, parents};
+
+	phmap_init(parents);
+	vc_refs_list(r->refs, COMMIT_REF_PREFIX, cut_window_fn, &a);
+	vc_refs_list(r->refs, SEGMENT_REF_PREFIX, cut_segment_fn, &a);
+}
+
+/* (a commit's location, given the map's value for it and the cut parents) */
+static VcLocation
+locate_in(VcRepo *r, const PHash *h, uint64 v, PHashMap *cut, uint32 *seg)
+{
+	if (v == LOC_BOUNDARY)
+		return VC_LOC_BOUNDARY;
+	if (LOC_IS_SEG(v))
+	{
+		if (seg)
+			*seg = LOC_SEG_ID(v);
+		return LOC_SEG_EXPORTED(v) ? VC_LOC_EXPORTED : VC_LOC_SEGMENT;
+	}
+	if (vc_in_window(r, h))
+		return VC_LOC_WINDOW;
+	if (cut && phmap_find(cut, h))
+		return VC_LOC_DISCARDED;
+	return VC_LOC_UNKNOWN;
+}
+
+VcLocation
+vc_locate(VcRepo *r, const PHash *h, uint32 *seg)
+{
+	RepoState	st;
+	uint64		v;
+	VcLocation	l;
+	PHashMap	cut;
+
+	if (vc_in_window(r, h))
+		return VC_LOC_WINDOW;
+	repo_read(r, VC_REF_READ, &st);
+	v = loc_get(r, &st.loc_root, h);
+	pfree(st.name);
+	if (v != LOC_GONE)
+		return locate_in(r, h, v, NULL, seg);
+	/* (not held: perhaps a parent of what is) */
+	cut_parents(r, &cut);
+	l = locate_in(r, h, v, &cut, seg);
+	phmap_free(&cut);
+	return l;
+}
+
+typedef struct LocsArg
+{
+	VcRepo	   *r;
+	VcLocFn		fn;
+	void	   *arg;
+	PHashMap   *known;
+} LocsArg;
+
+static void
+window_loc_fn(void *arg, const char *name, const PHash *hash)
+{
+	LocsArg    *a = arg;
+	bool		created;
+
+	phmap_ref(a->known, hash, &created);
+	a->fn(a->arg, hash, VC_LOC_WINDOW, VC_NO_SEGMENT);
+}
+
+void
+vc_locations(VcRepo *r, VcLocFn fn, void *arg)
+{
+	PHashMap	known,
+				cut;
+	LocsArg		a = {r, fn, arg, &known};
+	RepoState	st;
+	ProllyIter *it;
+	const uint8 *k,
+			   *v;
+	size_t		kl,
+				vl;
+	int			rc;
+
+	phmap_init(&known);
+	vc_refs_list(r->refs, COMMIT_REF_PREFIX, window_loc_fn, &a);
+	repo_read(r, VC_REF_READ, &st);
+	vc_must(&r->ctx, prolly_iter_open(&r->ctx, &st.loc_root, NULL, 0, &it));
+	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) == 1)
+	{
+		PHash		h;
+		uint64		where;
+		const uint8 *p = v;
+		uint32		seg = VC_NO_SEGMENT;
+		VcLocation	l;
+		bool		created;
+
+		if (kl != PHASH_LEN || !read_uvarint(&p, v + vl, &where))
+			continue;
+		memcpy(h.b, k, PHASH_LEN);
+		phmap_ref(&known, &h, &created);
+		l = locate_in(r, &h, where, NULL, &seg);
+		fn(arg, &h, l, l == VC_LOC_SEGMENT || l == VC_LOC_EXPORTED ? seg : VC_NO_SEGMENT);
+	}
+	prolly_iter_close(it);
+	if (rc < 0)
+		prolly_report(&r->ctx);
+	pfree(st.name);
+	/* and the parents discarded here that what is held names */
+	cut_parents(r, &cut);
+	for (size_t i = 0; i < cut.cap; i++)
+		if (cut.used[i] && !phmap_find(&known, &cut.keys[i]))
+			fn(arg, &cut.keys[i], VC_LOC_DISCARDED, VC_NO_SEGMENT);
+	phmap_free(&cut);
+	phmap_free(&known);
+}
+
+/* --------------------------------------------------------------- archives */
+
+typedef struct ManifestAcc
+{
+	ChunkStore *cs;
+	PHash	   *v;
+	size_t		n;
+	size_t		cap;
+} ManifestAcc;
+
+static void
+manifest_visit(void *arg, const uint8 *hash, uint32 len, const ChunkCounts *counts)
+{
+	ManifestAcc *a = arg;
+	uint32		l;
+	uint8	   *d;
+
+	if (counts->roots == 0)
+		return;
+	d = cs_get(a->cs, hash, &l);
+	if (d && l >= 2 && d[0] == CHUNK_TAG_MANIFEST && d[1] == CHUNK_FORMAT_VERSION)
+	{
+		px_grow((void **) &a->v, &a->cap, a->n + 1, sizeof(PHash));
+		memcpy(a->v[a->n++].b, hash, PHASH_LEN);
+	}
+	if (d)
+		pfree(d);
+}
+
+void
+vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n)
+{
+	ManifestAcc a = {archive, NULL, 0, 0};
+
+	cs_visit(archive, manifest_visit, &a);
+	*manifests = a.v;
+	*n = a.n;
+}
+
+bool
+vc_manifest_load(ChunkStore *archive, const PHash *h, VcManifest *m)
+{
+	uint32		len;
+	uint8	   *d = cs_get(archive, h->b, &len);
+	const uint8 *p,
+			   *end;
+	uint64		nl,
+				n;
+
+	memset(m, 0, sizeof(*m));
+	if (d == NULL || len < 2 || d[0] != CHUNK_TAG_MANIFEST || d[1] != CHUNK_FORMAT_VERSION)
+		goto bad;
+	p = d + 2;
+	end = d + len;
+	if (!read_uvarint(&p, end, &nl) || nl > (uint64) (end - p))
+		goto bad;
+	m->repo = pnstrdup((const char *) p, nl);
+	p += nl;
+	if (!read_uvarint(&p, end, &n) || n > (uint64) (end - p) / (PHASH_LEN + 1))
+		goto bad;
+	m->members = palloc_array(PHash, Max(n, 1));
+	m->gens = palloc_array(uint64, Max(n, 1));
+	m->n = n;
+	for (uint64 i = 0; i < n; i++)
+	{
+		if (end - p < PHASH_LEN)
+			goto bad;
+		memcpy(m->members[i].b, p, PHASH_LEN);
+		p += PHASH_LEN;
+		if (!read_uvarint(&p, end, &m->gens[i]))
+			goto bad;
+	}
+	if (!read_hashes(&p, end, &m->bounds, &m->nb) || !read_uvarint(&p, end, &n) || n != 0 ||
+		p != end)
+		goto bad;
+	pfree(d);
+	return true;
+bad:
+	if (d)
+		pfree(d);
+	vc_manifest_free(m);
+	return false;
+}
+
+void
+vc_manifest_free(VcManifest *m)
+{
+	if (m->repo)
+		pfree(m->repo);
+	if (m->members)
+		pfree(m->members);
+	if (m->gens)
+		pfree(m->gens);
+	if (m->bounds)
+		pfree(m->bounds);
+	memset(m, 0, sizeof(*m));
 }

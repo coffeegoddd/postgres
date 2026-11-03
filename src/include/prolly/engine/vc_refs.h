@@ -19,10 +19,12 @@
  * keeps their roots) changes them in the user's transaction, gone if it
  * aborts; "memory" (for unit tests, on the memory store) at once.
  *
- * get with for_update also locks the reference until the transaction ends,
+ * get can also lock the reference until the transaction ends.  For update,
  * for a change that reads it first (a commit reads its branch's head): a
  * second such get waits for the first transaction to end, and then reads
- * what it left.  Locking a reference not there locks nothing.
+ * what it left.  For share, for calls that need it to stay as it is while
+ * they run but may run together: they wait for one for update, and it for
+ * them.  Locking a reference not there locks nothing.
  *
  * Implementations register with the registry (prolly/registry.h) under
  * VC_REFS_IFACE.
@@ -43,6 +45,14 @@
 
 typedef struct VcRefs VcRefs;
 
+/* How a get locks the reference it reads. */
+typedef enum VcRefLock
+{
+	VC_REF_READ,				/* not at all */
+	VC_REF_SHARE,				/* against those for update */
+	VC_REF_UPDATE				/* against any lock */
+} VcRefLock;
+
 /* A reference as a listing sees it. */
 typedef void (*VcRefFn) (void *arg, const char *name, const PHash *hash);
 
@@ -52,7 +62,7 @@ typedef struct VcRefsRoutine
 	VcRefs	   *(*open) (ChunkStore *cs);
 
 	/* The chunk name names, in *out; false if there is no such reference. */
-	bool		(*get) (VcRefs *refs, const char *name, bool for_update,
+	bool		(*get) (VcRefs *refs, const char *name, VcRefLock lock,
 						PHash *out);
 
 	/* name made, or moved, to name hash. */
@@ -90,9 +100,9 @@ extern VcRefs *VcRefsOpen(const char *name, ChunkStore *cs);
 extern void MemoryVcRefsReset(void);
 
 static inline bool
-vc_refs_get(VcRefs *refs, const char *name, bool for_update, PHash *out)
+vc_refs_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
 {
-	return refs->routine->get(refs, name, for_update, out);
+	return refs->routine->get(refs, name, lock, out);
 }
 
 static inline void

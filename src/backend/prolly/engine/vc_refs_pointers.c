@@ -9,7 +9,8 @@
  * hash; the table's trigger takes, moves and lets go of the roots, in the
  * same transaction, so that a reference and its chunk commit or abort
  * together.  get for update is SELECT ... FOR UPDATE: a second waits for
- * the first's transaction, and then reads the row as that left it.  Each
+ * the first's transaction, and then reads the row as that left it; for
+ * share, SELECT ... FOR SHARE.  Each
  * statement reads with a snapshot of its own (not read-only), so it sees
  * what the calls before it in the transaction changed.
  * The statements are planned once a backend.
@@ -33,6 +34,7 @@ static VcRefs pointers_refs = {.routine = &PointersVcRefs};
 
 static SPIPlanPtr get_plan = NULL;
 static SPIPlanPtr lock_plan = NULL;
+static SPIPlanPtr share_plan = NULL;
 static SPIPlanPtr set_plan = NULL;
 static SPIPlanPtr add_plan = NULL;
 static SPIPlanPtr remove_plan = NULL;
@@ -118,7 +120,7 @@ datum_hash(Datum d, PHash *out)
 }
 
 static bool
-pointers_get(VcRefs *refs, const char *name, bool for_update, PHash *out)
+pointers_get(VcRefs *refs, const char *name, VcRefLock lock, PHash *out)
 {
 	Oid			types[1] = {TEXTOID};
 	Datum		args[1] = {CStringGetTextDatum(name)};
@@ -126,9 +128,12 @@ pointers_get(VcRefs *refs, const char *name, bool for_update, PHash *out)
 	int			rc;
 
 	spi_begin();
-	rc = SPI_execute_plan(for_update ?
+	rc = SPI_execute_plan(lock == VC_REF_UPDATE ?
 						  plan(&lock_plan, "SELECT hash FROM pg_history.pointers"
 							   " WHERE name = $1 FOR UPDATE", 1, types) :
+						  lock == VC_REF_SHARE ?
+						  plan(&share_plan, "SELECT hash FROM pg_history.pointers"
+							   " WHERE name = $1 FOR SHARE", 1, types) :
 						  plan(&get_plan, "SELECT hash FROM pg_history.pointers"
 							   " WHERE name = $1", 1, types),
 						  args, NULL, false, 1);

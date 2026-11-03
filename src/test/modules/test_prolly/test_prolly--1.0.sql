@@ -620,3 +620,20 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_vc_rows(branch text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Every commit outside the window of that depth moved into a new segment;
+-- how many.
+CREATE FUNCTION test_vc_sever(depth int4)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- A branch made at the commit on branch's line with message msg; false if
+-- it could not be.
+CREATE FUNCTION test_vc_branch_at(name text, branch text, msg text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- other merged into branch: how, or the error's code.
+CREATE FUNCTION test_vc_merge(branch text, other text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
