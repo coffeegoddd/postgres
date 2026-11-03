@@ -22,6 +22,7 @@
 
 #include "access/htup_details.h"
 #include "common/hashfn.h"
+#include "common/int.h"
 #include "common/pg_prng.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -1165,16 +1166,14 @@ test_vc_bench_edit(PG_FUNCTION_ARGS)
 static int
 cmp_u64(const void *a, const void *b)
 {
-	uint64		x = *(const uint64 *) a,
-				y = *(const uint64 *) b;
-
-	return x < y ? -1 : x > y;
+	return pg_cmp_u64(*(const uint64 *) a, *(const uint64 *) b);
 }
 
 /*
  * test_vc_bench_deep_commits(branch text, n int4, changes int4, rows int8)
  * returns float8: n commits on branch, each setting changes rows of the
- * first rows (distinct, at random); microseconds a commit
+ * first rows (distinct, from a sequence the same each session); microseconds
+ * a commit, in this one transaction, without its commit
  */
 Datum
 test_vc_bench_deep_commits(PG_FUNCTION_ARGS)
@@ -1184,9 +1183,16 @@ test_vc_bench_deep_commits(PG_FUNCTION_ARGS)
 	int32		changes = Max(PG_GETARG_INT32(2), 1);
 	int64		rows = Max(PG_GETARG_INT64(3), changes);
 	static uint64 version = 0;
+	static pg_prng_state prng;
+	static bool seeded = false;
 	double		us = 0;
 	VcRepo		r;
 
+	if (!seeded)
+	{
+		pg_prng_seed(&prng, 42);
+		seeded = true;
+	}
 	VC_CALL(r, 0,
 	{
 		uint64	   *ks = palloc_array(uint64, changes);
@@ -1201,7 +1207,7 @@ test_vc_bench_deep_commits(PG_FUNCTION_ARGS)
 			CHECK_FOR_INTERRUPTS();
 			while (m < changes)
 			{
-				uint64		k = pg_prng_uint64_range(&pg_global_prng_state, 0, (uint64) rows - 1);
+				uint64		k = pg_prng_uint64_range(&prng, 0, (uint64) rows - 1);
 				bool		dup = false;
 
 				for (int32 j = 0; j < m; j++)
@@ -1262,14 +1268,25 @@ deep_diff(VcRepo *r, const PHash *a, const PHash *b, uint64 *rows)
 	return us_since(start) / 1000;
 }
 
+/* (a walk of the branch's first parents from head, at most max: must succeed) */
+static void
+deep_line(VcRepo *r, const PHash *head, size_t max, LineAcc *line)
+{
+	line->n = 0;
+	if (vc_log(r, head, max, 0, line_fn, line) != VC_OK || line->n == 0)
+		elog(ERROR, "the branch's line could not be read");
+}
+
 /*
- * test_vc_bench_deep_probe(branch text, old text) returns (held int8,
- * log100_us float8, mb_short_us float8, mb_long_ms float8, diff1_ms float8,
- * diff1_rows int8, diff1k_ms float8, diff1k_rows int8, diffhalf_ms float8,
- * diffhalf_rows int8): the branch's line (its commits, walked first and
- * not timed); a log of 100; the merge base with a branch made one commit
- * off ten commits back (and dropped again), and with old; and row diffs
- * to the commits 1, 1,000 and half the line back
+ * test_vc_bench_deep_probe(branch text, old text) returns (log100_us float8,
+ * mb_short_us float8, mb_long_ms float8, diff1_ms float8, diff1_rows int8,
+ * diff1k_ms float8, diff1k_rows int8, held int8, diffhalf_ms float8,
+ * diffhalf_rows int8), in this order, so that what is timed is not disturbed
+ * by a walk before it: a log of 100; the merge base with a branch made one
+ * commit off ten commits back (and dropped again); row diffs to the commits
+ * 1 and 1,000 back, from a walk of just that far; the merge base with old,
+ * the load commit; and only then the whole line walked (its length) for a
+ * row diff to the commit half of it back.
  */
 Datum
 test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
@@ -1286,6 +1303,7 @@ test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
 	VC_CALL(r, 0,
 	{
 		VcBranch	b;
+		VcCommit	oc;
 		LineAcc		line = {0};
 		PHash		head,
 					base,
@@ -1299,13 +1317,12 @@ test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
 			elog(ERROR, "there is no branch \"%s\"", branch);
 		head = b.head;
 		vc_branch_free(&b);
-		(void) vc_log(&r, &head, SIZE_MAX, 0, line_fn, &line);
-		values[0] = Int64GetDatum((int64) line.n);
 
 		start = GetCurrentTimestamp();
 		(void) vc_log(&r, &head, 100, 0, count_log_fn, &n);
-		values[1] = Float8GetDatum(us_since(start));
+		values[0] = Float8GetDatum(us_since(start));
 
+		deep_line(&r, &head, 1001, &line);
 		back = Min(line.n - 1, 10);
 		if (vc_branch_create(&r, "deep-recent", &line.v[back]) != VC_OK)
 			elog(ERROR, "no branch made ten commits back");
@@ -1314,22 +1331,29 @@ test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
 		if (vc_merge_base_in(&r, &head, &recent, 0, &base) != 1 ||
 			!phash_eq(&base, &line.v[back]))
 			elog(ERROR, "the merge base ten commits back not found");
-		values[2] = Float8GetDatum(us_since(start));
+		values[1] = Float8GetDatum(us_since(start));
 		checkout(&r, branch);
 		(void) vc_branch_delete(&r, "deep-recent");
 
-		if (!vc_branch_get(&r, old, &b))
-			elog(ERROR, "there is no branch \"%s\"", old);
+		values[3] = Float8GetDatum(deep_diff(&r, &line.v[Min(line.n - 1, 1)], &head, &rows));
+		values[4] = Int64GetDatum((int64) rows);
+		values[5] = Float8GetDatum(deep_diff(&r, &line.v[Min(line.n - 1, 1000)], &head, &rows));
+		values[6] = Int64GetDatum((int64) rows);
+
+		if (!vc_branch_get(&r, old, &b) || !vc_commit_load(&r.ctx, &b.head, &oc) ||
+			oc.nparents != 1)
+			elog(ERROR, "no commit on branch \"%s\"", old);
 		start = GetCurrentTimestamp();
 		if (vc_merge_base_in(&r, &head, &b.head, 0, &base) != 1)
 			elog(ERROR, "no merge base with \"%s\"", old);
-		values[3] = Float8GetDatum(us_since(start) / 1000);
+		values[2] = Float8GetDatum(us_since(start) / 1000);
+		if (!phash_eq(&base, &oc.parents[0]))
+			elog(ERROR, "the merge base with \"%s\" is not where it left", old);
+		vc_commit_release(&oc);
 		vc_branch_free(&b);
 
-		values[4] = Float8GetDatum(deep_diff(&r, &line.v[Min(line.n - 1, 1)], &head, &rows));
-		values[5] = Int64GetDatum((int64) rows);
-		values[6] = Float8GetDatum(deep_diff(&r, &line.v[Min(line.n - 1, 1000)], &head, &rows));
-		values[7] = Int64GetDatum((int64) rows);
+		deep_line(&r, &head, SIZE_MAX, &line);
+		values[7] = Int64GetDatum((int64) line.n);
 		values[8] = Float8GetDatum(deep_diff(&r, &line.v[line.n / 2], &head, &rows));
 		values[9] = Int64GetDatum((int64) rows);
 		pfree(line.v);
@@ -1339,7 +1363,7 @@ test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
 
 /*
  * test_vc_bench_sever(depth int4) returns float8: a sever with a window of
- * that depth, timed; microseconds
+ * that depth, which must cut nothing, timed; microseconds
  */
 Datum
 test_vc_bench_sever(PG_FUNCTION_ARGS)
@@ -1357,13 +1381,16 @@ test_vc_bench_sever(PG_FUNCTION_ARGS)
 		if (vc_sever(&r, &w, &seg) != VC_OK)
 			elog(ERROR, "no window of depth %d", depth);
 		us = us_since(start);
+		if (seg != VC_NO_SEGMENT)
+			elog(ERROR, "a window of depth %d cut commits", depth);
 	});
 	PG_RETURN_FLOAT8(us);
 }
 
 /*
  * test_backend_private_mb() returns float8: this backend's private resident
- * memory (anonymous: not the shared buffers it has touched)
+ * memory now (anonymous: not the shared buffers it has touched, and not a
+ * peak); NULL where /proc does not say
  */
 Datum
 test_backend_private_mb(PG_FUNCTION_ARGS)

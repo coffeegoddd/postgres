@@ -201,6 +201,7 @@ tests += {
       't/082_vc_store_bounded.pl',
       't/083_vc_history_restarts.pl',
       't/084_vc_pointer_reads.pl',
+      't/085_vc_deep_bench.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
