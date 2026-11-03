@@ -4,7 +4,8 @@
 # pg_history.pointers that a commit, and an edit of its working set, lock
 # before they read it, so commits on one branch take turns and none, nor
 # its change, is lost; commits on different branches change different
-# rows (and chunks) and never wait on each other.
+# rows (and chunks) and never wait for each other's transactions, nor
+# deadlock (only, briefly, for one extending a relation both grow).
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -37,7 +38,7 @@ my $commits = sub {
 		qq{SELECT cardinality(string_to_array(test_vc_log('$branch'), ' '))});
 };
 
-# sixteen backends, a branch each: none waits on another
+# sixteen backends, a branch each: none waits for another's transaction
 my $log_at = -s $node->logfile;
 $node->pgbench(
 	'--no-vacuum --client=16 --jobs=4 --transactions=25',
@@ -70,8 +71,13 @@ my @named = map {
 	  . $node->safe_psql('postgres',
 		"SELECT coalesce((SELECT oid::regclass::text FROM pg_class WHERE oid = $_), 'gone')")
 } sort keys %rels;
-is(scalar(grep { /still waiting/ } @waited), 0, 'no process waited during the 16-branch run')
+# (a commit may wait briefly for another to extend a relation they both
+# grow, a page of the chunk index or the pointers; never for another's
+# transaction to end, nor for a lock on a row or relation, nor deadlock)
+my @long = grep { /still waiting/ && !/on extension of relation/ } @waited;
+is(scalar @long, 0, 'no commit waited for another branch\'s during the 16-branch run')
   or diag(join("\n", @named, @waited));
+unlike($waits, qr/deadlock detected/, 'no deadlock during the 16-branch run');
 
 # eight backends on one branch: they take turns, and every commit lands
 $node->pgbench(
