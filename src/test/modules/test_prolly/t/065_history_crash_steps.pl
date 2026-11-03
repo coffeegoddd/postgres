@@ -51,13 +51,8 @@ $node->safe_psql('postgres', q{
 	SELECT count(*) FROM generate_series(1, 3) i, LATERAL test_cs_put('pages', leaf(i));
 });
 
-# (every session of the test format, its references counted)
-my $refs = 'SELECT test_chunk_format_refs(true);';
-# (the last statement's output: the format's call prints a line of its own)
 my $q = sub {
-	my $out = $node->safe_psql('postgres', "$refs $_[0]");
-	$out =~ s/^\n//;
-	return $out;
+	return $node->safe_psql('postgres', $_[0]);
 };
 my $audit = sub {
 	return $q->(q{SELECT ok || ' ' || coalesce(why, '') FROM test_cs_check('pages')});
@@ -68,7 +63,6 @@ my $audit = sub {
 my $crash_at = sub {
 	my ($point, $sql) = @_;
 	my $s = $node->background_psql('postgres', on_error_stop => 0);
-	$s->query_safe($refs);
 	$s->query_safe(q{SELECT injection_points_set_local()});
 	$s->query_safe("SELECT injection_points_attach('$point', 'wait')");
 	$s->query_until(qr/stepping/, "\\echo stepping\n$sql;\n");

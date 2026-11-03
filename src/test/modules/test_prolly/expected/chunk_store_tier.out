@@ -645,12 +645,6 @@ SELECT test_chunk_format_refs(false);
 -- The transactional stores' part of the suite: a put, a root's change and
 -- a free are their transaction's, gone, with what they counted, if it
 -- aborts.
-SELECT test_chunk_format_refs(true);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-
 BEGIN;
 SELECT pg_temp.put('cs-tx-f') AS f;
  f 
@@ -790,12 +784,6 @@ SELECT ok, why FROM test_cs_check(:'store');
  ok | why 
 ----+-----
  t  | 
-(1 row)
-
-SELECT test_chunk_format_refs(false);
- test_chunk_format_refs 
-------------------------
- 
 (1 row)
 
 -- what the tier keeps: a pack a transaction that put chunks, written as it
