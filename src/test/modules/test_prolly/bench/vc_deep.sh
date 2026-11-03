@@ -4,12 +4,12 @@
 # window deeper than the history).  At each milestone (1k, 10k, 100k, 1M
 # ...) and at the end: the interval's cost of a commit, and of a sever (a
 # full pass over the window, cutting at most the commit the last milestone's
-# merge base branch left behind), every 1,000 commits to 10,000
-# and then every 10,000; a log of 100; the merge bases with a branch one
-# commit off ten back and with one off the load commit; row diffs to the
-# commits 1, 1,000 and half the line back; the committing backend's private
-# memory between statements (not a peak: not what a sever allocates); and
-# the store's size.
+# merge base branch left behind), every 1,000 commits to 10,000 and then
+# every 10,000; a log of 100; the merge bases with a branch one commit off
+# ten back and with one off the load commit; row diffs to the commits 1,
+# 1,000 and half the line back; the committing backend's private memory
+# between statements (not a peak: not what a sever allocates); and the
+# store's size.
 #
 # commit_us is a commit inside a transaction of 1,000 of them, without the
 # transaction's commit.  with_sever_us adds the interval's severs, spread
@@ -53,23 +53,29 @@ done=0; milestone=1000; cus=0; cn=0; sms=0; sn=0
 while [ $done -lt $COMMITS ]; do
 	us=$(ask "SELECT test_vc_bench_deep_commits('main', 1000, $CHANGES, $ROWS);")
 	done=$((done + 1000)); cus=$(calc "$cus + $us * 1000"); cn=$((cn + 1000))
+	report=false
+	if [ $done -eq $milestone ] || [ $done -eq $COMMITS ]; then
+		report=true
+		# (before this interval's sever: its walk of the whole history would
+		# leave the buffers holding it, for what is timed here)
+		private=$(ask "SELECT coalesce(round(test_backend_private_mb()::numeric), -1);")
+		# (in the committing session: one new to the store would time its first use)
+		probe=$(ask "SELECT held || ' ' || round(log100_us) || ' ' || round(mb_short_us) || ' ' || round(mb_long_ms::numeric, 1) || ' ' || round(diff1_ms::numeric, 1) || '/' || diff1_rows || ' ' || round(diff1k_ms::numeric, 1) || '/' || diff1k_rows || ' ' || round(diffhalf_ms::numeric, 1) || '/' || diffhalf_rows FROM test_vc_bench_deep_probe('main', 'old');")
+		store=$(q -c "SELECT (pg_relation_size('pg_history.chunks') + pg_relation_size('pg_history.chunk_index')) / 1048576")
+	fi
 	every=$(( done <= 10000 ? 1000 : 10000 ))
 	if [ $((done % every)) -eq 0 ]; then
 		sus=$(ask "SELECT test_vc_bench_sever($((COMMITS + 100)));")
 		sms=$(calc "$sms + $sus / 1000"); sn=$((sn + 1))
 	fi
-	if [ $done -eq $milestone ] || [ $done -eq $COMMITS ]; then
-		private=$(ask "SELECT coalesce(round(test_backend_private_mb()::numeric), -1);")
-		probe=$(q -F' ' -c "SELECT held, round(log100_us), round(mb_short_us), round(mb_long_ms::numeric, 1),
-			round(diff1_ms::numeric, 1) || '/' || diff1_rows, round(diff1k_ms::numeric, 1) || '/' || diff1k_rows,
-			round(diffhalf_ms::numeric, 1) || '/' || diffhalf_rows
-			FROM test_vc_bench_deep_probe('main', 'old')")
-		store=$(q -c "SELECT (pg_relation_size('pg_history.chunks') + pg_relation_size('pg_history.chunk_index')) / 1048576")
+	if $report; then
 		read -r held log100 mbs mbl d1 d1k dh <<< "$probe"
 		printf "%9d %10s %9.1f %13.1f %6d %9.1f %8s %9s %10s %9s %10s %13s %10s %9s\n" $done "$held" \
 			"$(calc "$cus / $cn")" "$(calc "($cus + $sms * 1000) / $cn")" $sn \
 			"$(calc "$sn > 0 ? $sms / $sn : 0")" "$log100" "$mbs" "$mbl" "$d1" "$d1k" "$dh" "$private" "$store"
 		cus=0; cn=0; sms=0; sn=0
-		[ $done -eq $milestone ] && milestone=$((milestone * 10))
+		if [ $done -eq $milestone ]; then
+			milestone=$((milestone * 10))
+		fi
 	fi
 done
