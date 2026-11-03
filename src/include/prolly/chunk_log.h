@@ -251,11 +251,12 @@ extern void ChunkLogMakeLane(Relation lane, uint32 n, Relation log);
 
 /*
  * The segments the n chunks at locs (of lens) are on, as a bit a segment
- * (*nbits of them): those in lane, a lane's places, or (lane < 0) all, in
- * a log of one place space.
+ * (*nbits of them, at least cover): those in lane, a lane's places, or
+ * (lane < 0) all, in a log of one place space.
  */
 extern uint8 *ChunkLogPendingBits(int n, const uint64 *locs, const uint32 *lens,
-								  int64 lane, uint64 segment_bytes, uint64 *nbits);
+								  int64 lane, uint64 segment_bytes, uint64 cover,
+								  uint64 *nbits);
 extern PGDLLIMPORT const ChunkLogRoutine PageChunkLog;
 
 /*

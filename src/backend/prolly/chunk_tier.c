@@ -2140,7 +2140,7 @@ tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
 	TransactionId frozen;
 	uint64		nbits;
 	uint8	   *pending_bits = ChunkLogPendingBits(npending, pending_locs, pending_lens, -1,
-												   tier_segment_bytes(rel), &nbits);
+												   tier_segment_bytes(rel), 0, &nbits);
 
 	walk_packs(rel, true, &frozen);
 	advance_frozen(rel, frozen, false);

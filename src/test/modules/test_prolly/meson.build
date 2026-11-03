@@ -180,6 +180,7 @@ tests += {
       't/076_chunk_free_marked.pl',
       't/078_chunk_lanes.pl',
       't/079_chunk_lane_numbers.pl',
+      't/080_chunk_lane_compaction.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

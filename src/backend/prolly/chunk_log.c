@@ -2666,6 +2666,17 @@ lane_bind_index(Relation log, Oid index)
 	}
 }
 
+/*
+ * (a log's lanes' counts summed: compaction moves into the compacting
+ * backend's own lane, whichever it is, where room free in others' lanes is
+ * none; so it may grow that lane by a segment, room free in it used first)
+ */
+static void
+lanes_may_grow(ChunkLogSegments *out)
+{
+	out->grow = SEGMENT_PAGES;
+}
+
 static void
 add_segments(ChunkLogSegments *to, const ChunkLogSegments *from)
 {
@@ -2696,6 +2707,7 @@ lane_find_segments(Relation log, double fraction, ChunkLogSegments *out)
 		add_segments(out, &one);
 		ChunkLaneClose(log, rel);
 	}
+	lanes_may_grow(out);
 }
 
 /* (each lane's, up to max in all, their places the log's) */
@@ -2753,6 +2765,8 @@ typedef struct LaneSweep
 	uint32		pass;			/* the index's VACUUM pass begun */
 	uint32		n;
 	void	  **states;
+	uint64	   *segments;		/* each lane's, as the pass began: those
+								 * after, grown meanwhile, passed by */
 } LaneSweep;
 
 static void *
@@ -2763,12 +2777,14 @@ lane_vacuum_begin(Relation log)
 	sw->pass = vacuum_pass(log, 0);
 	sw->n = ChunkLaneCount(log);
 	sw->states = palloc0_array(void *, sw->n);
+	sw->segments = palloc0_array(uint64, sw->n);
 	for (uint32 lane = 0; lane < sw->n; lane++)
 	{
 		Relation	rel = ChunkLaneOpen(log, lane, RowExclusiveLock);
 
 		if (rel == NULL)
 			continue;
+		sw->segments[lane] = page_end(rel) / page_segment_bytes(rel) + 1;
 		sw->states[lane] = page_vacuum_begin(rel);
 		ChunkLaneClose(log, rel);
 	}
@@ -2782,9 +2798,9 @@ lane_vacuum_begin(Relation log)
  */
 uint8 *
 ChunkLogPendingBits(int n, const uint64 *locs, const uint32 *lens, int64 lane,
-					uint64 segment_bytes, uint64 *nbits)
+					uint64 segment_bytes, uint64 cover, uint64 *nbits)
 {
-	uint64		top = 0;
+	uint64		top = cover;
 	uint8	   *bits;
 
 	for (int i = 0; i < n; i++)
@@ -2825,7 +2841,10 @@ lane_vacuum_end(Relation log, void *state, bool truncate, double fraction,
 		if (rel == NULL)
 			continue;
 		bits = ChunkLogPendingBits(npending, pending_locs, pending_lens, lane,
-								   page_segment_bytes(rel), &nbits);
+								   page_segment_bytes(rel),
+								   sw != NULL && lane < sw->n ? sw->segments[lane] :
+								   page_end(rel) / page_segment_bytes(rel) + 1,
+								   &nbits);
 
 		page_vacuum_end(rel, sw != NULL && lane < sw->n ? sw->states[lane] : NULL,
 						truncate, fraction, bits, nbits, &one);
@@ -2833,6 +2852,7 @@ lane_vacuum_end(Relation log, void *state, bool truncate, double fraction,
 		pfree(bits);
 		ChunkLaneClose(log, rel);
 	}
+	lanes_may_grow(out);
 	/* (the pass ended: lanes whose making aborted before it, given again) */
 	if (sw != NULL)
 		(void) vacuum_pass(log, sw->pass);

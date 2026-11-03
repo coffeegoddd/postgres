@@ -216,7 +216,13 @@ register_callbacks(void)
 {
 	if (callbacks_registered)
 		return;
-	before_shmem_exit(lanes_exit, 0);
+	/*
+	 * (on_shmem_exit, not before_shmem_exit: registered as a backend first
+	 * writes a log, maybe inside another's PG_ENSURE_ERROR_CLEANUP, whose
+	 * callback must stay the latest; and run after the backend's
+	 * transaction is aborted, the entry naming the lane until then)
+	 */
+	on_shmem_exit(lanes_exit, 0);
 	RegisterXactCallback(lanes_xact, NULL);
 	RegisterSubXactCallback(lanes_subxact, NULL);
 	callbacks_registered = true;
