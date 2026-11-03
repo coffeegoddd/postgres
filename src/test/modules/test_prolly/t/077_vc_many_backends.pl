@@ -19,6 +19,7 @@ max_connections = 40
 log_lock_waits = on
 deadlock_timeout = 10ms
 log_line_prefix = '%m [%p] %b %a: '
+log_min_error_statement = log
 });
 $node->start;
 $node->safe_psql('postgres', q{
