@@ -56,3 +56,66 @@ cleared
 t      
 (1 row)
 
+
+starting permutation: s1_attach s1_sever3 s2_commit s2_commit3 s2_wake s1_detach c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_attach: SELECT injection_points_attach('vc-sever-listed', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_sever3: SELECT test_vc_sever(3) AS cut; <waiting ...>
+step s2_commit: SELECT test_vc_commit('main', 'c2');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_commit3: SELECT test_vc_commit('main', 'c3');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s2_wake: SELECT injection_points_wakeup('vc-sever-listed');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_sever3: <... completed>
+cut
+---
+  2
+(1 row)
+
+step s1_detach: SELECT injection_points_detach('vc-sever-listed');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|commits
+----+-------
+t   |      3
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+

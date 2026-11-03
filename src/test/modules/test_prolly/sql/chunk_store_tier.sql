@@ -39,10 +39,11 @@ SELECT ok FROM test_cs_check('tier');
 
 -- packs settled by VACUUM, once: committed (no transaction's id kept), or
 -- orphaned and removed; the tier has a relfrozenxid (it had none), kept
--- no older than they
+-- no older than they (the states, not how many: the tests before this one
+-- leave packs of their own)
 SELECT relfrozenxid AS frozen0 FROM pg_class WHERE oid = 'pg_history.tier_chunks'::regclass \gset
 SELECT count(*) FILTER (WHERE state = 'made') AS made FROM test_tier_packs('pg_history.tier_chunks');
-SELECT state, count(*) FROM test_tier_packs('pg_history.tier_chunks') GROUP BY state ORDER BY state;
+SELECT DISTINCT state FROM test_tier_packs('pg_history.tier_chunks') ORDER BY state;
 SELECT relfrozenxid <> '0'::xid AS has_frozenxid, age(relfrozenxid) <= age(:'frozen0'::xid) AS not_older
 FROM pg_class WHERE oid = 'pg_history.tier_chunks'::regclass;
 -- and VACUUM of the tier itself settles them too

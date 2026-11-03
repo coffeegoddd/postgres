@@ -14,6 +14,8 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('preloaded');
 $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'test_prolly'");
+# (the unit tests' archives on the history store are its tier: a place for it)
+$node->append_conf('postgresql.conf', "history_tier_location = 'pg_test_history_tier'");
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');

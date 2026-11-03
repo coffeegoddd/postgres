@@ -228,6 +228,8 @@ segment_size(VcRepo *r, uint32 seg)
 static uint64
 release(ChunkStore *cs)
 {
+	if (!engine_test_on_memory())
+		return 0;				/* (held until the test's subtransaction ends) */
 	MemoryChunkStoreEndHolds(cs);
 	return cs_free_unheld(cs);
 }
@@ -266,7 +268,7 @@ archive_of(ChunkStore *archive)
 /* ------------------------------------------------------------------ tests */
 
 /* Severing A <- B to keep C <- D moves holds only: nothing copied or freed. */
-ENGINE_MEMORY_TEST(test_detach_moves_holds_only)
+ENGINE_TEST(test_detach_moves_holds_only)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -335,10 +337,10 @@ ENGINE_MEMORY_TEST(test_detach_moves_holds_only)
 }
 
 /* Export: a self-contained A <- B in the archive, freed here, exactly. */
-ENGINE_MEMORY_TEST(test_export_self_contained)
+ENGINE_TEST(test_export_self_contained)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	ProllyCtx	actx;
 	VcRepo		r;
@@ -372,7 +374,8 @@ ENGINE_MEMORY_TEST(test_export_self_contained)
 	 * location map's and repository's: the members marked exported)
 	 */
 	freed = release(cs);
-	CHECK_EQ(freed, want + 3);
+	if (engine_test_on_memory())
+		CHECK_EQ(freed, want + 3);
 	settle_and_check(cs);
 	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_EXPORTED);
 
@@ -382,14 +385,26 @@ ENGINE_MEMORY_TEST(test_export_self_contained)
 	check_snap(&actx, &l.b, &sb);
 	CHECK(cs_has(archive, l.init.b));
 	CHECK(!cs_has(archive, l.c.b));
-	MemoryChunkStoreEndHolds(archive);
-	check_store(archive, 0);
+	if (engine_test_on_memory())
+	{
+		MemoryChunkStoreEndHolds(archive);
+		check_store(archive, 0);
+	}
 
-	/* here, history ends at the cut */
-	CHECK(log_from(&r, &l.d, 0, &acc) == VC_ERR_SEVERED);
+	/* here, history ends at the cut (gone from the store once the holds
+	 * end; past the window's edge in any case) */
+	if (engine_test_on_memory())
+		CHECK(log_from(&r, &l.d, 0, &acc) == VC_ERR_SEVERED);
+	else
+		CHECK(log_from(&r, &l.d, VC_WINDOW_ONLY, &acc) == VC_ERR_OUTSIDE_WINDOW);
 	CHECK(acc.n == 2 && phash_eq(&r.ctx.err_hash, &l.b));
-	CHECK(vc_merge_base_in(&r, &l.d, &l.b, 0, &mb) == VC_ERR_SEVERED);
-	CHECK(vc_diff_commits(&r, &l.a, &l.d, 0, count_tables_fn, &n) == VC_ERR_SEVERED);
+	if (engine_test_on_memory())
+	{
+		CHECK(vc_merge_base_in(&r, &l.d, &l.b, 0, &mb) == VC_ERR_SEVERED);
+		CHECK(vc_diff_commits(&r, &l.a, &l.d, 0, count_tables_fn, &n) == VC_ERR_SEVERED);
+	}
+	CHECK(vc_merge_base_in(&r, &l.d, &l.b, VC_WINDOW_ONLY, &mb) == VC_ERR_OUTSIDE_WINDOW);
+	CHECK(vc_diff_commits(&r, &l.a, &l.d, VC_WINDOW_ONLY, count_tables_fn, &n) == VC_ERR_OUTSIDE_WINDOW);
 	CHECK(vc_reset_hard(&r, &l.b) == VC_ERR_OUTSIDE_WINDOW);
 
 	/* work inside the window costs what it did */
@@ -400,15 +415,19 @@ ENGINE_MEMORY_TEST(test_export_self_contained)
 	/* attached from the archive: exactly what was freed comes back */
 	st = *cs_stats(cs);
 	CHECK_EQ(vc_segment_attach(&r, seg, &arch), VC_OK);
-	CHECK_EQ(STATS_DELTA(cs, st, stored), freed - 3 + 2);	/* (+ map, repository) */
+	if (engine_test_on_memory())
+		CHECK_EQ(STATS_DELTA(cs, st, stored), freed - 3 + 2);	/* (+ map, repository) */
 	settle_and_check(cs);
 	check_snap(&r.ctx, &l.b, &sb);
 	CHECK(log_from(&r, &l.d, VC_WINDOW_ONLY, &acc) == VC_OK && acc.n == 5);
 	CHECK(phash_eq(&acc.v[2], &l.b) && phash_eq(&acc.v[4], &l.init));
 	/* and the archive lets go of it: its manifest's root is gone */
-	MemoryChunkStoreEndHolds(archive);
-	(void) cs_free_unheld(archive);
-	CHECK_EQ(store_count(archive), 0);
+	if (engine_test_on_memory())
+	{
+		MemoryChunkStoreEndHolds(archive);
+		(void) cs_free_unheld(archive);
+		CHECK_EQ(store_count(archive), 0);
+	}
 
 	pfree(sa.v);
 	pfree(sb.v);
@@ -418,10 +437,10 @@ ENGINE_MEMORY_TEST(test_export_self_contained)
 }
 
 /* Sliding the window and exporting again sends only what changed. */
-ENGINE_MEMORY_TEST(test_second_export_copies_diff)
+ENGINE_TEST(test_second_export_copies_diff)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	ProllyCtx	actx;
 	VcRepo		r;
@@ -466,8 +485,11 @@ ENGINE_MEMORY_TEST(test_second_export_copies_diff)
 	prolly_ctx_init(&actx, archive, &small_policy);
 	check_snap(&actx, &l.c, &sc);
 	check_snap(&actx, &l.d, &sd);
-	MemoryChunkStoreEndHolds(archive);
-	check_store(archive, 0);
+	if (engine_test_on_memory())
+	{
+		MemoryChunkStoreEndHolds(archive);
+		check_store(archive, 0);
+	}
 	settle_and_check(cs);
 
 	pfree(sc.v);
@@ -477,10 +499,10 @@ ENGINE_MEMORY_TEST(test_second_export_copies_diff)
 	cs_destroy(cs);
 }
 
-ENGINE_MEMORY_TEST(test_discard_frees_exactly)
+ENGINE_TEST(test_discard_frees_exactly)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	VcRepo		r;
 	Linear		l;
@@ -499,14 +521,18 @@ ENGINE_MEMORY_TEST(test_discard_frees_exactly)
 	repo_state_mark(&r, &state);
 	CHECK_EQ(vc_segment_discard(&r, seg, NULL), VC_OK);
 	/* (the members' own chunks, the segment's, and the repository's own it left) */
-	CHECK_EQ(release(cs), want + 1 + repo_state_unheld(&r, &state));
+	if (engine_test_on_memory())
+		CHECK_EQ(release(cs), want + 1 + repo_state_unheld(&r, &state));
 	settle_and_check(cs);
 	/* C names B, so B is known as discarded; A, below it, is forgotten */
 	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_DISCARDED);
 	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_UNKNOWN);
 	CHECK_EQ(segment_size(&r, seg), 0);
 	check_snap(&r.ctx, &l.d, &sd);
-	CHECK(log_from(&r, &l.d, 0, &acc) == VC_ERR_SEVERED && acc.n == 2);
+	/* (gone from the store once the holds end; past the window's edge in any case) */
+	if (engine_test_on_memory())
+		CHECK(log_from(&r, &l.d, 0, &acc) == VC_ERR_SEVERED && acc.n == 2);
+	CHECK(log_from(&r, &l.d, VC_WINDOW_ONLY, &acc) == VC_ERR_OUTSIDE_WINDOW && acc.n == 2);
 	/* a segment discarded is no segment */
 	CHECK_EQ(vc_segment_attach(&r, seg, NULL), VC_ERR);
 	CHECK_EQ(vc_segment_export(&r, seg, &arch), VC_ERR);
@@ -522,10 +548,10 @@ ENGINE_MEMORY_TEST(test_discard_frees_exactly)
  * feature:              B <- E <- F
  * With depth 2 the window is {C, D, E, F}; both branches cut at B.
  */
-ENGINE_MEMORY_TEST(test_branches_cut_at_shared_ancestor)
+ENGINE_TEST(test_branches_cut_at_shared_ancestor)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	VcRepo		r;
 	PHash		init,
@@ -579,11 +605,15 @@ ENGINE_MEMORY_TEST(test_branches_cut_at_shared_ancestor)
 	CHECK_EQ(vc_segment_export(&r, seg, &arch), VC_OK);
 	settle_and_check(cs);
 	working = vc_working(&r);
-	CHECK_EQ(vc_merge(&r, "feature", &m), VC_ERR_SEVERED);
-	CHECK(phash_eq(&r.ctx.err_hash, &b));
-	vc_head(&r, &br);
-	CHECK(phash_eq(&working, &br.working) && !br.merging);
-	vc_branch_free(&br);
+	/* (gone from the store once the holds end: until then, readable) */
+	if (engine_test_on_memory())
+	{
+		CHECK_EQ(vc_merge(&r, "feature", &m), VC_ERR_SEVERED);
+		CHECK(phash_eq(&r.ctx.err_hash, &b));
+		vc_head(&r, &br);
+		CHECK(phash_eq(&working, &br.working) && !br.merging);
+		vc_branch_free(&br);
+	}
 
 	/* attached from the archive, the merge goes through */
 	CHECK_EQ(vc_segment_attach(&r, seg, &arch), VC_OK);
@@ -605,7 +635,7 @@ ENGINE_MEMORY_TEST(test_branches_cut_at_shared_ancestor)
  * between it and the window around main are cut.
  * old:  A;  main: init <- A <- B <- C <- D
  */
-ENGINE_MEMORY_TEST(test_stale_branch_head_stays)
+ENGINE_TEST(test_stale_branch_head_stays)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -639,10 +669,15 @@ ENGINE_MEMORY_TEST(test_stale_branch_head_stays)
 	CHECK_EQ(vc_checkout(&r, "old"), VC_OK);
 	check_snap(&r.ctx, &a, &sa);
 	CHECK(log_from(&r, &a, VC_WINDOW_ONLY, &acc) == VC_OK && acc.n == 2);
-	CHECK(log_from(&r, &d, 0, &acc) == VC_ERR_SEVERED && acc.n == 2);
+	/* (gone from the store once the holds end; past the window's edge in any case) */
+	if (engine_test_on_memory())
+		CHECK(log_from(&r, &d, 0, &acc) == VC_ERR_SEVERED && acc.n == 2);
+	CHECK(log_from(&r, &d, VC_WINDOW_ONLY, &acc) == VC_ERR_OUTSIDE_WINDOW && acc.n == 2);
 	CHECK(phash_eq(&r.ctx.err_hash, &b));
 	/* A is D's ancestor only through B, which is gone: unknown, not "no" */
-	CHECK(vc_merge_base_in(&r, &d, &a, 0, &mb) == VC_ERR_SEVERED);
+	if (engine_test_on_memory())
+		CHECK(vc_merge_base_in(&r, &d, &a, 0, &mb) == VC_ERR_SEVERED);
+	CHECK(vc_merge_base_in(&r, &d, &a, VC_WINDOW_ONLY, &mb) == VC_ERR_OUTSIDE_WINDOW);
 
 	pfree(sa.v);
 	vc_repo_free(&r);
@@ -653,10 +688,10 @@ ENGINE_MEMORY_TEST(test_stale_branch_head_stays)
  * A merge commit whose first parent is cut and second parent is a branch
  * head: M = merge(C, E), depth 1 keeps only M and E.
  */
-ENGINE_MEMORY_TEST(test_merge_commit_parents_across_edge)
+ENGINE_TEST(test_merge_commit_parents_across_edge)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	VcRepo		r;
 	PHash		c,
@@ -691,7 +726,10 @@ ENGINE_MEMORY_TEST(test_merge_commit_parents_across_edge)
 
 	CHECK(vc_commit_load(&r.ctx, &mm, &cm) && cm.nparents == 2);
 	vc_commit_release(&cm);
-	CHECK(log_from(&r, &mm, 0, &acc) == VC_ERR_SEVERED && acc.n == 1);
+	/* (gone from the store once the holds end; past the window's edge in any case) */
+	if (engine_test_on_memory())
+		CHECK(log_from(&r, &mm, 0, &acc) == VC_ERR_SEVERED && acc.n == 1);
+	CHECK(log_from(&r, &mm, VC_WINDOW_ONLY, &acc) == VC_ERR_OUTSIDE_WINDOW && acc.n == 1);
 	CHECK(phash_eq(&r.ctx.err_hash, &c));
 	CHECK_EQ(vc_checkout(&r, "feature"), VC_OK);
 	check_snap(&r.ctx, &e, &se);
@@ -702,7 +740,7 @@ ENGINE_MEMORY_TEST(test_merge_commit_parents_across_edge)
 }
 
 /* Overlapping windows on two branches cut only what neither covers. */
-ENGINE_MEMORY_TEST(test_overlapping_branch_windows)
+ENGINE_TEST(test_overlapping_branch_windows)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -740,12 +778,71 @@ ENGINE_MEMORY_TEST(test_overlapping_branch_windows)
 	cs_destroy(cs);
 }
 
-ENGINE_MEMORY_TEST(test_pinned_commit_stays)
+/*
+ * One run of test_wider_window_stays_cut: main init, A, B, C, D, a branch
+ * old at A.  Depth 2 cuts B alone (old keeps A and init); old dropped, a
+ * window over all five is severed while B is still readable (in its
+ * segment, and on the history store its chunks not yet freed).
+ */
+static void
+wider_window_run(const VcWindow *wide)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
 	Linear		l;
 	uint32		seg;
+	VcWindow	depth2 = {.depth = 2};
+	VcCommit	c;
+
+	setup(&r, cs);
+	l.init = head_of(&r);
+	l.a = commit_rows(&r, 0, 20000, 0, "A");
+	CHECK_EQ(vc_branch_create(&r, "old", NULL), VC_OK);
+	l.b = commit_rows(&r, 0, 300, 1, "B");
+	l.c = commit_rows(&r, 10000, 10300, 2, "C");
+	l.d = commit_rows(&r, 19000, 19300, 3, "D");
+	CHECK_EQ(vc_sever(&r, &depth2, &seg), VC_OK);
+	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_SEGMENT);
+	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_WINDOW);
+	CHECK(vc_locate(&r, &l.init, NULL) == VC_LOC_WINDOW);
+	CHECK_EQ(vc_branch_delete(&r, "old"), VC_OK);
+	CHECK(vc_commit_load(&r.ctx, &l.b, &c));
+	vc_commit_release(&c);
+
+	/* A and init are reached only through B, cut: they are cut too */
+	CHECK_EQ(vc_sever(&r, wide, &seg), VC_OK);
+	CHECK(seg != VC_NO_SEGMENT);
+	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_SEGMENT);
+	CHECK(vc_locate(&r, &l.init, NULL) == VC_LOC_SEGMENT);
+	CHECK(vc_locate(&r, &l.c, NULL) == VC_LOC_WINDOW);
+	CHECK(vc_locate(&r, &l.d, NULL) == VC_LOC_WINDOW);
+	settle_and_check(cs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * A wider window does not bring back what is cut: a sever stops at a commit
+ * without a reference, though it can still be read, and does not keep what
+ * lies past it.  (With a depth alone, with a ceiling too, and with a low
+ * mark.)
+ */
+ENGINE_TEST(test_wider_window_stays_cut)
+{
+	wider_window_run(&(VcWindow) {.depth = 5});
+	wider_window_run(&(VcWindow) {.depth = 5,.max_commits = 100});
+	/* (past B, A is held below the ceiling: walked through, D's window would
+	 * be at its high mark, and cut back to D) */
+	wider_window_run(&(VcWindow) {.depth = 5,.max_commits = 3,.low_commits = 1});
+}
+
+ENGINE_TEST(test_pinned_commit_stays)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	Linear		l;
+	uint32		seg,
+				refused;
 	VcWindow	w = {.depth = 1};
 
 	setup(&r, cs);
@@ -757,6 +854,11 @@ ENGINE_MEMORY_TEST(test_pinned_commit_stays)
 	CHECK(vc_locate(&r, &l.d, NULL) == VC_LOC_WINDOW);
 	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_SEGMENT);
 	CHECK(vc_locate(&r, &l.c, NULL) == VC_LOC_SEGMENT);
+	/* a pin of a commit cut already, though in a segment still, is refused */
+	w.pinned = &l.b;
+	CHECK_EQ(vc_sever(&r, &w, &refused), VC_ERR_SEVERED);
+	CHECK(phash_eq(&r.ctx.err_hash, &l.b));
+	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_WINDOW);
 	CHECK_EQ(vc_segment_discard(&r, seg, NULL), VC_OK);
 	settle_and_check(cs);
 	CHECK_EQ(vc_branch_create(&r, "tag-a", &l.a), VC_OK);
@@ -764,7 +866,7 @@ ENGINE_MEMORY_TEST(test_pinned_commit_stays)
 	cs_destroy(cs);
 }
 
-ENGINE_MEMORY_TEST(test_refuse_outside_window)
+ENGINE_TEST(test_refuse_outside_window)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -830,7 +932,7 @@ static void
 win_scale_case(int history, WinScale *s)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	VcRepo		r;
 	VcWindow	w = {.depth = 5};
@@ -881,13 +983,16 @@ win_scale_case(int history, WinScale *s)
 	CHECK_EQ(vc_diff_commits(&r, &prev, &last, VC_WINDOW_ONLY, count_tables_fn, &n), VC_OK);
 	s->diff_reads_after = STATS_DELTA(cs, st, gets);
 	settle_and_check(cs);
-	MemoryChunkStoreEndHolds(archive);
-	check_store(archive, 0);
+	if (engine_test_on_memory())
+	{
+		MemoryChunkStoreEndHolds(archive);
+		check_store(archive, 0);
+	}
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
 
-ENGINE_MEMORY_TEST(test_window_scaling)
+ENGINE_TEST(test_window_scaling)
 {
 	static const int histories[] = {20, 400};
 	WinScale	s[2];
@@ -967,7 +1072,7 @@ state_bytes(VcRepo *r)
  * is known as discarded; an older edge is forgotten once the commit
  * naming it goes.  A second view of the repository sees the same.
  */
-ENGINE_MEMORY_TEST(test_state_does_not_grow_with_history)
+ENGINE_TEST(test_state_does_not_grow_with_history)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -992,7 +1097,12 @@ ENGINE_MEMORY_TEST(test_state_does_not_grow_with_history)
 		if (i == 10)
 		{
 			head = head_of(&r);
-			CHECK_EQ(log_from(&r, &head, 0, &acc), VC_ERR_SEVERED);
+			/* (gone from the store once the holds end; past the window's
+			 * edge in any case) */
+			if (engine_test_on_memory())
+				CHECK_EQ(log_from(&r, &head, 0, &acc), VC_ERR_SEVERED);
+			else
+				CHECK_EQ(log_from(&r, &head, VC_WINDOW_ONLY, &acc), VC_ERR_OUTSIDE_WINDOW);
 			first_edge = r.ctx.err_hash;
 			CHECK(vc_locate(&r, &first_edge, NULL) == VC_LOC_DISCARDED);
 		}
@@ -1008,7 +1118,10 @@ ENGINE_MEMORY_TEST(test_state_does_not_grow_with_history)
 	/* a varint grows a byte as segment ids move on: not the 390 commits cut */
 	CHECK_LE(bytes, bytes10 + 16);
 	head = head_of(&r);
-	CHECK(log_from(&r, &head, 0, &acc) == VC_ERR_SEVERED && acc.n == 5);
+	/* (gone from the store once the holds end; past the window's edge in any case) */
+	if (engine_test_on_memory())
+		CHECK(log_from(&r, &head, 0, &acc) == VC_ERR_SEVERED && acc.n == 5);
+	CHECK(log_from(&r, &head, VC_WINDOW_ONLY, &acc) == VC_ERR_OUTSIDE_WINDOW && acc.n == 5);
 	edge = r.ctx.err_hash;
 	CHECK(vc_locate(&r, &edge, NULL) == VC_LOC_DISCARDED);
 	CHECK(vc_locate(&r, &first_edge, NULL) == VC_LOC_UNKNOWN);
@@ -1028,7 +1141,7 @@ ENGINE_MEMORY_TEST(test_state_does_not_grow_with_history)
 }
 
 /* Branches cost what they are, however many there are. */
-ENGINE_MEMORY_TEST(test_many_branches)
+ENGINE_TEST(test_many_branches)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1133,8 +1246,8 @@ own_bytes(const VcCommit *c)
 
 /*
  * One head's window straight from its definition, added to out: every
- * ancestor of the head (or the head itself) that a floor keeps and no
- * ceiling cuts.
+ * ancestor of the head in the window now (or the head itself) that a floor
+ * keeps and no ceiling cuts.
  */
 static void
 expected_head(VcRepo *r, const PHash *head, const VcWindow *w, uint64 now, PHashMap *out)
@@ -1158,7 +1271,10 @@ expected_head(VcRepo *r, const PHash *head, const VcWindow *w, uint64 now, PHash
 					ceil;
 
 		phmap_ref(&anc, &h, &created);
-		if (!created || !vc_commit_load(&r->ctx, &h, &c))
+		/* (a sever only shrinks the window: what is past its edge stays out,
+		 * readable or not) */
+		if (!created || (!phash_eq(&h, head) && vc_locate(r, &h, NULL) != VC_LOC_WINDOW) ||
+			!vc_commit_load(&r->ctx, &h, &c))
 			continue;
 		after = H.bytes - c.bytes;
 		span = after + own_bytes(&c);
@@ -1259,7 +1375,7 @@ sever_and_compare(VcRepo *r, const VcWindow *w, uint64 now)
 }
 
 /* A commit's change bytes are exactly the chunks its root adds over its first parent's. */
-ENGINE_MEMORY_TEST(test_change_bytes)
+ENGINE_TEST(test_change_bytes)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1326,7 +1442,7 @@ ENGINE_MEMORY_TEST(test_change_bytes)
 }
 
 /* Each limit alone, as floor and as ceiling, and a ceiling beating a floor. */
-ENGINE_MEMORY_TEST(test_window_limits)
+ENGINE_TEST(test_window_limits)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1420,7 +1536,7 @@ ENGINE_MEMORY_TEST(test_window_limits)
  * Random branching, merging, clocks and policies: after every sever the
  * window is exactly what its definition says.
  */
-ENGINE_MEMORY_TEST(test_window_policy_random)
+ENGINE_TEST(test_window_policy_random)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1628,28 +1744,28 @@ marks_line(uint64 N, uint64 low, uint64 want_low)
 }
 
 /* low_commits = 1: the window grows to N commits, then holds only the head. */
-ENGINE_MEMORY_TEST(test_marks_tumbling)
+ENGINE_TEST(test_marks_tumbling)
 {
 	marks_line(8, 1, 1);
 	marks_line(1, 1, 1);		/* a high mark of one: only ever the head */
 }
 
 /* A low mark between: it grows to N, then back to the last L. */
-ENGINE_MEMORY_TEST(test_marks_hysteresis)
+ENGINE_TEST(test_marks_hysteresis)
 {
 	marks_line(10, 4, 4);
 	marks_line(10, 9, 9);
 }
 
 /* A low mark at or past the high mark slides, as with no low mark. */
-ENGINE_MEMORY_TEST(test_marks_at_high_slide)
+ENGINE_TEST(test_marks_at_high_slide)
 {
 	marks_line(10, 10, 10);
 	marks_line(10, 25, 10);
 }
 
 /* Low marks alone are refused: they need a high mark to fill to. */
-ENGINE_MEMORY_TEST(test_marks_need_high)
+ENGINE_TEST(test_marks_need_high)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1667,7 +1783,7 @@ ENGINE_MEMORY_TEST(test_marks_need_high)
  * A floor is the high mark too: a depth floor of 30 with no ceiling fills
  * to 30 commits, then is cut to the low mark, which wins over the floor.
  */
-ENGINE_MEMORY_TEST(test_marks_floor_is_high)
+ENGINE_TEST(test_marks_floor_is_high)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1697,7 +1813,7 @@ ENGINE_MEMORY_TEST(test_marks_floor_is_high)
  * its low mark while a quiet one keeps its whole window, shared history
  * included.
  */
-ENGINE_MEMORY_TEST(test_marks_branches_independent)
+ENGINE_TEST(test_marks_branches_independent)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1742,7 +1858,7 @@ ENGINE_MEMORY_TEST(test_marks_branches_independent)
 }
 
 /* A pinned commit stays through a cut to the low mark. */
-ENGINE_MEMORY_TEST(test_marks_pinned)
+ENGINE_TEST(test_marks_pinned)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1774,7 +1890,7 @@ ENGINE_MEMORY_TEST(test_marks_pinned)
  * Random histories, branches and merges under random marked windows: every
  * sever leaves exactly the definition's window.
  */
-ENGINE_MEMORY_TEST(test_marks_random)
+ENGINE_TEST(test_marks_random)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1857,7 +1973,7 @@ ENGINE_MEMORY_TEST(test_marks_random)
  * A parent two kept commits name stays known as discarded while either
  * does: X and Y share P; Y is cut and discarded later, and X still names P.
  */
-ENGINE_MEMORY_TEST(test_discarded_parent_still_named)
+ENGINE_TEST(test_discarded_parent_still_named)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1903,7 +2019,7 @@ ENGINE_MEMORY_TEST(test_discarded_parent_still_named)
  * A sever cuts at most max_cut commits; the rest wait for the next, which
  * cuts them.
  */
-ENGINE_MEMORY_TEST(test_sever_bounded)
+ENGINE_TEST(test_sever_bounded)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -1934,10 +2050,10 @@ ENGINE_MEMORY_TEST(test_sever_bounded)
  * An archive must be another store, as transactional as the repository's,
  * and an exported segment comes back only from the one it went to.
  */
-ENGINE_MEMORY_TEST(test_archive_checked)
+ENGINE_TEST(test_archive_checked)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
+	ChunkStore *archive = archive_store_create();
 	VcSource	arch = archive_of(archive);
 	VcSource	self = {"self", cs};
 	VcSource	other = {"other", archive};
@@ -1972,6 +2088,7 @@ static const ProllyUnitTest tests[] = {
 	{"stale_branch_head_stays", test_stale_branch_head_stays},
 	{"merge_commit_parents_across_edge", test_merge_commit_parents_across_edge},
 	{"overlapping_branch_windows", test_overlapping_branch_windows},
+	{"wider_window_stays_cut", test_wider_window_stays_cut},
 	{"pinned_commit_stays", test_pinned_commit_stays},
 	{"refuse_outside_window", test_refuse_outside_window},
 	{"window_scaling", test_window_scaling},

@@ -31,7 +31,29 @@
 /* The store a test's body runs on: "memory", then "pages". */
 static const char *engine_test_store = "memory";
 
-/* The store, empty if it is the memory one (and its references too). */
+/*
+ * Whether the body runs on the memory store: one whose holds a test ends,
+ * as a transaction's end would, to see what is freed (on "pages" holds last
+ * until the test's subtransaction is rolled back, and nothing is freed)
+ */
+static inline bool
+engine_test_on_memory(void)
+{
+	return strcmp(engine_test_store, "memory") == 0;
+}
+
+/* How many times the body running now has asked for its store. */
+static int	engine_test_stores_asked = 0;
+
+/* The body's subtransaction's nesting level, on "pages". */
+static int	engine_test_nest_level = 0;
+
+/*
+ * The store, as the body found it: the memory one emptied (its references
+ * too); on "pages", after the body's first, the body's subtransaction
+ * rolled back and begun again (a body making a repository afresh, as many
+ * times as it asks)
+ */
 static inline ChunkStore *
 memstore_create(void)
 {
@@ -40,6 +62,18 @@ memstore_create(void)
 		MemoryChunkStoreReset();
 		MemoryVcRefsReset();
 	}
+	else if (engine_test_stores_asked > 0)
+	{
+		MemoryContext cxt = CurrentMemoryContext;
+
+		/* (the body's own subtransaction, not one begun within it) */
+		if (GetCurrentTransactionNestLevel() != engine_test_nest_level)
+			elog(ERROR, "a test's store asked for again inside a subtransaction of its own");
+		RollbackAndReleaseCurrentSubTransaction();
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+	}
+	engine_test_stores_asked++;
 	return ChunkStoreOpen(engine_test_store);
 }
 
@@ -53,19 +87,21 @@ cs_destroy(ChunkStore *cs)
 	}
 }
 
-/* The references on the store: "memory" on it, or the history store's rows. */
+/*
+ * The references on the store: "memory" on a memory store (the backend's,
+ * or a test's own), or the history store's rows
+ */
 static inline VcRefs *
 t_refs(ChunkStore *cs)
 {
-	return VcRefsOpen(strcmp(engine_test_store, "memory") == 0 ? "memory" : "pointers",
-					  cs);
+	return VcRefsOpen(cs->routine == &MemoryChunkStore ? "memory" : "pointers", cs);
 }
 
 /*
- * What nothing holds freed, on the memory store, its holds ended as its
- * transaction's end would; the audit passes, with nothing unheld.  On
- * "pages" holds last until the test's subtransaction is rolled back: the
- * audit there is the history store's own tests'.
+ * What nothing holds freed, on a memory store (the backend's, or a test's
+ * own), its holds ended as its transaction's end would; the audit passes,
+ * with nothing unheld.  On the history store holds last until the test's
+ * subtransaction is rolled back: the audit there is its own tests'.
  */
 static inline void
 settle_and_check(ChunkStore *cs)
@@ -74,7 +110,7 @@ settle_and_check(ChunkStore *cs)
 				unheld;
 	char	   *why = NULL;
 
-	if (strcmp(engine_test_store, "memory") != 0)
+	if (cs->routine != &MemoryChunkStore)
 		return;
 	MemoryChunkStoreEndHolds(cs);
 	(void) cs_free_unheld(cs);
@@ -99,6 +135,18 @@ memstore_create_own(void)
 			 ENGINE_TEST_MAX_STORES);
 	engine_test_stores[engine_test_nstores] = MemoryChunkStoreCreate();
 	return engine_test_stores[engine_test_nstores++];
+}
+
+/*
+ * An archive for the store the body runs on: as transactional as it (an
+ * export lets go of the archive's roots with a segment's row), so a memory
+ * store of the test's own on the memory store, the history store's tier on
+ * "pages" (its writes rolled back with the test's subtransaction)
+ */
+static inline ChunkStore *
+archive_store_create(void)
+{
+	return engine_test_on_memory() ? memstore_create_own() : ChunkStoreOpen("tier");
 }
 
 static inline void
@@ -127,11 +175,13 @@ engine_test_run(void (*body) (void), const char *store)
 	ResourceOwner owner = CurrentResourceOwner;
 
 	engine_test_store = store;
+	engine_test_stores_asked = 0;
 	ChunkFormat = &EngineChunkFormat;
 	if (own_xact)
 	{
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
+		engine_test_nest_level = GetCurrentTransactionNestLevel();
 	}
 	PG_TRY();
 	{

@@ -1797,15 +1797,29 @@ stack_push(HashStack *s, const PHash *h)
 }
 
 /*
+ * Whether a commit a window's walk reaches is held: in the sever's listing
+ * of the commits with references, or (one committed since the listing,
+ * below a head that moved on more than a commit) with a reference now.
+ * One without is cut already, though its chunks may not yet be freed: a
+ * walk stops there, and it stays cut.
+ */
+static bool
+walk_held(VcRepo *r, PHashMap *held, const PHash *h)
+{
+	return phmap_find(held, h) || vc_in_window(r, h);
+}
+
+/*
  * The window of one head under floors and ceilings.  Generation, change
  * bytes and time only fall along history, so once a commit is out, all
  * its ancestors are out on that path: the walk stops there.  A parent's
  * measures are in its child, so a parent no floor keeps is never read; one
- * a byte ceiling may cut is read for its own change bytes.
+ * a byte ceiling may cut is read for its own change bytes.  The walk stops
+ * too at a commit already cut (walk_held).
  */
 static int
 window_add_policy(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
-				  PHashMap *below)
+				  PHashMap *held, PHashMap *below)
 {
 	VcCommit	H,
 				c;
@@ -1829,8 +1843,9 @@ window_add_policy(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w
 		if (!created)
 			continue;
 		/* a wider window can reach commits already cut; they stay cut */
-		if (!vc_commit_load(&r->ctx, &h, &c))
+		if (!phash_eq(&h, head) && !walk_held(r, held, &h))
 			continue;
+		c = must_load_commit(&r->ctx, &h);
 		for (uint32 i = 0; i < c.nparents; i++)
 			if (c.parent_bytes[i] > pb)
 				pb = c.parent_bytes[i];
@@ -1870,10 +1885,11 @@ window_add_policy(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w
  * commit reached again under a lower bound is expanded again, and heads
  * sharing history share the walk.  Parent generations live in the child,
  * so nothing outside the window is read.  below collects the parents the
- * window stops at.
+ * window stops at; it stops too at a commit already cut (walk_held).
  */
 static int
-window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHashMap *below)
+window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
+		   PHashMap *held, PHashMap *below)
 {
 	uint64		depth = w->depth;
 	VcCommit	c;
@@ -1882,7 +1898,7 @@ window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHash
 	int			rc;
 
 	if (!depth_only(w))
-		return window_add_policy(r, win, head, w, below);
+		return window_add_policy(r, win, head, w, held, below);
 	if ((rc = load_commit(&r->ctx, head, &c)) != VC_OK)
 		return rc;
 	bound = c.generation > depth ? c.generation - depth : 0;
@@ -1892,15 +1908,17 @@ window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHash
 	{
 		PHash		h = st.v[--st.n];
 		bool		created;
-		uint64	   *v = phmap_ref(win, &h, &created);
+		uint64	   *v;
 
 		CHECK_FOR_INTERRUPTS();
+		/* a wider window can reach commits already cut; they stay cut */
+		if (!phash_eq(&h, head) && !walk_held(r, held, &h))
+			continue;
+		v = phmap_ref(win, &h, &created);
 		if (!created && *v <= bound + 1)
 			continue;
 		*v = bound + 1;
-		/* a wider window can reach commits already cut; they stay cut */
-		if (!vc_commit_load(&r->ctx, &h, &c))
-			continue;
+		c = must_load_commit(&r->ctx, &h);
 		for (uint32 i = 0; i < c.nparents; i++)
 			if (c.parent_gen[i] > bound)
 				stack_push(&st, &c.parents[i]);
@@ -1946,7 +1964,8 @@ low_window(const VcWindow *w)
  * commit still held (one it stops at, cut by a ceiling or past the floors).
  */
 static int
-at_high_mark(VcRepo *r, const PHash *head, const VcWindow *w, bool *over)
+at_high_mark(VcRepo *r, const PHash *head, const VcWindow *w, PHashMap *held,
+			 bool *over)
 {
 	PHashMap	win,
 				below;
@@ -1954,11 +1973,11 @@ at_high_mark(VcRepo *r, const PHash *head, const VcWindow *w, bool *over)
 
 	phmap_init(&win);
 	phmap_init(&below);
-	rc = window_add(r, &win, head, w, &below);
+	rc = window_add(r, &win, head, w, held, &below);
 	*over = false;
 	for (size_t i = 0; rc == VC_OK && i < below.cap && !*over; i++)
 		if (below.used[i] && !phmap_find(&win, &below.keys[i]) &&
-			vc_in_window(r, &below.keys[i]))
+			walk_held(r, held, &below.keys[i]))
 			*over = true;
 	phmap_free(&win);
 	phmap_free(&below);
@@ -1968,7 +1987,7 @@ at_high_mark(VcRepo *r, const PHash *head, const VcWindow *w, bool *over)
 /* Adds head's window to win: its high mark's, or its low mark's once it reached the high one. */
 static int
 window_add_marked(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
-				  PHashMap *below)
+				  PHashMap *held, PHashMap *below)
 {
 	VcWindow	high = *w,
 				low;
@@ -1977,13 +1996,13 @@ window_add_marked(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w
 
 	high.low_commits = high.low_bytes = high.low_seconds = 0;
 	if (!has_low_marks(w))
-		return window_add(r, win, head, &high, below);
-	if ((rc = at_high_mark(r, head, &high, &over)) != VC_OK)
+		return window_add(r, win, head, &high, held, below);
+	if ((rc = at_high_mark(r, head, &high, held, &over)) != VC_OK)
 		return rc;
 	if (!over)
-		return window_add(r, win, head, &high, below);
+		return window_add(r, win, head, &high, held, below);
 	low = low_window(w);
-	return window_add(r, win, head, &low, below);
+	return window_add(r, win, head, &low, held, below);
 }
 
 /* (each branch's head and merge head, for the window) */
@@ -2442,9 +2461,11 @@ int
 vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 {
 	RepoState	st;
-	PHashMap	win;
+	PHashMap	win,
+				heldset;
 	HeadsArg	ha = {{0}};
 	HashStack	held = {0};
+	bool		created;
 	VcSegment	seg = {0};
 	LocEdits	le = {0};
 	size_t		cap = 0;
@@ -2501,17 +2522,32 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 	 */
 	vc_refs_list(r->refs, COMMIT_REF_PREFIX, held_fn, &held);
 	INJECTION_POINT("vc-sever-listed", NULL);
+	phmap_init(&heldset);
+	for (size_t i = 0; i < held.n; i++)
+		phmap_ref(&heldset, &held.v[i], &created);
 	phmap_init(&win);
 	vc_branch_list(r, heads_fn, &ha);
 	for (size_t i = 0; i < ha.heads.n && rc == VC_OK; i++)
-		rc = window_add_marked(r, &win, &ha.heads.v[i], w, NULL);
+		rc = window_add_marked(r, &win, &ha.heads.v[i], w, &heldset, NULL);
 	for (size_t i = 0; i < w->npinned && rc == VC_OK; i++)
-		rc = window_add(r, &win, &w->pinned[i], &(VcWindow) {.depth = 1}, NULL);
+	{
+		/* (a commit cut already is no commit to keep) */
+		if (!walk_held(r, &heldset, &w->pinned[i]))
+		{
+			r->ctx.err_hash = w->pinned[i];
+			r->ctx.err_has_hash = true;
+			r->ctx.err = rc = VC_ERR_SEVERED;
+			break;
+		}
+		rc = window_add(r, &win, &w->pinned[i], &(VcWindow) {.depth = 1}, &heldset, NULL);
+	}
 	px_free(ha.heads.v);
+	phmap_free(&heldset);
 	if (rc != VC_OK)
 	{
 		px_free(held.v);
 		phmap_free(&win);
+		locked_free(&locked);
 		repo_state_free(&st);
 		return rc;
 	}

@@ -9,7 +9,8 @@
  *	  remotes.
  *
  * They run on the memory store, with the memory references, ending its
- * holds as a transaction's end would to see what a sever let go of.
+ * holds as a transaction's end would to see what a sever let go of; and on
+ * the history store, with its rows, but for what only ended holds show.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -204,6 +205,8 @@ check_snap(ProllyCtx *ctx, const PHash *commit, const int64 *want)
 static uint64
 release(ChunkStore *cs)
 {
+	if (!engine_test_on_memory())
+		return 0;				/* (held until the test's subtransaction ends) */
 	MemoryChunkStoreEndHolds(cs);
 	return cs_free_unheld(cs);
 }
@@ -252,7 +255,7 @@ build_linear(VcRepo *r)
 /* ------------------------------------------------------------------ tests */
 
 /* init <- A <- B <- C <- D, a window of two: C is a root now, and the rest is gone. */
-ENGINE_MEMORY_TEST(test_cut_commit_becomes_root)
+ENGINE_TEST(test_cut_commit_becomes_root)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -305,17 +308,20 @@ ENGINE_MEMORY_TEST(test_cut_commit_becomes_root)
 	CHECK_EQ(w.window, 2);
 	CHECK_EQ(w.other, 0);
 
-	/* and nothing of the old history is in the store */
-	(void) release(cs);
-	CHECK(!has(cs, &l.init) && !has(cs, &l.a) && !has(cs, &l.b));
-	CHECK(!has(cs, &l.c) && !has(cs, &l.d));
+	/* and nothing of the old history is in the store (once its holds end) */
+	if (engine_test_on_memory())
+	{
+		(void) release(cs);
+		CHECK(!has(cs, &l.init) && !has(cs, &l.a) && !has(cs, &l.b));
+		CHECK(!has(cs, &l.c) && !has(cs, &l.d));
+	}
 	settle_and_check(cs);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
 
 /* Severing every commit, the store holds the window and no more. */
-ENGINE_MEMORY_TEST(test_store_stays_bounded)
+ENGINE_TEST(test_store_stays_bounded)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -340,8 +346,10 @@ ENGINE_MEMORY_TEST(test_store_stays_bounded)
 	CHECK_EQ(log_from(&r, &h, &acc), VC_OK);
 	CHECK_EQ(acc.n, 10);
 	CHECK_EQ(window_size(&r), 10);
-	/* the window is ten commits whatever the history's length */
-	CHECK_LE(settled_count(cs), at50 + at50 / 10);
+	/* the window is ten commits whatever the history's length (the store
+	 * the window's size once what it let go of is freed) */
+	if (engine_test_on_memory())
+		CHECK_LE(settled_count(cs), at50 + at50 / 10);
 	settle_and_check(cs);
 	vc_repo_free(&r);
 	cs_destroy(cs);
@@ -351,7 +359,7 @@ ENGINE_MEMORY_TEST(test_store_stays_bounded)
  * Two branches over shared history: the shared commit is written once and
  * both are written on it, so they still have a merge base and merge.
  */
-ENGINE_MEMORY_TEST(test_branches_share_the_new_root)
+ENGINE_TEST(test_branches_share_the_new_root)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -401,7 +409,7 @@ ENGINE_MEMORY_TEST(test_branches_share_the_new_root)
 }
 
 /* A merge commit with one parent cut keeps the other. */
-ENGINE_MEMORY_TEST(test_merge_commit_loses_its_cut_parent)
+ENGINE_TEST(test_merge_commit_loses_its_cut_parent)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -448,7 +456,7 @@ ENGINE_MEMORY_TEST(test_merge_commit_loses_its_cut_parent)
 }
 
 /* Nothing cut, nothing written: every hash stays. */
-ENGINE_MEMORY_TEST(test_nothing_cut_nothing_moves)
+ENGINE_TEST(test_nothing_cut_nothing_moves)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -469,7 +477,7 @@ ENGINE_MEMORY_TEST(test_nothing_cut_nothing_moves)
 }
 
 /* A pending merge head follows its commit. */
-ENGINE_MEMORY_TEST(test_merge_head_follows)
+ENGINE_TEST(test_merge_head_follows)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -513,7 +521,7 @@ ENGINE_MEMORY_TEST(test_merge_head_follows)
  * names its new hash, which a later sever's pin names to keep it; the old
  * hash, gone, is no commit to pin (VC_ERR_SEVERED).
  */
-ENGINE_MEMORY_TEST(test_pinned_follows_the_hook)
+ENGINE_TEST(test_pinned_follows_the_hook)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -537,9 +545,11 @@ ENGINE_MEMORY_TEST(test_pinned_follows_the_hook)
 	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
 	CHECK(vc_in_window(&r, &b2));	/* a root: nothing beneath it to cut */
 	CHECK_EQ(window_size(&r), 2);
-	/* the old hash, gone (its transaction's holds ended), is no commit */
-	(void) release(cs);
+	/* the old hash, without a reference, is no commit: freed or not yet */
 	w.pinned = &l.b;
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_ERR_SEVERED);
+	CHECK(phash_eq(&r.ctx.err_hash, &l.b));
+	(void) release(cs);
 	CHECK_EQ(vc_sever(&r, &w, &seg), VC_ERR_SEVERED);
 	CHECK(vc_in_window(&r, &b2));
 	settle_and_check(cs);
@@ -552,7 +562,7 @@ ENGINE_MEMORY_TEST(test_pinned_follows_the_hook)
  * the window keeps: commits outside it not cut yet keep their hashes, for
  * a later sever to cut.
  */
-ENGINE_MEMORY_TEST(test_max_cut_leaves_the_rest)
+ENGINE_TEST(test_max_cut_leaves_the_rest)
 {
 	/*
 	 * Of init, A and B, one is cut a sever, whichever the listing (by hash)
@@ -594,7 +604,7 @@ ENGINE_MEMORY_TEST(test_max_cut_leaves_the_rest)
  * What the window measures from a head is unchanged by a rewrite: change
  * bytes and generations after each commit, and its time.
  */
-ENGINE_MEMORY_TEST(test_measures_stay)
+ENGINE_TEST(test_measures_stay)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
@@ -638,7 +648,7 @@ ENGINE_MEMORY_TEST(test_measures_stay)
  * The mode is the repository's: another view of it (another backend's)
  * sees it, and its severs rewrite; set back to KEEP, they make segments.
  */
-ENGINE_MEMORY_TEST(test_mode_is_the_repository)
+ENGINE_TEST(test_mode_is_the_repository)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r,
@@ -671,7 +681,7 @@ ENGINE_MEMORY_TEST(test_mode_is_the_repository)
 }
 
 /* Hashes that do not last cannot be shared: no remotes either way. */
-ENGINE_MEMORY_TEST(test_no_remotes)
+ENGINE_TEST(test_no_remotes)
 {
 	ChunkStore *ca = memstore_create(),
 			   *cb = memstore_create_own(),
@@ -771,7 +781,7 @@ marks_rewrite(uint64 low)
 	cs_destroy(cs);
 }
 
-ENGINE_MEMORY_TEST(test_low_marks)
+ENGINE_TEST(test_low_marks)
 {
 	marks_rewrite(1);
 	marks_rewrite(3);

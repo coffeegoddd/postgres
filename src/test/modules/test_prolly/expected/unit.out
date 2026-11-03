@@ -90,6 +90,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_window   | stale_branch_head_stays              | ok     | 
  engine_window   | merge_commit_parents_across_edge     | ok     | 
  engine_window   | overlapping_branch_windows           | ok     | 
+ engine_window   | wider_window_stays_cut               | ok     | 
  engine_window   | pinned_commit_stays                  | ok     | 
  engine_window   | refuse_outside_window                | ok     | 
  engine_window   | window_scaling                       | ok     | 
@@ -144,7 +145,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_rewrite  | mode_is_the_repository               | ok     | 
  engine_rewrite  | no_remotes                           | ok     | 
  engine_rewrite  | low_marks                            | ok     | 
-(132 rows)
+(133 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
@@ -183,3 +184,9 @@ SELECT test_engine_build_finished();
  f
 (1 row)
 
+-- (the engine suites' archives on the history store, its tier, rolled back
+-- with each test, leave the tier's entries dead: vacuumed here, so that
+-- autovacuum does not take them up in a later test that counts on what it
+-- has not vacuumed yet)
+VACUUM pg_history.tier_index;
+VACUUM pg_history.tier_chunks;

@@ -315,7 +315,9 @@ extern bool vc_in_window(VcRepo *r, const PHash *commit);
  * no floor set everything is kept.  A ceiling cuts it once commits >
  * max_commits, or bytes > max_bytes, or age >= max_seconds: any ceiling
  * cuts it, and a ceiling wins over a floor.  Zero leaves a limit unset; a
- * window with none set is refused.  Heads are always kept.
+ * window with none set is refused.  Heads are always kept.  A pinned commit
+ * must be held: one cut already (in a segment, or discarded, its chunks
+ * freed or not) is refused, VC_ERR_SEVERED.
  *
  * Low marks.  Without them the window slides: each sever cuts a head's
  * history back to exactly the window above (its high mark).  With any low
@@ -451,7 +453,8 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  * that then aborts has moved none of them.  A commit pinned by hash
  * (VcWindow.pinned) with cut history beneath it is replaced as any: the
  * hook names its new hash, which a later sever's pin must name (the old
- * one, gone, is VC_ERR_SEVERED).  Changing
+ * one, without a reference, is VC_ERR_SEVERED, as any commit cut already
+ * that a pin names is, whether or not its chunks are freed yet).  Changing
  * the branches or the mode while a rewriting sever waits for the
  * repository's state refuses it (a serialization failure), to be run
  * again.

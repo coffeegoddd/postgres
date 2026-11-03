@@ -8,10 +8,13 @@
  *	  find a merge base, branching on both sides, histories that do not
  *	  attach, and what each transfer costs.
  *
- * They run on the memory store, with the memory references: each
- * repository has a store of its own (the backend's, and the test's own),
- * whose holds the tests end, as a transaction's end would, to see what a
- * call left behind.
+ * Each repository has a store of its own: the first the store a test runs
+ * on (the memory store, then the history store), the rest memory stores of
+ * the test's own, with the memory references.  The tests end a memory
+ * store's holds, as a transaction's end would, to see what a call left
+ * behind; on the history store they last until the test's subtransaction
+ * is rolled back.  An archive is as transactional as the repository that
+ * exports to it: the history store's tier for one on the history store.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -288,6 +291,8 @@ expected_frees(VcRepo *r, uint32 seg)
 static uint64
 release(ChunkStore *cs)
 {
+	if (cs->routine != &MemoryChunkStore)
+		return 0;				/* (held until the test's subtransaction ends) */
 	MemoryChunkStoreEndHolds(cs);
 	return cs_free_unheld(cs);
 }
@@ -309,6 +314,17 @@ static bool
 has(ChunkStore *cs, const PHash *h)
 {
 	return cs_has(cs, h->b);
+}
+
+/*
+ * Whether what the store's holds no longer cover is seen freed: on a memory
+ * store, whose holds a test ends; not on the history store, where they last
+ * until the test's subtransaction is rolled back
+ */
+static bool
+frees_seen(ChunkStore *cs)
+{
+	return cs->routine == &MemoryChunkStore;
 }
 
 #define STORED(cs) (cs_stats(cs)->stored)
@@ -353,7 +369,7 @@ build_main(VcRepo *r, int n)
 /* ------------------------------------------------------------------ tests */
 
 /* A laptop with full history pushing to a remote that discarded A, B sends none of it. */
-ENGINE_MEMORY_TEST(test_push_does_not_resurrect)
+ENGINE_TEST(test_push_does_not_resurrect)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -373,16 +389,22 @@ ENGINE_MEMORY_TEST(test_push_does_not_resurrect)
 	CHECK_EQ(vc_sever(&origin, &depth2, &seg), VC_OK);
 	CHECK_EQ(vc_segment_discard(&origin, seg, NULL), VC_OK);
 	(void) release(ocs);
-	CHECK(!has(ocs, &l.a));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.a));
 
 	e = commit_rows(&laptop, 500, 600, 9, "E");
 	stored = STORED(ocs);
 	CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_OK);
 	CHECK(head_is(&origin, "main", &e));
-	CHECK(!has(ocs, &l.a) && !has(ocs, &l.b));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.a) && !has(ocs, &l.b));
 	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);
 	CHECK_LE(STORED(ocs) - stored, 3 * 100 * 6 + 10);
-	CHECK_EQ(log_from(&origin, &e, 0, &acc), VC_ERR_SEVERED);
+	/* (gone from the store once the holds end; past the window's edge in any case) */
+	if (frees_seen(ocs))
+		CHECK_EQ(log_from(&origin, &e, 0, &acc), VC_ERR_SEVERED);
+	else
+		CHECK_EQ(log_from(&origin, &e, VC_WINDOW_ONLY, &acc), VC_ERR_OUTSIDE_WINDOW);
 	CHECK_EQ(acc.n, 3);
 	settle_and_check(ocs);
 	settle_and_check(lcs);
@@ -392,7 +414,7 @@ ENGINE_MEMORY_TEST(test_push_does_not_resurrect)
 }
 
 /* A clone at depth 3 takes three commits a branch, with hints for the rest. */
-ENGINE_MEMORY_TEST(test_shallow_clone_with_hints)
+ENGINE_TEST(test_shallow_clone_with_hints)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *scs = memstore_create_own(),
@@ -442,7 +464,7 @@ ENGINE_MEMORY_TEST(test_shallow_clone_with_hints)
 }
 
 /* A clone goes only into a store with no repository. */
-ENGINE_MEMORY_TEST(test_clone_into_empty_only)
+ENGINE_TEST(test_clone_into_empty_only)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -473,7 +495,7 @@ ENGINE_MEMORY_TEST(test_clone_into_empty_only)
 }
 
 /* Fetch connects: everything down to known commits, however small the window. */
-ENGINE_MEMORY_TEST(test_fetch_connects_past_depth)
+ENGINE_TEST(test_fetch_connects_past_depth)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -501,7 +523,7 @@ ENGINE_MEMORY_TEST(test_fetch_connects_past_depth)
 }
 
 /* The remote checks fast-forward from its own history, across the sender's cut. */
-ENGINE_MEMORY_TEST(test_push_ff_checked_by_receiver)
+ENGINE_TEST(test_push_ff_checked_by_receiver)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own(),
@@ -542,8 +564,13 @@ ENGINE_MEMORY_TEST(test_push_ff_checked_by_receiver)
 	count = settled_count(ocs);
 	CHECK_EQ(vc_push(&laptop, &origin, "side"), VC_ERR);
 	CHECK(!vc_in_window(&origin, &x));
-	CHECK_EQ(settled_count(ocs), count);
-	CHECK(!has(ocs, &x));
+	/* (what it sent before refusing, freed with its holds: rolled back on
+	 * the history store, as the refusal's error would) */
+	if (frees_seen(ocs))
+	{
+		CHECK_EQ(settled_count(ocs), count);
+		CHECK(!has(ocs, &x));
+	}
 	settle_and_check(ocs);
 	vc_repo_free(&origin);
 	vc_repo_free(&laptop);
@@ -551,7 +578,7 @@ ENGINE_MEMORY_TEST(test_push_ff_checked_by_receiver)
 }
 
 /* Deepening brings history past the cut into a segment, not the window. */
-ENGINE_MEMORY_TEST(test_deepen_from_remote)
+ENGINE_TEST(test_deepen_from_remote)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -603,10 +630,10 @@ ENGINE_MEMORY_TEST(test_deepen_from_remote)
 }
 
 /* The archive describes itself: a new repository restores from it alone. */
-ENGINE_MEMORY_TEST(test_restore_from_archive_alone)
+ENGINE_TEST(test_restore_from_archive_alone)
 {
 	ChunkStore *cs = memstore_create(),
-			   *acs = memstore_create_own(),
+			   *acs = archive_store_create(),
 			   *ncs = memstore_create_own();
 	VcSource	cold = {"cold", acs};
 	VcRepo		r,
@@ -655,7 +682,12 @@ ENGINE_MEMORY_TEST(test_restore_from_archive_alone)
 	cs_destroy(cs);
 }
 
-/* Exporting to a remote that already has the history moves almost nothing. */
+/*
+ * Exporting to a remote that already has the history moves almost nothing.
+ * (On the memory store alone: the laptop, a memory store, exports to the
+ * origin, which an archive as transactional as the laptop's store must be;
+ * on the history store the origin is not.)
+ */
 ENGINE_MEMORY_TEST(test_export_to_remote_with_history)
 {
 	ChunkStore *ocs = memstore_create(),
@@ -701,7 +733,7 @@ ENGINE_MEMORY_TEST(test_export_to_remote_with_history)
  * origin: main init <- A <- m2..m9;  feature A <- f1 <- f2.
  * A depth-2 clone cannot see the base A.  Pull deepens, if allowed enough.
  */
-ENGINE_MEMORY_TEST(test_pull_deepens_for_merge_base)
+ENGINE_TEST(test_pull_deepens_for_merge_base)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -743,7 +775,7 @@ ENGINE_MEMORY_TEST(test_pull_deepens_for_merge_base)
 }
 
 /* A merge's parent past the depth is a boundary even though the merge names it. */
-ENGINE_MEMORY_TEST(test_merge_parent_beyond_depth)
+ENGINE_TEST(test_merge_parent_beyond_depth)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -791,7 +823,7 @@ ENGINE_MEMORY_TEST(test_merge_parent_beyond_depth)
 }
 
 /* Restoring discarded history on a remote is explicit: it deepens from a source. */
-ENGINE_MEMORY_TEST(test_explicit_restore_on_remote)
+ENGINE_TEST(test_explicit_restore_on_remote)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -822,11 +854,11 @@ ENGINE_MEMORY_TEST(test_explicit_restore_on_remote)
 }
 
 /* Both sides branch, the remote has cut its history, and work still flows. */
-ENGINE_MEMORY_TEST(test_branching_both_sides)
+ENGINE_TEST(test_branching_both_sides)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own(),
-			   *acs = memstore_create_own();
+			   *acs = archive_store_create();
 	VcSource	cold = {"cold", acs};
 	VcRepo		origin,
 				laptop;
@@ -858,7 +890,9 @@ ENGINE_MEMORY_TEST(test_branching_both_sides)
 	CHECK_EQ(vc_push(&laptop, &origin, "topic"), VC_OK);
 	CHECK_LE(STORED(ocs) - stored, 2 * (3 * 100 * 6 + 10));
 	(void) release(ocs);
-	CHECK(!has(ocs, &l.a));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.a));
+	CHECK(vc_locate(&origin, &l.a, NULL) != VC_LOC_WINDOW);
 
 	/* and the remote's branch merges into the laptop's at their base C */
 	CHECK_EQ(vc_pull(&laptop, &origin, "feature", 0, &m), VC_OK);
@@ -876,7 +910,7 @@ ENGINE_MEMORY_TEST(test_branching_both_sides)
 }
 
 /* Separately started repositories share no history: every transfer is refused. */
-ENGINE_MEMORY_TEST(test_unrelated_histories_rejected)
+ENGINE_TEST(test_unrelated_histories_rejected)
 {
 	ChunkStore *acs = memstore_create(),
 			   *bcs = memstore_create_own();
@@ -919,11 +953,11 @@ ENGINE_MEMORY_TEST(test_unrelated_histories_rejected)
  * fetch is refused as detached, naming the cut and its archive, until the
  * laptop restores that stretch from the archive.
  */
-ENGINE_MEMORY_TEST(test_detached_fetch_until_repaired)
+ENGINE_TEST(test_detached_fetch_until_repaired)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own(),
-			   *acs = memstore_create_own();
+			   *acs = archive_store_create();
 	VcSource	cold = {"cold", acs};
 	VcRepo		origin,
 				laptop;
@@ -969,7 +1003,7 @@ ENGINE_MEMORY_TEST(test_detached_fetch_until_repaired)
  * shown to attach and is refused, leaving nothing on the remote, until the
  * laptop attaches its segment again.
  */
-ENGINE_MEMORY_TEST(test_detached_push_until_attached)
+ENGINE_TEST(test_detached_push_until_attached)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own(),
@@ -995,7 +1029,10 @@ ENGINE_MEMORY_TEST(test_detached_push_until_attached)
 	before = settled_count(ocs);
 	CHECK_EQ(vc_push(&laptop, &origin, "main"), VC_ERR_DETACHED);
 	CHECK(phash_eq(&laptop.ctx.err_hash, &c[2]));
-	CHECK_EQ(settled_count(ocs), before);
+	/* (what it sent before refusing, freed with its holds: rolled back on
+	 * the history store, as the refusal's error would) */
+	if (frees_seen(ocs))
+		CHECK_EQ(settled_count(ocs), before);
 	settle_and_check(ocs);
 
 	CHECK_EQ(vc_segment_attach(&laptop, seg, &cold), VC_OK);
@@ -1012,7 +1049,7 @@ ENGINE_MEMORY_TEST(test_detached_push_until_attached)
  * built on B still attaches there (same hash, same history), and B itself
  * is not sent back.
  */
-ENGINE_MEMORY_TEST(test_attach_at_cut_commit)
+ENGINE_TEST(test_attach_at_cut_commit)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -1035,9 +1072,14 @@ ENGINE_MEMORY_TEST(test_attach_at_cut_commit)
 	CHECK_EQ(vc_push(&laptop, &origin, "hotfix"), VC_OK);
 	CHECK(head_is(&origin, "hotfix", &x));
 	(void) release(ocs);
-	CHECK(!has(ocs, &l.b));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.b));
 	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);
-	CHECK_EQ(log_from(&origin, &x, 0, &acc), VC_ERR_SEVERED);
+	/* (gone from the store once the holds end; past the window's edge in any case) */
+	if (frees_seen(ocs))
+		CHECK_EQ(log_from(&origin, &x, 0, &acc), VC_ERR_SEVERED);
+	else
+		CHECK_EQ(log_from(&origin, &x, VC_WINDOW_ONLY, &acc), VC_ERR_OUTSIDE_WINDOW);
 	CHECK_EQ(acc.n, 1);
 	settle_and_check(ocs);
 	vc_repo_free(&origin);
@@ -1051,7 +1093,7 @@ ENGINE_MEMORY_TEST(test_attach_at_cut_commit)
  * a commit sent that builds on one, and on what the receiver holds, brings
  * it back with what it needs; discarded history it still names stays.
  */
-ENGINE_MEMORY_TEST(test_discarded_returns_only_when_built_on)
+ENGINE_TEST(test_discarded_returns_only_when_built_on)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -1076,7 +1118,9 @@ ENGINE_MEMORY_TEST(test_discarded_returns_only_when_built_on)
 	commit_rows(&laptop, 400, 410, 50, "on A");
 	CHECK_EQ(vc_push(&laptop, &origin, "side"), VC_ERR_UNRELATED);
 	(void) release(ocs);
-	CHECK(!has(ocs, &l.a));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.a));
+	CHECK(vc_locate(&origin, &l.a, NULL) != VC_LOC_WINDOW);
 
 	/* merged with D, which origin holds: it attaches, and A comes back */
 	CHECK_EQ(vc_merge(&laptop, "main", &m), VC_OK);
@@ -1087,14 +1131,16 @@ ENGINE_MEMORY_TEST(test_discarded_returns_only_when_built_on)
 	CHECK(vc_locate(&origin, &l.init, NULL) == VC_LOC_WINDOW);
 	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);	/* not sent */
 	settle_and_check(ocs);
-	CHECK(has(ocs, &l.a) && !has(ocs, &l.b));
+	CHECK(has(ocs, &l.a));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.b));
 	vc_repo_free(&origin);
 	vc_repo_free(&laptop);
 	cs_destroy(ocs);
 }
 
 /* A push does not overwrite work not committed on the remote's branch. */
-ENGINE_MEMORY_TEST(test_push_keeps_remote_work)
+ENGINE_TEST(test_push_keeps_remote_work)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -1154,7 +1200,7 @@ ENGINE_MEMORY_TEST(test_push_keeps_remote_work)
  * read) only for a commit as old as its history's discarded part: a push
  * of new work after a discard reads what the push needs, not the window.
  */
-ENGINE_MEMORY_TEST(test_transfer_reads_not_the_window)
+ENGINE_TEST(test_transfer_reads_not_the_window)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -1201,7 +1247,7 @@ state_names(VcRepo *r, const char *name)
 }
 
 /* Boundaries share their hint: the state names each place history came from once. */
-ENGINE_MEMORY_TEST(test_hints_named_once)
+ENGINE_TEST(test_hints_named_once)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -1240,7 +1286,7 @@ ENGINE_MEMORY_TEST(test_hints_named_once)
 }
 
 /* Pull names its tracking branch after the remote: one without a name is refused. */
-ENGINE_MEMORY_TEST(test_pull_needs_named_remote)
+ENGINE_TEST(test_pull_needs_named_remote)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own();
@@ -1270,11 +1316,11 @@ ENGINE_MEMORY_TEST(test_pull_needs_named_remote)
  * B, still named by C, is known as discarded by what the archive's
  * manifest says of the segment, and a branch on it attaches there.
  */
-ENGINE_MEMORY_TEST(test_attach_at_exported_cut_commit)
+ENGINE_TEST(test_attach_at_exported_cut_commit)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *lcs = memstore_create_own(),
-			   *acs = memstore_create_own();
+			   *acs = archive_store_create();
 	VcSource	cold = {"cold", acs};
 	VcRepo		origin,
 				laptop;
@@ -1296,7 +1342,8 @@ ENGINE_MEMORY_TEST(test_attach_at_exported_cut_commit)
 	CHECK_EQ(vc_push(&laptop, &origin, "hotfix"), VC_OK);
 	CHECK(head_is(&origin, "hotfix", &x));
 	(void) release(ocs);
-	CHECK(!has(ocs, &l.b));
+	if (frees_seen(ocs))
+		CHECK(!has(ocs, &l.b));
 	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);
 	settle_and_check(ocs);
 	vc_repo_free(&origin);
@@ -1325,7 +1372,7 @@ random_commit(VcRepo *r, uint64 ver)
 }
 
 /* Each transfer stores what its commits changed, not the history behind them. */
-ENGINE_MEMORY_TEST(test_transfer_costs)
+ENGINE_TEST(test_transfer_costs)
 {
 	ChunkStore *ocs = memstore_create(),
 			   *scs = memstore_create_own(),
