@@ -1049,7 +1049,7 @@ vc_scale_case(uint64 n, VcScale *s)
 	cs_destroy(cs);
 }
 
-ENGINE_MEMORY_TEST(test_vc_scaling)
+ENGINE_TEST(test_vc_scaling)
 {
 	static const uint64 sizes[] = {20000, 200000};
 	VcScale		s[2];
@@ -1139,7 +1139,7 @@ merge_base_reads(uint64 history, uint64 ahead)
 	return reads;
 }
 
-ENGINE_MEMORY_TEST(test_merge_base_cost)
+ENGINE_TEST(test_merge_base_cost)
 {
 	uint64		short_hist = merge_base_reads(10, 20);
 	uint64		long_hist = merge_base_reads(5000, 20);

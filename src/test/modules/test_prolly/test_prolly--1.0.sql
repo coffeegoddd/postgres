@@ -621,9 +621,9 @@ CREATE FUNCTION test_vc_rows(branch text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
--- Every commit outside the window of that depth moved into a new segment;
--- how many.
-CREATE FUNCTION test_vc_sever(depth int4)
+-- Every commit outside the window of that depth moved into a new segment
+-- (discarded, with discard); how many.
+CREATE FUNCTION test_vc_sever(depth int4, discard bool DEFAULT false)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
