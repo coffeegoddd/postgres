@@ -189,5 +189,14 @@ extern int	prolly_delta_write(ProllyCtx *ctx, const PHash *base,
 							   const PHash *target, PHash *out);
 extern int	prolly_delta_apply(ProllyCtx *ctx, const PHash *delta, PHash *out);
 
+/*
+ * Repair: the chunks of the tree root the context's store has not, copied
+ * into it from source, each checked against its name as it is put; how
+ * many.  Those it has, root's own included, are held, not walked below.
+ * A chunk source lacks, or bytes not their name's, is an error raised, and
+ * what was copied before it stays, held until the transaction ends.
+ */
+extern uint64 prolly_repair(ProllyCtx *ctx, ChunkStore *source,
+							const PHash *root);
 
 #endif							/* PROLLY_ENGINE_PROLLY_H */

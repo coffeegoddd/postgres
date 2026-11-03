@@ -6,6 +6,9 @@
  *
  * The chunks, their counts and its pins are the backend's alone, kept in a
  * hash table that lasts as long as the backend (or MemoryChunkStoreReset).
+ * Tests may make stores of their own beside it (MemoryChunkStoreCreate: a
+ * second store to copy from), end their holds before the transaction does,
+ * and damage them (a chunk dropped, or its bytes changed).
  * Its lifetime rules are the interface's, made at once, not by
  * transactions: a put, a root's change or a free stands though its
  * transaction aborts.  Its pins are let go of as each transaction ends.
@@ -21,6 +24,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "lib/ilist.h"
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_store.h"
 #include "prolly/chunkstore.h"
@@ -42,60 +46,115 @@ typedef struct MemPin
 	uint8		hash[CHUNK_HASH_LEN];
 } MemPin;
 
-static ChunkStore mem_store = {.routine = &MemoryChunkStore};
-static MemoryContext mem_cxt = NULL;
-static HTAB *chunks = NULL;
-static HTAB *pins = NULL;
+typedef struct MemStore
+{
+	ChunkStore	cs;				/* first: a ChunkStore is a MemStore */
+	MemoryContext cxt;
+	HTAB	   *chunks;
+	HTAB	   *pins;
+	dlist_node	node;			/* in stores */
+} MemStore;
+
+static MemStore *backend_store = NULL;
+static dlist_head stores = DLIST_STATIC_INIT(stores);
 
 static HTAB *
-make_table(const char *name, Size entrysize)
+make_table(MemStore *ms, const char *name, Size entrysize)
 {
 	HASHCTL		ctl;
 
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = entrysize;
-	ctl.hcxt = mem_cxt;
+	ctl.hcxt = ms->cxt;
 	return hash_create(name, 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+end_holds(MemStore *ms)
+{
+	if (hash_get_num_entries(ms->pins) > 0)
+	{
+		hash_destroy(ms->pins);
+		ms->pins = make_table(ms, "memory chunk store pins", sizeof(MemPin));
+	}
 }
 
 /* (pins last until the transaction ends) */
 static void
 release_pins(XactEvent event, void *arg)
 {
-	if (pins && hash_get_num_entries(pins) > 0 &&
-		(event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
-				 event == XACT_EVENT_PARALLEL_COMMIT ||
-				 event == XACT_EVENT_PARALLEL_ABORT || event == XACT_EVENT_PREPARE))
+	dlist_iter	it;
+
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PARALLEL_COMMIT &&
+		event != XACT_EVENT_PARALLEL_ABORT && event != XACT_EVENT_PREPARE)
+		return;
+	dlist_foreach(it, &stores)
+		end_holds(dlist_container(MemStore, node, it.cur));
+}
+
+static MemStore *
+store_create(void)
+{
+	static bool registered = false;
+	MemStore   *ms = MemoryContextAllocZero(TopMemoryContext, sizeof(MemStore));
+
+	if (!registered)
 	{
-		hash_destroy(pins);
-		pins = make_table("memory chunk store pins", sizeof(MemPin));
+		RegisterXactCallback(release_pins, NULL);
+		registered = true;
 	}
+	ms->cs.routine = &MemoryChunkStore;
+	ms->cxt = AllocSetContextCreate(TopMemoryContext, "memory chunk store",
+									ALLOCSET_DEFAULT_SIZES);
+	ms->chunks = make_table(ms, "memory chunk store", sizeof(MemChunk));
+	ms->pins = make_table(ms, "memory chunk store pins", sizeof(MemPin));
+	dlist_push_tail(&stores, &ms->node);
+	return ms;
 }
 
 static ChunkStore *
 mem_open(void)
 {
-	if (mem_cxt == NULL)
-	{
-		mem_cxt = AllocSetContextCreate(TopMemoryContext, "memory chunk store",
-										ALLOCSET_DEFAULT_SIZES);
-		chunks = make_table("memory chunk store", sizeof(MemChunk));
-		pins = make_table("memory chunk store pins", sizeof(MemPin));
-		RegisterXactCallback(release_pins, NULL);
-	}
-	return &mem_store;
+	if (backend_store == NULL)
+		backend_store = store_create();
+	return &backend_store->cs;
 }
 
 void
 MemoryChunkStoreReset(void)
 {
-	if (mem_cxt == NULL)
+	if (backend_store == NULL)
 		return;
-	hash_destroy(chunks);
-	hash_destroy(pins);
-	MemoryContextReset(mem_cxt);
-	chunks = make_table("memory chunk store", sizeof(MemChunk));
-	pins = make_table("memory chunk store pins", sizeof(MemPin));
+	MemoryContextReset(backend_store->cxt);
+	backend_store->chunks = make_table(backend_store, "memory chunk store",
+									   sizeof(MemChunk));
+	backend_store->pins = make_table(backend_store, "memory chunk store pins",
+									 sizeof(MemPin));
+}
+
+ChunkStore *
+MemoryChunkStoreCreate(void)
+{
+	return &store_create()->cs;
+}
+
+void
+MemoryChunkStoreDestroy(ChunkStore *cs)
+{
+	MemStore   *ms = (MemStore *) cs;
+
+	Assert(cs->routine == &MemoryChunkStore && ms != backend_store);
+	dlist_delete(&ms->node);
+	MemoryContextDelete(ms->cxt);
+	pfree(ms);
+}
+
+void
+MemoryChunkStoreEndHolds(ChunkStore *cs)
+{
+	Assert(cs->routine == &MemoryChunkStore);
+	end_holds((MemStore *) cs);
 }
 
 static char *
@@ -109,35 +168,35 @@ hash_text(const uint8 *hash)
 }
 
 static MemChunk *
-find(const uint8 *hash)
+find(MemStore *ms, const uint8 *hash)
 {
-	return hash_search(chunks, hash, HASH_FIND, NULL);
+	return hash_search(ms->chunks, hash, HASH_FIND, NULL);
 }
 
 static void
-pin(const uint8 *hash)
+pin(MemStore *ms, const uint8 *hash)
 {
-	(void) hash_search(pins, hash, HASH_ENTER, NULL);
+	(void) hash_search(ms->pins, hash, HASH_ENTER, NULL);
 }
 
 static bool
 mem_hold(ChunkStore *cs, const uint8 *hash)
 {
-	if (find(hash) == NULL)
+	MemStore   *ms = (MemStore *) cs;
+	if (find(ms, hash) == NULL)
 		return false;
-	pin(hash);
+	pin(ms, hash);
 	return true;
 }
 
 static void
 mem_visit(ChunkStore *cs, ChunkVisitFn fn, void *arg)
 {
+	MemStore   *ms = (MemStore *) cs;
 	HASH_SEQ_STATUS seq;
 	MemChunk   *c;
 
-	if (chunks == NULL)
-		return;
-	hash_seq_init(&seq, chunks);
+	hash_seq_init(&seq, ms->chunks);
 	while ((c = hash_seq_search(&seq)) != NULL)
 	{
 		ChunkCounts counts = {.refs = c->refs, .roots = c->roots};
@@ -172,13 +231,15 @@ add_ref(void *arg, const uint8 *hash)
 static bool
 mem_has(ChunkStore *cs, const uint8 *hash)
 {
-	return find(hash) != NULL;
+	MemStore   *ms = (MemStore *) cs;
+	return find(ms, hash) != NULL;
 }
 
 static void *
 mem_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 {
-	MemChunk   *c = find(hash);
+	MemStore   *ms = (MemStore *) cs;
+	MemChunk   *c = find(ms, hash);
 	void	   *data;
 
 	if (c == NULL)
@@ -204,29 +265,30 @@ mem_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out,
 static bool
 mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
+	MemStore   *ms = (MemStore *) cs;
 	RefList		refs = {0};
 	MemChunk   *c;
 	bool		found;
 
 	ChunkHash(data, len, hash);
-	pin(hash);
-	if (find(hash))
+	pin(ms, hash);
+	if (find(ms, hash))
 		return false;
 	ChunkFormat->refs(data, len, add_ref, &refs);
 	for (int i = 0; i < refs.n; i++)
-		if (!find(refs.hashes + i * CHUNK_HASH_LEN))
+		if (!find(ms, refs.hashes + i * CHUNK_HASH_LEN))
 			ereport(ERROR,
 					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 					 errmsg("chunk %s references chunk %s, which the store does not have",
 							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
-	c = hash_search(chunks, hash, HASH_ENTER, &found);
-	c->data = MemoryContextAlloc(mem_cxt, Max(len, 1));
+	c = hash_search(ms->chunks, hash, HASH_ENTER, &found);
+	c->data = MemoryContextAlloc(ms->cxt, Max(len, 1));
 	memcpy(c->data, data, len);
 	c->len = len;
 	c->refs = 0;
 	c->roots = 0;
 	for (int i = 0; i < refs.n; i++)
-		find(refs.hashes + i * CHUNK_HASH_LEN)->refs++;
+		find(ms, refs.hashes + i * CHUNK_HASH_LEN)->refs++;
 	if (refs.hashes)
 		pfree(refs.hashes);
 	return true;
@@ -241,6 +303,7 @@ static uint64
 mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 			 const void *const *datas, const uint32 *lens)
 {
+	MemStore   *ms = (MemStore *) cs;
 	HASHCTL		ctl;
 	HTAB	   *pack;
 	bool	   *fresh = palloc0(Max(n, 1) * sizeof(bool));
@@ -266,9 +329,9 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
 		bool		found;
 
-		pin(h);
+		pin(ms, h);
 		(void) hash_search(pack, h, HASH_ENTER, &found);
-		fresh[i] = !found && find(h) == NULL;
+		fresh[i] = !found && find(ms, h) == NULL;
 	}
 	for (int i = 0; i < n; i++)
 	{
@@ -281,7 +344,7 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 		{
 			const uint8 *rh = refs.hashes + r * CHUNK_HASH_LEN;
 
-			if (hash_search(pack, rh, HASH_FIND, NULL) == NULL && !find(rh))
+			if (hash_search(pack, rh, HASH_FIND, NULL) == NULL && !find(ms, rh))
 				ereport(ERROR,
 						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 						 errmsg("chunk %s references chunk %s, which the store does not have",
@@ -299,8 +362,8 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 
 		if (!fresh[i])
 			continue;
-		c = hash_search(chunks, hashes + i * CHUNK_HASH_LEN, HASH_ENTER, NULL);
-		c->data = MemoryContextAlloc(mem_cxt, Max(lens[i], 1));
+		c = hash_search(ms->chunks, hashes + i * CHUNK_HASH_LEN, HASH_ENTER, NULL);
+		c->data = MemoryContextAlloc(ms->cxt, Max(lens[i], 1));
 		memcpy(c->data, datas[i], lens[i]);
 		c->len = lens[i];
 		c->refs = 0;
@@ -315,7 +378,7 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 			continue;
 		ChunkFormat->refs(datas[i], lens[i], add_ref, &refs);
 		for (int r = 0; r < refs.n; r++)
-			find(refs.hashes + r * CHUNK_HASH_LEN)->refs++;
+			find(ms, refs.hashes + r * CHUNK_HASH_LEN)->refs++;
 		if (refs.hashes)
 			pfree(refs.hashes);
 	}
@@ -324,9 +387,9 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 }
 
 static void
-mem_root(const uint8 *hash, int32 droots)
+mem_root(MemStore *ms, const uint8 *hash, int32 droots)
 {
-	MemChunk   *c = find(hash);
+	MemChunk   *c = find(ms, hash);
 	int64		roots;
 
 	if (c == NULL)
@@ -346,19 +409,20 @@ mem_root(const uint8 *hash, int32 droots)
 static void
 mem_ref_root(ChunkStore *cs, const uint8 *hash)
 {
-	mem_root(hash, 1);
+	mem_root((MemStore *) cs, hash, 1);
 }
 
 static void
 mem_unref_root(ChunkStore *cs, const uint8 *hash)
 {
-	mem_root(hash, -1);
+	mem_root((MemStore *) cs, hash, -1);
 }
 
 static bool
 mem_counts(ChunkStore *cs, const uint8 *hash, ChunkCounts *out)
 {
-	MemChunk   *c = find(hash);
+	MemStore   *ms = (MemStore *) cs;
+	MemChunk   *c = find(ms, hash);
 
 	if (c == NULL)
 		return false;
@@ -368,15 +432,16 @@ mem_counts(ChunkStore *cs, const uint8 *hash, ChunkCounts *out)
 }
 
 static bool
-unheld(const MemChunk *c)
+unheld(MemStore *ms, const MemChunk *c)
 {
 	return c->refs == 0 && c->roots == 0 &&
-		hash_search(pins, c->hash, HASH_FIND, NULL) == NULL;
+		hash_search(ms->pins, c->hash, HASH_FIND, NULL) == NULL;
 }
 
 static uint64
 mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 {
+	MemStore   *ms = (MemStore *) cs;
 	RefList		work = {0};
 	uint64		freed = 0;
 
@@ -392,15 +457,15 @@ mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 
 		work.n--;
 		memcpy(hash, work.hashes + work.n * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
-		c = find(hash);
-		if (c == NULL || !unheld(c))
+		c = find(ms, hash);
+		if (c == NULL || !unheld(ms, c))
 			continue;
 		ChunkFormat->refs(c->data, c->len, add_ref, &refs);
 
 		/* (every reference checked before any is let go of) */
 		for (int i = 0; i < refs.n; i++)
 		{
-			MemChunk   *r = find(refs.hashes + i * CHUNK_HASH_LEN);
+			MemChunk   *r = find(ms, refs.hashes + i * CHUNK_HASH_LEN);
 
 			if (r == NULL || r->refs == 0)
 				ereport(ERROR,
@@ -410,7 +475,7 @@ mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 		}
 		for (int i = 0; i < refs.n; i++)
 		{
-			MemChunk   *r = find(refs.hashes + i * CHUNK_HASH_LEN);
+			MemChunk   *r = find(ms, refs.hashes + i * CHUNK_HASH_LEN);
 
 			r->refs--;
 			add_ref(&work, r->hash);
@@ -418,7 +483,7 @@ mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 		if (refs.hashes)
 			pfree(refs.hashes);
 		pfree(c->data);
-		(void) hash_search(chunks, hash, HASH_REMOVE, NULL);
+		(void) hash_search(ms->chunks, hash, HASH_REMOVE, NULL);
 		freed++;
 	}
 	if (work.hashes)
@@ -429,14 +494,15 @@ mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 static uint64
 mem_free_unheld(ChunkStore *cs)
 {
+	MemStore   *ms = (MemStore *) cs;
 	RefList		list = {0};
 	HASH_SEQ_STATUS seq;
 	MemChunk   *c;
 	uint64		freed;
 
-	hash_seq_init(&seq, chunks);
+	hash_seq_init(&seq, ms->chunks);
 	while ((c = hash_seq_search(&seq)) != NULL)
-		if (unheld(c))
+		if (unheld(ms, c))
 			add_ref(&list, c->hash);
 	freed = mem_free(cs, list.hashes, list.n);
 	if (list.hashes)
@@ -452,6 +518,7 @@ typedef struct EdgeCount
 
 typedef struct CheckState
 {
+	MemStore   *ms;
 	HTAB	   *edges;
 	char	   *why;
 } CheckState;
@@ -460,10 +527,11 @@ static void
 count_edge(void *arg, const uint8 *hash)
 {
 	CheckState *st = arg;
+	MemStore   *ms = st->ms;
 	EdgeCount  *e;
 	bool		found;
 
-	if (st->why == NULL && find(hash) == NULL)
+	if (st->why == NULL && find(ms, hash) == NULL)
 		st->why = psprintf("chunk %s, referenced, is not in the store", hash_text(hash));
 	e = hash_search(st->edges, hash, HASH_ENTER, &found);
 	if (!found)
@@ -474,18 +542,20 @@ count_edge(void *arg, const uint8 *hash)
 static bool
 mem_check(ChunkStore *cs, uint64 *nchunks, uint64 *nunheld, char **why)
 {
+	MemStore   *ms = (MemStore *) cs;
 	HASHCTL		ctl;
 	CheckState	st = {0};
 	HASH_SEQ_STATUS seq;
 	MemChunk   *c;
 
 	*nchunks = *nunheld = 0;
+	st.ms = ms;
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = sizeof(EdgeCount);
 	ctl.hcxt = CurrentMemoryContext;
 	st.edges = hash_create("memory chunk store edges", 256, &ctl,
 						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	hash_seq_init(&seq, chunks);
+	hash_seq_init(&seq, ms->chunks);
 	while ((c = hash_seq_search(&seq)) != NULL)
 	{
 		uint8		actual[CHUNK_HASH_LEN];
@@ -498,7 +568,7 @@ mem_check(ChunkStore *cs, uint64 *nchunks, uint64 *nunheld, char **why)
 			st.why = psprintf("stored chunk %s does not match its hash", hash_text(c->hash));
 		ChunkFormat->refs(c->data, c->len, count_edge, &st);
 	}
-	hash_seq_init(&seq, chunks);
+	hash_seq_init(&seq, ms->chunks);
 	while ((c = hash_seq_search(&seq)) != NULL)
 	{
 		EdgeCount  *e = hash_search(st.edges, c->hash, HASH_FIND, NULL);
@@ -534,7 +604,8 @@ const ChunkStoreRoutine MemoryChunkStore = {
 void
 MemoryChunkStoreMiscount(const uint8 *hash)
 {
-	MemChunk   *c = chunks ? find(hash) : NULL;
+	MemStore   *ms = backend_store;
+	MemChunk   *c = ms ? find(ms, hash) : NULL;
 
 	if (c == NULL)
 		ereport(ERROR,
@@ -543,3 +614,36 @@ MemoryChunkStoreMiscount(const uint8 *hash)
 	c->refs++;
 }
 
+static MemChunk *
+must_find(ChunkStore *cs, const uint8 *hash)
+{
+	MemStore   *ms = (MemStore *) cs;
+	MemChunk   *c;
+
+	Assert(cs->routine == &MemoryChunkStore);
+	c = find(ms, hash);
+	if (c == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the store has no chunk %s", hash_text(hash))));
+	return c;
+}
+
+void
+MemoryChunkStoreDrop(ChunkStore *cs, const uint8 *hash)
+{
+	MemChunk   *c = must_find(cs, hash);
+
+	pfree(c->data);
+	(void) hash_search(((MemStore *) cs)->chunks, hash, HASH_REMOVE, NULL);
+}
+
+void
+MemoryChunkStoreDamage(ChunkStore *cs, const uint8 *hash, uint32 at)
+{
+	MemChunk   *c = must_find(cs, hash);
+
+	if (at >= c->len)
+		elog(ERROR, "chunk %s has no byte %u", hash_text(hash), at);
+	c->data[at] ^= 1;
+}

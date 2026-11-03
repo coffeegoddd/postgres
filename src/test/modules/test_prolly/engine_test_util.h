@@ -111,6 +111,71 @@ engine_test_run(void (*body) (void), const char *store)
 	static void \
 	name##_body(void)
 
+/*
+ * A unit test whose body runs on the memory store alone: one that ends its
+ * holds, or damages its store, by the memory store's hooks for tests.
+ */
+#define ENGINE_MEMORY_TEST(name) \
+	static void name##_body(void); \
+	static void \
+	name(void) \
+	{ \
+		engine_test_run(name##_body, "memory"); \
+	} \
+	static void \
+	name##_body(void)
+
+/*
+ * body(arg) raises an error of code code, its message naming the chunk h
+ * unless h is NULL; in a subtransaction, rolled back after it.
+ */
+static inline void
+expect_error(void (*body) (void *), void *arg, int code, const PHash *h)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *edata = NULL;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		body(arg);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (edata == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg_internal("CHECK failed: no error raised")));
+	if (edata->sqlerrcode != code)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg_internal("CHECK failed: error \"%s\", of code %s, not %s",
+								 edata->message, unpack_sql_state(edata->sqlerrcode),
+								 unpack_sql_state(code))));
+	if (h)
+	{
+		char		hex[PHASH_HEX_LEN + 1];
+
+		phash_hex(h, hex);
+		if (strstr(edata->message, hex) == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg_internal("CHECK failed: error \"%s\" names no chunk %s",
+									 edata->message, hex)));
+	}
+	FreeErrorData(edata);
+}
+
 /* (the bytes of every chunk the store has) */
 static void
 add_len(void *arg, const uint8 *hash, uint32 len, const ChunkCounts *counts)

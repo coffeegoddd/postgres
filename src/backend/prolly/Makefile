@@ -25,6 +25,7 @@ OBJS = \
 	chunk_log.o \
 	chunk_memstore.o \
 	chunk_pin.o \
+	chunk_copy.o \
 	chunk_dump.o \
 	chunk_pointers.o \
 	chunk_push.o \
