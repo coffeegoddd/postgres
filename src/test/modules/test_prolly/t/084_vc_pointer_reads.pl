@@ -57,6 +57,13 @@ is( $node->safe_psql(
 	't|0|t',
 	'a listing reads its prefix\'s rows alone');
 
+# an empty prefix lists them all
+is( $node->safe_psql(
+		'postgres',
+		q{SELECT test_vc_refs_count('') = count(*) FROM pg_history.pointers}),
+	't',
+	'an empty prefix lists every reference');
+
 # the setting is the session's again after a call, and after a listing's error
 # caught as it runs
 is( $node->safe_psql(
