@@ -446,7 +446,14 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  * and reports no segment: it locks every branch, then the repository's
  * state, so commits wait for it, and moves heads and merge heads to the
  * new hashes.  The hook (this backend's) hears each commit replaced, so
- * whatever names commits outside the repository can follow.
+ * whatever names commits outside the repository can follow; it hears them
+ * as the sever writes them, before its transaction commits, so a sever
+ * that then aborts has moved none of them.  A commit pinned by hash
+ * (VcWindow.pinned) with cut history beneath it is replaced as any: the
+ * hook names its new hash, which a later sever's pin must name.  Changing
+ * the branches or the mode while a rewriting sever waits for the
+ * repository's state refuses it (a serialization failure), to be run
+ * again.
  */
 extern void vc_set_history_mode(VcRepo *r, VcHistoryMode mode);
 extern VcHistoryMode vc_history_mode(VcRepo *r);
@@ -466,8 +473,8 @@ extern void vc_set_rewrite_hook(VcRepo *r, VcRewriteFn fn, void *arg);
  * A transfer locks the receiver's state for update (it may record
  * boundaries), so it takes turns with window operations there, never with
  * commits; like them it needs a READ COMMITTED transaction, which reads
- * what committed while it waited.  Every call locks branches before the repository's state, so
- * calls do not deadlock on the two.
+ * what committed while it waited.  Every call locks branches before the
+ * repository's state, so calls do not deadlock on the two.
  *
  * Fetch, push and pull require the histories to attach: walking back from
  * the heads must reach a commit the receiver knows (a discarded one too:

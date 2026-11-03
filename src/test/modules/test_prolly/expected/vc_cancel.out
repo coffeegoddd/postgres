@@ -1,7 +1,9 @@
 -- Version control's long operations cancelled partway, on the history
--- store (as each reads its second chunk): each stops at its next check for
--- interrupts, and leaves nothing behind (the repository as it was, no
--- lock); then, not cancelled, each runs to its end.
+-- store: each op's chunk reads counted in a run rolled back, it is
+-- cancelled, in a savepoint, as it reads its last, after it has written
+-- (the next check for interrupts ends it); rolled back to the savepoint,
+-- the repository is as it was, and no lock of it is left.  Then, not
+-- cancelled, each runs to its end.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SELECT test_vc_open();
@@ -53,37 +55,64 @@ CREATE FUNCTION repo_same() RETURNS bool LANGUAGE sql AS $$
 		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/%') = refs
 	FROM repo_was
 $$;
--- (the locks a statement of this backend holds, but for its own)
+-- (locks this backend holds, but on relations, its virtual xid, and its
+-- transaction's own xid: a row's, an object's, a subtransaction's)
 CREATE FUNCTION locks_left() RETURNS int8 LANGUAGE sql AS $$
 	SELECT count(*) FROM pg_locks
-	WHERE pid = pg_backend_pid() AND locktype NOT IN ('virtualxid', 'relation')
+	WHERE pid = pg_backend_pid() AND locktype NOT IN ('virtualxid', 'relation') AND
+		NOT (locktype = 'transactionid' AND
+			 transactionid::text = pg_current_xact_id_if_assigned()::text)
 $$;
-SELECT test_vc_cancel('diff', 2);
+-- the diff, which writes nothing: cancelled mid-walk (at its last read
+-- it has no check for interrupts left to make)
+BEGIN;
+SELECT test_vc_cancel('diff', 0) AS reads \gset
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT test_vc_cancel('diff', :reads - 1);
 ERROR:  canceling statement due to user request
+ROLLBACK TO s;
 SELECT repo_same(), locks_left();
  repo_same | locks_left 
 -----------+------------
  t         |          0
 (1 row)
 
-SELECT test_vc_cancel('merge', 2);
+COMMIT;
+-- the merge: cancelled as it reads its last chunk, having written
+BEGIN;
+SELECT test_vc_cancel('merge', 0) AS reads \gset
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT test_vc_cancel('merge', :reads);
 ERROR:  canceling statement due to user request
-CONTEXT:  SQL statement "SELECT hash FROM pg_history.pointers WHERE name = $1 FOR SHARE"
-SELECT repo_same(), locks_left();
- repo_same | locks_left 
------------+------------
- t         |          0
+ROLLBACK TO s;
+SELECT test_vc_cancel_writes() > 0 AS had_written, repo_same(), locks_left();
+ had_written | repo_same | locks_left 
+-------------+-----------+------------
+ t           | t         |          0
 (1 row)
 
-SELECT test_vc_cancel('sever', 2);
+COMMIT;
+-- the sever, keeping its history
+BEGIN;
+SELECT test_vc_cancel('sever', 0) AS reads \gset
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT test_vc_cancel('sever', :reads);
 ERROR:  canceling statement due to user request
-CONTEXT:  SQL statement "SELECT name, hash FROM pg_history.pointers WHERE name >= $1 AND ($2 IS NULL OR name < $2) ORDER BY name"
-SELECT repo_same(), locks_left();
- repo_same | locks_left 
------------+------------
- t         |          0
+ROLLBACK TO s;
+SELECT test_vc_cancel_writes() > 0 AS had_written, repo_same(), locks_left();
+ had_written | repo_same | locks_left 
+-------------+-----------+------------
+ t           | t         |          0
 (1 row)
 
+COMMIT;
+-- the sever, rewriting it
 SELECT test_vc_rewrite(true);
  test_vc_rewrite 
 -----------------
@@ -94,15 +123,21 @@ DELETE FROM repo_was;
 INSERT INTO repo_was
 	SELECT test_vc_log('main'), test_vc_log('b'),
 		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/%');
-SELECT test_vc_cancel('sever', 2);
+BEGIN;
+SELECT test_vc_cancel('sever', 0) AS reads \gset
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+SELECT test_vc_cancel('sever', :reads);
 ERROR:  canceling statement due to user request
-CONTEXT:  SQL statement "SELECT hash FROM pg_history.pointers WHERE name = $1 FOR UPDATE"
-SELECT repo_same(), locks_left();
- repo_same | locks_left 
------------+------------
- t         |          0
+ROLLBACK TO s;
+SELECT test_vc_cancel_writes() > 0 AS had_written, repo_same(), locks_left();
+ had_written | repo_same | locks_left 
+-------------+-----------+------------
+ t           | t         |          0
 (1 row)
 
+COMMIT;
 -- and each runs to its end, nothing of the cancelled ones in its way
 SELECT test_vc_rewrite(false);
  test_vc_rewrite 
@@ -110,16 +145,16 @@ SELECT test_vc_rewrite(false);
  t
 (1 row)
 
-SELECT test_vc_cancel('diff', 1000000);
- test_vc_cancel 
-----------------
- finished
+SELECT test_vc_cancel('diff', 0) > 0 AS diffed;
+ diffed 
+--------
+ t
 (1 row)
 
-SELECT test_vc_cancel('merge', 1000000);
- test_vc_cancel 
-----------------
- finished
+SELECT test_vc_cancel('merge', 0) > 0 AS merged;
+ merged 
+--------
+ t
 (1 row)
 
 SELECT test_vc_log('main');
@@ -128,10 +163,10 @@ SELECT test_vc_log('main');
  merge c5 c4 c3 c2 c1 base init
 (1 row)
 
-SELECT test_vc_cancel('sever', 1000000);
- test_vc_cancel 
-----------------
- finished
+SELECT test_vc_cancel('sever', 0) > 0 AS severed;
+ severed 
+---------
+ t
 (1 row)
 
 SELECT test_vc_head_in_window('main') AS kept,
@@ -139,6 +174,29 @@ SELECT test_vc_head_in_window('main') AS kept,
  kept | segments 
 ------+----------
  t    |        1
+(1 row)
+
+-- transfers lock the receiver's state and read what committed while they
+-- waited: a READ COMMITTED transaction's, refused in one with a snapshot
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT test_vc_transfer('push');
+ERROR:  a push needs a READ COMMITTED transaction
+DETAIL:  It reads the branches after it locks the repository, which a snapshot taken before the lock would not show.
+ROLLBACK;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT test_vc_transfer('fetch');
+ERROR:  a transfer needs a READ COMMITTED transaction
+DETAIL:  It reads the branches after it locks the repository, which a snapshot taken before the lock would not show.
+ROLLBACK;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT test_vc_transfer('deepen');
+ERROR:  a deepening needs a READ COMMITTED transaction
+DETAIL:  It reads the branches after it locks the repository, which a snapshot taken before the lock would not show.
+ROLLBACK;
+SELECT test_vc_transfer('push') AS push, test_vc_transfer('fetch') AS fetch;
+ push | fetch 
+------+-------
+    0 |     0
 (1 row)
 
 SELECT test_vc_clear() > 0 AS cleared;

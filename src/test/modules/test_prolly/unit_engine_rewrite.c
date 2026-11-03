@@ -509,6 +509,45 @@ ENGINE_MEMORY_TEST(test_merge_head_follows)
 }
 
 /*
+ * A pinned commit with cut history beneath it is replaced as any: the hook
+ * names its new hash, which a later sever's pin names to keep it; the old
+ * hash, gone, pins nothing.
+ */
+ENGINE_MEMORY_TEST(test_pinned_follows_the_hook)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	Moves		m;
+	Linear		l;
+	uint32		seg;
+	PHash		b2;
+	VcWindow	w = {.depth = 1,.npinned = 1};
+
+	rewriting(&r, cs, &m);
+	l = build_linear(&r);
+	w.pinned = &l.b;
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
+	b2 = moved(&m, &l.b);
+	CHECK(!phash_eq(&b2, &l.b));
+	CHECK(vc_in_window(&r, &b2));
+	CHECK(!vc_in_window(&r, &l.b));
+	m.n = 0;
+	commit_rows(&r, 0, 10, 50, "E");
+	w.pinned = &b2;
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
+	CHECK(vc_in_window(&r, &b2));	/* a root: nothing beneath it to cut */
+	CHECK_EQ(window_size(&r), 2);
+	/* the old hash, gone, pins nothing: B's commit is cut with it unnamed */
+	w.pinned = &l.b;
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
+	CHECK(!vc_in_window(&r, &b2));
+	CHECK_EQ(window_size(&r), 1);
+	settle_and_check(cs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
  * What the window measures from a head is unchanged by a rewrite: change
  * bytes and generations after each commit, and its time.
  */
@@ -703,6 +742,7 @@ static const ProllyUnitTest tests[] = {
 	{"nothing_cut_nothing_moves", test_nothing_cut_nothing_moves},
 	{"merge_head_follows", test_merge_head_follows},
 	{"measures_stay", test_measures_stay},
+	{"pinned_follows_the_hook", test_pinned_follows_the_hook},
 	{"mode_is_the_repository", test_mode_is_the_repository},
 	{"no_remotes", test_no_remotes},
 	{"low_marks", test_low_marks},

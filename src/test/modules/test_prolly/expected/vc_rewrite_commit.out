@@ -1,4 +1,4 @@
-Parsed test spec with 3 sessions
+Parsed test spec with 4 sessions
 
 starting permutation: s2_begin s2_main s1_sever s2_commit c_repo
 test_vc_rewrite
@@ -66,6 +66,78 @@ step c_repo:
 main|b       |has_c2|commits
 ----+--------+------+-------
 c1  |b2 b1 c1|f     |      3
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s3_keep s3_begin s3_rewrite s1_sever s3_commit c_repo
+test_vc_rewrite
+---------------
+t              
+(1 row)
+
+step s3_keep: SELECT test_vc_rewrite(false);
+test_vc_rewrite
+---------------
+t              
+(1 row)
+
+step s3_begin: BEGIN;
+step s3_rewrite: SELECT test_vc_rewrite(true);
+test_vc_rewrite
+---------------
+t              
+(1 row)
+
+step s1_sever: SELECT test_vc_sever(1) AS cut; <waiting ...>
+step s3_commit: COMMIT;
+step s1_sever: <... completed>
+ERROR:  could not sever: the branches or the history mode changed while it waited
+step c_repo: 
+	SELECT test_vc_log('main') AS main, test_vc_log('b') AS b,
+		test_vc_working_has('main', 'c2') AS has_c2,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+main        |b              |has_c2|commits
+------------+---------------+------+-------
+c1 base init|b1 c1 base init|f     |      4
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s3_begin s3_branch s1_sever s3_commit c_repo
+test_vc_rewrite
+---------------
+t              
+(1 row)
+
+step s3_begin: BEGIN;
+step s3_branch: SELECT test_vc_branch('c', 'main');
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_sever: SELECT test_vc_sever(1) AS cut; <waiting ...>
+step s3_commit: COMMIT;
+step s1_sever: <... completed>
+ERROR:  could not sever: the branches or the history mode changed while it waited
+step c_repo: 
+	SELECT test_vc_log('main') AS main, test_vc_log('b') AS b,
+		test_vc_working_has('main', 'c2') AS has_c2,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+main        |b              |has_c2|commits
+------------+---------------+------+-------
+c1 base init|b1 c1 base init|f     |      4
 (1 row)
 
 cleared

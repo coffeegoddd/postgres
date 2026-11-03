@@ -139,10 +139,11 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_rewrite  | nothing_cut_nothing_moves            | ok     | 
  engine_rewrite  | merge_head_follows                   | ok     | 
  engine_rewrite  | measures_stay                        | ok     | 
+ engine_rewrite  | pinned_follows_the_hook              | ok     | 
  engine_rewrite  | mode_is_the_repository               | ok     | 
  engine_rewrite  | no_remotes                           | ok     | 
  engine_rewrite  | low_marks                            | ok     | 
-(130 rows)
+(131 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

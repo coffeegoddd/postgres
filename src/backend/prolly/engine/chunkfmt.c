@@ -288,7 +288,7 @@ repo_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 	if (!read_hash(&p, end, &h))
 		return false;
 	fn(arg, &h, true);
-	/* (the next segment's id, the generation forgotten, the mode, the name, the hints) */
+	/* (the next segment's id, the generation forgotten, the mode, the name) */
 	if (!read_uvarint(&p, end, &v) || !read_uvarint(&p, end, &v) ||
 		!read_uvarint(&p, end, &v) || !read_uvarint(&p, end, &v) ||
 		v > (uint64) (end - p))

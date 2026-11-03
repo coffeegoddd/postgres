@@ -45,6 +45,8 @@ PG_FUNCTION_INFO_V1(test_vc_branch_at);
 PG_FUNCTION_INFO_V1(test_vc_merge);
 PG_FUNCTION_INFO_V1(test_vc_rewrite);
 PG_FUNCTION_INFO_V1(test_vc_cancel);
+PG_FUNCTION_INFO_V1(test_vc_cancel_writes);
+PG_FUNCTION_INFO_V1(test_vc_transfer);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -567,20 +569,25 @@ count_change_fn(void *arg, const VcTableChange *c)
 }
 
 /*
- * The history store's reads, counted: the statement cancelled as the
- * cancel_after'th chunk is read, so the next check for interrupts, deep in
- * the operation reading it, ends it.
+ * The history store's reads and writes, counted: the statement cancelled
+ * as the cancel_after'th chunk is read, so the next check for interrupts,
+ * deep in the operation reading it, ends it.
  */
 static const ChunkStoreRoutine *counted_inner;
 static ChunkStoreRoutine counted_routine;
-static int	cancel_after;
+static int64 cancel_after;
+static int64 reads;
+static int64 writes;
+static int64 writes_at_cancel = -1;
 
 static void
 count_read(int n)
 {
-	if (cancel_after > 0 && (cancel_after -= n) <= 0)
+	reads += n;
+	if (cancel_after > 0 && reads >= cancel_after)
 	{
 		cancel_after = 0;
+		writes_at_cancel = writes;
 		QueryCancelPending = true;
 		InterruptPending = true;
 	}
@@ -600,19 +607,37 @@ counted_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out, uint32 
 	counted_inner->get_many(cs, hashes, n, out, lens);
 }
 
+static bool
+counted_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
+{
+	writes++;
+	return counted_inner->put(cs, data, len, hash);
+}
+
+static uint64
+counted_put_many(ChunkStore *cs, int n, const uint8 *hashes, const void *const *datas,
+				 const uint32 *lens)
+{
+	writes += n;
+	return counted_inner->put_many(cs, n, hashes, datas, lens);
+}
+
 /*
- * test_vc_cancel(op text, after int4) returns text: op ('diff' of main and
- * b, 'merge' of b into main, 'sever' to a window of 1), its statement
- * cancelled as it reads its after'th chunk: an error at the next check for
- * interrupts; 'finished' if it ran to its end first
+ * test_vc_cancel(op text, after int8) returns int8: op ('diff' of main
+ * and b, 'merge' of b into main, 'sever' to a window of 1) run, its
+ * statement cancelled as it reads its after'th chunk (0: never), an error
+ * at the next check for interrupts; how many chunks it read, if it ran to
+ * its end first
  */
 Datum
 test_vc_cancel(PG_FUNCTION_ARGS)
 {
 	char	   *op = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	int32		after = PG_GETARG_INT32(1);
+	int64		after = PG_GETARG_INT64(1);
 	VcRepo		r;
 
+	reads = writes = 0;
+	writes_at_cancel = -1;
 	VC_CALL(r, 0,
 	{
 		VcBranch	main,
@@ -625,8 +650,11 @@ test_vc_cancel(PG_FUNCTION_ARGS)
 		counted_inner = cs->routine;
 		counted_routine = *cs->routine;
 		counted_routine.get = counted_get;
+		counted_routine.put = counted_put;
 		if (counted_inner->get_many)
 			counted_routine.get_many = counted_get_many;
+		if (counted_inner->put_many)
+			counted_routine.put_many = counted_put_many;
 		cancel_after = after;
 		cs->routine = &counted_routine;
 		PG_TRY(2);
@@ -666,5 +694,50 @@ test_vc_cancel(PG_FUNCTION_ARGS)
 		vc_branch_free(&main);
 		vc_branch_free(&b);
 	});
-	PG_RETURN_TEXT_P(cstring_to_text("finished"));
+	PG_RETURN_INT64(reads);
+}
+
+/*
+ * test_vc_cancel_writes() returns int8: how many chunks the last
+ * test_vc_cancel had written when its cancel was armed (-1: never armed)
+ */
+Datum
+test_vc_cancel_writes(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(writes_at_cancel);
+}
+
+/*
+ * test_vc_transfer(op text) returns int4: op ('push', 'fetch' or 'deepen')
+ * between the repository and itself, its code (a transfer's isolation is
+ * checked before anything is done)
+ */
+Datum
+test_vc_transfer(PG_FUNCTION_ARGS)
+{
+	char	   *op = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	VcRepo		r;
+	int			rc = VC_OK;
+
+	VC_CALL(r, 0,
+	{
+		PHash		h;
+		uint32		seg;
+		VcSource	self = {"self", r.ctx.cs};
+		VcBranch	b;
+
+		if (strcmp(op, "push") == 0)
+			rc = vc_push(&r, &r, "main");
+		else if (strcmp(op, "fetch") == 0)
+			rc = vc_fetch(&r, &r, "main", &h);
+		else if (strcmp(op, "deepen") == 0)
+		{
+			vc_head(&r, &b);
+			rc = vc_deepen(&r, &self, &b.head, 0, &seg);
+			vc_branch_free(&b);
+		}
+		else
+			elog(ERROR, "no op \"%s\"", op);
+	});
+	PG_RETURN_INT32(rc);
 }

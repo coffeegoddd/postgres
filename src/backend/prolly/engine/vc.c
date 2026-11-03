@@ -2215,6 +2215,28 @@ lock_branches(VcRepo *r, Locked *done)
 		px_free(all.names);
 }
 
+/* Whether every branch there is was locked by lock_branches into l. */
+static bool
+all_locked(VcRepo *r, Locked *l)
+{
+	Locked		all = {0};
+	bool		ok = true;
+
+	vc_refs_list(r->refs, BRANCH_REF_PREFIX, locked_name_fn, &all);
+	for (size_t i = 0; i < all.n; i++)
+	{
+		bool		had = false;
+
+		for (size_t j = 0; j < l->n && !had; j++)
+			had = strcmp(l->names[j], all.names[i]) == 0;
+		ok = ok && had;
+		pfree(all.names[i]);
+	}
+	if (all.names)
+		px_free(all.names);
+	return ok;
+}
+
 static void
 locked_free(Locked *l)
 {
@@ -2277,8 +2299,10 @@ moved_branch_fn(void *arg, const VcBranch *b)
 }
 
 /*
- * REWRITE mode: the cut commits are let go at once, and every kept commit
- * with cut history beneath it is written again, oldest first: cut parents
+ * REWRITE mode: the cut commits are let go at once, and every commit the
+ * window keeps with cut history beneath it is written again, oldest first
+ * (one outside the window not cut yet, as max_cut leaves some, is left as
+ * it is, for a sever after to cut, not written again meanwhile): cut parents
  * dropped, rewritten ones replaced.  Its root value, time and message stay;
  * its generation and change bytes are recounted from its new parents, its
  * own change bytes kept, so measures from a head stay as they were.  A kept
@@ -2286,7 +2310,7 @@ moved_branch_fn(void *arg, const VcBranch *b)
  * move to the new hashes (every branch locked); the hook hears each one.
  */
 static void
-rewrite_history(VcRepo *r, const PHash *cut, size_t ncut)
+rewrite_history(VcRepo *r, const PHash *cut, size_t ncut, PHashMap *win)
 {
 	PHashMap	cutset,
 				idx;
@@ -2305,7 +2329,7 @@ rewrite_history(VcRepo *r, const PHash *cut, size_t ncut)
 	for (size_t i = 0; i < held.n; i++)
 	{
 		CHECK_FOR_INTERRUPTS();
-		if (!phmap_find(&cutset, &held.v[i]))
+		if (phmap_find(win, &held.v[i]))
 			k[nk++].c = must_load_commit(&r->ctx, &held.v[i]);
 	}
 	if (held.v)
@@ -2432,8 +2456,9 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 	/*
 	 * A rewriting sever moves heads: every branch locked first (as every
 	 * call locks branches before the repository's state), so no commit is
-	 * in flight on any.  Branches made, or the mode set, between that and
-	 * the state's lock are locked after it.
+	 * in flight on any.  A branch made, or the mode set, between that and
+	 * the state's lock would be locked after the state, against that
+	 * order: the sever is refused instead, to be run again.
 	 */
 	{
 		RepoState	pre;
@@ -2449,9 +2474,12 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 	 * commit it did not write holds this for share, so none is in flight)
 	 */
 	repo_read(r, VC_REF_UPDATE, &st);
-	if (st.history == VC_HISTORY_REWRITE)
-		lock_branches(r, &locked);
-	else if (st.next_seg >= VC_NO_SEGMENT)
+	if (st.history == VC_HISTORY_REWRITE && !all_locked(r, &locked))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not sever: the branches or the history mode changed while it waited"),
+				 errhint("Sever again.")));
+	else if (st.history == VC_HISTORY_KEEP && st.next_seg >= VC_NO_SEGMENT)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("the repository has made its last segment")));
@@ -2495,18 +2523,19 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 		seg.commits[seg.n++] = held.v[i];
 	}
 	px_free(held.v);
-	phmap_free(&win);
-	if (seg.n == 0)
+	if (seg.n > 0 && st.history == VC_HISTORY_REWRITE)
 	{
+		/* (no segment: the history in no state, nothing records it) */
+		rewrite_history(r, seg.commits, seg.n, &win);
+		px_free(seg.commits);
+		phmap_free(&win);
 		locked_free(&locked);
 		repo_state_free(&st);
 		return VC_OK;
 	}
-	if (st.history == VC_HISTORY_REWRITE)
+	phmap_free(&win);
+	if (seg.n == 0)
 	{
-		/* (no segment: the history in no state, nothing records it) */
-		rewrite_history(r, seg.commits, seg.n);
-		px_free(seg.commits);
 		locked_free(&locked);
 		repo_state_free(&st);
 		return VC_OK;
@@ -3549,6 +3578,9 @@ vc_fetch(VcRepo *local, VcRepo *remote, const char *branch, PHash *head)
 	VcBranch	rb;
 	int			rc;
 
+	if (vc_history_mode(local) == VC_HISTORY_REWRITE ||
+		vc_history_mode(remote) == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
 	if (!branch_read(remote, branch, VC_REF_READ, &rb))
 		return VC_ERR;
 	rc = transfer(remote, local, &rb.head, 1, 0, false);
@@ -3781,6 +3813,10 @@ vc_pull(VcRepo *local, VcRepo *remote, const char *branch, uint32 max_deepen,
 	int			rc;
 
 	memset(res, 0, sizeof(*res));
+	/* (refused first, as push: before any branch is locked) */
+	if (vc_history_mode(local) == VC_HISTORY_REWRITE ||
+		vc_history_mode(remote) == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
 	repo_read(remote, VC_REF_READ, &rst);
 	if (rst.name[0] == '\0')
 	{
