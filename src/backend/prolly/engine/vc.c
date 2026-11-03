@@ -293,6 +293,8 @@ merge_table(ProllyCtx *ctx, const ProllyDiff *o, const ProllyDiff *t,
 	}
 
 	vc_must(ctx, prolly_empty(ctx, 0, &empty));
+	/* (the nodes it reads again kept parsed: an operation's work_mem of them) */
+	ctx->memo_bytes = (size_t) work_mem * 1024;
 	vc_must(ctx, prolly_merge(ctx, has_base ? &base.data : &empty, &ours.data,
 							  &theirs.data, &mr));
 	for (size_t i = 0; i < mr.nconflicts; i++)
