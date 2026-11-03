@@ -22,6 +22,7 @@ OBJS = \
 	branch_filter.o \
 	chunk_freer.o \
 	chunk_index.o \
+	chunk_lane.o \
 	chunk_log.o \
 	chunk_memstore.o \
 	chunk_pin.o \

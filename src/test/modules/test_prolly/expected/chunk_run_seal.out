@@ -1,11 +1,35 @@
 Parsed test spec with 2 sessions
 
-starting permutation: b_vacuum b_free a_begin a_put b_put a_commit b_free b_put_more b_free
+starting permutation: b_load b_unheld b_vacuum b_free a_begin a_put b_put a_commit b_free b_put_more b_free
+step b_load: 
+	SELECT count(*) FILTER (WHERE test_chunk_put('rl', 'ri', rs_h(rs_big('a' || g, 20000)),
+		rs_big('a' || g, 20000))) FROM generate_series(1, 30) g;
+	SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('anchor', 20000)), rs_big('anchor', 20000));
+	SELECT test_chunk_ref_root('ri', rs_h(rs_big('anchor', 20000)));
+	-- (b's region let go of: its next put takes a segment freed)
+	SELECT test_chunk_log_let_go('rl');
+
+count
+-----
+   30
+(1 row)
+
+test_chunk_put
+--------------
+t             
+(1 row)
+
 test_chunk_ref_root
 -------------------
 (0,1)              
 (1 row)
 
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
+step b_unheld: SELECT test_chunk_free_unheld('rl', 'ri');
 test_chunk_free_unheld
 ----------------------
                     30
@@ -36,10 +60,10 @@ f
 step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
 free_pages
 ----------
-         9
+        41
 (1 row)
 
-step b_put_more: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 330000)), rs_big('z', 330000)) AS put;
+step b_put_more: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 700000)), rs_big('z', 700000)) AS put;
 put
 ---
 t  
@@ -48,6 +72,11 @@ t
 step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
 free_pages
 ----------
-        41
+        73
+(1 row)
+
+lanes_left
+----------
+         0
 (1 row)
 

@@ -50,7 +50,10 @@ my $standby = PostgreSQL::Test::Cluster->new('entries_first_standby');
 $standby->init_from_backup($primary, 'base', has_streaming => 1);
 $standby->start;
 
-my $size = q{SELECT pg_relation_size('pg_history.chunks')};
+# (the log's lanes all: a backend's puts are in its own)
+my $size = q{SELECT sum(pg_relation_size(c.oid)) FROM pg_class c
+	WHERE c.relnamespace = 'pg_history'::regnamespace
+		AND (c.relname = 'chunks' OR c.relname LIKE 'chunks\_lane\_%')};
 my $audit = q{SELECT ok FROM test_chunk_check('pg_history.chunks', 'pg_history.chunk_index')};
 
 # live chunks, to hold the log's beginning
@@ -86,10 +89,17 @@ is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 # bytes in pages sealed, which their entry, aborted, counts dead again)
 my $r = $primary->background_psql('postgres', on_error_stop => 0);
 $r->query_safe(q{SELECT injection_points_set_local()});
+# (the region not at its lane's end, which would go on into pages new, but
+# let go of for the next: a segment freed in the backend's own lane, a
+# region past it, the next put's in the segment freed)
+$r->query_safe(q{SELECT (test_cs_put('pages', blob(1500))).stored});
+$r->query_safe(q{SELECT test_chunk_log_let_go('pg_history.chunks')});
+$r->query_safe(q{SELECT (test_cs_put('pages', blob(1599))).stored});
+$primary->safe_psql('postgres', q{SELECT test_cs_free('pages', ARRAY[h(blob(1500))])});
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+$r->query_safe(q{SELECT test_chunk_log_let_go('pg_history.chunks')});
 $r->query_safe(q{SELECT (test_cs_put('pages', blob(1501))).stored});
-# (another's region after it: the region not at the log's end, which would
-# go on into pages new, but let go of for the next)
-$primary->safe_psql('postgres', q{SELECT (test_cs_put('pages', blob(1599))).stored});
 $r->query_safe(q{SELECT injection_points_attach('chunk-log-region-sealed', 'error')});
 $r->query(q{SELECT test_cs_put('pages', huge(1502))});
 like($r->{stderr}, qr/error triggered for injection point chunk-log-region-sealed/,
@@ -102,22 +112,18 @@ $r->quit;
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
-# 2. a tail cut between VACUUM's finding a put running and its entry's end
-# (the put's bytes on pages new at the log's end, past them another put's,
-# rolled back, so that the cut takes the pages)
+# 2. VACUUM's pass, its cut stopped, finding a put running whose entry is in
+# and whose bytes are not written: cancelled, its entry aborted.  The put's
+# bytes are reserved past its lane's end, on pages not made, and only its
+# backend makes its lane's pages: no other's put can make pages past them
+# (on one log, as before lanes, another's could, and the cut take them),
+# so the cut finds nothing of that lane's to take.
 my $p = $primary->background_psql('postgres', on_error_stop => 0);
 $p->query_safe(q{SELECT injection_points_set_local()});
 $p->query_safe(q{SELECT injection_points_attach('chunk-put-entered', 'wait')});
 $p->query_safe(q{SET application_name = 'entered'});
 $p->query_until(qr/putting/, "\\echo putting\nSELECT test_cs_put('pages', huge(2001));\n");
 $primary->wait_for_event('client backend', 'chunk-put-entered');
-# (another put, past the first's region, rolled back: the log's file made as
-# far as that, the first's pages in it never written, then all of it dead)
-$primary->safe_psql('postgres', q{
-	BEGIN;
-	SELECT test_cs_put('pages', huge(2002));
-	ROLLBACK;
-});
 my $v = $primary->background_psql('postgres');
 $v->query_safe(q{SELECT injection_points_set_local()});
 $v->query_safe(q{SELECT injection_points_attach('chunk-index-vacuum-cut', 'wait')});
@@ -139,16 +145,17 @@ $primary->safe_psql('postgres', q{
 $v->query_safe('SELECT 1');
 $v->quit;
 my $after_cut = $primary->safe_psql('postgres', $size);
-cmp_ok($after_cut, '<', $before_cut, 'VACUUM cut the tail, the aborted put\'s pages with it');
-# (puts after the cut, past a region of them, in pages made again where the
-# aborted put's were: each longer than a region, never into pages freed)
+is($after_cut, $before_cut, 'VACUUM cut nothing: the put\'s bytes past its lane\'s end, no pages made for them');
+# (puts after, each longer than a region, never into pages freed: the next
+# VACUUM, taking the aborted entry out, counts its bytes, on pages never
+# made, dead without making them)
 $primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE (test_cs_put('pages', huge(i))).stored) FROM generate_series(4001, 4004) i;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE test_cs_get('pages', h(huge(i))) = huge(i)) FROM generate_series(4001, 4004) i}),
-	'4', 'the next VACUUM, taking the aborted entry out, counts nothing of its pages cut: those made again are the puts\' after');
+	'4', 'the next VACUUM takes the aborted entry out, the puts after read back');
 is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
 # 3. puts after the cut, freed, and the tail cut again; then the chunks put

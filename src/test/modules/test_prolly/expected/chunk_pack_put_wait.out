@@ -251,7 +251,7 @@ step b_dead:
 
 more_dead
 ---------
-        6
+        3
 (1 row)
 
 step b_has: 

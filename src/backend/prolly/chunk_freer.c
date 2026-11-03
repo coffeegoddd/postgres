@@ -495,7 +495,7 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 		if (log != NULL && idx != NULL && RelationIsAnyChunkLog(log) &&
 			RelationIsChunkIndex(idx))
 		{
-			BlockNumber nblocks = RelationGetNumberOfBlocks(log);
+			BlockNumber nblocks;
 			uint64		starts[COMPACT_SEGMENTS];
 			uint64		ends[COMPACT_SEGMENTS];
 			int			n;
@@ -552,6 +552,8 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 					 * (compacting, the log grown by no more than it may;
 					 * evacuating, into room below the end alone, never new)
 					 */
+					/* (what compaction appends to: this backend's part of the log) */
+					nblocks = op == FREER_BEGIN_COMPACT ? ChunkLogOf(log)->write_blocks(log) : 0;
 					fs->limit = op == FREER_BEGIN_COMPACT ? nblocks + args->grow : 0;
 					fs->below = op == FREER_BEGIN_EVACUATE && n > 0 ? starts[0] : 0;
 					break;

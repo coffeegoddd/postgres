@@ -4,7 +4,9 @@
 # pass meanwhile, takes none of the pages with bytes reserved and not yet
 # written for a region let go of (it would seal them, and the pack's write
 # then find them full).  The pack stops, by an injection point of its
-# session alone, as its region grows the second time.
+# session alone, as its region grows the second time.  A log's free space
+# is its lanes' (prolly/chunk_lane.h): the segments freed are the pack's
+# backend's own lane's, written and freed by it.
 
 setup
 {
@@ -14,15 +16,6 @@ setup
 		AS $$SELECT convert_to(rpad('pe' || i, 2000, '.'), 'UTF8')$$;
 	CREATE OR REPLACE FUNCTION pe_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
-	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', pe_d(i));
-	SELECT stored FROM test_cs_put('pages', pe_d(5000));
-	SELECT test_cs_ref_root('pages', pe_h(pe_d(5000)));
-}
-
-# (freed in a transaction of its own: one's own puts are held by it)
-setup
-{
-	SELECT test_cs_free('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(1, 400) i));
 }
 
 teardown
@@ -35,6 +28,17 @@ session p
 setup		{
 	SET chunk_free_in_background = off;
 	SELECT injection_points_set_local();
+}
+step p_load		{
+	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', pe_d(i));
+	SELECT stored FROM test_cs_put('pages', pe_d(5000));
+	SELECT test_cs_ref_root('pages', pe_h(pe_d(5000)));
+	-- (its region let go of: the pack's takes a segment freed)
+	SELECT test_chunk_log_let_go('pg_history.chunks');
+}
+# (freed in a transaction of its own: one's own puts are held by it)
+step p_free		{
+	SELECT test_cs_free('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(1, 400) i));
 }
 step p_attach	{ SELECT injection_points_attach('chunk-log-extended', 'wait'); }
 step p_pack		{
@@ -56,4 +60,4 @@ step o_wake		{ SELECT injection_points_wakeup('chunk-log-extended'); }
 
 # the pages freed made free (VACUUM), the pack stopped as its region grows
 # the first time and then the second, VACUUM's pass then, and the pack on
-permutation v_vacuum p_attach p_pack o_wake v_vacuum o_wake p_detach v_check
+permutation p_load p_free v_vacuum p_attach p_pack o_wake v_vacuum o_wake p_detach v_check

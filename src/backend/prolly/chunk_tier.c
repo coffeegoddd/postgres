@@ -2126,15 +2126,26 @@ tier_vacuum_begin(Relation rel)
  * and the packs to be removed removed (what object of an orphan's may have
  * been written: the store's removes are of what is there)
  */
+static BlockNumber
+tier_write_blocks(Relation rel)
+{
+	return RelationGetNumberOfBlocks(rel);
+}
+
 static void
 tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
-				const uint8 *pending_bits, uint64 npending, ChunkLogSegments *out)
+				int npending, const uint64 *pending_locs, const uint32 *pending_lens,
+				ChunkLogSegments *out)
 {
 	TransactionId frozen;
+	uint64		nbits;
+	uint8	   *pending_bits = ChunkLogPendingBits(npending, pending_locs, pending_lens, -1,
+												   tier_segment_bytes(rel), 0, &nbits);
 
 	walk_packs(rel, true, &frozen);
 	advance_frozen(rel, frozen, false);
-	count_packs(rel, fraction, true, pending_bits, npending, out);
+	count_packs(rel, fraction, true, pending_bits, nbits, out);
+	pfree(pending_bits);
 }
 
 /*
@@ -2446,6 +2457,7 @@ const ChunkLogRoutine TierChunkLog = {
 	.compactable = tier_compactable,
 	.evacuable = tier_no_evacuable,
 	.segment_bytes = tier_segment_bytes,
+	.write_blocks = tier_write_blocks,
 	.compact_batch = tier_compact_batch,
 	.find_segments = tier_find_segments,
 	.vacuum_begin = tier_vacuum_begin,

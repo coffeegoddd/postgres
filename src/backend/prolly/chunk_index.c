@@ -2788,14 +2788,16 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	uint64		unheld = 0;
 	ChunkLogSegments segs = {0};
 	/*
-	 * (the log's segments with bytes of chunks freed kept for snapshots, a
-	 * bit each, to pass by: made as the log is opened, outside the windows
-	 * between taking entries out and counting their bytes dead, where
-	 * nothing is allocated; segments the log grows by meanwhile are not)
+	 * (the places of chunks freed kept for snapshots, whose segments the
+	 * log is to pass by: listed as their entries are passed, the list grown
+	 * as it needs, before a page's entries are taken out, outside the
+	 * windows between taking entries out and counting their bytes dead)
 	 */
-	uint8	   *pending = NULL;
-	uint64		npending = 0;
-	uint64		segment_bytes = 0;
+	uint64	   *pending_locs = NULL;
+	uint32	   *pending_lens = NULL;
+	int			npending = 0,
+				pendcap = 0;
+	bool		pending_wanted = false;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
 				dead_cap = 0;
@@ -2835,9 +2837,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				log_tried = true;
 				if (log != NULL)
 				{
-					segment_bytes = ChunkLogOf(log)->segment_bytes(log);
-					npending = ChunkLogOf(log)->end(log) / segment_bytes + 1;
-					pending = palloc0((npending + 7) / 8);
+					pending_wanted = true;
 				}
 
 				/*
@@ -2881,7 +2881,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				 * dead only later, once no snapshot might read them)
 				 */
 				if ((fates[i] == FATE_KEEP || fates[i] == FATE_FREEZE) &&
-					pending != NULL &&
+					pending_wanted &&
 					page_entry(page, i)->kind == CHUNK_KIND_CHUNK &&
 					page_entry(page, i)->len > 0 &&
 					TransactionIdIsValid(page_entry(page, i)->xmax) &&
@@ -2889,9 +2889,18 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				{
 					ChunkIndexEntry *pe = page_entry(page, i);
 
-					for (uint64 g = pe->loc / segment_bytes;
-						 g < npending && g <= (pe->loc + pe->len - 1) / segment_bytes; g++)
-						pending[g / 8] |= (uint8) (1 << (g % 8));
+					if (npending == pendcap)
+					{
+						pendcap = Max(pendcap * 2, 64);
+						pending_locs = pending_locs ?
+							repalloc_array(pending_locs, uint64, pendcap) :
+							palloc_array(uint64, pendcap);
+						pending_lens = pending_lens ?
+							repalloc_array(pending_lens, uint32, pendcap) :
+							palloc_array(uint32, pendcap);
+					}
+					pending_locs[npending] = pe->loc;
+					pending_lens[npending++] = pe->len;
 				}
 				if (fates[i] == FATE_REMOVE_FREED &&
 					(!TransactionIdIsValid(horizon) ||
@@ -2988,10 +2997,13 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 									truncate &&
 									!(log->rd_options != NULL &&
 									  ((StdRdOptions *) log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE),
-									chunk_compact_dead_fraction, pending, npending,
-									&segs);
-		if (pending)
-			pfree(pending);
+									chunk_compact_dead_fraction, npending, pending_locs,
+									pending_lens, &segs);
+		if (pending_locs)
+		{
+			pfree(pending_locs);
+			pfree(pending_lens);
+		}
 
 		/*
 		 * chunks nothing holds, segments to compact, or the end to evacuate:

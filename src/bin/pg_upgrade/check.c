@@ -1384,7 +1384,14 @@ history_store_rels(PGconn *conn)
 							"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
 							"LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam "
 							"LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.reltoastrelid "
-							"WHERE n.nspname = 'pg_history' AND c.relkind IN ('r', 'i')");
+	/*
+	 * (initdb's: a chunk log's lanes, made as backends wrote, the one kind
+	 * of the store's relation of a user's OID the check above passes, are
+	 * pg_dump's to make in the new cluster, as it restores the schema)
+	 */
+							"WHERE n.nspname = 'pg_history' AND c.relkind IN ('r', 'i') "
+							"AND c.oid < %u::pg_catalog.oid",
+							FirstNormalObjectId);
 	if (!PQgetisnull(res, 0, 0))
 		rels = pg_strdup(PQgetvalue(res, 0, 0));
 	PQclear(res);
@@ -1457,8 +1464,16 @@ check_for_history(ClusterInfo *cluster)
 								"                (c.reltoastrelid, 'TOAST table of ' || c.relname), "
 								"                (i.indexrelid, 'TOAST table index of ' || c.relname)) r(oid, relname) "
 								"WHERE n.nspname = 'pg_history' AND r.oid >= %u::pg_catalog.oid "
+		/* (a chunk log's lane, made as backends wrote, is pg_dump's to make) */
+								"AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d "
+								"  JOIN pg_catalog.pg_class l ON l.oid = d.refobjid "
+								"  WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+								"    AND d.objid = c.oid AND d.deptype = 'i' "
+								"    AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+								"    AND l.relnamespace = n.oid AND l.oid < %u::pg_catalog.oid "
+								"    AND c.relname LIKE l.relname || '\\_lane\\_%%') "
 								"ORDER BY c.oid LIMIT 1",
-								FirstNormalObjectId);
+								FirstNormalObjectId, FirstNormalObjectId);
 		if (PQntuples(res) > 0)
 			pg_fatal("Database \"%s\" has a relation in schema pg_history that initdb did not make,\n"
 					 "%s, which the upgrade cannot match to the new cluster's.\n"

@@ -4164,7 +4164,9 @@ dumpLO(Archive *fout, const LoInfo *loinfo)
  *	For binary upgrade, the version-control history store's relations
  *	(schema pg_history's tables and indexes, and their TOAST tables) come
  *	from the old cluster intact, as pg_largeobject does: each given its
- *	relfilenode, and each table its relfrozenxid and relminmxid.
+ *	relfilenode, and each table its relfrozenxid and relminmxid.  A chunk
+ *	log's lanes, made as backends wrote, not by initdb, are made again
+ *	first, each with its OID and relfilenode, and made their log's.
  */
 static void
 dumpHistoryUpgrade(Archive *fout)
@@ -4190,6 +4192,55 @@ dumpHistoryUpgrade(Archive *fout)
 		return;
 	}
 	q = createPQExpBuffer();
+	{
+		PQExpBuffer lq = createPQExpBuffer();
+		PGresult   *lanes;
+
+		appendPQExpBuffer(lq, "SELECT c.oid, c.relname, c.relfilenode, l.relname AS log, "
+											"  c.reltype, t.typarray, coalesce(s.spcname, '') "
+											"FROM pg_catalog.pg_class c "
+											"  JOIN pg_catalog.pg_type t ON t.oid = c.reltype "
+											"  JOIN pg_catalog.pg_am a ON a.oid = c.relam AND a.amname = 'prolly_chunks' "
+											"  LEFT JOIN pg_catalog.pg_tablespace s ON s.oid = c.reltablespace "
+											"  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+											"  JOIN pg_catalog.pg_depend d ON d.objid = c.oid "
+											"    AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+											"    AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass "
+											"    AND d.deptype = 'i' "
+											"  JOIN pg_catalog.pg_class l ON l.oid = d.refobjid AND l.relnamespace = n.oid "
+											"WHERE n.nspname = 'pg_history' AND c.relkind = 'r' "
+											"  AND c.oid >= %u::pg_catalog.oid "
+											"ORDER BY c.oid",
+						  FirstNormalObjectId);
+		lanes = ExecuteSqlQuery(fout, lq->data, PGRES_TUPLES_OK);
+		destroyPQExpBuffer(lq);
+
+		if (PQntuples(lanes) > 0)
+			appendPQExpBufferStr(q, "\n-- For binary upgrade, make the history store's chunk logs' lanes again\n");
+		for (int i = 0; i < PQntuples(lanes); i++)
+		{
+			/* (its row type and that's array type, as a table's are kept) */
+			appendPQExpBuffer(q, "SELECT pg_catalog.binary_upgrade_set_next_pg_type_oid('%s'::pg_catalog.oid);\n",
+							  PQgetvalue(lanes, i, 4));
+			appendPQExpBuffer(q, "SELECT pg_catalog.binary_upgrade_set_next_array_pg_type_oid('%s'::pg_catalog.oid);\n",
+							  PQgetvalue(lanes, i, 5));
+			appendPQExpBuffer(q, "SELECT pg_catalog.binary_upgrade_set_next_heap_pg_class_oid('%s'::pg_catalog.oid);\n",
+							  PQgetvalue(lanes, i, 0));
+			appendPQExpBuffer(q, "SELECT pg_catalog.binary_upgrade_set_next_heap_relfilenode('%s'::pg_catalog.oid);\n",
+							  PQgetvalue(lanes, i, 2));
+			appendPQExpBuffer(q, "CREATE TABLE pg_history.%s () USING prolly_chunks",
+							  fmtId(PQgetvalue(lanes, i, 1)));
+			/* (in its tablespace: the database's, unless named) */
+			if (PQgetvalue(lanes, i, 6)[0] != '\0')
+				appendPQExpBuffer(q, " TABLESPACE %s", fmtId(PQgetvalue(lanes, i, 6)));
+			appendPQExpBufferStr(q, ";\n");
+			appendPQExpBuffer(q, "SELECT pg_catalog.binary_upgrade_history_lane('pg_history.%s'::pg_catalog.regclass, ",
+							  fmtId(PQgetvalue(lanes, i, 1)));
+			appendPQExpBuffer(q, "'pg_history.%s'::pg_catalog.regclass);\n",
+							  fmtId(PQgetvalue(lanes, i, 3)));
+		}
+		PQclear(lanes);
+	}
 	appendPQExpBufferStr(q, "\n-- For binary upgrade, preserve the history store's relfilenodes, relfrozenxids and relminmxids\n");
 	for (int i = 0; i < PQntuples(res); i++)
 	{
@@ -4285,7 +4336,16 @@ getHistory(Archive *fout)
 	 */
 	history->query = "COPY (SELECT hash, data, name, roots, tier FROM pg_catalog.pg_history_export()) TO stdout;";
 	history->copyStmt = "COPY pg_history.chunk_restore (hash, data, name, roots, tier) FROM stdin;\n";
-	res = ExecuteSqlQueryForSingleRow(fout, "SELECT pg_relation_size('pg_history.chunks')");
+	/* (the log's lanes all: each a relation of its own) */
+	res = ExecuteSqlQueryForSingleRow(fout,
+									  "SELECT coalesce(sum(pg_catalog.pg_relation_size(c.oid)), 0) "
+									  "FROM pg_catalog.pg_class c "
+									  "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+									  "WHERE n.nspname = 'pg_history' AND (c.relname = 'chunks' OR "
+									  "  c.oid IN (SELECT d.objid FROM pg_catalog.pg_depend d "
+									  "    WHERE d.refobjid = 'pg_history.chunks'::pg_catalog.regclass "
+									  "      AND d.deptype = 'i' "
+									  "      AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass))");
 	history->size = (pgoff_t) strtoll(PQgetvalue(res, 0, 0), NULL, 10);
 	PQclear(res);
 }

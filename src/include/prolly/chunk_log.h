@@ -62,6 +62,9 @@ typedef struct ChunkLogRun
 	uint64		next;
 	uint64		limit;
 	uint32		generation;		/* the log's, the bytes' (mark_dead's) */
+	uint32		lane;			/* the lane it is in (prolly/chunk_lane.h) */
+	Relation	lane_rel;		/* ... open from prepare to release, so that
+								 * reserve opens nothing */
 } ChunkLogRun;
 
 typedef struct ChunkLogSegments ChunkLogSegments;
@@ -142,6 +145,12 @@ typedef struct ChunkLogRoutine
 	uint64		(*segment_bytes) (Relation rel);
 
 	/*
+	 * The pages of the part of the log this backend appends to (its own
+	 * lane's, a log of lanes'): what compaction's growth is counted in.
+	 */
+	BlockNumber (*write_blocks) (Relation rel);
+
+	/*
 	 * How much compaction moves a transaction: up to *chunks chunks, and
 	 * (*bytes not 0) up to *bytes of them; a log whose moved bytes are
 	 * written as its transactions commit (the tier's, a pack a
@@ -161,13 +170,14 @@ typedef struct ChunkLogRoutine
 	 * its end, or NULL), and ended: the log's own upkeep (letting go of
 	 * what no live backend holds; with truncate, cutting off its free end),
 	 * and what it finds of its segments in *out, those with bytes of chunks
-	 * freed kept for snapshots (pending, a bit a segment, of the first
-	 * npending) passed by.  Between them the pass counts bytes dead.
+	 * freed kept for snapshots (the npending chunks at pending_locs, of
+	 * pending_lens) passed by.  Between them the pass counts bytes dead.
 	 */
 	void	   *(*vacuum_begin) (Relation rel);
 	void		(*vacuum_end) (Relation rel, void *state, bool truncate,
-							   double fraction, const uint8 *pending,
-							   uint64 npending, ChunkLogSegments *out);
+							   double fraction, int npending,
+							   const uint64 *pending_locs,
+							   const uint32 *pending_lens, ChunkLogSegments *out);
 
 	/*
 	 * For audits: whether no part of the log counts bytes of the chunks
@@ -225,6 +235,28 @@ typedef struct ChunkLogRoutine
  * its log through it, so that its index may be bound to a log of any kind.
  */
 extern const ChunkLogRoutine *ChunkLogOf(Relation rel);
+
+/*
+ * Lanes (prolly/chunk_lane.h): how many numbers log has given (lanes 0 ..
+ * n - 1, some of them holes, their making aborted); the number of the next
+ * lane to make, a hole once safe to give again (no entry the aborted making
+ * left naming it) or a new one, the caller holding ChunkLaneLock; a lane
+ * made, its meta page naming it lane n of log.
+ */
+extern uint32 ChunkLogLanes(Relation log);
+/* rel's lane number and log, as its meta page says; false if it has none. */
+extern bool ChunkLogLaneOf(Relation rel, uint32 *lane, Oid *parent);
+extern uint32 ChunkLogTakeLane(Relation log, const uint32 *holes, int nholes);
+extern void ChunkLogMakeLane(Relation lane, uint32 n, Relation log);
+
+/*
+ * The segments the n chunks at locs (of lens) are on, as a bit a segment
+ * (*nbits of them, at least cover): those in lane, a lane's places, or
+ * (lane < 0) all, in a log of one place space.
+ */
+extern uint8 *ChunkLogPendingBits(int n, const uint64 *locs, const uint32 *lens,
+								  int64 lane, uint64 segment_bytes, uint64 cover,
+								  uint64 *nbits);
 extern PGDLLIMPORT const ChunkLogRoutine PageChunkLog;
 
 /*
