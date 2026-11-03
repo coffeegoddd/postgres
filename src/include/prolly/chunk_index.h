@@ -226,6 +226,7 @@ typedef struct ChunkIndexRoutine
 
 extern PGDLLIMPORT const ChunkIndexRoutine *ChunkIndex;
 extern PGDLLIMPORT const ChunkIndexRoutine PageChunkIndex;
+extern PGDLLIMPORT const ChunkIndexRoutine LaneChunkIndex;
 
 /* The prolly_chunk_index table access method's relations are its. */
 extern bool RelationIsChunkIndex(Relation rel);
