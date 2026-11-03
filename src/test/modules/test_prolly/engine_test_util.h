@@ -24,18 +24,22 @@
 #include "portability/instr_time.h"
 #include "prolly/chunkstore.h"
 #include "prolly/engine/prolly.h"
+#include "prolly/engine/vc.h"
 #include "utils/resowner.h"
 #include "test_prolly.h"
 
 /* The store a test's body runs on: "memory", then "pages". */
 static const char *engine_test_store = "memory";
 
-/* The store, empty if it is the memory one. */
+/* The store, empty if it is the memory one (and its references too). */
 static inline ChunkStore *
 memstore_create(void)
 {
 	if (strcmp(engine_test_store, "memory") == 0)
+	{
 		MemoryChunkStoreReset();
+		MemoryVcRefsReset();
+	}
 	return ChunkStoreOpen(engine_test_store);
 }
 
@@ -43,7 +47,42 @@ static inline void
 cs_destroy(ChunkStore *cs)
 {
 	if (strcmp(engine_test_store, "memory") == 0)
+	{
 		MemoryChunkStoreReset();
+		MemoryVcRefsReset();
+	}
+}
+
+/* The references on the store: "memory" on it, or the history store's rows. */
+static inline VcRefs *
+t_refs(ChunkStore *cs)
+{
+	return VcRefsOpen(strcmp(engine_test_store, "memory") == 0 ? "memory" : "pointers",
+					  cs);
+}
+
+/*
+ * What nothing holds freed, on the memory store, its holds ended as its
+ * transaction's end would; the audit passes, with nothing unheld.  On
+ * "pages" holds last until the test's subtransaction is rolled back: the
+ * audit there is the history store's own tests'.
+ */
+static inline void
+settle_and_check(ChunkStore *cs)
+{
+	uint64		chunks,
+				unheld;
+	char	   *why = NULL;
+
+	if (strcmp(engine_test_store, "memory") != 0)
+		return;
+	MemoryChunkStoreEndHolds(cs);
+	(void) cs_free_unheld(cs);
+	if (!cs_check(cs, &chunks, &unheld, &why))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg_internal("store invariant broken: %s", why ? why : "?")));
+	CHECK_EQ(unheld, 0);
 }
 
 /* A test's own memory stores, destroyed as it ends, however it ends. */

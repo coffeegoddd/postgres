@@ -244,6 +244,30 @@ image_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 	return p == end;
 }
 
+static bool
+branch_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
+{
+	const uint8 *p = data + 2;
+	const uint8 *end = data + len;
+	PHash		h;
+
+	for (int i = 0; i < 2; i++)	/* head, working root */
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, true);
+	}
+	if (p >= end || *p > 1)
+		return false;
+	if (*p++)
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, true);
+	}
+	return p == end;
+}
+
 bool
 engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 {
@@ -267,6 +291,8 @@ engine_chunk_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 			return image_refs(data, len, fn, arg);
 		case CHUNK_TAG_REPO:
 			return true;
+		case CHUNK_TAG_BRANCH:
+			return branch_refs(data, len, fn, arg);
 		default:
 			return false;
 	}
