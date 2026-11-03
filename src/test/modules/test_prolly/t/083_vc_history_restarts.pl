@@ -1,0 +1,139 @@
+
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# Version control's history across restarts, and on a hot standby: commits,
+# branches and their rows survive the server stopping (immediately, its WAL
+# replayed); rows written long before read back right after checkpoints and
+# restarts as more is committed; what a push and a fetch sent is there after
+# a restart; history discarded and freed is gone, and stays gone; and a hot
+# standby reads the history as the primary has it, refuses to write it, and
+# follows as the primary goes on.
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+my $primary = PostgreSQL::Test::Cluster->new('vc_primary');
+$primary->init(allows_streaming => 1);
+$primary->append_conf('postgresql.conf', 'autovacuum = off');
+$primary->start;
+$primary->safe_psql('postgres', q{
+	CREATE EXTENSION test_prolly;
+	SELECT test_vc_open();
+});
+$primary->safe_psql('postgres', "SELECT test_vc_commit('main', '$_')")
+  for qw(base a b c);
+$primary->safe_psql('postgres', q{
+	SELECT test_vc_branch_at('side', 'main', 'b');
+	SELECT test_vc_commit('side', 's1');
+});
+
+# what the history is: the branches' lines, their rows, a row each commit wrote
+my $state = sub {
+	my ($node) = @_;
+	return $node->safe_psql('postgres', q{
+		SELECT test_vc_log('main'), test_vc_log('side'),
+			test_vc_rows('main'), test_vc_rows('side'),
+			test_vc_working_has('main', 'base'), test_vc_working_has('side', 's1')});
+};
+like($primary->safe_psql('postgres', q{SELECT test_vc_log('main')}),
+	qr/^c b a base/, 'main\'s line');
+like($primary->safe_psql('postgres', q{SELECT test_vc_log('side')}),
+	qr/^s1 b a base/, 'side\'s line, from b');
+my $before;
+
+# a clone into memory pushes a commit back, and another is fetched from it
+my $fetched = $primary->safe_psql('postgres',
+	q{SELECT encode(test_vc_round_trip('main', 'pushed', 'fetched'), 'hex')});
+like($primary->safe_psql('postgres', q{SELECT test_vc_log('main')}),
+	qr/^pushed /, 'the push moved main');
+$before = $state->($primary);
+
+# stopped at once: what was committed is there, from its WAL
+$primary->stop('immediate');
+$primary->start;
+is($state->($primary), $before, 'the history after an immediate stop');
+is( $primary->safe_psql(
+		'postgres',
+		qq{SELECT test_cs_has('pages', decode('$fetched', 'hex')), test_vc_working_has('main', 'pushed')}),
+	't|t',
+	'what the push and the fetch sent, after it');
+is($primary->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
+	't', 'the store checks');
+
+# rows written first read back right after checkpoints and restarts, as more
+# is committed (each restart's reads the disk's, not the buffers')
+for my $i (1 .. 3)
+{
+	$primary->safe_psql('postgres', qq{SELECT test_vc_commit('main', 'more $i')});
+	$primary->safe_psql('postgres', 'CHECKPOINT');
+	$primary->restart;
+	is( $primary->safe_psql(
+			'postgres',
+			qq{SELECT test_vc_working_has('main', 'base'), test_vc_working_has('main', 'more $i'),
+				test_vc_working_has('side', 's1'), test_vc_rows('main')}),
+		't|t|t|' . (5 + $i),
+		"old and new rows after restart $i");
+}
+my $main_log = $primary->safe_psql('postgres', q{SELECT test_vc_log('main')});
+like($main_log, qr/^more 3 more 2 more 1 pushed c b a base/, 'main\'s line after the restarts');
+
+# a hot standby, from a backup: it reads the history as the primary has it
+$primary->backup('b');
+my $standby = PostgreSQL::Test::Cluster->new('vc_standby');
+$standby->init_from_backup($primary, 'b', has_streaming => 1);
+$standby->start;
+$primary->wait_for_replay_catchup($standby);
+is($state->($standby), $state->($primary), 'the standby reads the history');
+my ($ret, $out, $err) = $standby->psql('postgres', q{SELECT test_vc_commit('main', 'nope')});
+isnt($ret, 0, 'a commit on the standby is refused');
+like($err, qr/read-only|recovery/, '(as read only)');
+$primary->safe_psql('postgres', q{SELECT test_vc_commit('main', 'later')});
+$primary->wait_for_replay_catchup($standby);
+like($standby->safe_psql('postgres', q{SELECT test_vc_log('main')}),
+	qr/^later more 3 /, 'the standby follows the primary');
+
+# history discarded and freed is gone, and stays gone after a restart
+my $held = sub {
+	return [
+		split /\n/,
+		$primary->safe_psql(
+			'postgres',
+			q{SELECT encode(hash, 'hex') FROM pg_history.pointers
+			WHERE name LIKE 'vc/commit/%' ORDER BY 1})
+	];
+};
+my @was = @{ $held->() };
+ok($primary->safe_psql('postgres', 'SELECT test_vc_sever(2, true)') > 0,
+	'a window of two cuts commits, discarded');
+my %now = map { $_ => 1 } @{ $held->() };
+my @cut = grep { !$now{$_} } @was;
+ok(scalar(@cut) > 0, scalar(@cut) . ' commits cut');
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+ok( $primary->poll_query_until(
+		'postgres',
+		q{SELECT unheld = 0 AND test_chunk_index_marked('pg_history.chunk_index') = 0
+		FROM test_cs_check('pages')}),
+	'what the discard let go of freed');
+my $gone = sub {
+	return $primary->safe_psql('postgres',
+		'SELECT bool_and(NOT test_cs_has(\'pages\', decode(h, \'hex\'))) FROM unnest(ARRAY['
+		  . join(',', map { "'$_'" } @cut) . ']) h');
+};
+is($gone->(), 't', 'the cut commits are gone from the store');
+$primary->restart;
+is($gone->(), 't', 'and stay gone after a restart');
+is( $primary->safe_psql(
+		'postgres',
+		q{SELECT test_vc_working_has('main', 'later'), test_vc_working_has('side', 's1'),
+			(SELECT ok FROM test_cs_check('pages'))}),
+	't|t|t',
+	'the heads read, the store checks');
+$primary->wait_for_replay_catchup($standby);
+is($standby->safe_psql('postgres', q{SELECT test_vc_working_has('main', 'later')}),
+	't', 'the standby reads the heads too');
+
+$standby->stop;
+$primary->stop;
+done_testing();

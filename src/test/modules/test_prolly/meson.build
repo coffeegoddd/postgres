@@ -199,6 +199,7 @@ tests += {
       't/080_chunk_lane_compaction.pl',
       't/081_chunk_format_dump.pl',
       't/082_vc_store_bounded.pl',
+      't/083_vc_history_restarts.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
