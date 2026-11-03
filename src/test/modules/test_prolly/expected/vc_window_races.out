@@ -23,11 +23,12 @@ cut
 
 step c_repo: 
 	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
 		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
 
-kept|commits
-----+-------
-t   |      1
+kept|old_kept|commits
+----+--------+-------
+t   |f       |      2
 (1 row)
 
 cleared
@@ -59,11 +60,191 @@ f
 
 step c_repo: 
 	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
 		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
 
-kept|commits
-----+-------
-t   |      1
+kept|old_kept|commits
+----+--------+-------
+t   |f       |      2
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_old s2_sever s1_commit c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_old: SELECT test_vc_branch_at('old', 'main', 'base');
+test_vc_branch_at
+-----------------
+t                
+(1 row)
+
+step s2_sever: SELECT test_vc_sever(1) AS cut; <waiting ...>
+step s1_commit: COMMIT;
+step s2_sever: <... completed>
+cut
+---
+  3
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|old_kept|commits
+----+--------+-------
+t   |t       |      3
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_sever s2_old s1_commit c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_sever: SELECT test_vc_sever(1) AS cut;
+cut
+---
+  4
+(1 row)
+
+step s2_old: SELECT test_vc_branch_at('old', 'main', 'base'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_old: <... completed>
+test_vc_branch_at
+-----------------
+f                
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|old_kept|commits
+----+--------+-------
+t   |f       |      2
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_ff s2_sever s1_commit c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_ff: SELECT test_vc_merge('main', 'ahead');
+test_vc_merge
+-------------
+fast forward 
+(1 row)
+
+step s2_sever: SELECT test_vc_sever(1) AS cut; <waiting ...>
+step s1_commit: COMMIT;
+step s2_sever: <... completed>
+cut
+---
+  5
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|old_kept|commits
+----+--------+-------
+t   |f       |      1
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_sever s2_ff s1_commit c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_sever: SELECT test_vc_sever(1) AS cut;
+cut
+---
+  4
+(1 row)
+
+step s2_ff: SELECT test_vc_merge('main', 'ahead'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_ff: <... completed>
+test_vc_merge
+-------------
+fast forward 
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|old_kept|commits
+----+--------+-------
+t   |f       |      2
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_rr s1_sever s1_rollback c_repo
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;
+?column?
+--------
+       1
+(1 row)
+
+step s1_sever: SELECT test_vc_sever(1) AS cut;
+ERROR:  a sever needs a READ COMMITTED transaction
+step s1_rollback: ROLLBACK;
+step c_repo: 
+	SELECT test_vc_head_in_window('main') AS kept,
+		test_vc_head_in_window('old') AS old_kept,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+kept|old_kept|commits
+----+--------+-------
+t   |f       |      6
 (1 row)
 
 cleared

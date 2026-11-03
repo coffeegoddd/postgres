@@ -313,14 +313,6 @@ segment_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 			return false;
 		fn(arg, &h, !exported);
 	}
-	if (!read_uvarint(&p, end, &n) || n > len)
-		return false;
-	for (uint64 i = 0; i < n; i++)
-	{
-		if (!read_hash(&p, end, &h))
-			return false;
-		fn(arg, &h, false);
-	}
 	if (exported)
 	{
 		if (!read_uvarint(&p, end, &n) || n > (uint64) (end - p))
@@ -329,6 +321,14 @@ segment_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 		if (!read_hash(&p, end, &h))
 			return false;
 		fn(arg, &h, false);
+		if (!read_uvarint(&p, end, &n) || n > len)
+			return false;
+		for (uint64 i = 0; i < n; i++)
+		{
+			if (!read_hash(&p, end, &h))
+				return false;
+			fn(arg, &h, false);
+		}
 	}
 	return p == end;
 }

@@ -64,3 +64,6 @@ endif
 # the tests before them; version control's commits, with chunks of their
 # own, would make it split elsewhere)
 ISOLATION += vc_branch_races vc_open_race vc_window_races
+ifeq ($(enable_injection_points),yes)
+ISOLATION += vc_sever_commit
+endif

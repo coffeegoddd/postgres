@@ -40,6 +40,8 @@ PG_FUNCTION_INFO_V1(test_vc_head_in_window);
 PG_FUNCTION_INFO_V1(test_vc_clear);
 PG_FUNCTION_INFO_V1(test_vc_rows);
 PG_FUNCTION_INFO_V1(test_vc_sever);
+PG_FUNCTION_INFO_V1(test_vc_branch_at);
+PG_FUNCTION_INFO_V1(test_vc_merge);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -472,4 +474,68 @@ test_vc_sever(PG_FUNCTION_ARGS)
 		}
 	});
 	PG_RETURN_INT64((int64) n);
+}
+
+/*
+ * test_vc_branch_at(name text, branch text, msg text) returns bool: a
+ * branch made at the commit on branch's line with message msg (found as
+ * the call begins); false if it could not be (outside the window)
+ */
+Datum
+test_vc_branch_at(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *msg = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	VcRepo		r;
+	bool		made = false;
+
+	VC_CALL(r, 0,
+	{
+		VcBranch	b;
+		FindArg		f = {msg, false};
+
+		checkout(&r, branch);
+		vc_head(&r, &b);
+		if (vc_log(&r, &b.head, 1000, 0, find_fn, &f) != VC_OK || !f.found)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch \"%s\" has no commit \"%s\"", branch, msg)));
+		vc_branch_free(&b);
+		made = vc_branch_create(&r, name, &f.hash) == VC_OK;
+	});
+	PG_RETURN_BOOL(made);
+}
+
+/*
+ * test_vc_merge(branch text, other text) returns text: other merged into
+ * branch, how ("up to date", "fast forward", "committed", "conflicts"),
+ * or the error's code
+ */
+Datum
+test_vc_merge(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *other = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	VcRepo		r;
+	const char *how = NULL;
+	int			rc = VC_OK;
+
+	VC_CALL(r, 0,
+	{
+		VcMergeResult m;
+
+		checkout(&r, branch);
+		rc = vc_merge(&r, other, &m);
+		if (rc == VC_OK)
+		{
+			how = m.status == VC_MERGE_UP_TO_DATE ? "up to date" :
+				m.status == VC_MERGE_FAST_FORWARD ? "fast forward" :
+				m.status == VC_MERGE_COMMITTED ? "committed" : "conflicts";
+			vc_merge_result_free(&m);
+		}
+	});
+	if (how == NULL)
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf("error %d", rc)));
+	PG_RETURN_TEXT_P(cstring_to_text(how));
 }

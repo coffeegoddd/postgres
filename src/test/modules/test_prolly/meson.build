@@ -64,6 +64,9 @@ endif
 # the tests before them; version control's commits, with chunks of their
 # own, would make it split elsewhere)
 test_prolly_isolation += ['vc_branch_races', 'vc_open_race', 'vc_window_races']
+if get_option('injection_points')
+  test_prolly_isolation += ['vc_sever_commit']
+endif
 
 tests += {
   'name': 'test_prolly',

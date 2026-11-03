@@ -44,9 +44,9 @@
  *			The repository's own state, which vc/repo names: where each
  *			commit outside the window is.
  * Segment: tag, version, exported byte (0 or 1), uvarint n, member commit
- *			hash... (strong if not exported, else weak), uvarint nedge, edge
- *			commit hash... (weak), [uvarint namelen, archive name, manifest
- *			hash (weak)] (if exported)
+ *			hash... (strong if not exported, else weak), [uvarint namelen,
+ *			archive name, manifest hash (weak), uvarint nb, bound commit
+ *			hash... (weak): the members' parents not members] (if exported)
  *			Commits severed from the window together; a local segment
  *			holds them, an exported one's archive does.
  *

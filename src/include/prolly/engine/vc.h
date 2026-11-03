@@ -31,7 +31,12 @@
  * branch at a commit they did not just write (a branch made, a reset, a
  * merge) lock it for share, so that a sever cannot cut a commit they are
  * moving a branch to.  A commit, and a working set's change, take only
- * their branch's reference.
+ * their branch's reference.  vc/repo is locked before a branch's: a
+ * transaction that commits and then severs or resets takes them the other
+ * way, which Postgres finds as a deadlock.  The window's calls need READ
+ * COMMITTED: each reads the branches after its lock, with a snapshot of
+ * its own, and under a transaction's snapshot would not see a reset that
+ * committed while it waited (they refuse to run so).
  *
  * Calls that change a branch lock its reference first (for update), and
  * read it after, so two that change one branch take turns: two commits on
@@ -310,6 +315,7 @@ typedef struct VcWindow
 	uint64		low_commits;	/* low mark */
 	uint64		low_bytes;		/* low mark */
 	uint64		low_seconds;	/* low mark */
+	uint64		max_cut;		/* the most one sever cuts (0: VC_SEVER_MAX) */
 } VcWindow;
 
 #define VC_NO_SEGMENT PG_UINT32_MAX
@@ -321,12 +327,18 @@ typedef struct VcSegment
 	bool		exported;
 	PHash	   *commits;
 	size_t		n;
-	/* members that commits kept in the window name as parents */
-	PHash	   *edge;
-	size_t		nedge;
 	char	   *archive_name;	/* exported: where */
 	PHash		manifest;		/* exported: holds it there */
+	/* exported: the members' parents that are not members */
+	PHash	   *bounds;
+	size_t		nbounds;
 } VcSegment;
+
+/*
+ * The most commits one sever cuts, its segment's chunk bounded with them:
+ * the rest wait for the next.
+ */
+#define VC_SEVER_MAX 1000000
 
 /*
  * Anything chunks can be copied to or from by hash: an archive, a remote's
@@ -371,16 +383,29 @@ typedef enum VcLocation
  * stays the size of what it holds however much is cut.  What it still
  * knows of them is what the commits it holds name: their parents, which
  * vc_locate reports as discarded.  Deeper discarded commits are unknown
- * again.
+ * again.  (Those parents are found from what is held when asked, not
+ * kept: nothing to keep right as segments go in any order.)
+ *
+ * An archive's roots change with the segment's row: it must be as
+ * transactional as the repository's store (its root given up by a discard
+ * that then aborts would free what the segment's row still names), or the
+ * call is VC_ERR; its name must be the one the segment was exported under.
+ * A segment's window walks keep what each head reached apart (a history
+ * many heads share is walked once a head).
  */
 extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg);
 extern int	vc_segment_export(VcRepo *r, uint32 seg, const VcSource *archive);
 /* archive: the one an exported segment is in (NULL for a local one). */
-extern int	vc_segment_discard(VcRepo *r, uint32 seg, ChunkStore *archive);
-extern int	vc_segment_attach(VcRepo *r, uint32 seg, ChunkStore *archive);
+extern int	vc_segment_discard(VcRepo *r, uint32 seg, const VcSource *archive);
+extern int	vc_segment_attach(VcRepo *r, uint32 seg, const VcSource *archive);
 /* The segment, false if it has no row (discarded, attached, or none). */
 extern bool vc_segment_get(VcRepo *r, uint32 seg, VcSegment *out);
 extern void vc_segment_free(VcSegment *seg);
+/*
+ * Where a commit is: O(log n) for one the repository holds (its location
+ * map); one it does not is looked for among the parents of what it holds,
+ * which reads every commit of the window and of its local segments.
+ */
 extern VcLocation vc_locate(VcRepo *r, const PHash *commit, uint32 *seg);
 
 /* Every commit the repository knows of and where it is (O(history); for tests). */

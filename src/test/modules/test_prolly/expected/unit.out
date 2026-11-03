@@ -106,7 +106,10 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_window   | marks_branches_independent        | ok     | 
  engine_window   | marks_pinned                      | ok     | 
  engine_window   | marks_random                      | ok     | 
-(94 rows)
+ engine_window   | discarded_parent_still_named      | ok     | 
+ engine_window   | sever_bounded                     | ok     | 
+ engine_window   | archive_checked                   | ok     | 
+(97 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

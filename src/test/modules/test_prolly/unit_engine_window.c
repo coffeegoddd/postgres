@@ -367,9 +367,12 @@ ENGINE_MEMORY_TEST(test_export_self_contained)
 	want = expected_frees(&r, seg);
 	CHECK(want > 0);
 	CHECK_EQ(vc_segment_export(&r, seg, &arch), VC_OK);
-	/* (the members' own chunks, and the segment's chunk it replaced) */
+	/*
+	 * (the members' own chunks, and the segment's chunk it replaced, and the
+	 * location map's and repository's: the members marked exported)
+	 */
 	freed = release(cs);
-	CHECK_EQ(freed, want + 1);
+	CHECK_EQ(freed, want + 3);
 	settle_and_check(cs);
 	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_EXPORTED);
 
@@ -396,8 +399,8 @@ ENGINE_MEMORY_TEST(test_export_self_contained)
 
 	/* attached from the archive: exactly what was freed comes back */
 	st = *cs_stats(cs);
-	CHECK_EQ(vc_segment_attach(&r, seg, archive), VC_OK);
-	CHECK_EQ(STATS_DELTA(cs, st, stored), freed - 1 + 2);	/* (+ map, repository) */
+	CHECK_EQ(vc_segment_attach(&r, seg, &arch), VC_OK);
+	CHECK_EQ(STATS_DELTA(cs, st, stored), freed - 3 + 2);	/* (+ map, repository) */
 	settle_and_check(cs);
 	check_snap(&r.ctx, &l.b, &sb);
 	CHECK(log_from(&r, &l.d, VC_WINDOW_ONLY, &acc) == VC_OK && acc.n == 5);
@@ -581,7 +584,7 @@ ENGINE_MEMORY_TEST(test_branches_cut_at_shared_ancestor)
 	vc_branch_free(&br);
 
 	/* attached from the archive, the merge goes through */
-	CHECK_EQ(vc_segment_attach(&r, seg, archive), VC_OK);
+	CHECK_EQ(vc_segment_attach(&r, seg, &arch), VC_OK);
 	CHECK(vc_merge(&r, "feature", &m) == VC_OK && m.status == VC_MERGE_COMMITTED);
 	vc_merge_result_free(&m);
 	w = vc_working(&r);
@@ -1848,6 +1851,116 @@ ENGINE_MEMORY_TEST(test_marks_random)
 	cs_destroy(cs);
 }
 
+/*
+ * A parent two kept commits name stays known as discarded while either
+ * does: X and Y share P; Y is cut and discarded later, and X still names P.
+ */
+ENGINE_MEMORY_TEST(test_discarded_parent_still_named)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		p,
+				x,
+				y;
+	uint32		seg;
+	VcWindow	depth1 = {.depth = 1};
+
+	setup(&r, cs);
+	commit_rows(&r, 0, 100, 0, "base");
+	p = commit_rows(&r, 0, 10, 1, "P");
+	CHECK_EQ(vc_branch_create(&r, "x", NULL), VC_OK);
+	CHECK_EQ(vc_checkout(&r, "x"), VC_OK);
+	x = commit_rows(&r, 20, 30, 2, "X");
+	CHECK_EQ(vc_checkout(&r, "main"), VC_OK);
+	y = commit_rows(&r, 40, 50, 3, "Y");
+	sever_discard(&r, &depth1);
+	CHECK(vc_locate(&r, &p, NULL) == VC_LOC_DISCARDED);
+	CHECK(vc_locate(&r, &x, NULL) == VC_LOC_WINDOW);
+
+	/* Y cut and discarded: X still names P */
+	commit_rows(&r, 60, 70, 4, "Z");
+	CHECK_EQ(vc_sever(&r, &depth1, &seg), VC_OK);
+	CHECK_EQ(segment_size(&r, seg), 1);
+	CHECK(vc_locate(&r, &y, NULL) == VC_LOC_SEGMENT);
+	CHECK_EQ(vc_segment_discard(&r, seg, NULL), VC_OK);
+	release(cs);
+	CHECK(vc_locate(&r, &y, NULL) == VC_LOC_DISCARDED);	/* Z names it */
+	CHECK(vc_locate(&r, &p, NULL) == VC_LOC_DISCARDED);	/* X names it */
+
+	/* X's branch gone and severed: nothing names P, forgotten */
+	CHECK_EQ(vc_branch_delete(&r, "x"), VC_OK);
+	sever_discard(&r, &depth1);
+	CHECK(vc_locate(&r, &x, NULL) == VC_LOC_UNKNOWN);
+	CHECK(vc_locate(&r, &p, NULL) == VC_LOC_UNKNOWN);
+	settle_and_check(cs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * A sever cuts at most max_cut commits; the rest wait for the next, which
+ * cuts them.
+ */
+ENGINE_MEMORY_TEST(test_sever_bounded)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	Linear		l;
+	uint32		s1,
+				s2,
+				s3;
+	VcWindow	w = {.depth = 2, .max_cut = 2};
+
+	setup(&r, cs);
+	l = build_linear(&r);
+	CHECK_EQ(vc_sever(&r, &w, &s1), VC_OK);
+	CHECK_EQ(segment_size(&r, s1), 2);
+	CHECK_EQ(vc_sever(&r, &w, &s2), VC_OK);
+	CHECK(s2 == s1 + 1 && segment_size(&r, s2) == 1);
+	CHECK_EQ(vc_sever(&r, &w, &s3), VC_OK);
+	CHECK_EQ(s3, VC_NO_SEGMENT);
+	CHECK(vc_locate(&r, &l.c, NULL) == VC_LOC_WINDOW);
+	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_SEGMENT);
+	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_SEGMENT);
+	CHECK(vc_locate(&r, &l.init, NULL) == VC_LOC_SEGMENT);
+	settle_and_check(cs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * An archive must be another store, as transactional as the repository's,
+ * and an exported segment comes back only from the one it went to.
+ */
+ENGINE_MEMORY_TEST(test_archive_checked)
+{
+	ChunkStore *cs = memstore_create();
+	ChunkStore *archive = memstore_create_own();
+	VcSource	arch = archive_of(archive);
+	VcSource	self = {"self", cs};
+	VcSource	other = {"other", archive};
+	VcSource	pages = {"pages", ChunkStoreOpen("pages")};
+	VcRepo		r;
+	Linear		l;
+	uint32		seg;
+
+	setup(&r, cs);
+	l = build_linear(&r);
+	CHECK_EQ(vc_sever(&r, &depth2, &seg), VC_OK);
+	CHECK_EQ(vc_segment_export(&r, seg, &self), VC_ERR);
+	CHECK_EQ(vc_segment_export(&r, seg, &pages), VC_ERR);	/* transactional */
+	CHECK_EQ(vc_segment_export(&r, seg, &arch), VC_OK);
+	CHECK_EQ(vc_segment_attach(&r, seg, &other), VC_ERR);	/* not where it went */
+	CHECK_EQ(vc_segment_attach(&r, seg, NULL), VC_ERR);
+	CHECK_EQ(vc_segment_discard(&r, seg, &other), VC_ERR);
+	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_EXPORTED);
+	CHECK_EQ(vc_segment_attach(&r, seg, &arch), VC_OK);
+	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_WINDOW);
+	settle_and_check(cs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 static const ProllyUnitTest tests[] = {
 	{"detach_moves_holds_only", test_detach_moves_holds_only},
 	{"export_self_contained", test_export_self_contained},
@@ -1873,6 +1986,9 @@ static const ProllyUnitTest tests[] = {
 	{"marks_branches_independent", test_marks_branches_independent},
 	{"marks_pinned", test_marks_pinned},
 	{"marks_random", test_marks_random},
+	{"discarded_parent_still_named", test_discarded_parent_still_named},
+	{"sever_bounded", test_sever_bounded},
+	{"archive_checked", test_archive_checked},
 };
 
 const ProllyUnitSuite unit_engine_window_suite = {"engine_window", tests, lengthof(tests)};
