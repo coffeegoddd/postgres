@@ -391,13 +391,29 @@ init_meta(Page page)
 		(char *) meta + sizeof(ChunkLogMetaData) - (char *) page;
 }
 
+/*
+ * (carry: the storage's before, emptied: a lane keeps its number and log,
+ * and a log the numbers it has given, those its lanes still have)
+ */
 static void
-write_meta(SMgrRelation srel, bool use_wal)
+write_meta(SMgrRelation srel, bool use_wal, const ChunkLogMetaData *carry)
 {
 	BulkWriteState *bulk = smgr_bulk_start_smgr(srel, MAIN_FORKNUM, use_wal);
 	BulkWriteBuffer buf = smgr_bulk_get_buf(bulk);
 
 	init_meta((Page) buf);
+	if (carry != NULL)
+	{
+		ChunkLogMetaData *meta = (ChunkLogMetaData *) PageGetContents((Page) buf);
+
+		meta->lane = carry->lane;
+		meta->parent = carry->parent;
+		meta->next_lane = carry->next_lane;
+		meta->vac_begun = carry->vac_begun;
+		meta->vac_ended = carry->vac_ended;
+		meta->nunmade = carry->nunmade;
+		memcpy(meta->unmade, carry->unmade, sizeof(meta->unmade));
+	}
 	smgr_bulk_write(bulk, META_BLOCK, buf, true);
 	smgr_bulk_finish(bulk);
 }
@@ -3128,31 +3144,65 @@ create_store_storage(Relation rel, const RelFileLocator *newrlocator,
 }
 
 /*
- * (a log with lanes, or a lane, is not emptied: its lanes, relations of
- * their own, would keep their pages and the log its numbers given; a lane
- * goes only as its log is dropped)
+ * A log emptied empties its lanes with it, each keeping its number, and
+ * the log the numbers it has given (its lanes keep their names; a lane's
+ * number must not be given again while it is there).  Emptied, the log
+ * has a stamp of its own, as any storage made has: the index refuses the
+ * entries it had, for the log and its lanes alike (a place's stamp is the
+ * log's).  A lane alone is not emptied: only with its log.
  */
-static void
-refuse_truncate_laned(Relation rel)
+static bool emptying_lanes = false;
+
+/* (the meta page of rel's storage as it is, if it has one) */
+static bool
+meta_before(Relation rel, ChunkLogMetaData *out)
 {
-	uint32		lane;
-	Oid			parent;
+	Buffer		mbuf;
 
 	if (rel->rd_locator.relNumber == InvalidRelFileNumber ||
 		!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ||
-		!ChunkLogLaneOf(rel, &lane, &parent))
-		return;
-	if (lane > 0)
+		RelationGetNumberOfBlocks(rel) == 0)
+		return false;
+	mbuf = ReadBuffer(rel, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	*out = *page_meta(rel, BufferGetPage(mbuf));
+	UnlockReleaseBuffer(mbuf);
+	return true;
+}
+
+static void
+refuse_lane_alone(Relation rel, const ChunkLogMetaData *before)
+{
+	if (before->lane > 0 && !emptying_lanes)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot truncate \"%s\", a lane of a chunk log",
-						RelationGetRelationName(rel))));
-	if (ChunkLogLanes(rel) > 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot truncate chunk log \"%s\", which has lanes",
 						RelationGetRelationName(rel)),
-				 errdetail("A chunk log's lanes go only as it is dropped.")));
+				 errhint("Truncate its chunk log, which truncates its lanes too.")));
+}
+
+/* (log's lanes 1 .. n - 1 emptied, each with new storage of its own) */
+static void
+empty_lanes(Relation log, uint32 n)
+{
+	for (uint32 lane = 1; lane < n; lane++)
+	{
+		Relation	rel = ChunkLaneOpen(log, lane, AccessExclusiveLock);
+
+		if (rel == NULL)
+			continue;			/* (a hole) */
+		emptying_lanes = true;
+		PG_TRY();
+		{
+			RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+		}
+		PG_FINALLY();
+		{
+			emptying_lanes = false;
+		}
+		PG_END_TRY();
+		ChunkLaneClose(log, rel);
+	}
 }
 
 static void
@@ -3163,16 +3213,21 @@ cl_relation_set_new_filelocator(Relation rel,
 								MultiXactId *minmulti)
 {
 	SMgrRelation srel;
+	ChunkLogMetaData before;
+	bool		had = meta_before(rel, &before);
 
-	refuse_truncate_laned(rel);
+	if (had)
+		refuse_lane_alone(rel, &before);
 	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 
 	/*
 	 * (logged unless WAL is minimal, when the new storage is synced at
 	 * commit instead, as RelationCreateStorage arranged)
 	 */
-	write_meta(srel, XLogIsNeeded());
+	write_meta(srel, XLogIsNeeded(), had ? &before : NULL);
 	smgrclose(srel);
+	if (had && before.lane == 0 && before.next_lane > 1)
+		empty_lanes(rel, before.next_lane);
 }
 
 /* a chunk index's storage: its own first pages (prolly/chunk_index.h) */
@@ -3221,9 +3276,15 @@ ci_relation_nontransactional_truncate(Relation rel)
 static void
 cl_relation_nontransactional_truncate(Relation rel)
 {
-	refuse_truncate_laned(rel);
+	ChunkLogMetaData before;
+	bool		had = meta_before(rel, &before);
+
+	if (had)
+		refuse_lane_alone(rel, &before);
 	RelationTruncate(rel, 0);
-	write_meta(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+	write_meta(RelationGetSmgr(rel), RelationNeedsWAL(rel), had ? &before : NULL);
+	if (had && before.lane == 0 && before.next_lane > 1)
+		empty_lanes(rel, before.next_lane);
 
 	/* (the region this backend had is gone with its pages) */
 	if (rel->rd_amcache != NULL)
