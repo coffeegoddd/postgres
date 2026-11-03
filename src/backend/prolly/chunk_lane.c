@@ -63,11 +63,6 @@ typedef struct LaneEntry
 	uint32		lane;
 } LaneEntry;
 
-typedef struct LaneShared
-{
-	LaneEntry	entries[FLEXIBLE_ARRAY_MEMBER];
-} LaneShared;
-
 /* what this backend alone knows of its entries */
 typedef struct LocalLane
 {
@@ -76,7 +71,8 @@ typedef struct LocalLane
 	uint64		used;
 } LocalLane;
 
-static LaneShared *lanes;
+/* every process slot's entries, under ChunkLaneLock */
+static LaneEntry *lanes;
 static int	nslots;
 static LocalLane local[LANES_PER_BACKEND];
 static uint64 use_clock = 0;
@@ -102,9 +98,7 @@ ChunkLaneShmemRequest(void *arg)
 {
 	nslots = slot_count();
 	ShmemRequestStruct(.name = "Chunk Log Lanes",
-					   .size = add_size(offsetof(LaneShared, entries),
-										mul_size(mul_size(nslots, LANES_PER_BACKEND),
-												 sizeof(LaneEntry))),
+					   .size = mul_size(mul_size(nslots, LANES_PER_BACKEND), sizeof(LaneEntry)),
 					   .ptr = (void **) &lanes,
 		);
 }
@@ -113,7 +107,7 @@ static void
 ChunkLaneShmemInit(void *arg)
 {
 	for (int i = 0; i < nslots * LANES_PER_BACKEND; i++)
-		lanes->entries[i].db = InvalidOid;
+		lanes[i].db = InvalidOid;
 }
 
 static LaneEntry *
@@ -122,7 +116,7 @@ my_entries(void)
 	if (nslots == 0)
 		nslots = slot_count();
 	Assert(MyProcNumber >= 0 && MyProcNumber < nslots);
-	return &lanes->entries[MyProcNumber * LANES_PER_BACKEND];
+	return &lanes[MyProcNumber * LANES_PER_BACKEND];
 }
 
 /* (a backend exiting holds no lane) */
@@ -560,7 +554,7 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	LWLockAcquire(ChunkLaneLock, LW_EXCLUSIVE);
 	for (int i = 0; i < nslots * LANES_PER_BACKEND; i++)
 	{
-		LaneEntry  *e = &lanes->entries[i];
+		LaneEntry  *e = &lanes[i];
 
 		if (e->db == MyDatabaseId && e->log == RelationGetRelid(log) && e->lane < nlanes)
 			held[e->lane] = true;
