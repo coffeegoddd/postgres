@@ -146,7 +146,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_rewrite  | mode_is_the_repository               | ok     | 
  engine_rewrite  | no_remotes                           | ok     | 
  engine_rewrite  | low_marks                            | ok     | 
-(133 rows)
+(134 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
