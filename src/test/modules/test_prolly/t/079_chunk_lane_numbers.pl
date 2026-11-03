@@ -101,6 +101,27 @@ $node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
 	't', "the audit passes after VACUUM: no lane's live chunk counted dead");
 
+# a making prepared and rolled back: its number held while prepared (a
+# making meanwhile takes a new one), a hole once rolled back, given again
+# after a VACUUM pass; nothing of the reused lane counted dead
+put_held(11);
+my $q = $node->background_psql('postgres');
+$q->query_safe("BEGIN; SELECT (test_cs_put('pages', d(12))).stored; PREPARE TRANSACTION 'gone'");
+$q->quit;
+put_held(13);
+$node->safe_psql('postgres', "ROLLBACK PREPARED 'gone'");
+put_held(14);
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+put_held(15);
+is($node->safe_psql('postgres', $lanes),
+	'chunks_lane_1 chunks_lane_2 chunks_lane_3 chunks_lane_4 chunks_lane_5 chunks_lane_6 chunks_lane_7 chunks_lane_8 chunks_lane_9',
+	'the rolled-back making\'s number (6) held while prepared (8 and 9 new), then given again');
+is($node->safe_psql('postgres', q{SELECT test_cs_get('pages', h(d(15))) = d(15)}),
+	't', 'the chunk put in the reused lane reads back');
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
+	't', "the audit passes after VACUUM: the rolled-back making's entries out, nothing of the reused lane counted dead");
+
 # a log with lanes, and a lane, not truncated
 $node->safe_psql('postgres', 'CREATE TABLE tl () USING prolly_chunks');
 my $a = $node->background_psql('postgres');

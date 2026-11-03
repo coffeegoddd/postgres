@@ -49,6 +49,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -245,24 +246,31 @@ typedef struct LaneMap
 	Oid			log;			/* the key */
 	uint32		n;
 	Oid		   *relids;			/* InvalidOid: a hole */
+	bool	   *checked;		/* ... its meta page read naming it so, since
+								 * the relation's last invalidation */
 } LaneMap;
 
 static HTAB *lane_maps = NULL;
 
-static void
-map_lanes(Relation log, LaneMap *map)
+/*
+ * (built apart and put in the map after: opening lanes may take in
+ * invalidations, the log's forgetting its map meanwhile)
+ */
+static LaneMap *
+map_lanes(Relation log)
 {
+	LaneMap    *map;
+	Oid		   *relids;
+	bool	   *checked;
 	Relation	dep = table_open(DependRelationId, AccessShareLock);
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tup;
 	uint32		n = ChunkLogLanes(log);
 
-	if (map->relids)
-		pfree(map->relids);
-	map->n = n;
-	map->relids = MemoryContextAllocZero(TopMemoryContext, sizeof(Oid) * Max(n, 1));
-	map->relids[0] = RelationGetRelid(log);
+	relids = MemoryContextAllocZero(TopMemoryContext, sizeof(Oid) * Max(n, 1));
+	checked = MemoryContextAllocZero(TopMemoryContext, sizeof(bool) * Max(n, 1));
+	relids[0] = RelationGetRelid(log);
 	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(RelationRelationId));
 	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
@@ -282,11 +290,17 @@ map_lanes(Relation log, LaneMap *map)
 			continue;
 		if (RelationIsChunkLog(lane) && ChunkLogLaneOf(lane, &number, &parent) &&
 			parent == RelationGetRelid(log) && number > 0 && number < n)
-			map->relids[number] = d->objid;
+			relids[number] = d->objid;
 		relation_close(lane, AccessShareLock);
 	}
 	systable_endscan(scan);
 	table_close(dep, AccessShareLock);
+	forget_lanes(RelationGetRelid(log));
+	map = hash_search(lane_maps, &RelationGetRelid(log), HASH_ENTER, NULL);
+	map->n = n;
+	map->relids = relids;
+	map->checked = checked;
+	return map;
 }
 
 static void
@@ -301,13 +315,42 @@ forget_lanes(Oid log)
 		return;
 	if (map->relids)
 		pfree(map->relids);
+	if (map->checked)
+		pfree(map->checked);
 	(void) hash_search(lane_maps, &log, HASH_REMOVE, NULL);
+}
+
+/*
+ * (a relation invalidated: a log's map forgotten; a lane's checks
+ * forgotten, read again as it is next opened, in case it is gone and its
+ * OID given to another)
+ */
+static void
+lanes_relcache(Datum arg, Oid relid)
+{
+	HASH_SEQ_STATUS seq;
+	LaneMap    *map;
+
+	if (lane_maps == NULL)
+		return;
+	if (!OidIsValid(relid))
+	{
+		hash_seq_init(&seq, lane_maps);
+		while ((map = hash_seq_search(&seq)) != NULL)
+			memset(map->checked, 0, sizeof(bool) * Max(map->n, 1));
+		return;
+	}
+	forget_lanes(relid);
+	hash_seq_init(&seq, lane_maps);
+	while ((map = hash_seq_search(&seq)) != NULL)
+		for (uint32 l = 0; l < map->n; l++)
+			if (map->relids[l] == relid)
+				map->checked[l] = false;
 }
 
 static LaneMap *
 lane_map(Relation log)
 {
-	bool		found;
 	LaneMap    *map;
 
 	if (lane_maps == NULL)
@@ -317,14 +360,10 @@ lane_map(Relation log)
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(LaneMap);
 		lane_maps = hash_create("chunk log lanes", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+		CacheRegisterRelcacheCallback(lanes_relcache, (Datum) 0);
 	}
-	map = hash_search(lane_maps, &RelationGetRelid(log), HASH_ENTER, &found);
-	if (!found)
-	{
-		map->relids = NULL;
-		map_lanes(log, map);
-	}
-	return map;
+	map = hash_search(lane_maps, &RelationGetRelid(log), HASH_FIND, NULL);
+	return map != NULL ? map : map_lanes(log);
 }
 
 /* lane's relation, InvalidOid if it has none; fresh if asked */
@@ -337,7 +376,7 @@ lane_relid_of(Relation log, uint32 lane, bool fresh)
 		return RelationGetRelid(log);
 	map = lane_map(log);
 	if (fresh || lane >= map->n || !OidIsValid(map->relids[lane]))
-		map_lanes(log, map);
+		map = map_lanes(log);
 	return lane < map->n ? map->relids[lane] : InvalidOid;
 }
 
@@ -358,6 +397,7 @@ ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
 {
 	Oid			relid;
 	Relation	rel;
+	LaneMap    *map;
 
 	if (lane == 0)
 		return log;
@@ -373,9 +413,18 @@ ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
 		rel = try_relation_open(relid, lockmode);
 		if (rel == NULL)
 			continue;
+		/* (its meta page read once, until the relation is invalidated) */
+		map = lane_map(log);
+		if (lane < map->n && map->relids[lane] == relid && map->checked[lane])
+			return rel;
 		if (RelationIsChunkLog(rel) && ChunkLogLaneOf(rel, &number, &parent) &&
 			number == lane && parent == RelationGetRelid(log))
+		{
+			map = lane_map(log);
+			if (lane < map->n && map->relids[lane] == relid)
+				map->checked[lane] = true;
 			return rel;
+		}
 		relation_close(rel, lockmode);
 	}
 	return NULL;
