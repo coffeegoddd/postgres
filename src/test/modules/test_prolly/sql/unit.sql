@@ -22,3 +22,10 @@ SELECT * FROM test_prolly_unit_tests('no_such_suite');
 SELECT test_engine_build(1000, false), test_engine_build_finished();
 SELECT test_engine_build(100000, true);
 SELECT test_engine_build_finished();
+
+-- (the engine suites' archives on the history store, its tier, rolled back
+-- with each test, leave the tier's entries dead: vacuumed here, so that
+-- autovacuum does not take them up in a later test that counts on what it
+-- has not vacuumed yet)
+VACUUM pg_history.tier_index;
+VACUUM pg_history.tier_chunks;

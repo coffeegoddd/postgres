@@ -184,3 +184,9 @@ SELECT test_engine_build_finished();
  f
 (1 row)
 
+-- (the engine suites' archives on the history store, its tier, rolled back
+-- with each test, leave the tier's entries dead: vacuumed here, so that
+-- autovacuum does not take them up in a later test that counts on what it
+-- has not vacuumed yet)
+VACUUM pg_history.tier_index;
+VACUUM pg_history.tier_chunks;
