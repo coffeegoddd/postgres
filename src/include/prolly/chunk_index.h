@@ -226,10 +226,12 @@ extern PGDLLIMPORT const ChunkIndexRoutine PageChunkIndex;
 extern bool RelationIsChunkIndex(Relation rel);
 
 /* For the access method: a new index's pages, written to its storage. */
-extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal,
-								  const ChunkFormatRoutine *format);
+/* (format: the name of the format of the chunks it is to name) */
+extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal, const char *format);
 /* The format of the chunks the index names, recorded as it was made. */
 extern const ChunkFormatRoutine *ChunkIndexFormat(Relation idx);
+/* Its name alone (no module's format need be loaded). */
+extern const char *ChunkIndexFormatName(Relation idx);
 
 /*
  * For the access method: takes out the entries of transactions that

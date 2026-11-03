@@ -674,15 +674,3 @@ test_engine_unchunk(PG_FUNCTION_ARGS)
 	memcpy(VARDATA(out), b.data, b.len);
 	PG_RETURN_BYTEA_P(out);
 }
-
-/* test_chunk_index_format(idx regclass) returns text: its chunks' format's name */
-PG_FUNCTION_INFO_V1(test_chunk_index_format);
-Datum
-test_chunk_index_format(PG_FUNCTION_ARGS)
-{
-	Relation	idx = relation_open(PG_GETARG_OID(0), AccessShareLock);
-	const char *name = ChunkIndexFormat(idx)->name;
-
-	relation_close(idx, AccessShareLock);
-	PG_RETURN_TEXT_P(cstring_to_text(name));
-}

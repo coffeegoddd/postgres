@@ -31,7 +31,7 @@ $node->safe_psql('src', q{
 	RESET chunk_format;
 	CREATE TABLE engine_idx () USING prolly_chunk_index;
 });
-my $formats = q{SELECT string_agg(test_chunk_index_format(c::regclass), ' ' ORDER BY c)
+my $formats = q{SELECT string_agg(pg_chunk_index_format(c::regclass), ' ' ORDER BY c)
 	FROM unnest(ARRAY['engine_idx', 'leaf_idx', 'test_idx']) c};
 is($node->safe_psql('src', $formats), 'engine leaf test', 'made in three formats');
 

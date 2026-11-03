@@ -2403,7 +2403,7 @@ const ChunkIndexRoutine *ChunkIndex = &PageChunkIndex;
 /* ------------------------------------------------------- storage */
 
 void
-ChunkIndexInitStorage(SMgrRelation srel, bool use_wal, const ChunkFormatRoutine *format)
+ChunkIndexInitStorage(SMgrRelation srel, bool use_wal, const char *format)
 {
 	BulkWriteState *bulk = smgr_bulk_start_smgr(srel, MAIN_FORKNUM, use_wal);
 	BulkWriteBuffer buf;
@@ -2424,7 +2424,7 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal, const ChunkFormatRoutine 
 	meta->log = InvalidOid;
 	meta->log_stamp = 0;
 	meta->nmarks = 0;
-	strlcpy(meta->format, format->name, CHUNK_FORMAT_NAMELEN);
+	strlcpy(meta->format, format, CHUNK_FORMAT_NAMELEN);
 	meta->ndir = 1;
 	meta->dir[0] = 1;
 	set_meta_lower(page, meta);
@@ -3430,4 +3430,14 @@ ChunkIndexFormat(Relation idx)
 	if (cache->format == NULL)
 		cache->format = ChunkFormatNamed(cache->format_name);
 	return cache->format;
+}
+
+/*
+ * The name of that format, as recorded: what needs no reading of a chunk
+ * (pg_dump, TRUNCATE) needs no module's format loaded.
+ */
+const char *
+ChunkIndexFormatName(Relation idx)
+{
+	return get_cache(idx)->format_name;
 }

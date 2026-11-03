@@ -671,8 +671,3 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT IMMUTABLE;
 CREATE FUNCTION test_engine_unchunk(chunk bytea)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
-
--- The format of the chunks a chunk index names, recorded as it was made.
-CREATE FUNCTION test_chunk_index_format(idx regclass)
-RETURNS text
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;

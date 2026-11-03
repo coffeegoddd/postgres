@@ -37,7 +37,6 @@ $node->safe_psql('postgres', q{
 	-- branch's pointer moved to it
 	CREATE FUNCTION commit_to(branch text, a int, b int, c int) RETURNS void LANGUAGE plpgsql AS $$
 	BEGIN
-		PERFORM test_chunk_format_refs(true);
 		-- (the leaves in their names' order, as a pack puts them: two
 		-- commits putting two leaves new to the store each in the other's
 		-- order would wait for each other's, as inserts into a unique index)
@@ -46,7 +45,6 @@ $node->safe_psql('postgres', q{
 		PERFORM test_cs_put('pages', node(leaf(a), leaf(b), leaf(c)));
 		UPDATE pg_history.pointers SET hash = h(node(leaf(a), leaf(b), leaf(c))) WHERE name = branch;
 	END$$;
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put('pages', leaf(0));
 	INSERT INTO pg_history.pointers SELECT 'b' || i, h(leaf(0)) FROM generate_series(1, 16) i;
 });
@@ -66,20 +64,15 @@ $node->pgbench(
 SELECT commit_to('b' || :branch, :a, :b, :c);
 },
 		'066_free@1' => q{
-SELECT test_chunk_format_refs(true), test_cs_free_unheld('pages');
+SELECT test_cs_free_unheld('pages');
 },
-		# (VACUUM's session of the test format too: a session of the leaf
-		# format would start a freer of it, which frees a parent letting go
-		# of none of its references, which stay counted)
 		'066_vacuum@1' => q{
-SELECT test_chunk_format_refs(true);
 VACUUM pg_history.chunk_index;
 },
 	});
 
-my $refs = 'SELECT test_chunk_format_refs(true);';
 my $q = sub {
-	my $out = $node->safe_psql('postgres', "$refs $_[0]");
+	my $out = $node->safe_psql('postgres', $_[0]);
 	$out =~ s/^\n//;
 	return $out;
 };
@@ -91,7 +84,7 @@ is($q->(q{SELECT count(*) FILTER (WHERE test_cs_has('pages', hash)
 
 # what nobody holds freed, and taken out: what is left the pointers' alone
 $q->(q{SELECT test_cs_free_unheld('pages')});
-$node->safe_psql('postgres', "$refs VACUUM pg_history.chunk_index");
+$node->safe_psql('postgres', "VACUUM pg_history.chunk_index");
 is($q->(q{SELECT ok || ' ' || unheld || ' ' || coalesce(why, '') FROM test_cs_check('pages')}), 'true 0 ',
 	'nothing unheld left, the audit clean');
 is($q->(q{SELECT (SELECT chunks FROM test_cs_check('pages')) =

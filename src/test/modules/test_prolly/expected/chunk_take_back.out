@@ -6,16 +6,6 @@ test_cs_ref_root
                 
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 step a_begin: BEGIN;
 step a_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent()));
 stored
@@ -45,8 +35,8 @@ refs|roots
    1|    1
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
+test_cs_free
+------------
+           2
 (1 row)
 

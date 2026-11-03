@@ -55,7 +55,6 @@ step b_free		{
 	SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')]) AS freed;
 }
 step b_parent	{
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
 		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pack_parent(), '\x0a0201']) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
@@ -64,7 +63,6 @@ step b_leaf		{
 }
 step b_free_parent	{
 	SELECT test_cs_free('pages', ARRAY[pack_h(pack_parent())]) AS freed;
-	SELECT test_chunk_format_refs(false);
 }
 
 session c

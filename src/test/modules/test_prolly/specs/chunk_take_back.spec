@@ -16,14 +16,12 @@ setup
 
 teardown
 {
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_unref_root('pages', tb_h('\x0a0601'));
 	SELECT test_cs_free('pages', ARRAY[tb_h(tb_parent()), tb_h('\x0a0601')]);
-	SELECT test_chunk_format_refs(false);
 }
 
 session a
-setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
+setup		{ SET chunk_free_in_background = off; }
 step a_begin	{ BEGIN; }
 step a_put		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent())); }
 step a_commit	{ COMMIT; }
@@ -35,7 +33,7 @@ step u_unref	{ SELECT test_cs_unref_root('pages', tb_h('\x0a0601')); }
 step u_rollback	{ ROLLBACK; }
 
 session t
-setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
+setup		{ SET chunk_free_in_background = off; }
 step t_put		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent())); }
 step t_counts	{ SELECT refs, roots FROM test_cs_counts('pages', tb_h('\x0a0601')); }
 

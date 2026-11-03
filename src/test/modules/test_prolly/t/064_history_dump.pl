@@ -116,14 +116,12 @@ $snap->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 my $snapshot = $snap->query_safe('SELECT pg_export_snapshot()');
 $node->safe_psql('src', q{
 	DELETE FROM pg_history.pointers WHERE name = 'deep';
-	SELECT test_chunk_format_refs(true);
 });
-my $freed = $node->safe_psql('src', q{SELECT test_chunk_format_refs(true); SELECT test_cs_free_unheld('pages')});
-$freed =~ s/^\n//;
+my $freed = $node->safe_psql('src', q{SELECT test_cs_free_unheld('pages')});
 cmp_ok($freed, '>=', 21, 'the deep chain, and the loose leaf, freed after the snapshot');
 # (and chunks put after it, a parent and its leaf, which VACUUM sees
 # committed: not the snapshot's, nor in the dump)
-$node->safe_psql('src', q{SELECT test_chunk_format_refs(true);
+$node->safe_psql('src', q{
 	SELECT test_cs_put('pages', leaf(7000)), test_cs_put('pages', node(leaf(7000)))});
 $node->safe_psql('src', 'VACUUM pg_history.chunk_index');
 $node->command_ok([ 'pg_dump', '--format' => 'custom', '--snapshot' => $snapshot,

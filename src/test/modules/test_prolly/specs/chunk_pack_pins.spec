@@ -33,7 +33,6 @@ step p_pack_again	{
 		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored_again;
 }
 step p_parents	{
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x5201'::bytea || pack_h('\x50'::bytea || int4send(i)))
 			FROM generate_series(1, 3000) i ORDER BY i),
@@ -43,7 +42,6 @@ step p_parents	{
 step p_free_parents	{
 	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x5201'::bytea || pack_h('\x50'::bytea || int4send(i)))
 		FROM generate_series(1, 3000) i)) AS freed;
-	SELECT test_chunk_format_refs(false);
 }
 step p_commit	{ COMMIT; }
 step p_free		{

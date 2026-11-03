@@ -8,12 +8,6 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
-SELECT test_chunk_format_refs(true);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-
 -- (chunks of the test format, put and read as the history store's, the
 -- engine's: d's hash as one)
 CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
@@ -841,9 +835,3 @@ SELECT pg_history_release('tree') AS freed;
 (1 row)
 
 VACUUM pg_history.tier_index;
-SELECT test_chunk_format_refs(false);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-

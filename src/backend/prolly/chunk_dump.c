@@ -490,7 +490,8 @@ pg_chunk_index_format(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a chunk index", RelationGetRelationName(idx))));
-	name = pstrdup(ChunkIndexFormat(idx)->name);
+	/* (the name recorded: no module's format need be loaded to dump it) */
+	name = pstrdup(ChunkIndexFormatName(idx));
 	relation_close(idx, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(name));
 }

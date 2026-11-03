@@ -7,7 +7,6 @@
 -- nothing else holds; and a fetch copies a bundle back.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 SET chunk_free_in_background = off;
-SELECT test_chunk_format_refs(true);
 -- (chunks of the test format, put and read as the history store's, the
 -- engine's: d's hash as one)
 CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
@@ -311,4 +310,3 @@ ROLLBACK;
 SELECT pg_history_release('tree') AS freed;
 VACUUM pg_history.tier_index;
 
-SELECT test_chunk_format_refs(false);

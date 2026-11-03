@@ -109,17 +109,11 @@ t
 (1 row)
 
 step b_parent: 
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
 		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pack_parent(), '\x0a0201']) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step a_commit: COMMIT;
 step b_parent: <... completed>
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 stored
 ------
      1
@@ -135,16 +129,10 @@ refs|roots
 
 step b_free_parent: 
 	SELECT test_cs_free('pages', ARRAY[pack_h(pack_parent())]) AS freed;
-	SELECT test_chunk_format_refs(false);
 
 freed
 -----
     2
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
 (1 row)
 
 
@@ -162,17 +150,11 @@ t
 (1 row)
 
 step b_parent: 
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
 		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pack_parent(), '\x0a0201']) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step a_rollback: ROLLBACK;
 step b_parent: <... completed>
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 stored
 ------
      2
@@ -188,16 +170,10 @@ refs|roots
 
 step b_free_parent: 
 	SELECT test_cs_free('pages', ARRAY[pack_h(pack_parent())]) AS freed;
-	SELECT test_chunk_format_refs(false);
 
 freed
 -----
     2
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
 (1 row)
 
 

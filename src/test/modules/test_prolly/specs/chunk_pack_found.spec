@@ -17,7 +17,6 @@ setup
 		AS $$SELECT '\x5201'::bytea || pf_h('\x0a0901')$$;
 	CREATE OR REPLACE FUNCTION pf_p2() RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT '\x5202'::bytea || pf_h('\x0a0901') || pf_h('\x0a0902')$$;
-	SELECT test_chunk_format_refs(true);
 	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0901'));
 	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0902'));
 	SELECT stored FROM test_cs_put('pages', test_engine_chunk(pf_p1()));
@@ -26,16 +25,13 @@ setup
 
 teardown
 {
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_free('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()),
 		pf_h('\x0a0901'), pf_h('\x0a0902')]);
-	SELECT test_chunk_format_refs(false);
 }
 
 session p
 setup		{
 	SET chunk_free_in_background = off;
-	SELECT test_chunk_format_refs(true);
 	SELECT injection_points_set_local();
 }
 step p_attach	{ SELECT injection_points_attach('chunk-pack-found', 'wait'); }
@@ -48,7 +44,7 @@ step p_packed	{ SELECT 'packed' AS p; }
 step p_commit	{ COMMIT; SELECT injection_points_detach('chunk-pack-found'); }
 
 session q
-setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
+setup		{ SET chunk_free_in_background = off; }
 step q_begin	{ BEGIN; }
 step q_pack		{
 	SELECT test_cs_put_many('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()), pf_h('\x0a0901')],
@@ -57,7 +53,7 @@ step q_pack		{
 step q_commit	{ COMMIT; }
 
 session o
-setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
+setup		{ SET chunk_free_in_background = off; }
 step o_free_p1	{ SELECT test_cs_free('pages', ARRAY[pf_h(pf_p1())]) AS freed_p1; }
 step o_wake		{ SELECT injection_points_wakeup('chunk-pack-found'); }
 step o_free_all	{
