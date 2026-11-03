@@ -786,7 +786,12 @@ branch_name_ok(const char *name)
 	return name[0] != '\0' && strlen(name) <= NAMEDATALEN - 1;
 }
 
-/* A branch's chunk, of its head, working root and merge state. */
+/*
+ * A branch's chunk, of its head, working root and merge state, and its
+ * name: no two branches share one, so moving one branch's reference lets
+ * go of a chunk no other's holds (letting go of a root waits for any other
+ * transaction changing that chunk's counts).
+ */
 static PHash
 branch_put(ProllyCtx *ctx, const VcBranch *b)
 {
@@ -800,6 +805,8 @@ branch_put(ProllyCtx *ctx, const VcBranch *b)
 	buf_append_byte(&buf, b->merging ? 1 : 0);
 	if (b->merging)
 		buf_append(&buf, b->merge_head.b, PHASH_LEN);
+	buf_append_uvarint(&buf, strlen(b->name));
+	buf_append(&buf, b->name, strlen(b->name));
 	vc_must(ctx, prolly_put_chunk(ctx, buf.data, buf.len, &h));
 	buf_free(&buf);
 	return h;
@@ -812,10 +819,22 @@ branch_decode(ProllyCtx *ctx, const PHash *h, VcBranch *b)
 	uint8	   *d = cs_get(ctx->cs, h->b, &len);
 	VcCommit	c;
 	char		hex[PHASH_HEX_LEN + 1];
+	const uint8 *p,
+			   *end;
+	uint64		nl = 0;
+	bool		ok;
 
-	if (d == NULL || len < 2 + 2 * PHASH_LEN + 1 || d[0] != CHUNK_TAG_BRANCH ||
-		d[1] != CHUNK_FORMAT_VERSION || d[2 + 2 * PHASH_LEN] > 1 ||
-		len != 2 + 2 * PHASH_LEN + 1 + (d[2 + 2 * PHASH_LEN] ? PHASH_LEN : 0))
+	/* (fixed fields, then the name, which must be the branch's own) */
+	ok = d != NULL && len >= 2 + 2 * PHASH_LEN + 1 && d[0] == CHUNK_TAG_BRANCH &&
+		d[1] == CHUNK_FORMAT_VERSION && d[2 + 2 * PHASH_LEN] <= 1;
+	if (ok)
+	{
+		p = d + 3 + 2 * PHASH_LEN + (d[2 + 2 * PHASH_LEN] ? PHASH_LEN : 0);
+		end = d + len;
+		ok = p <= end && read_uvarint(&p, end, &nl) && nl == (uint64) (end - p) &&
+			nl == strlen(b->name) && memcmp(p, b->name, nl) == 0;
+	}
+	if (!ok)
 	{
 		phash_hex(h, hex);
 		ereport(ERROR,
@@ -953,11 +972,21 @@ unique_clock(VcRepo *r)
 void
 vc_repo_open(VcRepo *r, ChunkStore *cs, VcRefs *refs, const ChunkPolicy *policy)
 {
+	vc_repo_open_clock(r, cs, refs, policy, NULL, NULL);
+}
+
+void
+vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
+				   const ChunkPolicy *policy, uint64 (*now) (void *arg),
+				   void *now_arg)
+{
 	VcBranch	main;
 
 	memset(r, 0, sizeof(*r));
 	prolly_ctx_init(&r->ctx, cs, policy);
 	r->refs = refs;
+	r->now = now;
+	r->now_arg = now_arg;
 	r->cur = pstrdup("main");
 	if (!branch_read(r, "main", false, &main))
 	{
@@ -1204,6 +1233,25 @@ vc_reset_hard(VcRepo *r, const PHash *commit)
 	b.head = *commit;
 	b.head_root = c.root;
 	b.working = c.root;
+	b.merging = false;
+	branch_write(r, &b);
+	vc_branch_free(&b);
+	vc_commit_release(&c);
+	return VC_OK;
+}
+
+int
+vc_reset_soft(VcRepo *r, const PHash *commit)
+{
+	VcBranch	b;
+	VcCommit	c;
+	int			rc;
+
+	if ((rc = reach_commit(r, commit, VC_WINDOW_ONLY, &c)) != VC_OK)
+		return rc;
+	lock_head(r, &b);
+	b.head = *commit;
+	b.head_root = c.root;
 	b.merging = false;
 	branch_write(r, &b);
 	vc_branch_free(&b);

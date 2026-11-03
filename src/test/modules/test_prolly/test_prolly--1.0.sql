@@ -560,3 +560,57 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_engine_build_finished()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Version control on this database's history store and its references
+-- (pg_history.pointers), for tests of many backends at once.  Each call
+-- views the repository afresh, on the branch it names; a commit writes one
+-- row of table t, keyed by its message.
+
+-- The repository, made if new (with init_time > 0, its init commit made at
+-- that time, in microseconds).
+CREATE FUNCTION test_vc_open(init_time int8 DEFAULT 0)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- A row written on the branch's working set and committed, with msg.
+CREATE FUNCTION test_vc_commit(branch text, msg text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- A branch made at from's head; false if there is one already.
+CREATE FUNCTION test_vc_branch(name text, "from" text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_vc_branch_delete(name text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- The branch reset (hard, or soft) to the commit on its line with message
+-- to_msg, found as the call begins.
+CREATE FUNCTION test_vc_reset(branch text, to_msg text, hard bool)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- The messages of the branch's first-parent line, newest first; NULL if
+-- there is no such branch.
+CREATE FUNCTION test_vc_log(branch text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Whether the branch's working set has the row a commit with msg writes.
+CREATE FUNCTION test_vc_working_has(branch text, msg text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Whether the branch's head has its reference (the window keeps it).
+CREATE FUNCTION test_vc_head_in_window(branch text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Every reference of version control removed, and what nothing holds then
+-- freed by the engine's chunk formats: the history store as a test found
+-- it.  How many chunks were freed.
+CREATE FUNCTION test_vc_clear()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

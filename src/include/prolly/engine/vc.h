@@ -188,6 +188,10 @@ extern int	vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
  */
 extern void vc_repo_open(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 						 const ChunkPolicy *policy);
+/* vc_repo_open with the clock commits read, the init's too (for tests). */
+extern void vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
+							   const ChunkPolicy *policy,
+							   uint64 (*now) (void *arg), void *now_arg);
 extern void vc_repo_free(VcRepo *r);
 /* The branch, false if there is none; vc_branch_free frees out's name. */
 extern bool vc_branch_get(VcRepo *r, const char *name, VcBranch *out);
@@ -216,6 +220,15 @@ extern PHash vc_commit(VcRepo *r, const char *msg);
  */
 extern PHash vc_commit_root(VcRepo *r, const PHash *root, const char *msg);
 extern int	vc_reset_hard(VcRepo *r, const PHash *commit);
+
+/*
+ * Moves the branch's head to commit and leaves its working root alone (a
+ * pending merge is let go of): what the working root has beyond commit is
+ * then uncommitted.  As every call that changes a branch, it locks the
+ * branch before it reads it: a commit made meanwhile is not lost to a
+ * head read before it.
+ */
+extern int	vc_reset_soft(VcRepo *r, const PHash *commit);
 extern int	vc_merge(VcRepo *r, const char *branch, VcMergeResult *res);
 extern void vc_merge_result_free(VcMergeResult *res);
 

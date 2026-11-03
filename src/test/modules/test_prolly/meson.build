@@ -14,6 +14,7 @@ test_prolly_sources = files(
   'unit_engine_lifetime.c',
   'unit_engine_prolly.c',
   'unit_engine_vc.c',
+  'vc_sql.c',
   'unit_bufmgr.c',
   'unit_harness.c',
   'unit_registry.c',
@@ -57,6 +58,9 @@ test_prolly_isolation = [
 if get_option('injection_points')
   test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error', 'chunk_pack_found', 'chunk_pack_extend', 'chunk_tier_table', 'object_store_race']
 endif
+# (last: version control's commits grow the history store's index, which
+# the injection points above, at its splits, need as they leave it)
+test_prolly_isolation += ['vc_branch_races', 'vc_open_race']
 
 tests += {
   'name': 'test_prolly',
@@ -178,6 +182,7 @@ tests += {
       't/074_tier_manifest_crash.pl',
       't/075_history_dump_tier.pl',
       't/076_chunk_free_marked.pl',
+      't/077_vc_many_backends.pl',
       't/078_chunk_lanes.pl',
       't/079_chunk_lane_numbers.pl',
       't/080_chunk_lane_compaction.pl',

@@ -265,7 +265,14 @@ branch_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 			return false;
 		fn(arg, &h, true);
 	}
-	return p == end;
+	/* the branch's name */
+	{
+		uint64		nl;
+
+		if (!read_uvarint(&p, end, &nl) || nl != (uint64) (end - p))
+			return false;
+	}
+	return true;
 }
 
 bool

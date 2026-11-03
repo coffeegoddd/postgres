@@ -16,6 +16,7 @@ OBJS = \
 	unit_engine_lifetime.o \
 	unit_engine_prolly.o \
 	unit_engine_vc.o \
+	vc_sql.o \
 	unit_bufmgr.o \
 	unit_harness.o \
 	unit_registry.o \
@@ -57,3 +58,6 @@ endif
 ifeq ($(enable_injection_points),yes)
 ISOLATION += chunk_pack_order chunk_pack_error chunk_pack_found chunk_pack_extend chunk_tier_table object_store_race
 endif
+# (last: version control's commits grow the history store's index, which
+# the injection points above, at its splits, need as they leave it)
+ISOLATION += vc_branch_races vc_open_race
