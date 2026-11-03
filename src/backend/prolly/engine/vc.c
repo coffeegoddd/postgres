@@ -2102,10 +2102,13 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32 *seg_out)
 
 	/*
 	 * The commits with references, listed before the heads are read: a
-	 * commit adds its own reference before it moves its branch, so one
-	 * landing after the listing is not in it, and one landing before is
-	 * in it and seen as its branch's head.  (Read the other way round, a
-	 * commit landing between would be listed but not a head: cut.)
+	 * commit's reference and its branch's move become visible together,
+	 * as its transaction commits, so one committing after the listing is
+	 * not in it (nothing of it cut), and one committing before is in it
+	 * and its branch's move seen by the heads' read, which come after:
+	 * the head, or (if the branch has moved on since) behind it, where
+	 * the window decides as for any.  (Read the other way round, a commit
+	 * committing between would be listed but its head unseen: cut.)
 	 */
 	vc_refs_list(r->refs, COMMIT_REF_PREFIX, held_fn, &held);
 	INJECTION_POINT("vc-sever-listed", NULL);

@@ -1,7 +1,8 @@
 # A commit landing while a sever runs, between its listing of the commits'
 # references and its reading of the heads: the sever lists before it reads,
-# and a commit adds its own reference before it moves its branch, so the
-# new head is in neither its listing nor its cut, and keeps its reference.
+# and a commit's reference and its branch's move become visible together
+# as its transaction commits, so the new head is in neither the listing
+# nor the cut, and keeps its reference.
 
 setup
 {
