@@ -2669,7 +2669,9 @@ lane_bind_index(Relation log, Oid index)
 /*
  * (a log's lanes' counts summed: compaction moves into the compacting
  * backend's own lane, whichever it is, where room free in others' lanes is
- * none; so it may grow that lane by a segment, room free in it used first)
+ * none; so it may grow that lane by a segment, room free in it used first.
+ * A log of lane 0 alone too: the freer, lane 0 held by another, makes a
+ * lane of its own, empty)
  */
 static void
 lanes_may_grow(ChunkLogSegments *out)
@@ -2842,8 +2844,9 @@ lane_vacuum_end(Relation log, void *state, bool truncate, double fraction,
 			continue;
 		bits = ChunkLogPendingBits(npending, pending_locs, pending_lens, lane,
 								   page_segment_bytes(rel),
-								   sw != NULL && lane < sw->n ? sw->segments[lane] :
-								   page_end(rel) / page_segment_bytes(rel) + 1,
+								   /* (a lane made during the pass: all its segments grown meanwhile) */
+								   sw == NULL ? page_end(rel) / page_segment_bytes(rel) + 1 :
+								   lane < sw->n ? sw->segments[lane] : 0,
 								   &nbits);
 
 		page_vacuum_end(rel, sw != NULL && lane < sw->n ? sw->states[lane] : NULL,
