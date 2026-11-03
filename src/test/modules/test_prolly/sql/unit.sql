@@ -16,3 +16,9 @@ SELECT suite, test, result FROM test_prolly_unit_tests('harness');
 SELECT count(*) AS failures FROM test_prolly_unit_tests() WHERE result <> 'ok';
 
 SELECT * FROM test_prolly_unit_tests('no_such_suite');
+
+-- the engine's long operations check for interrupts: a build of many rows,
+-- cancelled as it begins, cut short (not run to its end)
+SELECT test_engine_build(1000, false), test_engine_build_finished();
+SELECT test_engine_build(100000, true);
+SELECT test_engine_build_finished();

@@ -34,7 +34,23 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  smgr          | md_hooks_do_nothing            | ok     | 
  branch_filter | rows_naming_objects            | ok     | 
  branch_filter | which_scans_filter             | ok     | 
-(22 rows)
+ engine_prolly | sha256_vectors                 | ok     | 
+ engine_prolly | empty_map                      | ok     | 
+ engine_prolly | random_edits_small_chunks      | ok     | 
+ engine_prolly | random_edits_default_chunks    | ok     | 
+ engine_prolly | single_key_edits               | ok     | 
+ engine_prolly | history_independence           | ok     | 
+ engine_prolly | iter_from_key                  | ok     | 
+ engine_prolly | diff_matches_model             | ok     | 
+ engine_prolly | merge                          | ok     | 
+ engine_prolly | merge_grafts                   | ok     | 
+ engine_prolly | structural_sharing             | ok     | 
+ engine_prolly | scaling                        | ok     | 
+ engine_prolly | merge_frees_its_copies         | ok     | 
+ engine_prolly | iter_across_context_resets     | ok     | 
+ engine_prolly | corrupt_delta_count            | ok     | 
+ engine_prolly | short_value_refused            | ok     | 
+(38 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
@@ -57,3 +73,19 @@ SELECT count(*) AS failures FROM test_prolly_unit_tests() WHERE result <> 'ok';
 
 SELECT * FROM test_prolly_unit_tests('no_such_suite');
 ERROR:  unit test suite "no_such_suite" does not exist
+-- the engine's long operations check for interrupts: a build of many rows,
+-- cancelled as it begins, cut short (not run to its end)
+SELECT test_engine_build(1000, false), test_engine_build_finished();
+ test_engine_build | test_engine_build_finished 
+-------------------+----------------------------
+              1000 | t
+(1 row)
+
+SELECT test_engine_build(100000, true);
+ERROR:  canceling statement due to user request
+SELECT test_engine_build_finished();
+ test_engine_build_finished 
+----------------------------
+ f
+(1 row)
+

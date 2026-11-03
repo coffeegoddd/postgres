@@ -38,6 +38,7 @@ SUBDIRS = \
 	partitioning \
 	postmaster \
 	prolly \
+	prolly/engine \
 	regex \
 	replication \
 	rewrite \

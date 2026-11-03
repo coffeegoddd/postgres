@@ -160,7 +160,7 @@ patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource m
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode; also (2) ChunkLog and ChunkIndex in the rmgr list
 patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
-patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
+patch src/include/Makefile     0  installs the engine's headers in src/include/prolly (and prolly/engine)
 patch src/include/access/heapam.h  1b  heap and index scans remember the branch whose catalog rows they see
 patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET, reusing the value 0x40 that upstream freed when it removed XLOG_HEAP2_VISIBLE
 patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager; also (2) RM_CHUNK_LOG_ID, RM_CHUNK_INDEX_ID
