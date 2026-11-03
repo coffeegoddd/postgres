@@ -820,18 +820,18 @@ edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version
 }
 
 /*
- * test_vc_round_trip(branch text, pushed text, fetched text) returns bytea:
- * the repository cloned into a memory store of this call's own, a commit
- * there (message pushed) pushed back to the branch, and another (fetched)
- * fetched from it; the fetched commit's hash.  The history store has what
- * it was sent, by the push and by the fetch, as its transaction commits.
+ * test_vc_round_trip(branch text, msg text) returns bytea: the repository
+ * cloned into a memory store of this call's own, there a commit (message
+ * msg || ' pushed') pushed back to the branch, another (' fetched') fetched
+ * from it, and one more there (' theirs') pulled into the branch after one
+ * of its own (' ours'), a merge; the fetched commit's hash.  The history
+ * store has what each sent it as its transaction commits.
  */
 Datum
 test_vc_round_trip(PG_FUNCTION_ARGS)
 {
 	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *pushed = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *fetched = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *msg = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	bytea	   *out = palloc(VARHDRSZ + PHASH_LEN);
 	VcRepo		r;
 
@@ -841,32 +841,49 @@ test_vc_round_trip(PG_FUNCTION_ARGS)
 		ChunkStore *mcs = MemoryChunkStoreCreate();
 		VcRepo		laptop;
 		VcBranch	b;
+		VcMergeResult mr;
 		PHash		sent,
 					got;
+		int			rc;
 
-		PG_TRY();
+		PG_TRY(2);
 		{
-			if (vc_repo_clone(&laptop, mcs, VcRefsOpen("memory", mcs), &prolly_default_policy,
-							  &r, 0) != VC_OK)
-				elog(ERROR, "the repository not cloned");
+			rc = vc_repo_clone(&laptop, mcs, VcRefsOpen("memory", mcs), &prolly_default_policy,
+							   &r, 0);
+			if (rc != VC_OK)
+				elog(ERROR, "the repository not cloned: %d", rc);
 			vc_repo_set_name(&laptop, "laptop");
-			sent = commit_msg(&laptop, branch, pushed);
-			if (vc_push(&laptop, &r, branch) != VC_OK)
-				elog(ERROR, "\"%s\" not pushed", pushed);
+
+			sent = commit_msg(&laptop, branch, psprintf("%s pushed", msg));
+			if ((rc = vc_push(&laptop, &r, branch)) != VC_OK)
+				elog(ERROR, "the push refused: %d", rc);
 			if (!vc_branch_get(&r, branch, &b) || !phash_eq(&b.head, &sent))
 				elog(ERROR, "the push did not move \"%s\"", branch);
 			vc_branch_free(&b);
-			sent = commit_msg(&laptop, branch, fetched);
-			if (vc_fetch(&r, &laptop, branch, &got) != VC_OK || !phash_eq(&got, &sent))
-				elog(ERROR, "\"%s\" not fetched", fetched);
+
+			sent = commit_msg(&laptop, branch, psprintf("%s fetched", msg));
+			if ((rc = vc_fetch(&r, &laptop, branch, &got)) != VC_OK)
+				elog(ERROR, "the fetch refused: %d", rc);
+			if (!phash_eq(&got, &sent))
+				elog(ERROR, "the fetch brought another head");
 			memcpy(VARDATA(out), got.b, PHASH_LEN);
+
+			(void) commit_msg(&r, branch, psprintf("%s ours", msg));
+			(void) commit_msg(&laptop, branch, psprintf("%s theirs", msg));
+			if ((rc = vc_pull(&r, &laptop, branch, 0, &mr)) != VC_OK)
+				elog(ERROR, "the pull refused: %d", rc);
+			if (mr.status != VC_MERGE_COMMITTED)
+				elog(ERROR, "the pull did not merge");
+			vc_merge_result_free(&mr);
 			vc_repo_free(&laptop);
 		}
-		PG_FINALLY();
+		PG_FINALLY(2);
 		{
+			/* (the store's references go with it: another call's may take its place) */
+			MemoryVcRefsForget(mcs);
 			MemoryChunkStoreDestroy(mcs);
 		}
-		PG_END_TRY();
+		PG_END_TRY(2);
 	});
 	PG_RETURN_BYTEA_P(out);
 }
