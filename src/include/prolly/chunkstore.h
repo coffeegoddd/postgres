@@ -50,6 +50,7 @@
 #ifndef PROLLY_CHUNKSTORE_H
 #define PROLLY_CHUNKSTORE_H
 
+#include "prolly/chunk_format.h"
 #include "prolly/chunk_index.h"
 
 #define CHUNK_STORE_IFACE	"chunk_store"
@@ -89,6 +90,9 @@ typedef struct ChunkStoreRoutine
 
 	/* The store, for this backend. */
 	ChunkStore *(*open) (void);
+
+	/* The format the store reads its chunks' references by. */
+	const ChunkFormatRoutine *(*format) (ChunkStore *cs);
 
 	bool		(*has) (ChunkStore *cs, const uint8 *hash);
 
@@ -206,6 +210,12 @@ extern void MemoryChunkStoreEndHolds(ChunkStore *cs);
 extern void MemoryChunkStoreDrop(ChunkStore *cs, const uint8 *hash);
 extern void MemoryChunkStoreDamage(ChunkStore *cs, const uint8 *hash,
 									uint32 at);
+
+static inline const ChunkFormatRoutine *
+cs_format(ChunkStore *cs)
+{
+	return cs->routine->format(cs);
+}
 
 static inline bool
 cs_has(ChunkStore *cs, const uint8 *hash)

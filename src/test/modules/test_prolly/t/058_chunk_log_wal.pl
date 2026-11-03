@@ -17,7 +17,9 @@ use Test::More;
 my $primary = PostgreSQL::Test::Cluster->new('log_wal_primary');
 # (without checksums or wal_log_hints, whose hint records would carry the
 # free space map's pages to the standby now and then)
-$primary->init(allows_streaming => 1, extra => ['--no-data-checksums']);
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$primary->init(allows_streaming => 1, extra => ['-c', 'chunk_format=leaf', '--no-data-checksums']);
 $primary->append_conf('postgresql.conf', qq{
 autovacuum = off
 chunk_free_in_background = off

@@ -20,9 +20,11 @@
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_pin.h"
 #include "prolly/chunk_store.h"
+#include "prolly/engine/chunkfmt.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/rel.h"
@@ -205,11 +207,71 @@ leaf_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
 }
 
 const ChunkFormatRoutine LeafChunkFormat = {
+	.name = "leaf",
 	.refs = leaf_refs,
 };
 
 const ChunkFormatRoutine *ChunkFormat = &LeafChunkFormat;
-const ChunkFormatRoutine *ChunkFormatConfigured = &LeafChunkFormat;
+char	   *chunk_format_name = NULL;
+
+#define MAX_CHUNK_FORMATS 16
+
+static const ChunkFormatRoutine *chunk_formats[MAX_CHUNK_FORMATS] = {
+	&LeafChunkFormat, &EngineChunkFormat,
+};
+static int	nchunk_formats = 2;
+
+void
+ChunkFormatRegister(const ChunkFormatRoutine *format)
+{
+	if (format->name == NULL || format->name[0] == '\0' ||
+		strlen(format->name) >= CHUNK_FORMAT_NAMELEN)
+		elog(ERROR, "a chunk format's name is 1 to %d bytes", CHUNK_FORMAT_NAMELEN - 1);
+	for (int i = 0; i < nchunk_formats; i++)
+		if (strcmp(chunk_formats[i]->name, format->name) == 0)
+		{
+			if (chunk_formats[i] == format)
+				return;
+			elog(ERROR, "chunk format \"%s\" is registered already", format->name);
+		}
+	if (nchunk_formats == MAX_CHUNK_FORMATS)
+		elog(ERROR, "at most %d chunk formats are registered", MAX_CHUNK_FORMATS);
+	chunk_formats[nchunk_formats++] = format;
+}
+
+const ChunkFormatRoutine *
+ChunkFormatFind(const char *name)
+{
+	for (int i = 0; i < nchunk_formats; i++)
+		if (strcmp(chunk_formats[i]->name, name) == 0)
+			return chunk_formats[i];
+	return NULL;
+}
+
+const ChunkFormatRoutine *
+ChunkFormatNamed(const char *name)
+{
+	const ChunkFormatRoutine *f = ChunkFormatFind(name);
+
+	if (f == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("there is no chunk format \"%s\"", name),
+				 errhint("A module's format is there once the module is loaded.")));
+	return f;
+}
+
+bool
+check_chunk_format(char **newval, void **extra, GucSource source)
+{
+	/* (a module's format may be named before the module is loaded) */
+	if (*newval == NULL || (*newval)[0] == '\0' || strlen(*newval) >= CHUNK_FORMAT_NAMELEN)
+	{
+		GUC_check_errdetail("A chunk format's name is 1 to %d bytes.", CHUNK_FORMAT_NAMELEN - 1);
+		return false;
+	}
+	return true;
+}
 
 typedef struct RefList
 {
@@ -444,7 +506,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	 * meanwhile, and no pin is needed), taken back if another puts the
 	 * chunk first; an abort, or a crash, takes them back with the chunk
 	 */
-	ChunkFormat->refs(data, len, add_ref, &refs);
+	ChunkIndexFormat(idx)->refs(data, len, add_ref, &refs);
 	check_refs(idx, hash, &refs, NULL, NULL);
 	for (int i = 0; i < refs.n; i++)
 	{
@@ -543,7 +605,7 @@ hold_found(Relation idx, int n, const uint8 *hashes, const void *const *datas,
 	{
 		if (!has[i])
 			continue;
-		ChunkFormat->refs(datas[i], lens[i], add_ref, &kids[i]);
+		ChunkIndexFormat(idx)->refs(datas[i], lens[i], add_ref, &kids[i]);
 		for (int r = 0; r < kids[i].n; r++)
 		{
 			PackChunk  *pc = hash_search(pack, kids[i].hashes + r * CHUNK_HASH_LEN,
@@ -695,7 +757,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	for (int i = 0; i < n; i++)
 		if (fresh[i])
 		{
-			ChunkFormat->refs(datas[i], lens[i], add_ref, &refs[i]);
+			ChunkIndexFormat(idx)->refs(datas[i], lens[i], add_ref, &refs[i]);
 			check_refs(idx, hashes + i * CHUNK_HASH_LEN, &refs[i], pack, planned);
 		}
 	for (int i = 0; i < n; i++)
@@ -938,7 +1000,7 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
 		ChunkLogOf(log)->read(log, e.loc, data, e.len);
 		check_hash(h, data, e.len, log, e.loc);
-		ChunkFormat->refs(data, e.len, add_ref, &kids);
+		ChunkIndexFormat(idx)->refs(data, e.len, add_ref, &kids);
 		pfree(data);
 		for (int k = 0; k < kids.n; k++)
 		{
@@ -1248,7 +1310,7 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 		ChunkLogOf(log)->read(log, a->loc, data, a->len);
 		check_hash(a->hash, data, a->len, log, a->loc);
 		es.from = a->hash;
-		ChunkFormat->refs(data, a->len, audit_edge, &es);
+		ChunkIndexFormat(idx)->refs(data, a->len, audit_edge, &es);
 		pfree(data);
 		CHECK_FOR_INTERRUPTS();
 	}

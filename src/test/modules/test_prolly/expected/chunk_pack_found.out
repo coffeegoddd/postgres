@@ -24,7 +24,7 @@ test_chunk_format_refs
 step q_begin: BEGIN;
 step q_pack: 
 	SELECT test_cs_put_many('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()), pf_h('\x0a0901')],
-		ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 
 stored
 ------
@@ -84,7 +84,7 @@ injection_points_attach
 step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()), pf_h('\x0a0901')],
-		ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step o_free_p1: SELECT test_cs_free('pages', ARRAY[pf_h(pf_p1())]) AS freed_p1;
 freed_p1

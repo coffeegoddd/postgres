@@ -12,7 +12,7 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION pack_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 }
 
 session p
@@ -21,7 +21,7 @@ step p_begin	{ BEGIN; }
 step p_pack		{
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step p_own_free	{
 	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x50'::bytea || int4send(i))
@@ -30,15 +30,15 @@ step p_own_free	{
 step p_pack_again	{
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored_again;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored_again;
 }
 step p_parents	{
 	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x5201'::bytea || pack_h('\x50'::bytea || int4send(i)))
 			FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x5201'::bytea || pack_h('\x50'::bytea || int4send(i))
-			FROM generate_series(1, 3000) i ORDER BY i)) AS parents;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x5201'::bytea || pack_h('\x50'::bytea || int4send(i))
+			FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS parents;
 }
 step p_free_parents	{
 	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x5201'::bytea || pack_h('\x50'::bytea || int4send(i)))
@@ -53,7 +53,7 @@ step p_free		{
 
 session o
 setup		{ SET chunk_free_in_background = off; }
-step o_put		{ SELECT stored FROM test_cs_put('pages', '\x0a0501'); }
+step o_put		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0501')); }
 step o_free		{ SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0501')]) AS freed; }
 step o_free_found	{
 	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x50'::bytea || int4send(i))

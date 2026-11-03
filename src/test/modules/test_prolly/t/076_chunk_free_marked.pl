@@ -18,7 +18,6 @@ my $node = PostgreSQL::Test::Cluster->new('free_marked');
 $node->init;
 $node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'test_prolly'
-test_prolly.chunk_format_refs = on
 autovacuum = off
 log_min_messages = debug1
 max_prepared_transactions = 2
@@ -29,10 +28,10 @@ $node->safe_psql('postgres', q{
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION leaf(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(md5('m' || i), 'hex')$$;
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(md5('m' || i), 'hex'))$$;
 	CREATE FUNCTION node(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
-			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+		AS $$SELECT test_engine_chunk('R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o)))$$;
 	CREATE FUNCTION tree(a int, b int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT node(VARIADIC ARRAY(SELECT leaf(i) FROM generate_series(a, b) i))';
 	CREATE FUNCTION marked() RETURNS int8 LANGUAGE sql
@@ -191,10 +190,13 @@ $ra->query_safe('COMMIT');
 $ra->quit;
 $gone->(q{h(leaf(81001))}, 'the reference let go of, committed: freed');
 
-# the format a session may not set apart from the settings' (a freer
-# started from it would free by the settings')
-my ($ret, $out, $err) = $node->psql('postgres', 'SET test_prolly.chunk_format_refs = off');
-like($err, qr/cannot be changed now/, 'the test format a setting of the server\'s');
+# the store reads its chunks by its index's format, whatever a session
+# sets (a session's chunk_format is the format of indexes it makes): a
+# chunk naming one not there is refused under the leaf format too
+my ($ret, $out, $err) = $node->psql('postgres',
+	'SET chunk_format = leaf; SELECT test_cs_put(\'pages\', node(leaf(99991)))');
+like($err, qr/which the store does not have/,
+	'the history store reads its chunks by its own format, not the session\'s');
 
 # many commits, one freer: a freer held as it begins a pass, twenty
 # pointers dropped meanwhile, none registers another; let go, it passes

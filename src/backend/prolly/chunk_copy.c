@@ -10,7 +10,7 @@
  * batch at a time (put_many), each after those it references, so a batch
  * lays its chunks out in the walk's order (a tier's pack: a chunk's
  * children together).  Memory: the chunks on the walk's way down, and a
- * batch.  The references are ChunkFormat's.
+ * batch.  The references are as the source store's format says.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -40,6 +40,7 @@ typedef struct CopyFrame
 typedef struct CopyState
 {
 	ChunkStore *from;
+	const ChunkFormatRoutine *format;	/* from's: its chunks' references */
 	ChunkStore *to;
 	const char *verb;			/* the copy, for errors ("push", "fetch") */
 	const char *source;			/* the store read from, for errors */
@@ -209,7 +210,7 @@ copy_reached(CopyState *ps, const uint8 *root)
 			void	   *data = f->data;
 			uint32		len = f->len;
 
-			ChunkFormat->refs(data, len, note_kid, ps);
+			ps->format->refs(data, len, note_kid, ps);
 		}
 		read_kids(ps);
 	}
@@ -223,6 +224,7 @@ cs_copy_closure(ChunkStore *from, ChunkStore *to, const uint8 *roots, int n,
 	HASHCTL		ctl;
 
 	ps.from = from;
+	ps.format = cs_format(from);
 	ps.to = to;
 	ps.verb = verb;
 	ps.source = source;

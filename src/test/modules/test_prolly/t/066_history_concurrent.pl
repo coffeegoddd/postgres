@@ -27,11 +27,12 @@ $node->safe_psql('postgres', q{
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION leaf(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('w' || i), 8), 'hex')$$;
-	-- (a chunk of the test format referencing others: 'R', their count, them)
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5('w' || i), 8), 'hex'))$$;
+	-- (a chunk of the test format referencing others, 'R', their count,
+	-- them, as the history store's format has it, the engine's)
 	CREATE FUNCTION node(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
-			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+		AS $$SELECT test_engine_chunk('R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o)))$$;
 	-- a commit: leaves (some another's too) and a parent of them put, and the
 	-- branch's pointer moved to it
 	CREATE FUNCTION commit_to(branch text, a int, b int, c int) RETURNS void LANGUAGE plpgsql AS $$
@@ -95,9 +96,9 @@ is($q->(q{SELECT ok || ' ' || unheld || ' ' || coalesce(why, '') FROM test_cs_ch
 	'nothing unheld left, the audit clean');
 is($q->(q{SELECT (SELECT chunks FROM test_cs_check('pages')) =
 	(SELECT count(*) FROM (SELECT DISTINCT hash FROM pg_history.pointers
-		UNION SELECT substr(test_cs_get('pages', p.hash), 3 + 20 * j, 20)
+		UNION SELECT substr(test_engine_unchunk(test_cs_get('pages', p.hash)), 3 + 20 * j, 20)
 		FROM pg_history.pointers p, generate_series(0, 2) j
-		WHERE get_byte(test_cs_get('pages', p.hash), 0) = 82) s)}), 't',
+		WHERE get_byte(test_engine_unchunk(test_cs_get('pages', p.hash)), 0) = 82) s)}), 't',
 	'the chunks left are the pointers\' and the leaves they reference');
 
 $node->stop;

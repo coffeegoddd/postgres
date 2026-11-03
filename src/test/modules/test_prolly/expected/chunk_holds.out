@@ -6,18 +6,14 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
-SELECT test_chunk_format_refs(true);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-
 CREATE FUNCTION hh(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';
--- (a leaf, and a chunk referencing it)
-CREATE FUNCTION leaf() RETURNS bytea LANGUAGE sql IMMUTABLE AS $$SELECT '\x0a0701'::bytea$$;
+-- (a leaf, and a chunk referencing it: the history store's, the engine's
+-- format)
+CREATE FUNCTION leaf() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT test_engine_chunk('\x0a0701')$$;
 CREATE FUNCTION parent() RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS $$SELECT '\x5201'::bytea || hh(leaf())$$;
+	AS $$SELECT test_engine_chunk('\x5201'::bytea || hh(leaf()))$$;
 SELECT (test_cs_put('pages', leaf())).stored AS leaf, (test_cs_put('pages', parent())).stored AS parent;
  leaf | parent 
 ------+--------
@@ -98,9 +94,10 @@ ROLLBACK;
 -- a pack refused for a reference the store lacks counts none of the others
 VACUUM pg_history.chunk_index;
 SELECT entries AS e1 FROM test_chunk_index_shape('pg_history.chunk_index') \gset
-SELECT test_cs_put_many('pages', ARRAY[hh('\x5202'::bytea || hh(leaf()) || hh('\x0a0799'))],
-	ARRAY['\x5202'::bytea || hh(leaf()) || hh('\x0a0799')]);
-ERROR:  chunk 4c1fc5d06505bdc64a1f32b6643c48d33594e5a0 references chunk 31843ebe1c26f3b46134ba82e5dc2aaf63d6666d, which the store does not have
+SELECT test_cs_put_many('pages',
+	ARRAY[hh(test_engine_chunk('\x5202'::bytea || hh(leaf()) || hh(test_engine_chunk('\x0a0799'))))],
+	ARRAY[test_engine_chunk('\x5202'::bytea || hh(leaf()) || hh(test_engine_chunk('\x0a0799')))]);
+ERROR:  chunk 516e7b57ac3e96b75598ddb37bc2f76d91ea1509 references chunk 5188a847822d4304cdf7485c7b8a89dca622ec84, which the store does not have
 SELECT entries - :e1 AS left_behind FROM test_chunk_index_shape('pg_history.chunk_index');
  left_behind 
 -------------
@@ -111,12 +108,6 @@ SELECT test_cs_free('pages', ARRAY[hh(parent()), hh(leaf())]) AS freed;
  freed 
 -------
      2
-(1 row)
-
-SELECT test_chunk_format_refs(false);
- test_chunk_format_refs 
-------------------------
- 
 (1 row)
 
 DROP FUNCTION hh(bytea), leaf(), parent();

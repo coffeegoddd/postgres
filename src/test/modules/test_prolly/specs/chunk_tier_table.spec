@@ -22,7 +22,7 @@ setup
 	CREATE OR REPLACE FUNCTION tt_e() RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT decode(repeat('0e', 60), 'hex')$$;
 	CREATE OR REPLACE FUNCTION tt_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 	-- (the packs made before)
 	CREATE TABLE tt_before AS
 		SELECT coalesce(max(id), 0) AS id FROM test_tier_packs('pg_history.tier_chunks');
@@ -41,21 +41,21 @@ step p_attach	{ SELECT injection_points_attach('chunk-pack-found', 'wait'); }
 step p_begin	{ BEGIN; }
 step p_pack		{
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_a()), tt_h(tt_b()), tt_h(tt_c())],
-		ARRAY[tt_a(), tt_b(), tt_c()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_a(), tt_b(), tt_c()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step p_pack2	{
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_e()), tt_h(tt_d())],
-		ARRAY[tt_e(), tt_d()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_e(), tt_d()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step p_packed	{ SELECT 'packed' AS p; }
 step p_commit	{ COMMIT; SELECT injection_points_detach('chunk-pack-found'); }
 
 session q
 setup		{ SET chunk_free_in_background = off; }
-step q_put_a	{ SELECT stored FROM test_cs_put('tier', tt_a()); }
-step q_put_b	{ SELECT stored FROM test_cs_put('tier', tt_b()); }
-step q_put_c	{ SELECT stored FROM test_cs_put('tier', tt_c()); }
-step q_put_e	{ SELECT stored FROM test_cs_put('tier', tt_e()); }
+step q_put_a	{ SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_a())); }
+step q_put_b	{ SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_b())); }
+step q_put_c	{ SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_c())); }
+step q_put_e	{ SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_e())); }
 step q_wake		{ SELECT injection_points_wakeup('chunk-pack-found'); }
 step q_dead		{
 	SELECT size, dead FROM test_tier_packs('pg_history.tier_chunks')

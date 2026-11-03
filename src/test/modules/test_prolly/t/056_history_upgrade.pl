@@ -24,10 +24,10 @@ my $fns = q{
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION leaf(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('u' || i), 20), 'hex')$$;
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5('u' || i), 20), 'hex'))$$;
 	CREATE FUNCTION node(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
-			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+		AS $$SELECT test_engine_chunk('R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o)))$$;
 	CREATE FUNCTION tree(a int, b int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT node(VARIADIC ARRAY(SELECT leaf(i) FROM generate_series(a, b) i))';
 	-- a pointer's tree of leaves 1-20, a bundle's of 11-30 (pushed)
@@ -44,7 +44,6 @@ my $conf = sub {
 	my ($node, $tier) = @_;
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'test_prolly'
-test_prolly.chunk_format_refs = on
 autovacuum = off
 chunk_free_in_background = off
 history_tier_location = '$tier'
@@ -81,10 +80,10 @@ for my $run ([ '--copy', 0, '_copy' ], [ '--copy', 1, '_copy_own' ],
 	# (a second writer at once: a chunk in a lane beside the log's, made
 	# as the backend wrote, not by initdb)
 	my $holder = $old->background_psql('postgres');
-	$holder->query_safe(q{SELECT (test_cs_put('pages', '\x0a7701')).stored});
+	$holder->query_safe(q{SELECT (test_cs_put('pages', test_engine_chunk('\x0a7701'))).stored});
 	$old->safe_psql('postgres', q{
-		SELECT (test_cs_put('pages', '\x0a7702')).stored;
-		SELECT test_cs_ref_root('pages', h('\x0a7702'));
+		SELECT (test_cs_put('pages', test_engine_chunk('\x0a7702'))).stored;
+		SELECT test_cs_ref_root('pages', h(test_engine_chunk('\x0a7702')));
 	});
 	$holder->quit;
 	is($old->safe_psql('postgres', q{SELECT count(*) > 0 FROM pg_class
@@ -175,7 +174,7 @@ for my $run ([ '--copy', 0, '_copy' ], [ '--copy', 1, '_copy_own' ],
 		is($new->safe_psql($db, $numbers), $old_numbers{$db}, "$mode, $db: the relations' file numbers kept");
 		if ($db eq 'postgres')
 		{
-			is($new->safe_psql($db, q{SELECT test_cs_get('pages', h('\x0a7702')) = '\x0a7702'}), 't',
+			is($new->safe_psql($db, q{SELECT test_cs_get('pages', h(test_engine_chunk('\x0a7702'))) = test_engine_chunk('\x0a7702')}), 't',
 				"$mode: a chunk in a lane read back");
 			is($new->safe_psql($db, q{SELECT count(*) FROM pg_class c JOIN pg_depend d ON d.objid = c.oid
 				WHERE c.relname LIKE 'chunks_lane_%' AND d.deptype = 'i'

@@ -584,8 +584,16 @@ mem_check(ChunkStore *cs, uint64 *nchunks, uint64 *nunheld, char **why)
 	return st.why == NULL;
 }
 
+/* (a memory store has no index: its chunks are the session's format's) */
+static const ChunkFormatRoutine *
+mem_format(ChunkStore *cs)
+{
+	return ChunkFormat;
+}
+
 const ChunkStoreRoutine MemoryChunkStore = {
 	.transactional = false,
+	.format = mem_format,
 	.open = mem_open,
 	.has = mem_has,
 	.get = mem_get,

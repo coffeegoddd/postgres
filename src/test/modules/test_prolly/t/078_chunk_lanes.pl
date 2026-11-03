@@ -15,7 +15,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('lanes');
-$node->init(allows_streaming => 1);
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$node->init(allows_streaming => 1, extra => ['-c', 'chunk_format=leaf']);
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 max_connections = 100

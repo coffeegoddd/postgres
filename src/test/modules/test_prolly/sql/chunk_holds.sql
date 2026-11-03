@@ -5,13 +5,14 @@
 -- held by that one's references, with nothing written.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 SET chunk_free_in_background = off;
-SELECT test_chunk_format_refs(true);
 CREATE FUNCTION hh(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';
--- (a leaf, and a chunk referencing it)
-CREATE FUNCTION leaf() RETURNS bytea LANGUAGE sql IMMUTABLE AS $$SELECT '\x0a0701'::bytea$$;
+-- (a leaf, and a chunk referencing it: the history store's, the engine's
+-- format)
+CREATE FUNCTION leaf() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT test_engine_chunk('\x0a0701')$$;
 CREATE FUNCTION parent() RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS $$SELECT '\x5201'::bytea || hh(leaf())$$;
+	AS $$SELECT test_engine_chunk('\x5201'::bytea || hh(leaf()))$$;
 SELECT (test_cs_put('pages', leaf())).stored AS leaf, (test_cs_put('pages', parent())).stored AS parent;
 VACUUM pg_history.chunk_index;
 SELECT entries AS e0 FROM test_chunk_index_shape('pg_history.chunk_index') \gset
@@ -44,10 +45,10 @@ ROLLBACK;
 -- a pack refused for a reference the store lacks counts none of the others
 VACUUM pg_history.chunk_index;
 SELECT entries AS e1 FROM test_chunk_index_shape('pg_history.chunk_index') \gset
-SELECT test_cs_put_many('pages', ARRAY[hh('\x5202'::bytea || hh(leaf()) || hh('\x0a0799'))],
-	ARRAY['\x5202'::bytea || hh(leaf()) || hh('\x0a0799')]);
+SELECT test_cs_put_many('pages',
+	ARRAY[hh(test_engine_chunk('\x5202'::bytea || hh(leaf()) || hh(test_engine_chunk('\x0a0799'))))],
+	ARRAY[test_engine_chunk('\x5202'::bytea || hh(leaf()) || hh(test_engine_chunk('\x0a0799')))]);
 SELECT entries - :e1 AS left_behind FROM test_chunk_index_shape('pg_history.chunk_index');
 
 SELECT test_cs_free('pages', ARRAY[hh(parent()), hh(leaf())]) AS freed;
-SELECT test_chunk_format_refs(false);
 DROP FUNCTION hh(bytea), leaf(), parent();

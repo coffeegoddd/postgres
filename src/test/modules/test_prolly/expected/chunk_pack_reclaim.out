@@ -6,8 +6,9 @@ NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
 CREATE FUNCTION pr_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';
+-- (a leaf of the history store's format, the engine's)
 CREATE FUNCTION pr_blob(tag text, i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS $$SELECT 'L'::bytea || decode(repeat(md5(tag || i), 25), 'hex')$$;
+	AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5(tag || i), 25), 'hex'))$$;
 -- pages of chunks, then one kept past them; the chunks freed
 SELECT test_cs_put_many('pages', ARRAY(SELECT pr_h(pr_blob('pr-a', i)) FROM generate_series(1, 400) i ORDER BY i),
 	ARRAY(SELECT pr_blob('pr-a', i) FROM generate_series(1, 400) i ORDER BY i)) AS stored;

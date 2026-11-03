@@ -7,10 +7,13 @@ CREATE EXTENSION IF NOT EXISTS test_prolly;
 SET chunk_free_in_background = off;
 SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1;
+-- (d as a chunk of the history store's format, the engine's: its hash, and
+-- a put of it)
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS 'SELECT substr(sha256(d), 1, 20)';
+	AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 CREATE FUNCTION put(d bytea) RETURNS bool LANGUAGE sql
-	AS $$SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h(d), d)$$;
+	AS $$SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h(d),
+		test_engine_chunk(d))$$;
 CREATE FUNCTION roots(d bytea) RETURNS int8 LANGUAGE sql
 	AS $$SELECT roots FROM test_chunk_index_entry('pg_history.chunk_index', h(d))$$;
 

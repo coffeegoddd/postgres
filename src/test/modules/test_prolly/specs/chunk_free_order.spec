@@ -8,22 +8,22 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION fo_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 	-- (chunks of the test format: '\x52', the count, the chunks named)
 	CREATE OR REPLACE FUNCTION fo_parent(tag bytea, kid bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT '\x5202'::bytea || fo_h(kid) || fo_h(tag)$$;
 	SELECT test_chunk_format_refs(true);
-	SELECT stored FROM test_cs_put('pages', '\x0a0c01');
-	SELECT stored FROM test_cs_put('pages', '\x0a0c02');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf1');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf2');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf3');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf4');
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0c01'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0c02'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf1'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf2'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf3'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf4'));
 	-- two parents of each of two leaves (each held by both)
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf1', '\x0a0c01'));
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf2', '\x0a0c02'));
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf3', '\x0a0c02'));
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf4', '\x0a0c01'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf1', '\x0a0c01')));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf2', '\x0a0c02')));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf3', '\x0a0c02')));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf4', '\x0a0c01')));
 }
 
 teardown

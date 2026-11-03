@@ -8,7 +8,7 @@ step b_mark:
 	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
 
 step a_begin: BEGIN;
-step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
+step a_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0101'));
 stored
 ------
 t     
@@ -17,7 +17,7 @@ t
 step b_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
-		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0101', '\x0a0102']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step a_commit: COMMIT;
 step b_pack: <... completed>
@@ -59,7 +59,7 @@ step b_mark:
 	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
 
 step a_begin: BEGIN;
-step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
+step a_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0101'));
 stored
 ------
 t     
@@ -68,7 +68,7 @@ t
 step b_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
-		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0101', '\x0a0102']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step a_rollback: ROLLBACK;
 step b_pack: <... completed>
@@ -102,7 +102,7 @@ step b_mark:
 	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
 
 step a_begin: BEGIN;
-step a_put_leaf: SELECT stored FROM test_cs_put('pages', '\x0a0201');
+step a_put_leaf: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0201'));
 stored
 ------
 t     
@@ -111,7 +111,7 @@ t
 step b_parent: 
 	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
-		ARRAY[pack_parent(), '\x0a0201']) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pack_parent(), '\x0a0201']) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step a_commit: COMMIT;
 step b_parent: <... completed>
@@ -155,7 +155,7 @@ step b_mark:
 	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
 
 step a_begin: BEGIN;
-step a_put_leaf: SELECT stored FROM test_cs_put('pages', '\x0a0201');
+step a_put_leaf: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0201'));
 stored
 ------
 t     
@@ -164,7 +164,7 @@ t
 step b_parent: 
 	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
-		ARRAY[pack_parent(), '\x0a0201']) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pack_parent(), '\x0a0201']) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step a_rollback: ROLLBACK;
 step b_parent: <... completed>
@@ -208,7 +208,7 @@ step b_mark:
 	CREATE TEMP TABLE dead0 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
 
 step a_begin: BEGIN;
-step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
+step a_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0101'));
 stored
 ------
 t     
@@ -217,7 +217,7 @@ t
 step b_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
-		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0101', '\x0a0102']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step c_cancel: 
 	SELECT pg_cancel_backend(pid) FROM pg_stat_activity
@@ -239,7 +239,7 @@ more_dead
 (1 row)
 
 step a_rollback: ROLLBACK;
-step b_live: SELECT stored FROM test_cs_put('pages', '\x0a0109');
+step b_live: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0109'));
 stored
 ------
 t     
@@ -251,7 +251,7 @@ step b_dead:
 
 more_dead
 ---------
-        3
+        5
 (1 row)
 
 step b_has: 

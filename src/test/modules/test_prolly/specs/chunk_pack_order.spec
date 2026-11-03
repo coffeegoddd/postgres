@@ -10,7 +10,7 @@ setup
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	CREATE OR REPLACE FUNCTION pack_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 }
 
 session b
@@ -22,7 +22,7 @@ setup		{
 step b_begin	{ BEGIN; }
 step b_pack		{
 	SELECT test_cs_put_many('pages', ARRAY[pack_h('\x0a0301'), pack_h('\x0a0302')],
-		ARRAY['\x0a0301', '\x0a0302']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0301', '\x0a0302']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step b_commit	{ COMMIT; }
 step b_free		{
@@ -34,7 +34,7 @@ setup		{ SET chunk_free_in_background = off; }
 step d_begin	{ BEGIN; }
 step d_pack		{
 	SELECT test_cs_put_many('pages', ARRAY[pack_h('\x0a0302'), pack_h('\x0a0301')],
-		ARRAY['\x0a0302', '\x0a0301']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0302', '\x0a0301']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step d_commit	{ COMMIT; }
 

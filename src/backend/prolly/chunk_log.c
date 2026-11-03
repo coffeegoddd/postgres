@@ -3239,15 +3239,19 @@ ci_relation_set_new_filelocator(Relation rel,
 								MultiXactId *minmulti)
 {
 	SMgrRelation srel;
+	const ChunkFormatRoutine *format;
 
 	/* (an index truncated whose tier has packs: those could not be freed) */
 	if (rel->rd_createSubid == InvalidSubTransactionId)
 		ChunkTierCheckIndex(rel, "truncate");
+	/* (storage there now: an index truncated, keeping its format) */
+	format = smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ? ChunkIndexFormat(rel) :
+		ChunkFormatNamed(chunk_format_name);
 	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 
 	/* (its entries name the transactions that inserted them) */
 	*freezeXid = RecentXmin;
-	ChunkIndexInitStorage(srel, XLogIsNeeded());
+	ChunkIndexInitStorage(srel, XLogIsNeeded(), format);
 	smgrclose(srel);
 }
 
@@ -3262,10 +3266,12 @@ ci_relation_vacuum(Relation rel, const VacuumParams *params,
 static void
 ci_relation_nontransactional_truncate(Relation rel)
 {
+	const ChunkFormatRoutine *format = ChunkIndexFormat(rel);
+
 	/* (made in this transaction, a tier's chunks through it: the same) */
 	ChunkTierCheckIndex(rel, "truncate");
 	RelationTruncate(rel, 0);
-	ChunkIndexInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+	ChunkIndexInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel), format);
 	if (rel->rd_amcache != NULL)
 	{
 		pfree(rel->rd_amcache);

@@ -502,6 +502,15 @@
   max => '1.0',
 },
 
+{ name => 'chunk_format', type => 'string', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the format of the chunks a new chunk index holds.',
+  long_desc => 'The name of a chunk format: "engine", the version-control engine\'s, "leaf", which references no chunk, or one a module registers. An index keeps the format it was made with.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'chunk_format_name',
+  boot_val => '"engine"',
+  check_hook => 'check_chunk_format',
+},
+
 { name => 'chunk_free_in_background', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Frees the history store\'s chunks nothing holds after VACUUM of its index.',
   long_desc => 'VACUUM of a chunk index starts a background worker that frees the chunks nothing holds.',

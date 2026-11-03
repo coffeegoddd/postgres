@@ -659,3 +659,20 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_vc_merge(branch text, other text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- A chunk of the test format as one of the engine's naming the same chunks
+-- ('R' chunks as a local segment's, any other as a page chunk), and back.
+CREATE FUNCTION test_engine_chunk(chunk bytea)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT IMMUTABLE;
+
+-- (stable, not immutable: it errors on chunks it did not make, which a
+-- planner folding a CASE's branch not taken must not try)
+CREATE FUNCTION test_engine_unchunk(chunk bytea)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+-- The format of the chunks a chunk index names, recorded as it was made.
+CREATE FUNCTION test_chunk_index_format(idx regclass)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;

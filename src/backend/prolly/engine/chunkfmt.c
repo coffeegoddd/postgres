@@ -404,5 +404,6 @@ engine_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
 }
 
 const ChunkFormatRoutine EngineChunkFormat = {
+	.name = "engine",
 	.refs = engine_refs,
 };

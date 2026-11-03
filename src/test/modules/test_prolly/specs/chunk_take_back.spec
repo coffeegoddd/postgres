@@ -6,11 +6,11 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION tb_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 	-- (a chunk of the test format referencing the leaf '\x0a0601')
 	CREATE OR REPLACE FUNCTION tb_parent() RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT '\x5201'::bytea || tb_h('\x0a0601')$$;
-	SELECT stored FROM test_cs_put('pages', '\x0a0601');
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0601'));
 	SELECT test_cs_ref_root('pages', tb_h('\x0a0601'));
 }
 
@@ -25,7 +25,7 @@ teardown
 session a
 setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
 step a_begin	{ BEGIN; }
-step a_put		{ SELECT stored FROM test_cs_put('pages', tb_parent()); }
+step a_put		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent())); }
 step a_commit	{ COMMIT; }
 
 session u
@@ -36,7 +36,7 @@ step u_rollback	{ ROLLBACK; }
 
 session t
 setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
-step t_put		{ SELECT stored FROM test_cs_put('pages', tb_parent()); }
+step t_put		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent())); }
 step t_counts	{ SELECT refs, roots FROM test_cs_counts('pages', tb_h('\x0a0601')); }
 
 # t's put waits for a's, finds the chunk a's, and takes back its reference

@@ -30,9 +30,10 @@ my $fns = q{
 };
 $node->safe_psql('postgres', qq{
 	CREATE EXTENSION test_prolly;
+	$fmt
+	-- (the index made in the test format, whose chunks name others: 'R')
 	CREATE TABLE rl () USING prolly_chunks;
 	CREATE TABLE ri () USING prolly_chunk_index;
-	$fmt
 	$fns
 	SELECT test_chunk_put('rl', 'ri', h(d), d) FROM (VALUES ('\\x61'::bytea), ('\\x62')) v(d);
 	SELECT test_chunk_put('rl', 'ri', h(node('p', '\\x61')), node('p', '\\x61'));

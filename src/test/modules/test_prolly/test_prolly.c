@@ -44,7 +44,7 @@ PG_FUNCTION_INFO_V1(test_prolly_loaded_at_preload);
  */
 static bool loaded_at_preload = false;
 
-extern void test_chunk_format_define_setting(void);
+extern void test_chunk_format_register(void);
 
 static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_harness_suite,
@@ -80,7 +80,7 @@ _PG_init(void)
 	loaded_at_preload = process_shared_preload_libraries_in_progress;
 	register_test_checksum_implementations();
 	register_branch_implementations();
-	test_chunk_format_define_setting();
+	test_chunk_format_register();
 }
 
 /*

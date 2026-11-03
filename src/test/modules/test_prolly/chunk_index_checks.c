@@ -19,11 +19,13 @@
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "portability/instr_time.h"
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_store.h"
+#include "prolly/engine/chunkfmt.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -243,39 +245,38 @@ test_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
 		fn(arg, b + 2 + i * CHUNK_HASH_LEN);
 }
 
+/*
+ * "test": chunks that name others ('R', their count, their hashes) or
+ * none (anything else).  Registered as the module loads, so an index made
+ * with chunk_format = test is read by it in every backend that loaded the
+ * module (preloaded, for programs' sessions and workers: pg_dump's,
+ * pg_restore's, the freer's).
+ */
 static const ChunkFormatRoutine TestChunkFormat = {
+	.name = "test",
 	.refs = test_refs,
 };
 
-/*
- * The test format for every backend from its start (test_prolly.chunk_format_refs,
- * the module preloaded): for programs' sessions, pg_dump's and pg_restore's
- */
-static bool format_refs_setting = false;
-
-extern void test_chunk_format_define_setting(void);
-
-static void
-assign_format_refs(bool newval, void *extra)
-{
-	ChunkFormat = newval ? &TestChunkFormat : &LeafChunkFormat;
-	ChunkFormatConfigured = ChunkFormat;
-}
+extern void test_chunk_format_register(void);
 
 void
-test_chunk_format_define_setting(void)
+test_chunk_format_register(void)
 {
-	DefineCustomBoolVariable("test_prolly.chunk_format_refs",
-							 "Chunks of the test format, with references, for every session.",
-							 NULL, &format_refs_setting, false, PGC_SIGHUP, 0,
-							 NULL, assign_format_refs, NULL);
+	ChunkFormatRegister(&TestChunkFormat);
 }
 
-/* test_chunk_format_refs(on bool): the test format for this backend, or not */
+/*
+ * test_chunk_format_refs(on bool): the test format for this session, or the
+ * leaf format: for the indexes it makes next (chunk_format) and its memory
+ * store's chunks
+ */
 Datum
 test_chunk_format_refs(PG_FUNCTION_ARGS)
 {
-	ChunkFormat = PG_GETARG_BOOL(0) ? &TestChunkFormat : &LeafChunkFormat;
+	bool		on = PG_GETARG_BOOL(0);
+
+	ChunkFormat = on ? &TestChunkFormat : &LeafChunkFormat;
+	SetConfigOption("chunk_format", on ? "test" : "leaf", PGC_USERSET, PGC_S_SESSION);
 	PG_RETURN_VOID();
 }
 
@@ -585,4 +586,103 @@ test_chunk_index_buckets(PG_FUNCTION_ARGS)
 
 	relation_close(idx, AccessShareLock);
 	PG_RETURN_INT64(n);
+}
+
+/*
+ * test_engine_chunk(chunk bytea) returns bytea: a chunk of the test format
+ * as one of the engine's naming the same chunks: an 'R' chunk (its count,
+ * their hashes) as a local segment's, naming them strongly, in order;
+ * anything else as a page chunk, its bytes, naming none
+ */
+PG_FUNCTION_INFO_V1(test_engine_chunk);
+Datum
+test_engine_chunk(PG_FUNCTION_ARGS)
+{
+	bytea	   *in = PG_GETARG_BYTEA_PP(0);
+	const uint8 *d = (const uint8 *) VARDATA_ANY(in);
+	Size		len = VARSIZE_ANY_EXHDR(in);
+	StringInfoData b;
+	bytea	   *out;
+
+	initStringInfo(&b);
+	if (len >= 2 && d[0] == 'R' && len == 2 + (Size) d[1] * CHUNK_HASH_LEN)
+	{
+		appendStringInfoChar(&b, (char) CHUNK_TAG_SEGMENT);
+		appendStringInfoChar(&b, (char) CHUNK_FORMAT_VERSION);
+		appendStringInfoChar(&b, 0);	/* local: its members strong */
+		/* (their count, a uvarint: two bytes from 128) */
+		if (d[1] < 0x80)
+			appendStringInfoChar(&b, (char) d[1]);
+		else
+		{
+			appendStringInfoChar(&b, (char) ((d[1] & 0x7f) | 0x80));
+			appendStringInfoChar(&b, (char) (d[1] >> 7));
+		}
+		appendBinaryStringInfo(&b, (const char *) d + 2, len - 2);
+	}
+	else
+	{
+		appendStringInfoChar(&b, (char) CHUNK_TAG_PAGE);
+		appendStringInfoChar(&b, (char) CHUNK_FORMAT_VERSION);
+		appendBinaryStringInfo(&b, (const char *) d, len);
+	}
+	out = palloc(VARHDRSZ + b.len);
+	SET_VARSIZE(out, VARHDRSZ + b.len);
+	memcpy(VARDATA(out), b.data, b.len);
+	PG_RETURN_BYTEA_P(out);
+}
+
+/*
+ * test_engine_unchunk(chunk bytea) returns bytea: what test_engine_chunk
+ * made, the test format's chunk again
+ */
+PG_FUNCTION_INFO_V1(test_engine_unchunk);
+Datum
+test_engine_unchunk(PG_FUNCTION_ARGS)
+{
+	bytea	   *in = PG_GETARG_BYTEA_PP(0);
+	const uint8 *d = (const uint8 *) VARDATA_ANY(in);
+	Size		len = VARSIZE_ANY_EXHDR(in);
+	StringInfoData b;
+	bytea	   *out;
+
+	initStringInfo(&b);
+	/* (a count of 128 and more is two bytes, as test_engine_chunk writes it) */
+	if (len >= 4 && d[0] == CHUNK_TAG_SEGMENT && d[1] == CHUNK_FORMAT_VERSION && d[2] == 0 &&
+		d[3] < 0x80 && len == 4 + (Size) d[3] * CHUNK_HASH_LEN)
+	{
+		appendStringInfoChar(&b, 'R');
+		appendStringInfoChar(&b, (char) d[3]);
+		appendBinaryStringInfo(&b, (const char *) d + 4, len - 4);
+	}
+	else if (len >= 5 && d[0] == CHUNK_TAG_SEGMENT && d[1] == CHUNK_FORMAT_VERSION &&
+			 d[2] == 0 && (d[3] & 0x80) && d[4] == 1 &&
+			 len == 5 + (Size) ((d[3] & 0x7f) | 0x80) * CHUNK_HASH_LEN)
+	{
+		appendStringInfoChar(&b, 'R');
+		appendStringInfoChar(&b, (char) ((d[3] & 0x7f) | 0x80));
+		appendBinaryStringInfo(&b, (const char *) d + 5, len - 5);
+	}
+	else if (len >= 2 && d[0] == CHUNK_TAG_PAGE && d[1] == CHUNK_FORMAT_VERSION)
+		appendBinaryStringInfo(&b, (const char *) d + 2, len - 2);
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a chunk of %zu bytes is not one test_engine_chunk makes", len)));
+	out = palloc(VARHDRSZ + b.len);
+	SET_VARSIZE(out, VARHDRSZ + b.len);
+	memcpy(VARDATA(out), b.data, b.len);
+	PG_RETURN_BYTEA_P(out);
+}
+
+/* test_chunk_index_format(idx regclass) returns text: its chunks' format's name */
+PG_FUNCTION_INFO_V1(test_chunk_index_format);
+Datum
+test_chunk_index_format(PG_FUNCTION_ARGS)
+{
+	Relation	idx = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	const char *name = ChunkIndexFormat(idx)->name;
+
+	relation_close(idx, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(name));
 }

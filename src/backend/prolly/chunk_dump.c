@@ -4,8 +4,8 @@
  *	  The history store taken out, and put back, by pg_dump and pg_restore.
  *
  * pg_history_export() is the store as of the transaction's snapshot: every
- * chunk it had then, each after the chunks it references (as ChunkFormat
- * finds them); then every chunk of its tier's bundles, read from the tier,
+ * chunk it had then, each after the chunks it references (as its index's
+ * format finds them); then every chunk of its tier's bundles, read from the tier,
  * each after those it references (one the store has too given again: it was
  * in both); then every pointer; then every bundle.  As rows (hash, data,
  * name, roots, tier): a chunk's with no name, tier true if the tier's; a
@@ -180,7 +180,7 @@ export_from(ReturnSetInfo *rsinfo, Relation log, Relation idx, Snapshot snap,
 		{
 			f->data = read_as_of(log, idx, snap, f->hash, &f->len);
 			memset(&f->refs, 0, sizeof(f->refs));
-			ChunkFormat->refs(f->data, f->len, collect_ref, &f->refs);
+			ChunkIndexFormat(idx)->refs(f->data, f->len, collect_ref, &f->refs);
 			f->next = 0;
 		}
 		if (f->next < f->refs.n)
@@ -473,4 +473,24 @@ pg_history_chunk_restore(PG_FUNCTION_ARGS)
 		SPI_finish();
 	}
 	return PointerGetDatum(tuple);
+}
+
+/*
+ * pg_chunk_index_format(idx regclass) returns text: the format of the
+ * chunks a chunk index names, as it records it (for pg_dump, which makes
+ * the index again with it)
+ */
+Datum
+pg_chunk_index_format(PG_FUNCTION_ARGS)
+{
+	Relation	idx = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	char	   *name;
+
+	if (!RelationIsChunkIndex(idx))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a chunk index", RelationGetRelationName(idx))));
+	name = pstrdup(ChunkIndexFormat(idx)->name);
+	relation_close(idx, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(name));
 }

@@ -26,7 +26,9 @@ if ($ENV{enable_injection_points} ne 'yes')
 }
 
 my $primary = PostgreSQL::Test::Cluster->new('entries_first');
-$primary->init(allows_streaming => 1);
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$primary->init(allows_streaming => 1, extra => ['-c', 'chunk_format=leaf']);
 $primary->append_conf('postgresql.conf', qq{
 autovacuum = off
 chunk_free_in_background = off

@@ -37,14 +37,15 @@ $node->safe_psql('postgres', q{
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION leaf(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('c' || i), 30), 'hex')$$;
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5('c' || i), 30), 'hex'))$$;
 	-- (longer than a region: its bytes many pages, a record each)
 	CREATE FUNCTION huge(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('c' || i), 20000), 'hex')$$;
-	-- (a chunk of the test format referencing others: 'R', their count, them)
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5('c' || i), 20000), 'hex'))$$;
+	-- (a chunk of the test format referencing others, 'R', their count,
+	-- them, as the history store's format has it, the engine's)
 	CREATE FUNCTION node(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
-			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+		AS $$SELECT test_engine_chunk('R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o)))$$;
 	CREATE FUNCTION p1() RETURNS bytea LANGUAGE sql IMMUTABLE AS 'SELECT node(leaf(1), leaf(2), leaf(3))';
 	CREATE FUNCTION p2() RETURNS bytea LANGUAGE sql IMMUTABLE AS 'SELECT node(leaf(1))';
 	SELECT count(*) FROM generate_series(1, 3) i, LATERAL test_cs_put('pages', leaf(i));
@@ -141,7 +142,7 @@ for my $point ('chunk-index-split-copied', 'chunk-index-split-published')
 # crash before its bytes are written; the chunks where they were, each
 # read back, its counts as they were
 $q->(q{CREATE FUNCTION mid(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS $$SELECT 'L'::bytea || convert_to(rpad('m' || i, 2000, '.'), 'UTF8')$$});
+	AS $$SELECT test_engine_chunk('L'::bytea || convert_to(rpad('m' || i, 2000, '.'), 'UTF8'))$$});
 $q->(q{SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', mid(i))});
 $q->(q{SELECT count(*) FROM generate_series(2, 400, 2) i, LATERAL test_cs_ref_root('pages', h(mid(i)))});
 $q->(q{SELECT test_cs_free('pages', ARRAY(SELECT h(mid(i)) FROM generate_series(1, 400, 2) i))});

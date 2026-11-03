@@ -18278,6 +18278,29 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 			tbinfo->relkind == RELKIND_PARTITIONED_TABLE)
 			tableam = tbinfo->amname;
 
+		/*
+		 * A chunk index records the format of the chunks it names as it is
+		 * made: made again under the one it has
+		 */
+		if (tableam && strcmp(tableam, "prolly_chunk_index") == 0)
+		{
+			PQExpBuffer fq = createPQExpBuffer();
+			PQExpBuffer made = createPQExpBuffer();
+			PGresult   *fres;
+
+			appendPQExpBuffer(fq, "SELECT pg_catalog.pg_chunk_index_format('%u'::pg_catalog.regclass)",
+							  tbinfo->dobj.catId.oid);
+			fres = ExecuteSqlQueryForSingleRow(fout, fq->data);
+			appendPQExpBufferStr(made, "SET chunk_format = ");
+			appendStringLiteralAH(made, PQgetvalue(fres, 0, 0), fout);
+			appendPQExpBuffer(made, ";\n%sRESET chunk_format;\n", q->data);
+			resetPQExpBuffer(q);
+			appendPQExpBufferStr(q, made->data);
+			PQclear(fres);
+			destroyPQExpBuffer(fq);
+			destroyPQExpBuffer(made);
+		}
+
 		ArchiveEntry(fout, tbinfo->dobj.catId, tbinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
 								  .namespace = tbinfo->dobj.namespace->dobj.name,

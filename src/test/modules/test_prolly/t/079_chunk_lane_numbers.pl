@@ -11,7 +11,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('lane_numbers');
-$node->init;
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$node->init(extra => ['-c', 'chunk_format=leaf']);
 $node->append_conf('postgresql.conf', "autovacuum = off\nmax_prepared_transactions = 2");
 $node->start;
 my $ts_dir = PostgreSQL::Test::Utils::tempdir_short();

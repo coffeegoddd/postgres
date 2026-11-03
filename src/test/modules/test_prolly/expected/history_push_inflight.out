@@ -7,7 +7,7 @@ test_cs_ref_root
 (1 row)
 
 step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
-step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+step r_read: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
 bytes   
 --------
 \x0a2101
@@ -33,14 +33,14 @@ copied
      2
 (1 row)
 
-step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+step r_read: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
 bytes   
 --------
 \x0a2101
 (1 row)
 
-step p_after: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
-ERROR:  chunk 694e992221317cc70d7d1f2cc10bca607d528eda was pushed to the history store's tier
+step p_after: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
+ERROR:  chunk 32d6705e2813adee9402dfdbd62529cc61930905 was pushed to the history store's tier
 step r_commit: COMMIT;
 test_cs_free
 ------------
@@ -55,7 +55,7 @@ test_cs_ref_root
 (1 row)
 
 step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
-step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+step r_read: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
 bytes   
 --------
 \x0a2101
@@ -87,13 +87,13 @@ freed
     2
 (1 row)
 
-step r_read: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+step r_read: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
 bytes   
 --------
 \x0a2101
 (1 row)
 
-step p_after: SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes;
+step p_after: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
 bytes
 -----
      
