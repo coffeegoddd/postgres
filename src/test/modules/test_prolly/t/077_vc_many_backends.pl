@@ -62,8 +62,15 @@ is(scalar @rows, 0, "each branch's head has its 25 commits' rows, and base's")
 my $waits = slurp_file($node->logfile, $log_at);
 my @waited = grep { /still waiting/ .. /STATEMENT|^\S+ \S+ \[\d+\] .*: (?!DETAIL|CONTEXT)/ }
   split /\n/, $waits;
+# (each relation a wait was on, named: its oid differs between builds)
+my %rels = map { $_ => 1 } ($waits =~ /of relation (\d+) of database/g);
+my @named = map {
+	"relation $_ is "
+	  . $node->safe_psql('postgres',
+		"SELECT coalesce((SELECT oid::regclass::text FROM pg_class WHERE oid = $_), 'gone')")
+} sort keys %rels;
 is(scalar(grep { /still waiting/ } @waited), 0, 'no process waited during the 16-branch run')
-  or diag(join("\n", @waited, grep { /TRACE/ } split /\n/, $waits));
+  or diag(join("\n", @named, @waited));
 
 # eight backends on one branch: they take turns, and every commit lands
 $node->pgbench(
