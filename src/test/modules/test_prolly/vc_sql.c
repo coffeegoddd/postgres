@@ -464,13 +464,15 @@ test_vc_rows(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_vc_sever(depth int4) returns int8: every commit outside the window
- * of that depth moved into a new segment; how many (0: none)
+ * test_vc_sever(depth int4, discard bool) returns int8: every commit outside
+ * the window of that depth moved into a new segment (discarded, with
+ * discard); how many (0: none)
  */
 Datum
 test_vc_sever(PG_FUNCTION_ARGS)
 {
 	int32		depth = PG_GETARG_INT32(0);
+	bool		discard = PG_GETARG_BOOL(1);
 	VcRepo		r;
 	uint64		n = 0;
 
@@ -486,6 +488,8 @@ test_vc_sever(PG_FUNCTION_ARGS)
 		{
 			n = s.n;
 			vc_segment_free(&s);
+			if (discard && vc_segment_discard(&r, seg, NULL) != VC_OK)
+				elog(ERROR, "segment %u not discarded", seg);
 		}
 	});
 	PG_RETURN_INT64((int64) n);

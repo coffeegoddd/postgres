@@ -8,7 +8,8 @@
  *	  rebuilding from reverse deltas, and what each costs.
  *
  * Most run on the memory store alone: they end its holds, as a
- * transaction's end would, to free within a test, or damage it.
+ * transaction's end would, to free within a test, or damage it.  The
+ * scaling test runs on both, but for severing and repair.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -72,6 +73,8 @@ held(ChunkStore *cs, PHash h)
 static uint64
 release(ChunkStore *cs)
 {
+	if (cs->routine != &MemoryChunkStore)
+		return 0;				/* (held until the test's subtransaction ends) */
 	MemoryChunkStoreEndHolds(cs);
 	return cs_free_unheld(cs);
 }
@@ -1042,7 +1045,6 @@ static void
 life_scale_case(uint64 n, LifeScale *s)
 {
 	ChunkStore *cs = memstore_create();
-	ChunkStore *archive = memstore_create_own();
 	ProllyCtx	ctx = t_ctx(cs, &small_policy);
 	PHash		a,
 				b,
@@ -1071,7 +1073,6 @@ life_scale_case(uint64 n, LifeScale *s)
 		batch_put(&eb, rnd_below_global(2 * n), 1);
 	b = held(cs, t_apply(&ctx, &a, eb.e, eb.n));
 	release(cs);
-	archive_copy(archive, cs, &a);
 
 	st = *cs_stats(cs);
 	d = chunk_diff_set(&ctx, &a, &b);
@@ -1083,25 +1084,37 @@ life_scale_case(uint64 n, LifeScale *s)
 	pfree(cs_get(cs, delta.b, &len));
 	s->delta_bytes = len;
 
-	st = *cs_stats(cs);
-	s->sever_frees = sever(cs, &a);
-	s->sever_reads = STATS_DELTA(cs, st, gets);
-	CHECK_EQ(s->sever_frees, set_size(&d));
+	/*
+	 * Severing a, repairing it and dropping it again, on a memory store: what
+	 * is freed, and copied back, freed within the test (on the history
+	 * store, nothing is freed until the transaction ends, so a is still
+	 * there and the delta is replayed over it)
+	 */
+	if (cs->routine == &MemoryChunkStore)
+	{
+		ChunkStore *archive = memstore_create_own();
 
-	st = *cs_stats(cs);
-	ast = *cs_stats(archive);
-	s->repair_copied = prolly_repair(&ctx, archive, &a);
-	s->repair_holds = STATS_DELTA(cs, st, holds);
-	s->repair_src_reads = STATS_DELTA(archive, ast, gets);
-	CHECK_EQ(s->repair_copied, set_size(&d));
-	CHECK_EQ(STATS_DELTA(cs, st, stored), s->repair_copied);
-	release(cs);				/* not rooted: repair's copy goes again */
-	CHECK(!cs_has(cs, a.b));
+		archive_copy(archive, cs, &a);
+		st = *cs_stats(cs);
+		s->sever_frees = sever(cs, &a);
+		s->sever_reads = STATS_DELTA(cs, st, gets);
+		CHECK_EQ(s->sever_frees, set_size(&d));
+
+		st = *cs_stats(cs);
+		ast = *cs_stats(archive);
+		s->repair_copied = prolly_repair(&ctx, archive, &a);
+		s->repair_holds = STATS_DELTA(cs, st, holds);
+		s->repair_src_reads = STATS_DELTA(archive, ast, gets);
+		CHECK_EQ(s->repair_copied, set_size(&d));
+		CHECK_EQ(STATS_DELTA(cs, st, stored), s->repair_copied);
+		release(cs);			/* not rooted: repair's copy goes again */
+		CHECK(!cs_has(cs, a.b));
+	}
 
 	st = *cs_stats(cs);
 	CHECK_OK(prolly_delta_apply(&ctx, &delta, &back));
 	s->delta_apply_reads = STATS_DELTA(cs, st, gets);
-	s->delta_apply_writes = STATS_DELTA(cs, st, stored);
+	s->delta_apply_writes = STATS_DELTA(cs, st, puts);	/* (found there or not) */
 	CHECK(phash_eq(&back, &a));
 	held(cs, back);
 	release(cs);
@@ -1109,7 +1122,8 @@ life_scale_case(uint64 n, LifeScale *s)
 	/* dropping a tree that shares everything with a rooted one frees nothing */
 	same = held(cs, t_apply(&ctx, &b, eb.e, 0));
 	release(cs);
-	s->hold_frees = sever(cs, &same);
+	if (cs->routine == &MemoryChunkStore)
+		s->hold_frees = sever(cs, &same);
 
 	phmap_free(&d);
 	batch_free(&eb);
@@ -1119,12 +1133,14 @@ life_scale_case(uint64 n, LifeScale *s)
 /*
  * What each costs, at two sizes a tree's height apart: chunk diffs,
  * severing, repair and deltas follow the edits and the height, not the
- * rows.
+ * rows.  (Severing and repair, what a memory store frees within a test, on
+ * the memory store alone; the rest on both.)
  */
-ENGINE_MEMORY_TEST(test_lifetime_scaling)
+ENGINE_TEST(test_lifetime_scaling)
 {
 	static const uint64 sizes[] = {20000, 200000};
 	LifeScale	s[2];
+	bool		memory = engine_test_on_memory();
 
 	for (int i = 0; i < 2; i++)
 	{
@@ -1136,27 +1152,35 @@ ENGINE_MEMORY_TEST(test_lifetime_scaling)
 
 		/* chunk diff: O(d h), like row diff */
 		CHECK_LE(x->chunk_diff_reads, 4 * LT_K * h + 2);
+		/* delta: O(d) bytes; replay costs the same as the edits it records */
+		CHECK_LE(x->delta_bytes, LT_K * 40 + 64);
+		CHECK_LE(x->delta_apply_reads, 4 * LT_K * h + 2);
+		CHECK_LE(x->delta_apply_writes, 3 * LT_K * h);
+		if (!memory)
+			continue;
 		/* sever: O(d h) chunks freed, with no chunk read through the store */
 		CHECK_LE(x->sever_frees, 3 * LT_K * h);
 		CHECK_EQ(x->sever_reads, 0);
 		/* repair: exactly the missing chunks read and written */
 		CHECK_EQ(x->repair_src_reads, x->repair_copied);
 		CHECK_LE(x->repair_holds, x->repair_copied * SMALL_MAX_FANOUT + 1);
-		/* delta: O(d) bytes; replay costs the same as the edits it records */
-		CHECK_LE(x->delta_bytes, LT_K * 40 + 64);
-		CHECK_LE(x->delta_apply_reads, 4 * LT_K * h + 2);
-		CHECK_LE(x->delta_apply_writes, 3 * LT_K * h);
 		CHECK_EQ(x->hold_frees, 0);
 	}
 	/* the sizes a level apart */
 	CHECK_LT(s[0].height, s[1].height);
 	/* 10x the rows: costs follow height, not n */
 	CHECK_LE(s[1].chunk_diff_reads, 2 * s[0].chunk_diff_reads * s[1].height / s[0].height);
-	CHECK_LE(s[1].sever_frees, 2 * s[0].sever_frees * s[1].height / s[0].height);
-	CHECK_LE(s[1].repair_copied, 2 * s[0].repair_copied * s[1].height / s[0].height);
-	CHECK_LE(s[1].repair_holds, 2 * s[0].repair_holds * s[1].height / s[0].height);
 	CHECK_LE(s[1].delta_bytes, 2 * s[0].delta_bytes);
 	CHECK_LE(s[1].delta_apply_reads, 2 * s[0].delta_apply_reads * s[1].height / s[0].height);
+	/* (the chunk diffs and deltas measured: on every store) */
+	CHECK(s[0].chunk_diff_reads > 0 && s[0].delta_apply_reads > 0 && s[0].delta_apply_writes > 0);
+	if (memory)
+	{
+		CHECK_LE(s[1].sever_frees, 2 * s[0].sever_frees * s[1].height / s[0].height);
+		CHECK_LE(s[1].repair_copied, 2 * s[0].repair_copied * s[1].height / s[0].height);
+		CHECK_LE(s[1].repair_holds, 2 * s[0].repair_holds * s[1].height / s[0].height);
+		CHECK(s[0].sever_frees > 0 && s[0].repair_copied > 0);
+	}
 }
 
 static const ProllyUnitTest tests[] = {
