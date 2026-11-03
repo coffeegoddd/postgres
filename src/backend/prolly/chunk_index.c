@@ -1579,6 +1579,7 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 		UnlockReleaseBuffer(primary);
 		if (st != ENTRY_IN_PROGRESS || !freeing)
 			return false;
+		elog(LOG, "TRACE chunk index waits (lookup: being moved): chunk %s, transaction %u", ChunkHashText(hash), running);
 		XactLockTableWait(running, NULL, NULL, XLTW_None);
 	}
 	*out = *page_entry(BufferGetPage(found), at);
@@ -1628,6 +1629,7 @@ page_insert(Relation idx, ChunkIndexEntry *entry, ChunkReserveFn reserve,
 			case ENTRY_IN_PROGRESS:
 				/* (as for a unique index: whether it is there is up to it) */
 				UnlockReleaseBuffer(primary);
+				elog(LOG, "TRACE chunk index waits (put: in progress): chunk %s, transaction %u", ChunkHashText(entry->hash), running);
 				XactLockTableWait(running, NULL, NULL, XLTW_None);
 				continue;
 			case ENTRY_DEAD:
@@ -1716,6 +1718,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 			if (st != ENTRY_IN_PROGRESS || !freeing)
 				return false;
 			/* (being freed: wait to see) */
+			elog(LOG, "TRACE chunk index waits (adjust: being freed): chunk %s, transaction %u drefs %d droots %d", ChunkHashText(hash), running, drefs, droots);
 			XactLockTableWait(running, NULL, NULL, XLTW_None);
 			continue;
 		}
@@ -1744,6 +1747,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 			!own_change_covers(idx, primary, own_blk, own_at, drefs, droots))
 		{
 			UnlockReleaseBuffer(primary);
+			elog(LOG, "TRACE chunk index waits (adjust: root let go of): chunk %s, transaction %u drefs %d droots %d", ChunkHashText(hash), running, drefs, droots);
 			XactLockTableWait(running, NULL, NULL, XLTW_None);
 			continue;
 		}
