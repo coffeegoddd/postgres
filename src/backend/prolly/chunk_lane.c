@@ -5,12 +5,16 @@
  *	  (prolly/chunk_lane.h).
  *
  * Each process slot has a few entries in shared memory, its own alone
- * writes, under one spinlock that a backend takes only to take or let go
- * of a lane (once a log, as it first appends to it): the database, the
- * log and the lane it holds.  A lane is taken from those that exist (as
- * the catalogs say) that no entry names, or made, its number the log's
- * next (its meta page's, never given again: an aborted making's lane is
- * gone, and entries its transaction left name it, which no lane must be).
+ * writes, under ChunkLaneLock, which a backend takes only to take or let
+ * go of a lane (once a log, as it first appends to it): the database, the
+ * log and the lane it holds.  A lane is taken from those that exist that
+ * no entry names, or made, its number the log's to give
+ * (ChunkLogTakeLane): a hole (a lane whose making aborted) safe to give
+ * again, or a new one.  The lock is held from finding the holes to the
+ * maker's entry naming its number, so that no hole is a number another is
+ * about to make.  A log's lanes are found from what depends on it, each
+ * lane's meta page naming its number and log: the names a lane is made
+ * with are no more than names.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -35,7 +39,14 @@
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
-#include "storage/spin.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_depend.h"
+#include "storage/lwlock.h"
+#include "utils/fmgroids.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -51,7 +62,6 @@ typedef struct LaneEntry
 
 typedef struct LaneShared
 {
-	slock_t		lock;
 	LaneEntry	entries[FLEXIBLE_ARRAY_MEMBER];
 } LaneShared;
 
@@ -99,7 +109,6 @@ ChunkLaneShmemRequest(void *arg)
 static void
 ChunkLaneShmemInit(void *arg)
 {
-	SpinLockInit(&lanes->lock);
 	for (int i = 0; i < nslots * LANES_PER_BACKEND; i++)
 		lanes->entries[i].db = InvalidOid;
 }
@@ -119,18 +128,18 @@ lanes_exit(int code, Datum arg)
 {
 	LaneEntry  *mine = my_entries();
 
-	SpinLockAcquire(&lanes->lock);
+	LWLockAcquire(ChunkLaneLock, LW_EXCLUSIVE);
 	for (int j = 0; j < LANES_PER_BACKEND; j++)
 		mine[j].db = InvalidOid;
-	SpinLockRelease(&lanes->lock);
+	LWLockRelease(ChunkLaneLock);
 }
 
 static void
 clear_entry(int j)
 {
-	SpinLockAcquire(&lanes->lock);
+	LWLockAcquire(ChunkLaneLock, LW_EXCLUSIVE);
 	my_entries()[j].db = InvalidOid;
-	SpinLockRelease(&lanes->lock);
+	LWLockRelease(ChunkLaneLock);
 	local[j].making = false;
 }
 
@@ -182,18 +191,103 @@ lane_name(Relation log, uint32 lane)
 	return psprintf("%s_lane_%u", RelationGetRelationName(log), lane);
 }
 
-static Oid
-lane_relid(Relation log, uint32 lane)
+/*
+ * A backend's map of each log's lanes (lane -> relation), from what depends
+ * on the log internally, each lane's meta page naming it: made again as a
+ * lane is asked for that it lacks, or that is gone (its log dropped and
+ * made again under the same OID cannot be: a relation's OID is not given
+ * again while it is)
+ */
+typedef struct LaneMap
 {
-	char	   *name;
-	Oid			relid;
+	Oid			log;			/* the key */
+	uint32		n;
+	Oid		   *relids;			/* InvalidOid: a hole */
+} LaneMap;
+
+static HTAB *lane_maps = NULL;
+
+static void
+map_lanes(Relation log, LaneMap *map)
+{
+	Relation	dep = table_open(DependRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	uint32		n = ChunkLogLanes(log);
+
+	if (map->relids)
+		pfree(map->relids);
+	map->n = n;
+	map->relids = MemoryContextAllocZero(TopMemoryContext, sizeof(Oid) * Max(n, 1));
+	map->relids[0] = RelationGetRelid(log);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(log)));
+	scan = systable_beginscan(dep, DependReferenceIndexId, true, NULL, 2, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+		Relation	lane;
+		uint32		number;
+		Oid			parent;
+
+		if (d->classid != RelationRelationId || d->deptype != DEPENDENCY_INTERNAL)
+			continue;
+		lane = try_relation_open(d->objid, AccessShareLock);
+		if (lane == NULL)
+			continue;
+		if (RelationIsChunkLog(lane) && ChunkLogLaneOf(lane, &number, &parent) &&
+			parent == RelationGetRelid(log) && number > 0 && number < n)
+			map->relids[number] = d->objid;
+		relation_close(lane, AccessShareLock);
+	}
+	systable_endscan(scan);
+	table_close(dep, AccessShareLock);
+}
+
+static LaneMap *
+lane_map(Relation log)
+{
+	bool		found;
+	LaneMap    *map;
+
+	if (lane_maps == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(LaneMap);
+		lane_maps = hash_create("chunk log lanes", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	map = hash_search(lane_maps, &RelationGetRelid(log), HASH_ENTER, &found);
+	if (!found)
+	{
+		map->relids = NULL;
+		map_lanes(log, map);
+	}
+	return map;
+}
+
+/* lane's relation, InvalidOid if it has none; fresh if asked */
+static Oid
+lane_relid_of(Relation log, uint32 lane, bool fresh)
+{
+	LaneMap    *map;
 
 	if (lane == 0)
 		return RelationGetRelid(log);
-	name = lane_name(log, lane);
-	relid = get_relname_relid(name, RelationGetNamespace(log));
-	pfree(name);
-	return relid;
+	map = lane_map(log);
+	if (fresh || lane >= map->n || !OidIsValid(map->relids[lane]))
+		map_lanes(log, map);
+	return lane < map->n ? map->relids[lane] : InvalidOid;
+}
+
+static Oid
+lane_relid(Relation log, uint32 lane)
+{
+	return lane_relid_of(log, lane, false);
 }
 
 uint32
@@ -206,13 +300,19 @@ Relation
 ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
 {
 	Oid			relid;
+	Relation	rel;
 
 	if (lane == 0)
 		return log;
 	relid = lane_relid(log, lane);
-	if (!OidIsValid(relid))
-		return NULL;
-	return try_relation_open(relid, lockmode);
+	rel = OidIsValid(relid) ? try_relation_open(relid, lockmode) : NULL;
+	if (rel == NULL && OidIsValid(relid))
+	{
+		/* (gone since mapped: mapped again) */
+		relid = lane_relid_of(log, lane, true);
+		rel = OidIsValid(relid) ? try_relation_open(relid, lockmode) : NULL;
+	}
+	return rel;
 }
 
 void
@@ -233,8 +333,9 @@ make_lane(Relation log, uint32 lane)
 	char	   *name = lane_name(log, lane);
 	char	   *nsp = get_namespace_name(RelationGetNamespace(log));
 	char	   *am = get_am_name(log->rd_rel->relam);
-	char	   *ts = OidIsValid(log->rd_rel->reltablespace) ?
-		get_tablespace_name(log->rd_rel->reltablespace) : NULL;
+	/* (the log's, as it is: the database's named, whatever the session's default) */
+	char	   *ts = get_tablespace_name(OidIsValid(log->rd_rel->reltablespace) ?
+										 log->rd_rel->reltablespace : MyDatabaseTableSpace);
 	StringInfoData sql;
 	Oid			save_userid;
 	int			save_sec_context;
@@ -269,13 +370,14 @@ make_lane(Relation log, uint32 lane)
 	PG_END_TRY();
 	CommandCounterIncrement();
 
-	made = relation_open(lane_relid(log, lane), RowExclusiveLock);
+	made = relation_open(get_relname_relid(name, RelationGetNamespace(log)), RowExclusiveLock);
 	ObjectAddressSet(laneaddr, RelationRelationId, RelationGetRelid(made));
 	ObjectAddressSet(logaddr, RelationRelationId, RelationGetRelid(log));
 	recordDependencyOn(&laneaddr, &logaddr, DEPENDENCY_INTERNAL);
 	CommandCounterIncrement();
 	ChunkLogMakeLane(made, lane, log);
 	relation_close(made, NoLock);
+	(void) lane_relid_of(log, lane, true);
 	pfree(name);
 	pfree(sql.data);
 }
@@ -290,6 +392,7 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	bool		make = false;
 	bool	   *held;
 	bool	   *exists;
+	uint32	   *holes;
 	Relation	rel;
 
 	register_callbacks();
@@ -329,15 +432,17 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	}
 
 	/*
-	 * the lanes there are (those whose making aborted are gone, their
-	 * numbers never given again), and those no live backend holds
+	 * the lanes there are (as the catalogs say, read before the lock is
+	 * taken), those no live backend holds, and the holes: numbers given with
+	 * no lane and no holder, their making aborted
 	 */
 	nlanes = ChunkLaneCount(log);
 	exists = palloc0(sizeof(bool) * nlanes);
+	held = palloc0(sizeof(bool) * nlanes);
+	holes = palloc(sizeof(uint32) * nlanes);
 	for (uint32 l = 0; l < nlanes; l++)
 		exists[l] = OidIsValid(lane_relid(log, l));
-	SpinLockAcquire(&lanes->lock);
-	held = palloc0(sizeof(bool) * nlanes);
+	LWLockAcquire(ChunkLaneLock, LW_EXCLUSIVE);
 	for (int i = 0; i < nslots * LANES_PER_BACKEND; i++)
 	{
 		LaneEntry  *e = &lanes->entries[i];
@@ -348,30 +453,35 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	for (lane = 0; lane < nlanes && (held[lane] || !exists[lane]); lane++)
 		;
 	make = lane == nlanes;
-	if (!make)
+	if (make)
 	{
-		mine[slot].db = MyDatabaseId;
-		mine[slot].log = RelationGetRelid(log);
-		mine[slot].lane = lane;
+		int			nholes = 0;
+
+		for (uint32 l = 1; l < nlanes; l++)
+			if (!held[l] && !exists[l])
+				holes[nholes++] = l;
+		/*
+		 * (a hole made since the catalogs were read is one its maker's entry
+		 * named under this lock, so held: a hole read stale is one made and
+		 * its maker gone, which ChunkLogTakeLane gives again only once seen
+		 * again later, after a pass of VACUUM)
+		 */
+		lane = ChunkLogTakeLane(log, holes, nholes);
 	}
-	SpinLockRelease(&lanes->lock);
+	mine[slot].db = MyDatabaseId;
+	mine[slot].log = RelationGetRelid(log);
+	mine[slot].lane = lane;
+	LWLockRelease(ChunkLaneLock);
 	pfree(held);
 	pfree(exists);
-	if (make)
-	{
-		/* (all held: the next number, never given before, its own) */
-		lane = ChunkLogTakeLane(log);
-		SpinLockAcquire(&lanes->lock);
-		mine[slot].db = MyDatabaseId;
-		mine[slot].log = RelationGetRelid(log);
-		mine[slot].lane = lane;
-		SpinLockRelease(&lanes->lock);
-		local[slot].making = true;
-		local[slot].subid = GetCurrentSubTransactionId();
-	}
+	pfree(holes);
 	local[slot].used = ++use_clock;
 	if (make)
+	{
+		local[slot].making = true;
+		local[slot].subid = GetCurrentSubTransactionId();
 		make_lane(log, lane);
+	}
 	*lane_out = lane;
 	rel = ChunkLaneOpen(log, lane, RowExclusiveLock);
 	if (rel == NULL)

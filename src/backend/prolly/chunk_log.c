@@ -61,6 +61,9 @@
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
 #define CHUNK_LOG_VERSION	8
 
+/* The lanes' numbers whose making aborted a log keeps to give again. */
+#define CHUNK_LOG_UNMADE	64
+
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
 #define CHUNK_PAGE_MAP		3
@@ -105,8 +108,24 @@ typedef struct ChunkLogMetaData
 								 * InvalidOid */
 	uint32		lane;			/* its lane's number in its log (0: the log's) */
 	Oid			parent;			/* a lane's: the log's (prolly/chunk_lane.h) */
-	uint32		next_lane;		/* the log's: the next lane's number (never
-								 * one before, though its making aborted) */
+	uint32		next_lane;		/* the log's: the next new lane's number */
+
+	/*
+	 * The log's: its index's VACUUM passes begun, and the last begun of
+	 * those ended; and the numbers of lanes whose making aborted (no lane
+	 * and no backend holding the number), each with the passes begun when
+	 * it was first seen so.  Such a number is given again once a pass
+	 * begun after that has ended: the entries the aborted making left,
+	 * naming the lane, all taken out by it.
+	 */
+	uint32		vac_begun;
+	uint32		vac_ended;
+	uint32		nunmade;
+	struct
+	{
+		uint32		lane;
+		uint32		seen;
+	}			unmade[CHUNK_LOG_UNMADE];
 } ChunkLogMetaData;
 
 /*
@@ -362,6 +381,8 @@ init_meta(Page page)
 	meta->lane = 0;
 	meta->parent = InvalidOid;
 	meta->next_lane = 1;
+	meta->vac_begun = meta->vac_ended = 0;
+	meta->nunmade = 0;
 	if (!pg_strong_random(&meta->stamp, sizeof(meta->stamp)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -2281,6 +2302,23 @@ page_vacuum_end(Relation rel, void *state, bool truncate, double fraction,
  * every lane, the lane's own places in the bits below.
  */
 
+bool
+ChunkLogLaneOf(Relation rel, uint32 *lane, Oid *parent)
+{
+	Buffer		mbuf;
+	ChunkLogMetaData *meta;
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+		return false;
+	mbuf = ReadBuffer(rel, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	meta = page_meta(rel, BufferGetPage(mbuf));
+	*lane = meta->lane;
+	*parent = meta->parent;
+	UnlockReleaseBuffer(mbuf);
+	return true;
+}
+
 uint32
 ChunkLogLanes(Relation log)
 {
@@ -2294,36 +2332,101 @@ ChunkLogLanes(Relation log)
 }
 
 /*
- * (the page's change, not the transaction's: a lane's making aborted, its
- * number stays taken, so that no other lane is ever named so by an entry
- * the aborted transaction left)
+ * The number of the lane to make: one of holes (numbers below next_lane
+ * with no lane and no backend holding them: their making aborted) once a
+ * VACUUM pass of the log's index begun after it was first seen so has
+ * ended, or else the next new one.  A page's change, not the transaction's
+ * (a number taken stays taken, whatever becomes of the making).  The
+ * caller holds ChunkLaneLock, as any taker and maker does, so that no hole
+ * is a number another is about to make.
  */
 uint32
-ChunkLogTakeLane(Relation log)
+ChunkLogTakeLane(Relation log, const uint32 *holes, int nholes)
 {
 	Buffer		mbuf = ReadBuffer(log, META_BLOCK);
 	ChunkLogMetaData *meta;
-	uint32		n;
+	int			reuse = -1;
+	uint32		n,
+				kept = 0;
 
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = page_meta(log, BufferGetPage(mbuf));
-	n = meta->next_lane;
-	if (n > LANE_MAX)
+
+	/* (decided first, the page as it is: an error leaves it so) */
+	for (uint32 k = 0; k < meta->nunmade && reuse < 0; k++)
+		for (int h = 0; h < nholes; h++)
+			if (holes[h] == meta->unmade[k].lane && meta->unmade[k].seen < meta->vac_ended)
+				reuse = (int) k;
+	if (reuse < 0 && meta->next_lane > LANE_MAX)
 	{
 		UnlockReleaseBuffer(mbuf);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("chunk log \"%s\" has made its last lane", RelationGetRelationName(log)),
-				 errdetail("A chunk log makes at most %d lanes.", LANE_MAX)));
+				 errdetail("A chunk log has at most %d lanes.", LANE_MAX)));
 	}
+	n = reuse >= 0 ? meta->unmade[reuse].lane : meta->next_lane;
+
 	START_CRIT_SECTION();
-	meta->next_lane = n + 1;
+
+	/*
+	 * the numbers kept that are holes still (the one given again let go
+	 * of; one no longer a hole, made or being made, let go of too), and
+	 * holes not yet kept, seen as of the passes begun
+	 */
+	for (uint32 k = 0; k < meta->nunmade; k++)
+	{
+		bool		hole = false;
+
+		for (int h = 0; h < nholes && !hole; h++)
+			hole = holes[h] == meta->unmade[k].lane;
+		if (hole && (int) k != reuse)
+			meta->unmade[kept++] = meta->unmade[k];
+	}
+	meta->nunmade = kept;
+	for (int h = 0; h < nholes && meta->nunmade < CHUNK_LOG_UNMADE; h++)
+	{
+		bool		known = reuse >= 0 && holes[h] == n;
+
+		for (uint32 k = 0; k < meta->nunmade && !known; k++)
+			known = meta->unmade[k].lane == holes[h];
+		if (!known)
+		{
+			meta->unmade[meta->nunmade].lane = holes[h];
+			meta->unmade[meta->nunmade++].seen = meta->vac_begun;
+		}
+	}
+	if (reuse < 0)
+		meta->next_lane = n + 1;
 	MarkBufferDirty(mbuf);
 	if (RelationNeedsWAL(log))
 		log_newpage_buffer(mbuf, true);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(mbuf);
 	return n;
+}
+
+/* (a pass of the log's index's VACUUM begun, its number; one ended) */
+static uint32
+vacuum_pass(Relation log, uint32 ended)
+{
+	Buffer		mbuf = ReadBuffer(log, META_BLOCK);
+	ChunkLogMetaData *meta;
+	uint32		pass;
+
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = page_meta(log, BufferGetPage(mbuf));
+	START_CRIT_SECTION();
+	if (ended == 0)
+		pass = ++meta->vac_begun;
+	else
+		pass = meta->vac_ended = Max(meta->vac_ended, ended);
+	MarkBufferDirty(mbuf);
+	if (RelationNeedsWAL(log))
+		log_newpage_buffer(mbuf, true);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(mbuf);
+	return pass;
 }
 
 void
@@ -2634,6 +2737,7 @@ lane_evacuable_segments(Relation log, int max, uint64 *starts, uint64 *ends)
 
 typedef struct LaneSweep
 {
+	uint32		pass;			/* the index's VACUUM pass begun */
 	uint32		n;
 	void	  **states;
 } LaneSweep;
@@ -2643,6 +2747,7 @@ lane_vacuum_begin(Relation log)
 {
 	LaneSweep  *sw = palloc0(sizeof(LaneSweep));
 
+	sw->pass = vacuum_pass(log, 0);
 	sw->n = ChunkLaneCount(log);
 	sw->states = palloc0_array(void *, sw->n);
 	for (uint32 lane = 0; lane < sw->n; lane++)
@@ -2715,6 +2820,9 @@ lane_vacuum_end(Relation log, void *state, bool truncate, double fraction,
 		pfree(bits);
 		ChunkLaneClose(log, rel);
 	}
+	/* (the pass ended: lanes whose making aborted before it, given again) */
+	if (sw != NULL)
+		(void) vacuum_pass(log, sw->pass);
 }
 
 static uint64
