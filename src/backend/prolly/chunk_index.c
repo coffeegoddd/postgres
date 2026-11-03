@@ -2490,7 +2490,7 @@ xmin_state(ChunkIndexEntry *e, Buffer buf)
 /*
  * Whether an entry is counted, to snap: its insert visible, and moved out
  * of a lane by no merger snap sees, or moved into the index by one it does;
- * a chunk's, not freed by a merger snap sees (*freeing set if one is
+ * a chunk's, not freed by a transaction snap sees (*freeing set if one is
  * freeing it, running)
  */
 static bool
@@ -2502,7 +2502,7 @@ lane_counts(ChunkIndexEntry *e, Buffer buf, bool lane, Snapshot snap,
 	if (lane ? merge_done(e->merge_xid, snap) :
 		(TransactionIdIsValid(e->merge_xid) && !merge_done(e->merge_xid, snap)))
 		return false;
-	if (e->kind == CHUNK_KIND_CHUNK && !lane && TransactionIdIsValid(e->xmax) &&
+	if (e->kind == CHUNK_KIND_CHUNK && TransactionIdIsValid(e->xmax) &&
 		!(e->flags & CHUNK_ENTRY_XMAX_ABORTED))
 	{
 		if (merge_done(e->xmax, snap))
@@ -2523,7 +2523,8 @@ typedef struct LaneScan
 	ChunkIndexEntry *changes;
 	int			nchanges,
 				changecap;
-	TransactionId freeing;		/* a merger freeing one, running, or 0 */
+	TransactionId freeing;		/* a transaction freeing one, running, or 0 */
+	TransactionId running;		/* another's entry or change of it, running */
 } LaneScan;
 
 static void
@@ -2557,8 +2558,14 @@ scan_rel(LaneScan *s, Relation rel, bool lane, const uint8 *hash)
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
 
-			if (memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 || !belongs(e, bucket, &masks) ||
-				!lane_counts(e, cur, lane, s->snap, &s->freeing))
+			if (memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 || !belongs(e, bucket, &masks))
+				continue;
+			if (xmin_state(e, cur) == ENTRY_IN_PROGRESS)
+			{
+				s->running = e->xmin;
+				continue;
+			}
+			if (!lane_counts(e, cur, lane, s->snap, &s->freeing))
 				continue;
 			if (e->kind == CHUNK_KIND_CHUNK)
 				scan_push(&s->chunks, &s->nchunks, &s->chunkcap, e);
@@ -3188,6 +3195,362 @@ lane_remove(Relation idx, const uint8 *hash)
 	return any;
 }
 
+
+/* ------------------------------------------------------------ the merger */
+
+/*
+ * The entries of hash in idx itself as this transaction (the merger) sees
+ * them: the chunk's entries present (its first in *chunk; false if none),
+ * and its counts, entries' and changes', summed.
+ */
+static bool
+main_counts(Relation idx, const uint8 *hash, ChunkIndexEntry *chunk, int64 *refs,
+			int64 *roots)
+{
+	LaneScan	s;
+
+	memset(&s, 0, sizeof(s));
+	s.snap = RegisterSnapshot(GetLatestSnapshot());
+	scan_rel(&s, idx, false, hash);
+	UnregisterSnapshot(s.snap);
+	*refs = *roots = 0;
+	for (int i = 0; i < s.nchunks; i++)
+	{
+		*refs += s.chunks[i].refs;
+		*roots += s.chunks[i].roots;
+		for (int j = 0; j < s.nchanges; j++)
+			if (change_of(&s.changes[j], &s.chunks[i]))
+			{
+				*refs += (int32) s.changes[j].refs;
+				*roots += (int32) s.changes[j].roots;
+			}
+	}
+	if (s.nchunks > 0)
+	{
+		/* (the first not an alias: the chunk's own) */
+		*chunk = s.chunks[0];
+		for (int i = 0; i < s.nchunks; i++)
+			if (!(s.chunks[i].flags & CHUNK_ENTRY_ALIAS))
+			{
+				*chunk = s.chunks[i];
+				break;
+			}
+	}
+	lanes_scan_free(&s);
+	return s.nchunks > 0;
+}
+
+/* an entry added to idx itself, as an insert adds one (the bucket split if it grew) */
+static void
+main_add(Relation idx, ChunkIndexEntry *e)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary = lock_bucket(idx, e->hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	BlockNumber space,
+				last;
+	bool		grew;
+
+	chain_room(idx, primary, &space, &last);
+	grew = add_entry(idx, primary, bucket, space, last, e, NULL, NULL);
+	UnlockReleaseBuffer(primary);
+	if (grew)
+		split_bucket(idx);
+}
+
+/*
+ * A lane's entry moved into idx by this transaction: a change, copied; a
+ * chunk's, copied as the chunk's entry if idx has none of it present, else
+ * as an alias of the one there (the same chunk put twice at once: its own
+ * counts a change of that one, its changes counted through it); tagged by
+ * this transaction.  Whether its counts left the chunk none (*zero).
+ */
+static void
+merge_into(Relation idx, const ChunkIndexEntry *e, TransactionId xid, bool *zero)
+{
+	ChunkIndexEntry copy = *e;
+	ChunkIndexEntry chunk;
+	int64		refs,
+				roots;
+
+	copy.merge_xid = xid;
+	copy.flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
+	if (e->kind == CHUNK_KIND_CHUNK && main_counts(idx, e->hash, &chunk, &refs, &roots))
+	{
+		ChunkIndexEntry change;
+
+		copy.flags |= CHUNK_ENTRY_ALIAS;
+		copy.refs = copy.roots = 0;
+		main_add(idx, &copy);
+		if (e->refs != 0 || e->roots != 0)
+		{
+			memset(&change, 0, sizeof(change));
+			memcpy(change.hash, e->hash, CHUNK_HASH_LEN);
+			change.kind = CHUNK_KIND_CHANGE;
+			change.refs = e->refs;
+			change.roots = e->roots;
+			change.xmin = xid;
+			change.xmax = chunk.xmin;
+			change.loc = chunk.loc;
+			change.flags = 0;
+			change.merge_xid = xid;
+			main_add(idx, &change);
+		}
+	}
+	else
+		main_add(idx, &copy);
+	(void) main_counts(idx, e->hash, &chunk, &refs, &roots);
+	*zero = refs == 0 && roots == 0;
+}
+
+/*
+ * The entries of lane committed, and not moved yet (or moved by a merger
+ * that aborted), moved into idx by this transaction: each marked moved in
+ * the lane, bucket by bucket, its chain locked from its first page, as
+ * VACUUM walks it (a bucket split meanwhile read again, so that no copy a
+ * split made is moved twice), then copied into idx.  The buckets of idx of
+ * chunks left with no counts marked, for the freer.  How many moved.
+ */
+static uint64
+merge_lane(Relation idx, Relation lane)
+{
+	TransactionId xid = GetCurrentTransactionId();
+	IndexCache *cache = load_cache(lane);
+	ChunkIndexEntry *moved = NULL;
+	int			cap = 0;
+	uint64		total = 0;
+
+	for (uint32 b = 0; b <= cache->maxbucket; b++)
+	{
+		BlockNumber blk = bucket_block(lane, cache, b);
+		Buffer		primary = ReadBuffer(lane, blk);
+		Buffer		cur;
+		IndexPageOpaque opaque;
+		IndexCache	masks;
+		int			nm = 0;
+
+		LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
+		opaque = check_ipage(lane, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
+		if (opaque->split_at > cache->maxbucket)
+		{
+			UnlockReleaseBuffer(primary);
+			cache = load_cache(lane);
+			b--;
+			continue;
+		}
+		masks = *cache;
+		cur = primary;
+		for (;;)
+		{
+			Page		page = BufferGetPage(cur);
+			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			int			n = page_entries(page);
+
+			for (int i = 0; i < n; i++)
+			{
+				ChunkIndexEntry *e = page_entry(page, i);
+				xl_chunk_index_slot xlrec = {.slot = i, .xmax = xid};
+
+				if (!belongs(e, b, &masks) || xmin_state(e, cur) != ENTRY_VISIBLE ||
+					TransactionIdIsCurrentTransactionId(e->xmin))
+					continue;
+				if (TransactionIdIsValid(e->merge_xid) &&
+					(TransactionIdIsCurrentTransactionId(e->merge_xid) ||
+					 TransactionIdIsInProgress(e->merge_xid) ||
+					 TransactionIdDidCommit(e->merge_xid)))
+					continue;
+				/* (freed, or being freed: VACUUM takes it out of the lane) */
+				if (e->kind == CHUNK_KIND_CHUNK && TransactionIdIsValid(e->xmax) &&
+					!(e->flags & CHUNK_ENTRY_XMAX_ABORTED) &&
+					(TransactionIdIsInProgress(e->xmax) || TransactionIdDidCommit(e->xmax)))
+					continue;
+				START_CRIT_SECTION();
+				ipage_set_merge(page, i, xid);
+				log_slot_change(lane, primary, cur, XLOG_CHUNK_INDEX_SET_MERGE, &xlrec);
+				END_CRIT_SECTION();
+				if (nm == cap)
+				{
+					cap = cap ? cap * 2 : 64;
+					moved = moved ? repalloc_array(moved, ChunkIndexEntry, cap) :
+						palloc_array(ChunkIndexEntry, cap);
+				}
+				moved[nm++] = *e;
+			}
+			if (cur != primary)
+				UnlockReleaseBuffer(cur);
+			if (!BlockNumberIsValid(next))
+				break;
+			cur = ReadBuffer(lane, next);
+			LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+			check_ipage(lane, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+		}
+		UnlockReleaseBuffer(primary);
+		for (int k = 0; k < nm; k++)
+		{
+			bool		zero;
+
+			CHECK_FOR_INTERRUPTS();
+			merge_into(idx, &moved[k], xid, &zero);
+			if (zero)
+			{
+				uint32		ib;
+				IndexCache	im;
+				Buffer		ip = lock_bucket(idx, moved[k].hash, BUFFER_LOCK_SHARE, &ib, &im);
+
+				UnlockReleaseBuffer(ip);
+				set_mark(idx, ib, true);
+			}
+		}
+		total += nm;
+	}
+	if (moved)
+		pfree(moved);
+	return total;
+}
+
+static uint64
+lane_merge(Relation idx)
+{
+	Relation	log = laned_log(idx);
+	uint32		n;
+	uint64		total = 0;
+
+	if (log == NULL)
+		return 0;
+	relation_close(log, AccessShareLock);
+	PreventCommandIfReadOnly("merge a chunk index's lanes");
+	n = ChunkIndexLaneCount(idx);
+	for (uint32 l = 0; l < n; l++)
+	{
+		Relation	lane = ChunkIndexLaneOpen(idx, l, RowExclusiveLock);
+
+		if (lane == NULL)
+			continue;
+		total += merge_lane(idx, lane);
+		ChunkIndexLaneClose(lane);
+	}
+	if (total > 0)
+		pgstat_count_heap_insert(idx, (PgStat_Counter) total);
+	return total;
+}
+
+/*
+ * xmax set on every entry of hash's chunk in rel (a lane, or the index)
+ * present to this transaction, or (xid 0) cleared on those it set it on
+ */
+static void
+rel_set_xmax(Relation rel, bool lane, const uint8 *hash, TransactionId xid, Snapshot snap)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary = lock_bucket(rel, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	Buffer		cur = primary;
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			n = page_entries(page);
+
+		for (int i = 0; i < n; i++)
+		{
+			ChunkIndexEntry *e = page_entry(page, i);
+			xl_chunk_index_slot xlrec = {.slot = i, .xmax = xid};
+
+			if (e->kind != CHUNK_KIND_CHUNK || memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
+				!belongs(e, bucket, &masks))
+				continue;
+			if (TransactionIdIsValid(xid) ? !lane_counts(e, cur, lane, snap, NULL) :
+				!(TransactionIdIsValid(e->xmax) && TransactionIdIsCurrentTransactionId(e->xmax)))
+				continue;
+			START_CRIT_SECTION();
+			ipage_set_xmax(page, i, xid);
+			log_slot_change(rel, primary, cur, XLOG_CHUNK_INDEX_SET_XMAX, &xlrec);
+			END_CRIT_SECTION();
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (!BlockNumberIsValid(next))
+			break;
+		cur = ReadBuffer(rel, next);
+		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(rel, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+	UnlockReleaseBuffer(primary);
+}
+
+/* rel_set_xmax on every lane of idx and on idx */
+static void
+lanes_set_xmax(Relation idx, const uint8 *hash, TransactionId xid)
+{
+	uint32		n = ChunkIndexLaneCount(idx);
+	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+
+	for (uint32 l = 0; l < n; l++)
+	{
+		Relation	rel = ChunkIndexLaneOpen(idx, l, RowExclusiveLock);
+
+		if (rel == NULL)
+			continue;
+		rel_set_xmax(rel, true, hash, xid, snap);
+		ChunkIndexLaneClose(rel);
+	}
+	rel_set_xmax(idx, false, hash, xid, snap);
+	UnregisterSnapshot(snap);
+}
+
+/*
+ * A chunk freed, if nothing holds it: its counts zero, wherever its entries
+ * and changes are; no other transaction's entry or change of it running;
+ * none of its entries this transaction's own put; and held false.  Each
+ * entry of it present marked freed (changing pages, never adding one: a
+ * lane is extended by its writer alone); then looked for again: an entry
+ * or change of it another made meanwhile (a transaction holding it as it
+ * is freed, whose own look then finds the freeing running and waits for
+ * it) takes the freeing back.
+ */
+static bool
+lane_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uint8 *hash),
+		  ChunkIndexEntry *out)
+{
+	Relation	log = laned_log(idx);
+	LaneScan	s;
+	bool		there,
+				mine = false;
+
+	if (log == NULL)
+		return page_free(idx, hash, held, out);
+	relation_close(log, AccessShareLock);
+	PreventCommandIfReadOnly("free a chunk");
+	there = lanes_scan(idx, hash, &s, out);
+	for (int i = 0; there && i < s.nchunks; i++)
+		mine = mine || ChunkEntryIsMine(&s.chunks[i]);
+	if (!there || out->refs != 0 || out->roots != 0 || TransactionIdIsValid(s.running) ||
+		TransactionIdIsValid(s.freeing) || mine || (held && held(idx, hash)))
+	{
+		lanes_scan_free(&s);
+		return false;
+	}
+	lanes_scan_free(&s);
+	lanes_set_xmax(idx, hash, GetCurrentTransactionId());
+	{
+		ChunkIndexEntry again;
+
+		there = lanes_scan(idx, hash, &s, &again);
+		if (there || TransactionIdIsValid(s.running))
+		{
+			lanes_scan_free(&s);
+			lanes_set_xmax(idx, hash, InvalidTransactionId);
+			return false;
+		}
+		lanes_scan_free(&s);
+	}
+	pgstat_count_heap_delete(idx);
+	out->refs = 0;
+	out->roots = 0;
+	return true;
+}
+
 const ChunkIndexRoutine PageChunkIndex = {
 	.lookup = page_lookup,
 	.insert = page_insert,
@@ -3203,18 +3566,18 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.lookup_as_of = page_lookup_as_of,
 	.visit_as_of = page_visit_as_of,
 	.move = page_move,
+	.merge = NULL,
 };
 
 /*
- * (freeing, compaction and the freer's marks act on the index itself for
- * now: the merger, which moves the lanes' entries into it, is to free
- * chunks once they are merged)
+ * (the freer's marks, and compaction's moves, are of the index itself:
+ * chunks are freed and moved once the merger has moved them in)
  */
 const ChunkIndexRoutine LaneChunkIndex = {
 	.lookup = lane_lookup,
 	.insert = lane_insert,
 	.adjust = lane_adjust,
-	.free = page_free,
+	.free = lane_free,
 	.log_of = page_log_of,
 	.bind_log = lane_bind_log,
 	.remove = lane_remove,
@@ -3225,9 +3588,10 @@ const ChunkIndexRoutine LaneChunkIndex = {
 	.lookup_as_of = lane_lookup_as_of,
 	.visit_as_of = lane_visit_as_of,
 	.move = page_move,
+	.merge = lane_merge,
 };
 
-const ChunkIndexRoutine *ChunkIndex = &PageChunkIndex;
+const ChunkIndexRoutine *ChunkIndex = &LaneChunkIndex;
 
 /* ------------------------------------------------------- storage */
 
@@ -3344,13 +3708,29 @@ chain_find(Relation idx, Buffer primary, EntryTest wants, const void *arg,
 	}
 }
 
+/*
+ * (an entry a merger moved into the index: folded, or folded into, only
+ * once every snapshot sees the move, lest a snapshot not seeing it lose
+ * what the fold adds in: VACUUM's horizon, as it folds)
+ */
+static TransactionId fold_horizon = InvalidTransactionId;
+
+static bool
+merge_seen_by_all(const ChunkIndexEntry *e)
+{
+	return !TransactionIdIsValid(e->merge_xid) ||
+		(TransactionIdIsValid(fold_horizon) &&
+		 TransactionIdPrecedes(e->merge_xid, fold_horizon) &&
+		 TransactionIdDidCommit(e->merge_xid));
+}
+
 /* a committed change: of increases (arg true), or of any */
 static bool
 committed_change(const ChunkIndexEntry *e, const void *arg)
 {
 	return e->kind == CHUNK_KIND_CHANGE &&
 		(!*(const bool *) arg || ((int32) e->refs >= 0 && (int32) e->roots >= 0)) &&
-		entry_state_unhinted(e) == ENTRY_VISIBLE;
+		entry_state_unhinted(e) == ENTRY_VISIBLE && merge_seen_by_all(e);
 }
 
 /* the entry (not freed) the change arg is of */
@@ -3358,7 +3738,8 @@ static bool
 chunk_of(const ChunkIndexEntry *e, const void *arg)
 {
 	return e->kind == CHUNK_KIND_CHUNK &&
-		change_of(arg, e) && entry_state_unhinted(e) != ENTRY_DEAD;
+		change_of(arg, e) && entry_state_unhinted(e) != ENTRY_DEAD &&
+		merge_seen_by_all(e);
 }
 
 /*
@@ -3463,6 +3844,8 @@ typedef enum VacuumFate
 /* (VACUUM's records have a byte of each: their values are WAL's) */
 StaticAssertDecl(FATE_FREEZE_CLEAR <= PG_UINT8_MAX, "a fate fits a byte");
 
+static VacuumFate vacuum_fate_entry(const ChunkIndexEntry *e, TransactionId frozen);
+
 /*
  * VACUUM's fates of a page's entries, made: those taken out out, the rest
  * frozen or their freeing cleared as their fates say; the entries kept
@@ -3501,13 +3884,48 @@ ipage_vacuum(Page page, const uint8 *fates, int n)
  */
 static VacuumFate
 vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
-			TransactionId frozen)
+			TransactionId frozen, bool lane)
+{
+	if (!belongs(e, bucket, masks))
+		return FATE_REMOVE_COPY;
+
+	/*
+	 * (a lane's entry moved into the index: out once every snapshot sees
+	 * the move, its bytes the copy's; the index's copy of a move aborted:
+	 * out, its bytes the lane's entry's still; of one running (this
+	 * VACUUM's own, perhaps), not taken out, but frozen as any entry is,
+	 * its insert being committed: the relation's relfrozenxid passes it)
+	 */
+	if (TransactionIdIsValid(e->merge_xid) && !lane)
+	{
+		bool		running = TransactionIdIsCurrentTransactionId(e->merge_xid) ||
+			TransactionIdIsInProgress(e->merge_xid);
+
+		if (running)
+		{
+			VacuumFate	f = vacuum_fate_entry(e, frozen);
+
+			return f == FATE_REMOVE || f == FATE_REMOVE_FREED ? FATE_KEEP : f;
+		}
+		if (!TransactionIdDidCommit(e->merge_xid))
+			return FATE_REMOVE_COPY;
+	}
+	else if (TransactionIdIsValid(e->merge_xid) &&
+			 !TransactionIdIsCurrentTransactionId(e->merge_xid) &&
+			 !TransactionIdIsInProgress(e->merge_xid) &&
+			 TransactionIdDidCommit(e->merge_xid) &&
+			 TransactionIdPrecedes(e->merge_xid, frozen))
+		return FATE_REMOVE_COPY;
+	return vacuum_fate_entry(e, frozen);
+}
+
+/* an entry's fate by its xmin and xmax alone */
+static VacuumFate
+vacuum_fate_entry(const ChunkIndexEntry *e, TransactionId frozen)
 {
 	bool		freeze;
 	bool		clear = false;
 
-	if (!belongs(e, bucket, masks))
-		return FATE_REMOVE_COPY;
 	if (!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
 	{
 		if (e->flags & CHUNK_ENTRY_ABORTED)
@@ -3613,46 +4031,59 @@ count_unheld(Relation idx, Buffer primary)
 	return n;
 }
 
-void
-ChunkIndexVacuum(Relation idx, bool truncate)
+/* What a VACUUM of an index and its lanes carries from one relation to the next. */
+typedef struct VacState
 {
-	uint32		first_marked;
-	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
-	TimestampTz starttime = GetCurrentTimestamp();
-	double		kept_entries = 0;
-	Relation	log = NULL;
-	bool		log_tried = false;
-	bool		any_pass = false;
-	void	   *sweep = NULL;
-	uint64		unheld = 0;
-	ChunkLogSegments segs = {0};
-	/*
-	 * (the places of chunks freed kept for snapshots, whose segments the
-	 * log is to pass by: listed as their entries are passed, the list grown
-	 * as it needs, before a page's entries are taken out, outside the
-	 * windows between taking entries out and counting their bytes dead)
-	 */
-	uint64	   *pending_locs = NULL;
-	uint32	   *pending_lens = NULL;
-	int			npending = 0,
-				pendcap = 0;
-	bool		pending_wanted = false;
-	ChunkIndexEntry *dead = NULL;
-	int			ndead = 0,
-				dead_cap = 0;
+	TransactionId frozen;
+	double		kept_entries;
+	Relation	log;
+	bool		log_tried;
+	bool		any_pass;
+	void	   *sweep;
+	uint64		unheld;
+	uint64	   *pending_locs;
+	uint32	   *pending_lens;
+	int			npending,
+				pendcap;
+	bool		pending_wanted;
+	ChunkIndexEntry *dead;
+	int			ndead,
+				dead_cap;
+	TransactionId oldest;		/* the oldest transaction a kept entry of the
+								 * relation passed still names, or 0 */
+} VacState;
 
-	/*
-	 * Every transaction older than frozen has ended: past its bucket's
-	 * pages, each of its entries is out or frozen (WAL-logged), and none
-	 * needs the commit log again.  Buckets split meanwhile are walked too
-	 * (the highest bucket is read again after each): a split moves entries,
-	 * flags and all, from a bucket to a higher one, and an entry inserted
-	 * meanwhile is of a transaction past frozen.
-	 */
-	for (uint32 b = 0; b <= load_cache(idx)->maxbucket; b++)
+/* (xid noted, if older than the oldest yet) */
+static inline void
+note_oldest(VacState *vs, TransactionId xid)
+{
+	if (TransactionIdIsNormal(xid) &&
+		(!TransactionIdIsValid(vs->oldest) || TransactionIdPrecedes(xid, vs->oldest)))
+		vs->oldest = xid;
+}
+
+/* a relation's relfrozenxid: the horizon, unless a kept entry names an older transaction */
+static inline TransactionId
+pass_frozen(const VacState *vs)
+{
+	return TransactionIdIsValid(vs->oldest) && TransactionIdPrecedes(vs->oldest, vs->frozen) ?
+		vs->oldest : vs->frozen;
+}
+
+/*
+ * VACUUM's pass of rel, the index or (lane) one of its lanes: each bucket's
+ * entries taken out, frozen or cleared as their fates say, their bytes
+ * counted dead; the index's changes folded in and its buckets of chunks
+ * nothing holds marked (a lane's are not: its entries are the merger's to
+ * move in, its changes counted where they are)
+ */
+static void
+vacuum_pass(Relation rel, bool lane, VacState *vs)
+{
+	for (uint32 b = 0; b <= load_cache(rel)->maxbucket; b++)
 	{
-		IndexCache	masks = *(IndexCache *) idx->rd_amcache;
-		BlockNumber blk = bucket_block(idx, &masks, b);
+		IndexCache	masks = *(IndexCache *) rel->rd_amcache;
+		BlockNumber blk = bucket_block(rel, &masks, b);
 		Buffer		primary;
 		Buffer		cur;
 
@@ -3666,34 +4097,34 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		 * a first put binds meanwhile keeps the entries of chunks with bytes
 		 * for the next VACUUM.
 		 */
-		if (!log_tried)
+		if (!vs->log_tried)
 		{
 			uint64		stamp;
 
-			if (OidIsValid(page_log_of(idx, &stamp)))
+			if (OidIsValid(page_log_of(rel, &stamp)))
 			{
-				log = open_bound_log(idx);
-				log_tried = true;
-				if (log != NULL)
+				vs->log = open_bound_log(rel);
+				vs->log_tried = true;
+				if (vs->log != NULL)
 				{
-					pending_wanted = true;
+					vs->pending_wanted = true;
 				}
 
 				/*
 				 * (the pages of regions held by none as the pass begins, to
 				 * let go of after it if unchanged: the log's vacuum_begin)
 				 */
-				if (log != NULL && !any_pass)
-					sweep = ChunkLogOf(log)->vacuum_begin(log);
+				if (vs->log != NULL && !vs->any_pass)
+					vs->sweep = ChunkLogOf(vs->log)->vacuum_begin(vs->log);
 			}
 		}
-		any_pass = true;
+		vs->any_pass = true;
 		HOLD_INTERRUPTS();
-		primary = ReadBuffer(idx, blk);
+		primary = ReadBuffer(rel, blk);
 		LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
-		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
+		check_ipage(rel, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
 		if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
-			masks = *load_cache(idx);
+			masks = *load_cache(rel);
 		cur = primary;
 		for (;;)
 		{
@@ -3706,8 +4137,8 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 
 			for (int i = 0; i < n; i++)
 			{
-				fates[i] = vacuum_fate(page_entry(page, i), b, &masks, frozen);
-				if (log == NULL &&
+				fates[i] = vacuum_fate(page_entry(page, i), b, &masks, vs->frozen, lane);
+				if (vs->log == NULL &&
 					(fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED) &&
 					page_entry(page, i)->kind == CHUNK_KIND_CHUNK &&
 					page_entry(page, i)->len > 0)
@@ -3720,7 +4151,7 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				 * dead only later, once no snapshot might read them)
 				 */
 				if ((fates[i] == FATE_KEEP || fates[i] == FATE_FREEZE) &&
-					pending_wanted &&
+					vs->pending_wanted &&
 					page_entry(page, i)->kind == CHUNK_KIND_CHUNK &&
 					page_entry(page, i)->len > 0 &&
 					TransactionIdIsValid(page_entry(page, i)->xmax) &&
@@ -3728,18 +4159,18 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 				{
 					ChunkIndexEntry *pe = page_entry(page, i);
 
-					if (npending == pendcap)
+					if (vs->npending == vs->pendcap)
 					{
-						pendcap = Max(pendcap * 2, 64);
-						pending_locs = pending_locs ?
-							repalloc_array(pending_locs, uint64, pendcap) :
-							palloc_array(uint64, pendcap);
-						pending_lens = pending_lens ?
-							repalloc_array(pending_lens, uint32, pendcap) :
-							palloc_array(uint32, pendcap);
+						vs->pendcap = Max(vs->pendcap * 2, 64);
+						vs->pending_locs = vs->pending_locs ?
+							repalloc_array(vs->pending_locs, uint64, vs->pendcap) :
+							palloc_array(uint64, vs->pendcap);
+						vs->pending_lens = vs->pending_lens ?
+							repalloc_array(vs->pending_lens, uint32, vs->pendcap) :
+							palloc_array(uint32, vs->pendcap);
 					}
-					pending_locs[npending] = pe->loc;
-					pending_lens[npending++] = pe->len;
+					vs->pending_locs[vs->npending] = pe->loc;
+					vs->pending_lens[vs->npending++] = pe->len;
 				}
 				if (fates[i] == FATE_REMOVE_FREED &&
 					(!TransactionIdIsValid(horizon) ||
@@ -3755,6 +4186,41 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 					(!TransactionIdIsValid(horizon) ||
 					 TransactionIdFollows(page_entry(page, i)->xmin, horizon)))
 					horizon = page_entry(page, i)->xmin;
+			}
+			/*
+			 * (what a kept entry still names: its insert, unless frozen; its
+			 * freeing; and its move, cleared once every snapshot sees it, or
+			 * it aborted, so that nothing asks the commit log of it after)
+			 */
+			for (int i = 0; i < n; i++)
+			{
+				ChunkIndexEntry *e = page_entry(page, i);
+				bool		kept = fates[i] == FATE_KEEP || fates[i] == FATE_CLEAR ||
+					fates[i] == FATE_FREEZE || fates[i] == FATE_FREEZE_CLEAR;
+
+				if (!kept)
+					continue;
+				if (!(e->flags & CHUNK_ENTRY_FROZEN) &&
+					fates[i] != FATE_FREEZE && fates[i] != FATE_FREEZE_CLEAR)
+					note_oldest(vs, e->xmin);
+				if (TransactionIdIsValid(e->xmax) &&
+					fates[i] != FATE_CLEAR && fates[i] != FATE_FREEZE_CLEAR)
+					note_oldest(vs, e->xmax);
+				if (TransactionIdIsValid(e->merge_xid) &&
+					!TransactionIdIsCurrentTransactionId(e->merge_xid) &&
+					!TransactionIdIsInProgress(e->merge_xid) &&
+					(!TransactionIdDidCommit(e->merge_xid) ||
+					 TransactionIdPrecedes(e->merge_xid, vs->frozen)))
+				{
+					xl_chunk_index_slot xlrec = {.slot = i, .xmax = InvalidTransactionId};
+
+					START_CRIT_SECTION();
+					ipage_set_merge(page, i, InvalidTransactionId);
+					log_slot_change(rel, primary, cur, XLOG_CHUNK_INDEX_SET_MERGE, &xlrec);
+					END_CRIT_SECTION();
+				}
+				else if (TransactionIdIsValid(e->merge_xid))
+					note_oldest(vs, e->merge_xid);
 			}
 			if (change)
 			{
@@ -3778,51 +4244,104 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 					if ((fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED) &&
 						e->kind == CHUNK_KIND_CHUNK && e->len > 0)
 					{
-						if (ndead == dead_cap)
+						if (vs->ndead == vs->dead_cap)
 						{
-							dead_cap = dead_cap ? dead_cap * 2 : 64;
-							dead = dead ? repalloc(dead, dead_cap * sizeof(*dead)) :
-								palloc(dead_cap * sizeof(*dead));
+							vs->dead_cap = vs->dead_cap ? vs->dead_cap * 2 : 64;
+							vs->dead = vs->dead ? repalloc(vs->dead, vs->dead_cap * sizeof(*vs->dead)) :
+								palloc(vs->dead_cap * sizeof(*vs->dead));
 						}
-						dead[ndead++] = *e;
+						vs->dead[vs->ndead++] = *e;
 					}
 				}
 				START_CRIT_SECTION();
-				kept_entries += ipage_vacuum(page, fates, n);
-				log_index_change(idx, XLOG_CHUNK_INDEX_VACUUM, &xlrec, sizeof(xlrec), &lp, 1,
+				vs->kept_entries += ipage_vacuum(page, fates, n);
+				log_index_change(rel, XLOG_CHUNK_INDEX_VACUUM, &xlrec, sizeof(xlrec), &lp, 1,
 								 primary);
 				END_CRIT_SECTION();
 			}
 			else
-				kept_entries += n;
+				vs->kept_entries += n;
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
 			if (!BlockNumberIsValid(next))
 				break;
 			CHECK_FOR_INTERRUPTS();
-			cur = ReadBuffer(idx, next);
+			cur = ReadBuffer(rel, next);
 			LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
-			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+			check_ipage(rel, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
 		}
-		fold_changes(idx, primary, b, &masks);
+		if (!lane)
+			fold_changes(rel, primary, b, &masks);
 		/* (chunks nothing holds: the bucket marked, for the freer) */
-		if (count_unheld(idx, primary) > 0)
+		if (!lane && count_unheld(rel, primary) > 0)
 		{
-			unheld++;
-			set_mark(idx, b, true);
+			vs->unheld++;
+			set_mark(rel, b, true);
 		}
 		UnlockReleaseBuffer(primary);
 
 		/* the bytes of the chunks taken out, dead in their log */
-		if (ndead > 0 && log != NULL)
-			for (int i = 0; i < ndead; i++)
-				ChunkLogOf(log)->mark_dead(log, dead[i].loc, dead[i].len, dead[i].log_gen);
-		ndead = 0;
+		if (vs->ndead > 0 && vs->log != NULL)
+			for (int i = 0; i < vs->ndead; i++)
+				ChunkLogOf(vs->log)->mark_dead(vs->log, vs->dead[i].loc, vs->dead[i].len, vs->dead[i].log_gen);
+		vs->ndead = 0;
 		RESUME_INTERRUPTS();
 	}
-	if (!log_tried)
-		log = open_bound_log(idx);
-	if (log != NULL)
+}
+
+void
+ChunkIndexVacuum(Relation idx, bool truncate)
+{
+	uint32		first_marked;
+	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
+	TimestampTz starttime = GetCurrentTimestamp();
+	VacState	vs = {.frozen = frozen};
+	TransactionId main_frozen;
+	double		main_kept;
+	uint32		lane_no;
+	Oid			lane_parent;
+	bool		lane_of = ChunkIndexLaneOf(idx, &lane_no, &lane_parent) &&
+		OidIsValid(lane_parent);
+	ChunkLogSegments segs = {0};
+
+	/*
+	 * Every transaction older than frozen has ended: past its bucket's
+	 * pages, each of its entries is out or frozen (WAL-logged), and none
+	 * needs the commit log again.  Buckets split meanwhile are walked too
+	 * (the highest bucket is read again after each): a split moves entries,
+	 * flags and all, from a bucket to a higher one, and an entry inserted
+	 * meanwhile is of a transaction past frozen.
+	 */
+	/* (the lanes' entries moved in first: what the pass sees, and frees) */
+	if (!lane_of && ChunkIndex->merge)
+		(void) ChunkIndex->merge(idx);
+	fold_horizon = frozen;
+	vs.oldest = InvalidTransactionId;
+	vacuum_pass(idx, lane_of, &vs);
+	main_frozen = pass_frozen(&vs);
+	main_kept = vs.kept_entries;
+	if (!lane_of)
+	{
+		uint32		nl = ChunkIndexLaneCount(idx);
+
+		for (uint32 l = 0; l < nl; l++)
+		{
+			Relation	lane = ChunkIndexLaneOpen(idx, l, ShareUpdateExclusiveLock);
+			double		before = vs.kept_entries;
+
+			if (lane == NULL)
+				continue;
+			vs.oldest = InvalidTransactionId;
+			vacuum_pass(lane, true, &vs);
+			vac_update_relstats(lane, RelationGetNumberOfBlocks(lane), vs.kept_entries - before,
+								0, 0, false, pass_frozen(&vs), InvalidMultiXactId, NULL, NULL, false);
+			ChunkIndexLaneClose(lane);
+		}
+	}
+	fold_horizon = InvalidTransactionId;
+	if (!vs.log_tried)
+		vs.log = open_bound_log(idx);
+	if (vs.log != NULL)
 	{
 		/*
 		 * The log's own end of VACUUM: the regions of backends gone, or that
@@ -3832,44 +4351,44 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		 * readers of the log); then what it finds of its segments, those with
 		 * chunks freed kept for snapshots passed by
 		 */
-		ChunkLogOf(log)->vacuum_end(log, sweep,
+		ChunkLogOf(vs.log)->vacuum_end(vs.log, vs.sweep,
 									truncate &&
-									!(log->rd_options != NULL &&
-									  ((StdRdOptions *) log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE),
-									chunk_compact_dead_fraction, npending, pending_locs,
-									pending_lens, &segs);
-		if (pending_locs)
+									!(vs.log->rd_options != NULL &&
+									  ((StdRdOptions *) vs.log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE),
+									chunk_compact_dead_fraction, vs.npending, vs.pending_locs,
+									vs.pending_lens, &segs);
+		if (vs.pending_locs)
 		{
-			pfree(pending_locs);
-			pfree(pending_lens);
+			pfree(vs.pending_locs);
+			pfree(vs.pending_lens);
 		}
 
 		/*
 		 * chunks nothing holds, segments to compact, or the end to evacuate:
 		 * a freer frees them, and what they held, compacts, and evacuates
 		 */
-		if (unheld > 0 || page_marked(idx, 0, 1, &first_marked) > 0 ||
+		if (vs.unheld > 0 || page_marked(idx, 0, 1, &first_marked) > 0 ||
 			(segs.compactable > 0 && segs.worth) || segs.evacuable > 0)
 		{
 			ereport(DEBUG1,
 					(errmsg_internal("chunk index \"%s\": a freer to start: %llu buckets of chunks unheld, %u segments to compact%s, %u to evacuate, %u passed by for snapshots",
 									 RelationGetRelationName(idx),
-									 (unsigned long long) unheld, segs.compactable,
+									 (unsigned long long) vs.unheld, segs.compactable,
 									 segs.worth ? "" : " (not worth it)",
 									 segs.evacuable, segs.pending)));
-			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx), false,
+			(void) ChunkFreerLaunch(RelationGetRelid(vs.log), RelationGetRelid(idx), false,
 									segs.compactable > 0 && segs.worth,
 									segs.evacuable > 0,
 									chunk_compact_dead_fraction, segs.grow, 0);
 		}
-		relation_close(log, NoLock);
+		relation_close(vs.log, NoLock);
 	}
 
-	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), kept_entries, 0, 0,
-						false, frozen, InvalidMultiXactId, NULL, NULL, false);
+	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), main_kept, 0, 0,
+						false, main_frozen, InvalidMultiXactId, NULL, NULL, false);
 
 	/* (as a heap's VACUUM does: autovacuum counts inserts from here) */
-	pgstat_report_vacuum(idx, (PgStat_Counter) kept_entries, 0, starttime);
+	pgstat_report_vacuum(idx, (PgStat_Counter) main_kept, 0, starttime);
 }
 
 uint64

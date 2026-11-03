@@ -404,6 +404,7 @@ freer_exit(int code, Datum arg)
 /* what the freer does in a transaction */
 typedef enum FreerOp
 {
+	FREER_MERGE,				/* move an index's lanes' entries into it */
 	FREER_FREE,					/* free the chunks nothing holds, of the
 								 * buckets marked */
 	FREER_UNMARK,				/* unmark the buckets freed */
@@ -420,6 +421,7 @@ typedef struct FreerState
 	uint64		below;			/* where room for moves must end before */
 	int			looked;			/* the step's chunks looked at, or -1 */
 	uint64		freed;
+	uint64		merged;			/* lanes' entries moved into the index */
 	uint64		chunks;
 	uint64		bytes;
 	/* freeing: the buckets marked from this one, those being freed */
@@ -484,7 +486,7 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	/* (freeing waits for another freer's compaction step; compacting, not) */
-	if (op == FREER_FREE || op == FREER_UNMARK ?
+	if (op == FREER_FREE || op == FREER_UNMARK || op == FREER_MERGE ?
 		(LockDatabaseObject(RelationRelationId, args->idx, 0, ExclusiveLock), true) :
 		ConditionalLockDatabaseObject(RelationRelationId, args->idx, 0,
 									  ExclusiveLock))
@@ -505,6 +507,9 @@ freer_step(const ChunkFreerArgs *args, FreerOp op, FreerState *fs)
 			done = true;
 			switch (op)
 			{
+				case FREER_MERGE:
+					fs->merged += ChunkIndex->merge ? ChunkIndex->merge(idx) : 0;
+					break;
 				case FREER_FREE:
 					{
 						List	   *unheld = NIL;
@@ -686,6 +691,10 @@ freer_free(const ChunkFreerArgs *args, FreerState *fs)
 		fs->nrunning = 0;
 		fs->retry_left = false;
 		INJECTION_POINT("chunk-freer-pass", NULL);
+
+		/* (the lanes' entries moved in first: what is freed is in the index) */
+		if (!freer_step(args, FREER_MERGE, fs))
+			goto gone;
 		for (;;)
 		{
 			uint32		next;
@@ -850,10 +859,11 @@ ChunkFreerMain(Datum main_arg)
 		cancel_before_shmem_exit(freer_exit, 0);
 	pgstat_report_stat(true);
 	ereport(DEBUG1,
-			(errmsg_internal("chunk freer freed %llu chunks of chunk index %u, looking in %llu buckets marked, and moved %llu (%llu bytes)",
+			(errmsg_internal("chunk freer freed %llu chunks of chunk index %u, looking in %llu buckets marked, and moved %llu (%llu bytes); merged %llu lanes' entries",
 							 (unsigned long long) fs.freed, args.idx,
 							 (unsigned long long) fs.buckets_looked,
 							 (unsigned long long) moved,
-							 (unsigned long long) moved_bytes)));
+							 (unsigned long long) moved_bytes,
+							 (unsigned long long) fs.merged)));
 	proc_exit(0);
 }

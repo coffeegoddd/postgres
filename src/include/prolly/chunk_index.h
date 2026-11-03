@@ -101,6 +101,10 @@ typedef void (*ChunkReserveFn) (void *arg, ChunkIndexEntry *entry);
 										 * running: WAL-logged by VACUUM */
 #define CHUNK_ENTRY_XMAX_COMMITTED	0x08	/* xmax committed (a hint) */
 #define CHUNK_ENTRY_XMAX_ABORTED	0x10	/* xmax aborted, or crashed (a hint) */
+#define CHUNK_ENTRY_ALIAS		0x20	/* a chunk's entry put twice at once, moved
+										 * in by the merger beside the one there:
+										 * its counts that one's, its changes
+										 * counted through it */
 
 /*
  * Whether this transaction put the entry (its xmin's, not frozen: a frozen
@@ -219,6 +223,14 @@ typedef struct ChunkIndexRoutine
 	 */
 	bool		(*lookup_as_of) (Relation idx, const uint8 *hash,
 								 Snapshot snap, ChunkIndexEntry *out);
+
+	/*
+	 * An index in lanes: the lanes' entries committed moved into the index
+	 * by this transaction, the buckets of chunks left with no counts
+	 * marked; how many moved.  NULL for an index of no lanes.  (Its freer
+	 * calls it before freeing.)
+	 */
+	uint64		(*merge) (Relation idx);
 	void		(*visit_as_of) (Relation idx, Snapshot snap,
 								bool (*fn) (void *arg, const ChunkIndexEntry *e),
 								void *arg);
