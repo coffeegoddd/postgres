@@ -45,6 +45,9 @@ engine_test_on_memory(void)
 /* How many times the body running now has asked for its store. */
 static int	engine_test_stores_asked = 0;
 
+/* The body's subtransaction's nesting level, on "pages". */
+static int	engine_test_nest_level = 0;
+
 /*
  * The store, as the body found it: the memory one emptied (its references
  * too); on "pages", after the body's first, the body's subtransaction
@@ -63,6 +66,9 @@ memstore_create(void)
 	{
 		MemoryContext cxt = CurrentMemoryContext;
 
+		/* (the body's own subtransaction, not one begun within it) */
+		if (GetCurrentTransactionNestLevel() != engine_test_nest_level)
+			elog(ERROR, "a test's store asked for again inside a subtransaction of its own");
 		RollbackAndReleaseCurrentSubTransaction();
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
@@ -175,6 +181,7 @@ engine_test_run(void (*body) (void), const char *store)
 	{
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
+		engine_test_nest_level = GetCurrentTransactionNestLevel();
 	}
 	PG_TRY();
 	{

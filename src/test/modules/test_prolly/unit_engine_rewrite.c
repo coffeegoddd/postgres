@@ -545,14 +545,13 @@ ENGINE_TEST(test_pinned_follows_the_hook)
 	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
 	CHECK(vc_in_window(&r, &b2));	/* a root: nothing beneath it to cut */
 	CHECK_EQ(window_size(&r), 2);
-	/* the old hash, gone (its transaction's holds ended), is no commit */
-	if (engine_test_on_memory())
-	{
-		(void) release(cs);
-		w.pinned = &l.b;
-		CHECK_EQ(vc_sever(&r, &w, &seg), VC_ERR_SEVERED);
-		CHECK(vc_in_window(&r, &b2));
-	}
+	/* the old hash, without a reference, is no commit: freed or not yet */
+	w.pinned = &l.b;
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_ERR_SEVERED);
+	CHECK(phash_eq(&r.ctx.err_hash, &l.b));
+	(void) release(cs);
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_ERR_SEVERED);
+	CHECK(vc_in_window(&r, &b2));
 	settle_and_check(cs);
 	vc_repo_free(&r);
 	cs_destroy(cs);

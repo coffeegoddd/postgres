@@ -824,12 +824,16 @@ wider_window_run(const VcWindow *wide)
 /*
  * A wider window does not bring back what is cut: a sever stops at a commit
  * without a reference, though it can still be read, and does not keep what
- * lies past it.  (With a depth alone, and with a ceiling too.)
+ * lies past it.  (With a depth alone, with a ceiling too, and with a low
+ * mark.)
  */
 ENGINE_TEST(test_wider_window_stays_cut)
 {
 	wider_window_run(&(VcWindow) {.depth = 5});
 	wider_window_run(&(VcWindow) {.depth = 5,.max_commits = 100});
+	/* (past B, A is held below the ceiling: walked through, D's window would
+	 * be at its high mark, and cut back to D) */
+	wider_window_run(&(VcWindow) {.depth = 5,.max_commits = 3,.low_commits = 1});
 }
 
 ENGINE_TEST(test_pinned_commit_stays)

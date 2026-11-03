@@ -451,7 +451,8 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  * that then aborts has moved none of them.  A commit pinned by hash
  * (VcWindow.pinned) with cut history beneath it is replaced as any: the
  * hook names its new hash, which a later sever's pin must name (the old
- * one, gone, is VC_ERR_SEVERED).  Changing
+ * one, without a reference, is VC_ERR_SEVERED, as any commit cut already
+ * that a pin names is, whether or not its chunks are freed yet).  Changing
  * the branches or the mode while a rewriting sever waits for the
  * repository's state refuses it (a serialization failure), to be run
  * again.
