@@ -35,5 +35,8 @@ is( $node->safe_psql(
 		FROM test_vc_bench_deep_probe('main', 'old')}),
 	'1202|t|t|t|t|t|t',
 	'the probe, its merge bases checked, its diffs as far apart as asked');
+# (the commit the probe's dropped branch left: a sever takes it, and goes on)
+ok($node->safe_psql('postgres', q{SELECT test_vc_bench_sever(2000)}) > 0,
+	'a sever after a probe');
 $node->stop;
 done_testing();

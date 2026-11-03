@@ -3,7 +3,8 @@
 # commits of CHANGES random row updates each, all on main, all held (the
 # window deeper than the history).  At each milestone (1k, 10k, 100k, 1M
 # ...) and at the end: the interval's cost of a commit, and of a sever (a
-# full pass over the window, cutting nothing), every 1,000 commits to 10,000
+# full pass over the window, cutting at most the commit the last milestone's
+# merge base branch left behind), every 1,000 commits to 10,000
 # and then every 10,000; a log of 100; the merge bases with a branch one
 # commit off ten back and with one off the load commit; row diffs to the
 # commits 1, 1,000 and half the line back; the committing backend's private

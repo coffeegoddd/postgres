@@ -1282,7 +1282,7 @@ deep_line(VcRepo *r, const PHash *head, size_t max, LineAcc *line)
  * mb_short_us float8, mb_long_ms float8, diff1_ms float8, diff1_rows int8,
  * diff1k_ms float8, diff1k_rows int8, held int8, diffhalf_ms float8,
  * diffhalf_rows int8), in this order, so that what is timed is not disturbed
- * by a walk before it: a log of 100; the merge base with a branch made one
+ * by a walk before it: a log of 100, in a session that has logged; the merge base with a branch made one
  * commit off ten commits back (and dropped again); row diffs to the commits
  * 1 and 1,000 back, from a walk of just that far; the merge base with old,
  * the load commit; and only then the whole line walked (its length) for a
@@ -1318,6 +1318,8 @@ test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
 		head = b.head;
 		vc_branch_free(&b);
 
+		/* (a session's first log is its first use of the store: the second timed) */
+		(void) vc_log(&r, &head, 100, 0, count_log_fn, &n);
 		start = GetCurrentTimestamp();
 		(void) vc_log(&r, &head, 100, 0, count_log_fn, &n);
 		values[0] = Float8GetDatum(us_since(start));
@@ -1363,7 +1365,8 @@ test_vc_bench_deep_probe(PG_FUNCTION_ARGS)
 
 /*
  * test_vc_bench_sever(depth int4) returns float8: a sever with a window of
- * that depth, which must cut nothing, timed; microseconds
+ * that depth, timed; microseconds.  It must cut nothing but the one commit a
+ * probe's dropped branch left behind, which is discarded.
  */
 Datum
 test_vc_bench_sever(PG_FUNCTION_ARGS)
@@ -1382,7 +1385,15 @@ test_vc_bench_sever(PG_FUNCTION_ARGS)
 			elog(ERROR, "no window of depth %d", depth);
 		us = us_since(start);
 		if (seg != VC_NO_SEGMENT)
-			elog(ERROR, "a window of depth %d cut commits", depth);
+		{
+			VcSegment	s;
+
+			if (!vc_segment_get(&r, seg, &s) || s.n != 1)
+				elog(ERROR, "a window of depth %d cut commits", depth);
+			vc_segment_free(&s);
+			if (vc_segment_discard(&r, seg, NULL) != VC_OK)
+				elog(ERROR, "the commit a probe left not discarded");
+		}
 	});
 	PG_RETURN_FLOAT8(us);
 }
