@@ -63,6 +63,12 @@ typedef struct ChunkIndexEntry
 	uint16		kind;			/* CHUNK_KIND_* */
 	uint32		log_gen;		/* a chunk's: the log's generation its bytes
 								 * were reserved in (prolly/chunk_log.h) */
+	TransactionId merge_xid;	/* the merger's transaction that moved it: in
+								 * a lane, the entry moved out (counted unless
+								 * that transaction is in the snapshot); in the
+								 * index, the copy moved in (counted only if
+								 * it is); 0 if none */
+	uint32		unused;			/* (no padding: entries are WAL-logged whole) */
 } ChunkIndexEntry;
 
 /*

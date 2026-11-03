@@ -112,6 +112,11 @@ chunk_index_desc(StringInfo buf, XLogReaderState *record)
 							 ((xl_chunk_index_slot *) rec)->slot,
 							 ((xl_chunk_index_slot *) rec)->xmax);
 			break;
+		case XLOG_CHUNK_INDEX_SET_MERGE:
+			appendStringInfo(buf, "slot: %u, merge xid: %u",
+							 ((xl_chunk_index_slot *) rec)->slot,
+							 ((xl_chunk_index_slot *) rec)->xmax);
+			break;
 		case XLOG_CHUNK_INDEX_REMOVE_SLOT:
 			appendStringInfo(buf, "slot: %u", ((xl_chunk_index_slot *) rec)->slot);
 			break;
@@ -177,6 +182,8 @@ chunk_index_identify(uint8 info)
 			return "SET_COUNTS";
 		case XLOG_CHUNK_INDEX_SET_XMAX:
 			return "SET_XMAX";
+		case XLOG_CHUNK_INDEX_SET_MERGE:
+			return "SET_MERGE";
 		case XLOG_CHUNK_INDEX_KEEP:
 			return "KEEP";
 		case XLOG_CHUNK_INDEX_REMOVE_SLOT:

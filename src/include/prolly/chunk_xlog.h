@@ -127,6 +127,7 @@ extern void chunk_log_mask(char *pagedata, BlockNumber blkno);
 #define XLOG_CHUNK_INDEX_MARK		0xB0	/* 0: the marks' page */
 #define XLOG_CHUNK_INDEX_ADD_MARKS	0xC0	/* 0: meta, 1: the new marks'
 											 * page */
+#define XLOG_CHUNK_INDEX_SET_MERGE	0xD0	/* 0: the page */
 
 typedef struct xl_chunk_index_vacuum
 {
@@ -139,8 +140,9 @@ typedef struct xl_chunk_index_slot
 {
 	uint32		refs;			/* SET_COUNTS: the counts after */
 	uint32		roots;
-	TransactionId xmax;			/* SET_XMAX: the freeing transaction */
-	uint16		slot;			/* SET_COUNTS, SET_XMAX, REMOVE_SLOT */
+	TransactionId xmax;			/* SET_XMAX: the freeing transaction;
+								 * SET_MERGE: the merger's */
+	uint16		slot;			/* SET_COUNTS, SET_XMAX, SET_MERGE, REMOVE_SLOT */
 	uint16		unused;
 } xl_chunk_index_slot;
 

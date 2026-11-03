@@ -64,7 +64,7 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	7
+#define CHUNK_INDEX_VERSION	8
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -102,6 +102,9 @@ typedef struct IndexMetaData
 	BlockNumber next_block;		/* the first page not in use */
 	Oid			log;			/* the chunk log the entries are of, or 0 */
 	uint64		log_stamp;		/* and its storage's stamp */
+	uint32		lane;			/* a lane's: its number (prolly/chunk_lane.h) */
+	Oid			parent;			/* a lane's: the index it is a lane of; the
+								 * index's own, 0 */
 	uint32		nmarks;			/* the marks' pages */
 	BlockNumber marks[64];		/* MAX_MARKS */
 	uint32		ndir;			/* the directory's pages */
@@ -134,8 +137,8 @@ typedef struct IndexCache
 	BlockNumber dir[MAX_DIR];
 } IndexCache;
 
-StaticAssertDecl(sizeof(ChunkIndexEntry) == 56,
-				 "a chunk index entry is 56 bytes");
+StaticAssertDecl(sizeof(ChunkIndexEntry) == 64,
+				 "a chunk index entry is 64 bytes");
 StaticAssertDecl(sizeof(xl_chunk_index_vacuum) == 8 &&
 				 sizeof(xl_chunk_index_slot) == 16 &&
 				 sizeof(xl_chunk_index_fold) == 16 &&
@@ -380,6 +383,12 @@ ipage_set_counts(Page page, int at, uint32 refs, uint32 roots)
 {
 	page_entry(page, at)->refs = refs;
 	page_entry(page, at)->roots = roots;
+}
+
+static void
+ipage_set_merge(Page page, int at, TransactionId merge_xid)
+{
+	page_entry(page, at)->merge_xid = merge_xid;
 }
 
 static void
@@ -1613,6 +1622,8 @@ page_insert(Relation idx, ChunkIndexEntry *entry, ChunkReserveFn reserve,
 	entry->xmax = InvalidTransactionId;
 	entry->flags = 0;
 	entry->kind = CHUNK_KIND_CHUNK;
+	entry->merge_xid = InvalidTransactionId;
+	entry->unused = 0;
 	for (;;)
 	{
 		primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket,
@@ -2415,6 +2426,8 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	meta->next_block = 2 + INIT_BUCKETS;
 	meta->log = InvalidOid;
 	meta->log_stamp = 0;
+	meta->lane = 0;
+	meta->parent = InvalidOid;
 	meta->nmarks = 0;
 	meta->ndir = 1;
 	meta->dir[0] = 1;
@@ -3181,6 +3194,8 @@ redo_slot(RedoPages *rp, uint8 info)
 		ipage_set_counts(page, xlrec->slot, xlrec->refs, xlrec->roots);
 	else if (info == XLOG_CHUNK_INDEX_SET_XMAX)
 		ipage_set_xmax(page, xlrec->slot, xlrec->xmax);
+	else if (info == XLOG_CHUNK_INDEX_SET_MERGE)
+		ipage_set_merge(page, xlrec->slot, xlrec->xmax);
 	else
 		ipage_remove_slot(page, xlrec->slot);
 }
@@ -3253,6 +3268,7 @@ chunk_index_redo(XLogReaderState *record)
 			}
 		case XLOG_CHUNK_INDEX_SET_COUNTS:
 		case XLOG_CHUNK_INDEX_SET_XMAX:
+		case XLOG_CHUNK_INDEX_SET_MERGE:
 		case XLOG_CHUNK_INDEX_REMOVE_SLOT:
 			redo_slot(&rp, info);
 			break;
