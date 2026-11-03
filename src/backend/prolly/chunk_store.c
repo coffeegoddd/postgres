@@ -1088,7 +1088,7 @@ ChunkStoreCompactStep(Relation log, Relation idx, ChunkCompaction *c, int max,
 		PlaceArg	place;
 		void	   *data;
 		bool		may_grow = below == 0 &&
-			RelationGetNumberOfBlocks(log) < grow_to;
+			ChunkLogOf(log)->write_blocks(log) < grow_to;
 
 		/*
 		 * (the cap of bytes not passed by the next chunk: in the tier, a

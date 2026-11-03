@@ -63,6 +63,8 @@ typedef struct ChunkLogRun
 	uint64		limit;
 	uint32		generation;		/* the log's, the bytes' (mark_dead's) */
 	uint32		lane;			/* the lane it is in (prolly/chunk_lane.h) */
+	Relation	lane_rel;		/* ... open from prepare to release, so that
+								 * reserve opens nothing */
 } ChunkLogRun;
 
 typedef struct ChunkLogSegments ChunkLogSegments;
@@ -141,6 +143,12 @@ typedef struct ChunkLogRoutine
 	int			(*evacuable) (Relation rel, int max, uint64 *starts,
 							  uint64 *ends);
 	uint64		(*segment_bytes) (Relation rel);
+
+	/*
+	 * The pages of the part of the log this backend appends to (its own
+	 * lane's, a log of lanes'): what compaction's growth is counted in.
+	 */
+	BlockNumber (*write_blocks) (Relation rel);
 
 	/*
 	 * How much compaction moves a transaction: up to *chunks chunks, and

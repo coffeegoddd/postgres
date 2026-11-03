@@ -84,6 +84,7 @@ permutation b_start b_mark a_begin a_put_leaf b_parent a_commit b_leaf b_free_pa
 permutation b_start b_mark a_begin a_put_leaf b_parent a_rollback b_leaf b_free_parent
 # cancelled while it waits (for the second of its chunks by name, the first,
 # '\x0a0102', put): nothing written, nothing dead; once VACUUM has the
-# entries out, the bytes reserved for the one it put (3) dead, and those
-# the other's put, rolled back, wrote (3); neither there
+# entries out, the bytes reserved for the one it put (3) dead, in its
+# backend's lane; those the other's put, rolled back, wrote (3), alone at
+# the end of that backend's lane, cut off with it, not counted; neither there
 permutation b_start b_mark a_begin a_put b_pack c_cancel b_dead a_rollback b_live b_vacuum b_dead b_has b_free_live

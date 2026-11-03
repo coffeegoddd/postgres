@@ -112,10 +112,12 @@ $r->quit;
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
-# 2. a tail cut between VACUUM's finding a put running and its entry's end
-# (the put's bytes reserved past its lane's end, on pages not made: only
-# its backend makes its lane's pages, so none is there past them, made by
-# another's put, for the cut to take)
+# 2. VACUUM's pass, its cut stopped, finding a put running whose entry is in
+# and whose bytes are not written: cancelled, its entry aborted.  The put's
+# bytes are reserved past its lane's end, on pages not made, and only its
+# backend makes its lane's pages: no other's put can make pages past them
+# (on one log, as before lanes, another's could, and the cut take them),
+# so the cut finds nothing of that lane's to take.
 my $p = $primary->background_psql('postgres', on_error_stop => 0);
 $p->query_safe(q{SELECT injection_points_set_local()});
 $p->query_safe(q{SELECT injection_points_attach('chunk-put-entered', 'wait')});
@@ -144,15 +146,16 @@ $v->query_safe('SELECT 1');
 $v->quit;
 my $after_cut = $primary->safe_psql('postgres', $size);
 is($after_cut, $before_cut, 'VACUUM cut nothing: the put\'s bytes past its lane\'s end, no pages made for them');
-# (puts after the cut, past a region of them, in pages made again where the
-# aborted put's were: each longer than a region, never into pages freed)
+# (puts after, each longer than a region, never into pages freed: the next
+# VACUUM, taking the aborted entry out, counts its bytes, on pages never
+# made, dead without making them)
 $primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE (test_cs_put('pages', huge(i))).stored) FROM generate_series(4001, 4004) i;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE test_cs_get('pages', h(huge(i))) = huge(i)) FROM generate_series(4001, 4004) i}),
-	'4', 'the next VACUUM, taking the aborted entry out, counts nothing of its pages cut: those made again are the puts\' after');
+	'4', 'the next VACUUM takes the aborted entry out, the puts after read back');
 is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
 # 3. puts after the cut, freed, and the tail cut again; then the chunks put

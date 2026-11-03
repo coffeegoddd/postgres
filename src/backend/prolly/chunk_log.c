@@ -2479,7 +2479,7 @@ lane_prepare(Relation log, size_t len, ChunkLogRun *run)
 
 	page_prepare(rel, len, run);
 	run->lane = lane;
-	ChunkLaneClose(log, rel);
+	run->lane_rel = rel;
 }
 
 static bool
@@ -2494,7 +2494,7 @@ lane_prepare_free(Relation log, size_t len, uint64 below, ChunkLogRun *run)
 						   below != 0 && LANE_OF(below) == lane ? LANE_PLACE(below) : 0,
 						   run);
 	run->lane = lane;
-	ChunkLaneClose(log, rel);
+	run->lane_rel = rel;
 	return ok;
 }
 
@@ -2511,14 +2511,11 @@ lane_of(Relation log, uint32 lane, LOCKMODE lockmode)
 	return rel;
 }
 
+/* (under the caller's buffer lock: nothing opened, nothing to fail) */
 static uint64
 lane_reserve(Relation log, ChunkLogRun *run, size_t len)
 {
-	Relation	rel = lane_of(log, run->lane, RowExclusiveLock);
-	uint64		loc = LANE_LOC(run->lane, page_reserve(rel, run, len));
-
-	ChunkLaneClose(log, rel);
-	return loc;
+	return LANE_LOC(run->lane, page_reserve(run->lane_rel, run, len));
 }
 
 static void
@@ -2533,20 +2530,14 @@ lane_write(Relation log, uint64 loc, const void *data, size_t len)
 static bool
 lane_extend(Relation log, ChunkLogRun *run, size_t len)
 {
-	Relation	rel = lane_of(log, run->lane, RowExclusiveLock);
-	bool		ok = page_extend(rel, run, len);
-
-	ChunkLaneClose(log, rel);
-	return ok;
+	return page_extend(run->lane_rel, run, len);
 }
 
 static void
 lane_release(Relation log, const ChunkLogRun *run)
 {
-	Relation	rel = lane_of(log, run->lane, RowExclusiveLock);
-
-	page_release(rel, run);
-	ChunkLaneClose(log, rel);
+	page_release(run->lane_rel, run);
+	ChunkLaneClose(log, run->lane_rel);
 }
 
 static void
@@ -2603,6 +2594,21 @@ static bool
 lane_check_live(Relation log, int n, const uint64 *locs, const uint32 *lens, char **why)
 {
 	uint32		nlanes = ChunkLaneCount(log);
+
+	/* (a chunk live in a lane the log has not made, or that is gone) */
+	for (int i = 0; i < n; i++)
+	{
+		Relation	rel = LANE_OF(locs[i]) < nlanes ?
+			ChunkLaneOpen(log, LANE_OF(locs[i]), AccessShareLock) : NULL;
+
+		if (rel == NULL)
+		{
+			*why = psprintf("a chunk is in lane %u of chunk log \"%s\", which it has not",
+							LANE_OF(locs[i]), RelationGetRelationName(log));
+			return false;
+		}
+		ChunkLaneClose(log, rel);
+	}
 
 	for (uint32 lane = 0; lane < nlanes; lane++)
 	{
@@ -2718,6 +2724,13 @@ lane_segments(Relation log, double fraction, int max, uint64 *starts, uint64 *en
 		}
 		n += got;
 		ChunkLaneClose(log, rel);
+
+		/*
+		 * (evacuating, one lane's tail a pass: the room below it, for the
+		 * chunks moved, is that lane's, prepare_free's below)
+		 */
+		if (evacuable && n > 0)
+			break;
 	}
 	return n;
 }
@@ -2825,6 +2838,17 @@ lane_vacuum_end(Relation log, void *state, bool truncate, double fraction,
 		(void) vacuum_pass(log, sw->pass);
 }
 
+static BlockNumber
+lane_write_blocks(Relation log)
+{
+	uint32		lane;
+	Relation	rel = ChunkLaneForWrite(log, &lane);
+	BlockNumber n = RelationGetNumberOfBlocks(rel);
+
+	ChunkLaneClose(log, rel);
+	return n;
+}
+
 static uint64
 lane_stamp(Relation log)
 {
@@ -2841,6 +2865,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.compactable = lane_compactable_segments,
 	.evacuable = lane_evacuable_segments,
 	.segment_bytes = page_segment_bytes,
+	.write_blocks = lane_write_blocks,
 	.compact_batch = page_compact_batch,
 	.find_segments = lane_find_segments,
 	.vacuum_begin = lane_vacuum_begin,
@@ -3079,6 +3104,34 @@ create_store_storage(Relation rel, const RelFileLocator *newrlocator,
 	return RelationCreateStorageWith(*newrlocator, persistence, true, SMGR_MD);
 }
 
+/*
+ * (a log with lanes, or a lane, is not emptied: its lanes, relations of
+ * their own, would keep their pages and the log its numbers given; a lane
+ * goes only as its log is dropped)
+ */
+static void
+refuse_truncate_laned(Relation rel)
+{
+	uint32		lane;
+	Oid			parent;
+
+	if (rel->rd_locator.relNumber == InvalidRelFileNumber ||
+		!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ||
+		!ChunkLogLaneOf(rel, &lane, &parent))
+		return;
+	if (lane > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot truncate \"%s\", a lane of a chunk log",
+						RelationGetRelationName(rel))));
+	if (ChunkLogLanes(rel) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot truncate chunk log \"%s\", which has lanes",
+						RelationGetRelationName(rel)),
+				 errdetail("A chunk log's lanes go only as it is dropped.")));
+}
+
 static void
 cl_relation_set_new_filelocator(Relation rel,
 								const RelFileLocator *newrlocator,
@@ -3086,8 +3139,10 @@ cl_relation_set_new_filelocator(Relation rel,
 								TransactionId *freezeXid,
 								MultiXactId *minmulti)
 {
-	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
-											 freezeXid, minmulti);
+	SMgrRelation srel;
+
+	refuse_truncate_laned(rel);
+	srel = create_store_storage(rel, newrlocator, persistence, freezeXid, minmulti);
 
 	/*
 	 * (logged unless WAL is minimal, when the new storage is synced at
@@ -3143,6 +3198,7 @@ ci_relation_nontransactional_truncate(Relation rel)
 static void
 cl_relation_nontransactional_truncate(Relation rel)
 {
+	refuse_truncate_laned(rel);
 	RelationTruncate(rel, 0);
 	write_meta(RelationGetSmgr(rel), RelationNeedsWAL(rel));
 

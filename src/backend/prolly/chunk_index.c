@@ -2788,10 +2788,10 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	uint64		unheld = 0;
 	ChunkLogSegments segs = {0};
 	/*
-	 * (the log's segments with bytes of chunks freed kept for snapshots, a
-	 * bit each, to pass by: made as the log is opened, outside the windows
-	 * between taking entries out and counting their bytes dead, where
-	 * nothing is allocated; segments the log grows by meanwhile are not)
+	 * (the places of chunks freed kept for snapshots, whose segments the
+	 * log is to pass by: listed as their entries are passed, the list grown
+	 * as it needs, before a page's entries are taken out, outside the
+	 * windows between taking entries out and counting their bytes dead)
 	 */
 	uint64	   *pending_locs = NULL;
 	uint32	   *pending_lens = NULL;

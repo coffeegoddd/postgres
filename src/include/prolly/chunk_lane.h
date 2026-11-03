@@ -9,20 +9,26 @@
  * lane n named "<log>_lane_<n>" in its namespace, each internally
  * dependent on it (dropped with it, not alone).  Each lane is a whole log
  * of pages: its meta page, its regions, segments and free space.  A
- * backend appends only into the lane it holds, so that only it ever
- * extends that lane's relation: Postgres takes a relation's extension lock
- * per relation, and so no backend waits for another to grow the log.
+ * backend appends only into the lane it holds, so that no other writer
+ * ever extends that lane's relation: Postgres takes a relation's extension
+ * lock per relation, and so no writer waits for another to grow the log.
+ * (VACUUM, counting bytes dead that were reserved and never written past a
+ * lane's end, may make that lane's pages too.)
  *
  * Which backend holds which lane is in shared memory, as each backend's
  * own entries: a backend appending to a log for the first time takes a
  * lane no live backend holds, or, if every lane is held, makes the next,
  * in its own transaction (gone with it if that aborts, and the entry with
  * it).  A backend holds its lane until it exits (a crash lets go of them
- * all), so a log has as many lanes as it has had writers at once.  A
- * place in the log carries its lane in its top LANE_BITS bits.  A lane's
- * number is never given again, even to a lane whose making aborted: the
- * entries the aborted transaction left name it, and must name no lane; a
- * log makes at most LANE_MAX lanes in its life.
+ * all), or until it needs room for another log's (it holds lanes of a few
+ * logs at once), so a log has about as many lanes as it has had writers
+ * at once.  A
+ * place in the log carries its lane in its top LANE_BITS bits.  A lane
+ * whose making aborted leaves a hole, its number given again only once a
+ * VACUUM pass of the log's index begun after the hole was seen has ended
+ * (the entries its transaction left, naming the lane, taken out by it); a
+ * log has at most LANE_MAX lanes.  Lanes are found by what depends on the
+ * log, each lane's meta page naming its number and log, not by name.
  *
  * Each lane's free space is its own: a backend's appends reuse the
  * segments freed in its own lane, never another's (that lane's holder
