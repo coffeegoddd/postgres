@@ -36,6 +36,7 @@
 PG_FUNCTION_INFO_V1(test_vc_open);
 PG_FUNCTION_INFO_V1(test_vc_commit);
 PG_FUNCTION_INFO_V1(test_vc_refs_count);
+PG_FUNCTION_INFO_V1(test_vc_round_trip);
 PG_FUNCTION_INFO_V1(test_vc_branch);
 PG_FUNCTION_INFO_V1(test_vc_branch_delete);
 PG_FUNCTION_INFO_V1(test_vc_reset);
@@ -147,6 +148,34 @@ test_vc_open(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(true);
 }
 
+/* A row written on the branch's working set and committed, msg its message. */
+static PHash
+commit_msg(VcRepo *r, const char *branch, const char *msg)
+{
+	PHash		rv,
+				out;
+	VcTable		t;
+	uint8		key[8],
+				val[16];
+	ProllyEdit	e = {key, 8, val, 16, false};
+
+	checkout(r, branch);
+	/* (an edit: locked as it reads, so a second on the branch waits) */
+	rv = vc_working_lock(r);
+	if (!vc_table_get(&r->ctx, &rv, "t", &t))
+	{
+		if (vc_table_create(&r->ctx, &rv, "t", ddl, strlen(ddl), &rv) != VC_OK)
+			elog(ERROR, "could not make table t");
+	}
+	put_u64(key, msg_key(msg));
+	put_u64(val, msg_key(msg));
+	put_u64(val + 8, 1);
+	if (vc_table_edit(&r->ctx, &rv, "t", &e, 1, &out) != VC_OK)
+		elog(ERROR, "could not write table t");
+	vc_set_working(r, &out);
+	return vc_commit(r, msg);
+}
+
 /*
  * test_vc_commit(branch text, msg text) returns bool: a row written on the
  * branch's working set and committed
@@ -160,28 +189,7 @@ test_vc_commit(PG_FUNCTION_ARGS)
 
 	VC_CALL(r, 0,
 	{
-		PHash		rv,
-					out;
-		VcTable		t;
-		uint8		key[8],
-					val[16];
-		ProllyEdit	e = {key, 8, val, 16, false};
-
-		checkout(&r, branch);
-		/* (an edit: locked as it reads, so a second on the branch waits) */
-		rv = vc_working_lock(&r);
-		if (!vc_table_get(&r.ctx, &rv, "t", &t))
-		{
-			if (vc_table_create(&r.ctx, &rv, "t", ddl, strlen(ddl), &rv) != VC_OK)
-				elog(ERROR, "could not make table t");
-		}
-		put_u64(key, msg_key(msg));
-		put_u64(val, msg_key(msg));
-		put_u64(val + 8, 1);
-		if (vc_table_edit(&r.ctx, &rv, "t", &e, 1, &out) != VC_OK)
-			elog(ERROR, "could not write table t");
-		vc_set_working(&r, &out);
-		(void) vc_commit(&r, msg);
+		(void) commit_msg(&r, branch, msg);
 	});
 	PG_RETURN_BOOL(true);
 }
@@ -497,13 +505,15 @@ test_vc_refs_count(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_vc_sever(depth int4) returns int8: every commit outside the window
- * of that depth moved into a new segment; how many (0: none)
+ * test_vc_sever(depth int4, discard bool) returns int8: every commit outside
+ * the window of that depth moved into a new segment (discarded, with
+ * discard); how many (0: none)
  */
 Datum
 test_vc_sever(PG_FUNCTION_ARGS)
 {
 	int32		depth = PG_GETARG_INT32(0);
+	bool		discard = PG_GETARG_BOOL(1);
 	VcRepo		r;
 	uint64		n = 0;
 
@@ -519,6 +529,8 @@ test_vc_sever(PG_FUNCTION_ARGS)
 		{
 			n = s.n;
 			vc_segment_free(&s);
+			if (discard && vc_segment_discard(&r, seg, NULL) != VC_OK)
+				elog(ERROR, "segment %u not discarded", seg);
 		}
 	});
 	PG_RETURN_INT64((int64) n);
@@ -838,6 +850,75 @@ edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version
 	pfree(e);
 	pfree(keys);
 	pfree(vals);
+}
+
+/*
+ * test_vc_round_trip(branch text, msg text) returns bytea: the repository
+ * cloned into a memory store of this call's own, there a commit (message
+ * msg || ' pushed') pushed back to the branch, another (' fetched') fetched
+ * from it, and one more there (' theirs') pulled into the branch after one
+ * of its own (' ours'), a merge; the fetched commit's hash.  The history
+ * store has what each sent it as its transaction commits.
+ */
+Datum
+test_vc_round_trip(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *msg = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	bytea	   *out = palloc(VARHDRSZ + PHASH_LEN);
+	VcRepo		r;
+
+	SET_VARSIZE(out, VARHDRSZ + PHASH_LEN);
+	VC_CALL(r, 0,
+	{
+		ChunkStore *mcs = MemoryChunkStoreCreate();
+		VcRepo		laptop;
+		VcBranch	b;
+		VcMergeResult mr;
+		PHash		sent,
+					got;
+		int			rc;
+
+		PG_TRY(2);
+		{
+			rc = vc_repo_clone(&laptop, mcs, VcRefsOpen("memory", mcs), &prolly_default_policy,
+							   &r, 0);
+			if (rc != VC_OK)
+				elog(ERROR, "the repository not cloned: %d", rc);
+			vc_repo_set_name(&laptop, "laptop");
+
+			sent = commit_msg(&laptop, branch, psprintf("%s pushed", msg));
+			if ((rc = vc_push(&laptop, &r, branch)) != VC_OK)
+				elog(ERROR, "the push refused: %d", rc);
+			if (!vc_branch_get(&r, branch, &b) || !phash_eq(&b.head, &sent))
+				elog(ERROR, "the push did not move \"%s\"", branch);
+			vc_branch_free(&b);
+
+			sent = commit_msg(&laptop, branch, psprintf("%s fetched", msg));
+			if ((rc = vc_fetch(&r, &laptop, branch, &got)) != VC_OK)
+				elog(ERROR, "the fetch refused: %d", rc);
+			if (!phash_eq(&got, &sent))
+				elog(ERROR, "the fetch brought another head");
+			memcpy(VARDATA(out), got.b, PHASH_LEN);
+
+			(void) commit_msg(&r, branch, psprintf("%s ours", msg));
+			(void) commit_msg(&laptop, branch, psprintf("%s theirs", msg));
+			if ((rc = vc_pull(&r, &laptop, branch, 0, &mr)) != VC_OK)
+				elog(ERROR, "the pull refused: %d", rc);
+			if (mr.status != VC_MERGE_COMMITTED)
+				elog(ERROR, "the pull did not merge");
+			vc_merge_result_free(&mr);
+			vc_repo_free(&laptop);
+		}
+		PG_FINALLY(2);
+		{
+			/* (the store's references go with it: another call's may take its place) */
+			MemoryVcRefsForget(mcs);
+			MemoryChunkStoreDestroy(mcs);
+		}
+		PG_END_TRY(2);
+	});
+	PG_RETURN_BYTEA_P(out);
 }
 
 /*

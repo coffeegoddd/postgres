@@ -627,9 +627,9 @@ CREATE FUNCTION test_vc_refs_count(prefix text, fail bool DEFAULT false)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
--- Every commit outside the window of that depth moved into a new segment;
--- how many.
-CREATE FUNCTION test_vc_sever(depth int4)
+-- Every commit outside the window of that depth moved into a new segment
+-- (discarded, with discard); how many.
+CREATE FUNCTION test_vc_sever(depth int4, discard bool DEFAULT false)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
@@ -654,6 +654,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 -- How many chunks the last test_vc_cancel had written as it was cancelled.
 CREATE FUNCTION test_vc_cancel_writes()
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- The repository cloned into a memory store of the call's own, a commit
+-- there (msg || ' pushed') pushed back to the branch, another (' fetched')
+-- fetched from it, and one more (' theirs') pulled into the branch after a
+-- commit of its own (' ours'): the fetched commit's hash.
+CREATE FUNCTION test_vc_round_trip(branch text, msg text)
+RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 -- op ('push', 'fetch' or 'deepen') between the repository and itself: its code.
