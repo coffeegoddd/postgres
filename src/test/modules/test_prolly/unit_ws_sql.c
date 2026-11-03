@@ -168,9 +168,10 @@ static void
 test_attempt_whose_error(void)
 {
 	static const char *const raised[] = {"XX000", "XX001", "XX002", "53100", "53200", "40001",
-	"40P01", "55P03", "58030", "P0004", "57014"};
+	"40P01", "55P03", "58030", "58P01", "P0004", "57014", "25006"};
 	static const char *const own[] = {"21000", "22012", "23505", "2BP01", "3F000", "42P01",
-	"44000", "0A000", "55000", "P0001"};
+		"44000", "0A000", "55000", "P0000", "P0001", "P0002", "P0003", "54000", "54011",
+	"2F005", "20000", "38000", "39000", "0LP01", "F0000"};
 
 	for (size_t i = 0; i < lengthof(raised); i++)
 		expect_error(attempt_raising, (void *) raised[i],
@@ -233,15 +234,20 @@ test_attempt_in_spi(void)
 {
 	WsSqlRows	rows;
 	WsSqlFailure f;
+	SPITupleTable *outer;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
+	CHECK_EQ(SPI_execute("SELECT 2", true, 0), SPI_OK_SELECT);
+	outer = SPI_tuptable;
 	CHECK(!WsSql->attempt("SELECT 1 / 0", 0, NULL, &rows, &f));
 	ws_sql_failure_free(&f);
 	CHECK(WsSql->attempt("SELECT 1", 0, NULL, &rows, &f));
 	ws_sql_rows_free(&rows);
-	CHECK_EQ(SPI_execute("SELECT 2", true, 0), SPI_OK_SELECT);
-	CHECK_EQ(SPI_processed, 1);
+	/* (what was read before them is still there to read) */
+	CHECK(is(SPI_getvalue(outer->vals[0], outer->tupdesc, 1), "2"));
+	CHECK_EQ(SPI_execute("SELECT 3", true, 0), SPI_OK_SELECT);
+	CHECK(is(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1), "3"));
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 }
@@ -255,12 +261,22 @@ bad_encoding(void *arg)
 	WsSql->run("SELECT $1", 1, params, &rows);
 }
 
-/* A parameter not in the database's encoding is refused. */
 static void
-test_parameter_encoding(void)
+bad_encoding_statement(void *arg)
 {
-	if (GetDatabaseEncoding() == PG_UTF8)
-		expect_error(bad_encoding, NULL, ERRCODE_CHARACTER_NOT_IN_REPERTOIRE, NULL);
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT 'a\xff\xfe'", 0, NULL, &rows);
+}
+
+/* A statement or parameter not in the database's encoding is refused. */
+static void
+test_encoding(void)
+{
+	if (GetDatabaseEncoding() != PG_UTF8)
+		return;
+	expect_error(bad_encoding, NULL, ERRCODE_CHARACTER_NOT_IN_REPERTOIRE, NULL);
+	expect_error(bad_encoding_statement, NULL, ERRCODE_CHARACTER_NOT_IN_REPERTOIRE, NULL);
 }
 
 /* The session's temporary schema cannot shadow the catalogs. */
@@ -301,7 +317,12 @@ odd_session(void)
 	for (size_t i = 0; i < lengthof(session_settings); i++)
 		(void) set_config_option(session_settings[i].name, session_settings[i].value,
 								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-	/* (money's output otherwise, where the system has the locale: quietly if not) */
+	/*
+	 * (POSIX, which every system has, reads back otherwise than the scope's
+	 * C; money's output otherwise too, where the system has the locale)
+	 */
+	(void) set_config_option("lc_monetary", "POSIX", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 	(void) set_config_option("lc_monetary", "es_ES.utf8", PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, DEBUG5, false);
 	return level;
@@ -321,6 +342,37 @@ check_settings_taken(void)
 	CHECK(is(one("SELECT pg_catalog.quote_ident('abc')"), "abc"));
 	CHECK(is(one("SELECT pg_catalog.current_setting('catalog_branch_filter')"), "on"));
 	CHECK(is(one("SELECT pg_catalog.current_setting('row_security')"), "off"));
+}
+
+/* (as a role with no privileges: a scope, and all of it undone by the error) */
+static void
+as_nobody(void *arg)
+{
+	int			level;
+
+	run("CREATE ROLE regress_ws_sql_nobody NOLOGIN NOSUPERUSER");
+	run("SET LOCAL ROLE regress_ws_sql_nobody");
+	level = WsSql->begin();
+	CHECK(is(one("SELECT pg_catalog.current_setting('catalog_branch_filter')"), "on"));
+	check_settings_taken();
+	WsSql->end(level);
+	run("DO $$ BEGIN RAISE EXCEPTION 'done'; END $$");
+}
+
+/* A scope is for any role: catalog_branch_filter is a superuser's to set. */
+static void
+test_scope_not_superuser(void)
+{
+	WsSqlFailure f;
+	int			odd = NewGUCNestLevel();
+
+	/* (the filter off, as it may be, so that taking it is a change) */
+	(void) set_config_option("catalog_branch_filter", "off", PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	CHECK(!WsSql->attempt_fn(as_nobody, NULL, &f));
+	CHECK(is(f.message, "done"));
+	ws_sql_failure_free(&f);
+	AtEOXact_GUC(true, odd);
 }
 
 /*
@@ -384,10 +436,11 @@ static const ProllyUnitTest tests[] = {
 	{"attempt_whose_error", test_attempt_whose_error},
 	{"attempt_group", test_attempt_group},
 	{"attempt_in_spi", test_attempt_in_spi},
-	{"parameter_encoding", test_parameter_encoding},
+	{"encoding", test_encoding},
 	{"temp_does_not_shadow", test_temp_does_not_shadow},
 	{"settings", test_settings},
 	{"settings_after_errors", test_settings_after_errors},
+	{"scope_not_superuser", test_scope_not_superuser},
 };
 
 const ProllyUnitSuite unit_ws_sql_suite = {"ws_sql", tests, lengthof(tests)};

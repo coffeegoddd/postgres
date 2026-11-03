@@ -13,7 +13,9 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "engine_test_util.h"
+#include "mb/pg_wchar.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "test_prolly.h"
@@ -56,7 +58,7 @@ test_bytes(void)
 		"\x01" "t" "p"			/* name, persistence */
 		"\x01"					/* columns */
 		"\x07" "\x02" "id" "\x06" "bigint" "s" "\x01" "a" "\x00" "\x00"
-		"\x03" "pk" "\x01\x07";	/* key: its name, its columns */
+		"\x02" "pk" "\x01\x07";	/* key: its name, its columns */
 	WsColumn	cols[] = {{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,
 		.not_null = true,.identity = WS_IDENTITY_ALWAYS}};
 	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,
@@ -68,13 +70,28 @@ test_bytes(void)
 	CHECK(memcmp(b.data, want, b.len) == 0);
 	buf_free(&b);
 
-	/* a default of nothing and an empty one differ: its length plus one */
-	cols[0].identity = WS_IDENTITY_NONE;
-	cols[0].def = "";
-	WsSchemaCodec->encode(&s, &b);
-	CHECK_EQ(b.len, sizeof(want) - 1);
-	CHECK_EQ(b.data[b.len - 7], 1);
-	buf_free(&b);
+	/* each kind of column, a default and a collation, a tag of two bytes, unlogged */
+	{
+		static const char want2[] =
+			"\x01" "\x01" "t" "u" "\x03"
+			"\x07" "\x01" "k" "\x01" "i" "s" "\x01" "d" "\x00" "\x00"
+			"\xac\x02" "\x01" "v" "\x01" "t" "s" "\x00" "\x00" "\x03" "\'x\'" "\x03" "\"C\""
+			"\x05" "\x01" "g" "\x01" "i" "g" "\x00" "\x00" "\x01" "1" "\x00"
+			"\x02" "pk" "\x01\x07";
+		WsColumn	c2[] = {
+			{.tag = 7,.name = "k",.type = "i",.kind = WS_COL_STORED,.not_null = true,
+			.identity = WS_IDENTITY_BY_DEFAULT},
+			{.tag = 300,.name = "v",.type = "t",.kind = WS_COL_STORED,.def = "'x'",.collation = "\"C\""},
+			{.tag = 5,.name = "g",.type = "i",.kind = WS_COL_GENERATED_STORED,.def = "1"},
+		};
+		WsTableSchema s2 = {.name = "t",.persistence = WS_PERSISTENCE_UNLOGGED,.ncols = 3,
+		.cols = c2,.key_name = "pk",.nkey = 1,.key = example_key};
+
+		WsSchemaCodec->encode(&s2, &b);
+		CHECK_EQ(b.len, sizeof(want2) - 1);
+		CHECK(memcmp(b.data, want2, b.len) == 0);
+		buf_free(&b);
+	}
 }
 
 static void
@@ -156,6 +173,60 @@ test_row_shape(void)
 	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
 	CHECK_EQ(ws_row_shape_at(&shape, 9), -1);
 	ws_row_shape_free(&shape);
+
+	/* a key on later attributes, out of their order: the key first, in its order */
+	{
+		uint64		key[] = {0, 300};
+		WsColumn	cols[lengthof(example_cols)];
+
+		memcpy(cols, example_cols, sizeof(cols));
+		s.cols = cols;
+		cols[1].not_null = true;
+		cols[4].not_null = true;
+		s.key = key;
+		s.nkey = 2;
+		CHECK(ws_schema_problem(&s) == NULL);
+		ws_schema_row_shape(&s, &shape);
+		CHECK(shape.nkey == 2 && shape.nstored == 4);
+		CHECK(shape.tags[0] == 0 && shape.tags[1] == 300 && shape.tags[2] == 7 && shape.tags[3] == 5);
+		ws_row_shape_free(&shape);
+	}
+
+	/* no key: every stored column, in attribute order */
+	s.nkey = 0;
+	s.key = NULL;
+	ws_schema_row_shape(&s, &shape);
+	CHECK(shape.nkey == 0 && shape.nstored == 4);
+	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
+	ws_row_shape_free(&shape);
+}
+
+/* The widest table there and back; names as they may be. */
+static void
+test_wide_and_odd(void)
+{
+	WsColumn   *cols = palloc0_array(WsColumn, WS_MAX_COLS);
+	WsTableSchema s = {.name = "tab\there \"q\" \xc3\xa9",.persistence = WS_PERSISTENCE_PERMANENT,
+	.ncols = WS_MAX_COLS,.cols = cols};
+	WsTableSchema got;
+	Buf			b = BUF_INIT;
+
+	for (int i = 0; i < WS_MAX_COLS; i++)
+	{
+		cols[i].tag = (uint64) i * 1000;
+		cols[i].name = psprintf("c\n%d", i);
+		cols[i].type = "a type";
+		cols[i].kind = WS_COL_STORED;
+	}
+	if (GetDatabaseEncoding() != PG_UTF8)
+		s.name = "tab\there \"q\"";
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK_EQ(got.ncols, WS_MAX_COLS);
+	CHECK(strcmp(got.name, s.name) == 0);
+	CHECK(strcmp(got.cols[WS_MAX_COLS - 1].name, cols[WS_MAX_COLS - 1].name) == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
 }
 
 typedef struct Invalid
@@ -277,7 +348,50 @@ name_no_key(WsTableSchema *s)
 	s->nkey = 0;
 }
 
+static void
+name_long(WsTableSchema *s)
+{
+	s->name = psprintf("%0*d", NAMEDATALEN, 0);
+}
+
+static void
+col_name_long(WsTableSchema *s)
+{
+	s->cols[1].name = psprintf("%0*d", NAMEDATALEN, 0);
+}
+
+static void
+identity_nullable(WsTableSchema *s)
+{
+	s->cols[0].not_null = false;
+	s->nkey = 0;
+}
+
+static void
+empty_default(WsTableSchema *s)
+{
+	s->cols[1].def = "";
+}
+
+static void
+empty_collation(WsTableSchema *s)
+{
+	s->cols[1].collation = "";
+}
+
+static void
+key_too_many(WsTableSchema *s)
+{
+	s->nkey = s->ncols + 1;
+}
+
 static const Invalid invalid[] = {
+	{"a table's name too long", name_long},
+	{"a column's name too long", col_name_long},
+	{"an identity column that may be null", identity_nullable},
+	{"an empty default", empty_default},
+	{"an empty collation", empty_collation},
+	{"a key of more columns than the table has", key_too_many},
 	{"a table with no name", no_name},
 	{"a table of no known persistence", persistence},
 	{"a column with no name", col_no_name},
@@ -336,19 +450,39 @@ test_invalid(void)
 	}
 }
 
-typedef struct Decoding
-{
-	const uint8 *p;
-	size_t		len;
-} Decoding;
-
+/*
+ * Bytes refused as they should be: ERRCODE_DATA_CORRUPTED, for this reason
+ * and no other (a cut short, a wrong length, would otherwise pass for it).
+ */
 static void
-decode_it(void *arg)
+check_refused(const char *p, size_t len, const char *why)
 {
-	Decoding   *d = arg;
-	WsTableSchema s;
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *edata = NULL;
 
-	WsSchemaCodec->decode(d->p, d->len, &s);
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		WsTableSchema s;
+
+		WsSchemaCodec->decode((const uint8 *) p, len, &s);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (edata == NULL)
+		elog(ERROR, "no error, for: %s", why);
+	if (edata->sqlerrcode != ERRCODE_DATA_CORRUPTED || strstr(edata->message, why) == NULL)
+		elog(ERROR, "\"%s\", for: %s", edata->message, why);
 }
 
 /* Bytes that are no schema's are refused: however cut, or whatever is wrong. */
@@ -362,50 +496,42 @@ test_malformed(void)
 	{
 		const char *p;
 		size_t		len;
+		const char *why;
 	}			bad[] = {
-		/* an unknown version */
-		{"\x02" "\x01" "t" "p" "\x00" "\x00" "\x00", 7},
-		/* a NUL in the name */
-		{"\x01" "\x02" "t\0" "p" "\x00" "\x00" "\x00", 8},
-		/* a name past its end */
-		{"\x01" "\x09" "t", 3},
-		/* a not null that is neither */
-		{"\x01" "\x01" "t" "p" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00", 17},
-		/* more columns than a table has */
-		{"\x01" "\x01" "t" "p" "\xc1\x0c" "\x00", 7},
-		/* a schema with a problem: no persistence known */
-		{"\x01" "\x01" "t" "x" "\x00" "\x00" "\x00", 7},
-		/* a key of more columns than the table has */
-		{"\x01" "\x01" "t" "p" "\x00" "\x02" "k" "\x01" "\x07", 9},
+		{"\x02" "\x01" "t" "p" "\x00" "\x00" "\x00", 7, "a version not known"},
+		{"\x01" "\x02" "t\0" "p" "\x00" "\x00" "\x00", 8, "a NUL"},
+		{"\x01" "\x09" "t", 3, "runs past its end"},
+		{"\x01" "\x01" "t" "p" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 18, "neither"},
+		{"\x01" "\x01" "t" "p" "\xc1\x0c" "\x00", 7, "more columns than a table can have"},
+		{"\x01" "\x01" "t" "x" "\x00" "\x00" "\x00", 7, "no known persistence"},
+		{"\x01" "\x01" "t" "p" "\x00" "\x02" "k" "\x01" "\x07", 9, "a key of more columns"},
+		/* a number not in its shortest form: one schema, other bytes */
+		{"\x01" "\x81\x00" "t" "p" "\x00" "\x00" "\x00", 8, "shortest form"},
+		{"\x01" "\x01" "t" "p" "\x80\x00" "\x00" "\x00", 8, "shortest form"},
+		{"\x01" "\x01" "t" "p" "\x00" "\x00" "\x80\x80\x00", 9, "shortest form"},
+		/* a tag of bits past the 64th, dropped on reading */
+		{"\x01" "\x01" "t" "p" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 24, "shortest form"},
 	};
 
 	WsSchemaCodec->encode(&s, &b);
 
 	/* cut anywhere */
 	for (size_t n = 0; n < b.len; n++)
-	{
-		Decoding	d = {b.data, n};
-
-		expect_error(decode_it, &d, ERRCODE_DATA_CORRUPTED, NULL);
-	}
+		check_refused((const char *) b.data, n, "a malformed table schema");
 	/* a byte left over */
 	copy = palloc(b.len + 1);
 	memcpy(copy, b.data, b.len);
 	copy[b.len] = 0;
-	{
-		Decoding	d = {copy, b.len + 1};
-
-		expect_error(decode_it, &d, ERRCODE_DATA_CORRUPTED, NULL);
-	}
+	check_refused((const char *) copy, b.len + 1, "bytes left over");
 	pfree(copy);
 	buf_free(&b);
 
 	for (size_t i = 0; i < lengthof(bad); i++)
-	{
-		Decoding	d = {(const uint8 *) bad[i].p, bad[i].len};
+		check_refused(bad[i].p, bad[i].len, bad[i].why);
 
-		expect_error(decode_it, &d, ERRCODE_DATA_CORRUPTED, NULL);
-	}
+	/* a name not in the database's encoding */
+	if (GetDatabaseEncoding() == PG_UTF8)
+		check_refused("\x01" "\x01" "\xff" "p" "\x00" "\x00" "\x00", 7, "encoding");
 }
 
 /* The statement, to the byte: names quoted, each clause, references by name. */
@@ -491,6 +617,90 @@ static void
 test_create_table_dangling(void)
 {
 	expect_error(create_dangling, NULL, ERRCODE_DATA_CORRUPTED, NULL);
+}
+
+typedef struct Injection
+{
+	const char *type;
+	const char *collation;
+	const char *def;
+} Injection;
+
+static void
+create_injected(void *arg)
+{
+	Injection  *in = arg;
+	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = (char *) in->type,.kind = WS_COL_STORED,
+	.collation = (char *) in->collation,.def = (char *) in->def}};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/*
+ * A commit may have come from anywhere.  Text that would be more than a type,
+ * a collation or an expression, closing what it is put in and going on, is
+ * refused: no statement is written with it.
+ */
+static void
+test_create_table_injection(void)
+{
+	static const Injection bad[] = {
+		{.type = "int); DROP TABLE x.y; --"},
+		{.type = "int, b int"},
+		{.type = "int NOT NULL"},
+		{.type = "int COLLATE \"C\""},
+		{.type = "integer", .collation = "\"C\"; DROP TABLE x.y"},
+		{.type = "integer", .collation = "\"C\" NOT NULL"},
+		{.type = "integer", .def = "1); DROP TABLE x.y; SELECT (1"},
+		{.type = "integer", .def = "1), (2"},
+		{.type = "integer", .def = "1) FROM x.y WHERE (true"},
+		{.type = "integer", .def = "1) UNION SELECT (2"},
+		{.type = "integer", .def = "1) LIMIT (1"},
+		{.type = "integer", .def = "1, b int"},
+	};
+	static const Injection good[] = {
+		{.type = "character varying(10)"},
+		{.type = "numeric(10,2)[]"},
+		{.type = "\"My Schema\".\"My Type\""},
+		{.type = "timestamp(3) with time zone"},
+		{.type = "text", .collation = "pg_catalog.\"C\""},
+		{.type = "integer", .def = "(1 + 2)"},
+		{.type = "text", .def = "'); DROP TABLE x.y; --'::text"},
+		{.type = "integer", .def = "(SELECT 1)"},
+		{.type = "integer", .def = "CASE WHEN true THEN 1 ELSE 2 END"},
+	};
+
+	for (size_t i = 0; i < lengthof(bad); i++)
+	{
+		MemoryContext cxt = CurrentMemoryContext;
+		ResourceOwner owner = CurrentResourceOwner;
+		volatile bool refused = false;
+
+		/* (by a parse's own syntax error, or as corrupt: never written) */
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		PG_TRY();
+		{
+			create_injected((void *) &bad[i]);
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(cxt);
+			FlushErrorState();
+			refused = true;
+		}
+		PG_END_TRY();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (!refused)
+			elog(ERROR, "not refused: %s %s %s", bad[i].type,
+				 bad[i].collation ? bad[i].collation : "", bad[i].def ? bad[i].def : "");
+	}
+	for (size_t i = 0; i < lengthof(good); i++)
+		create_injected((void *) &good[i]);
 }
 
 /* (what failed, in the log: always false, for a CHECK to fail on) */
@@ -584,12 +794,14 @@ static const ProllyUnitTest tests[] = {
 	{"smallest", test_smallest},
 	{"find", test_find},
 	{"row_shape", test_row_shape},
+	{"wide_and_odd", test_wide_and_odd},
 	{"invalid", test_invalid},
 	{"malformed", test_malformed},
 	{"create_table", test_create_table},
 	{"create_table_names", test_create_table_names},
 	{"create_table_empty", test_create_table_empty},
 	{"create_table_dangling", test_create_table_dangling},
+	{"create_table_injection", test_create_table_injection},
 	{"create_table_runs", test_create_table_runs},
 };
 

@@ -73,19 +73,25 @@ spi_end_scope(int level)
 static bool
 statements_own_error(int code)
 {
-	if (code == ERRCODE_LOCK_NOT_AVAILABLE)
+	if (code == ERRCODE_LOCK_NOT_AVAILABLE || code == ERRCODE_ASSERT_FAILURE)
 		return false;
-	if (code == ERRCODE_RAISE_EXCEPTION)
-		return true;
 	switch (ERRCODE_TO_CATEGORY(code))
 	{
 		case ERRCODE_CARDINALITY_VIOLATION:
+		case ERRCODE_CASE_NOT_FOUND:
+		case ERRCODE_CONFIG_FILE_ERROR:
 		case ERRCODE_DATA_EXCEPTION:
 		case ERRCODE_DEPENDENT_PRIVILEGE_DESCRIPTORS_STILL_EXIST:
+		case ERRCODE_EXTERNAL_ROUTINE_EXCEPTION:
+		case ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION:
 		case ERRCODE_FEATURE_NOT_SUPPORTED:
 		case ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION:
+		case ERRCODE_INVALID_GRANTOR:
 		case ERRCODE_INVALID_SCHEMA_NAME:
 		case ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE:
+		case ERRCODE_PLPGSQL_ERROR:
+		case ERRCODE_PROGRAM_LIMIT_EXCEEDED:
+		case ERRCODE_SQL_ROUTINE_EXCEPTION:
 		case ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION:
 		case ERRCODE_WITH_CHECK_OPTION_VIOLATION:
 			return true;
@@ -105,6 +111,7 @@ spi_run_in(const char *sql, int nparams, const char *const *params, WsSqlRows *r
 	int			rc;
 
 	memset(rows, 0, sizeof(*rows));
+	(void) pg_verifymbstr(sql, strlen(sql), false);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	if (nparams > 0)

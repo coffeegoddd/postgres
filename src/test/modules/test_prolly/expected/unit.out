@@ -163,26 +163,29 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_sql          | attempt_whose_error                  | ok     | 
  ws_sql          | attempt_group                        | ok     | 
  ws_sql          | attempt_in_spi                       | ok     | 
- ws_sql          | parameter_encoding                   | ok     | 
+ ws_sql          | encoding                             | ok     | 
  ws_sql          | temp_does_not_shadow                 | ok     | 
  ws_sql          | settings                             | ok     | 
  ws_sql          | settings_after_errors                | ok     | 
+ ws_sql          | scope_not_superuser                  | ok     | 
  ws_schema       | bytes                                | ok     | 
  ws_schema       | round_trip                           | ok     | 
  ws_schema       | smallest                             | ok     | 
  ws_schema       | find                                 | ok     | 
  ws_schema       | row_shape                            | ok     | 
+ ws_schema       | wide_and_odd                         | ok     | 
  ws_schema       | invalid                              | ok     | 
  ws_schema       | malformed                            | ok     | 
  ws_schema       | create_table                         | ok     | 
  ws_schema       | create_table_names                   | ok     | 
  ws_schema       | create_table_empty                   | ok     | 
  ws_schema       | create_table_dangling                | ok     | 
+ ws_schema       | create_table_injection               | ok     | 
  ws_schema       | create_table_runs                    | ok     | 
  ws_tags         | escape_and_render                    | ok     | 
  ws_tags         | render_missing                       | ok     | 
  ws_tags         | render_malformed                     | ok     | 
-(170 rows)
+(173 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
