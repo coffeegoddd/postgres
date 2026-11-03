@@ -511,7 +511,7 @@ ENGINE_MEMORY_TEST(test_merge_head_follows)
 /*
  * A pinned commit with cut history beneath it is replaced as any: the hook
  * names its new hash, which a later sever's pin names to keep it; the old
- * hash, gone, pins nothing.
+ * hash, gone, is no commit to pin (VC_ERR_SEVERED).
  */
 ENGINE_MEMORY_TEST(test_pinned_follows_the_hook)
 {
@@ -537,14 +537,57 @@ ENGINE_MEMORY_TEST(test_pinned_follows_the_hook)
 	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
 	CHECK(vc_in_window(&r, &b2));	/* a root: nothing beneath it to cut */
 	CHECK_EQ(window_size(&r), 2);
-	/* the old hash, gone, pins nothing: B's commit is cut with it unnamed */
+	/* the old hash, gone (its transaction's holds ended), is no commit */
+	(void) release(cs);
 	w.pinned = &l.b;
-	CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
-	CHECK(!vc_in_window(&r, &b2));
-	CHECK_EQ(window_size(&r), 1);
+	CHECK_EQ(vc_sever(&r, &w, &seg), VC_ERR_SEVERED);
+	CHECK(vc_in_window(&r, &b2));
 	settle_and_check(cs);
 	vc_repo_free(&r);
 	cs_destroy(cs);
+}
+
+/*
+ * Severs that cut at most one commit each (max_cut) write again only what
+ * the window keeps: commits outside it not cut yet keep their hashes, for
+ * a later sever to cut.
+ */
+ENGINE_MEMORY_TEST(test_max_cut_leaves_the_rest)
+{
+	/*
+	 * Of init, A and B, one is cut a sever, whichever the listing (by hash)
+	 * comes to first: the others, outside the window and not cut, keep
+	 * their hashes meanwhile; once B is cut, C and D are written again,
+	 * once.  (Repeated: in one order of the three of six, B, A, init, no
+	 * commit outside the window has a parent cut before it.)
+	 */
+	for (int run = 0; run < 8; run++)
+	{
+		ChunkStore *cs = memstore_create();
+		VcRepo		r;
+		Moves		m;
+		Linear		l;
+		uint32		seg;
+		VcWindow	w = {.depth = 2,.max_cut = 1};
+
+		rewriting(&r, cs, &m);
+		l = build_linear(&r);
+		for (int i = 0; i < 3; i++)
+		{
+			int			held = 0;
+
+			CHECK_EQ(vc_sever(&r, &w, &seg), VC_OK);
+			held += vc_in_window(&r, &l.init) ? 1 : 0;
+			held += vc_in_window(&r, &l.a) ? 1 : 0;
+			held += vc_in_window(&r, &l.b) ? 1 : 0;
+			CHECK_EQ(held, 2 - i);
+		}
+		CHECK_EQ(m.n, 2);
+		CHECK_EQ(window_size(&r), 2);
+		settle_and_check(cs);
+		vc_repo_free(&r);
+		cs_destroy(cs);
+	}
 }
 
 /*
@@ -743,6 +786,7 @@ static const ProllyUnitTest tests[] = {
 	{"merge_head_follows", test_merge_head_follows},
 	{"measures_stay", test_measures_stay},
 	{"pinned_follows_the_hook", test_pinned_follows_the_hook},
+	{"max_cut_leaves_the_rest", test_max_cut_leaves_the_rest},
 	{"mode_is_the_repository", test_mode_is_the_repository},
 	{"no_remotes", test_no_remotes},
 	{"low_marks", test_low_marks},

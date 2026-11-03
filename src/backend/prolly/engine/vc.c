@@ -2206,8 +2206,13 @@ lock_branches(VcRepo *r, Locked *done)
 			pfree(all.names[i]);
 			continue;
 		}
-		if (branch_read(r, all.names[i], VC_REF_UPDATE, &b))
-			vc_branch_free(&b);
+		/* (one deleted while waited for is not locked: not named so) */
+		if (!branch_read(r, all.names[i], VC_REF_UPDATE, &b))
+		{
+			pfree(all.names[i]);
+			continue;
+		}
+		vc_branch_free(&b);
 		px_grow((void **) &done->names, &done->cap, done->n + 1, sizeof(char *));
 		done->names[done->n++] = all.names[i];
 	}

@@ -450,7 +450,8 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  * as the sever writes them, before its transaction commits, so a sever
  * that then aborts has moved none of them.  A commit pinned by hash
  * (VcWindow.pinned) with cut history beneath it is replaced as any: the
- * hook names its new hash, which a later sever's pin must name.  Changing
+ * hook names its new hash, which a later sever's pin must name (the old
+ * one, gone, is VC_ERR_SEVERED).  Changing
  * the branches or the mode while a rewriting sever waits for the
  * repository's state refuses it (a serialization failure), to be run
  * again.
