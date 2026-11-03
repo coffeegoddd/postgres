@@ -16,6 +16,7 @@ test_prolly_sources = files(
   'unit_engine_remote.c',
   'unit_engine_rewrite.c',
   'unit_ws_row.c',
+  'unit_ws_schema.c',
   'unit_ws_sql.c',
   'unit_engine_vc.c',
   'unit_engine_window.c',

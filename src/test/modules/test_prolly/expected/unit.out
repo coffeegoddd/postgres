@@ -167,7 +167,14 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_sql          | temp_does_not_shadow                 | ok     | 
  ws_sql          | settings                             | ok     | 
  ws_sql          | settings_after_errors                | ok     | 
-(155 rows)
+ ws_schema       | bytes                                | ok     | 
+ ws_schema       | round_trip                           | ok     | 
+ ws_schema       | smallest                             | ok     | 
+ ws_schema       | find                                 | ok     | 
+ ws_schema       | row_shape                            | ok     | 
+ ws_schema       | invalid                              | ok     | 
+ ws_schema       | malformed                            | ok     | 
+(162 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
