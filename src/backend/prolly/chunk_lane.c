@@ -8,9 +8,9 @@
  * writes, under one spinlock that a backend takes only to take or let go
  * of a lane (once a log, as it first appends to it): the database, the
  * log and the lane it holds.  A lane is taken from those that exist (as
- * the catalogs say) that no entry names; a lane being made is named by its
- * maker's entry until its transaction ends, so that no other takes its
- * number.
+ * the catalogs say) that no entry names, or made, its number the log's
+ * next (its meta page's, never given again: an aborted making's lane is
+ * gone, and entries its transaction left name it, which no lane must be).
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -199,11 +199,7 @@ lane_relid(Relation log, uint32 lane)
 uint32
 ChunkLaneCount(Relation log)
 {
-	uint32		n = 1;
-
-	while (n <= LANE_MAX && OidIsValid(lane_relid(log, n)))
-		n++;
-	return n;
+	return ChunkLogLanes(log);
 }
 
 Relation
@@ -290,10 +286,10 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	LaneEntry  *mine;
 	uint32		nlanes;
 	uint32		lane = 0;
-	uint32		top = 0;
 	int			slot = -1;
 	bool		make = false;
 	bool	   *held;
+	bool	   *exists;
 	Relation	rel;
 
 	register_callbacks();
@@ -332,47 +328,50 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 		clear_entry(slot);
 	}
 
-	/* the lanes there are, and those no live backend holds */
+	/*
+	 * the lanes there are (those whose making aborted are gone, their
+	 * numbers never given again), and those no live backend holds
+	 */
 	nlanes = ChunkLaneCount(log);
-	held = palloc0(sizeof(bool) * nlanes);
+	exists = palloc0(sizeof(bool) * nlanes);
+	for (uint32 l = 0; l < nlanes; l++)
+		exists[l] = OidIsValid(lane_relid(log, l));
 	SpinLockAcquire(&lanes->lock);
+	held = palloc0(sizeof(bool) * nlanes);
 	for (int i = 0; i < nslots * LANES_PER_BACKEND; i++)
 	{
 		LaneEntry  *e = &lanes->entries[i];
 
-		if (e->db != MyDatabaseId || e->log != RelationGetRelid(log))
-			continue;
-		if (e->lane < nlanes)
+		if (e->db == MyDatabaseId && e->log == RelationGetRelid(log) && e->lane < nlanes)
 			held[e->lane] = true;
-		top = Max(top, e->lane + 1);
 	}
-	for (lane = 0; lane < nlanes && held[lane]; lane++)
+	for (lane = 0; lane < nlanes && (held[lane] || !exists[lane]); lane++)
 		;
-	if (lane == nlanes)
+	make = lane == nlanes;
+	if (!make)
 	{
-		/* (all held: the next, past any being made) */
-		lane = Max(nlanes, top);
-		make = true;
+		mine[slot].db = MyDatabaseId;
+		mine[slot].log = RelationGetRelid(log);
+		mine[slot].lane = lane;
 	}
-	if (lane > LANE_MAX)
-	{
-		SpinLockRelease(&lanes->lock);
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("chunk log \"%s\" has its last lane", RelationGetRelationName(log))));
-	}
-	mine[slot].db = MyDatabaseId;
-	mine[slot].log = RelationGetRelid(log);
-	mine[slot].lane = lane;
 	SpinLockRelease(&lanes->lock);
 	pfree(held);
-	local[slot].used = ++use_clock;
+	pfree(exists);
 	if (make)
 	{
+		/* (all held: the next number, never given before, its own) */
+		lane = ChunkLogTakeLane(log);
+		SpinLockAcquire(&lanes->lock);
+		mine[slot].db = MyDatabaseId;
+		mine[slot].log = RelationGetRelid(log);
+		mine[slot].lane = lane;
+		SpinLockRelease(&lanes->lock);
 		local[slot].making = true;
 		local[slot].subid = GetCurrentSubTransactionId();
-		make_lane(log, lane);
 	}
+	local[slot].used = ++use_clock;
+	if (make)
+		make_lane(log, lane);
 	*lane_out = lane;
 	rel = ChunkLaneOpen(log, lane, RowExclusiveLock);
 	if (rel == NULL)

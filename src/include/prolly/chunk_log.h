@@ -228,7 +228,14 @@ typedef struct ChunkLogRoutine
  */
 extern const ChunkLogRoutine *ChunkLogOf(Relation rel);
 
-/* A lane made (prolly/chunk_lane.h): its meta page naming it lane n of log. */
+/*
+ * Lanes (prolly/chunk_lane.h): how many log has made (lanes 0 .. n - 1, some
+ * of them gone with their making's abort); the next lane's number taken
+ * (never given again, whatever becomes of its making); a lane made, its
+ * meta page naming it lane n of log.
+ */
+extern uint32 ChunkLogLanes(Relation log);
+extern uint32 ChunkLogTakeLane(Relation log);
 extern void ChunkLogMakeLane(Relation lane, uint32 n, Relation log);
 
 /*

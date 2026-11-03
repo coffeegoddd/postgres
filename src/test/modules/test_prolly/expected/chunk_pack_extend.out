@@ -1,19 +1,44 @@
 Parsed test spec with 3 sessions
 
-starting permutation: v_vacuum p_attach p_pack o_wake v_vacuum o_wake p_detach v_check
+starting permutation: p_load p_free v_vacuum p_attach p_pack o_wake v_vacuum o_wake p_detach v_check
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step p_load: 
+	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', pe_d(i));
+	SELECT stored FROM test_cs_put('pages', pe_d(5000));
+	SELECT test_cs_ref_root('pages', pe_h(pe_d(5000)));
+	-- (its region let go of: the pack's takes a segment freed)
+	SELECT test_chunk_log_let_go('pg_history.chunks');
+
+count
+-----
+  400
+(1 row)
+
+stored
+------
+t     
+(1 row)
+
 test_cs_ref_root
 ----------------
                 
 (1 row)
 
+test_chunk_log_let_go
+---------------------
+                     
+(1 row)
+
+step p_free: 
+	SELECT test_cs_free('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(1, 400) i));
+
 test_cs_free
 ------------
          400
-(1 row)
-
-injection_points_set_local
---------------------------
-                          
 (1 row)
 
 step v_vacuum: VACUUM pg_history.chunk_index;
