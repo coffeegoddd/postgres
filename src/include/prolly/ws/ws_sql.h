@@ -18,10 +18,10 @@
  * what it set, not what a statement set: a statement's SET outlives it.
  *
  * A statement and its parameters are valid in the database's encoding; its
- * parameters are text, $1 and on: it casts them to what it needs.  Each statement reads with a
- * snapshot of its own, so it sees what those before it changed; and, in READ
- * COMMITTED, what other sessions committed between them: a caller needing
- * one point in time is in REPEATABLE READ already.
+ * parameters are text, $1 and on: it casts them to what it needs.  Each
+ * statement reads with a snapshot of its own, so it sees what those before
+ * it changed; and, in READ COMMITTED, what other sessions committed between
+ * them: a caller needing one point in time is in REPEATABLE READ already.
  *
  * This is for catalogs and statements, not a table's rows: all of a
  * statement's rows are held in memory as text, and more than an int counts

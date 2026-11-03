@@ -350,8 +350,8 @@ as_nobody(void *arg)
 {
 	int			level;
 
-	run("CREATE ROLE ws_sql_nobody NOLOGIN NOSUPERUSER");
-	run("SET LOCAL ROLE ws_sql_nobody");
+	run("CREATE ROLE regress_ws_sql_nobody NOLOGIN NOSUPERUSER");
+	run("SET LOCAL ROLE regress_ws_sql_nobody");
 	level = WsSql->begin();
 	CHECK(is(one("SELECT pg_catalog.current_setting('catalog_branch_filter')"), "on"));
 	check_settings_taken();
