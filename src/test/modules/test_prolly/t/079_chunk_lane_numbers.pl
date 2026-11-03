@@ -184,7 +184,7 @@ $y->query_safe("SELECT test_chunk_put('tq', 'tqi', h(d(201)), d(201))");
 push @q, $y;
 my $tq_lanes = q{SELECT string_agg(relname || ':' || pg_relation_size(oid) / current_setting('block_size')::int, ' ' ORDER BY relname)
 	FROM pg_class WHERE relname LIKE 'tq\_lane\_%'};
-like($node->safe_psql('postgres', $tq_lanes), qr/^tq_lane_1:\d+ tq_lane_2:\d+ tq_lane_4:\d+$/,
+like($node->safe_psql('postgres', $tq_lanes), qr/^tq_lane_1:[2-9]\d* tq_lane_2:[2-9]\d* tq_lane_4:[2-9]\d*$/,
 	'tq has lanes 1, 2 and 4, 3 a hole (its making rolled back)');
 $node->safe_psql('postgres', 'BEGIN; SAVEPOINT s; TRUNCATE tq; ROLLBACK TO s; COMMIT');
 is($node->safe_psql('postgres', q{SELECT string_agg((test_chunk_get('tq', 'tqi', h(d(i))) = d(i))::text, ' ' ORDER BY i)
@@ -193,6 +193,14 @@ is($node->safe_psql('postgres', q{SELECT string_agg((test_chunk_get('tq', 'tqi',
 $node->safe_psql('postgres', 'BEGIN; TRUNCATE tq; TRUNCATE tq; COMMIT');
 is($node->safe_psql('postgres', $tq_lanes), 'tq_lane_1:1 tq_lane_2:1 tq_lane_4:1',
 	'truncated twice in a transaction: every lane its meta page alone, the hole passed by');
+# (the second truncation's meta page carrying the log's numbers: a lane's
+# writer appends again, and a new writer, every lane held, makes lane 5)
+my $qloc = $q[1]->query_safe(q{SELECT test_chunk_log_append('tq', '\x0c')});
+is($node->safe_psql('postgres', qq{SELECT test_chunk_log_read('tq', $qloc, 1)}), '\x0c',
+	'a lane\'s writer appends to the twice-truncated log, read back');
+$node->safe_psql('postgres', q{SELECT test_chunk_log_append('tq', '\x0d')});
+like($node->safe_psql('postgres', $tq_lanes), qr/ tq_lane_5:\d+$/,
+	'a new writer makes lane 5: the log\'s numbers carried through both truncations');
 ($ret, $out, $err) = $node->psql('postgres', "SELECT test_chunk_put('tq', 'tqi', h(d(300)), d(300))");
 like($err, qr/storage before it was truncated/, 'the index refuses the log it had, its lanes with it');
 $node->safe_psql('postgres', 'VACUUM tqi');
