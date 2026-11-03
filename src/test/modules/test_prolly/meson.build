@@ -13,6 +13,7 @@ test_prolly_sources = files(
   'unit_branch_filter.c',
   'unit_engine_lifetime.c',
   'unit_engine_prolly.c',
+  'unit_engine_vc.c',
   'unit_bufmgr.c',
   'unit_harness.c',
   'unit_registry.c',

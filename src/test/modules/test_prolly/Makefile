@@ -15,6 +15,7 @@ OBJS = \
 	unit_branch_filter.o \
 	unit_engine_lifetime.o \
 	unit_engine_prolly.o \
+	unit_engine_vc.o \
 	unit_bufmgr.o \
 	unit_harness.o \
 	unit_registry.o \
