@@ -24,7 +24,9 @@
  * logs at once), so a log has about as many lanes as it has had writers
  * at once.  A
  * place in the log carries its lane in its top LANE_BITS bits.  A lane
- * whose making aborted leaves a hole, its number given again only once a
+ * whose making ended without it (aborted; a prepared making's number is
+ * held, by a lock its transaction holds, until it ends) leaves a hole, its
+ * number given again only once a
  * VACUUM pass of the log's index begun after the hole was seen has ended
  * (the entries its transaction left, naming the lane, taken out by it); a
  * log has at most LANE_MAX lanes.  Lanes are found by what depends on the
@@ -34,7 +36,10 @@
  * segments freed in its own lane, never another's (that lane's holder
  * alone may grow it).  Compaction moves chunks off any lane's tail into
  * the compacting backend's lane, so that the tails of lanes no one writes
- * to are cut off in turn.  A lane is made in its log's tablespace as it is
+ * to are cut off in turn.  Evacuation (moving a tail into room below it,
+ * never growing anything) moves one lane's tail a pass, into free segments
+ * of the evacuating backend's lane: a lane another holds, its tail behind
+ * live chunks, waits for compaction, or for its holder to free room.  A lane is made in its log's tablespace as it is
  * then; moving the log's relation moves its own storage, not its lanes'.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group

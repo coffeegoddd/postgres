@@ -12,7 +12,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('lane_numbers');
 $node->init;
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->append_conf('postgresql.conf', "autovacuum = off\nmax_prepared_transactions = 2");
 $node->start;
 my $ts_dir = PostgreSQL::Test::Utils::tempdir_short();
 $node->safe_psql('postgres', qq{
@@ -72,6 +72,34 @@ is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
 $node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
 	't', "the audit passes after VACUUM: nothing the aborted making left counted in the reused lane");
+
+# a making prepared: its number not a hole while the transaction is
+# prepared (another making aborted, VACUUM passing, the next making takes
+# neither number); the backend that prepared it does not wait on it
+my $p = $node->background_psql('postgres');
+$p->query_safe("BEGIN; SELECT (test_cs_put('pages', d(6))).stored; PREPARE TRANSACTION 'made'");
+$p->query_safe("SET statement_timeout = '5s'; SELECT (test_cs_put('pages', d(7))).stored");
+is($node->safe_psql('postgres', q{SELECT test_cs_get('pages', h(d(7))) = d(7)}),
+	't', 'the backend that prepared the making put again without waiting on it');
+push @held, $p;
+$c = $node->background_psql('postgres');
+$c->query_safe("BEGIN; SELECT (test_cs_put('pages', d(8))).stored; ROLLBACK");
+$c->quit;
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+put_held(9);
+is($node->safe_psql('postgres', $lanes),
+	'chunks_lane_1 chunks_lane_2 chunks_lane_3 chunks_lane_5 chunks_lane_7',
+	'the prepared making\'s number (4) not given again, nor the hole seen once (6)');
+$node->safe_psql('postgres', "COMMIT PREPARED 'made'");
+is($node->safe_psql('postgres', q{SELECT reltablespace FROM pg_class WHERE oid = 'pg_history.chunks_lane_4'::regclass}),
+	'0', 'committed, the prepared making\'s lane is there');
+is( $node->safe_psql('postgres',
+		q{SELECT string_agg((test_cs_get('pages', h(d(i))) IS NOT DISTINCT FROM d(i))::text, ' ' ORDER BY i)
+		  FROM unnest(ARRAY[6, 9]) i}),
+	'true true', 'the chunks put in lanes 4 and 7 read back');
+$node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
+	't', "the audit passes after VACUUM: no lane's live chunk counted dead");
 
 # a log with lanes, and a lane, not truncated
 $node->safe_psql('postgres', 'CREATE TABLE tl () USING prolly_chunks');

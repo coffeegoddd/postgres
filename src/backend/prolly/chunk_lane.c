@@ -24,12 +24,16 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/relation.h"
+#include "access/table.h"
+#include "access/twophase.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "access/twophase.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_depend.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
 #include "executor/spi.h"
@@ -37,18 +41,16 @@
 #include "prolly/chunk_lane.h"
 #include "prolly/chunk_log.h"
 #include "storage/ipc.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
-#include "access/genam.h"
-#include "access/table.h"
-#include "catalog/indexing.h"
-#include "catalog/pg_depend.h"
-#include "storage/lwlock.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
-#include "utils/memutils.h"
-#include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #define LANES_PER_BACKEND	4
@@ -134,12 +136,47 @@ lanes_exit(int code, Datum arg)
 	LWLockRelease(ChunkLaneLock);
 }
 
+static void forget_lanes(Oid log);
+
+/*
+ * The lock a lane's maker holds on its number until its transaction ends
+ * (prepared, until it is committed or rolled back, across a restart too):
+ * a number with no lane, no holder and this lock free is a hole, its
+ * making ended without the lane.
+ */
+static void
+making_tag(LOCKTAG *tag, Oid log, uint32 lane)
+{
+	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, RelationRelationId, log, (uint16) lane);
+}
+
+static bool
+is_being_made(Oid log, uint32 lane)
+{
+	LOCKTAG		tag;
+
+	making_tag(&tag, log, lane);
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return true;
+	LockRelease(&tag, ExclusiveLock, false);
+	return false;
+}
+
+/*
+ * (an entry let go of: a lane being made, its making's transaction ended
+ * without it here, aborted or prepared, the lanes this backend knew of the
+ * log forgotten, the lane not its to see)
+ */
 static void
 clear_entry(int j)
 {
+	Oid			log = my_entries()[j].log;
+
 	LWLockAcquire(ChunkLaneLock, LW_EXCLUSIVE);
 	my_entries()[j].db = InvalidOid;
 	LWLockRelease(ChunkLaneLock);
+	if (local[j].making)
+		forget_lanes(log);
 	local[j].making = false;
 }
 
@@ -151,10 +188,15 @@ lanes_xact(XactEvent event, void *arg)
 	{
 		if (!local[j].making)
 			continue;
-		if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		/*
+		 * (prepared, the lane is the prepared transaction's, not this
+		 * backend's: let go of, as though aborted, its number held by the
+		 * making's lock until that transaction ends)
+		 */
+		if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT ||
+			event == XACT_EVENT_PREPARE)
 			clear_entry(j);
-		else if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
-				 event == XACT_EVENT_PREPARE)
+		else if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT)
 			local[j].making = false;
 	}
 }
@@ -194,9 +236,9 @@ lane_name(Relation log, uint32 lane)
 /*
  * A backend's map of each log's lanes (lane -> relation), from what depends
  * on the log internally, each lane's meta page naming it: made again as a
- * lane is asked for that it lacks, or that is gone (its log dropped and
- * made again under the same OID cannot be: a relation's OID is not given
- * again while it is)
+ * lane is asked for that it lacks, or that is gone or no longer names
+ * itself that lane of that log as it is opened (a relation's OID may be
+ * given again once it is dropped)
  */
 typedef struct LaneMap
 {
@@ -245,6 +287,21 @@ map_lanes(Relation log, LaneMap *map)
 	}
 	systable_endscan(scan);
 	table_close(dep, AccessShareLock);
+}
+
+static void
+forget_lanes(Oid log)
+{
+	LaneMap    *map;
+
+	if (lane_maps == NULL)
+		return;
+	map = hash_search(lane_maps, &log, HASH_FIND, NULL);
+	if (map == NULL)
+		return;
+	if (map->relids)
+		pfree(map->relids);
+	(void) hash_search(lane_maps, &log, HASH_REMOVE, NULL);
 }
 
 static LaneMap *
@@ -304,15 +361,24 @@ ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
 
 	if (lane == 0)
 		return log;
-	relid = lane_relid(log, lane);
-	rel = OidIsValid(relid) ? try_relation_open(relid, lockmode) : NULL;
-	if (rel == NULL && OidIsValid(relid))
+	for (int tries = 0; tries < 2; tries++)
 	{
-		/* (gone since mapped: mapped again) */
-		relid = lane_relid_of(log, lane, true);
-		rel = OidIsValid(relid) ? try_relation_open(relid, lockmode) : NULL;
+		uint32		number;
+		Oid			parent;
+
+		/* (gone, or another relation, since mapped: mapped again) */
+		relid = lane_relid_of(log, lane, tries > 0);
+		if (!OidIsValid(relid))
+			return NULL;
+		rel = try_relation_open(relid, lockmode);
+		if (rel == NULL)
+			continue;
+		if (RelationIsChunkLog(rel) && ChunkLogLaneOf(rel, &number, &parent) &&
+			number == lane && parent == RelationGetRelid(log))
+			return rel;
+		relation_close(rel, lockmode);
 	}
-	return rel;
+	return NULL;
 }
 
 void
@@ -457,8 +523,9 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	{
 		int			nholes = 0;
 
+		/* (none whose making's transaction is still running, prepared too) */
 		for (uint32 l = 1; l < nlanes; l++)
-			if (!held[l] && !exists[l])
+			if (!held[l] && !exists[l] && !is_being_made(RelationGetRelid(log), l))
 				holes[nholes++] = l;
 		/*
 		 * (a hole made since the catalogs were read is one its maker's entry
@@ -478,8 +545,19 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	local[slot].used = ++use_clock;
 	if (make)
 	{
+		LOCKTAG		tag;
+
 		local[slot].making = true;
 		local[slot].subid = GetCurrentSubTransactionId();
+
+		/*
+		 * (free: a new number's no one has had, a hole's no one holds; while
+		 * the entry names the lane, so that no one finds it a hole meanwhile)
+		 */
+		making_tag(&tag, RelationGetRelid(log), lane);
+		if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+			elog(ERROR, "lane %u of chunk log \"%s\" is being made by another",
+				 lane, RelationGetRelationName(log));
 		make_lane(log, lane);
 	}
 	*lane_out = lane;
