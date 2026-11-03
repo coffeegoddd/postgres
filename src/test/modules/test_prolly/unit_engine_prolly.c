@@ -1045,6 +1045,9 @@ ENGINE_TEST(test_iter_across_context_resets)
 /*
  * A delta naming more edits than its bytes could hold (two bytes each at
  * least) is no delta: refused as one, without allocating for its count.
+ * Its count is under its length in bytes, over half of it: the edits it
+ * names, were they allocated for, would take a block of their own in a
+ * context whose first is too small for them, which it would keep.
  */
 ENGINE_TEST(test_corrupt_delta_count)
 {
@@ -1054,16 +1057,48 @@ ENGINE_TEST(test_corrupt_delta_count)
 	Buf			b = BUF_INIT;
 	PHash		delta,
 				out;
+	MemoryContext cxt,
+				old;
+	Size		before;
 
 	buf_append_byte(&b, CHUNK_TAG_DELTA);
 	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
 	buf_append(&b, base.b, PHASH_LEN);
 	buf_append(&b, base.b, PHASH_LEN);
-	buf_append_uvarint(&b, UINT64CONST(1) << 40);
+	buf_append_uvarint(&b, 160);
+	for (int i = 0; i < 200; i++)
+		buf_append_byte(&b, 0);
 	CHECK_OK(prolly_put_chunk(&ctx, b.data, b.len, &delta));
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "corrupt delta",
+								1024, 1024, ALLOCSET_DEFAULT_MAXSIZE);
+	before = MemoryContextMemAllocated(cxt, true);
+	old = MemoryContextSwitchTo(cxt);
 	CHECK_EQ(prolly_delta_apply(&ctx, &delta, &out), PROLLY_ERR_BAD_DELTA);
+	MemoryContextSwitchTo(old);
+	CHECK(160 * sizeof(ProllyEdit) > 2048);
+	CHECK_EQ(MemoryContextMemAllocated(cxt, true), before);
 	CHECK(ctx.err_has_hash && phash_eq(&ctx.err_hash, &delta));
+	MemoryContextDelete(cxt);
 	buf_free(&b);
+	cs_destroy(cs);
+}
+
+/*
+ * A leaf's value shorter than the chunk references its tree's leaves hold
+ * is the caller's error, not a chunk's: its own code, naming no chunk.
+ */
+ENGINE_TEST(test_short_value_refused)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &small_policy);
+	uint8		key[8],
+				val[PHASH_LEN - 1] = {0};
+	ProllyKV	kv = {key, sizeof(key), val, sizeof(val)};
+	PHash		out;
+
+	put_u64(key, 1);
+	CHECK_EQ(prolly_build(&ctx, 1, &kv, 1, &out), PROLLY_ERR_BAD_VALUE);
+	CHECK(!ctx.err_has_hash);
 	cs_destroy(cs);
 }
 
@@ -1083,6 +1118,7 @@ static const ProllyUnitTest tests[] = {
 	{"merge_frees_its_copies", test_merge_frees_its_copies},
 	{"iter_across_context_resets", test_iter_across_context_resets},
 	{"corrupt_delta_count", test_corrupt_delta_count},
+	{"short_value_refused", test_short_value_refused},
 };
 
 const ProllyUnitSuite unit_engine_prolly_suite = {"engine_prolly", tests, lengthof(tests)};

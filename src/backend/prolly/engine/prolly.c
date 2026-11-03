@@ -71,11 +71,13 @@ prolly_report(ProllyCtx *ctx)
 {
 	char		hex[PHASH_HEX_LEN + 1];
 
-	phash_hex(&ctx->err_hash, hex);
-	if (!ctx->err_has_hash)
+	if (ctx->err == PROLLY_ERR_BAD_VALUE)
 		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a leaf's value holds fewer chunk references than its tree's nodes say")));
+	/* (every other error names the chunk at fault) */
+	Assert(ctx->err_has_hash);
+	phash_hex(&ctx->err_hash, hex);
 	if (ctx->err == PROLLY_ERR_MISSING)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -426,7 +428,7 @@ lc_add(LevelChunker *lc, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 	/* (a build, or edits, of many rows reads no node to check at) */
 	CHECK_FOR_INTERRUPTS();
 	if (lc->level == 0 && vl < (size_t) lc->shape.vrefs * PHASH_LEN)
-		return fail(lc->ctx, PROLLY_ERR_CORRUPT, NULL);
+		return fail(lc->ctx, PROLLY_ERR_BAD_VALUE, NULL);
 	buf_append_uvarint(&lc->items, kl);
 	lc->lastkoff = lc->items.len;
 	lc->lastklen = (uint32) kl;

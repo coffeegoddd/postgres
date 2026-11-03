@@ -54,6 +54,7 @@
 #define PROLLY_ERR_MISSING (-1)	/* a chunk not in the store */
 #define PROLLY_ERR_CORRUPT (-2)	/* bytes not a node, or not of this tree */
 #define PROLLY_ERR_BAD_DELTA (-3)	/* bytes not a delta, or not of its trees */
+#define PROLLY_ERR_BAD_VALUE (-4)	/* a value shorter than its tree's references */
 
 extern const ChunkPolicy prolly_default_policy;
 
