@@ -27,13 +27,14 @@
  * made from what it was (an edit: read, change, write back) reads it with
  * vc_working_lock, which locks the branch as a commit does, so that two
  * such edits take turns too and neither is lost; vc_set_working writes the
- * root it is given, whatever the working set was meanwhile.  A working
- * root two commits could share, and a commit whose hash another branch's
- * commit has (the same parents, root, time and message: two merges of one
- * branch into two at one head, in one microsecond), are the only chunks
- * commits on different branches can both write; the second waits for the
- * first's transaction there.  Errors of the
- * caller's (an unknown or misnamed branch, uncommitted changes) are
+ * root it is given, whatever the working set was meanwhile.  The one chunk
+ * commits on different branches can both write is a commit whose hash
+ * another branch's commit has: the same parents, root, time and message
+ * (two merges of one branch into two at one head, at one time: in one
+ * microsecond, or with the clock behind the parents', which puts a commit
+ * just after them); the second waits for the first's transaction there.
+ * Errors of the caller's (an unknown or misnamed branch, uncommitted
+ * changes) are
  * VC_ERR, and a name is any of 1 to NAMEDATALEN - 1 bytes; history a
  * call cannot reach is VC_ERR_SEVERED or VC_ERR_OUTSIDE_WINDOW, the commit
  * in ctx.err_hash; damage, of a tree or a commit, is raised.
