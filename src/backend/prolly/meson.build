@@ -25,3 +25,4 @@ backend_sources += files(
 )
 
 subdir('engine')
+subdir('ws')

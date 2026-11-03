@@ -19,6 +19,7 @@ OBJS = \
 	unit_engine_rewrite.o \
 	unit_engine_vc.o \
 	unit_engine_window.o \
+	unit_ws_row.o \
 	vc_sql.o \
 	unit_bufmgr.o \
 	unit_harness.o \
