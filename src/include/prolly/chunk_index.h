@@ -230,6 +230,15 @@ extern PGDLLIMPORT const ChunkIndexRoutine PageChunkIndex;
 /* The prolly_chunk_index table access method's relations are its. */
 extern bool RelationIsChunkIndex(Relation rel);
 
+/*
+ * An index's lanes (prolly/chunk_lane.h): rel's number and the index it is
+ * a lane of (InvalidOid for an index itself), as its meta page says, false
+ * if it has none; and a lane made, its meta page naming it lane n of idx,
+ * bound to idx's log.
+ */
+extern bool ChunkIndexLaneOf(Relation rel, uint32 *lane, Oid *parent);
+extern void ChunkIndexMakeLane(Relation lane, uint32 n, Relation idx);
+
 /* For the access method: a new index's pages, written to its storage. */
 extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
 

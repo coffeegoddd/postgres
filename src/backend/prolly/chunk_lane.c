@@ -38,6 +38,7 @@
 #include "commands/tablespace.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
+#include "prolly/chunk_index.h"
 #include "prolly/chunk_lane.h"
 #include "prolly/chunk_log.h"
 #include "storage/ipc.h"
@@ -243,7 +244,9 @@ lane_name(Relation log, uint32 lane)
  */
 typedef struct LaneMap
 {
-	Oid			log;			/* the key */
+	Oid			log;			/* the key: the log's, or the index's */
+	bool		index;			/* a chunk index's lanes (its lane 0 a
+								 * relation of its own), not a log's */
 	uint32		n;
 	Oid		   *relids;			/* InvalidOid: a hole */
 	bool	   *checked;		/* ... its meta page read naming it so, since
@@ -256,8 +259,43 @@ static HTAB *lane_maps = NULL;
  * (built apart and put in the map after: opening lanes may take in
  * invalidations, the log's forgetting its map meanwhile)
  */
+/*
+ * The lanes a chunk index may have: as many as its log has (index lane n
+ * is written by the backend holding log lane n), and one if it is bound to
+ * none, or to a log of no lanes (a tier).
+ */
+static uint32
+index_lane_count(Relation idx)
+{
+	uint64		stamp;
+	Oid			logid = PageChunkIndex.log_of(idx, &stamp);
+	Relation	log;
+	uint32		n = 1;
+
+	if (!OidIsValid(logid) || (log = try_relation_open(logid, AccessShareLock)) == NULL)
+		return n;
+	if (RelationIsChunkLog(log))
+		n = ChunkLogLanes(log);
+	relation_close(log, AccessShareLock);
+	return n;
+}
+
+/* (rel names itself lane number of parent) */
+static bool
+lane_names(Relation rel, bool index, Oid parent, uint32 number)
+{
+	uint32		lane;
+	Oid			of;
+
+	if (index)
+		return RelationIsChunkIndex(rel) && ChunkIndexLaneOf(rel, &lane, &of) &&
+			of == parent && lane == number;
+	return RelationIsChunkLog(rel) && ChunkLogLaneOf(rel, &lane, &of) &&
+		of == parent && lane == number;
+}
+
 static LaneMap *
-map_lanes(Relation log)
+map_lanes(Relation log, bool index)
 {
 	LaneMap    *map;
 	Oid		   *relids;
@@ -266,11 +304,12 @@ map_lanes(Relation log)
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tup;
-	uint32		n = ChunkLogLanes(log);
+	uint32		n = index ? index_lane_count(log) : ChunkLogLanes(log);
 
 	relids = MemoryContextAllocZero(TopMemoryContext, sizeof(Oid) * Max(n, 1));
 	checked = MemoryContextAllocZero(TopMemoryContext, sizeof(bool) * Max(n, 1));
-	relids[0] = RelationGetRelid(log);
+	if (!index)
+		relids[0] = RelationGetRelid(log);
 	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(RelationRelationId));
 	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
@@ -288,7 +327,9 @@ map_lanes(Relation log)
 		lane = try_relation_open(d->objid, AccessShareLock);
 		if (lane == NULL)
 			continue;
-		if (RelationIsChunkLog(lane) && ChunkLogLaneOf(lane, &number, &parent) &&
+		if (index ? RelationIsChunkIndex(lane) && ChunkIndexLaneOf(lane, &number, &parent) &&
+			parent == RelationGetRelid(log) && number < n :
+			RelationIsChunkLog(lane) && ChunkLogLaneOf(lane, &number, &parent) &&
 			parent == RelationGetRelid(log) && number > 0 && number < n)
 			relids[number] = d->objid;
 		relation_close(lane, AccessShareLock);
@@ -297,6 +338,7 @@ map_lanes(Relation log)
 	table_close(dep, AccessShareLock);
 	forget_lanes(RelationGetRelid(log));
 	map = hash_search(lane_maps, &RelationGetRelid(log), HASH_ENTER, NULL);
+	map->index = index;
 	map->n = n;
 	map->relids = relids;
 	map->checked = checked;
@@ -349,7 +391,7 @@ lanes_relcache(Datum arg, Oid relid)
 }
 
 static LaneMap *
-lane_map(Relation log)
+lane_map(Relation log, bool index)
 {
 	LaneMap    *map;
 
@@ -363,21 +405,27 @@ lane_map(Relation log)
 		CacheRegisterRelcacheCallback(lanes_relcache, (Datum) 0);
 	}
 	map = hash_search(lane_maps, &RelationGetRelid(log), HASH_FIND, NULL);
-	return map != NULL ? map : map_lanes(log);
+	return map != NULL ? map : map_lanes(log, index);
 }
 
 /* lane's relation, InvalidOid if it has none; fresh if asked */
 static Oid
-lane_relid_of(Relation log, uint32 lane, bool fresh)
+lane_relid_kind(Relation log, uint32 lane, bool fresh, bool index)
 {
 	LaneMap    *map;
 
-	if (lane == 0)
+	if (lane == 0 && !index)
 		return RelationGetRelid(log);
-	map = lane_map(log);
+	map = lane_map(log, index);
 	if (fresh || lane >= map->n || !OidIsValid(map->relids[lane]))
-		map = map_lanes(log);
+		map = map_lanes(log, index);
 	return lane < map->n ? map->relids[lane] : InvalidOid;
+}
+
+static Oid
+lane_relid_of(Relation log, uint32 lane, bool fresh)
+{
+	return lane_relid_kind(log, lane, fresh, false);
 }
 
 static Oid
@@ -392,35 +440,31 @@ ChunkLaneCount(Relation log)
 	return ChunkLogLanes(log);
 }
 
-Relation
-ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
+static Relation
+open_lane(Relation log, uint32 lane, LOCKMODE lockmode, bool index)
 {
 	Oid			relid;
 	Relation	rel;
 	LaneMap    *map;
 
-	if (lane == 0)
+	if (lane == 0 && !index)
 		return log;
 	for (int tries = 0; tries < 2; tries++)
 	{
-		uint32		number;
-		Oid			parent;
-
 		/* (gone, or another relation, since mapped: mapped again) */
-		relid = lane_relid_of(log, lane, tries > 0);
+		relid = lane_relid_kind(log, lane, tries > 0, index);
 		if (!OidIsValid(relid))
 			return NULL;
 		rel = try_relation_open(relid, lockmode);
 		if (rel == NULL)
 			continue;
 		/* (its meta page read once, until the relation is invalidated) */
-		map = lane_map(log);
+		map = lane_map(log, index);
 		if (lane < map->n && map->relids[lane] == relid && map->checked[lane])
 			return rel;
-		if (RelationIsChunkLog(rel) && ChunkLogLaneOf(rel, &number, &parent) &&
-			number == lane && parent == RelationGetRelid(log))
+		if (lane_names(rel, index, RelationGetRelid(log), lane))
 		{
-			map = lane_map(log);
+			map = lane_map(log, index);
 			if (lane < map->n && map->relids[lane] == relid)
 				map->checked[lane] = true;
 			return rel;
@@ -428,6 +472,31 @@ ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
 		relation_close(rel, lockmode);
 	}
 	return NULL;
+}
+
+Relation
+ChunkLaneOpen(Relation log, uint32 lane, LOCKMODE lockmode)
+{
+	return open_lane(log, lane, lockmode, false);
+}
+
+Relation
+ChunkIndexLaneOpen(Relation idx, uint32 lane, LOCKMODE lockmode)
+{
+	return open_lane(idx, lane, lockmode, true);
+}
+
+uint32
+ChunkIndexLaneCount(Relation idx)
+{
+	return lane_map(idx, true)->n;
+}
+
+void
+ChunkIndexLaneClose(Relation lane)
+{
+	if (lane != NULL)
+		relation_close(lane, NoLock);
 }
 
 void
@@ -443,7 +512,7 @@ ChunkLaneClose(Relation log, Relation lane)
  * naming it a lane of log's (and bound to log's index, if log is bound)
  */
 static void
-make_lane(Relation log, uint32 lane)
+make_lane(Relation log, uint32 lane, bool index)
 {
 	char	   *name = lane_name(log, lane);
 	char	   *nsp = get_namespace_name(RelationGetNamespace(log));
@@ -474,7 +543,7 @@ make_lane(Relation log, uint32 lane)
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
 		if (SPI_execute(sql.data, false, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "could not make lane \"%s\" of chunk log \"%s\"",
+			elog(ERROR, "could not make lane \"%s\" of \"%s\"",
 				 name, RelationGetRelationName(log));
 		SPI_finish();
 	}
@@ -490,9 +559,20 @@ make_lane(Relation log, uint32 lane)
 	ObjectAddressSet(logaddr, RelationRelationId, RelationGetRelid(log));
 	recordDependencyOn(&laneaddr, &logaddr, DEPENDENCY_INTERNAL);
 	CommandCounterIncrement();
-	ChunkLogMakeLane(made, lane, log);
+	if (index)
+	{
+		ChunkIndexMakeLane(made, lane, log);
+
+		/*
+		 * (others' maps of the index's lanes made again as they next lock
+		 * it, this one committed: none misses the lane's entries)
+		 */
+		CacheInvalidateRelcache(log);
+	}
+	else
+		ChunkLogMakeLane(made, lane, log);
 	relation_close(made, NoLock);
-	(void) lane_relid_of(log, lane, true);
+	(void) lane_relid_kind(log, lane, true, index);
 	pfree(name);
 	pfree(sql.data);
 }
@@ -508,6 +588,7 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	bool	   *held;
 	bool	   *exists;
 	uint32	   *holes;
+	Oid			index;
 	Relation	rel;
 
 	register_callbacks();
@@ -552,6 +633,7 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 	 * no lane and no holder, their making aborted
 	 */
 	nlanes = ChunkLaneCount(log);
+	index = ChunkLogIndexOf(log);
 	exists = palloc0(sizeof(bool) * nlanes);
 	held = palloc0(sizeof(bool) * nlanes);
 	holes = palloc(sizeof(uint32) * nlanes);
@@ -565,7 +647,10 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 		if (e->db == MyDatabaseId && e->log == RelationGetRelid(log) && e->lane < nlanes)
 			held[e->lane] = true;
 	}
-	for (lane = 0; lane < nlanes && (held[lane] || !exists[lane]); lane++)
+	/* (nor one whose index lane is being made, a prepared transaction's) */
+	for (lane = 0; lane < nlanes &&
+		 (held[lane] || !exists[lane] ||
+		  (OidIsValid(index) && is_being_made(index, lane))); lane++)
 		;
 	make = lane == nlanes;
 	if (make)
@@ -607,11 +692,49 @@ ChunkLaneForWrite(Relation log, uint32 *lane_out)
 		if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
 			elog(ERROR, "lane %u of chunk log \"%s\" is being made by another",
 				 lane, RelationGetRelationName(log));
-		make_lane(log, lane);
+		make_lane(log, lane, false);
 	}
 	*lane_out = lane;
 	rel = ChunkLaneOpen(log, lane, RowExclusiveLock);
 	if (rel == NULL)
 		elog(ERROR, "lane %u of chunk log \"%s\" is gone", lane, RelationGetRelationName(log));
 	return rel;
+}
+
+/*
+ * The lane of idx this backend writes: the one numbered as the lane of log
+ * it holds (made if it has none yet, in this transaction, under the
+ * making lock of its number, as a log's lane is), opened in
+ * RowExclusiveLock; its number in *lane.
+ */
+Relation
+ChunkIndexLaneForWrite(Relation idx, Relation log, uint32 *lane_out)
+{
+	uint32		lane;
+	Relation	rel = ChunkLaneForWrite(log, &lane);
+	Relation	ir;
+
+	ChunkLaneClose(log, rel);
+	*lane_out = lane;
+	ir = ChunkIndexLaneOpen(idx, lane, RowExclusiveLock);
+	if (ir == NULL)
+	{
+		LOCKTAG		tag;
+
+		/*
+		 * (none else makes it: the lane of log is this backend's, and none
+		 * takes a lane of log whose index lane is being made, a prepared
+		 * transaction's making included)
+		 */
+		making_tag(&tag, RelationGetRelid(idx), lane);
+		if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+			elog(ERROR, "lane %u of chunk index \"%s\" is being made by another",
+				 lane, RelationGetRelationName(idx));
+		make_lane(idx, lane, true);
+		ir = ChunkIndexLaneOpen(idx, lane, RowExclusiveLock);
+		if (ir == NULL)
+			elog(ERROR, "lane %u of chunk index \"%s\" made, and not found",
+				 lane, RelationGetRelationName(idx));
+	}
+	return ir;
 }

@@ -246,6 +246,8 @@ extern const ChunkLogRoutine *ChunkLogOf(Relation rel);
 extern uint32 ChunkLogLanes(Relation log);
 /* rel's lane number and log, as its meta page says; false if it has none. */
 extern bool ChunkLogLaneOf(Relation rel, uint32 *lane, Oid *parent);
+/* The index log is bound to, as its meta page says, or InvalidOid. */
+extern Oid	ChunkLogIndexOf(Relation log);
 extern uint32 ChunkLogTakeLane(Relation log, const uint32 *holes, int nholes);
 extern void ChunkLogMakeLane(Relation lane, uint32 n, Relation log);
 

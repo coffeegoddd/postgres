@@ -2335,6 +2335,21 @@ ChunkLogLaneOf(Relation rel, uint32 *lane, Oid *parent)
 	return true;
 }
 
+Oid
+ChunkLogIndexOf(Relation log)
+{
+	Buffer		mbuf;
+	Oid			index;
+
+	if (RelationGetNumberOfBlocks(log) == 0)
+		return InvalidOid;
+	mbuf = ReadBuffer(log, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	index = page_meta(log, BufferGetPage(mbuf))->index;
+	UnlockReleaseBuffer(mbuf);
+	return index;
+}
+
 uint32
 ChunkLogLanes(Relation log)
 {

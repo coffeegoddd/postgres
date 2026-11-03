@@ -2131,6 +2131,49 @@ page_log_of(Relation idx, uint64 *stamp)
 	return log;
 }
 
+static void page_bind_log(Relation idx, Oid log, uint64 stamp);
+
+bool
+ChunkIndexLaneOf(Relation rel, uint32 *lane, Oid *parent)
+{
+	Buffer		mbuf;
+	IndexMetaData *meta;
+
+	if (RelationGetNumberOfBlocks(rel) == 0)
+		return false;
+	mbuf = ReadBuffer(rel, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	meta = page_meta(rel, BufferGetPage(mbuf));
+	*lane = meta->lane;
+	*parent = meta->parent;
+	UnlockReleaseBuffer(mbuf);
+	return true;
+}
+
+void
+ChunkIndexMakeLane(Relation lane, uint32 n, Relation idx)
+{
+	uint64		stamp;
+	Oid			log = page_log_of(idx, &stamp);
+	Buffer		mbuf = ReadBuffer(lane, META_BLOCK);
+	IndexMetaData *meta;
+
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = page_meta(lane, BufferGetPage(mbuf));
+	START_CRIT_SECTION();
+	meta->lane = n;
+	meta->parent = RelationGetRelid(idx);
+	MarkBufferDirty(mbuf);
+	if (RelationNeedsWAL(lane))
+		log_newpage_buffer(mbuf, true);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(mbuf);
+
+	/* (its entries of the index's log, as the index's are) */
+	if (OidIsValid(log))
+		page_bind_log(lane, log, stamp);
+}
+
 /*
  * The log the index's entries are of, opened, if it is the one they are
  * of (the same storage), else NULL, with a WARNING: its dead bytes are

@@ -84,4 +84,17 @@ extern void ChunkLaneClose(Relation log, Relation lane);
 /* How many lanes log has, lane 0 among them: lanes 0 .. n - 1. */
 extern uint32 ChunkLaneCount(Relation log);
 
+/*
+ * A chunk index's lanes: relations of its access method beside it, lane n
+ * named "<index>_lane_<n>" and written by the backend holding lane n of
+ * the index's log (lane 0 too, a relation of its own: the index itself is
+ * written by its merger alone).  Lane lane of idx opened in lockmode, NULL
+ * if it has none; the lane this backend writes, made if missing; how many
+ * idx may have (its log's lanes); a lane closed (its lock kept).
+ */
+extern Relation ChunkIndexLaneOpen(Relation idx, uint32 lane, LOCKMODE lockmode);
+extern Relation ChunkIndexLaneForWrite(Relation idx, Relation log, uint32 *lane);
+extern uint32 ChunkIndexLaneCount(Relation idx);
+extern void ChunkIndexLaneClose(Relation lane);
+
 #endif							/* PROLLY_CHUNK_LANE_H */
