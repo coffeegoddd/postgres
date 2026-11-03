@@ -18,6 +18,7 @@ test_prolly_sources = files(
   'unit_ws_row.c',
   'unit_ws_schema.c',
   'unit_ws_sql.c',
+  'unit_ws_tags.c',
   'unit_engine_vc.c',
   'unit_engine_window.c',
   'vc_sql.c',

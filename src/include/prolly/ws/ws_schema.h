@@ -8,8 +8,9 @@
  * and retypes: rows, and everything else that refers to a column, name it by
  * tag.  Its type is format_type's text under the settings of a statement's
  * scope (prolly/ws/ws_sql.h), which names no cluster-local object; its
- * default or generation expression refers to columns as @{tag}.  Names are
- * as they are, not quoted.  Columns are in attribute order; the primary key
+ * default or generation expression is stored text (prolly/ws/ws_tags.h),
+ * referring to columns by tag.  Names are as they are, not quoted.  Columns
+ * are in attribute order; the primary key has its constraint's name, and
  * lists its columns' tags in key order.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -53,15 +54,16 @@ typedef struct WsTableSchema
 	char		persistence;	/* WS_PERSISTENCE_* */
 	int			ncols;
 	WsColumn   *cols;			/* attribute order */
+	char	   *key_name;		/* the primary key's constraint, or NULL: none */
 	int			nkey;
-	uint64	   *key;			/* the primary key's tags, or none */
+	uint64	   *key;			/* the primary key's tags */
 } WsTableSchema;
 
 /*
  * What a schema must be, in order to be written and when it is read: named,
  * its columns' tags and names distinct, a generated column with its
- * expression and no identity, its key's columns its own, stored, not null
- * and distinct.  NULL if it is so, or what is wrong.
+ * expression and no identity, a key named if it has columns, its columns its
+ * own, stored, not null and distinct.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -95,5 +97,15 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
  * order.  A virtual column has no value.
  */
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
+
+/*
+ * The CREATE TABLE statement for the table, in the named schema, appended to
+ * out; each expression's references the names of its table's columns.  Names
+ * are quoted as quote_identifier does, under the session's settings: a scope
+ * (prolly/ws/ws_sql.h) makes the text the same whoever asks.  An expression
+ * referring to a column the table does not have raises
+ * ERRCODE_DATA_CORRUPTED.
+ */
+extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
 
 #endif							/* PROLLY_WS_SCHEMA_H */
