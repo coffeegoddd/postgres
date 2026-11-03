@@ -132,7 +132,19 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_remote   | pull_needs_named_remote              | ok     | 
  engine_remote   | transfer_reads_not_the_window        | ok     | 
  engine_remote   | transfer_costs                       | ok     | 
-(120 rows)
+ engine_rewrite  | cut_commit_becomes_root              | ok     | 
+ engine_rewrite  | store_stays_bounded                  | ok     | 
+ engine_rewrite  | branches_share_the_new_root          | ok     | 
+ engine_rewrite  | merge_commit_loses_its_cut_parent    | ok     | 
+ engine_rewrite  | nothing_cut_nothing_moves            | ok     | 
+ engine_rewrite  | merge_head_follows                   | ok     | 
+ engine_rewrite  | measures_stay                        | ok     | 
+ engine_rewrite  | pinned_follows_the_hook              | ok     | 
+ engine_rewrite  | max_cut_leaves_the_rest              | ok     | 
+ engine_rewrite  | mode_is_the_repository               | ok     | 
+ engine_rewrite  | no_remotes                           | ok     | 
+ engine_rewrite  | low_marks                            | ok     | 
+(132 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

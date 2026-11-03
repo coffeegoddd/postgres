@@ -14,6 +14,7 @@ test_prolly_sources = files(
   'unit_engine_lifetime.c',
   'unit_engine_prolly.c',
   'unit_engine_remote.c',
+  'unit_engine_rewrite.c',
   'unit_engine_vc.c',
   'unit_engine_window.c',
   'vc_sql.c',
@@ -64,7 +65,8 @@ endif
 # index splitting a bucket, and expect it to split where it does after
 # the tests before them; version control's commits, with chunks of their
 # own, would make it split elsewhere)
-test_prolly_isolation += ['vc_branch_races', 'vc_open_race', 'vc_window_races']
+test_prolly_isolation += ['vc_branch_races', 'vc_open_race', 'vc_window_races',
+  'vc_rewrite_commit']
 if get_option('injection_points')
   test_prolly_isolation += ['vc_sever_commit']
 endif
@@ -105,6 +107,7 @@ tests += {
       'history_push',
       'chunk_pack_reclaim',
       'object_store_directory',
+      'vc_cancel',
     ],
   },
   'isolation': {

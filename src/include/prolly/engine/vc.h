@@ -77,6 +77,7 @@
 #define VC_ERR_OUTSIDE_WINDOW (-12)	/* stopped at the window's edge */
 #define VC_ERR_UNRELATED (-13)	/* the histories share no commit */
 #define VC_ERR_DETACHED (-14)	/* the sender's history is cut before it attaches */
+#define VC_ERR_REWRITTEN (-15)	/* remotes, with a repository that rewrites its history */
 
 /* Stop at the window's edge: refuse any commit the window does not hold. */
 #define VC_WINDOW_ONLY 0x1
@@ -162,6 +163,27 @@ typedef struct VcBranch
 	PHash		merge_head;
 } VcBranch;
 
+/*
+ * What a sever does with the history it cuts, a mode of the repository's
+ * (its state's, so every backend's).
+ *	KEEP	commits keep their hashes: what is cut becomes a segment, to
+ *			export, discard or attach again, and the kept commits still
+ *			name the parents they lost.  Remotes work across cuts.
+ *	REWRITE	what is cut is let go at once, and every kept commit with cut
+ *			history beneath it is written again without it: the oldest
+ *			kept commits become roots, and their descendants get new
+ *			hashes.  Nothing of the cut history is kept.  Hashes change at
+ *			every sever, so a repository in this mode has no remotes.
+ */
+typedef enum VcHistoryMode
+{
+	VC_HISTORY_KEEP = 0,
+	VC_HISTORY_REWRITE = 1
+} VcHistoryMode;
+
+/* Told, for each commit a rewriting sever replaced, the old and new hash. */
+typedef void (*VcRewriteFn) (void *arg, const PHash *old, const PHash *now);
+
 typedef struct VcRepo
 {
 	ProllyCtx	ctx;
@@ -169,6 +191,8 @@ typedef struct VcRepo
 	char	   *cur;			/* the branch checked out: this backend's */
 	uint64		(*now) (void *arg); /* microseconds; NULL: the server's clock */
 	void	   *now_arg;
+	VcRewriteFn rewrite_fn;		/* this backend's: told of each rewrite */
+	void	   *rewrite_arg;
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -418,6 +442,25 @@ extern void vc_locations(VcRepo *r, VcLocFn fn, void *arg);
 extern void vc_repo_set_name(VcRepo *r, const char *name);
 
 /*
+ * The history mode (KEEP until set).  In REWRITE mode vc_sever rewrites
+ * and reports no segment: it locks every branch, then the repository's
+ * state, so commits wait for it, and moves heads and merge heads to the
+ * new hashes.  The hook (this backend's) hears each commit replaced, so
+ * whatever names commits outside the repository can follow; it hears them
+ * as the sever writes them, before its transaction commits, so a sever
+ * that then aborts has moved none of them.  A commit pinned by hash
+ * (VcWindow.pinned) with cut history beneath it is replaced as any: the
+ * hook names its new hash, which a later sever's pin must name (the old
+ * one, gone, is VC_ERR_SEVERED).  Changing
+ * the branches or the mode while a rewriting sever waits for the
+ * repository's state refuses it (a serialization failure), to be run
+ * again.
+ */
+extern void vc_set_history_mode(VcRepo *r, VcHistoryMode mode);
+extern VcHistoryMode vc_history_mode(VcRepo *r);
+extern void vc_set_rewrite_hook(VcRepo *r, VcRewriteFn fn, void *arg);
+
+/*
  * Remotes: another repository with its own store and references.
  *
  * A transfer sends the commits the receiver lacks, each with its whole
@@ -430,8 +473,9 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  *
  * A transfer locks the receiver's state for update (it may record
  * boundaries), so it takes turns with window operations there, never with
- * commits.  Every call locks branches before the repository's state, so
- * calls do not deadlock on the two.
+ * commits; like them it needs a READ COMMITTED transaction, which reads
+ * what committed while it waited.  Every call locks branches before the
+ * repository's state, so calls do not deadlock on the two.
  *
  * Fetch, push and pull require the histories to attach: walking back from
  * the heads must reach a commit the receiver knows (a discarded one too:
@@ -441,6 +485,9 @@ extern void vc_repo_set_name(VcRepo *r, const char *name);
  * it, vc_hint says where it is), which deepening or attaching repairs.
  * Only a clone, into a store with no repository, starts unattached, at the
  * given depth (0: everything the source has).
+ *
+ * A repository that rewrites its history has no remotes: every call here
+ * with one, on either side, is VC_ERR_REWRITTEN, with nothing done.
  *
  * Parents not sent become boundaries on the receiver, with a hint naming
  * where their content can be found.  Push is checked for fast-forward by
