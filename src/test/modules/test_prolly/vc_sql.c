@@ -23,6 +23,7 @@
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "prolly/engine/chunkfmt.h"
 #include "prolly/engine/vc.h"
 #include "utils/builtins.h"
 
@@ -37,6 +38,7 @@ PG_FUNCTION_INFO_V1(test_vc_log);
 PG_FUNCTION_INFO_V1(test_vc_working_has);
 PG_FUNCTION_INFO_V1(test_vc_head_in_window);
 PG_FUNCTION_INFO_V1(test_vc_clear);
+PG_FUNCTION_INFO_V1(test_vc_rows);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -92,6 +94,14 @@ vc_begin(VcRepo *r, int64 init_time)
 		vc_repo_free(&(r)); \
 	} while (0)
 
+/* (a tree call that must succeed) */
+static void
+vc_must_ok(int rc, ProllyCtx *ctx)
+{
+	if (rc < 0)
+		prolly_report(ctx);
+}
+
 /* (a commit's row: its message's hash its key) */
 static uint64
 msg_key(const char *msg)
@@ -139,7 +149,8 @@ test_vc_commit(PG_FUNCTION_ARGS)
 		ProllyEdit	e = {key, 8, val, 16, false};
 
 		checkout(&r, branch);
-		rv = vc_working(&r);
+		/* (an edit: locked as it reads, so a second on the branch waits) */
+		rv = vc_working_lock(&r);
 		if (!vc_table_get(&r.ctx, &rv, "t", &t))
 		{
 			if (vc_table_create(&r.ctx, &rv, "t", ddl, strlen(ddl), &rv) != VC_OK)
@@ -345,11 +356,37 @@ collect_fn(void *arg, const char *name, const PHash *hash)
 	l->names = lappend(l->names, pstrdup(name));
 }
 
+static void
+no_ref_fn(void *arg, const PHash *h, bool strong)
+{
+}
+
+/* (an unheld chunk not of the engine's formats: another test's) */
+static void
+engine_only_fn(void *arg, const uint8 *hash, uint32 len, const ChunkCounts *counts)
+{
+	ChunkStore *cs = arg;
+	uint32		l;
+	uint8	   *d;
+
+	if (counts->refs != 0 || counts->roots != 0)
+		return;
+	d = cs_get(cs, hash, &l);
+	if (d == NULL || !engine_chunk_refs(d, l, no_ref_fn, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the history store holds an unheld chunk not of the engine's formats"),
+				 errdetail("A test before this one left it.")));
+	pfree(d);
+}
+
 /*
  * test_vc_clear() returns int8: every reference of version control
  * removed, and what nothing holds then freed, by the engine's formats (its
  * branches' and commits' chunks, and all they alone held): the store as a
- * test found it, for the tests after it.  How many chunks it freed.
+ * test found it, for the tests after it.  Every chunk it frees must be the
+ * engine's (another test's, unheld, freed by these formats, would have the
+ * wrong references let go of), and none is left unheld.  How many it freed.
  */
 Datum
 test_vc_clear(PG_FUNCTION_ARGS)
@@ -365,10 +402,18 @@ test_vc_clear(PG_FUNCTION_ARGS)
 		NameList	l = {NIL};
 		ListCell   *lc;
 
+		uint64		chunks,
+					unheld;
+		char	   *why = NULL;
+
 		vc_refs_list(refs, "vc/", collect_fn, &l);
 		foreach(lc, l.names)
 			(void) vc_refs_remove(refs, lfirst(lc));
+		cs_visit(cs, engine_only_fn, cs);
 		freed = cs_free_unheld(cs);
+		if (!cs_check(cs, &chunks, &unheld, &why) || unheld != 0)
+			elog(ERROR, "the history store, cleared, has %llu unheld chunks: %s",
+				 (unsigned long long) unheld, why ? why : "");
 	}
 	PG_FINALLY();
 	{
@@ -376,4 +421,26 @@ test_vc_clear(PG_FUNCTION_ARGS)
 	}
 	PG_END_TRY();
 	PG_RETURN_INT64((int64) freed);
+}
+
+/* test_vc_rows(branch text) returns int8: the rows of table t at its head */
+Datum
+test_vc_rows(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	VcRepo		r;
+	uint64		n = 0;
+
+	VC_CALL(r, 0,
+	{
+		VcBranch	b;
+		VcTable		t;
+
+		checkout(&r, branch);
+		vc_head(&r, &b);
+		if (vc_table_get(&r.ctx, &b.head_root, "t", &t))
+			vc_must_ok(prolly_count(&r.ctx, &t.data, &n), &r.ctx);
+		vc_branch_free(&b);
+	});
+	PG_RETURN_INT64((int64) n);
 }

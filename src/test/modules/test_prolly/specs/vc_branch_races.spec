@@ -20,19 +20,18 @@ teardown
 }
 
 session s1
-setup			{ SET chunk_free_in_background = off; }
 step s1_begin	{ BEGIN; }
 step s1_main	{ SELECT test_vc_commit('main', 's1'); }
 step s1_a		{ SELECT test_vc_commit('a', 's1a'); }
 step s1_hard	{ SELECT test_vc_reset('main', 'base', true); }
 step s1_soft	{ SELECT test_vc_reset('main', 'base', false); }
 step s1_drop_b	{ SELECT test_vc_branch_delete('b'); }
+step s1_drop_a	{ SELECT test_vc_branch_delete('a'); }
 step s1_make_x	{ SELECT test_vc_branch('x', 'main'); }
 step s1_commit	{ COMMIT; }
 step s1_rollback	{ ROLLBACK; }
 
 session s2
-setup			{ SET chunk_free_in_background = off; }
 step s2_main	{ SELECT test_vc_commit('main', 's2'); }
 step s2_b		{ SELECT test_vc_commit('b', 's2b'); }
 step s2_hard	{ SELECT test_vc_reset('main', 'base', true); }
@@ -51,12 +50,17 @@ step c_log
 }
 step c_s1_working	{ SELECT test_vc_working_has('main', 's1') AS has_s1; }
 
-# two commits on one branch take turns; both land, the second on the first
-permutation s1_begin s1_main s2_main s1_commit c_log
+# two commits on one branch take turns; both land, the second on the first,
+# its tree with the first's change in it
+permutation s1_begin s1_main s2_main s1_commit c_log c_s1_working
 # the first rolled back, the second lands on what was there
-permutation s1_begin s1_main s2_main s1_rollback c_log
-# commits on different branches do not wait on each other
+permutation s1_begin s1_main s2_main s1_rollback c_log c_s1_working
+# changes to different branches do not wait on each other: a commit, a
+# deletion, a reset, a branch made, beside a commit on another branch
 permutation s1_begin s1_a s2_b s1_commit c_log
+permutation s1_begin s1_drop_a s2_b s1_commit c_log
+permutation s1_begin s1_hard s2_b s1_commit c_log
+permutation s1_begin s1_make_x s2_b s1_commit c_log
 # in repeatable read, the second fails cleanly, and nothing of it lands
 permutation s1_begin s2_rr s1_main s2_rr_main s1_commit s2_end c_log
 

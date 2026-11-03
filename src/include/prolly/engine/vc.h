@@ -23,10 +23,16 @@
  *
  * Calls that change a branch lock its reference first (for update), and
  * read it after, so two that change one branch take turns: two commits on
- * one branch both land, one after the other.  vc_set_working replaces the
- * working root it is given, whatever it was meanwhile: two sessions
- * writing one branch's working set without committing between them are
- * the working set's own concern, not this layer's.  Errors of the
+ * one branch both land, one after the other.  A change of the working set
+ * made from what it was (an edit: read, change, write back) reads it with
+ * vc_working_lock, which locks the branch as a commit does, so that two
+ * such edits take turns too and neither is lost; vc_set_working writes the
+ * root it is given, whatever the working set was meanwhile.  A working
+ * root two commits could share, and a commit whose hash another branch's
+ * commit has (the same parents, root, time and message: two merges of one
+ * branch into two at one head, in one microsecond), are the only chunks
+ * commits on different branches can both write; the second waits for the
+ * first's transaction there.  Errors of the
  * caller's (an unknown or misnamed branch, uncommitted changes) are
  * VC_ERR, and a name is any of 1 to NAMEDATALEN - 1 bytes; history a
  * call cannot reach is VC_ERR_SEVERED or VC_ERR_OUTSIDE_WINDOW, the commit
@@ -201,6 +207,8 @@ extern void vc_branch_list(VcRepo *r, VcBranchFn fn, void *arg);
 /* The branch checked out. */
 extern void vc_head(VcRepo *r, VcBranch *out);
 extern PHash vc_working(VcRepo *r);
+/* The working root, its branch locked until the transaction ends: for an edit. */
+extern PHash vc_working_lock(VcRepo *r);
 extern void vc_set_working(VcRepo *r, const PHash *rv);
 /* A new branch at commit (NULL: the head checked out). */
 extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);

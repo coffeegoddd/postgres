@@ -1084,6 +1084,18 @@ vc_working(VcRepo *r)
 	return w;
 }
 
+PHash
+vc_working_lock(VcRepo *r)
+{
+	VcBranch	b;
+	PHash		w;
+
+	lock_head(r, &b);
+	w = b.working;
+	vc_branch_free(&b);
+	return w;
+}
+
 void
 vc_set_working(VcRepo *r, const PHash *rv)
 {

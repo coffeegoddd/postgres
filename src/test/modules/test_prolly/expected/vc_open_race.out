@@ -31,15 +31,15 @@ t
 (1 row)
 
 
-starting permutation: s1_begin s1_open s2_later s1_commit c_repo
+starting permutation: s1_begin s1_open2 s2_later s1_commit c_repo
 step s1_begin: BEGIN;
-step s1_open: SELECT test_vc_open(1000);
+step s1_open2: SELECT test_vc_open(5000);
 test_vc_open
 ------------
 t           
 (1 row)
 
-step s2_later: SELECT test_vc_open(2000); <waiting ...>
+step s2_later: SELECT test_vc_open(6000); <waiting ...>
 step s1_commit: COMMIT;
 step s2_later: <... completed>
 test_vc_open
@@ -62,17 +62,17 @@ t
 (1 row)
 
 
-starting permutation: s1_begin s1_open s2_later s1_rollback c_repo
+starting permutation: s1_begin s1_open3 s2_later3 s1_rollback c_repo
 step s1_begin: BEGIN;
-step s1_open: SELECT test_vc_open(1000);
+step s1_open3: SELECT test_vc_open(9000);
 test_vc_open
 ------------
 t           
 (1 row)
 
-step s2_later: SELECT test_vc_open(2000); <waiting ...>
+step s2_later3: SELECT test_vc_open(10000); <waiting ...>
 step s1_rollback: ROLLBACK;
-step s2_later: <... completed>
+step s2_later3: <... completed>
 test_vc_open
 ------------
 t           

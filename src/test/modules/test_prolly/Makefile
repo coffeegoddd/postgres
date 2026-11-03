@@ -58,6 +58,8 @@ endif
 ifeq ($(enable_injection_points),yes)
 ISOLATION += chunk_pack_order chunk_pack_error chunk_pack_found chunk_pack_extend chunk_tier_table object_store_race
 endif
-# (last: version control's commits grow the history store's index, which
-# the injection points above, at its splits, need as they leave it)
+# (last: the injection point tests above stop at the history store's
+# index splitting a bucket, and expect it to split where it does after
+# the tests before them; version control's commits, with chunks of their
+# own, would make it split elsewhere)
 ISOLATION += vc_branch_races vc_open_race

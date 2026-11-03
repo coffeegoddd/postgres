@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_begin s1_main s2_main s1_commit c_log
+starting permutation: s1_begin s1_main s2_main s1_commit c_log c_s1_working
 test_vc_branch
 --------------
 t             
@@ -31,13 +31,19 @@ main           |a        |b        |x|kept
 s2 s1 base init|base init|base init| |t   
 (1 row)
 
+step c_s1_working: SELECT test_vc_working_has('main', 's1') AS has_s1;
+has_s1
+------
+t     
+(1 row)
+
 cleared
 -------
 t      
 (1 row)
 
 
-starting permutation: s1_begin s1_main s2_main s1_rollback c_log
+starting permutation: s1_begin s1_main s2_main s1_rollback c_log c_s1_working
 test_vc_branch
 --------------
 t             
@@ -66,6 +72,12 @@ step c_log:
 main        |a        |b        |x|kept
 ------------+---------+---------+-+----
 s2 base init|base init|base init| |t   
+(1 row)
+
+step c_s1_working: SELECT test_vc_working_has('main', 's1') AS has_s1;
+has_s1
+------
+f     
 (1 row)
 
 cleared
@@ -102,6 +114,114 @@ step c_log:
 main     |a            |b            |x|kept
 ---------+-------------+-------------+-+----
 base init|s1a base init|s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_drop_a s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_drop_a: SELECT test_vc_branch_delete('a');
+test_vc_branch_delete
+---------------------
+t                    
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a|b            |x|kept
+---------+-+-------------+-+----
+base init| |s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_hard s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_hard: SELECT test_vc_reset('main', 'base', true);
+test_vc_reset
+-------------
+t            
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b            |x|kept
+---------+---------+-------------+-+----
+base init|base init|s2b base init| |t   
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_make_x s2_b s1_commit c_log
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_make_x: SELECT test_vc_branch('x', 'main');
+test_vc_branch
+--------------
+t             
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 's2b');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_commit: COMMIT;
+step c_log: 
+	SELECT test_vc_log('main') AS main, test_vc_log('a') AS a,
+		test_vc_log('b') AS b, test_vc_log('x') AS x,
+		test_vc_head_in_window('main') AS kept;
+
+main     |a        |b            |x        |kept
+---------+---------+-------------+---------+----
+base init|base init|s2b base init|base init|t   
 (1 row)
 
 cleared

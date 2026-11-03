@@ -610,7 +610,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 -- Every reference of version control removed, and what nothing holds then
 -- freed by the engine's chunk formats: the history store as a test found
--- it.  How many chunks were freed.
+-- it, each chunk freed the engine's and none left unheld.  How many chunks
+-- were freed.
 CREATE FUNCTION test_vc_clear()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- The rows of table t at the branch's head.
+CREATE FUNCTION test_vc_rows(branch text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

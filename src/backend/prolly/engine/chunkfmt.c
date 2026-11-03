@@ -269,7 +269,8 @@ branch_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 	{
 		uint64		nl;
 
-		if (!read_uvarint(&p, end, &nl) || nl != (uint64) (end - p))
+		if (!read_uvarint(&p, end, &nl) || nl != (uint64) (end - p) || nl == 0 ||
+			nl > NAMEDATALEN - 1)
 			return false;
 	}
 	return true;
