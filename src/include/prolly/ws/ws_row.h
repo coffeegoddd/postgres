@@ -27,6 +27,27 @@
 /* Postgres's limit on a table's columns */
 #define WS_MAX_COLS 1600
 
+/*
+ * A uvarint read as read_uvarint does, and false too if it is not the
+ * shortest form of its value: the same value is always the same bytes, so
+ * that one row or schema does not have many hashes.
+ */
+static inline bool
+ws_read_canonical_uvarint(const uint8 **p, const uint8 *end, uint64 *out)
+{
+	const uint8 *start = *p;
+	size_t		len;
+
+	if (!read_uvarint(p, end, out))
+		return false;
+	len = (size_t) (*p - start);
+	if (len > 1 && start[len - 1] == 0)
+		return false;			/* a last byte of no bits: too long */
+	if (len == 10 && start[9] > 1)
+		return false;			/* bits past the 64th */
+	return len <= 10;
+}
+
 /* A stored column's value: its output text, or NULL. */
 typedef struct WsField
 {

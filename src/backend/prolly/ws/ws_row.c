@@ -114,9 +114,9 @@ cell_next(const uint8 **p, const uint8 *end, bool has_prev, uint64 prev, WsCell 
 
 	if (*p >= end)
 		return false;
-	if (!read_uvarint(p, end, &tag) || !read_uvarint(p, end, &len) ||
+	if (!ws_read_canonical_uvarint(p, end, &tag) || !ws_read_canonical_uvarint(p, end, &len) ||
 		len > (uint64) (end - *p))
-		malformed("a cell runs past its end");
+		malformed("a cell runs past its end, or is not in its shortest form");
 	if (has_prev && tag <= prev)
 		malformed("its cells are not in order of their tags");
 	c->tag = tag;
@@ -216,8 +216,8 @@ cells_key_fields(const WsRowShape *s, const uint8 *k, size_t kl, WsField *f)
 	{
 		uint64		len = 0;
 
-		if (!read_uvarint(&p, end, &len) || len > (uint64) (end - p))
-			malformed("a key's value runs past its end");
+		if (!ws_read_canonical_uvarint(&p, end, &len) || len > (uint64) (end - p))
+			malformed("a key's value runs past its end, or is not in its shortest form");
 		f[i].p = p;
 		f[i].len = (size_t) len;
 		f[i].null = false;

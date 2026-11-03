@@ -32,6 +32,7 @@
 #define WS_IDENTITY_ALWAYS 'a'
 #define WS_IDENTITY_BY_DEFAULT 'd'
 
+/* (not temporary: a temporary table is in no versioned schema) */
 #define WS_PERSISTENCE_PERMANENT 'p'
 #define WS_PERSISTENCE_UNLOGGED 'u'
 
@@ -59,17 +60,19 @@ typedef struct WsTableSchema
 
 /*
  * What a schema must be, in order to be written and when it is read: named,
- * its columns' tags and names distinct, a generated column with its
- * expression and no identity, its key's columns its own, stored, not null
- * and distinct.  NULL if it is so, or what is wrong.
+ * in names Postgres would not shorten, its columns' tags and names distinct,
+ * a generated column with its expression and no identity, an identity not
+ * null, no empty expression or collation, its key's columns its own, stored,
+ * not null and distinct.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
 /*
- * The schema codec.  The same schema is always the same bytes.  encode raises
- * an error if the schema has a problem; decode raises
- * ERRCODE_DATA_CORRUPTED if the bytes are not a schema's, or the schema they
- * hold has one.  What decode gives is the caller's to ws_schema_free.
+ * The schema codec.  The same schema is always the same bytes, and only
+ * those bytes are read as it.  encode raises an error if the schema has a
+ * problem; decode raises ERRCODE_DATA_CORRUPTED if the bytes are not a
+ * schema's, or the schema they hold has one, or a string is not in the
+ * database's encoding.  What decode gives is the caller's to ws_schema_free.
  */
 typedef struct WsSchemaCodecRoutine
 {

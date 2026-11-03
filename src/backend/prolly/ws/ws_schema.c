@@ -7,8 +7,8 @@
  * version byte, name, persistence byte, uvarint ncols, then each column:
  * uvarint tag, name, type, kind byte, not null byte (0 or 1), identity byte,
  * default, collation; then uvarint nkey and the key's tags.  A string is its
- * uvarint length and bytes; a default or collation is its length plus one,
- * with 0 for none, so that an empty one is not none.
+ * uvarint length and bytes, in its shortest form; a default or collation
+ * none is empty, which neither is if it is there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "mb/pg_wchar.h"
 #include "prolly/ws/ws_schema.h"
 
 #define WS_SCHEMA_VERSION 1
@@ -29,6 +30,8 @@ ws_schema_problem(const WsTableSchema *s)
 {
 	if (s->name == NULL || s->name[0] == '\0')
 		return "a table with no name";
+	if (strlen(s->name) >= NAMEDATALEN)
+		return "a table's name too long";
 	if (s->persistence != WS_PERSISTENCE_PERMANENT && s->persistence != WS_PERSISTENCE_UNLOGGED)
 		return "a table of no known persistence";
 	if (s->ncols < 0 || s->ncols > WS_MAX_COLS)
@@ -39,6 +42,8 @@ ws_schema_problem(const WsTableSchema *s)
 
 		if (c->name == NULL || c->name[0] == '\0')
 			return "a column with no name";
+		if (strlen(c->name) >= NAMEDATALEN)
+			return "a column's name too long";
 		if (c->type == NULL || c->type[0] == '\0')
 			return "a column with no type";
 		if (c->kind != WS_COL_STORED && c->kind != WS_COL_GENERATED_STORED &&
@@ -53,6 +58,12 @@ ws_schema_problem(const WsTableSchema *s)
 			return "a generated column that is an identity";
 		if (c->identity != WS_IDENTITY_NONE && c->def != NULL)
 			return "an identity column with a default";
+		if (c->identity != WS_IDENTITY_NONE && !c->not_null)
+			return "an identity column that may be null";
+		if (c->def != NULL && c->def[0] == '\0')
+			return "an empty default";
+		if (c->collation != NULL && c->collation[0] == '\0')
+			return "an empty collation";
 		for (int j = 0; j < i; j++)
 		{
 			if (s->cols[j].tag == c->tag)
@@ -92,10 +103,7 @@ put_string(Buf *out, const char *s)
 static void
 put_optional(Buf *out, const char *s)
 {
-	size_t		n = s ? strlen(s) : 0;
-
-	buf_append_uvarint(out, s ? n + 1 : 0);
-	buf_append(out, s, n);
+	put_string(out, s ? s : "");
 }
 
 static void
@@ -140,8 +148,8 @@ get_uvarint(const uint8 **p, const uint8 *end)
 {
 	uint64		v = 0;
 
-	if (!read_uvarint(p, end, &v))
-		malformed("it ends early");
+	if (!ws_read_canonical_uvarint(p, end, &v))
+		malformed("it ends early, or a number is not in its shortest form");
 	return v;
 }
 
@@ -163,6 +171,8 @@ get_bytes(const uint8 **p, const uint8 *end, uint64 n)
 		malformed("a string runs past its end");
 	if (memchr(*p, '\0', (size_t) n) != NULL)
 		malformed("a string with a NUL in it");
+	if (!pg_verifymbstr((const char *) *p, (int) n, true))
+		malformed("a string not in the database's encoding");
 	s = px_malloc((size_t) n + 1);
 	memcpy(s, *p, (size_t) n);
 	s[n] = '\0';
@@ -183,7 +193,7 @@ get_optional(const uint8 **p, const uint8 *end)
 {
 	uint64		n = get_uvarint(p, end);
 
-	return n == 0 ? NULL : get_bytes(p, end, n - 1);
+	return n == 0 ? NULL : get_bytes(p, end, n);
 }
 
 static void
@@ -279,9 +289,10 @@ ws_schema_column_named(const WsTableSchema *s, const char *name)
 void
 ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape)
 {
-	uint64		tags[WS_MAX_COLS];
+	uint64	   *tags = px_malloc((size_t) (s->nkey + s->ncols) * sizeof(uint64));
 	int			n = 0;
 
+	/* (a schema not yet checked, a merge's: ws_row_shape_init refuses too many) */
 	for (int i = 0; i < s->nkey; i++)
 		tags[n++] = s->key[i];
 	for (int i = 0; i < s->ncols; i++)
@@ -294,4 +305,5 @@ ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape)
 			tags[n++] = s->cols[i].tag;
 	}
 	ws_row_shape_init(shape, tags, n, s->nkey);
+	px_free(tags);
 }
