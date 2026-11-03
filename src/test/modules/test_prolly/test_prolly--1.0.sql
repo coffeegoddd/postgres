@@ -650,6 +650,14 @@ CREATE FUNCTION test_vc_cancel_writes()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- The repository cloned into a memory store of the call's own, a commit
+-- there (msg || ' pushed') pushed back to the branch, another (' fetched')
+-- fetched from it, and one more (' theirs') pulled into the branch after a
+-- commit of its own (' ours'): the fetched commit's hash.
+CREATE FUNCTION test_vc_round_trip(branch text, msg text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- op ('push', 'fetch' or 'deepen') between the repository and itself: its code.
 CREATE FUNCTION test_vc_transfer(op text)
 RETURNS int4
