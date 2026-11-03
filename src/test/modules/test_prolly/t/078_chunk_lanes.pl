@@ -2,7 +2,10 @@
 
 # Many backends writing the history store at once never wait on each
 # other to grow it: each appends into a lane of its own (a relation that
-# only it extends), so no relation's extension lock is ever taken by two.
+# only it extends), so no relation of the store's is extended by two.
+# (Making a lane makes a relation: the catalogs it writes, pg_type's and
+# the like, are extended as any DDL's are, and a maker may wait briefly
+# for another to do so.)
 # Their chunks read back, from any backend; the lanes are the log's, and
 # go with it.  A standby, streaming, reads them all back too.
 use strict;
@@ -54,15 +57,27 @@ SELECT (test_cs_put('pages', d(nextval('n')))).stored;
 
 # (a wait's lines, its relation named, shown if there is one)
 my $waits = slurp_file($node->logfile, $log_at);
-my %rels = map { $_ => 1 } ($waits =~ /of relation (\d+) of database/g);
+my %rels = map { $_ => 1 } ($waits =~ /relation (\d+) of database/g);
 my @named = map {
 	"relation $_ is "
 	  . $node->safe_psql('postgres',
 		"SELECT coalesce((SELECT oid::regclass::text FROM pg_class WHERE oid = $_), 'gone')")
 } sort keys %rels;
-my @waited = grep { /still waiting/ .. /STATEMENT/ } split /\n/, $waits;
-is(scalar(grep { /still waiting/ } @waited), 0, 'no backend waited on another')
+my @waited = grep { /still waiting/ ... /STATEMENT|^\S+ \S+ \S+ \[\d+\] [^:]*: (?!DETAIL|CONTEXT)/ }
+  split /\n/, $waits;
+# (the system catalogs' relations, whose extension a lane's making waits for)
+my %catalog = map { $_ => 1 } grep {
+	$node->safe_psql('postgres',
+		"SELECT coalesce((SELECT relnamespace = 'pg_catalog'::regnamespace FROM pg_class WHERE oid = $_), false)"
+	) eq 't'
+} keys %rels;
+my @long = grep {
+	/still waiting/
+	  && !(/on extension of relation (\d+) of database/ && $catalog{$1})
+} @waited;
+is(scalar @long, 0, 'no backend waited on another, but to extend a catalog making a lane')
   or diag(join("\n", @named, @waited));
+unlike($waits, qr/deadlock detected/, 'no deadlock');
 
 # every chunk reads back, here, in one backend, from every lane
 my $read_back = q{SELECT count(*) FILTER (WHERE test_cs_get('pages', h(d(i))) IS DISTINCT FROM d(i))

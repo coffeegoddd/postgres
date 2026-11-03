@@ -6,6 +6,11 @@
 # its change, is lost; commits on different branches change different
 # rows (and chunks) and never wait for each other's transactions, nor
 # deadlock (only, briefly, for one extending a relation both grow).
+#
+# A backend's first write takes a chunk-log lane, making one if none is
+# free; a new lane is seen as its maker commits, a moment before the
+# maker lets go of its lock on it, so one opening it then waits that
+# moment.  The lanes are made first, by a run before the one measured.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -38,6 +43,23 @@ my $commits = sub {
 		qq{SELECT cardinality(string_to_array(test_vc_log('$branch'), ' '))});
 };
 
+# the lanes made: as many backends as below, each commit holding its lane
+# while the others make theirs (a backend keeps its lane while it lives)
+my @makers = map { $node->background_psql('postgres') } 1 .. 16;
+$makers[ $_ - 1 ]->query_safe(qq{SELECT test_vc_commit('b$_', 'b$_-lane')}) for 1 .. 16;
+$_->quit for @makers;
+# (gone, their lanes let go of as they exit: none made below)
+$node->poll_query_until('postgres',
+	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'client backend'})
+  or die "the backends that made the lanes did not exit";
+my $lanes = sub {
+	return $node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_class WHERE relname ~ '_lane_[0-9]+$'});
+};
+my $lanes_made = $lanes->();
+# (sixteen lanes: the log is the first, the rest relations of their own)
+is($lanes_made, 15, 'sixteen backends at once made sixteen lanes');
+
 # sixteen backends, a branch each: none waits for another's transaction
 my $log_at = -s $node->logfile;
 $node->pgbench(
@@ -51,21 +73,22 @@ $node->pgbench(
 SELECT test_vc_commit('b' || (:client_id + 1), 'b' || (:client_id + 1) || '-' || nextval('n'));
 }
 	});
-my @lost = grep { $commits->("b$_") != 27 } 1 .. 16;
-is(scalar @lost, 0, 'each branch has its 25 commits, on base and init')
+is($lanes->(), $lanes_made, 'the run took the lanes made before it, making none');
+my @lost = grep { $commits->("b$_") != 28 } 1 .. 16;
+is(scalar @lost, 0, 'each branch has its 25 commits, on its lane commit, base and init')
   or diag("branches short: @lost");
 # (each commit's row in its tree: none's change lost to another's)
 my @rows = grep {
-	$node->safe_psql('postgres', qq{SELECT test_vc_rows('b$_')}) != 26
+	$node->safe_psql('postgres', qq{SELECT test_vc_rows('b$_')}) != 27
 } 1 .. 16;
-is(scalar @rows, 0, "each branch's head has its 25 commits' rows, and base's")
+is(scalar @rows, 0, "each branch's head has its 26 commits' rows, and base's")
   or diag("branches short of rows: @rows");
 # (a wait's lines, with what waited and on what, shown if there is one)
 my $waits = slurp_file($node->logfile, $log_at);
-my @waited = grep { /still waiting/ .. /STATEMENT|^\S+ \S+ \S+ \[\d+\] .*: (?!DETAIL|CONTEXT)/ }
+my @waited = grep { /still waiting/ ... /STATEMENT|^\S+ \S+ \S+ \[\d+\] [^:]*: (?!DETAIL|CONTEXT)/ }
   split /\n/, $waits;
 # (each relation a wait was on, named: its oid differs between builds)
-my %rels = map { $_ => 1 } ($waits =~ /of relation (\d+) of database/g);
+my %rels = map { $_ => 1 } ($waits =~ /relation (\d+) of database/g);
 my @named = map {
 	"relation $_ is "
 	  . $node->safe_psql('postgres',
@@ -97,10 +120,10 @@ is($node->safe_psql('postgres', q{SELECT test_vc_rows('main')}),
 is($node->safe_psql('postgres', q{SELECT test_vc_head_in_window('main')}),
 	't', "main's head keeps its row");
 
-# every commit kept has its row: 400 + 200, base and init
+# every commit kept has its row: 16 + 400 + 200, base and init
 is( $node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%'}),
-	'602', 'every commit has its row');
+	'618', 'every commit has its row');
 
 $node->stop;
 done_testing();
