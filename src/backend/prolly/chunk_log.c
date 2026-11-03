@@ -38,6 +38,7 @@
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_index.h"
+#include "prolly/chunk_lane.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_tier.h"
 #include "prolly/chunk_region.h"
@@ -58,7 +59,7 @@
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	7
+#define CHUNK_LOG_VERSION	8
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
@@ -102,6 +103,8 @@ typedef struct ChunkLogMetaData
 								 * InvalidBlockNumber */
 	Oid			index;			/* the one chunk index naming its bytes, or
 								 * InvalidOid */
+	uint32		lane;			/* its lane's number in its log (0: the log's) */
+	Oid			parent;			/* a lane's: the log's (prolly/chunk_lane.h) */
 } ChunkLogMetaData;
 
 /*
@@ -2232,28 +2235,412 @@ page_vacuum_end(Relation rel, void *state, bool truncate, double fraction,
 	ChunkLogRecordFree(rel, fraction, pending, npending, out);
 }
 
+/* -------------------------------------------------------------- the lanes */
+
+/*
+ * A log is lanes (prolly/chunk_lane.h): its relation, lane 0, and lanes
+ * beside it, each a log of pages of its own.  The routine's functions take
+ * the log; each works on the lane it concerns: a write in this backend's
+ * own lane, a place's in the lane its top bits name, the log's upkeep in
+ * every lane, the lane's own places in the bits below.
+ */
+
+void
+ChunkLogMakeLane(Relation lane, uint32 n, Relation log)
+{
+	Buffer		mbuf;
+	ChunkLogMetaData *meta;
+	Oid			index;
+
+	mbuf = ReadBuffer(log, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	index = page_meta(log, BufferGetPage(mbuf))->index;
+	UnlockReleaseBuffer(mbuf);
+
+	mbuf = ReadBuffer(lane, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = page_meta(lane, BufferGetPage(mbuf));
+	START_CRIT_SECTION();
+	meta->lane = n;
+	meta->parent = RelationGetRelid(log);
+	MarkBufferDirty(mbuf);
+	if (RelationNeedsWAL(lane))
+		log_newpage_buffer(mbuf, true);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(mbuf);
+	if (OidIsValid(index))
+		page_bind_index(lane, index);
+}
+
+static uint64
+lane_append(Relation log, const void *data, size_t len)
+{
+	uint32		lane;
+	Relation	rel;
+	uint64		loc;
+
+	if (len == 0)
+		return 0;
+	rel = ChunkLaneForWrite(log, &lane);
+	loc = LANE_LOC(lane, page_append(rel, data, len));
+	ChunkLaneClose(log, rel);
+	return loc;
+}
+
+static void
+lane_prepare(Relation log, size_t len, ChunkLogRun *run)
+{
+	uint32		lane;
+	Relation	rel = ChunkLaneForWrite(log, &lane);
+
+	page_prepare(rel, len, run);
+	run->lane = lane;
+	ChunkLaneClose(log, rel);
+}
+
+static bool
+lane_prepare_free(Relation log, size_t len, uint64 below, ChunkLogRun *run)
+{
+	uint32		lane;
+	Relation	rel = ChunkLaneForWrite(log, &lane);
+	bool		ok;
+
+	/* (below is a place in one lane: room in another is wholly before it) */
+	ok = page_prepare_free(rel, len,
+						   below != 0 && LANE_OF(below) == lane ? LANE_PLACE(below) : 0,
+						   run);
+	run->lane = lane;
+	ChunkLaneClose(log, rel);
+	return ok;
+}
+
+/* (the lane of a run, or a place: opened, as the log is held, or must be) */
+static Relation
+lane_of(Relation log, uint32 lane, LOCKMODE lockmode)
+{
+	Relation	rel = ChunkLaneOpen(log, lane, lockmode);
+
+	if (rel == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk log \"%s\" has no lane %u", RelationGetRelationName(log), lane)));
+	return rel;
+}
+
+static uint64
+lane_reserve(Relation log, ChunkLogRun *run, size_t len)
+{
+	Relation	rel = lane_of(log, run->lane, RowExclusiveLock);
+	uint64		loc = LANE_LOC(run->lane, page_reserve(rel, run, len));
+
+	ChunkLaneClose(log, rel);
+	return loc;
+}
+
+static void
+lane_write(Relation log, uint64 loc, const void *data, size_t len)
+{
+	Relation	rel = lane_of(log, LANE_OF(loc), RowExclusiveLock);
+
+	page_write_at(rel, LANE_PLACE(loc), data, len);
+	ChunkLaneClose(log, rel);
+}
+
+static bool
+lane_extend(Relation log, ChunkLogRun *run, size_t len)
+{
+	Relation	rel = lane_of(log, run->lane, RowExclusiveLock);
+	bool		ok = page_extend(rel, run, len);
+
+	ChunkLaneClose(log, rel);
+	return ok;
+}
+
+static void
+lane_release(Relation log, const ChunkLogRun *run)
+{
+	Relation	rel = lane_of(log, run->lane, RowExclusiveLock);
+
+	page_release(rel, run);
+	ChunkLaneClose(log, rel);
+}
+
+static void
+lane_read(Relation log, uint64 loc, void *dst, size_t len)
+{
+	Relation	rel = lane_of(log, LANE_OF(loc), AccessShareLock);
+
+	page_read(rel, LANE_PLACE(loc), dst, len);
+	ChunkLaneClose(log, rel);
+}
+
+/* (places ascending: a lane's together, read a lane at a time) */
+static void
+lane_read_many(Relation log, int n, const uint64 *locs, const uint32 *lens, void **dsts)
+{
+	int			i = 0;
+
+	while (i < n)
+	{
+		uint32		lane = LANE_OF(locs[i]);
+		int			j = i;
+		uint64	   *places;
+		Relation	rel;
+
+		while (j < n && LANE_OF(locs[j]) == lane)
+			j++;
+		places = palloc_array(uint64, j - i);
+		for (int k = i; k < j; k++)
+			places[k - i] = LANE_PLACE(locs[k]);
+		rel = lane_of(log, lane, AccessShareLock);
+		page_read_many(rel, j - i, places, lens + i, dsts + i);
+		ChunkLaneClose(log, rel);
+		pfree(places);
+		i = j;
+	}
+}
+
+static void
+lane_mark_dead(Relation log, uint64 loc, size_t len, uint32 generation)
+{
+	Relation	rel = lane_of(log, LANE_OF(loc), RowExclusiveLock);
+
+	page_mark_dead(rel, LANE_PLACE(loc), len, generation);
+	ChunkLaneClose(log, rel);
+}
+
+static bool
+lane_check_live(Relation log, int n, const uint64 *locs, const uint32 *lens, char **why)
+{
+	uint32		nlanes = ChunkLaneCount(log);
+
+	for (uint32 lane = 0; lane < nlanes; lane++)
+	{
+		uint64	   *places = palloc_array(uint64, Max(n, 1));
+		uint32	   *plens = palloc_array(uint32, Max(n, 1));
+		int			m = 0;
+		Relation	rel;
+		bool		ok;
+
+		for (int i = 0; i < n; i++)
+			if (LANE_OF(locs[i]) == lane)
+			{
+				places[m] = LANE_PLACE(locs[i]);
+				plens[m++] = lens[i];
+			}
+		rel = lane_of(log, lane, AccessShareLock);
+		ok = ChunkLogCheckLive(rel, m, places, plens, why);
+		ChunkLaneClose(log, rel);
+		pfree(places);
+		pfree(plens);
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+static uint64
+lane_end(Relation log)
+{
+	uint32		nlanes = ChunkLaneCount(log);
+	Relation	rel = lane_of(log, nlanes - 1, AccessShareLock);
+	uint64		end = LANE_LOC(nlanes - 1, page_end(rel));
+
+	ChunkLaneClose(log, rel);
+	return end;
+}
+
+static void
+lane_bind_index(Relation log, Oid index)
+{
+	uint32		nlanes = ChunkLaneCount(log);
+
+	page_bind_index(log, index);
+	for (uint32 lane = 1; lane < nlanes; lane++)
+	{
+		Relation	rel = lane_of(log, lane, RowExclusiveLock);
+
+		page_bind_index(rel, index);
+		ChunkLaneClose(log, rel);
+	}
+}
+
+static void
+add_segments(ChunkLogSegments *to, const ChunkLogSegments *from)
+{
+	to->segments += from->segments;
+	to->free += from->free;
+	to->compactable += from->compactable;
+	to->compactable_dead += from->compactable_dead;
+	to->worth |= from->worth;
+	to->evacuable += from->evacuable;
+	to->pending += from->pending;
+	to->grow = Max(to->grow, from->grow);
+}
+
+static void
+lane_find_segments(Relation log, double fraction, ChunkLogSegments *out)
+{
+	uint32		nlanes = ChunkLaneCount(log);
+
+	memset(out, 0, sizeof(*out));
+	for (uint32 lane = 0; lane < nlanes; lane++)
+	{
+		Relation	rel = lane_of(log, lane, AccessShareLock);
+		ChunkLogSegments one;
+
+		page_find_segments(rel, fraction, &one);
+		add_segments(out, &one);
+		ChunkLaneClose(log, rel);
+	}
+}
+
+/* (each lane's, up to max in all, their places the log's) */
+static int
+lane_segments(Relation log, double fraction, int max, uint64 *starts, uint64 *ends,
+			  bool evacuable)
+{
+	uint32		nlanes = ChunkLaneCount(log);
+	int			n = 0;
+
+	for (uint32 lane = 0; lane < nlanes && n < max; lane++)
+	{
+		Relation	rel = lane_of(log, lane, AccessShareLock);
+		int			got = evacuable ?
+			page_evacuable_segments(rel, max - n, starts + n, ends + n) :
+			page_compactable_segments(rel, fraction, max - n, starts + n, ends + n);
+
+		for (int i = n; i < n + got; i++)
+		{
+			starts[i] = LANE_LOC(lane, starts[i]);
+			ends[i] = LANE_LOC(lane, ends[i]);
+		}
+		n += got;
+		ChunkLaneClose(log, rel);
+	}
+	return n;
+}
+
+static int
+lane_compactable_segments(Relation log, double fraction, int max, uint64 *starts,
+						  uint64 *ends)
+{
+	return lane_segments(log, fraction, max, starts, ends, false);
+}
+
+static int
+lane_evacuable_segments(Relation log, int max, uint64 *starts, uint64 *ends)
+{
+	return lane_segments(log, 0, max, starts, ends, true);
+}
+
+typedef struct LaneSweep
+{
+	uint32		n;
+	void	  **states;
+} LaneSweep;
+
+static void *
+lane_vacuum_begin(Relation log)
+{
+	LaneSweep  *sw = palloc0(sizeof(LaneSweep));
+
+	sw->n = ChunkLaneCount(log);
+	sw->states = palloc0_array(void *, sw->n);
+	for (uint32 lane = 0; lane < sw->n; lane++)
+	{
+		Relation	rel = lane_of(log, lane, RowExclusiveLock);
+
+		sw->states[lane] = page_vacuum_begin(rel);
+		ChunkLaneClose(log, rel);
+	}
+	return sw;
+}
+
+/*
+ * The places of chunks freed and kept for snapshots, as a bit a segment
+ * of a log of one place space (a lane's, or the tier's): those of the
+ * places given in lane (or all, lane < 0).
+ */
+uint8 *
+ChunkLogPendingBits(int n, const uint64 *locs, const uint32 *lens, int64 lane,
+					uint64 segment_bytes, uint64 *nbits)
+{
+	uint64		top = 0;
+	uint8	   *bits;
+
+	for (int i = 0; i < n; i++)
+		if (lane < 0 || LANE_OF(locs[i]) == (uint32) lane)
+			top = Max(top, ((lane < 0 ? locs[i] : LANE_PLACE(locs[i])) + lens[i]) /
+					  segment_bytes + 1);
+	*nbits = top;
+	bits = palloc0((top + 7) / 8 + 1);
+	for (int i = 0; i < n; i++)
+	{
+		uint64		place;
+
+		if (!(lane < 0 || LANE_OF(locs[i]) == (uint32) lane) || lens[i] == 0)
+			continue;
+		place = lane < 0 ? locs[i] : LANE_PLACE(locs[i]);
+		for (uint64 g = place / segment_bytes; g <= (place + lens[i] - 1) / segment_bytes; g++)
+			bits[g / 8] |= (uint8) (1 << (g % 8));
+	}
+	return bits;
+}
+
+static void
+lane_vacuum_end(Relation log, void *state, bool truncate, double fraction,
+				int npending, const uint64 *pending_locs, const uint32 *pending_lens,
+				ChunkLogSegments *out)
+{
+	LaneSweep  *sw = state;
+	uint32		nlanes = ChunkLaneCount(log);
+
+	memset(out, 0, sizeof(*out));
+	for (uint32 lane = 0; lane < nlanes; lane++)
+	{
+		Relation	rel = lane_of(log, lane, RowExclusiveLock);
+		uint64		nbits;
+		uint8	   *bits = ChunkLogPendingBits(npending, pending_locs, pending_lens, lane,
+											   page_segment_bytes(rel), &nbits);
+		ChunkLogSegments one;
+
+		page_vacuum_end(rel, sw != NULL && lane < sw->n ? sw->states[lane] : NULL,
+						truncate, fraction, bits, nbits, &one);
+		add_segments(out, &one);
+		pfree(bits);
+		ChunkLaneClose(log, rel);
+	}
+}
+
+static uint64
+lane_stamp(Relation log)
+{
+	return page_stamp(log);
+}
+
 const ChunkLogRoutine PageChunkLog = {
-	.append = page_append,
-	.prepare = page_prepare,
-	.reserve = page_reserve,
-	.write = page_write_at,
-	.release = page_release,
-	.prepare_free = page_prepare_free,
-	.compactable = page_compactable_segments,
-	.evacuable = page_evacuable_segments,
+	.append = lane_append,
+	.prepare = lane_prepare,
+	.reserve = lane_reserve,
+	.write = lane_write,
+	.release = lane_release,
+	.prepare_free = lane_prepare_free,
+	.compactable = lane_compactable_segments,
+	.evacuable = lane_evacuable_segments,
 	.segment_bytes = page_segment_bytes,
 	.compact_batch = page_compact_batch,
-	.find_segments = page_find_segments,
-	.vacuum_begin = page_vacuum_begin,
-	.vacuum_end = page_vacuum_end,
-	.check_live = ChunkLogCheckLive,
-	.extend = page_extend,
-	.bind_index = page_bind_index,
-	.read = page_read,
-	.read_many = page_read_many,
-	.mark_dead = page_mark_dead,
-	.stamp = page_stamp,
-	.end = page_end,
+	.find_segments = lane_find_segments,
+	.vacuum_begin = lane_vacuum_begin,
+	.vacuum_end = lane_vacuum_end,
+	.check_live = lane_check_live,
+	.extend = lane_extend,
+	.bind_index = lane_bind_index,
+	.read = lane_read,
+	.read_many = lane_read_many,
+	.mark_dead = lane_mark_dead,
+	.stamp = lane_stamp,
+	.end = lane_end,
 };
 
 const ChunkLogRoutine *

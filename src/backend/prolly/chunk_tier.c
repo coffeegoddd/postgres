@@ -2128,13 +2128,18 @@ tier_vacuum_begin(Relation rel)
  */
 static void
 tier_vacuum_end(Relation rel, void *vstate, bool truncate, double fraction,
-				const uint8 *pending_bits, uint64 npending, ChunkLogSegments *out)
+				int npending, const uint64 *pending_locs, const uint32 *pending_lens,
+				ChunkLogSegments *out)
 {
 	TransactionId frozen;
+	uint64		nbits;
+	uint8	   *pending_bits = ChunkLogPendingBits(npending, pending_locs, pending_lens, -1,
+												   tier_segment_bytes(rel), &nbits);
 
 	walk_packs(rel, true, &frozen);
 	advance_frozen(rel, frozen, false);
-	count_packs(rel, fraction, true, pending_bits, npending, out);
+	count_packs(rel, fraction, true, pending_bits, nbits, out);
+	pfree(pending_bits);
 }
 
 /*
