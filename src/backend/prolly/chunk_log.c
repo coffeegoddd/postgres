@@ -3245,6 +3245,54 @@ cl_relation_set_new_filelocator(Relation rel,
 		empty_lanes(rel, before.next_lane);
 }
 
+/*
+ * An index's lanes, as its storage is (an index made has none; one
+ * truncated has its lanes truncated with it, each keeping its number, as a
+ * log's are), and a lane alone not truncated: in *lane and *parent, and
+ * how many lanes it may have (0 if not an index with storage)
+ */
+static uint32
+index_lanes_before(Relation rel, uint32 *lane, Oid *parent)
+{
+	*lane = 0;
+	*parent = InvalidOid;
+	if (rel->rd_locator.relNumber == InvalidRelFileNumber ||
+		!smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM) ||
+		RelationGetNumberOfBlocks(rel) == 0 || !ChunkIndexLaneOf(rel, lane, parent))
+		return 0;
+	if (OidIsValid(*parent) && !emptying_lanes)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot truncate \"%s\", a lane of a chunk index",
+						RelationGetRelationName(rel)),
+				 errhint("Truncate its chunk index, which truncates its lanes too.")));
+	return OidIsValid(*parent) ? 0 : ChunkIndexLaneCount(rel);
+}
+
+/* (idx's lanes 0 .. n - 1 emptied, each with new storage of its own) */
+static void
+empty_index_lanes(Relation idx, uint32 n)
+{
+	for (uint32 l = 0; l < n; l++)
+	{
+		Relation	rel = ChunkIndexLaneOpen(idx, l, AccessExclusiveLock);
+
+		if (rel == NULL)
+			continue;
+		emptying_lanes = true;
+		PG_TRY();
+		{
+			RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+		}
+		PG_FINALLY();
+		{
+			emptying_lanes = false;
+		}
+		PG_END_TRY();
+		ChunkIndexLaneClose(rel);
+	}
+}
+
 /* a chunk index's storage: its own first pages (prolly/chunk_index.h) */
 static void
 ci_relation_set_new_filelocator(Relation rel,
@@ -3254,6 +3302,9 @@ ci_relation_set_new_filelocator(Relation rel,
 								MultiXactId *minmulti)
 {
 	SMgrRelation srel;
+	uint32		lane;
+	Oid			parent;
+	uint32		nlanes = index_lanes_before(rel, &lane, &parent);
 
 	/* (an index truncated whose tier has packs: those could not be freed) */
 	if (rel->rd_createSubid == InvalidSubTransactionId)
@@ -3262,8 +3313,10 @@ ci_relation_set_new_filelocator(Relation rel,
 
 	/* (its entries name the transactions that inserted them) */
 	*freezeXid = RecentXmin;
-	ChunkIndexInitStorage(srel, XLogIsNeeded());
+	ChunkIndexInitStorageAs(srel, XLogIsNeeded(), lane, parent);
 	smgrclose(srel);
+	if (nlanes > 0)
+		empty_index_lanes(rel, nlanes);
 }
 
 /* a chunk index's VACUUM: aborted transactions' entries out, the rest frozen */
@@ -3277,15 +3330,21 @@ ci_relation_vacuum(Relation rel, const VacuumParams *params,
 static void
 ci_relation_nontransactional_truncate(Relation rel)
 {
+	uint32		lane;
+	Oid			parent;
+	uint32		nlanes = index_lanes_before(rel, &lane, &parent);
+
 	/* (made in this transaction, a tier's chunks through it: the same) */
 	ChunkTierCheckIndex(rel, "truncate");
 	RelationTruncate(rel, 0);
-	ChunkIndexInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+	ChunkIndexInitStorageAs(RelationGetSmgr(rel), RelationNeedsWAL(rel), lane, parent);
 	if (rel->rd_amcache != NULL)
 	{
 		pfree(rel->rd_amcache);
 		rel->rd_amcache = NULL;
 	}
+	if (nlanes > 0)
+		empty_index_lanes(rel, nlanes);
 }
 
 static void

@@ -264,7 +264,7 @@ FROM (SELECT convert_to('kept ' || g, 'UTF8') AS d FROM generate_series(1, 300) 
 SELECT entries AS before_vacuum FROM test_chunk_index_shape('ci3');
  before_vacuum 
 ---------------
-           600
+           300
 (1 row)
 
 -- (lookups note commits on entries, but freeze none: only VACUUM does)
@@ -278,7 +278,7 @@ FROM generate_series(1, 300) g;
 SELECT test_chunk_index_unfrozen('ci3') AS unfrozen_before;
  unfrozen_before 
 -----------------
-             600
+             300
 (1 row)
 
 SELECT age(relfrozenxid) AS age_before FROM pg_class WHERE relname = 'ci3' \gset
@@ -288,6 +288,9 @@ SELECT txid_current() IS NOT NULL AS advanced_xid;
  t
 (1 row)
 
+VACUUM ci3;
+-- (one VACUUM moves the lane's entries in, in its own transaction; the
+-- next takes the lane's copies out, the move seen by every snapshot)
 VACUUM ci3;
 SELECT entries AS after_vacuum, test_chunk_index_unfrozen('ci3') AS unfrozen_after
 FROM test_chunk_index_shape('ci3');
@@ -334,7 +337,7 @@ TRUNCATE ci;
 SELECT * FROM test_chunk_index_shape('ci');
  buckets | pages | entries 
 ---------+-------+---------
-       8 |    10 |       0
+      16 |    20 |       0
 (1 row)
 
 SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after_truncate;
@@ -357,7 +360,7 @@ TRUNCATE ci_once;
 SELECT * FROM test_chunk_index_shape('ci_once');
  buckets | pages | entries 
 ---------+-------+---------
-       8 |    10 |       0
+      16 |    20 |       0
 (1 row)
 
 SELECT test_chunk_put('cl_once', 'ci_once', h('\x01'), '\x01') AS stored_again;

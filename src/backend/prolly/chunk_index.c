@@ -2514,9 +2514,13 @@ lane_counts(ChunkIndexEntry *e, Buffer buf, bool lane, Snapshot snap,
 }
 
 /* A chunk's entries and changes, wherever they are, as a lookup sees them. */
+#define SCAN_INLINE 8
+
 typedef struct LaneScan
 {
 	Snapshot	snap;
+	ChunkIndexEntry inline_chunks[SCAN_INLINE];	/* (no allocation, mostly) */
+	ChunkIndexEntry inline_changes[SCAN_INLINE];
 	ChunkIndexEntry *chunks;
 	int			nchunks,
 				chunkcap;
@@ -2528,15 +2532,31 @@ typedef struct LaneScan
 } LaneScan;
 
 static void
-scan_push(ChunkIndexEntry **v, int *n, int *cap, const ChunkIndexEntry *e)
+scan_push_grow(ChunkIndexEntry **v, int *n, int *cap, const ChunkIndexEntry *e,
+			   ChunkIndexEntry *inl)
 {
 	if (*n == *cap)
 	{
+		ChunkIndexEntry *nv;
+
 		*cap = *cap ? *cap * 2 : 8;
-		*v = *v ? repalloc_array(*v, ChunkIndexEntry, *cap) :
-			palloc_array(ChunkIndexEntry, *cap);
+		if (*v == inl || *v == NULL)
+		{
+			nv = palloc_array(ChunkIndexEntry, *cap);
+			if (*n > 0)
+				memcpy(nv, *v, sizeof(ChunkIndexEntry) * *n);
+		}
+		else
+			nv = repalloc_array(*v, ChunkIndexEntry, *cap);
+		*v = nv;
 	}
 	(*v)[(*n)++] = *e;
+}
+
+static void
+scan_push(ChunkIndexEntry **v, int *n, int *cap, const ChunkIndexEntry *e)
+{
+	scan_push_grow(v, n, cap, e, NULL);
 }
 
 /* hash's entries in rel (a lane, or the index), counted, into s */
@@ -2568,9 +2588,9 @@ scan_rel(LaneScan *s, Relation rel, bool lane, const uint8 *hash)
 			if (!lane_counts(e, cur, lane, s->snap, &s->freeing))
 				continue;
 			if (e->kind == CHUNK_KIND_CHUNK)
-				scan_push(&s->chunks, &s->nchunks, &s->chunkcap, e);
+				scan_push_grow(&s->chunks, &s->nchunks, &s->chunkcap, e, s->inline_chunks);
 			else
-				scan_push(&s->changes, &s->nchanges, &s->changecap, e);
+				scan_push_grow(&s->changes, &s->nchanges, &s->changecap, e, s->inline_changes);
 		}
 		if (cur != primary)
 			UnlockReleaseBuffer(cur);
@@ -2596,6 +2616,10 @@ lanes_scan(Relation idx, const uint8 *hash, LaneScan *s, ChunkIndexEntry *out)
 				roots = 0;
 
 	memset(s, 0, sizeof(*s));
+	s->chunks = s->inline_chunks;
+	s->chunkcap = SCAN_INLINE;
+	s->changes = s->inline_changes;
+	s->changecap = SCAN_INLINE;
 	s->snap = RegisterSnapshot(GetLatestSnapshot());
 	for (uint32 l = 0; l < n; l++)
 	{
@@ -2635,9 +2659,9 @@ lanes_scan(Relation idx, const uint8 *hash, LaneScan *s, ChunkIndexEntry *out)
 static void
 lanes_scan_free(LaneScan *s)
 {
-	if (s->chunks)
+	if (s->chunks && s->chunks != s->inline_chunks)
 		pfree(s->chunks);
-	if (s->changes)
+	if (s->changes && s->changes != s->inline_changes)
 		pfree(s->changes);
 }
 
@@ -2770,13 +2794,16 @@ own_change(Relation rel, Buffer primary, uint32 bucket, const IndexCache *masks,
 	}
 }
 
-static bool
-lane_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
-			ChunkIndexEntry *out)
+/*
+ * This transaction's change of the chunk entry chunk's counts, written in
+ * this backend's lane (its own change of it there changed, if it has one;
+ * a hold not written again, if any of its changes holds it)
+ */
+static void
+write_change(Relation idx, Relation log, const uint8 *hash, int32 drefs,
+			 int32 droots, const ChunkIndexEntry *chunk)
 {
-	Relation	log = laned_log(idx);
 	Relation	lane;
-	LaneScan	s;
 	uint32		n,
 				bucket;
 	IndexCache	masks;
@@ -2786,40 +2813,10 @@ lane_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 				last;
 	int			own_at = 0;
 	bool		any_own;
-	int64		refs,
-				roots;
 
-	if (log == NULL)
-		return page_adjust(idx, hash, drefs, droots, out);
-	PreventCommandIfReadOnly("change a chunk index");
-	if (!lanes_scan(idx, hash, &s, out))
-	{
-		lanes_scan_free(&s);
-		relation_close(log, AccessShareLock);
-		return false;
-	}
-	lanes_scan_free(&s);
-	refs = (int64) out->refs + drefs;
-	roots = (int64) out->roots + droots;
-	if (refs < 0 || roots < 0 || refs > PG_UINT32_MAX || roots > PG_UINT32_MAX)
-	{
-		relation_close(log, AccessShareLock);
-		ereport(ERROR,
-				(errcode(refs < 0 || roots < 0 ? ERRCODE_INVALID_PARAMETER_VALUE :
-						 ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("a chunk's reference counts would be %lld and %lld",
-						(long long) refs, (long long) roots)));
-	}
-
-	/*
-	 * (the change written, in this backend's lane, naming the entry found;
-	 * then the chunk looked for again: should the merger be freeing it,
-	 * the change is one its check before committing finds, or else that
-	 * freeing is seen here, set before this looks)
-	 */
 	lane = ChunkIndexLaneForWrite(idx, log, &n);
 	primary = lock_bucket(lane, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	own_change(lane, primary, bucket, &masks, out, &own_blk, &own_at, &any_own);
+	own_change(lane, primary, bucket, &masks, chunk, &own_blk, &own_at, &any_own);
 	if (any_own && drefs == 0 && droots == 0)
 	{
 		/* (a change of this transaction's holds the chunk already) */
@@ -2853,8 +2850,8 @@ lane_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		change.refs = (uint32) drefs;
 		change.roots = (uint32) droots;
 		change.xmin = GetCurrentTransactionId();
-		change.xmax = out->xmin;
-		change.loc = out->loc;
+		change.xmax = chunk->xmin;
+		change.loc = chunk->loc;
 		change.kind = CHUNK_KIND_CHANGE;
 		chain_room(lane, primary, &space, &last);
 		grew = add_entry(lane, primary, bucket, space, last, &change, NULL, NULL);
@@ -2868,22 +2865,74 @@ lane_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	if (BufferIsValid(primary))
 		UnlockReleaseBuffer(primary);
 	ChunkIndexLaneClose(lane);
-	relation_close(log, AccessShareLock);
-	pgstat_count_heap_insert(idx, 1);
+}
 
+static bool
+lane_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
+			ChunkIndexEntry *out)
+{
+	Relation	log = laned_log(idx);
+	LaneScan	s;
+	int64		refs,
+				roots;
+
+	if (log == NULL)
+		return page_adjust(idx, hash, drefs, droots, out);
+	PreventCommandIfReadOnly("change a chunk index");
+	if (!lanes_scan(idx, hash, &s, out))
+	{
+		lanes_scan_free(&s);
+		relation_close(log, AccessShareLock);
+		return false;
+	}
+	lanes_scan_free(&s);
+	refs = (int64) out->refs + drefs;
+	roots = (int64) out->roots + droots;
+	if (refs < 0 || roots < 0 || refs > PG_UINT32_MAX || roots > PG_UINT32_MAX)
+	{
+		relation_close(log, AccessShareLock);
+		ereport(ERROR,
+				(errcode(refs < 0 || roots < 0 ? ERRCODE_INVALID_PARAMETER_VALUE :
+						 ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("a chunk's reference counts would be %lld and %lld",
+						(long long) refs, (long long) roots)));
+	}
+
+	/*
+	 * (the change written, in this backend's lane, naming the entry found;
+	 * then the chunk looked for again: should a transaction be freeing or
+	 * moving it, the change is one its look before committing finds (and
+	 * takes it back for), or else that is seen here and waited for; moved,
+	 * the change is written again, of the entry it has now, the one before
+	 * of an entry freed, counting nothing)
+	 */
 	for (;;)
 	{
 		ChunkIndexEntry again;
-		bool		there = lanes_scan(idx, hash, &s, &again);
-		TransactionId freeing = s.freeing;
+		bool		there;
+		TransactionId freeing;
 
-		lanes_scan_free(&s);
+		write_change(idx, log, hash, drefs, droots, out);
+		for (;;)
+		{
+			there = lanes_scan(idx, hash, &s, &again);
+			freeing = s.freeing;
+			lanes_scan_free(&s);
+			if (!there || !TransactionIdIsValid(freeing))
+				break;
+			XactLockTableWait(freeing, NULL, NULL, XLTW_None);
+		}
 		if (!there)
-			return false;		/* (freed before the change: gone) */
-		if (!TransactionIdIsValid(freeing))
+		{
+			relation_close(log, AccessShareLock);
+			return false;		/* (freed: gone) */
+		}
+		if (again.xmin == out->xmin && again.loc == out->loc)
 			break;
-		XactLockTableWait(freeing, NULL, NULL, XLTW_None);
+		*out = again;			/* (moved meanwhile: of its new entry) */
 	}
+	relation_close(log, AccessShareLock);
+	pgstat_count_heap_insert(idx, 1);
 	out->refs = (uint32) refs;
 	out->roots = (uint32) roots;
 	if (drefs < 0 || droots < 0)
@@ -3551,6 +3600,166 @@ lane_free(Relation idx, const uint8 *hash, bool (*held) (Relation idx, const uin
 	return true;
 }
 
+/*
+ * Whether a change of the chunk entry chunk is in any lane of idx or in
+ * idx (any transaction's, running or committed, not this one's)
+ */
+static bool
+changes_of(Relation idx, const ChunkIndexEntry *chunk)
+{
+	uint32		n = ChunkIndexLaneCount(idx);
+
+	for (uint32 l = 0; l <= n; l++)
+	{
+		Relation	rel = l < n ? ChunkIndexLaneOpen(idx, l, AccessShareLock) : idx;
+		uint32		bucket;
+		IndexCache	masks;
+		Buffer		primary,
+					cur;
+		bool		have = false;
+
+		if (rel == NULL)
+			continue;
+		primary = lock_bucket(rel, chunk->hash, BUFFER_LOCK_SHARE, &bucket, &masks);
+		cur = primary;
+		for (;;)
+		{
+			Page		page = BufferGetPage(cur);
+			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			int			np = page_entries(page);
+
+			for (int i = 0; i < np && !have; i++)
+			{
+				ChunkIndexEntry *e = page_entry(page, i);
+
+				if (change_of(e, chunk) && belongs(e, bucket, &masks) &&
+					!TransactionIdIsCurrentTransactionId(e->xmin) &&
+					xmin_state(e, cur) != ENTRY_DEAD)
+					have = true;
+			}
+			if (cur != primary)
+				UnlockReleaseBuffer(cur);
+			if (have || !BlockNumberIsValid(next))
+				break;
+			cur = ReadBuffer(rel, next);
+			LockBuffer(cur, BUFFER_LOCK_SHARE);
+			check_ipage(rel, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+		}
+		UnlockReleaseBuffer(primary);
+		if (rel != idx)
+			ChunkIndexLaneClose(rel);
+		if (have)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A chunk's entry moved, for compaction: only a chunk all of whose counts
+ * are in its one entry in idx itself (no alias, no change of it anywhere,
+ * none running), the one seen.  Its entry marked freed; then every lane
+ * looked in again for a change of it another made meanwhile (which the
+ * new entry would leave counting nothing): one there takes the freeing
+ * back.  Else the new entry, its counts the old's, its place reserve's.
+ */
+static bool
+lane_move(Relation idx, const ChunkIndexEntry *seen, ChunkIndexEntry *moved,
+		  ChunkReserveFn reserve, void *arg)
+{
+	Relation	log = laned_log(idx);
+	LaneScan	s;
+	ChunkIndexEntry e;
+	bool		there;
+	xl_chunk_index_slot xlrec = {0};
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary,
+				cur;
+	BlockNumber space,
+				last;
+	bool		set = false;
+	bool		grew;
+	TransactionId xid;
+
+	if (log == NULL)
+		return page_move(idx, seen, moved, reserve, arg);
+	relation_close(log, AccessShareLock);
+	PreventCommandIfReadOnly("move a chunk");
+	there = lanes_scan(idx, seen->hash, &s, &e);
+	if (!there || s.nchunks != 1 || s.nchanges != 0 || TransactionIdIsValid(s.running) ||
+		TransactionIdIsValid(s.freeing) || TransactionIdIsValid(s.chunks[0].merge_xid) ||
+		s.chunks[0].xmin != seen->xmin || s.chunks[0].loc != seen->loc ||
+		s.chunks[0].len != seen->len || ChunkEntryIsMine(&s.chunks[0]))
+	{
+		lanes_scan_free(&s);
+		return false;
+	}
+	lanes_scan_free(&s);
+
+	/* (in idx itself: a lane's entry has its own place, and is the merger's) */
+	xid = GetCurrentTransactionId();
+	primary = lock_bucket(idx, seen->hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	cur = primary;
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			n = page_entries(page);
+
+		for (int i = 0; i < n && !set; i++)
+		{
+			ChunkIndexEntry *x = page_entry(page, i);
+
+			if (x->kind != CHUNK_KIND_CHUNK || memcmp(x->hash, seen->hash, CHUNK_HASH_LEN) != 0 ||
+				!belongs(x, bucket, &masks) || x->xmin != seen->xmin || x->loc != seen->loc ||
+				TransactionIdIsValid(x->xmax))
+				continue;
+			xlrec.slot = i;
+			xlrec.xmax = xid;
+			START_CRIT_SECTION();
+			ipage_set_xmax(page, i, xid);
+			log_slot_change(idx, primary, cur, XLOG_CHUNK_INDEX_SET_XMAX, &xlrec);
+			END_CRIT_SECTION();
+			set = true;
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (set || !BlockNumberIsValid(next))
+			break;
+		cur = ReadBuffer(idx, next);
+		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+	UnlockReleaseBuffer(primary);
+	if (!set)
+		return false;
+	if (changes_of(idx, &e))
+	{
+		Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+
+		rel_set_xmax(idx, false, seen->hash, InvalidTransactionId, snap);
+		UnregisterSnapshot(snap);
+		return false;
+	}
+
+	memset(moved, 0, sizeof(*moved));
+	memcpy(moved->hash, e.hash, CHUNK_HASH_LEN);
+	moved->len = e.len;
+	moved->refs = e.refs;
+	moved->roots = e.roots;
+	moved->xmin = xid;
+	moved->kind = CHUNK_KIND_CHUNK;
+	primary = lock_bucket(idx, seen->hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	chain_room(idx, primary, &space, &last);
+	grew = add_entry(idx, primary, bucket, space, last, moved, reserve, arg);
+	UnlockReleaseBuffer(primary);
+	pgstat_count_heap_insert(idx, 1);
+	pgstat_count_heap_delete(idx);
+	if (grew)
+		split_bucket(idx);
+	return true;
+}
+
 const ChunkIndexRoutine PageChunkIndex = {
 	.lookup = page_lookup,
 	.insert = page_insert,
@@ -3587,7 +3796,7 @@ const ChunkIndexRoutine LaneChunkIndex = {
 	.unmark = page_unmark,
 	.lookup_as_of = lane_lookup_as_of,
 	.visit_as_of = lane_visit_as_of,
-	.move = page_move,
+	.move = lane_move,
 	.merge = lane_merge,
 };
 
@@ -3597,6 +3806,12 @@ const ChunkIndexRoutine *ChunkIndex = &LaneChunkIndex;
 
 void
 ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
+{
+	ChunkIndexInitStorageAs(srel, use_wal, 0, InvalidOid);
+}
+
+void
+ChunkIndexInitStorageAs(SMgrRelation srel, bool use_wal, uint32 lane, Oid parent)
 {
 	BulkWriteState *bulk = smgr_bulk_start_smgr(srel, MAIN_FORKNUM, use_wal);
 	BulkWriteBuffer buf;
@@ -3616,8 +3831,8 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	meta->next_block = 2 + INIT_BUCKETS;
 	meta->log = InvalidOid;
 	meta->log_stamp = 0;
-	meta->lane = 0;
-	meta->parent = InvalidOid;
+	meta->lane = lane;
+	meta->parent = parent;
 	meta->nmarks = 0;
 	meta->ndir = 1;
 	meta->dir[0] = 1;
@@ -4391,8 +4606,8 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 	pgstat_report_vacuum(idx, (PgStat_Counter) main_kept, 0, starttime);
 }
 
-uint64
-ChunkIndexUnfrozen(Relation idx)
+static uint64
+rel_unfrozen(Relation idx)
 {
 	uint32		nbuckets = load_cache(idx)->maxbucket + 1;
 	uint64		unfrozen = 0;
@@ -4421,8 +4636,8 @@ ChunkIndexUnfrozen(Relation idx)
 	return unfrozen;
 }
 
-void
-ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages, uint64 *entries)
+static void
+rel_shape(Relation idx, uint32 *buckets, uint32 *pages, uint64 *entries)
 {
 	IndexCache *cache = load_cache(idx);
 	uint32		nbuckets = cache->maxbucket + 1;
@@ -4447,6 +4662,48 @@ ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages, uint64 *entries)
 			blk = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			UnlockReleaseBuffer(buf);
 		}
+	}
+}
+
+/* (for tests: an index's lanes counted with it, the index as a whole) */
+uint64
+ChunkIndexUnfrozen(Relation idx)
+{
+	uint64		n = rel_unfrozen(idx);
+	uint32		nl = ChunkIndexLaneCount(idx);
+
+	for (uint32 l = 0; l < nl; l++)
+	{
+		Relation	lane = ChunkIndexLaneOpen(idx, l, AccessShareLock);
+
+		if (lane == NULL)
+			continue;
+		n += rel_unfrozen(lane);
+		ChunkIndexLaneClose(lane);
+	}
+	return n;
+}
+
+void
+ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages, uint64 *entries)
+{
+	uint32		nl = ChunkIndexLaneCount(idx);
+
+	rel_shape(idx, buckets, pages, entries);
+	for (uint32 l = 0; l < nl; l++)
+	{
+		Relation	lane = ChunkIndexLaneOpen(idx, l, AccessShareLock);
+		uint32		b,
+					p;
+		uint64		e;
+
+		if (lane == NULL)
+			continue;
+		rel_shape(lane, &b, &p, &e);
+		*buckets += b;
+		*pages += p;
+		*entries += e;
+		ChunkIndexLaneClose(lane);
 	}
 }
 

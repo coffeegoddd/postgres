@@ -8,15 +8,16 @@ NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
 SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1;
-   relname   |       amname       
--------------+--------------------
- bundles     | heap
- chunk_index | prolly_chunk_index
- chunks      | prolly_chunks
- pointers    | heap
- tier_chunks | prolly_tier
- tier_index  | prolly_chunk_index
-(6 rows)
+      relname       |       amname       
+--------------------+--------------------
+ bundles            | heap
+ chunk_index        | prolly_chunk_index
+ chunk_index_lane_0 | prolly_chunk_index
+ chunks             | prolly_chunks
+ pointers           | heap
+ tier_chunks        | prolly_tier
+ tier_index         | prolly_chunk_index
+(7 rows)
 
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';

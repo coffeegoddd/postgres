@@ -78,8 +78,10 @@ SELECT free('\x78') AS freed;
 SELECT put('\x78') AS x_again;
 SELECT refs, roots FROM test_chunk_index_entry('fi', h('\x78'));
 
--- VACUUM takes freed chunks' entries out, and their changes
+-- VACUUM takes freed chunks' entries out, and their changes (two: one to
+-- move the lane's into the index, the next to take them out)
 SELECT free('\x78') AS freed;
+VACUUM fi;
 VACUUM fi;
 SELECT entries, test_chunk_index_unfrozen('fi') AS unfrozen FROM test_chunk_index_shape('fi');
 SELECT ok, chunks, unheld FROM test_chunk_check('fl', 'fi');

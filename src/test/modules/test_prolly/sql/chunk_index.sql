@@ -104,6 +104,9 @@ SELECT test_chunk_index_unfrozen('ci3') AS unfrozen_before;
 SELECT age(relfrozenxid) AS age_before FROM pg_class WHERE relname = 'ci3' \gset
 SELECT txid_current() IS NOT NULL AS advanced_xid;
 VACUUM ci3;
+-- (one VACUUM moves the lane's entries in, in its own transaction; the
+-- next takes the lane's copies out, the move seen by every snapshot)
+VACUUM ci3;
 SELECT entries AS after_vacuum, test_chunk_index_unfrozen('ci3') AS unfrozen_after
 FROM test_chunk_index_shape('ci3');
 SELECT age(relfrozenxid) < :age_before AS frozenxid_advanced FROM pg_class WHERE relname = 'ci3';

@@ -20,6 +20,10 @@ SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(blob('a' || g)), blob
 FROM generate_series(1, 2000) g;
 SELECT count(*) FROM generate_series(2, 2000, 2) g, LATERAL test_chunk_ref_root('ci', h(blob('a' || g)));
 SELECT sum(test_chunk_free('cl', 'ci', h(blob('a' || g)))) AS freed FROM generate_series(1, 2000, 2) g;
+-- (the entries moved from the writer's lane into the index by one VACUUM,
+-- their counts added up by the next: a chunk is compacted once all its
+-- counts are in its entry)
+VACUUM ci;
 VACUUM ci;
 SELECT segments, free, compactable, worth, evacuable, grow FROM test_chunk_log_segments('cl', 0.4);
 SELECT pg_relation_size('cl') AS size_written \gset

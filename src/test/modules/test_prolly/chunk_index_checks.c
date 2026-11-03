@@ -40,6 +40,7 @@ PG_FUNCTION_INFO_V1(test_chunk_index_adjust);
 PG_FUNCTION_INFO_V1(test_chunk_index_remove);
 PG_FUNCTION_INFO_V1(test_chunk_index_shape);
 PG_FUNCTION_INFO_V1(test_chunk_index_unfrozen);
+PG_FUNCTION_INFO_V1(test_chunk_index_merge);
 PG_FUNCTION_INFO_V1(test_chunk_format_refs);
 PG_FUNCTION_INFO_V1(test_chunk_ref_root);
 PG_FUNCTION_INFO_V1(test_chunk_unref_root);
@@ -221,6 +222,17 @@ test_chunk_index_unfrozen(PG_FUNCTION_ARGS)
 	uint64		n = ChunkIndexUnfrozen(idx);
 
 	relation_close(idx, AccessShareLock);
+	PG_RETURN_INT64((int64) n);
+}
+
+/* The index's lanes' entries moved into it, as its freer does: how many. */
+Datum
+test_chunk_index_merge(PG_FUNCTION_ARGS)
+{
+	Relation	idx = open_index(PG_GETARG_OID(0), ShareUpdateExclusiveLock);
+	uint64		n = ChunkIndex->merge ? ChunkIndex->merge(idx) : 0;
+
+	relation_close(idx, NoLock);
 	PG_RETURN_INT64((int64) n);
 }
 

@@ -351,6 +351,12 @@ CREATE FUNCTION test_chunk_index_unfrozen(idx regclass)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
 
+-- The index's lanes' entries moved into it, as its freer does (committed
+-- as the statement is): how many.
+CREATE FUNCTION test_chunk_index_merge(idx regclass)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- References and roots: a test format of chunks naming others ('R', a
 -- count, hashes), roots taken and let go of, and the store's audit.
 CREATE FUNCTION test_chunk_format_refs(on_ bool)

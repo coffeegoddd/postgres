@@ -254,6 +254,9 @@ extern void ChunkIndexMakeLane(Relation lane, uint32 n, Relation idx);
 
 /* For the access method: a new index's pages, written to its storage. */
 extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
+/* ... a lane's: its meta page naming it lane of parent (an index truncated) */
+extern void ChunkIndexInitStorageAs(SMgrRelation srel, bool use_wal, uint32 lane,
+									Oid parent);
 
 /*
  * For the access method: takes out the entries of transactions that
