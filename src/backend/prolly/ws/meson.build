@@ -2,4 +2,5 @@
 
 backend_sources += files(
   'ws_row.c',
+  'ws_sql.c',
 )
