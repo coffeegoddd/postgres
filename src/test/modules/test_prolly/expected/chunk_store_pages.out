@@ -27,8 +27,18 @@ SELECT test_chunk_format_refs(true);
  
 (1 row)
 
-CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS 'SELECT substr(sha256(d), 1, 20)';
+-- (a chunk of the test format as the store holds it: the memory store's
+-- format is the session's, the test format; the history store's, and its
+-- tier's, the engine's)
+CREATE FUNCTION pg_temp.c(d bytea) RETURNS bytea LANGUAGE sql STABLE
+	AS $$SELECT CASE WHEN current_setting('test.store') = 'memory' THEN d
+		ELSE test_engine_chunk(d) END$$;
+-- (and back, as read)
+CREATE FUNCTION pg_temp.got(c bytea) RETURNS bytea LANGUAGE sql STABLE
+	AS $$SELECT CASE WHEN current_setting('test.store') = 'memory' THEN c
+		ELSE test_engine_unchunk(c) END$$;
+CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql STABLE
+	AS 'SELECT substr(sha256(pg_temp.c(d)), 1, 20)';
 -- (a chunk of the test format referencing others: 'R', their count, them)
 CREATE FUNCTION pg_temp.parent(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
@@ -38,7 +48,7 @@ CREATE FUNCTION pg_temp.put(d bytea) RETURNS bool LANGUAGE plpgsql AS $$
 DECLARE
 	r record;
 BEGIN
-	SELECT * INTO r FROM test_cs_put(current_setting('test.store'), d);
+	SELECT * INTO r FROM test_cs_put(current_setting('test.store'), pg_temp.c(d));
 	IF r.hash <> pg_temp.h(d) THEN
 		RAISE 'a put named a chunk %, not its hash', r.hash;
 	END IF;
@@ -77,7 +87,7 @@ SELECT pg_temp.put('cs-leaf-a') AS a, pg_temp.put('cs-leaf-b') AS b,
 (1 row)
 
 SELECT pg_temp.has('cs-leaf-a') AS has_a, pg_temp.has('cs-nowhere') AS has_nowhere,
-	convert_from(test_cs_get(:'store', pg_temp.h('cs-leaf-a')), 'UTF8') AS get_a,
+	convert_from(pg_temp.got(test_cs_get(:'store', pg_temp.h('cs-leaf-a'))), 'UTF8') AS get_a,
 	test_cs_get(:'store', pg_temp.h('cs-nowhere')) IS NULL AS get_nowhere;
  has_a | has_nowhere |   get_a   | get_nowhere 
 -------+-------------+-----------+-------------
@@ -91,7 +101,7 @@ SELECT pg_temp.refs('cs-leaf-a') AS a, pg_temp.refs('cs-nowhere') AS nowhere;
 (1 row)
 
 -- many at once: each where it was asked, absent ones NULL, one asked twice twice
-SELECT convert_from(c, 'UTF8') AS got, o FROM unnest(test_cs_get_many(:'store',
+SELECT convert_from(pg_temp.got(c), 'UTF8') AS got, o FROM unnest(test_cs_get_many(:'store',
 	ARRAY[pg_temp.h('cs-leaf-b'), pg_temp.h('cs-nowhere'), pg_temp.h('cs-leaf-a'),
 		  pg_temp.h('cs-leaf-b')])) WITH ORDINALITY u(c, o);
     got    | o 
@@ -123,7 +133,7 @@ SELECT count(*) FILTER (WHERE pg_temp.put('L'::bytea || decode(repeat(md5('cs-ma
  300
 (1 row)
 
-SELECT count(*) AS asked, count(*) FILTER (WHERE m.c = test_cs_get(:'store', pg_temp.h(d))) AS same
+SELECT count(*) AS asked, count(*) FILTER (WHERE pg_temp.got(m.c) = d AND m.c = test_cs_get(:'store', pg_temp.h(d))) AS same
 FROM (SELECT i, 'L'::bytea || decode(repeat(md5('cs-many-' || i), 64), 'hex') d FROM generate_series(1, 300) i) x
 JOIN unnest(test_cs_get_many(:'store', ARRAY(
 	SELECT pg_temp.h('L'::bytea || decode(repeat(md5('cs-many-' || i), 64), 'hex'))
@@ -137,7 +147,7 @@ JOIN unnest(test_cs_get_many(:'store', ARRAY(
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))$$);
                                                                     refused                                                                     
 ------------------------------------------------------------------------------------------------------------------------------------------------
- 23503: chunk 234064f1a5b1ab4eee7cacd785435076469f1b5a references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
+ 23503: chunk 20a133d20ec3ec0059bbfc5fb16a07ac3348dca3 references chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5, which the store does not have
 (1 row)
 
 SELECT pg_temp.has(pg_temp.parent('cs-leaf-a', 'cs-nowhere')) AS refused_there;
@@ -184,13 +194,13 @@ SELECT pg_temp.refs(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p;
 SELECT pg_temp.refused($$SELECT pg_temp.root('cs-nowhere', true)$$);
                                 refused                                 
 ------------------------------------------------------------------------
- 42704: the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
+ 42704: the store has no chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5
 (1 row)
 
 SELECT pg_temp.refused($$SELECT pg_temp.root('cs-nowhere', false)$$);
                                 refused                                 
 ------------------------------------------------------------------------
- 42704: the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
+ 42704: the store has no chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5
 (1 row)
 
 SELECT pg_temp.refused($$SELECT pg_temp.root('cs-leaf-a', false)$$);
@@ -262,7 +272,8 @@ SELECT pg_temp.free(pg_temp.parent('cs-pair'), 'cs-pair', pg_temp.parent('cs-pai
 -- a pack put at once: its parent first, a chunk the store has, one twice
 CREATE FUNCTION pg_temp.put_pack(VARIADIC ds bytea[]) RETURNS int8 LANGUAGE sql
 	AS $$SELECT test_cs_put_many(current_setting('test.store'),
-		ARRAY(SELECT pg_temp.h(d) FROM unnest(ds) WITH ORDINALITY u(d, o) ORDER BY o), ds)$$;
+		ARRAY(SELECT pg_temp.h(d) FROM unnest(ds) WITH ORDINALITY u(d, o) ORDER BY o),
+		ARRAY(SELECT pg_temp.c(d) FROM unnest(ds) WITH ORDINALITY u(d, o) ORDER BY o))$$;
 SELECT pg_temp.put('cs-pack-old') AS old;
  old 
 -----
@@ -277,7 +288,7 @@ SELECT pg_temp.put_pack(pg_temp.parent('cs-pack-a', 'cs-pack-b', 'cs-pack-old'),
 (1 row)
 
 SELECT pg_temp.refs('cs-pack-a') AS a, pg_temp.refs('cs-pack-b') AS b, pg_temp.refs('cs-pack-old') AS old,
-	convert_from(test_cs_get(:'store', pg_temp.h('cs-pack-b')), 'UTF8') AS get_b;
+	convert_from(pg_temp.got(test_cs_get(:'store', pg_temp.h('cs-pack-b'))), 'UTF8') AS get_b;
   a  |  b  | old |   get_b   
 -----+-----+-----+-----------
  1/0 | 1/0 | 1/0 | cs-pack-b
@@ -294,7 +305,7 @@ SELECT test_cs_put_many(:'store', '{}', '{}') AS empty;
 SELECT pg_temp.refused($$SELECT pg_temp.put_pack('cs-pack-c', pg_temp.parent('cs-pack-c', 'cs-nowhere'))$$);
                                                                     refused                                                                     
 ------------------------------------------------------------------------------------------------------------------------------------------------
- 23503: chunk 3e2250f26e79d2e87c08e2d79f38a4206d20cdb6 references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
+ 23503: chunk 092d15274ae1d587d44c28e58310cb709d909292 references chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5, which the store does not have
 (1 row)
 
 SELECT pg_temp.has('cs-pack-c') AS c;
@@ -304,10 +315,11 @@ SELECT pg_temp.has('cs-pack-c') AS c;
 (1 row)
 
 SELECT pg_temp.refused($$SELECT test_cs_put_many(current_setting('test.store'),
-	ARRAY[pg_temp.h('cs-pack-d'), pg_temp.h('cs-pack-x')], ARRAY['cs-pack-d', 'cs-pack-y']::bytea[])$$);
+	ARRAY[pg_temp.h('cs-pack-d'), pg_temp.h('cs-pack-x')],
+	ARRAY[pg_temp.c('cs-pack-d'), pg_temp.c('cs-pack-y')])$$);
                                        refused                                        
 --------------------------------------------------------------------------------------
- XX001: bytes put as chunk f46ec36d2ccb378c8c7bbfc404532ae3a417d193 do not hash to it
+ XX001: bytes put as chunk ff224804d527c848aacca1d927a02f698f5987b6 do not hash to it
 (1 row)
 
 SELECT pg_temp.has('cs-pack-d') AS d;
@@ -320,14 +332,14 @@ SELECT pg_temp.has('cs-pack-d') AS d;
 SELECT test_cs_put_many(:'store', ARRAY(
 		SELECT pg_temp.h('L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex'))
 		FROM generate_series(1, 300) i ORDER BY i),
-	ARRAY(SELECT 'L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex')
+	ARRAY(SELECT pg_temp.c('L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex'))
 		FROM generate_series(1, 300) i ORDER BY i)) AS stored;
  stored 
 --------
     300
 (1 row)
 
-SELECT count(*) FILTER (WHERE test_cs_get(:'store', pg_temp.h(d)) = d) AS same
+SELECT count(*) FILTER (WHERE pg_temp.got(test_cs_get(:'store', pg_temp.h(d))) = d) AS same
 FROM (SELECT 'L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex') d
 	FROM generate_series(1, 300) i) x;
  same 
@@ -340,14 +352,14 @@ FROM (SELECT 'L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex') 
 SELECT test_cs_put_many(:'store', ARRAY(
 		SELECT pg_temp.h('L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex'))
 		FROM generate_series(1, 500) i ORDER BY i),
-	ARRAY(SELECT 'L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex')
+	ARRAY(SELECT pg_temp.c('L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex'))
 		FROM generate_series(1, 500) i ORDER BY i)) AS stored;
  stored 
 --------
     500
 (1 row)
 
-SELECT count(*) FILTER (WHERE test_cs_get(:'store', pg_temp.h(d)) = d) AS same
+SELECT count(*) FILTER (WHERE pg_temp.got(test_cs_get(:'store', pg_temp.h(d))) = d) AS same
 FROM (SELECT 'L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex') d
 	FROM generate_series(1, 500) i) x;
  same 
@@ -361,7 +373,7 @@ SELECT pg_temp.put_pack('', 'cs-pack-z') AS stored;
       2
 (1 row)
 
-SELECT test_cs_get(:'store', pg_temp.h('')) = '' AS empty_chunk, pg_temp.refs('') AS refs;
+SELECT pg_temp.got(test_cs_get(:'store', pg_temp.h(''))) = '' AS empty_chunk, pg_temp.refs('') AS refs;
  empty_chunk | refs 
 -------------+------
  t           | 0/0
@@ -440,7 +452,7 @@ BEGIN;
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-e', 'cs-nowhere'))$$);
                                                                     refused                                                                     
 ------------------------------------------------------------------------------------------------------------------------------------------------
- 23503: chunk 66f5c0d3d3a8d301fe743e2a1437bf4e08aeb72f references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
+ 23503: chunk 03c1e95df75f326f0df52c1c87194b99de92fd50 references chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5, which the store does not have
 (1 row)
 
 SELECT pg_temp.free('cs-leaf-e') AS e_not_held_by_refused_put;
@@ -542,7 +554,7 @@ SELECT refs, roots FROM test_cs_visit(:'store') WHERE hash = pg_temp.h('cs-roote
 SELECT len FROM test_cs_visit(:'store') WHERE hash = pg_temp.h('cs-shared');
  len 
 -----
-   9
+  11
 (1 row)
 
 -- what the store was asked, counted
@@ -586,7 +598,7 @@ SELECT * FROM test_cs_stats(:'store', true);
 
 -- (and of packs, many at once, and of every chunk nothing holds)
 SELECT test_cs_put_many(:'store', ARRAY[pg_temp.h('cs-pack1'), pg_temp.h('cs-pack2'), pg_temp.h('cs-pack1')],
-	ARRAY['cs-pack1', 'cs-pack2', 'cs-pack1']::bytea[]) AS packed;
+	ARRAY[pg_temp.c('cs-pack1'), pg_temp.c('cs-pack2'), pg_temp.c('cs-pack1')]) AS packed;
  packed 
 --------
       2
@@ -641,12 +653,6 @@ SELECT test_chunk_format_refs(false);
 -- The transactional stores' part of the suite: a put, a root's change and
 -- a free are their transaction's, gone, with what they counted, if it
 -- aborts.
-SELECT test_chunk_format_refs(true);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-
 BEGIN;
 SELECT pg_temp.put('cs-tx-f') AS f;
  f 
@@ -786,11 +792,5 @@ SELECT ok, why FROM test_cs_check(:'store');
  ok | why 
 ----+-----
  t  | 
-(1 row)
-
-SELECT test_chunk_format_refs(false);
- test_chunk_format_refs 
-------------------------
- 
 (1 row)
 

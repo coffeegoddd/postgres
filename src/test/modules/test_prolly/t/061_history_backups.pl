@@ -16,7 +16,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $primary = PostgreSQL::Test::Cluster->new('backups_primary');
-$primary->init(allows_streaming => 1, has_archiving => 1);
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$primary->init(allows_streaming => 1, has_archiving => 1, extra => ['-c', 'chunk_format=leaf']);
 $primary->append_conf('postgresql.conf', qq{
 autovacuum = off
 chunk_free_in_background = off

@@ -15,7 +15,7 @@ setup
 	CREATE OR REPLACE FUNCTION pe_d(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT convert_to(rpad('pe' || i, 2000, '.'), 'UTF8')$$;
 	CREATE OR REPLACE FUNCTION pe_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 }
 
 teardown
@@ -30,8 +30,8 @@ setup		{
 	SELECT injection_points_set_local();
 }
 step p_load		{
-	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', pe_d(i));
-	SELECT stored FROM test_cs_put('pages', pe_d(5000));
+	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', test_engine_chunk(pe_d(i)));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(pe_d(5000)));
 	SELECT test_cs_ref_root('pages', pe_h(pe_d(5000)));
 	-- (its region let go of: the pack's takes a segment freed)
 	SELECT test_chunk_log_let_go('pg_history.chunks');
@@ -43,7 +43,7 @@ step p_free		{
 step p_attach	{ SELECT injection_points_attach('chunk-log-extended', 'wait'); }
 step p_pack		{
 	SELECT test_cs_put_many('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(1001, 1300) i),
-		ARRAY(SELECT pe_d(i) FROM generate_series(1001, 1300) i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT pe_d(i) FROM generate_series(1001, 1300) i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step p_detach	{ SELECT injection_points_detach('chunk-log-extended'); }
 
@@ -51,7 +51,7 @@ session v
 setup		{ SET chunk_free_in_background = off; }
 step v_vacuum	{ VACUUM pg_history.chunk_index; }
 step v_check	{
-	SELECT ok, count(*) FILTER (WHERE test_cs_get('pages', pe_h(pe_d(i))) = pe_d(i)) AS read_back
+	SELECT ok, count(*) FILTER (WHERE test_engine_unchunk(test_cs_get('pages', pe_h(pe_d(i)))) = pe_d(i)) AS read_back
 	FROM test_cs_check('pages'), generate_series(1001, 1300) i GROUP BY ok;
 }
 

@@ -11,7 +11,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('lane_compaction');
-$node->init;
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$node->init(extra => ['-c', 'chunk_format=leaf']);
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 log_min_messages = debug1

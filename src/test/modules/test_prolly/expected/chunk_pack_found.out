@@ -11,20 +11,10 @@ injection_points_set_local
                           
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 step q_begin: BEGIN;
 step q_pack: 
 	SELECT test_cs_put_many('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()), pf_h('\x0a0901')],
-		ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 
 stored
 ------
@@ -48,9 +38,9 @@ p1|leaf
 t |t   
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
+test_cs_free
+------------
+           4
 (1 row)
 
 
@@ -65,16 +55,6 @@ injection_points_set_local
                           
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 step p_attach: SELECT injection_points_attach('chunk-pack-found', 'wait');
 injection_points_attach
 -----------------------
@@ -84,7 +64,7 @@ injection_points_attach
 step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()), pf_h('\x0a0901')],
-		ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step o_free_p1: SELECT test_cs_free('pages', ARRAY[pf_h(pf_p1())]) AS freed_p1;
 freed_p1
@@ -132,8 +112,8 @@ p1|leaf
 t |t   
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
+test_cs_free
+------------
+           4
 (1 row)
 

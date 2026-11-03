@@ -15,9 +15,9 @@ injection_points_attach
 step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_a()), tt_h(tt_b()), tt_h(tt_c())],
-		ARRAY[tt_a(), tt_b(), tt_c()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_a(), tt_b(), tt_c()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
-step q_put_a: SELECT stored FROM test_cs_put('tier', tt_a());
+step q_put_a: SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_a()));
 stored
 ------
 t     
@@ -67,8 +67,8 @@ step q_dead:
 
 size|dead
 ----+----
- 101|   0
- 171| 101
+ 103|   0
+ 177| 103
 (2 rows)
 
 
@@ -87,9 +87,9 @@ injection_points_attach
 step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_a()), tt_h(tt_b()), tt_h(tt_c())],
-		ARRAY[tt_a(), tt_b(), tt_c()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_a(), tt_b(), tt_c()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
-step q_put_b: SELECT stored FROM test_cs_put('tier', tt_b());
+step q_put_b: SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_b()));
 stored
 ------
 t     
@@ -139,8 +139,8 @@ step q_dead:
 
 size|dead
 ----+----
-  30|   0
- 171|  30
+  32|   0
+ 177|  32
 (2 rows)
 
 
@@ -159,9 +159,9 @@ injection_points_attach
 step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_a()), tt_h(tt_b()), tt_h(tt_c())],
-		ARRAY[tt_a(), tt_b(), tt_c()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_a(), tt_b(), tt_c()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
-step q_put_c: SELECT stored FROM test_cs_put('tier', tt_c());
+step q_put_c: SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_c()));
 stored
 ------
 t     
@@ -211,8 +211,8 @@ step q_dead:
 
 size|dead
 ----+----
-  40|   0
- 131|   0
+  42|   0
+ 135|   0
 (2 rows)
 
 
@@ -231,9 +231,9 @@ injection_points_attach
 step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_a()), tt_h(tt_b()), tt_h(tt_c())],
-		ARRAY[tt_a(), tt_b(), tt_c()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_a(), tt_b(), tt_c()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
-step q_put_a: SELECT stored FROM test_cs_put('tier', tt_a());
+step q_put_a: SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_a()));
 stored
 ------
 t     
@@ -259,9 +259,9 @@ packed
 
 step p_pack2: 
 	SELECT test_cs_put_many('tier', ARRAY[tt_h(tt_e()), tt_h(tt_d())],
-		ARRAY[tt_e(), tt_d()]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[tt_e(), tt_d()]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
-step q_put_e: SELECT stored FROM test_cs_put('tier', tt_e());
+step q_put_e: SELECT stored FROM test_cs_put('tier', test_engine_chunk(tt_e()));
 stored
 ------
 t     
@@ -297,8 +297,8 @@ step q_dead:
 
 size|dead
 ----+----
- 101|   0
- 281| 161
-  60|   0
+ 103|   0
+ 291| 165
+  62|   0
 (3 rows)
 

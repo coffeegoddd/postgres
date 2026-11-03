@@ -8,9 +8,9 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION hp_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
-	SELECT stored FROM test_cs_put('pages', '\x0a2101');
-	SELECT stored FROM test_cs_put('pages', '\x0a2102');
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a2101'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a2102'));
 	SELECT test_cs_ref_root('pages', hp_h('\x0a2101'));
 	SELECT test_cs_ref_root('pages', hp_h('\x0a2102'));
 }
@@ -24,7 +24,7 @@ teardown
 session r
 setup			{ SET chunk_free_in_background = off; }
 step r_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
-step r_read		{ SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes; }
+step r_read		{ SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes; }
 step r_commit	{ COMMIT; }
 
 session w
@@ -40,7 +40,7 @@ step p_push		{
 	SELECT test_cs_unref_root('pages', hp_h('\x0a2102'));
 	SELECT pg_history_push('hp', ARRAY[hp_h('\x0a2101'), hp_h('\x0a2102')]) AS copied;
 }
-step p_after	{ SELECT test_cs_get('pages', hp_h('\x0a2101')) AS bytes; }
+step p_after	{ SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes; }
 step p_held		{ SELECT test_cs_has('pages', hp_h('\x0a2102')) AS kept; }
 step p_release	{ SELECT pg_history_release('hp') AS freed; }
 

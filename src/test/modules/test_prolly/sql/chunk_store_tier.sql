@@ -18,20 +18,20 @@ SELECT test_chunk_format_refs(false);
 VACUUM pg_history.tier_index;
 SELECT count(*) AS packs0 FROM test_os_list('directory', 'pg_test_history_tier', 'packs/') \gset
 BEGIN;
-SELECT (test_cs_put('tier', convert_to('tier-a' || g, 'UTF8'))).stored
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('tier-a' || g, 'UTF8')))).stored
 FROM generate_series(1, 3) g;
 COMMIT;
 SELECT count(*) - :packs0 AS one_pack_more FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
 BEGIN;
-SELECT (test_cs_put('tier', convert_to('tier-gone', 'UTF8'))).stored;
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('tier-gone', 'UTF8')))).stored;
 ROLLBACK;
 SELECT count(*) - :packs0 AS still_one_more FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
-SELECT test_cs_has('tier', substr(sha256(convert_to('tier-gone', 'UTF8')), 1, 20)) AS gone;
+SELECT test_cs_has('tier', substr(sha256(test_engine_chunk(convert_to('tier-gone', 'UTF8'))), 1, 20)) AS gone;
 -- read back from its pack
-SELECT convert_from(test_cs_get('tier', substr(sha256(convert_to('tier-a2', 'UTF8')), 1, 20)), 'UTF8') AS read_back;
+SELECT convert_from(test_engine_unchunk(test_cs_get('tier', substr(sha256(test_engine_chunk(convert_to('tier-a2', 'UTF8'))), 1, 20))), 'UTF8') AS read_back;
 -- the pack's chunks freed: VACUUM takes their entries out, the pack all
 -- dead, its object removed
-SELECT test_cs_free('tier', ARRAY(SELECT substr(sha256(convert_to('tier-a' || g, 'UTF8')), 1, 20)
+SELECT test_cs_free('tier', ARRAY(SELECT substr(sha256(test_engine_chunk(convert_to('tier-a' || g, 'UTF8'))), 1, 20)
 	FROM generate_series(1, 3) g)) AS freed;
 VACUUM pg_history.tier_index;
 SELECT count(*) - :packs0 AS pack_removed FROM test_os_list('directory', 'pg_test_history_tier', 'packs/');
@@ -46,7 +46,7 @@ SELECT state, count(*) FROM test_tier_packs('pg_history.tier_chunks') GROUP BY s
 SELECT relfrozenxid <> '0'::xid AS has_frozenxid, age(relfrozenxid) <= age(:'frozen0'::xid) AS not_older
 FROM pg_class WHERE oid = 'pg_history.tier_chunks'::regclass;
 -- and VACUUM of the tier itself settles them too
-SELECT (test_cs_put('tier', convert_to('tier-settle', 'UTF8'))).stored;
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('tier-settle', 'UTF8')))).stored;
 SELECT count(*) FILTER (WHERE state = 'made') AS made_before FROM test_tier_packs('pg_history.tier_chunks');
 VACUUM pg_history.tier_chunks;
 SELECT count(*) FILTER (WHERE state = 'made') AS made_after FROM test_tier_packs('pg_history.tier_chunks');
@@ -55,14 +55,14 @@ SELECT count(*) FILTER (WHERE state = 'made') AS made_after FROM test_tier_packs
 -- the chunks put after it, in it, committed, the pack kept
 BEGIN;
 SAVEPOINT s;
-SELECT (test_cs_put('tier', convert_to('tier-sub-gone', 'UTF8'))).stored;
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('tier-sub-gone', 'UTF8')))).stored;
 ROLLBACK TO s;
-SELECT (test_cs_put('tier', convert_to('tier-sub-kept', 'UTF8'))).stored;
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('tier-sub-kept', 'UTF8')))).stored;
 COMMIT;
-SELECT test_cs_ref_root('tier', substr(sha256(convert_to('tier-sub-kept', 'UTF8')), 1, 20));
+SELECT test_cs_ref_root('tier', substr(sha256(test_engine_chunk(convert_to('tier-sub-kept', 'UTF8'))), 1, 20));
 VACUUM pg_history.tier_index;
-SELECT convert_from(test_cs_get('tier', substr(sha256(convert_to('tier-sub-kept', 'UTF8')), 1, 20)), 'UTF8') AS kept,
-	test_cs_has('tier', substr(sha256(convert_to('tier-sub-gone', 'UTF8')), 1, 20)) AS gone;
+SELECT convert_from(test_engine_unchunk(test_cs_get('tier', substr(sha256(test_engine_chunk(convert_to('tier-sub-kept', 'UTF8'))), 1, 20))), 'UTF8') AS kept,
+	test_cs_has('tier', substr(sha256(test_engine_chunk(convert_to('tier-sub-gone', 'UTF8'))), 1, 20)) AS gone;
 SELECT ok FROM test_cs_check('tier');
 
 -- a dump of the tier's chunks: no bundle, none of them (a bundle's chunks
@@ -76,13 +76,13 @@ SELECT count(*) FILTER (WHERE roots IS NOT NULL) AS bundles,
 -- a pack's table, at its end: each chunk in it, by hash, its bytes there
 -- hashing to it
 SELECT count(*) FROM generate_series(1, 7) g,
-	LATERAL test_cs_put('tier', convert_to(repeat('table' || g, g * 10), 'UTF8'));
+	LATERAL test_cs_put('tier', test_engine_chunk(convert_to(repeat('table' || g, g * 10), 'UTF8')));
 SELECT max(id) AS last_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
 SELECT count(*) AS entries,
-	count(*) FILTER (WHERE test_cs_get('tier', t.hash) IS NOT NULL
+	count(*) FILTER (WHERE test_engine_unchunk(test_cs_get('tier', t.hash)) IS NOT NULL
 		AND substr(sha256(test_cs_get('tier', t.hash)), 1, 20) = t.hash
 		AND length(test_cs_get('tier', t.hash)) = t.len) AS each_its_chunk,
-	bool_and(t.hash IN (SELECT substr(sha256(convert_to(repeat('table' || g, g * 10), 'UTF8')), 1, 20)
+	bool_and(t.hash IN (SELECT substr(sha256(test_engine_chunk(convert_to(repeat('table' || g, g * 10), 'UTF8'))), 1, 20)
 		FROM generate_series(1, 7) g)) AS all_put,
 	(SELECT bool_and(a < b) FROM (SELECT hash a, lead(hash) OVER (ORDER BY ord) b
 		FROM test_tier_pack_table('pg_history.tier_chunks', :last_pack) WITH ORDINALITY x(hash, off, len, ord)) y
@@ -128,14 +128,14 @@ SELECT * FROM pg_temp.read('order') AS (h bytea, o int8, l int8);
 -- its hash, each its bytes; the index's the live one
 BEGIN;
 SAVEPOINT s;
-SELECT (test_cs_put('tier', convert_to('twice in a pack', 'UTF8'))).stored;
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('twice in a pack', 'UTF8')))).stored;
 ROLLBACK TO s;
-SELECT (test_cs_put('tier', convert_to('twice in a pack', 'UTF8'))).stored;
+SELECT (test_cs_put('tier', test_engine_chunk(convert_to('twice in a pack', 'UTF8')))).stored;
 COMMIT;
 SELECT max(id) AS twice_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
 SELECT count(*) AS entries, count(DISTINCT off) AS places
 FROM test_tier_pack_table('pg_history.tier_chunks', :twice_pack)
-WHERE hash = substr(sha256(convert_to('twice in a pack', 'UTF8')), 1, 20);
+WHERE hash = substr(sha256(test_engine_chunk(convert_to('twice in a pack', 'UTF8'))), 1, 20);
 
 -- a tier is pg_history's alone (the tests' made there, and truncated and
 -- dropped, as one allowed to change the system's catalogs)
@@ -181,8 +181,8 @@ CREATE TABLE pg_history.my_tier2_index () USING prolly_chunk_index;
 -- (65 MB: a pack filled would be written as it goes)
 SELECT count(*) FROM generate_series(1, 65) g,
 	LATERAL test_chunk_put('pg_history.my_tier2', 'pg_history.my_tier2_index',
-		substr(sha256(convert_to(rpad(g::text, 1048576, '.'), 'UTF8')), 1, 20),
-		convert_to(rpad(g::text, 1048576, '.'), 'UTF8'));
+		substr(sha256(test_engine_chunk(convert_to(rpad(g::text, 1048576, '.'), 'UTF8'))), 1, 20),
+		test_engine_chunk(convert_to(rpad(g::text, 1048576, '.'), 'UTF8')));
 ROLLBACK;
 CREATE TABLE pg_history.my_tier4 () USING prolly_tier;
 CREATE TABLE pg_history.my_tier4_index () USING prolly_chunk_index;
@@ -229,8 +229,9 @@ RESET allow_system_table_mods;
 -- repacking: a pack with more than the fraction of its bytes dead is a
 -- segment to compact; compaction moves its live chunks into a pack of its
 -- transaction, and the old one, all dead then, is removed
+-- (a chunk of the tier's format, the engine's)
 CREATE FUNCTION pg_temp.rp(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS $$SELECT convert_to(rpad('repack' || i, 1000, '.'), 'UTF8')$$;
+	AS $$SELECT test_engine_chunk(convert_to(rpad('repack' || i, 1000, '.'), 'UTF8'))$$;
 SELECT count(*) FROM generate_series(1, 10) g, LATERAL test_cs_put('tier', pg_temp.rp(g));
 SELECT max(id) AS rp_pack FROM test_tier_packs('pg_history.tier_chunks') WHERE state <> 'removed' \gset
 SELECT count(*) FROM generate_series(1, 10) g,

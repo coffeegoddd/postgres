@@ -10,11 +10,11 @@ step b_begin: BEGIN;
 step d_begin: BEGIN;
 step b_pack: 
 	SELECT test_cs_put_many('pages', ARRAY[pack_h('\x0a0301'), pack_h('\x0a0302')],
-		ARRAY['\x0a0301', '\x0a0302']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0301', '\x0a0302']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step d_pack: 
 	SELECT test_cs_put_many('pages', ARRAY[pack_h('\x0a0302'), pack_h('\x0a0301')],
-		ARRAY['\x0a0302', '\x0a0301']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0302', '\x0a0301']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step c_wake: 
 	SELECT injection_points_detach('chunk-pack-entry');

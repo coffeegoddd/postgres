@@ -17,7 +17,6 @@ my $node = PostgreSQL::Test::Cluster->new('history_dump');
 $node->init;
 $node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'test_prolly'
-test_prolly.chunk_format_refs = on
 autovacuum = off
 chunk_free_in_background = off
 });
@@ -28,11 +27,12 @@ $node->safe_psql('src', q{
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION leaf(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('d' || i), 40), 'hex')$$;
-	-- (a chunk of the test format referencing others: 'R', their count, them)
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5('d' || i), 40), 'hex'))$$;
+	-- (a chunk of the test format referencing others, 'R', their count,
+	-- them, as the history store's format has it, the engine's)
 	CREATE FUNCTION node(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
-			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+		AS $$SELECT test_engine_chunk('R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o)))$$;
 	CREATE TABLE t AS SELECT i FROM generate_series(1, 10) i;
 	-- 300 leaves, 30 parents of ten each, a root of the parents, and a
 	-- second root sharing half of them
@@ -116,14 +116,12 @@ $snap->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 my $snapshot = $snap->query_safe('SELECT pg_export_snapshot()');
 $node->safe_psql('src', q{
 	DELETE FROM pg_history.pointers WHERE name = 'deep';
-	SELECT test_chunk_format_refs(true);
 });
-my $freed = $node->safe_psql('src', q{SELECT test_chunk_format_refs(true); SELECT test_cs_free_unheld('pages')});
-$freed =~ s/^\n//;
+my $freed = $node->safe_psql('src', q{SELECT test_cs_free_unheld('pages')});
 cmp_ok($freed, '>=', 21, 'the deep chain, and the loose leaf, freed after the snapshot');
 # (and chunks put after it, a parent and its leaf, which VACUUM sees
 # committed: not the snapshot's, nor in the dump)
-$node->safe_psql('src', q{SELECT test_chunk_format_refs(true);
+$node->safe_psql('src', q{
 	SELECT test_cs_put('pages', leaf(7000)), test_cs_put('pages', node(leaf(7000)))});
 $node->safe_psql('src', 'VACUUM pg_history.chunk_index');
 $node->command_ok([ 'pg_dump', '--format' => 'custom', '--snapshot' => $snapshot,

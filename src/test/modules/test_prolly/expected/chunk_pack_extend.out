@@ -7,8 +7,8 @@ injection_points_set_local
 (1 row)
 
 step p_load: 
-	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', pe_d(i));
-	SELECT stored FROM test_cs_put('pages', pe_d(5000));
+	SELECT count(*) FROM generate_series(1, 400) i, LATERAL test_cs_put('pages', test_engine_chunk(pe_d(i)));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(pe_d(5000)));
 	SELECT test_cs_ref_root('pages', pe_h(pe_d(5000)));
 	-- (its region let go of: the pack's takes a segment freed)
 	SELECT test_chunk_log_let_go('pg_history.chunks');
@@ -50,7 +50,7 @@ injection_points_attach
 
 step p_pack: 
 	SELECT test_cs_put_many('pages', ARRAY(SELECT pe_h(pe_d(i)) FROM generate_series(1001, 1300) i),
-		ARRAY(SELECT pe_d(i) FROM generate_series(1001, 1300) i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT pe_d(i) FROM generate_series(1001, 1300) i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
  <waiting ...>
 step o_wake: SELECT injection_points_wakeup('chunk-log-extended');
 injection_points_wakeup
@@ -78,7 +78,7 @@ injection_points_detach
 (1 row)
 
 step v_check: 
-	SELECT ok, count(*) FILTER (WHERE test_cs_get('pages', pe_h(pe_d(i))) = pe_d(i)) AS read_back
+	SELECT ok, count(*) FILTER (WHERE test_engine_unchunk(test_cs_get('pages', pe_h(pe_d(i)))) = pe_d(i)) AS read_back
 	FROM test_cs_check('pages'), generate_series(1001, 1300) i GROUP BY ok;
 
 ok|read_back

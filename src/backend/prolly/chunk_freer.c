@@ -94,13 +94,6 @@ ChunkFreerLaunch(Oid log, Oid idx, bool owner, bool compact, bool evacuate,
 	if (!chunk_free_in_background)
 		return false;
 
-	/*
-	 * (the freer frees by the format a backend starts with: from a session
-	 * using another it would let go of no chunk's references, which would
-	 * stay counted)
-	 */
-	if (ChunkFormat != ChunkFormatConfigured)
-		return false;
 	memset(&bgw, 0, sizeof(bgw));
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -329,8 +322,7 @@ ChunkFreerChanged(Relation idx, bool marked)
 		if (marked_indexes[i].idx == RelationGetRelid(idx))
 			return;
 	log = ChunkIndex->log_of(idx, &stamp);
-	if (!OidIsValid(log) || !chunk_free_in_background ||
-		ChunkFormat != ChunkFormatConfigured)
+	if (!OidIsValid(log) || !chunk_free_in_background)
 		return;
 
 	/* (the entry made now, in the transaction: not as it commits) */

@@ -17,7 +17,9 @@ use Test::More;
 
 my $tier = PostgreSQL::Test::Utils::tempdir;
 my $node = PostgreSQL::Test::Cluster->new('repack');
-$node->init;
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$node->init(extra => ['-c', 'chunk_format=leaf']);
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 chunk_compact_dead_fraction = 0.4

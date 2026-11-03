@@ -10,10 +10,10 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION hr_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
-	SELECT stored FROM test_cs_put('pages', '\x0a3101');
-	SELECT stored FROM test_cs_put('pages', '\x0a3102');
-	SELECT stored FROM test_cs_put('pages', '\x0a3103');
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a3101'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a3102'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a3103'));
 	SELECT test_cs_ref_root('pages', hr_h('\x0a3102'));
 	SELECT test_cs_ref_root('pages', hr_h('\x0a3103'));
 	SELECT test_cs_ref_root('pages', hr_h('\x0a3103'));

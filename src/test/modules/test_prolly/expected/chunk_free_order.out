@@ -6,21 +6,6 @@ stored
 t     
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 step a_begin: BEGIN;
 step b_begin: BEGIN;
 step a_free1: SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf1', '\x0a0c01'))]) AS freed;

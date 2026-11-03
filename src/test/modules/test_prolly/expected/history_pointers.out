@@ -18,10 +18,13 @@ WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1
  tier_index  | prolly_chunk_index
 (6 rows)
 
+-- (d as a chunk of the history store's format, the engine's: its hash, and
+-- a put of it)
 CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS 'SELECT substr(sha256(d), 1, 20)';
+	AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 CREATE FUNCTION put(d bytea) RETURNS bool LANGUAGE sql
-	AS $$SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h(d), d)$$;
+	AS $$SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h(d),
+		test_engine_chunk(d))$$;
 CREATE FUNCTION roots(d bytea) RETURNS int8 LANGUAGE sql
 	AS $$SELECT roots FROM test_chunk_index_entry('pg_history.chunk_index', h(d))$$;
 SELECT put('\x01') AS one, put('\x02') AS two;
@@ -90,9 +93,9 @@ SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
 
 -- refused: a pointer to a chunk the store hasn't, and TRUNCATE
 INSERT INTO pg_history.pointers VALUES ('nowhere', h('\x7a'));
-ERROR:  the store has no chunk 594e519ae499312b29433b7dd8a97ff068defcba
+ERROR:  the store has no chunk 09505f4dd52d649b01990d71ac89e779c1d3872a
 UPDATE pg_history.pointers SET hash = h('\x7a') WHERE name = 'trunk';
-ERROR:  the store has no chunk 594e519ae499312b29433b7dd8a97ff068defcba
+ERROR:  the store has no chunk 09505f4dd52d649b01990d71ac89e779c1d3872a
 INSERT INTO pg_history.pointers VALUES ('short', '\x01');
 ERROR:  new row for relation "pointers" violates check constraint "pointers_hash_check"
 DETAIL:  Failing row contains (short, \x01).

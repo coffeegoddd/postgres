@@ -12,7 +12,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('chunk_freer');
-$node->init;
+# (the history store holds raw bytes here: initdb makes it with the leaf
+# format, which references no chunk)
+$node->init(extra => ['-c', 'chunk_format=leaf']);
 $node->append_conf('postgresql.conf', 'autovacuum = off');
 $node->start;
 $node->safe_psql('postgres', q{

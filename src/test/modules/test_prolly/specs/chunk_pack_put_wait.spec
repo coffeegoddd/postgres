@@ -10,7 +10,7 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION pack_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 	-- (a chunk of the test format referencing the leaf '\x0a0201')
 	CREATE OR REPLACE FUNCTION pack_parent() RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT '\x5201'::bytea || pack_h('\x0a0201')$$;
@@ -19,8 +19,8 @@ setup
 session a
 setup		{ SET chunk_free_in_background = off; }
 step a_begin	{ BEGIN; }
-step a_put		{ SELECT stored FROM test_cs_put('pages', '\x0a0101'); }
-step a_put_leaf	{ SELECT stored FROM test_cs_put('pages', '\x0a0201'); }
+step a_put		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0101')); }
+step a_put_leaf	{ SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0201')); }
 step a_commit	{ COMMIT; }
 step a_rollback	{ ROLLBACK; }
 
@@ -38,7 +38,7 @@ step b_mark		{
 step b_pack		{
 	SELECT test_cs_put_many('pages',
 		ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')],
-		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY['\x0a0101', '\x0a0102']::bytea[]) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step b_has		{
 	SELECT test_cs_has('pages', pack_h('\x0a0101')) AS first,
@@ -49,22 +49,20 @@ step b_dead		{
 }
 step b_vacuum	{ VACUUM pg_history.chunk_index; }
 # (a chunk after the pack's, keeping the log's tail, which VACUUM would cut)
-step b_live		{ SELECT stored FROM test_cs_put('pages', '\x0a0109'); }
+step b_live		{ SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0109')); }
 step b_free_live	{ SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0109')]) AS freed; }
 step b_free		{
 	SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')]) AS freed;
 }
 step b_parent	{
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages', ARRAY[pack_h(pack_parent()), pack_h('\x0a0201')],
-		ARRAY[pack_parent(), '\x0a0201']) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY[pack_parent(), '\x0a0201']) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 }
 step b_leaf		{
 	SELECT refs, roots FROM test_cs_counts('pages', pack_h('\x0a0201'));
 }
 step b_free_parent	{
 	SELECT test_cs_free('pages', ARRAY[pack_h(pack_parent())]) AS freed;
-	SELECT test_chunk_format_refs(false);
 }
 
 session c

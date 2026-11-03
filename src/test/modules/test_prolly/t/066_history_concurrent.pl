@@ -27,16 +27,16 @@ $node->safe_psql('postgres', q{
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION leaf(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'L'::bytea || decode(repeat(md5('w' || i), 8), 'hex')$$;
-	-- (a chunk of the test format referencing others: 'R', their count, them)
+		AS $$SELECT test_engine_chunk('L'::bytea || decode(repeat(md5('w' || i), 8), 'hex'))$$;
+	-- (a chunk of the test format referencing others, 'R', their count,
+	-- them, as the history store's format has it, the engine's)
 	CREATE FUNCTION node(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
-			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+		AS $$SELECT test_engine_chunk('R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+			(SELECT string_agg(h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o)))$$;
 	-- a commit: leaves (some another's too) and a parent of them put, and the
 	-- branch's pointer moved to it
 	CREATE FUNCTION commit_to(branch text, a int, b int, c int) RETURNS void LANGUAGE plpgsql AS $$
 	BEGIN
-		PERFORM test_chunk_format_refs(true);
 		-- (the leaves in their names' order, as a pack puts them: two
 		-- commits putting two leaves new to the store each in the other's
 		-- order would wait for each other's, as inserts into a unique index)
@@ -45,7 +45,6 @@ $node->safe_psql('postgres', q{
 		PERFORM test_cs_put('pages', node(leaf(a), leaf(b), leaf(c)));
 		UPDATE pg_history.pointers SET hash = h(node(leaf(a), leaf(b), leaf(c))) WHERE name = branch;
 	END$$;
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put('pages', leaf(0));
 	INSERT INTO pg_history.pointers SELECT 'b' || i, h(leaf(0)) FROM generate_series(1, 16) i;
 });
@@ -65,20 +64,15 @@ $node->pgbench(
 SELECT commit_to('b' || :branch, :a, :b, :c);
 },
 		'066_free@1' => q{
-SELECT test_chunk_format_refs(true), test_cs_free_unheld('pages');
+SELECT test_cs_free_unheld('pages');
 },
-		# (VACUUM's session of the test format too: a session of the leaf
-		# format would start a freer of it, which frees a parent letting go
-		# of none of its references, which stay counted)
 		'066_vacuum@1' => q{
-SELECT test_chunk_format_refs(true);
 VACUUM pg_history.chunk_index;
 },
 	});
 
-my $refs = 'SELECT test_chunk_format_refs(true);';
 my $q = sub {
-	my $out = $node->safe_psql('postgres', "$refs $_[0]");
+	my $out = $node->safe_psql('postgres', $_[0]);
 	$out =~ s/^\n//;
 	return $out;
 };
@@ -90,14 +84,14 @@ is($q->(q{SELECT count(*) FILTER (WHERE test_cs_has('pages', hash)
 
 # what nobody holds freed, and taken out: what is left the pointers' alone
 $q->(q{SELECT test_cs_free_unheld('pages')});
-$node->safe_psql('postgres', "$refs VACUUM pg_history.chunk_index");
+$node->safe_psql('postgres', "VACUUM pg_history.chunk_index");
 is($q->(q{SELECT ok || ' ' || unheld || ' ' || coalesce(why, '') FROM test_cs_check('pages')}), 'true 0 ',
 	'nothing unheld left, the audit clean');
 is($q->(q{SELECT (SELECT chunks FROM test_cs_check('pages')) =
 	(SELECT count(*) FROM (SELECT DISTINCT hash FROM pg_history.pointers
-		UNION SELECT substr(test_cs_get('pages', p.hash), 3 + 20 * j, 20)
+		UNION SELECT substr(test_engine_unchunk(test_cs_get('pages', p.hash)), 3 + 20 * j, 20)
 		FROM pg_history.pointers p, generate_series(0, 2) j
-		WHERE get_byte(test_cs_get('pages', p.hash), 0) = 82) s)}), 't',
+		WHERE get_byte(test_engine_unchunk(test_cs_get('pages', p.hash)), 0) = 82) s)}), 't',
 	'the chunks left are the pointers\' and the leaves they reference');
 
 $node->stop;

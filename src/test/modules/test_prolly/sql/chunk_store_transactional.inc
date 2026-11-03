@@ -1,7 +1,6 @@
 -- The transactional stores' part of the suite: a put, a root's change and
 -- a free are their transaction's, gone, with what they counted, if it
 -- aborts.
-SELECT test_chunk_format_refs(true);
 BEGIN;
 SELECT pg_temp.put('cs-tx-f') AS f;
 ROLLBACK;
@@ -38,4 +37,3 @@ ROLLBACK;
 SELECT pg_temp.has(pg_temp.parent('cs-tx-g')) AS parent, pg_temp.refs('cs-tx-g') AS g;
 SELECT pg_temp.free(pg_temp.parent('cs-tx-g')) AS parent_and_g;
 SELECT ok, why FROM test_cs_check(:'store');
-SELECT test_chunk_format_refs(false);

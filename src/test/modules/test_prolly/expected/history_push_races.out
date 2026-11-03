@@ -114,7 +114,7 @@ copied
 step q_pointer_pushed: INSERT INTO pg_history.pointers VALUES ('hr_ptr2', hr_h('\x0a3102')); <waiting ...>
 step p_commit: COMMIT;
 step q_pointer_pushed: <... completed>
-ERROR:  chunk 6dec999aa125ef4c76c83c010a831ea2ca93bdc3 was pushed to the history store's tier
+ERROR:  chunk 331afabd0cad8cc5ff5a122f20537fc27329c5bd was pushed to the history store's tier
 test_cs_free
 ------------
            2

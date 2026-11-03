@@ -64,7 +64,7 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	7
+#define CHUNK_INDEX_VERSION	8
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -104,6 +104,7 @@ typedef struct IndexMetaData
 	uint64		log_stamp;		/* and its storage's stamp */
 	uint32		nmarks;			/* the marks' pages */
 	BlockNumber marks[64];		/* MAX_MARKS */
+	char		format[CHUNK_FORMAT_NAMELEN];	/* its chunks' format's name */
 	uint32		ndir;			/* the directory's pages */
 	BlockNumber dir[FLEXIBLE_ARRAY_MEMBER];
 } IndexMetaData;
@@ -130,6 +131,8 @@ typedef struct IndexCache
 	uint32		highmask;
 	uint32		nmarks;
 	BlockNumber marks[MAX_MARKS];
+	char		format_name[CHUNK_FORMAT_NAMELEN];	/* its chunks' format's */
+	const ChunkFormatRoutine *format;	/* ... found, once asked for */
 	uint32		ndir;
 	BlockNumber dir[MAX_DIR];
 } IndexCache;
@@ -632,9 +635,12 @@ load_cache(Relation rel)
 	Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
 	IndexMetaData *meta;
 	IndexCache	cache;
+	char		format[CHUNK_FORMAT_NAMELEN];
 
 	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
 	meta = page_meta(rel, BufferGetPage(mbuf));
+	memcpy(format, meta->format, CHUNK_FORMAT_NAMELEN);
+	format[CHUNK_FORMAT_NAMELEN - 1] = '\0';
 	cache.relnumber = rel->rd_locator.relNumber;
 	cache.log = meta->log;
 	cache.log_stamp = meta->log_stamp;
@@ -646,6 +652,8 @@ load_cache(Relation rel)
 	cache.ndir = meta->ndir;
 	memcpy(cache.dir, meta->dir, meta->ndir * sizeof(BlockNumber));
 	UnlockReleaseBuffer(mbuf);
+	memcpy(cache.format_name, format, CHUNK_FORMAT_NAMELEN);
+	cache.format = NULL;
 
 	/* (reading may have reset the relcache entry) */
 	if (rel->rd_amcache == NULL)
@@ -2395,7 +2403,7 @@ const ChunkIndexRoutine *ChunkIndex = &PageChunkIndex;
 /* ------------------------------------------------------- storage */
 
 void
-ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
+ChunkIndexInitStorage(SMgrRelation srel, bool use_wal, const char *format)
 {
 	BulkWriteState *bulk = smgr_bulk_start_smgr(srel, MAIN_FORKNUM, use_wal);
 	BulkWriteBuffer buf;
@@ -2416,6 +2424,7 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	meta->log = InvalidOid;
 	meta->log_stamp = 0;
 	meta->nmarks = 0;
+	strlcpy(meta->format, format, CHUNK_FORMAT_NAMELEN);
 	meta->ndir = 1;
 	meta->dir[0] = 1;
 	set_meta_lower(page, meta);
@@ -3403,4 +3412,32 @@ uint32
 ChunkIndexBuckets(Relation idx)
 {
 	return load_cache(idx)->maxbucket + 1;
+}
+
+/*
+ * The format of the chunks idx names, as it was made with: its meta page's
+ * (cached), its name found among the formats registered.
+ */
+const ChunkFormatRoutine *
+ChunkIndexFormat(Relation idx)
+{
+	IndexCache *cache = get_cache(idx);
+
+	/*
+	 * (found as asked for, not as the index is read: what reads no chunk's
+	 * references, VACUUM, needs no module's format loaded)
+	 */
+	if (cache->format == NULL)
+		cache->format = ChunkFormatNamed(cache->format_name);
+	return cache->format;
+}
+
+/*
+ * The name of that format, as recorded: what needs no reading of a chunk
+ * (pg_dump, TRUNCATE) needs no module's format loaded.
+ */
+const char *
+ChunkIndexFormatName(Relation idx)
+{
+	return get_cache(idx)->format_name;
 }

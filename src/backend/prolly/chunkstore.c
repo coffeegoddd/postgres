@@ -119,6 +119,19 @@ close_store(Relation log, Relation idx)
 	relation_close(idx, NoLock);
 }
 
+/* the format of the chunks the store's index names */
+static const ChunkFormatRoutine *
+pages_format(ChunkStore *cs)
+{
+	Relation	idx;
+	const ChunkFormatRoutine *format;
+
+	open_store(cs, AccessShareLock, NULL, &idx);
+	format = ChunkIndexFormat(idx);
+	close_store(NULL, idx);
+	return format;
+}
+
 static bool
 pages_has(ChunkStore *cs, const uint8 *hash)
 {
@@ -354,6 +367,7 @@ pages_check(ChunkStore *cs, uint64 *chunks, uint64 *unheld, char **why)
 { \
 	.open = open_fn, \
 	.transactional = true, \
+	.format = pages_format, \
 	.has = pages_has, \
 	.get = pages_get, \
 	.get_many = pages_get_many, \

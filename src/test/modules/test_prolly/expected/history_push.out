@@ -8,27 +8,23 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SET chunk_free_in_background = off;
-SELECT test_chunk_format_refs(true);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-
+-- (chunks of the test format, put and read as the history store's, the
+-- engine's: d's hash as one)
 CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-	AS 'SELECT substr(sha256(d), 1, 20)';
+	AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 -- (two leaves of their own and one shared; two parents, a root each)
 CREATE FUNCTION pg_temp.p1() RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT '\x5202'::bytea || pg_temp.h('\x0a1101') || pg_temp.h('\x0a11ff')$$;
 CREATE FUNCTION pg_temp.p2() RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT '\x5202'::bytea || pg_temp.h('\x0a1102') || pg_temp.h('\x0a11ff')$$;
 SELECT count(*) FROM unnest(ARRAY['\x0a1101', '\x0a1102', '\x0a11ff']::bytea[]) d,
-	LATERAL test_cs_put('pages', d);
+	LATERAL test_cs_put('pages', test_engine_chunk(d));
  count 
 -------
      3
 (1 row)
 
-SELECT (test_cs_put('pages', pg_temp.p1())).stored AS p1, (test_cs_put('pages', pg_temp.p2())).stored AS p2;
+SELECT (test_cs_put('pages', test_engine_chunk(pg_temp.p1()))).stored AS p1, (test_cs_put('pages', test_engine_chunk(pg_temp.p2()))).stored AS p2;
  p1 | p2 
 ----+----
  t  | t
@@ -107,19 +103,21 @@ SELECT ok FROM test_cs_check('tier');
 (1 row)
 
 -- a read of what was pushed: an error; so is a root taken of it
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p1()));
-ERROR:  chunk 89aba503089c0f5f14e9a4b14c69aae11e689993 was pushed to the history store's tier
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p1())));
+ERROR:  chunk 945b62a93f883e2101004a36817d4dff433aaa87 was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
-SELECT test_cs_get_many('pages', ARRAY[pg_temp.h(pg_temp.p2()), pg_temp.h('\x0a1101')]);
-ERROR:  chunk 665d5db05b355f7dc6207477095191af5e256ac3 was pushed to the history store's tier
+SELECT ARRAY(SELECT test_engine_unchunk(c) FROM unnest(test_cs_get_many('pages',
+	ARRAY[pg_temp.h(pg_temp.p2()), pg_temp.h('\x0a1101')])) WITH ORDINALITY u(c, o) ORDER BY o)
+	AS test_cs_get_many;
+ERROR:  chunk eb0aba93d807033934d9e66c5534265c437b0bed was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p1()));
-ERROR:  chunk 89aba503089c0f5f14e9a4b14c69aae11e689993 was pushed to the history store's tier
+ERROR:  chunk 945b62a93f883e2101004a36817d4dff433aaa87 was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 -- (what is shared, and was kept, reads)
-SELECT test_cs_get('pages', pg_temp.h('\x0a11ff'));
- test_cs_get 
--------------
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h('\x0a11ff')));
+ test_engine_unchunk 
+---------------------
  \x0a11ff
 (1 row)
 
@@ -157,18 +155,18 @@ SELECT ok, unheld FROM test_cs_check('pages');
 -- has not
 SELECT pg_history_push('b1', ARRAY[pg_temp.h('\x0a11ff')]);
 ERROR:  bundle "b1" is in the history store's tier already
-SELECT (test_cs_put('pages', '\x0a1199')).stored;
+SELECT (test_cs_put('pages', test_engine_chunk('\x0a1199'))).stored;
  stored 
 --------
  t
 (1 row)
 
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199'), pg_temp.h('\x0a1199')]);
-ERROR:  root 554f980c5247a07ece9379bfd7e4c4f336caf002 is given twice
+ERROR:  root 9265ed1596cc5c65af3837e8bc5aeeb5abaa2f4c is given twice
 SELECT pg_history_push('b3', ARRAY[]::bytea[]);
 ERROR:  a bundle has a root at least
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1198')]);
-ERROR:  the history store has no chunk 90f4c3cd0489dcb2e5d5b3851a5b8fc3c49a704c to push
+ERROR:  the history store has no chunk 4a83b55a90b9db07a11bead71a30902617f32aa2 to push
 -- a chunk something still holds (a pointer, here): pushed, and kept here,
 -- read here still; the pointer as it was
 INSERT INTO pg_history.pointers VALUES ('main', pg_temp.h('\x0a1199'));
@@ -178,7 +176,7 @@ SELECT pg_history_push('b6', ARRAY[pg_temp.h('\x0a1199')]) AS copied;
       1
 (1 row)
 
-SELECT test_cs_get('pages', pg_temp.h('\x0a1199')) AS read_here,
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h('\x0a1199'))) AS read_here,
 	(test_cs_counts('pages', pg_temp.h('\x0a1199'))).roots AS roots,
 	test_cs_has('tier', pg_temp.h('\x0a1199')) AS in_tier;
  read_here | roots | in_tier 
@@ -196,7 +194,7 @@ SELECT pg_history_release('b6') AS freed;
 -- (a bundle's row of a root twice: refused, its roots each once)
 INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')], 0);
 ERROR:  new row for relation "bundles" violates check constraint "bundles_manifest_check"
-DETAIL:  Failing row contains (dupx, {"\\xe0c654b3347bf26ba13391e96f76712064682844","\\xe0c654b3347bf..., 0).
+DETAIL:  Failing row contains (dupx, {"\\x574f74d65da0705b384f7715b02d0077f389c8a4","\\x574f74d65da07..., 0).
 -- the bundles' rows are not changed, nor truncated (the table a system
 -- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
@@ -240,7 +238,7 @@ SELECT test_cs_has('pages', pg_temp.h('\x0a1199')) AS kept,
 -- pointers made and dropped many at once, in one statement each (more
 -- distinct chunks than the shared lock table holds locks for)
 SELECT count(*) FROM generate_series(1, 20000) g,
-	LATERAL test_cs_put('pages', int4send(g));
+	LATERAL test_cs_put('pages', test_engine_chunk(int4send(g)));
  count 
 -------
  20000
@@ -283,7 +281,7 @@ SELECT count(*) AS rows FROM pg_history.bundles;
 SELECT pg_history_release('b2');
 ERROR:  there is no bundle "b2" in the history store's tier
 -- and a chunk released is no longer pushed: a read finds nothing
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p1())) IS NULL AS absent;
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p1()))) IS NULL AS absent;
  absent 
 --------
  t
@@ -313,7 +311,7 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1199')]);
 -- copy here
 CREATE FUNCTION pg_temp.p7() RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT '\x5201'::bytea || pg_temp.h('\x0a1701')$$;
-SELECT (test_cs_put('pages', '\x0a1701')).stored, (test_cs_put('pages', pg_temp.p7())).stored;
+SELECT (test_cs_put('pages', test_engine_chunk('\x0a1701'))).stored, (test_cs_put('pages', test_engine_chunk(pg_temp.p7()))).stored;
  stored | stored 
 --------+--------
  t      | t
@@ -339,8 +337,8 @@ SELECT pg_history_push('b7', ARRAY[pg_temp.h(pg_temp.p7())]) AS copied;
 (1 row)
 
 COMMIT;
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7()));
-ERROR:  chunk 7c40254dc47854781e934a8d7c876b778fb418e6 was pushed to the history store's tier
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p7())));
+ERROR:  chunk 3bfe8b225fe35ce99a3eb8e39aaf9c5c3b4acb37 was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 -- (a fetch aborted: still pushed)
 BEGIN;
@@ -351,8 +349,8 @@ SELECT pg_history_fetch('b7') AS copied;
 (1 row)
 
 ROLLBACK;
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7()));
-ERROR:  chunk 7c40254dc47854781e934a8d7c876b778fb418e6 was pushed to the history store's tier
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p7())));
+ERROR:  chunk 3bfe8b225fe35ce99a3eb8e39aaf9c5c3b4acb37 was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 BEGIN;
 SELECT pg_history_fetch('b7') AS copied;
@@ -368,8 +366,8 @@ SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p7()));
 (1 row)
 
 COMMIT;
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_here,
-	test_cs_get('pages', pg_temp.h('\x0a1701')) AS leaf_here,
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p7()))) = pg_temp.p7() AS read_here,
+	test_engine_unchunk(test_cs_get('pages', pg_temp.h('\x0a1701'))) AS leaf_here,
 	test_cs_has('tier', pg_temp.h(pg_temp.p7())) AS tier_keeps;
  read_here | leaf_here | tier_keeps 
 -----------+-----------+------------
@@ -394,7 +392,7 @@ SELECT pg_history_release('b7') AS freed;
      2
 (1 row)
 
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p7())) = pg_temp.p7() AS read_still;
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p7()))) = pg_temp.p7() AS read_still;
  read_still 
 ------------
  t
@@ -406,7 +404,7 @@ ERROR:  there is no bundle "b7" in the history store's tier
 -- again what was freed here but not taken out yet
 CREATE FUNCTION pg_temp.p8() RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT '\x5202'::bytea || pg_temp.h('\x0a1701') || pg_temp.h('\x0a1801')$$;
-SELECT (test_cs_put('pages', '\x0a1801')).stored, (test_cs_put('pages', pg_temp.p8())).stored;
+SELECT (test_cs_put('pages', test_engine_chunk('\x0a1801'))).stored, (test_cs_put('pages', test_engine_chunk(pg_temp.p8()))).stored;
  stored | stored 
 --------+--------
  t      | t
@@ -436,7 +434,7 @@ SELECT pg_history_fetch('b8') AS put_again;
          2
 (1 row)
 
-SELECT test_cs_get('pages', pg_temp.h(pg_temp.p8())) = pg_temp.p8() AS read_here;
+SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p8()))) = pg_temp.p8() AS read_here;
  read_here 
 -----------
  t
@@ -491,7 +489,7 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h(pg_temp.p7())]) AS freed;
 -- manifests: each bundle's, in the tier's store, which lists the bundles
 -- from it alone; a push aborted leaves an orphan, removed by VACUUM; a
 -- release's manifest stays until VACUUM, its release committed, removes it
-SELECT (test_cs_put('pages', '\x0a1901')).stored, (test_cs_put('pages', '\x0a1902')).stored;
+SELECT (test_cs_put('pages', test_engine_chunk('\x0a1901'))).stored, (test_cs_put('pages', test_engine_chunk('\x0a1902'))).stored;
  stored | stored 
 --------+--------
  t      | t
@@ -593,7 +591,7 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1902')]) AS freed;
 -- a release in a subtransaction rolled back: its manifest the bundle's
 -- still; a push in one: its manifest an orphan, removed; a release after
 -- one aborted, at once
-SELECT (test_cs_put('pages', '\x0a1903')).stored, (test_cs_put('pages', '\x0a1904')).stored;
+SELECT (test_cs_put('pages', test_engine_chunk('\x0a1903'))).stored, (test_cs_put('pages', test_engine_chunk('\x0a1904'))).stored;
  stored | stored 
 --------+--------
  t      | t
@@ -667,7 +665,7 @@ SELECT test_cs_free('pages', ARRAY[pg_temp.h('\x0a1904')]) AS freed;
 (1 row)
 
 -- a bundle's row names one manifest, its own, a tier's entry's number
-SELECT (test_cs_put('pages', '\x0a1905')).stored, (test_cs_put('pages', '\x0a1906')).stored;
+SELECT (test_cs_put('pages', test_engine_chunk('\x0a1905'))).stored, (test_cs_put('pages', test_engine_chunk('\x0a1906'))).stored;
  stored | stored 
 --------+--------
  t      | t
@@ -681,7 +679,7 @@ SELECT pg_history_push('b13', ARRAY[pg_temp.h('\x0a1905')]) AS copied;
 
 INSERT INTO pg_history.bundles VALUES ('b14', ARRAY[pg_temp.h('\x0a1905')], -5);
 ERROR:  new row for relation "bundles" violates check constraint "bundles_manifest_check"
-DETAIL:  Failing row contains (b14, {"\\xd01b9feb632a10bb88f2d64afb1fc8bfe7509946"}, -5).
+DETAIL:  Failing row contains (b14, {"\\x9c4cf54eef164febdd14389b446aa5bf3aaf16db"}, -5).
 -- (terse: the number another bundle's, whatever it is)
 \set VERBOSITY terse
 INSERT INTO pg_history.bundles SELECT 'b14', roots, manifest FROM pg_history.bundles WHERE name = 'b13';
@@ -770,19 +768,19 @@ CREATE FUNCTION pg_temp.tm(m int) RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
 CREATE FUNCTION pg_temp.tr() RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
 	SELECT '\x52'::bytea || set_byte('\x00'::bytea, 0, 3) ||
 		(SELECT string_agg(pg_temp.h(pg_temp.tm(m)), ''::bytea ORDER BY m) FROM generate_series(0, 2) m)$$;
-SELECT count(*) FROM generate_series(0, 14) g, LATERAL test_cs_put('pages', pg_temp.tl(g));
+SELECT count(*) FROM generate_series(0, 14) g, LATERAL test_cs_put('pages', test_engine_chunk(pg_temp.tl(g)));
  count 
 -------
     15
 (1 row)
 
-SELECT count(*) FROM generate_series(0, 2) m, LATERAL test_cs_put('pages', pg_temp.tm(m));
+SELECT count(*) FROM generate_series(0, 2) m, LATERAL test_cs_put('pages', test_engine_chunk(pg_temp.tm(m)));
  count 
 -------
      3
 (1 row)
 
-SELECT (test_cs_put('pages', pg_temp.tr())).stored;
+SELECT (test_cs_put('pages', test_engine_chunk(pg_temp.tr()))).stored;
  stored 
 --------
  t
@@ -803,7 +801,9 @@ WITH t AS (
 		WHERE r.hash = pg_temp.h(pg_temp.tr())))
 SELECT bool_and(mid.off = (SELECT max(l.off + l.len) FROM t l
 		WHERE l.hash IN (SELECT pg_temp.h(pg_temp.tl(m * 5 + g)) FROM generate_series(0, 4) g))
-	AND mid.off - 1000 = (SELECT min(l.off) FROM t l
+	AND mid.off - (SELECT sum(l.len) FROM t l
+		WHERE l.hash IN (SELECT pg_temp.h(pg_temp.tl(m * 5 + g)) FROM generate_series(0, 4) g))
+		= (SELECT min(l.off) FROM t l
 		WHERE l.hash IN (SELECT pg_temp.h(pg_temp.tl(m * 5 + g)) FROM generate_series(0, 4) g)))
 	AS leaves_together
 FROM generate_series(0, 2) m JOIN t mid ON mid.hash = pg_temp.h(pg_temp.tm(m));
@@ -835,9 +835,3 @@ SELECT pg_history_release('tree') AS freed;
 (1 row)
 
 VACUUM pg_history.tier_index;
-SELECT test_chunk_format_refs(false);
- test_chunk_format_refs 
-------------------------
- 
-(1 row)
-

@@ -8,46 +8,43 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS test_prolly;
 	CREATE OR REPLACE FUNCTION fo_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
-		AS 'SELECT substr(sha256(d), 1, 20)';
+		AS 'SELECT substr(sha256(test_engine_chunk(d)), 1, 20)';
 	-- (chunks of the test format: '\x52', the count, the chunks named)
 	CREATE OR REPLACE FUNCTION fo_parent(tag bytea, kid bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT '\x5202'::bytea || fo_h(kid) || fo_h(tag)$$;
-	SELECT test_chunk_format_refs(true);
-	SELECT stored FROM test_cs_put('pages', '\x0a0c01');
-	SELECT stored FROM test_cs_put('pages', '\x0a0c02');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf1');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf2');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf3');
-	SELECT stored FROM test_cs_put('pages', '\x0a0cf4');
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0c01'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0c02'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf1'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf2'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf3'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0cf4'));
 	-- two parents of each of two leaves (each held by both)
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf1', '\x0a0c01'));
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf2', '\x0a0c02'));
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf3', '\x0a0c02'));
-	SELECT stored FROM test_cs_put('pages', fo_parent('\x0a0cf4', '\x0a0c01'));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf1', '\x0a0c01')));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf2', '\x0a0c02')));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf3', '\x0a0c02')));
+	SELECT stored FROM test_cs_put('pages', test_engine_chunk(fo_parent('\x0a0cf4', '\x0a0c01')));
 }
 
 teardown
 {
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_free_unheld('pages');
 }
 
 session a
-setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
+setup		{ SET chunk_free_in_background = off; }
 step a_begin	{ BEGIN; }
 step a_free1	{ SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf1', '\x0a0c01'))]) AS freed; }
 step a_free2	{ SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf2', '\x0a0c02'))]) AS freed; }
 step a_commit	{ COMMIT; }
 
 session b
-setup		{ SET chunk_free_in_background = off; SELECT test_chunk_format_refs(true); }
+setup		{ SET chunk_free_in_background = off; }
 step b_begin	{ BEGIN; }
 step b_free1	{ SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf3', '\x0a0c02'))]) AS freed; }
 step b_free2	{ SELECT test_cs_free('pages', ARRAY[fo_h(fo_parent('\x0a0cf4', '\x0a0c01'))]) AS freed; }
 step b_commit	{ COMMIT; }
 
 session c
-setup		{ SELECT test_chunk_format_refs(true); }
 step c_counts	{
 	SELECT string_agg(coalesce(refs::text, '-'), ',' ORDER BY k) AS refs
 	FROM unnest(ARRAY['\x0a0c01', '\x0a0c02']::bytea[]) WITH ORDINALITY u(d, k),

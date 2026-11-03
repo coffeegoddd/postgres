@@ -6,18 +6,8 @@ test_cs_ref_root
                 
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
-
 step a_begin: BEGIN;
-step a_put: SELECT stored FROM test_cs_put('pages', tb_parent());
+step a_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent()));
 stored
 ------
 t     
@@ -30,7 +20,7 @@ test_cs_unref_root
                   
 (1 row)
 
-step t_put: SELECT stored FROM test_cs_put('pages', tb_parent()); <waiting ...>
+step t_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk(tb_parent())); <waiting ...>
 step a_commit: COMMIT;
 step t_put: <... completed>
 stored
@@ -45,8 +35,8 @@ refs|roots
    1|    1
 (1 row)
 
-test_chunk_format_refs
-----------------------
-                      
+test_cs_free
+------------
+           2
 (1 row)
 

@@ -1,7 +1,7 @@
 Parsed test spec with 2 sessions
 
 starting permutation: o_put p_begin p_pack p_own_free o_free p_commit p_free
-step o_put: SELECT stored FROM test_cs_put('pages', '\x0a0501');
+step o_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0501'));
 stored
 ------
 t     
@@ -11,7 +11,7 @@ step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 
 stored
 ------
@@ -45,7 +45,7 @@ freed
 
 
 starting permutation: o_put p_begin p_pack p_pack_again o_free p_commit p_free
-step o_put: SELECT stored FROM test_cs_put('pages', '\x0a0501');
+step o_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0501'));
 stored
 ------
 t     
@@ -55,7 +55,7 @@ step p_begin: BEGIN;
 step p_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 
 stored
 ------
@@ -65,7 +65,7 @@ stored
 step p_pack_again: 
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored_again;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored_again;
 
 stored_again
 ------------
@@ -93,14 +93,14 @@ starting permutation: p_pack o_put p_begin p_parents o_free p_commit p_free_pare
 step p_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 
 stored
 ------
   3000
 (1 row)
 
-step o_put: SELECT stored FROM test_cs_put('pages', '\x0a0501');
+step o_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0501'));
 stored
 ------
 t     
@@ -108,17 +108,11 @@ t
 
 step p_begin: BEGIN;
 step p_parents: 
-	SELECT test_chunk_format_refs(true);
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x5201'::bytea || pack_h('\x50'::bytea || int4send(i)))
 			FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x5201'::bytea || pack_h('\x50'::bytea || int4send(i))
-			FROM generate_series(1, 3000) i ORDER BY i)) AS parents;
-
-test_chunk_format_refs
-----------------------
-                      
-(1 row)
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x5201'::bytea || pack_h('\x50'::bytea || int4send(i))
+			FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS parents;
 
 parents
 -------
@@ -135,16 +129,10 @@ step p_commit: COMMIT;
 step p_free_parents: 
 	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x5201'::bytea || pack_h('\x50'::bytea || int4send(i)))
 		FROM generate_series(1, 3000) i)) AS freed;
-	SELECT test_chunk_format_refs(false);
 
 freed
 -----
  6000
-(1 row)
-
-test_chunk_format_refs
-----------------------
-                      
 (1 row)
 
 step p_free: 
@@ -161,14 +149,14 @@ starting permutation: p_pack o_put p_begin p_pack_again o_free o_free_found p_ow
 step p_pack: 
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored;
 
 stored
 ------
   3000
 (1 row)
 
-step o_put: SELECT stored FROM test_cs_put('pages', '\x0a0501');
+step o_put: SELECT stored FROM test_cs_put('pages', test_engine_chunk('\x0a0501'));
 stored
 ------
 t     
@@ -178,7 +166,7 @@ step p_begin: BEGIN;
 step p_pack_again: 
 	SELECT test_cs_put_many('pages',
 		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored_again;
+		ARRAY(SELECT test_engine_chunk(x) FROM unnest(ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) WITH ORDINALITY u(x, o) ORDER BY o)) AS stored_again;
 
 stored_again
 ------------
