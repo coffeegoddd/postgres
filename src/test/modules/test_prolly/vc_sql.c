@@ -20,13 +20,16 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "prolly/engine/chunkfmt.h"
 #include "prolly/engine/vc.h"
 #include "utils/builtins.h"
+#include "utils/timestamp.h"
 
 #include "test_prolly.h"
 
@@ -47,6 +50,13 @@ PG_FUNCTION_INFO_V1(test_vc_rewrite);
 PG_FUNCTION_INFO_V1(test_vc_cancel);
 PG_FUNCTION_INFO_V1(test_vc_cancel_writes);
 PG_FUNCTION_INFO_V1(test_vc_transfer);
+PG_FUNCTION_INFO_V1(test_vc_bench_commits);
+PG_FUNCTION_INFO_V1(test_vc_bench_branches);
+PG_FUNCTION_INFO_V1(test_vc_bench_log);
+PG_FUNCTION_INFO_V1(test_vc_bench_diff);
+PG_FUNCTION_INFO_V1(test_vc_bench_load);
+PG_FUNCTION_INFO_V1(test_vc_bench_edit);
+PG_FUNCTION_INFO_V1(test_vc_bench_merge);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -740,4 +750,333 @@ test_vc_transfer(PG_FUNCTION_ARGS)
 			elog(ERROR, "no op \"%s\"", op);
 	});
 	PG_RETURN_INT32(rc);
+}
+
+/* ---------------------------------------------------------- measurements */
+
+/* (microseconds since start) */
+static double
+us_since(TimestampTz start)
+{
+	return (double) (GetCurrentTimestamp() - start);
+}
+
+/*
+ * n rows of table t (made if the working set has none), first, first +
+ * stride, ..., set to version, in one edit of the branch's working set
+ */
+static void
+edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version);
+
+static void
+edit_rows(VcRepo *r, uint64 lo, uint64 hi, uint64 version)
+{
+	edit_rows_every(r, lo, hi - lo, 1, version);
+}
+
+static void
+edit_rows_every(VcRepo *r, uint64 first, uint64 n, uint64 stride, uint64 version)
+{
+	PHash		rv = vc_working_lock(r),
+				out;
+	VcTable		t;
+	ProllyEdit *e = palloc_array(ProllyEdit, Max(n, 1));
+	uint8	   *keys = palloc(Max(n, 1) * 8);
+	uint8	   *vals = palloc(Max(n, 1) * 16);
+
+	if (!vc_table_get(&r->ctx, &rv, "t", &t) &&
+		vc_table_create(&r->ctx, &rv, "t", ddl, strlen(ddl), &rv) != VC_OK)
+		elog(ERROR, "could not make table t");
+	for (size_t i = 0; i < n; i++)
+	{
+		put_u64(keys + i * 8, first + i * stride);
+		put_u64(vals + i * 16, first + i * stride);
+		put_u64(vals + i * 16 + 8, version);
+		e[i].key = keys + i * 8;
+		e[i].klen = 8;
+		e[i].val = vals + i * 16;
+		e[i].vlen = 16;
+		e[i].del = false;
+	}
+	if (n > 0 && vc_table_edit(&r->ctx, &rv, "t", e, n, &out) != VC_OK)
+		elog(ERROR, "could not write table t");
+	if (n > 0)
+		vc_set_working(r, &out);
+	pfree(e);
+	pfree(keys);
+	pfree(vals);
+}
+
+/*
+ * test_vc_bench_commits(branch text, n int4, keys int4) returns float8: n
+ * commits on branch, each setting one of keys rows (in turn, so the table
+ * stays keys rows long however long history grows); microseconds a commit
+ */
+Datum
+test_vc_bench_commits(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		n = PG_GETARG_INT32(1);
+	int32		keys = PG_GETARG_INT32(2);
+	static uint64 next = 0;
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		TimestampTz start;
+
+		checkout(&r, branch);
+		start = GetCurrentTimestamp();
+		for (int32 i = 0; i < n; i++)
+		{
+			uint64		k = next++ % (uint64) Max(keys, 1);
+
+			CHECK_FOR_INTERRUPTS();
+			edit_rows(&r, k, k + 1, next);
+			(void) vc_commit(&r, "bench");
+		}
+		us = us_since(start) / Max(n, 1);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+/*
+ * test_vc_bench_branches(prefix text, first int4, n int4) returns float8: n
+ * branches made at the head checked out (main), prefix || first.. ;
+ * microseconds a branch
+ */
+Datum
+test_vc_bench_branches(PG_FUNCTION_ARGS)
+{
+	char	   *prefix = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		first = PG_GETARG_INT32(1);
+	int32		n = PG_GETARG_INT32(2);
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		TimestampTz start = GetCurrentTimestamp();
+
+		for (int32 i = 0; i < n; i++)
+		{
+			char	   *name = psprintf("%s%d", prefix, first + i);
+
+			CHECK_FOR_INTERRUPTS();
+			if (vc_branch_create(&r, name, NULL) != VC_OK)
+				elog(ERROR, "could not make branch \"%s\"", name);
+			pfree(name);
+		}
+		us = us_since(start) / Max(n, 1);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+static void
+count_log_fn(void *arg, const VcCommit *c)
+{
+	(*(uint64 *) arg)++;
+}
+
+/*
+ * test_vc_bench_log(branch text, max int4) returns float8: the branch's log,
+ * max commits of its first-parent line; microseconds for it all
+ */
+Datum
+test_vc_bench_log(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		max = PG_GETARG_INT32(1);
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		VcBranch	b;
+		uint64		n = 0;
+		TimestampTz start;
+
+		if (!vc_branch_get(&r, branch, &b))
+			elog(ERROR, "there is no branch \"%s\"", branch);
+		start = GetCurrentTimestamp();
+		(void) vc_log(&r, &b.head, (size_t) max, 0, count_log_fn, &n);
+		us = us_since(start);
+		vc_branch_free(&b);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+typedef struct DiffCount
+{
+	ProllyCtx  *ctx;
+	uint64		rows;
+} DiffCount;
+
+static void
+count_row_fn(void *arg, const ProllyDiff *d)
+{
+	((DiffCount *) arg)->rows++;
+}
+
+/* (a table changed: its rows that differ walked, counted) */
+static void
+count_change_bench_fn(void *arg, const VcTableChange *c)
+{
+	DiffCount  *dc = arg;
+
+	if (c->has_from && c->has_to)
+		vc_must_ok(prolly_diff(dc->ctx, &c->from.data, &c->to.data, count_row_fn, dc), dc->ctx);
+}
+
+/*
+ * test_vc_bench_diff(a text, b text) returns (us float8, rows int8): the
+ * diff of the two branches' heads, row by row; microseconds for it, and
+ * the rows that differ
+ */
+Datum
+test_vc_bench_diff(PG_FUNCTION_ARGS)
+{
+	char	   *a = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *b = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	double		us = 0;
+	uint64		rows = 0;
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {false};
+	VcRepo		r;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	VC_CALL(r, 0,
+	{
+		VcBranch	ba,
+					bb;
+		DiffCount	dc = {&r.ctx, 0};
+		TimestampTz start;
+
+		if (!vc_branch_get(&r, a, &ba) || !vc_branch_get(&r, b, &bb))
+			elog(ERROR, "branches \"%s\" and \"%s\" are needed", a, b);
+		start = GetCurrentTimestamp();
+		if (vc_diff_commits(&r, &ba.head, &bb.head, 0, count_change_bench_fn, &dc) != VC_OK)
+			elog(ERROR, "could not diff \"%s\" and \"%s\"", a, b);
+		us = us_since(start);
+		rows = dc.rows;
+		vc_branch_free(&ba);
+		vc_branch_free(&bb);
+	});
+	values[0] = Float8GetDatum(us);
+	values[1] = Int64GetDatum((int64) rows);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * test_vc_bench_load(branch text, rows int8, batch int4) returns float8:
+ * rows 0..rows-1 of table t set on branch, batch to an edit, then
+ * committed; microseconds for it all
+ */
+Datum
+test_vc_bench_load(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int64		rows = PG_GETARG_INT64(1);
+	int32		batch = PG_GETARG_INT32(2);
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		TimestampTz start;
+
+		checkout(&r, branch);
+		start = GetCurrentTimestamp();
+		for (int64 lo = 0; lo < rows; lo += Max(batch, 1))
+		{
+			CHECK_FOR_INTERRUPTS();
+			edit_rows(&r, (uint64) lo, (uint64) Min(rows, lo + Max(batch, 1)), 0);
+		}
+		(void) vc_commit(&r, "load");
+		us = us_since(start);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+/*
+ * test_vc_bench_edit(branch text, first int8, n int8, stride int8,
+ * version int8) returns float8: n rows, first, first + stride, ..., set to
+ * version on branch and committed; microseconds for it
+ */
+Datum
+test_vc_bench_edit(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int64		first = PG_GETARG_INT64(1);
+	int64		n = PG_GETARG_INT64(2);
+	int64		stride = PG_GETARG_INT64(3);
+	int64		version = PG_GETARG_INT64(4);
+	double		us = 0;
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		TimestampTz start;
+
+		checkout(&r, branch);
+		start = GetCurrentTimestamp();
+		edit_rows_every(&r, (uint64) first, (uint64) n, (uint64) Max(stride, 1),
+						(uint64) version);
+		(void) vc_commit(&r, "edit");
+		us = us_since(start);
+	});
+	PG_RETURN_FLOAT8(us);
+}
+
+/*
+ * test_vc_bench_merge(branch text, other text) returns (status text,
+ * us float8, gets int8, puts int8): other merged into branch, timed, with
+ * the chunks the history store was asked for and asked to put
+ */
+Datum
+test_vc_bench_merge(PG_FUNCTION_ARGS)
+{
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *other = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	TupleDesc	tupdesc;
+	Datum		values[4];
+	bool		nulls[4] = {false};
+	const char *how = "error";
+	double		us = 0;
+	uint64		gets = 0,
+				puts = 0;
+	VcRepo		r;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	VC_CALL(r, 0,
+	{
+		VcMergeResult m;
+		ChunkStoreStats before;
+		TimestampTz start;
+		int			rc;
+
+		checkout(&r, branch);
+		before = *cs_stats(r.ctx.cs);
+		start = GetCurrentTimestamp();
+		rc = vc_merge(&r, other, &m);
+		us = us_since(start);
+		gets = cs_stats(r.ctx.cs)->gets - before.gets;
+		puts = cs_stats(r.ctx.cs)->puts - before.puts;
+		if (rc == VC_OK)
+		{
+			how = m.status == VC_MERGE_UP_TO_DATE ? "up to date" :
+				m.status == VC_MERGE_FAST_FORWARD ? "fast forward" :
+				m.status == VC_MERGE_COMMITTED ? "committed" : "conflicts";
+			vc_merge_result_free(&m);
+		}
+	});
+	values[0] = CStringGetTextDatum(how);
+	values[1] = Float8GetDatum(us);
+	values[2] = Int64GetDatum((int64) gets);
+	values[3] = Int64GetDatum((int64) puts);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

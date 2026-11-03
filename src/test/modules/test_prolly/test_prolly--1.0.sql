@@ -671,3 +671,21 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT IMMUTABLE;
 CREATE FUNCTION test_engine_unchunk(chunk bytea)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+-- Measurements of version control on the history store (bench/vc_scale.sh):
+-- each returns microseconds.
+CREATE FUNCTION test_vc_bench_commits(branch text, n int4, keys int4)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_branches(prefix text, first int4, n int4)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_log(branch text, max int4)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_diff(a text, b text, OUT us float8, OUT rows int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_load(branch text, rows int8, batch int4)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_edit(branch text, first int8, n int8, stride int8, version int8)
+RETURNS float8 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_vc_bench_merge(branch text, other text,
+	OUT status text, OUT us float8, OUT gets int8, OUT puts int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
