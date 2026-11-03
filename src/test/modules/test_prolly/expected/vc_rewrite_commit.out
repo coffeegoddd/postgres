@@ -1,0 +1,75 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s2_begin s2_main s1_sever s2_commit c_repo
+test_vc_rewrite
+---------------
+t              
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_main: SELECT test_vc_commit('main', 'c2');
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step s1_sever: SELECT test_vc_sever(1) AS cut; <waiting ...>
+step s2_commit: COMMIT;
+step s1_sever: <... completed>
+cut
+---
+  0
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_log('main') AS main, test_vc_log('b') AS b,
+		test_vc_working_has('main', 'c2') AS has_c2,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+main|b |has_c2|commits
+----+--+------+-------
+c2  |b1|t     |      2
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+
+
+starting permutation: s1_begin s1_sever s2_b s1_commit c_repo
+test_vc_rewrite
+---------------
+t              
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_sever: SELECT test_vc_sever(1) AS cut;
+cut
+---
+  0
+(1 row)
+
+step s2_b: SELECT test_vc_commit('b', 'b2'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_b: <... completed>
+test_vc_commit
+--------------
+t             
+(1 row)
+
+step c_repo: 
+	SELECT test_vc_log('main') AS main, test_vc_log('b') AS b,
+		test_vc_working_has('main', 'c2') AS has_c2,
+		(SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'vc/commit/%') AS commits;
+
+main|b       |has_c2|commits
+----+--------+------+-------
+c1  |b2 b1 c1|f     |      3
+(1 row)
+
+cleared
+-------
+t      
+(1 row)
+

@@ -16,6 +16,7 @@ OBJS = \
 	unit_engine_lifetime.o \
 	unit_engine_prolly.o \
 	unit_engine_remote.o \
+	unit_engine_rewrite.o \
 	unit_engine_vc.o \
 	unit_engine_window.o \
 	vc_sql.o \
@@ -32,7 +33,7 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
 	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats \
 	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_holds chunk_reclaim chunk_compact chunk_abandoned \
-	history_pointers chunk_store_pages chunk_store_memory chunk_store_tier history_push chunk_pack_reclaim object_store_directory
+	history_pointers chunk_store_pages chunk_store_memory chunk_store_tier history_push chunk_pack_reclaim object_store_directory vc_cancel
 ISOLATION = bmap_shared_writers chunk_index_put_wait chunk_roots_wait chunk_free_wait \
 	chunk_pack_put_wait chunk_vacuum_cancel chunk_pack_pins chunk_take_back chunk_hold chunk_run_seal chunk_free_order chunk_move history_push_inflight history_push_races
 REGRESS_OPTS = --temp-config=$(srcdir)/chunk_store.conf
@@ -64,7 +65,7 @@ endif
 # index splitting a bucket, and expect it to split where it does after
 # the tests before them; version control's commits, with chunks of their
 # own, would make it split elsewhere)
-ISOLATION += vc_branch_races vc_open_race vc_window_races
+ISOLATION += vc_branch_races vc_open_race vc_window_races vc_rewrite_commit
 ifeq ($(enable_injection_points),yes)
 ISOLATION += vc_sever_commit
 endif

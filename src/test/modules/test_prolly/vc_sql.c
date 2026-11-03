@@ -23,6 +23,7 @@
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "prolly/engine/chunkfmt.h"
 #include "prolly/engine/vc.h"
 #include "utils/builtins.h"
@@ -42,6 +43,8 @@ PG_FUNCTION_INFO_V1(test_vc_rows);
 PG_FUNCTION_INFO_V1(test_vc_sever);
 PG_FUNCTION_INFO_V1(test_vc_branch_at);
 PG_FUNCTION_INFO_V1(test_vc_merge);
+PG_FUNCTION_INFO_V1(test_vc_rewrite);
+PG_FUNCTION_INFO_V1(test_vc_cancel);
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -538,4 +541,130 @@ test_vc_merge(PG_FUNCTION_ARGS)
 	if (how == NULL)
 		PG_RETURN_TEXT_P(cstring_to_text(psprintf("error %d", rc)));
 	PG_RETURN_TEXT_P(cstring_to_text(how));
+}
+
+/*
+ * test_vc_rewrite(rewrite bool) returns bool: the repository's history mode set,
+ * REWRITE if rewrite, else KEEP
+ */
+Datum
+test_vc_rewrite(PG_FUNCTION_ARGS)
+{
+	bool		on = PG_GETARG_BOOL(0);
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		vc_set_history_mode(&r, on ? VC_HISTORY_REWRITE : VC_HISTORY_KEEP);
+	});
+	PG_RETURN_BOOL(true);
+}
+
+static void
+count_change_fn(void *arg, const VcTableChange *c)
+{
+	(*(uint64 *) arg)++;
+}
+
+/*
+ * The history store's reads, counted: the statement cancelled as the
+ * cancel_after'th chunk is read, so the next check for interrupts, deep in
+ * the operation reading it, ends it.
+ */
+static const ChunkStoreRoutine *counted_inner;
+static ChunkStoreRoutine counted_routine;
+static int	cancel_after;
+
+static void
+count_read(int n)
+{
+	if (cancel_after > 0 && (cancel_after -= n) <= 0)
+	{
+		cancel_after = 0;
+		QueryCancelPending = true;
+		InterruptPending = true;
+	}
+}
+
+static void *
+counted_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
+{
+	count_read(1);
+	return counted_inner->get(cs, hash, len);
+}
+
+static void
+counted_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out, uint32 *lens)
+{
+	count_read(n);
+	counted_inner->get_many(cs, hashes, n, out, lens);
+}
+
+/*
+ * test_vc_cancel(op text, after int4) returns text: op ('diff' of main and
+ * b, 'merge' of b into main, 'sever' to a window of 1), its statement
+ * cancelled as it reads its after'th chunk: an error at the next check for
+ * interrupts; 'finished' if it ran to its end first
+ */
+Datum
+test_vc_cancel(PG_FUNCTION_ARGS)
+{
+	char	   *op = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		after = PG_GETARG_INT32(1);
+	VcRepo		r;
+
+	VC_CALL(r, 0,
+	{
+		VcBranch	main,
+					b;
+		ChunkStore *cs = r.ctx.cs;
+
+		checkout(&r, "main");
+		if (!vc_branch_get(&r, "main", &main) || !vc_branch_get(&r, "b", &b))
+			elog(ERROR, "branches main and b are needed");
+		counted_inner = cs->routine;
+		counted_routine = *cs->routine;
+		counted_routine.get = counted_get;
+		if (counted_inner->get_many)
+			counted_routine.get_many = counted_get_many;
+		cancel_after = after;
+		cs->routine = &counted_routine;
+		PG_TRY(2);
+		{
+			if (strcmp(op, "diff") == 0)
+			{
+				uint64		n = 0;
+
+				(void) vc_diff_commits(&r, &main.head, &b.head, 0, count_change_fn, &n);
+			}
+			else if (strcmp(op, "merge") == 0)
+			{
+				VcMergeResult m;
+
+				if (vc_merge(&r, "b", &m) == VC_OK)
+					vc_merge_result_free(&m);
+			}
+			else if (strcmp(op, "sever") == 0)
+			{
+				VcWindow	w = {.depth = 1};
+				uint32		seg;
+
+				(void) vc_sever(&r, &w, &seg);
+			}
+			else
+				elog(ERROR, "no op \"%s\"", op);
+		}
+		PG_FINALLY(2);
+		{
+			cs->routine = counted_inner;
+			cancel_after = 0;
+		}
+		PG_END_TRY(2);
+		/* (ran to its end first: the cancel, if armed, taken back) */
+		QueryCancelPending = false;
+		InterruptPending = false;
+		vc_branch_free(&main);
+		vc_branch_free(&b);
+	});
+	PG_RETURN_TEXT_P(cstring_to_text("finished"));
 }

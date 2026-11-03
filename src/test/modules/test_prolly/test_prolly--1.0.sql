@@ -633,6 +633,18 @@ CREATE FUNCTION test_vc_branch_at(name text, branch text, msg text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- The repository's history mode: REWRITE if rewrite, else KEEP.
+CREATE FUNCTION test_vc_rewrite(rewrite bool)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- op ('diff', 'merge' or 'sever') run with its statement cancelled as it
+-- reads its after'th chunk: an error at the next check for interrupts, or
+-- 'finished' if it ran to its end first.
+CREATE FUNCTION test_vc_cancel(op text, after int4)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- other merged into branch: how, or the error's code.
 CREATE FUNCTION test_vc_merge(branch text, other text)
 RETURNS text
