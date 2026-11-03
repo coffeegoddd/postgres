@@ -160,9 +160,14 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_sql          | rows                                 | ok     | 
  ws_sql          | attempt                              | ok     | 
  ws_sql          | attempt_cancelled                    | ok     | 
+ ws_sql          | attempt_whose_error                  | ok     | 
+ ws_sql          | attempt_group                        | ok     | 
+ ws_sql          | attempt_in_spi                       | ok     | 
+ ws_sql          | parameter_encoding                   | ok     | 
+ ws_sql          | temp_does_not_shadow                 | ok     | 
  ws_sql          | settings                             | ok     | 
  ws_sql          | settings_after_errors                | ok     | 
-(150 rows)
+(155 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

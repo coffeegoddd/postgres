@@ -5,16 +5,27 @@
  *	  and text out, under settings that make the text the same whatever the
  *	  session's are.
  *
- * A scope (begin to end) holds the settings: a value's output text, and a
- * definition the catalogs' functions print, does not depend on the session
- * (DateStyle, IntervalStyle, TimeZone, extra_float_digits, bytea_output,
- * search_path, lc_monetary, quote_all_identifiers), so a commit means the
- * same thing whoever captured it.  With an empty search_path, a statement
- * names its schemas.
+ * A scope (begin to end) holds the settings a statement's output depends on:
+ * a value's output text, and a definition the catalogs' functions print,
+ * does not depend on the session (DateStyle, IntervalStyle, TimeZone,
+ * extra_float_digits, bytea_output, search_path, lc_monetary,
+ * quote_all_identifiers), and what is read is this branch's whole
+ * (catalog_branch_filter, and row_security: a row a policy would hide is an
+ * error, not a row left out).  So a commit means the same thing whoever
+ * captured it.  The search path is pg_catalog then the session's temporary
+ * schema, which cannot shadow the catalogs: a statement names its schemas.
+ * It holds no setting that only input depends on.  A scope's end puts back
+ * what it set, not what a statement set: a statement's SET outlives it.
  *
- * A statement's parameters are text, $1 and on: it casts them to what it
- * needs.  Each statement reads with a snapshot of its own, so it sees what
- * those before it changed.
+ * A statement's parameters are text, $1 and on, valid in the database's
+ * encoding: it casts them to what it needs.  Each statement reads with a
+ * snapshot of its own, so it sees what those before it changed; and, in READ
+ * COMMITTED, what other sessions committed between them: a caller needing
+ * one point in time is in REPEATABLE READ already.
+ *
+ * This is for catalogs and statements, not a table's rows: all of a
+ * statement's rows are held in memory as text, and more than an int counts
+ * is an error.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -61,10 +72,16 @@ typedef struct WsSqlRoutine
 						WsSqlRows *rows);
 	/*
 	 * A statement run; if it fails, false, with what it changed undone and
-	 * its failure in *failure.
+	 * its failure in *failure.  A failure is the statement's own: its data, a
+	 * constraint, its syntax or what it names, or an error a function it ran
+	 * raised.  Any other error (a cancel, a lock's timeout or deadlock, no
+	 * memory or disk, corruption) is raised, as run's.  A deferred constraint
+	 * is checked as the transaction commits, not here.
 	 */
 	bool		(*attempt) (const char *sql, int nparams, const char *const *params,
 							WsSqlRows *rows, WsSqlFailure *failure);
+	/* The same of what fn does: statements, and the work between them. */
+	bool		(*attempt_fn) (void (*fn) (void *arg), void *arg, WsSqlFailure *failure);
 } WsSqlRoutine;
 
 extern PGDLLIMPORT const WsSqlRoutine SpiWsSql;

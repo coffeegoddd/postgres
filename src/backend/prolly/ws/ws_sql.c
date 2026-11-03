@@ -15,6 +15,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
+#include "mb/pg_wchar.h"
 #include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -24,9 +25,10 @@
 const WsSqlRoutine *WsSql = &SpiWsSql;
 
 /*
- * The settings a commit's text is written under.  (lc_monetary: money's
- * output.  quote_all_identifiers: what format_type and the pg_get_*
- * functions print.)
+ * The settings a commit is captured under.  (lc_monetary: money's output.
+ * quote_all_identifiers: what format_type and the pg_get_* functions print.
+ * catalog_branch_filter: other branches' objects stay out of a commit.
+ * row_security: a policy does not quietly leave rows out.)
  */
 static const struct
 {
@@ -38,11 +40,14 @@ static const struct
 	{"TimeZone", "UTC"},
 	{"extra_float_digits", "1"},
 	{"bytea_output", "hex"},
-	{"search_path", ""},
+	{"search_path", "pg_catalog, pg_temp"},
 	{"lc_monetary", "C"},
 	{"quote_all_identifiers", "off"},
+	{"catalog_branch_filter", "on"},
+	{"row_security", "off"},
 };
 
+/* (as PGC_SUSET: catalog_branch_filter is, and this is no user's choosing) */
 static int
 spi_begin_scope(void)
 {
@@ -50,7 +55,7 @@ spi_begin_scope(void)
 
 	for (size_t i = 0; i < lengthof(ws_settings); i++)
 		(void) set_config_option(ws_settings[i].name, ws_settings[i].value,
-								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+								 PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return level;
 }
 
@@ -58,6 +63,35 @@ static void
 spi_end_scope(int level)
 {
 	AtEOXact_GUC(true, level);
+}
+
+/*
+ * Whether an error is the statement's own to report: what it was given or
+ * asked for, or what a function it ran raised, and not the server's state.
+ * (All else is raised: the next statement could not rightly go on.)
+ */
+static bool
+statements_own_error(int code)
+{
+	if (code == ERRCODE_LOCK_NOT_AVAILABLE)
+		return false;
+	if (code == ERRCODE_RAISE_EXCEPTION)
+		return true;
+	switch (ERRCODE_TO_CATEGORY(code))
+	{
+		case ERRCODE_CARDINALITY_VIOLATION:
+		case ERRCODE_DATA_EXCEPTION:
+		case ERRCODE_DEPENDENT_PRIVILEGE_DESCRIPTORS_STILL_EXIST:
+		case ERRCODE_FEATURE_NOT_SUPPORTED:
+		case ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION:
+		case ERRCODE_INVALID_SCHEMA_NAME:
+		case ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE:
+		case ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION:
+		case ERRCODE_WITH_CHECK_OPTION_VIOLATION:
+			return true;
+		default:
+			return false;
+	}
 }
 
 /* The statement run under SPI, its rows copied into cxt. */
@@ -80,6 +114,8 @@ spi_run_in(const char *sql, int nparams, const char *const *params, WsSqlRows *r
 		nulls = palloc_array(char, nparams);
 		for (int i = 0; i < nparams; i++)
 		{
+			if (params[i])
+				(void) pg_verifymbstr(params[i], strlen(params[i]), false);
 			types[i] = TEXTOID;
 			nulls[i] = params[i] ? ' ' : 'n';
 			values[i] = params[i] ? CStringGetTextDatum(params[i]) : (Datum) 0;
@@ -89,6 +125,8 @@ spi_run_in(const char *sql, int nparams, const char *const *params, WsSqlRows *r
 	if (rc < 0)
 		elog(ERROR, "\"%s\" failed: %s", sql, SPI_result_code_string(rc));
 	rows->processed = SPI_processed;
+	if (SPI_tuptable != NULL && SPI_processed > (uint64) INT_MAX)
+		elog(ERROR, "\"%s\" returned too many rows", sql);
 	if (SPI_tuptable != NULL)
 	{
 		TupleDesc	desc = SPI_tuptable->tupdesc;
@@ -120,8 +158,7 @@ spi_run(const char *sql, int nparams, const char *const *params, WsSqlRows *rows
 
 /* (as PL/pgSQL's block with an exception clause: a subtransaction) */
 static bool
-spi_attempt(const char *sql, int nparams, const char *const *params, WsSqlRows *rows,
-			WsSqlFailure *failure)
+spi_attempt_fn(void (*fn) (void *arg), void *arg, WsSqlFailure *failure)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
@@ -132,7 +169,7 @@ spi_attempt(const char *sql, int nparams, const char *const *params, WsSqlRows *
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
 	{
-		spi_run_in(sql, nparams, params, rows, cxt);
+		fn(arg);
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
@@ -147,21 +184,46 @@ spi_attempt(const char *sql, int nparams, const char *const *params, WsSqlRows *
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
-
-		/* (what cannot be gone on from is not the statement's to report) */
-		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
-			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		if (!statements_own_error(edata->sqlerrcode))
 			ReThrowError(edata);
 		memcpy(failure->sqlstate, unpack_sql_state(edata->sqlerrcode), 6);
 		failure->message = edata->message ? pstrdup(edata->message) : NULL;
 		failure->constraint = edata->constraint_name ? pstrdup(edata->constraint_name) : NULL;
 		failure->column = edata->column_name ? pstrdup(edata->column_name) : NULL;
 		FreeErrorData(edata);
-		memset(rows, 0, sizeof(*rows));
 		ok = false;
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+typedef struct AttemptArgs
+{
+	const char *sql;
+	int			nparams;
+	const char *const *params;
+	WsSqlRows  *rows;
+	MemoryContext cxt;
+} AttemptArgs;
+
+static void
+attempt_statement(void *arg)
+{
+	AttemptArgs *a = arg;
+
+	spi_run_in(a->sql, a->nparams, a->params, a->rows, a->cxt);
+}
+
+static bool
+spi_attempt(const char *sql, int nparams, const char *const *params, WsSqlRows *rows,
+			WsSqlFailure *failure)
+{
+	AttemptArgs a = {sql, nparams, params, rows, CurrentMemoryContext};
+
+	if (spi_attempt_fn(attempt_statement, &a, failure))
+		return true;
+	memset(rows, 0, sizeof(*rows));
+	return false;
 }
 
 const WsSqlRoutine SpiWsSql = {
@@ -170,6 +232,7 @@ const WsSqlRoutine SpiWsSql = {
 	.end = spi_end_scope,
 	.run = spi_run,
 	.attempt = spi_attempt,
+	.attempt_fn = spi_attempt_fn,
 };
 
 void
