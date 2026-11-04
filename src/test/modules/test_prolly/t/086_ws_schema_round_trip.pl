@@ -163,6 +163,23 @@ $node->safe_psql('postgres', q{
 	ALTER SEQUENCE src.nn_seqtab_a_seq RENAME TO nn_seq_moved;
 	CREATE TABLE src.nn_seqtab_a_seq (a int);
 	CREATE TABLE src.nn_fk (a int NOT NULL, id int UNIQUE);
+	CREATE TABLE src.pr (a integer, b text, c integer) PARTITION BY RANGE (a, b);
+	CREATE TABLE src.pl (a integer, b text) PARTITION BY LIST (b);
+	CREATE TABLE src.ph (a integer) PARTITION BY HASH (a);
+	CREATE TABLE src.pe (a integer, "Odd" text, c int4range)
+		PARTITION BY RANGE (lower("Odd"), (a + 1), "Odd" COLLATE "POSIX" text_pattern_ops, (a + 2), lower(c));
+	CREATE TABLE src.po (a integer) PARTITION BY RANGE (a other."My Ops");
+	CREATE TABLE src.pk_part (id integer, a integer, r int4range,
+		CONSTRAINT pk_part_k PRIMARY KEY (id),
+		CONSTRAINT pk_part_u UNIQUE (id, a),
+		CONSTRAINT pk_part_c CHECK (a > 0),
+		CONSTRAINT pk_part_x EXCLUDE USING btree (id WITH =, a WITH =) WHERE (a > 0)) PARTITION BY RANGE (id);
+	CREATE INDEX pk_part_i ON src.pk_part (a);
+	CREATE INDEX pk_part_e ON src.pk_part (lower(r));
+	CREATE TABLE src.pren (a integer, b integer) PARTITION BY RANGE ((a + b), a);
+	ALTER TABLE src.pren RENAME a TO z;
+	CREATE TABLE src.pfk_p (id integer PRIMARY KEY) PARTITION BY HASH (id);
+	CREATE TABLE src.pfk_c (id integer, r integer REFERENCES src.pfk_p (id)) PARTITION BY HASH (id);
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -175,7 +192,8 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key',
 	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_defp', 'fk_defc', 'fk_self', 'fk_selfu', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats',
 	'excl', 'excl_ren', 'excl_key',
-	'xnn', 'unn', 'knn', 'xseq', 'useq', 'iseq', 'nn_ren', 'nn_named', 'nn_seqtab', 'nn_seqtab_a_seq', 'nn_fk');
+	'xnn', 'unn', 'knn', 'xseq', 'useq', 'iseq', 'nn_ren', 'nn_named', 'nn_seqtab', 'nn_seqtab_a_seq', 'nn_fk',
+	'pr', 'pl', 'ph', 'pe', 'po', 'pk_part', 'pren', 'pfk_p', 'pfk_c');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -280,6 +298,26 @@ $node->safe_psql('postgres', q{SELECT test_ws_fk_copy('src', 'nn_fk', 'dst_fk')}
 is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_constraint WHERE conrelid = 'dst_fk.nn_fk'::regclass AND conname = 'nn_fk_b_not_null' AND contype = 'f'}),
 	'1', 'and made again');
 
+# a partitioned table made again divides its rows as it did
+my $partdef = q{SELECT pg_get_partkeydef('%s.%s'::regclass)};
+for my $table ('pr', 'pl', 'ph', 'pe', 'po', 'pk_part', 'pren')
+{
+	my $want = $node->safe_psql('postgres', sprintf($partdef, 'src', $table));
+	isnt($want, '', "$table has a partitioning");
+	is($node->safe_psql('postgres', sprintf($partdef, 'dst', $table)), $want, "$table its partitioning made again");
+}
+is($node->safe_psql('postgres', sprintf($partdef, 'src', 'pren')), 'RANGE (((z + b)), z)', '(after its rename)');
+is( $node->safe_psql('postgres', q!SELECT position('z + b'::bytea in test_ws_schema_bytes('src', 'pren')) = 0!),
+	't', 'a partition key stored by tag');
+is($node->safe_psql('postgres', q{SELECT relkind FROM pg_class WHERE oid = 'dst.pk_part_i'::regclass}),
+	'I', 'and its index the kind a partitioned table has');
+$node->safe_psql('postgres', q{
+	CREATE TABLE dst.pr1 PARTITION OF dst.pr FOR VALUES FROM (0, 'a') TO (10, 'z');
+	INSERT INTO dst.pr VALUES (1, 'b', 2);
+});
+is($node->safe_psql('postgres', q{SELECT tableoid::regclass FROM dst.pr}), 'dst.pr1', 'and a partition of it takes its rows');
+$node->safe_psql('postgres', q{DROP TABLE dst.pr1});
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -314,6 +352,7 @@ my %refused_for = (
 	xclu => 'an index has options', xstat => 'an index has options', xcmt => 'a comment',
 	xicmt => 'a comment', xext => 'depends on an extension', fksopt => 'an index has options',
 	seqother => 'its sequence in another schema',
+	part => 'it has partitions', part1 => 'it is a partition', pam => 'another access method', psp => 'a tablespace',
 	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
@@ -326,8 +365,10 @@ my %refused_for = (
 for my $t (
 	[ 'inc', 'CREATE TABLE src.inc (a int, b int, PRIMARY KEY (a) INCLUDE (b))' ],
 	[ 'defr', 'CREATE TABLE src.defr (a int PRIMARY KEY DEFERRABLE)' ],
-	[ 'part', 'CREATE TABLE src.part (a int) PARTITION BY RANGE (a)' ],
-	[ 'part1', q{CREATE TABLE src.part1 PARTITION OF src.part FOR VALUES FROM (0) TO (1)} ],
+	[ 'part', q{CREATE TABLE src.part (a int) PARTITION BY RANGE (a); CREATE TABLE src.part1 PARTITION OF src.part FOR VALUES FROM (0) TO (1)} ],
+	[ 'part1', 'SELECT 1' ],
+	[ 'pam', 'CREATE TABLE src.pam (a int) PARTITION BY RANGE (a) ; ALTER TABLE src.pam SET ACCESS METHOD heap' ],
+	[ 'psp', 'CREATE TABLE src.psp (a int) PARTITION BY RANGE (a) TABLESPACE t86' ],
 	[ 'child', 'CREATE TABLE src.child () INHERITS (src.parent)' ],
 	[ 'parent', 'SELECT 1' ],
 	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],

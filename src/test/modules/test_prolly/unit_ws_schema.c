@@ -1344,6 +1344,165 @@ test_exclusions(void)
 	buf_free(&b);
 }
 
+/* A partitioned table: the record, its bytes and its statement. */
+static void
+test_partitioned(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "text",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	keys[] = {
+		{.tag = 7,.order = 'd',.nulls = 'd'},
+		{.expr = "lower(@{8})",.collation = "\"C\"",.opclass = "o.c",.order = 'd',.nulls = 'd'},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.partition = WS_PARTITION_RANGE,
+	.npartition = 2,.partition_keys = keys};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x02"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x08" "\x01" "b" "\x04" "text" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"			/* no key */
+		"\x00"					/* constraints */
+		"\x00"					/* indexes */
+		"r" "\x02"
+		"\x07" "\x00" "\x00"
+		"\x00" "\x0b" "lower(@{8})" "\x03" "\"C\"" "\x03" "o.c";
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.partition == WS_PARTITION_RANGE && got.npartition == 2);
+	CHECK(got.partition_keys[0].tag == 7);
+	CHECK(strcmp(got.partition_keys[1].expr, "lower(@{8})") == 0);
+	CHECK(strcmp(got.partition_keys[1].opclass, "o.c") == 0);
+	CHECK(got.partition_keys[1].order == 'd' && got.partition_keys[1].nulls == 'd');
+	ws_schema_free(&got);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a integer,\n"
+				 "    b text\n"
+				 ") PARTITION BY RANGE (a, (lower(b)) COLLATE \"C\" o.c)") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+static void
+test_partitioning_problems(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsIndexKey	two[] = {key, key};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.partition = WS_PARTITION_HASH,
+	.npartition = 1,.partition_keys = &key};
+
+	CHECK(ws_schema_problem(&s) == NULL);
+	s.partition = 'z';
+	CHECK(problem_has(ws_schema_problem(&s), "no known kind"));
+	s.partition = WS_PARTITION_NONE;
+	CHECK(problem_has(ws_schema_problem(&s), "no partitioning"));
+	s.partition = WS_PARTITION_RANGE;
+	s.npartition = 0;
+	CHECK(problem_has(ws_schema_problem(&s), "no keys"));
+	s.npartition = PARTITION_MAX_KEYS + 1;
+	CHECK(problem_has(ws_schema_problem(&s), "too many"));
+	s.npartition = 2;
+	s.partition_keys = two;
+	CHECK(ws_schema_problem(&s) == NULL);
+	s.partition = WS_PARTITION_LIST;
+	CHECK(problem_has(ws_schema_problem(&s), "more than one key"));
+	s.partition = WS_PARTITION_RANGE;
+	s.npartition = 1;
+	s.partition_keys = &key;
+	key.order = WS_INDEX_ORDER_DESC;
+	CHECK(problem_has(ws_schema_problem(&s), "an order or an operator"));
+	key.order = 'd';
+	key.nulls = WS_INDEX_NULLS_FIRST;
+	CHECK(problem_has(ws_schema_problem(&s), "an order or an operator"));
+	key.nulls = 'd';
+	key.op = "=";
+	CHECK(problem_has(ws_schema_problem(&s), "an order or an operator"));
+	key.op = NULL;
+	key.tag = 9;
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	key.tag = 0;
+	CHECK(problem_has(ws_schema_problem(&s), "neither"));
+	key.expr = "@{9}";
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+}
+
+typedef struct PartitionAttack
+{
+	const char *expr;
+	const char *collation;
+	const char *opclass;
+} PartitionAttack;
+
+static void
+partition_injected(void *arg)
+{
+	const PartitionAttack *in = arg;
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key = {.tag = in->expr ? 0 : 7,.expr = (char *) in->expr,.collation = (char *) in->collation,
+	.opclass = (char *) in->opclass,.order = 'd',.nulls = 'd'};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.partition = WS_PARTITION_RANGE,
+	.npartition = 1,.partition_keys = &key};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* A partition key's text saying more than the record. */
+static void
+test_partition_injection(void)
+{
+	static const PartitionAttack bad[] = {
+		{.expr = "1), (2"},
+		{.expr = "1)) TABLESPACE x --"},
+		{.expr = "1)) USING heap --"},
+		{.expr = "1)) WITH (fillfactor = 10) --"},
+		{.expr = "1)) ON COMMIT DROP --"},
+		{.collation = "\"C\" int4_ops"},
+		{.collation = "\"C\", a"},
+		{.collation = "\"C\") TABLESPACE x --"},
+		{.collation = " \"C\""},
+		{.opclass = "int4_ops, a"},
+		{.opclass = "int4_ops) USING heap --"},
+		{.opclass = "pg_catalog . int4_ops"},
+	};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(partition_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+
+	/* a stray byte, a partitioning saying none, too many keys */
+	{
+		static const char none[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "\x00";
+		static const char many[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "r" "\x7f";
+		static const char cut[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "r";
+		static const char over[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "h" "\x01" "\x07" "\x00" "\x00" "x";
+
+		check_refused(none, sizeof(none) - 1, "left over");
+		check_refused(many, sizeof(many) - 1, "too many keys");
+		check_refused(cut, sizeof(cut) - 1, "ends early");
+		check_refused(over, sizeof(over) - 1, "left over");
+	}
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -1810,6 +1969,9 @@ static const ProllyUnitTest tests[] = {
 	{"indexes", test_indexes},
 	{"index_problems", test_index_problems},
 	{"index_injection", test_index_injection},
+	{"partitioned", test_partitioned},
+	{"partitioning_problems", test_partitioning_problems},
+	{"partition_injection", test_partition_injection},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},

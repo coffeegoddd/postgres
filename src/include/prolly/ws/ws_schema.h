@@ -100,6 +100,11 @@ typedef struct WsConstraint
 	WsIndex		excl;			/* an exclusion's index */
 } WsConstraint;
 
+#define WS_PARTITION_NONE '\0'
+#define WS_PARTITION_RANGE 'r'
+#define WS_PARTITION_LIST 'l'
+#define WS_PARTITION_HASH 'h'
+
 typedef struct WsTableSchema
 {
 	char	   *name;
@@ -112,6 +117,9 @@ typedef struct WsTableSchema
 	WsConstraint *constraints;	/* other than the key, by name in UTF8's order */
 	int			nindexes;
 	WsIndex    *indexes;		/* those no constraint has, by name in UTF8's order */
+	char		partition;		/* WS_PARTITION_*: how its partitions divide its rows */
+	int			npartition;
+	WsIndexKey *partition_keys; /* a column or expression, its collation and opclass */
 } WsTableSchema;
 
 /*
@@ -129,8 +137,10 @@ typedef struct WsTableSchema
  * if deferrable; indexes in order by name, none named as a constraint with an
  * index or the key, with a method and keys, each a column of its own or an
  * expression, not both, and no operator, INCLUDE's columns its own, an order of
- * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique.
- * NULL if it is so, or what is wrong.
+ * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique;
+ * a known way to partition with keys, one if by list or range's many, none
+ * if not partitioned, each key as an index's with no order or operator.  NULL if
+ * it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -174,7 +184,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * refuses the table here too): false if the schema
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
- * What the record cannot yet hold and would lose (inheritance and partitions,
+ * What the record cannot yet hold and would lose (inheritance, partitions and a
+ * partitioned table with any,
  * storage settings, a key's options, a sequence's, a default using one,
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
