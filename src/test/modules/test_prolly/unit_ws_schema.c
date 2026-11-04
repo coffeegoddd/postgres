@@ -1872,6 +1872,18 @@ test_storage(void)
 				 "ALTER TABLE ONLY x.t ALTER b SET STATISTICS 0, ALTER b SET (n_distinct = '5')") == 0);
 	buf_free(&sql);
 
+	/* (each word as it says it, on a build with no lz4 too) */
+	{
+		WsColumn	words[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.storage = 'p',.compression = 'l'}};
+		WsTableSchema w = {.name = "t",.ncols = 1,.cols = words};
+		Buf			text = BUF_INIT;
+
+		ws_schema_create_table(&w, "x", &text);
+		buf_append_byte(&text, 0);
+		CHECK(strstr((char *) text.data, "a text STORAGE plain COMPRESSION lz4") != NULL);
+		buf_free(&text);
+	}
+
 	/* (none to give: nothing) */
 	{
 		WsTableSchema plain = {.name = "t",.ncols = 1,.cols = &cols[2]};
@@ -1937,6 +1949,23 @@ test_storage_problems(void)
 		static const char saysnone[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x00";
+		static const char outorder[] =
+			"\x01" "\x01" "t" "\x02" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x08" "\x01" "b" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x08" "e" "\x00" "\x00" "\x00" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char dup[] =
+			"\x01" "\x01" "t" "\x02" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x08" "\x01" "b" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x07" "e" "\x00" "\x00" "\x00" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char coloptions[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x7f";
+		static const char toomany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "w" "\x81\x02";
+		static const char wrongorder[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "e" "\x00" "\x00" "\x00" "w" "\x01" "\x00" "\x01" "x" "\x01" "y";
 		static const char target[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\xff\x7f" "\x00";
@@ -1949,6 +1978,11 @@ test_storage_problems(void)
 		check_refused(absent, sizeof(absent) - 1, "does not have");
 		check_refused(saysnone, sizeof(saysnone) - 1, "saying it has none");
 		check_refused(target, sizeof(target) - 1, "out of range");
+		check_refused(outorder, sizeof(outorder) - 1, "not in attribute order");
+		check_refused(dup, sizeof(dup) - 1, "not in attribute order");
+		check_refused(coloptions, sizeof(coloptions) - 1, "more options than bytes");
+		check_refused(toomany, sizeof(toomany) - 1, "more options than a table has");
+		check_refused(wrongorder, sizeof(wrongorder) - 1, "left over");
 	}
 }
 
@@ -1956,7 +1990,6 @@ typedef struct StorageAttack
 {
 	const char *def;
 	char		storage;
-	bool		settings;
 } StorageAttack;
 
 /* What a column's text could add to the statement, in place of what the record says. */

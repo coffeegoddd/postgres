@@ -36,10 +36,11 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/toast_compression.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
-#include "access/toast_compression.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_partitioned_table.h"
@@ -155,8 +156,8 @@ index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 static const char *
 options_problem(const WsOption *options, int n)
 {
-	if (n < 0)
-		return "a negative number of options";
+	if (n < 0 || n > WS_MAX_OPTIONS)
+		return "a number of options no table has";
 	for (int i = 0; i < n; i++)
 	{
 		const WsOption *o = &options[i];
@@ -1117,6 +1118,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		n = get_uvarint(&p, end);
 		if (n == 0)
 			malformed("it has no options, at length");
+		if (n > WS_MAX_OPTIONS)
+			malformed("more options than a table has");
 		/* (each is at least three bytes: its toast byte and two lengths) */
 		if (n > (uint64) (end - p) / 3)
 			malformed("more options than bytes");
@@ -1169,6 +1172,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			col->has_stattarget = target > 0;
 			col->stattarget = target > 0 ? (int) target - 1 : 0;
 			target = get_uvarint(&p, end);
+			if (target > WS_MAX_OPTIONS)
+				malformed("more options than a table has");
 			/* (each is at least two bytes: two lengths) */
 			if (target > (uint64) (end - p) / 2)
 				malformed("more options than bytes");
@@ -2808,7 +2813,7 @@ static const char *const unsupported_sql =
 "    THEN 'a column owns the identity sequence of another table' "
 "  END "
 "FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam "
-"LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid WHERE c.oid = $1::oid";
+"WHERE c.oid = $1::oid";
 
 /*
  * The columns as this snapshot saw them have the names they have now: names
@@ -3146,7 +3151,7 @@ option_cmp(const void *a, const void *b)
 	return strcmp(x->name, y->name);
 }
 
-/* name=value, as a catalog's options array holds each, split in a commit's encoding. */
+/* name=value, as a catalog's options array holds each, each part in a commit's encoding. */
 static void
 read_option(const char *held, bool toast, WsOption *o)
 {
@@ -3169,6 +3174,24 @@ read_options(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 	WsSql->run("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
 			   "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
 			   "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
+	/*
+	 * A TOAST table outlives the need for one, and its parameters with it, where
+	 * CREATE TABLE would make none and lose them: what decides is what it would.
+	 */
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_sql_value(&rows, i, 1)[0] == 't')
+		{
+			Relation	r = relation_open(atooid(oid), NoLock);
+			bool		needs = table_relation_needs_toast_table(r);
+
+			relation_close(r, NoLock);
+			if (!needs)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the schema of table \"%s\" cannot be read yet: its TOAST table has parameters, and it no longer needs one",
+								out->name)));
+			break;
+		}
 	if (rows.nrows > 0)
 	{
 		out->options = px_malloc((size_t) rows.nrows * sizeof(WsOption));

@@ -682,6 +682,20 @@ for my $table ('so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 
 }
 isnt($node->safe_psql('postgres', q{SELECT reloptions FROM pg_class WHERE oid = 'src.so_tab'::regclass}), '', '(it has some)');
 
+# parameters in another order than the record's, however they came to be: the same bytes
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.so_un (a integer) WITH (parallel_workers = 2, fillfactor = 50, autovacuum_enabled = false);
+	ALTER TABLE src.so_un SET (toast_tuple_target = 200), ALTER a SET (n_distinct_inherited = 7, n_distinct = 5);
+	CREATE TABLE src.so_un2 (a integer) WITH (autovacuum_enabled = false, fillfactor = 50, parallel_workers = 2, toast_tuple_target = 200);
+	ALTER TABLE src.so_un2 ALTER a SET (n_distinct = 5, n_distinct_inherited = 7);
+	CREATE SCHEMA so_dst VERSIONED;
+});
+{
+	my $hex = $bytes->($node, 'postgres', 'so_un');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'so_dst')});
+	is($bytes->($node, 'postgres', 'so_un', undef, 'so_dst'), $hex, 'parameters in any order made again in one');
+}
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -718,7 +732,7 @@ my %refused_for = (
 	seqother => 'its sequence in another schema',
 	ponly => 'or is not valid', ponlyk => 'or is not valid',
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
-	ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
+	toastd => 'no longer needs one', toastp => 'no longer needs one', ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
 	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
@@ -758,6 +772,8 @@ for my $t (
 	[ 'pwhole', q{CREATE TABLE src.pwhole (a int) PARTITION BY RANGE ((pwhole IS NOT NULL))} ],
 	[ 'pam', 'CREATE TABLE src.pam (a int) PARTITION BY RANGE (a) ; ALTER TABLE src.pam SET ACCESS METHOD heap' ],
 	[ 'psp', 'CREATE TABLE src.psp (a int) PARTITION BY RANGE (a) TABLESPACE t86' ],
+	[ 'toastd', 'CREATE TABLE src.toastd (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE src.toastd DROP COLUMN t' ],
+	[ 'toastp', 'CREATE TABLE src.toastp (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE src.toastp ALTER t SET STORAGE PLAIN' ],
 	[ 'ihx', q{CREATE TABLE ptother.ihxp (a int); CREATE TABLE src.ihx () INHERITS (ptother.ihxp)} ],
 	[ 'ihf', q{CREATE FOREIGN TABLE src.ihfp (a int) SERVER pxs; CREATE TABLE src.ihf () INHERITS (src.ihfp)} ],
 	[ 'ihg', q{CREATE TABLE src.ihg (a int); CREATE FOREIGN TABLE src.ihg1 () INHERITS (src.ihg) SERVER pxs} ],
@@ -1401,7 +1417,7 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 		qq{SET client_encoding = UTF8; SELECT test_ws_schema_set_inherited(decode('$inh_utf8', 'hex'), 'lié');});
 	like($err, qr/table "enfanté" says "colonné" is inherited/, 'a lie told in the server\'s encoding');
 }
-# storage parameters' text in each encoding (the server takes any name in a toast's place: only a value it would refuse, none here)
+# settings around names in each encoding (parameters themselves are ASCII: the server refuses any other)
 my $so_sql = q{
 	SET client_encoding = UTF8;
 	CREATE TABLE enc."stocké" ("colonné" text STORAGE EXTERNAL) WITH (fillfactor = 50);
