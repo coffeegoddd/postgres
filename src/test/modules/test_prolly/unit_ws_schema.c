@@ -22,8 +22,8 @@
 
 /* t (id bigint PRIMARY KEY, v text COLLATE "C" DEFAULT '', g bigint GENERATED, w ...) */
 static WsColumn example_cols[] = {
-	{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,.not_null = true,
-	.identity = WS_IDENTITY_ALWAYS},
+	{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,.not_null = "nn",
+	.identity = WS_IDENTITY_ALWAYS,.identity_seq = "s"},
 	{.tag = 300,.name = "v",.type = "text",.kind = WS_COL_STORED,.def = "''::text",
 	.collation = "pg_catalog.\"C\""},
 	{.tag = 5,.name = "g",.type = "bigint",.kind = WS_COL_GENERATED_STORED,.def = "(@{7} * 2)"},
@@ -49,6 +49,13 @@ str_same(const char *a, const char *b)
 }
 
 /* A schema's bytes are the format: changing them is changing every commit. */
+/* (a problem not found is the test's failure, not its crash) */
+static bool
+problem_has(const char *problem, const char *why)
+{
+	return problem != NULL && strstr(problem, why) != NULL;
+}
+
 static void
 test_bytes(void)
 {
@@ -56,12 +63,12 @@ test_bytes(void)
 		"\x01"					/* version */
 		"\x01" "t"				/* name */
 		"\x01"					/* columns */
-		"\x07" "\x02" "id" "\x06" "bigint" "s" "\x01" "a" "\x00" "\x00"
+		"\x07" "\x02" "id" "\x06" "bigint" "s" "\x02" "nn" "a" "\x01" "s" "\x00" "\x00"
 		"\x02" "pk" "\x01\x07"	/* key: its name, its columns */
 		"\x00"					/* constraints */
 		"\x00";					/* indexes */
 	WsColumn	cols[] = {{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,
-		.not_null = true,.identity = WS_IDENTITY_ALWAYS}};
+		.not_null = "nn",.identity = WS_IDENTITY_ALWAYS,.identity_seq = "s"}};
 	WsTableSchema s = {.name = "t",.ncols = 1,
 	.cols = cols,.key_name = "pk",.nkey = 1,.key = example_key};
 	Buf			b = BUF_INIT;
@@ -75,13 +82,13 @@ test_bytes(void)
 	{
 		static const char want2[] =
 			"\x01" "\x01" "t" "\x03"
-			"\x07" "\x01" "k" "\x01" "i" "s" "\x01" "d" "\x00" "\x00"
+			"\x07" "\x01" "k" "\x01" "i" "s" "\x02" "nn" "d" "\x01" "s" "\x00" "\x00"
 			"\xac\x02" "\x01" "v" "\x01" "t" "s" "\x00" "\x00" "\x03" "\'x\'" "\x03" "\"C\""
 			"\x05" "\x01" "g" "\x01" "i" "g" "\x00" "\x00" "\x01" "1" "\x00"
 			"\x02" "pk" "\x01\x07" "\x00" "\x00";
 		WsColumn	c2[] = {
-			{.tag = 7,.name = "k",.type = "i",.kind = WS_COL_STORED,.not_null = true,
-			.identity = WS_IDENTITY_BY_DEFAULT},
+			{.tag = 7,.name = "k",.type = "i",.kind = WS_COL_STORED,.not_null = "nn",
+			.identity = WS_IDENTITY_BY_DEFAULT,.identity_seq = "s"},
 			{.tag = 300,.name = "v",.type = "t",.kind = WS_COL_STORED,.def = "'x'",.collation = "\"C\""},
 			{.tag = 5,.name = "g",.type = "i",.kind = WS_COL_GENERATED_STORED,.def = "1"},
 		};
@@ -113,8 +120,9 @@ test_round_trip(void)
 		CHECK(strcmp(got.cols[i].name, s.cols[i].name) == 0);
 		CHECK(strcmp(got.cols[i].type, s.cols[i].type) == 0);
 		CHECK_EQ(got.cols[i].kind, s.cols[i].kind);
-		CHECK_EQ(got.cols[i].not_null, s.cols[i].not_null);
+		CHECK(str_same(got.cols[i].not_null, s.cols[i].not_null));
 		CHECK_EQ(got.cols[i].identity, s.cols[i].identity);
+		CHECK(str_same(got.cols[i].identity_seq, s.cols[i].identity_seq));
 		CHECK(str_same(got.cols[i].def, s.cols[i].def));
 		CHECK(str_same(got.cols[i].collation, s.cols[i].collation));
 	}
@@ -182,8 +190,8 @@ test_row_shape(void)
 
 		memcpy(cols, example_cols, sizeof(cols));
 		s.cols = cols;
-		cols[1].not_null = true;
-		cols[4].not_null = true;
+		cols[1].not_null = "nn1";
+		cols[4].not_null = "nn4";
 		s.key = key;
 		s.nkey = 2;
 		CHECK(ws_schema_problem(&s) == NULL);
@@ -335,7 +343,7 @@ key_virtual(WsTableSchema *s)
 {
 	static uint64 k[] = {9};
 
-	s->cols[3].not_null = true;
+	s->cols[3].not_null = "nn3";
 	s->key = k;
 }
 
@@ -383,7 +391,7 @@ col_name_long(WsTableSchema *s)
 static void
 identity_nullable(WsTableSchema *s)
 {
-	s->cols[0].not_null = false;
+	s->cols[0].not_null = NULL;
 	s->nkey = 0;
 }
 
@@ -535,7 +543,7 @@ test_malformed(void)
 		{"\x02" "\x01" "t" "\x00" "\x00" "\x00" "\x00" "\x00", 8, "a version not known"},
 		{"\x01" "\x02" "t\0" "\x00" "\x00" "\x00" "\x00" "\x00", 9, "a NUL"},
 		{"\x01" "\x09" "t", 3, "runs past its end"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 19, "neither"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "nn" "a" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 22, "sequence with no name"},
 		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00" "\x00", 8, "more columns than a table can have"},
 		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00" "\x00", 10, "a key of more columns"},
 		/* constraints */
@@ -585,7 +593,7 @@ test_create_table(void)
 {
 	static const char want[] =
 		"CREATE TABLE sch.t (\n"
-		"    id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,\n"
+		"    id bigint GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME sch.s) CONSTRAINT nn NOT NULL,\n"
 		"    v text COLLATE pg_catalog.\"C\" DEFAULT (''::text),\n"
 		"    g bigint GENERATED ALWAYS AS ((id * 2)) STORED,\n"
 		"    w bigint GENERATED ALWAYS AS ((id + 1)) VIRTUAL,\n"
@@ -607,7 +615,7 @@ static void
 test_create_table_names(void)
 {
 	WsColumn	cols[] = {
-		{.tag = 1,.name = "Odd Name",.type = "integer",.kind = WS_COL_STORED,.not_null = true},
+		{.tag = 1,.name = "Odd Name",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn"},
 		{.tag = 2,.name = "select",.type = "integer",.kind = WS_COL_STORED,.def = "(@{1} @@ 2)"},
 	};
 	uint64		key[] = {1};
@@ -619,7 +627,7 @@ test_create_table_names(void)
 	buf_append_byte(&b, 0);
 	if (strcmp((char *) b.data,
 			   "CREATE TABLE \"Odd Schema\".\"Odd Table\" (\n"
-			   "    \"Odd Name\" integer NOT NULL,\n"
+			   "    \"Odd Name\" integer CONSTRAINT nn NOT NULL,\n"
 			   "    \"select\" integer DEFAULT ((\"Odd Name\" @ 2)),\n"
 			   "    CONSTRAINT \"Odd Key\" PRIMARY KEY (\"Odd Name\")\n"
 			   ")") != 0)
@@ -670,7 +678,7 @@ typedef struct Injection
 	const char *type;
 	const char *collation;
 	const char *def;
-	bool		not_null;
+	const char *not_null;
 } Injection;
 
 static void
@@ -678,7 +686,7 @@ create_injected(void *arg)
 {
 	Injection  *in = arg;
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = (char *) in->type,.kind = WS_COL_STORED,
-	.collation = (char *) in->collation,.def = (char *) in->def,.not_null = in->not_null}};
+	.collation = (char *) in->collation,.def = (char *) in->def,.not_null = (char *) in->not_null}};
 	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
 
@@ -724,8 +732,8 @@ test_create_table_injection(void)
 		{.type = "text", .collation = "pg_catalog . \"C\""},
 		{.type = "text", .collation = "12345678901234567890123456789012345678901234567890123456789012345678"},
 		/* a clause standing in for another */
-		{.type = "integer --", .not_null = true, .def = "1\nNOT NULL NOT NULL --"},
-		{.type = "integer", .not_null = true, .def = "1) NOT NULL NO INHERIT --"},
+		{.type = "integer --", .not_null = "nn", .def = "1\nNOT NULL NOT NULL --"},
+		{.type = "integer", .not_null = "nn", .def = "1) NOT NULL NO INHERIT --"},
 		/* the text's fault, by each class a parser raises */
 		{.type = "float(0)"},
 		{.type = "integer", .def = "1::float(0)"},
@@ -772,7 +780,7 @@ create_unchecked(void *arg)
 static void
 generated_replaced(void *arg)
 {
-	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer --",.not_null = true,
+	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer --",.not_null = "nn",
 	.kind = WS_COL_GENERATED_STORED,.def = "1\nNOT NULL NOT NULL --"}};
 	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
@@ -932,18 +940,18 @@ test_constraint_problems(void)
 #undef BAD
 #undef CHECK_C
 	{
-		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = true}};
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn"}};
 		WsConstraint same = {.name = "k",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
 		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.key_name = "k",.nkey = 1,.key = a,
 		.nconstraints = 1,.constraints = &same};
 
-		CHECK(strstr(ws_schema_problem(&s), "named as the key") != NULL);
+		CHECK(problem_has(ws_schema_problem(&s), "named as the key"));
 		same.name = "u";
 		same.kind = WS_CONSTRAINT_UNIQUE;
 		same.expr = NULL;
 		same.ncols = 1;
 		same.cols = a;
-		CHECK(strstr(ws_schema_problem(&s), "alike the key") != NULL);
+		CHECK(problem_has(ws_schema_problem(&s), "alike the key"));
 		/* (not alike: CREATE TABLE makes both) */
 		same.deferrable = true;
 		CHECK(ws_schema_problem(&s) == NULL);
@@ -1089,7 +1097,7 @@ test_index_problems(void)
 		{"no method", {.name = "x"}, OK_KEY},
 		{"too long", {.name = "1234567890123456789012345678901234567890123456789012345678901234",
 		.method = "btree"}, OK_KEY},
-		{"named as a unique constraint", {.name = "c",.method = "btree"}, OK_KEY},
+		{"named as a constraint with an index", {.name = "c",.method = "btree"}, OK_KEY},
 		{"does not have", {.name = "x",.method = "btree",.predicate = "(@{9} > 0)"}, OK_KEY},
 		{"malformed", {.name = "x",.method = "btree",.predicate = "@"}, OK_KEY},
 		{"no known order", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'a',.nulls = 'd'}},
@@ -1132,7 +1140,7 @@ test_index_problems(void)
 	}
 	{
 		/* a key's name; indexes out of order; a check's name is free to take */
-		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.not_null = true}};
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.not_null = "nn"}};
 		uint64		a[] = {7};
 		WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
 		WsConstraint check = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
@@ -1144,13 +1152,13 @@ test_index_problems(void)
 		WsIndex		as_check = {.name = "c",.method = "btree",.nkeys = 1,.keys = &key};
 		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 2,.indexes = two};
 
-		CHECK(strstr(ws_schema_problem(&s), "not in order") != NULL);
+		CHECK(problem_has(ws_schema_problem(&s), "not in order"));
 		s.nindexes = 1;
 		s.indexes = &named;
 		s.key_name = "k";
 		s.nkey = 1;
 		s.key = a;
-		CHECK(strstr(ws_schema_problem(&s), "named as the key") != NULL);
+		CHECK(problem_has(ws_schema_problem(&s), "named as the key"));
 		s.key_name = NULL;
 		s.nkey = 0;
 		s.key = NULL;
@@ -1281,6 +1289,379 @@ test_index_injection(void)
 	}
 }
 
+/* An exclusion constraint: the record, its bytes and its statement. */
+static void
+test_exclusions(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "int4range",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	keys[] = {
+		{.tag = 7,.order = 'd',.nulls = 'd',.op = "&&"},
+		{.expr = "(@{8} + 1)",.collation = "\"C\"",.opclass = "o.c",.order = 'D',.nulls = 'l',.op = "o.==="},
+	};
+	uint64		include[] = {8};
+	WsConstraint con = {.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,.deferrable = true,.initdeferred = true,
+		.excl = {.method = "gist",.nkeys = 2,.keys = keys,.ninclude = 1,.include = include,
+	.predicate = "(@{8} > 0)"}};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 1,.constraints = &con};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x02"
+		"\x07" "\x01" "a" "\x09" "int4range" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x08" "\x01" "b" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"			/* no key */
+		"\x01"					/* constraints */
+		"\x01" "x" "x" "\x06" "\x04" "gist" "\x02"
+		"\x07" "\x00" "\x00" "d" "d" "\x02" "&&"
+		"\x00" "\x0a" "(@{8} + 1)" "\x03" "\"C\"" "\x03" "o.c" "D" "l" "\x05" "o.==="
+		"\x01" "\x08" "\x0a" "(@{8} > 0)"
+		"\x00";					/* indexes */
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.constraints[0].kind == WS_CONSTRAINT_EXCLUSION);
+	CHECK(strcmp(got.constraints[0].excl.keys[1].op, "o.===") == 0);
+	CHECK(strcmp(got.constraints[0].excl.predicate, "(@{8} > 0)") == 0);
+	CHECK(got.constraints[0].excl.include[0] == 8 && got.constraints[0].initdeferred);
+	ws_schema_free(&got);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a int4range,\n"
+				 "    b integer,\n"
+				 "    CONSTRAINT x EXCLUDE USING gist (a WITH OPERATOR(&&), ((b + 1)) COLLATE \"C\" o.c DESC NULLS LAST WITH OPERATOR(o.===))"
+				 " INCLUDE (b) WHERE ((b > 0)) DEFERRABLE INITIALLY DEFERRED\n"
+				 ")") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+/* A column's not-null constraint's and sequence's names: what they must be. */
+static void
+test_column_names(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "n1",
+		.identity = WS_IDENTITY_ALWAYS,.identity_seq = "s1"},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED,.not_null = "n2",
+		.identity = WS_IDENTITY_ALWAYS,.identity_seq = "s2"},
+	};
+	uint64		a[] = {7};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = a,.deferrable = true};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 1,.keys = &key};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.key_name = "k",.nkey = 1,.key = a,
+	.nconstraints = 1,.constraints = &con,.nindexes = 1,.indexes = &ix};
+	static char too_long[] = "1234567890123456789012345678901234567890123456789012345678901234";
+
+	CHECK(ws_schema_problem(&s) == NULL);
+#define NAMED(field, value, why) \
+	do { \
+		char	   *keep = cols[1].field; \
+		cols[1].field = (char *) (value); \
+		CHECK(problem_has(ws_schema_problem(&s), why)); \
+		cols[1].field = keep; \
+	} while (0)
+	NAMED(not_null, "", "no name");
+	NAMED(not_null, too_long, "too long");
+	NAMED(not_null, "n1", "two not-null constraints");
+	NAMED(not_null, "k", "named as the key");
+	NAMED(not_null, "c", "as another constraint");
+	NAMED(identity_seq, NULL, "no sequence");
+	NAMED(identity_seq, "", "no name");
+	NAMED(identity_seq, too_long, "too long");
+	NAMED(identity_seq, "s1", "two sequences");
+	NAMED(identity_seq, "t", "as the table");
+	NAMED(identity_seq, "k", "or its key");
+	NAMED(identity_seq, "c", "constraint with an index");
+	NAMED(identity_seq, "i", "as an index");
+#undef NAMED
+	/* (a relation's name is free to a not-null constraint, a constraint's to a sequence if no index) */
+	cols[1].not_null = "i";
+	CHECK(ws_schema_problem(&s) == NULL);
+	cols[1].not_null = "n2";
+	cols[1].identity = WS_IDENTITY_NONE;
+	CHECK(problem_has(ws_schema_problem(&s), "sequence with no identity"));
+}
+
+/* More than the decoder first makes room for, each with what it holds. */
+static void
+test_many_constraints(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint cons[50];
+	char		names[50][8];
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 50,.constraints = cons};
+	Buf			b = BUF_INIT;
+	WsTableSchema got;
+
+	memset(cons, 0, sizeof(cons));
+	for (int i = 0; i < 50; i++)
+	{
+		snprintf(names[i], sizeof(names[i]), "c%02d", i);
+		cons[i].name = names[i];
+		cons[i].kind = WS_CONSTRAINT_CHECK;
+		cons[i].expr = "true";
+	}
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK_EQ(got.nconstraints, 50);
+	for (int i = 0; i < 50; i++)
+		CHECK(strcmp(got.constraints[i].name, names[i]) == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+}
+
+static const char *
+exclusion_problem(const WsIndexKey *key, const char *method, const char *predicate,
+				  const WsConstraint *extra)
+{
+	static WsColumn cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint cons[2] = {{.name = "a",.kind = WS_CONSTRAINT_EXCLUSION,
+			.excl = {.method = (char *) method,.nkeys = 1,.keys = (WsIndexKey *) key,
+	.predicate = (char *) predicate}}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = extra ? 2 : 1,.constraints = cons};
+
+	if (extra)
+		cons[1] = *extra;
+	return ws_schema_problem(&s);
+}
+
+static void
+test_exclusion_problems(void)
+{
+	WsIndexKey	ok = {.tag = 7,.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	noop = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsIndexKey	emptyop = {.tag = 7,.order = 'd',.nulls = 'd',.op = ""};
+	WsIndexKey	nocol = {.tag = 9,.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	badexpr = {.expr = "@{9}",.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	both = {.tag = 7,.expr = "1",.order = 'd',.nulls = 'd',.op = "="};
+	WsConstraint alike = {.name = "b",.kind = WS_CONSTRAINT_EXCLUSION,
+	.excl = {.method = "gist",.nkeys = 1,.keys = &ok}};
+	WsConstraint other = alike;
+
+	CHECK(exclusion_problem(&ok, "gist", NULL, NULL) == NULL);
+	CHECK(problem_has(exclusion_problem(&noop, "gist", NULL, NULL), "no operator"));
+	CHECK(problem_has(exclusion_problem(&emptyop, "gist", NULL, NULL), "no operator"));
+	CHECK(problem_has(exclusion_problem(&nocol, "gist", NULL, NULL), "does not have"));
+	CHECK(problem_has(exclusion_problem(&badexpr, "gist", NULL, NULL), "does not have"));
+	CHECK(problem_has(exclusion_problem(&both, "gist", NULL, NULL), "or both"));
+	CHECK(problem_has(exclusion_problem(&ok, NULL, NULL, NULL), "no method"));
+	CHECK(problem_has(exclusion_problem(&ok, "gist", "@", NULL), "malformed"));
+	CHECK(problem_has(exclusion_problem(&ok, "gist", NULL, &alike), "alike"));
+	/* (each difference is another index) */
+	other.deferrable = true;
+	CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	other = alike;
+	other.excl.method = "btree";
+	CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	other = alike;
+	other.excl.predicate = "true";
+	CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	{
+		WsIndexKey	op2 = {.tag = 7,.order = 'd',.nulls = 'd',.op = "<>"};
+
+		other = alike;
+		other.excl.keys = &op2;
+		CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	}
+	{
+		/* an exclusion's fields elsewhere, and elsewhere's on an exclusion */
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+		uint64		a[] = {7};
+		WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true",.excl = {.method = "gist"}};
+		WsIndexKey	idxkey = {.tag = 7,.order = 'd',.nulls = 'd'};
+		WsIndex		ix = {.name = "c",.method = "btree",.nkeys = 1,.keys = &idxkey};
+		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+
+		CHECK(problem_has(ws_schema_problem(&s), "an exclusion's fields"));
+		con.excl.method = NULL;
+		con.excl.unique = true;
+		CHECK(problem_has(ws_schema_problem(&s), "an exclusion's fields"));
+		con.excl.unique = false;
+		con.excl.nulls_not_distinct = true;
+		CHECK(problem_has(ws_schema_problem(&s), "an exclusion's fields"));
+		con = (WsConstraint) {.name = "c",.kind = WS_CONSTRAINT_EXCLUSION,.ncols = 1,.cols = a,
+		.excl = {.method = "gist",.nkeys = 1,.keys = &ok}};
+		CHECK(problem_has(ws_schema_problem(&s), "another constraint's fields"));
+		con.ncols = 0;
+		con.cols = NULL;
+		con.excl.unique = true;
+		CHECK(problem_has(ws_schema_problem(&s), "or unique"));
+		con.excl.unique = false;
+		con.excl.name = "c";
+		CHECK(problem_has(ws_schema_problem(&s), "or unique"));
+		con.excl.name = NULL;
+		CHECK(ws_schema_problem(&s) == NULL);
+		/* (an index of the exclusion's name, and an operator on a plain index) */
+		s.nindexes = 1;
+		s.indexes = &ix;
+		CHECK(problem_has(ws_schema_problem(&s), "named as a constraint"));
+		ix.name = "i";
+		CHECK(ws_schema_problem(&s) == NULL);
+		idxkey.op = "=";
+		CHECK(problem_has(ws_schema_problem(&s), "with an operator"));
+	}
+}
+
+typedef struct ExclusionAttack
+{
+	const char *op;
+	const char *expr;
+	const char *predicate;
+	const char *opclass;
+	const char *collation;
+} ExclusionAttack;
+
+static void
+exclusion_injected(void *arg)
+{
+	const ExclusionAttack *in = arg;
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	key = {.tag = in->expr ? 0 : 7,.expr = (char *) in->expr,.opclass = (char *) in->opclass,
+		.collation = (char *) in->collation,.order = 'd',.nulls = 'd',.op = (char *) (in->op ? in->op : "=")};
+	WsConstraint con = {.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,
+		.excl = {.method = "gist",.nkeys = 1,.keys = &key,
+	.predicate = (char *) in->predicate}};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/*
+ * A comment ending one key's expression and a newline in the next's, so that
+ * the statement says more after them; each key's WITH is said before the comment.
+ */
+static void
+exclusion_spanned(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	keys[] = {
+		{.expr = "1) WITH OPERATOR(=) --",.order = 'd',.nulls = 'd',.op = "="},
+		{.expr = (char *) arg,.order = 'd',.nulls = 'd',.op = "="},
+	};
+	WsConstraint con = {.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,
+	.excl = {.method = "gist",.nkeys = 2,.keys = keys}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* body(arg) raises ERRCODE_DATA_CORRUPTED, saying this: which check caught it. */
+static void
+refused_saying(void (*body) (void *), void *arg, const char *why)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *edata = NULL;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		body(arg);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (edata == NULL)
+		elog(ERROR, "no error, for: %s", why);
+	if (edata->sqlerrcode != ERRCODE_DATA_CORRUPTED || strstr(edata->message, why) == NULL)
+		elog(ERROR, "\"%s\", for: %s", edata->message, why);
+}
+
+/* Text differing where the grammar does not: CREATE TABLE would keep one. */
+static void
+exclusions_parse_alike(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key1 = {.expr = "@{7}",.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	key2 = {.expr = " @{7}",.order = 'd',.nulls = 'd',.op = "="};
+	WsConstraint cons[] = {
+		{.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,.excl = {.method = "gist",.nkeys = 1,.keys = &key1}},
+		{.name = "y",.kind = WS_CONSTRAINT_EXCLUSION,.excl = {.method = "gist",.nkeys = 1,.keys = &key2}},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 2,.constraints = cons};
+	Buf			b = BUF_INIT;
+
+	CHECK(ws_schema_problem(&s) == NULL);
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* A clause of the statement, hidden from the record: named otherwise than it says. */
+static void
+test_not_null_name_injection(void)
+{
+	Injection	in = {.type = "integer --",.not_null = "nn",.def = "1\nCONSTRAINT other NOT NULL DEFAULT (1) --"};
+
+	refused_saying(create_injected, &in, "not-null constraint");
+}
+
+static void
+test_exclusion_injection(void)
+{
+	static const ExclusionAttack bad[] = {
+		{.op = "= ) WHERE (true) --"},
+		{.op = "=) WHERE (true"},
+		{.op = "=), b WITH OPERATOR(="},
+		{.op = "= /* */"},
+		{.op = "=/*"},
+		{.op = " ="},
+		{.op = "= "},
+		{.op = "pg_catalog . ="},
+		{.op = "\"pg_catalog\".="},
+		{.op = "PG_CATALOG.="},
+		{.op = "12345678901234567890123456789012345678901234567890123456789012345678.="},
+		{.op = "x"},
+		{.expr = "1) WITH OPERATOR(=), (2"},
+		{.expr = "1)) INCLUDE (a) --"},
+		{.predicate = "true) DEFERRABLE --"},
+		{.predicate = "true) DEFERRABLE INITIALLY DEFERRED --"},
+		{.opclass = "o.c WITH OPERATOR(=), a"},
+		{.opclass = "int4_ops DESC"},
+		{.opclass = "int4_ops NULLS FIRST"},
+		{.collation = "\"C\" DESC"},
+		{.collation = "\"C\" int4_ops"},
+	};
+	static const char *const spanning[] = {
+		"2 /*\n, ((2)) WITH OPERATOR(=)) INCLUDE (a) -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) WITH (fillfactor = 10) -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) USING INDEX TABLESPACE x -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) WHERE (true) -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) DEFERRABLE -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=), ((3)) WITH OPERATOR(=)) -- */",
+	};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(exclusion_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(exclusions_parse_alike, NULL, ERRCODE_DATA_CORRUPTED, NULL);
+
+	for (int i = 0; i < lengthof(spanning); i++)
+		refused_saying(exclusion_spanned, (void *) spanning[i], "another constraint");
+	/* (the clauses all it should be, and the first key not an expression alone) */
+	refused_saying(exclusion_spanned, "2 /*\n, ((2)) WITH OPERATOR(=)) -- */", "syntax error");
+}
+
 /* An expression's references take the names the record has now. */
 static void
 test_create_table_renamed(void)
@@ -1349,13 +1730,13 @@ static void
 create_and_read(void *arg)
 {
 	WsColumn	cols[] = {
-		{.tag = 1,.name = "id",.type = "bigint",.kind = WS_COL_STORED,.not_null = true,
-		.identity = WS_IDENTITY_BY_DEFAULT},
+		{.tag = 1,.name = "id",.type = "bigint",.kind = WS_COL_STORED,.not_null = "nn1",
+		.identity = WS_IDENTITY_BY_DEFAULT,.identity_seq = "made_seq"},
 		{.tag = 2,.name = "v",.type = "character varying(10)",.kind = WS_COL_STORED,
 		.def = "'x'::character varying",.collation = "pg_catalog.\"C\""},
 		{.tag = 3,.name = "g",.type = "bigint",.kind = WS_COL_GENERATED_STORED,.def = "(@{1} * 2)"},
 		{.tag = 4,.name = "w",.type = "bigint",.kind = WS_COL_GENERATED_VIRTUAL,.def = "(@{1} + 1)"},
-		{.tag = 5,.name = "n",.type = "integer",.kind = WS_COL_STORED,.not_null = true},
+		{.tag = 5,.name = "n",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn5"},
 	};
 	uint64		key[] = {5, 1};
 	WsTableSchema s = {.name = "made",.ncols = lengthof(cols),
@@ -1429,6 +1810,12 @@ static const ProllyUnitTest tests[] = {
 	{"indexes", test_indexes},
 	{"index_problems", test_index_problems},
 	{"index_injection", test_index_injection},
+	{"column_names", test_column_names},
+	{"not_null_name_injection", test_not_null_name_injection},
+	{"many_constraints", test_many_constraints},
+	{"exclusions", test_exclusions},
+	{"exclusion_problems", test_exclusion_problems},
+	{"exclusion_injection", test_exclusion_injection},
 	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},

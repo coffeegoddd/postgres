@@ -18,7 +18,7 @@
 #include "test_prolly.h"
 
 static WsColumn cols[] = {
-	{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,.not_null = true},
+	{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,.not_null = "nn"},
 	{.tag = 8,.name = "v",.type = "text",.kind = WS_COL_STORED},
 };
 static uint64 key_tags[] = {7};
