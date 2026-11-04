@@ -64,8 +64,9 @@ typedef struct WsTableSchema
  * What a schema must be, in order to be written and when it is read: named,
  * in names Postgres would not shorten, its columns' tags and names distinct,
  * a generated column with its expression and no identity, an identity not
- * null, no empty expression or collation, a key named if it has columns, its
- * columns its own, stored, not null and distinct.  NULL if it is so, or what
+ * null, no empty expression or collation, an expression's references well
+ * formed, a key named if it has columns, its columns its own, stored, not
+ * null and distinct.  NULL if it is so, or what
  * is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
@@ -98,7 +99,8 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 /*
  * The row codec's shape of the table: the key's columns, then the other
  * stored columns (generated or not) in attribute order, which is COPY's
- * order.  A virtual column has no value.
+ * order.  A virtual column has no value.  A schema with a problem (one a merge
+ * made, not yet checked) raises an error.
  */
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
@@ -107,11 +109,12 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * out; each expression's references the names of its table's columns.  Names
  * are quoted as quote_identifier does, under the session's settings: a scope
  * (prolly/ws/ws_sql.h) makes the text the same whoever asks.  A commit may
- * have come from anywhere, so a type, collation or expression that is not
- * one alone by the grammar, or an expression referring to a column the table
- * does not have, raises ERRCODE_DATA_CORRUPTED, and goes in no statement.
- * A valid expression still runs when the statement does: as a default or a
- * generation expression, with its functions, not as statements of its own.
+ * have come from anywhere: the whole statement is parsed and compared with
+ * the record, and if it is anything but one CREATE TABLE of just these
+ * columns, types, constraints and key, it raises ERRCODE_DATA_CORRUPTED and
+ * is not given back.  A schema with a problem raises an error.  What an
+ * expression does is not checked: a default runs as it is, on later inserts,
+ * with the inserter's privileges.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
 

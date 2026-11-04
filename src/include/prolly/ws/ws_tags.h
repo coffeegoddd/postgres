@@ -23,6 +23,12 @@
 /* A column's name by tag (as it is, not quoted), or NULL if it has none. */
 typedef const char *(*WsTagNameFn) (void *arg, uint64 tag);
 
+/*
+ * Whether stored text is well formed, each reference a tag in its one form:
+ * the same text is always the same bytes.
+ */
+extern bool ws_tags_well_formed(const char *stored);
+
 /* Text as written, appended to out as stored: with no references. */
 extern void ws_tags_escape(const char *text, Buf *out);
 

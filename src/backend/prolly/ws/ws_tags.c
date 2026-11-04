@@ -25,6 +25,51 @@ ws_tags_escape(const char *text, Buf *out)
 	}
 }
 
+/*
+ * The reference at p ("@{"), its tag in *tag and what follows it in *after:
+ * false if it is not one, or not in the tag's one form.
+ */
+static bool
+parse_reference(const char *p, uint64 *tag, const char **after)
+{
+	const char *q = p + 2;
+
+	*tag = 0;
+	if (!isdigit((unsigned char) *q) || (q[0] == '0' && isdigit((unsigned char) q[1])))
+		return false;
+	for (; isdigit((unsigned char) *q); q++)
+	{
+		uint64		d = (uint64) (*q - '0');
+
+		if (*tag > (PG_UINT64_MAX - d) / 10)
+			return false;
+		*tag = *tag * 10 + d;
+	}
+	if (*q != '}')
+		return false;
+	*after = q + 1;
+	return true;
+}
+
+bool
+ws_tags_well_formed(const char *stored)
+{
+	for (const char *p = stored; *p;)
+	{
+		uint64		tag;
+
+		if (*p != '@')
+			p++;
+		else if (p[1] == '@')
+			p += 2;
+		else if (p[1] == '{' && parse_reference(p, &tag, &p))
+			continue;
+		else
+			return false;
+	}
+	return true;
+}
+
 pg_noreturn static void
 malformed(const char *stored)
 {
@@ -39,7 +84,7 @@ ws_tags_render(const char *stored, WsTagNameFn name, void *arg, Buf *out, uint64
 	for (const char *p = stored; *p;)
 	{
 		uint64		tag = 0;
-		const char *q;
+		const char *after;
 		const char *n;
 		const char *quoted;
 
@@ -54,17 +99,7 @@ ws_tags_render(const char *stored, WsTagNameFn name, void *arg, Buf *out, uint64
 			p += 2;
 			continue;
 		}
-		if (p[1] != '{' || !isdigit((unsigned char) p[2]))
-			malformed(stored);
-		for (q = p + 2; isdigit((unsigned char) *q); q++)
-		{
-			uint64		d = (uint64) (*q - '0');
-
-			if (tag > (PG_UINT64_MAX - d) / 10)
-				malformed(stored);
-			tag = tag * 10 + d;
-		}
-		if (*q != '}')
+		if (p[1] != '{' || !parse_reference(p, &tag, &after))
 			malformed(stored);
 		n = name(arg, tag);
 		if (n == NULL)
@@ -76,7 +111,7 @@ ws_tags_render(const char *stored, WsTagNameFn name, void *arg, Buf *out, uint64
 		buf_append(out, quoted, strlen(quoted));
 		if (quoted != n)
 			pfree((char *) quoted);
-		p = q + 1;
+		p = after;
 	}
 	return true;
 }

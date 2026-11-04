@@ -195,10 +195,32 @@ test_row_shape(void)
 	/* no key: every stored column, in attribute order */
 	s.nkey = 0;
 	s.key = NULL;
+	s.key_name = NULL;
 	ws_schema_row_shape(&s, &shape);
 	CHECK(shape.nkey == 0 && shape.nstored == 4);
 	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
 	ws_row_shape_free(&shape);
+}
+
+static void
+shape_of_invalid(void *arg)
+{
+	WsColumn	cols[lengthof(example_cols)];
+	WsTableSchema s = example();
+	uint64		key[] = {8};
+	WsRowShape	shape;
+
+	memcpy(cols, example_cols, sizeof(cols));
+	s.cols = cols;
+	s.key = key;
+	ws_schema_row_shape(&s, &shape);
+}
+
+/* A schema with a problem, a merge's not yet checked, gives no shape. */
+static void
+test_row_shape_invalid(void)
+{
+	expect_error(shape_of_invalid, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
 /* The widest table there and back; names as they may be. */
@@ -380,6 +402,18 @@ empty_collation(WsTableSchema *s)
 }
 
 static void
+lone_at(WsTableSchema *s)
+{
+	s->cols[1].def = "a @ b";
+}
+
+static void
+tag_leading_zero(WsTableSchema *s)
+{
+	s->cols[2].def = "(@{07} * 2)";
+}
+
+static void
 key_too_many(WsTableSchema *s)
 {
 	s->nkey = s->ncols + 1;
@@ -392,6 +426,8 @@ static const Invalid invalid[] = {
 	{"an empty default", empty_default},
 	{"an empty collation", empty_collation},
 	{"a key of more columns than the table has", key_too_many},
+	{"an expression with malformed column references", lone_at},
+	{"an expression with malformed column references", tag_leading_zero},
 	{"a table with no name", no_name},
 	{"a table of no known persistence", persistence},
 	{"a column with no name", col_no_name},
@@ -510,7 +546,7 @@ test_malformed(void)
 		{"\x01" "\x01" "t" "p" "\x80\x00" "\x00" "\x00", 8, "shortest form"},
 		{"\x01" "\x01" "t" "p" "\x00" "\x00" "\x80\x80\x00", 9, "shortest form"},
 		/* a tag of bits past the 64th, dropped on reading */
-		{"\x01" "\x01" "t" "p" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 24, "shortest form"},
+		{"\x01" "\x01" "t" "p" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 26, "shortest form"},
 	};
 
 	WsSchemaCodec->encode(&s, &b);
@@ -541,10 +577,10 @@ test_create_table(void)
 	static const char want[] =
 		"CREATE TABLE sch.t (\n"
 		"    id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,\n"
-		"    v text COLLATE pg_catalog.\"C\" DEFAULT ''::text,\n"
+		"    v text COLLATE pg_catalog.\"C\" DEFAULT (''::text),\n"
 		"    g bigint GENERATED ALWAYS AS ((id * 2)) STORED,\n"
 		"    w bigint GENERATED ALWAYS AS ((id + 1)) VIRTUAL,\n"
-		"    e integer DEFAULT 0,\n"
+		"    e integer DEFAULT (0),\n"
 		"    CONSTRAINT t_pkey PRIMARY KEY (id)\n"
 		")";
 	WsTableSchema s = example();
@@ -575,7 +611,7 @@ test_create_table_names(void)
 	if (strcmp((char *) b.data,
 			   "CREATE UNLOGGED TABLE \"Odd Schema\".\"Odd Table\" (\n"
 			   "    \"Odd Name\" integer NOT NULL,\n"
-			   "    \"select\" integer DEFAULT (\"Odd Name\" @ 2),\n"
+			   "    \"select\" integer DEFAULT ((\"Odd Name\" @ 2)),\n"
 			   "    CONSTRAINT \"Odd Key\" PRIMARY KEY (\"Odd Name\")\n"
 			   ")") != 0)
 		elog(ERROR, "got: %s", b.data);
@@ -585,7 +621,7 @@ test_create_table_names(void)
 	cols[0].name = "renamed";
 	ws_schema_create_table(&s, "x", &b);
 	buf_append_byte(&b, 0);
-	CHECK(strstr((char *) b.data, "DEFAULT (renamed @ 2)") != NULL);
+	CHECK(strstr((char *) b.data, "DEFAULT ((renamed @ 2))") != NULL);
 	buf_free(&b);
 }
 
@@ -639,26 +675,37 @@ create_injected(void *arg)
 }
 
 /*
- * A commit may have come from anywhere.  Text that would be more than a type,
- * a collation or an expression, closing what it is put in and going on, is
- * refused: no statement is written with it.
+ * A commit may have come from anywhere.  Text that would make the statement
+ * anything but what the record says, by closing what it is put in, by a
+ * comment that hides what follows it, or by a clause of its own, is refused
+ * as corruption: no statement is written with it.
  */
 static void
 test_create_table_injection(void)
 {
 	static const Injection bad[] = {
+		/* a type that goes on */
 		{.type = "int); DROP TABLE x.y; --"},
 		{.type = "int, b int"},
 		{.type = "int NOT NULL"},
 		{.type = "int COLLATE \"C\""},
-		{.type = "integer", .collation = "\"C\"; DROP TABLE x.y"},
-		{.type = "integer", .collation = "\"C\" NOT NULL"},
+		{.type = "setof integer"},
+		/* a type that creates what the record does not have */
+		{.type = "serial"},
+		{.type = "pg_catalog.bigserial"},
+		/* a collation that goes on, spaces or none */
+		{.type = "text", .collation = "\"C\"; DROP TABLE x.y"},
+		{.type = "text", .collation = "\"C\" NOT NULL"},
+		{.type = "text", .collation = "ucs_basic);DROP/**/TABLE/**/x.y;CREATE/**/TABLE/**/x.z(a/**/int"},
+		{.type = "text", .collation = "C,b/**/int"},
+		/* a comment in the type hides the default's quote: its string runs */
+		{.type = "integer --", .def = "'\n); DROP TABLE x.y; CREATE TABLE x.z (a int --'"},
+		/* an expression that goes on */
 		{.type = "integer", .def = "1); DROP TABLE x.y; SELECT (1"},
-		{.type = "integer", .def = "1), (2"},
-		{.type = "integer", .def = "1) FROM x.y WHERE (true"},
-		{.type = "integer", .def = "1) UNION SELECT (2"},
-		{.type = "integer", .def = "1) LIMIT (1"},
-		{.type = "integer", .def = "1, b int"},
+		{.type = "integer", .def = "1), b integer DEFAULT (2"},
+		{.type = "integer", .def = "1) NOT NULL DEFAULT (2"},
+		{.type = "integer", .def = "1) CHECK (false"},
+		{.type = "integer", .def = "1); --"},
 	};
 	static const Injection good[] = {
 		{.type = "character varying(10)"},
@@ -668,39 +715,34 @@ test_create_table_injection(void)
 		{.type = "text", .collation = "pg_catalog.\"C\""},
 		{.type = "integer", .def = "(1 + 2)"},
 		{.type = "text", .def = "'); DROP TABLE x.y; --'::text"},
-		{.type = "integer", .def = "(SELECT 1)"},
+		{.type = "text", .def = "'x'::text COLLATE \"C\""},
 		{.type = "integer", .def = "CASE WHEN true THEN 1 ELSE 2 END"},
+		{.type = "integer", .def = "1 --\n"},
 	};
 
 	for (size_t i = 0; i < lengthof(bad); i++)
-	{
-		MemoryContext cxt = CurrentMemoryContext;
-		ResourceOwner owner = CurrentResourceOwner;
-		volatile bool refused = false;
-
-		/* (by a parse's own syntax error, or as corrupt: never written) */
-		BeginInternalSubTransaction(NULL);
-		MemoryContextSwitchTo(cxt);
-		PG_TRY();
-		{
-			create_injected((void *) &bad[i]);
-		}
-		PG_CATCH();
-		{
-			MemoryContextSwitchTo(cxt);
-			FlushErrorState();
-			refused = true;
-		}
-		PG_END_TRY();
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(cxt);
-		CurrentResourceOwner = owner;
-		if (!refused)
-			elog(ERROR, "not refused: %s %s %s", bad[i].type,
-				 bad[i].collation ? bad[i].collation : "", bad[i].def ? bad[i].def : "");
-	}
+		expect_error(create_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
 	for (size_t i = 0; i < lengthof(good); i++)
 		create_injected((void *) &good[i]);
+}
+
+static void
+create_unchecked(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	uint64		key[] = {9};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,
+	.cols = cols,.key_name = "k",.nkey = 1,.key = key};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* A schema with a problem, a merge's not yet checked, gives no statement. */
+static void
+test_create_table_unchecked(void)
+{
+	expect_error(create_unchecked, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
 /* (what failed, in the log: always false, for a CHECK to fail on) */
@@ -794,6 +836,7 @@ static const ProllyUnitTest tests[] = {
 	{"smallest", test_smallest},
 	{"find", test_find},
 	{"row_shape", test_row_shape},
+	{"row_shape_invalid", test_row_shape_invalid},
 	{"wide_and_odd", test_wide_and_odd},
 	{"invalid", test_invalid},
 	{"malformed", test_malformed},
@@ -802,6 +845,7 @@ static const ProllyUnitTest tests[] = {
 	{"create_table_empty", test_create_table_empty},
 	{"create_table_dangling", test_create_table_dangling},
 	{"create_table_injection", test_create_table_injection},
+	{"create_table_unchecked", test_create_table_unchecked},
 	{"create_table_runs", test_create_table_runs},
 };
 

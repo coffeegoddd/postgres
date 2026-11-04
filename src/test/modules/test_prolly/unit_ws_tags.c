@@ -83,11 +83,15 @@ test_render_malformed(void)
 {
 	static const char *const bad[] = {
 		"@", "a @ b", "@x", "@{", "@{}", "@{x}", "@{7", "@{7x}",
-		"@{18446744073709551616}",
+		"@{18446744073709551616}", "@{07}", "@{00}",
 	};
 
 	for (size_t i = 0; i < lengthof(bad); i++)
+	{
 		expect_error(render_it, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+		CHECK(!ws_tags_well_formed(bad[i]));
+	}
+	CHECK(ws_tags_well_formed("") && ws_tags_well_formed("a @@ @{0} @{7}b"));
 }
 
 static const ProllyUnitTest tests[] = {
