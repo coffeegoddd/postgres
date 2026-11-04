@@ -143,8 +143,8 @@ typedef struct WsTableSchema
  * expression, not both, and no operator, INCLUDE's columns its own, an order of
  * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique;
  * a known way to partition with keys, one if by list, no more than a partition
- * key can have otherwise, none if not partitioned, each key as an index's with no order or operator.  NULL if
- * it is so, or what is wrong.
+ * key can have otherwise, none if not partitioned, each key as an index's with no
+ * order or operator.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
