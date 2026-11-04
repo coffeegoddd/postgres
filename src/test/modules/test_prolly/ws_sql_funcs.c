@@ -19,6 +19,7 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "prolly/ws/ws_fk.h"
+#include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
@@ -37,6 +38,8 @@ PG_FUNCTION_INFO_V1(test_ws_schema_set_inherited);
 PG_FUNCTION_INFO_V1(test_ws_schema_add_checks);
 PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
+PG_FUNCTION_INFO_V1(test_ws_obj_bytes);
+PG_FUNCTION_INFO_V1(test_ws_obj_copy);
 PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
 PG_FUNCTION_INFO_V1(test_ws_role_restore);
@@ -490,6 +493,66 @@ test_ws_role_restore(PG_FUNCTION_ARGS)
 	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(0)), &roles, &n);
 	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(1)), &previous, &nprevious);
 	ws_role_restore(roles, n, previous, nprevious);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_obj_bytes(schema text) returns text: the objects of the schema, each its
+ * key, a tab, and its value in hex, a line each
+ */
+Datum
+test_ws_obj_bytes(PG_FUNCTION_ARGS)
+{
+	WsObject   *objs;
+	int			n;
+	StringInfoData out;
+
+	initStringInfo(&out);
+	ws_obj_read(text_to_cstring(PG_GETARG_TEXT_PP(0)), &objs, &n);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			k = BUF_INIT;
+		Buf			v = BUF_INIT;
+
+		WsObjectCodec->encode_key(&objs[i], &k);
+		WsObjectCodec->encode_value(&objs[i], &v);
+		appendBinaryStringInfo(&out, (char *) k.data, k.len);
+		appendStringInfoChar(&out, '\t');
+		for (size_t j = 0; j < v.len; j++)
+			appendStringInfo(&out, "%02x", v.data[j]);
+		appendStringInfoChar(&out, '\n');
+		buf_free(&k);
+		buf_free(&v);
+		ws_obj_free(&objs[i]);
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_obj_copy(from_schema text, to_schema text) returns void: makes the
+ * objects of the one in the other, through their bytes
+ */
+Datum
+test_ws_obj_copy(PG_FUNCTION_ARGS)
+{
+	WsObject   *objs;
+	WsObject   *back;
+	int			n;
+
+	ws_obj_read(text_to_cstring(PG_GETARG_TEXT_PP(0)), &objs, &n);
+	back = palloc0_array(WsObject, Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		Buf			k = BUF_INIT;
+		Buf			v = BUF_INIT;
+
+		WsObjectCodec->encode_key(&objs[i], &k);
+		WsObjectCodec->encode_value(&objs[i], &v);
+		WsObjectCodec->decode(k.data, k.len, v.data, v.len, &back[i]);
+		buf_free(&k);
+		buf_free(&v);
+	}
+	ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)));
 	PG_RETURN_VOID();
 }
 
