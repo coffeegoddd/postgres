@@ -357,6 +357,38 @@ $node->safe_psql('postgres', q{
 	ALTER INDEX src.io_part1_pkey SET (fillfactor = 80);
 	ALTER TABLE src.io_part1 CLUSTER ON io_part1_pkey, REPLICA IDENTITY NOTHING;
 	CREATE TABLE src.io_ren (a integer, b integer, CONSTRAINT io_ren_k PRIMARY KEY (a) INCLUDE (b));
+	CREATE TABLE src.io_repck (a integer NOT NULL);
+	CREATE UNIQUE INDEX io_repck_i ON src.io_repck (a);
+	ALTER TABLE src.io_repck ADD CONSTRAINT io_repck_i CHECK (a > 0);
+	ALTER TABLE src.io_repck REPLICA IDENTITY USING INDEX io_repck_i;
+	CREATE OPERATOR CLASS other.ts_sig FOR TYPE tsvector USING gist AS
+		OPERATOR 1 = ,
+		FUNCTION 1 gtsvector_consistent(internal, tsvector, smallint, oid, internal),
+		FUNCTION 2 gtsvector_union(internal, internal),
+		FUNCTION 3 gtsvector_compress(internal),
+		FUNCTION 4 gtsvector_decompress(internal),
+		FUNCTION 5 gtsvector_penalty(internal, internal, internal),
+		FUNCTION 6 gtsvector_picksplit(internal, internal),
+		FUNCTION 7 gtsvector_same(gtsvector, gtsvector, internal),
+		FUNCTION 10 gtsvector_options(internal),
+		STORAGE gtsvector;
+	CREATE TABLE src.io_xk (t tsvector, CONSTRAINT io_xk_1 EXCLUDE USING gist (t other.ts_sig (siglen = 10) WITH =),
+		CONSTRAINT io_xk_2 EXCLUDE USING gist (t other.ts_sig (siglen = 20) WITH =));
+	CREATE TABLE src.io_inc (a integer, b integer, CONSTRAINT io_inc_ab UNIQUE (a, b), CONSTRAINT io_inc_a UNIQUE (a) INCLUDE (b),
+		CONSTRAINT io_inc_ba UNIQUE (b) INCLUDE (a, a), CONSTRAINT io_inc_k UNIQUE (a) INCLUDE (a));
+	CREATE TABLE src.io_ppart (a integer, b integer) PARTITION BY RANGE (a);
+	CREATE INDEX io_ppart_e ON src.io_ppart ((a + 1)) WITH (fillfactor = 60);
+	ALTER INDEX src.io_ppart_e ALTER COLUMN 1 SET STATISTICS 7;
+	CREATE TABLE src.io_ppart1 (a integer, b integer);
+	CREATE INDEX io_ppart1_e ON src.io_ppart1 ((a + 1));
+	ALTER TABLE src.io_ppart ATTACH PARTITION src.io_ppart1 FOR VALUES FROM (0) TO (10);
+	ALTER INDEX src.io_ppart1_e ALTER COLUMN 1 SET STATISTICS 3;
+	CREATE TABLE src.io_pdef (a integer, CONSTRAINT io_pdef_k PRIMARY KEY (a) DEFERRABLE) PARTITION BY RANGE (a);
+	CREATE TABLE src.io_pdef1 PARTITION OF src.io_pdef FOR VALUES FROM (0) TO (10);
+	CREATE TABLE src.io_prep (a integer NOT NULL, CONSTRAINT io_prep_k UNIQUE (a)) PARTITION BY RANGE (a);
+	ALTER TABLE src.io_prep REPLICA IDENTITY USING INDEX io_prep_k;
+	CREATE TABLE src.io_prep1 PARTITION OF src.io_prep FOR VALUES FROM (0) TO (10);
+	ALTER TABLE src.io_prep1 REPLICA IDENTITY USING INDEX io_prep1_a_key;
 	ALTER TABLE src.io_ren RENAME b TO z;
 	CREATE TABLE src.rs_on (a integer); ALTER TABLE src.rs_on ENABLE ROW LEVEL SECURITY;
 	CREATE TABLE src.rs_force (a integer); ALTER TABLE src.rs_force FORCE ROW LEVEL SECURITY;
@@ -393,6 +425,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 'so_inh2', 'so_ren',
 	'io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4',
 	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
+	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk',
 	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1', 'rs_fkp', 'rs_fkc');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
@@ -743,7 +776,8 @@ my $ixset = q{SELECT string_agg(ic.relname || ' ' || pg_get_indexdef(i.indexreli
 	FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid WHERE i.indrelid = '%s.%s'::regclass};
 my $ixkey = q{SELECT string_agg(conname || ' ' || condeferrable || condeferred, ',' ORDER BY conname) || ' ' || (SELECT relreplident::text FROM pg_class WHERE oid = '%1$s.%2$s'::regclass)
 	FROM pg_constraint WHERE conrelid = '%1$s.%2$s'::regclass AND contype IN ('p', 'u', 'x')};
-for my $table ('io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4', 'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren')
+for my $table ('io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4', 'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
+	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk')
 {
 	(my $want = $node->safe_psql('postgres', sprintf($ixset, 'src', $table))) =~ s/\bsrc\./dst./g;
 	is($node->safe_psql('postgres', sprintf($ixset, 'dst', $table)), $want, "$table its indexes' settings as they were");
@@ -792,6 +826,44 @@ is($node->safe_psql('postgres', sprintf($rsec, 'dst')), $node->safe_psql('postgr
 	$node->safe_psql('postgres', q{DROP SCHEMA rs_dst CASCADE; DROP OWNED BY regress_rs_owner; DROP ROLE regress_rs_owner});
 }
 
+# a TOAST table's parameters on an old snapshot: its columns since changed, so what
+# they need is not what the snapshot's would
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.ot1 (a int, t text) WITH (toast.autovacuum_enabled = false);
+	ALTER TABLE src.ot1 ALTER t SET STORAGE PLAIN;
+	CREATE TABLE src.ot2 (a int, t text) WITH (toast.autovacuum_enabled = false);
+	ALTER TABLE src.ot2 DROP COLUMN t;
+	CREATE TABLE src.ot3 (a int, t text) WITH (toast.autovacuum_enabled = false);
+	CREATE TABLE src.ot4 (a int, t text, u varchar(10)) WITH (toast.autovacuum_enabled = false);
+	ALTER TABLE src.ot4 DROP COLUMN t;
+});
+for my $t ([ 'ot1', 'ALTER TABLE src.ot1 ALTER t SET STORAGE EXTENDED' ], [ 'ot2', 'ALTER TABLE src.ot2 ADD u text' ],
+	[ 'ot3', 'ALTER TABLE src.ot3 ALTER t SET STORAGE PLAIN' ],
+	[ 'ot4', 'ALTER TABLE src.ot4 ALTER u TYPE varchar(100000)' ])
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $t->[1]);
+	$old->query(qq{SELECT test_ws_schema_bytes('src', '$t->[0]')});
+	like($old->{stderr}, qr/added, or its size or storage changed, since this transaction's snapshot/,
+		"$t->[0] changed since a snapshot refused as such");
+	$old->query('ROLLBACK');
+	$old->quit;
+}
+
+# parameters in another order than the record's, however they came to be: the same bytes
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.so_un (a integer) WITH (parallel_workers = 2, fillfactor = 50, autovacuum_enabled = false);
+	ALTER TABLE src.so_un SET (toast_tuple_target = 200), ALTER a SET (n_distinct_inherited = 7, n_distinct = 5);
+	CREATE SCHEMA so_dst VERSIONED;
+});
+{
+	my $hex = $bytes->($node, 'postgres', 'so_un');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'so_dst')});
+	is($bytes->($node, 'postgres', 'so_un', undef, 'so_dst'), $hex, 'parameters in any order made again in one');
+}
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -823,11 +895,13 @@ $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 my %refused_for = (
 	ctrg => 'a constraint trigger',
 	xdup => 'two constraints alike', xspc => 'has a tablespace', xcmt => 'a comment',
+	repgone => 'no longer has', repgonek => 'no longer has', uoptd => 'two constraints alike', kuoptd => 'two constraints alike',
+	xoptd => 'two constraints alike', ixo1 => 'one for the other',
 	xicmt => 'a comment', xext => 'depends on an extension', fksopt => 'has a tablespace',
 	seqother => 'its sequence in another schema',
 	ponly => 'or is not valid', ponlyk => 'or is not valid',
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
-	ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
+	toastd => 'no longer needs one', toastp => 'no longer needs one', ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
 	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uover => 'over a period', uspc => 'has a tablespace',
 	iext => 'depends on an extension', icmt => 'a comment',
@@ -863,6 +937,8 @@ for my $t (
 	[ 'pwhole', q{CREATE TABLE src.pwhole (a int) PARTITION BY RANGE ((pwhole IS NOT NULL))} ],
 	[ 'pam', 'CREATE TABLE src.pam (a int) PARTITION BY RANGE (a) ; ALTER TABLE src.pam SET ACCESS METHOD heap' ],
 	[ 'psp', 'CREATE TABLE src.psp (a int) PARTITION BY RANGE (a) TABLESPACE t86' ],
+	[ 'toastd', 'CREATE TABLE src.toastd (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE src.toastd DROP COLUMN t' ],
+	[ 'toastp', 'CREATE TABLE src.toastp (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE src.toastp ALTER t SET STORAGE PLAIN' ],
 	[ 'ihx', q{CREATE TABLE ptother.ihxp (a int); CREATE TABLE src.ihx () INHERITS (ptother.ihxp)} ],
 	[ 'ihf', q{CREATE FOREIGN TABLE src.ihfp (a int) SERVER pxs; CREATE TABLE src.ihf () INHERITS (src.ihfp)} ],
 	[ 'ihg', q{CREATE TABLE src.ihg (a int); CREATE FOREIGN TABLE src.ihg1 () INHERITS (src.ihg) SERVER pxs} ],
@@ -878,6 +954,12 @@ for my $t (
 		CREATE CONSTRAINT TRIGGER ctrg_t AFTER INSERT ON src.ctrg FOR EACH ROW EXECUTE FUNCTION src.ctrg_f()} ],
 	[ 'fksopt', 'CREATE TABLE src.fksopt (a int, b int); CREATE UNIQUE INDEX fksopt_i ON src.fksopt (a) TABLESPACE t86; ALTER TABLE src.fksopt ADD FOREIGN KEY (b) REFERENCES src.fksopt (a)' ],
 	[ 'seqother', 'CREATE TABLE other.seqother (a int); CREATE TABLE src.seqother (a int NOT NULL); ALTER TABLE src.seqother ALTER a ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME other.seqother_s)' ],
+	[ 'repgone', 'CREATE TABLE src.repgone (a int NOT NULL); CREATE UNIQUE INDEX repgone_i ON src.repgone (a); ALTER TABLE src.repgone REPLICA IDENTITY USING INDEX repgone_i; DROP INDEX src.repgone_i' ],
+	[ 'repgonek', 'CREATE TABLE src.repgonek (a int, CONSTRAINT repgonek_k PRIMARY KEY (a)); ALTER TABLE src.repgonek REPLICA IDENTITY USING INDEX repgonek_k; ALTER TABLE src.repgonek DROP CONSTRAINT repgonek_k' ],
+	[ 'uoptd', 'CREATE TABLE src.uoptd (a int, CONSTRAINT uoptd_1 UNIQUE (a)); ALTER TABLE src.uoptd ADD CONSTRAINT uoptd_2 UNIQUE (a) WITH (fillfactor = 50)' ],
+	[ 'kuoptd', 'CREATE TABLE src.kuoptd (a int PRIMARY KEY); ALTER TABLE src.kuoptd ADD CONSTRAINT kuoptd_2 UNIQUE (a) WITH (fillfactor = 50)' ],
+	[ 'xoptd', 'CREATE TABLE src.xoptd (r int4range, CONSTRAINT xoptd_1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xoptd ADD CONSTRAINT xoptd_2 EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50)' ],
+	[ 'ixo1', q{CREATE TABLE src.ixo (a integer) PARTITION BY RANGE (a); CREATE INDEX ixo_1 ON src.ixo (a); CREATE INDEX ixo_2 ON src.ixo (a) WITH (fillfactor = 50); CREATE TABLE src.ixo1 PARTITION OF src.ixo FOR VALUES FROM (0) TO (10)} ],
 	[ 'xdup', 'CREATE TABLE src.xdup (r int4range, CONSTRAINT x1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xdup ADD CONSTRAINT x2 EXCLUDE USING gist (r WITH &&)' ],
 	[ 'xspc', 'CREATE TABLE src.xspc (r int4range, EXCLUDE USING gist (r WITH &&) USING INDEX TABLESPACE t86)' ],
 	[ 'xcmt', q{CREATE TABLE src.xcmt (r int4range, CONSTRAINT xcmt_x EXCLUDE USING gist (r WITH &&)); COMMENT ON CONSTRAINT xcmt_x ON src.xcmt IS 'x'} ],
@@ -1099,6 +1181,24 @@ $node->safe_psql('postgres', q{
 		'a column retyped since a snapshot refused as such');
 	$old->query('ROLLBACK');
 	$old->quit;
+}
+
+# an index's settings changed since the reader's snapshot: as the snapshot saw them
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.ioold (a int);
+	CREATE INDEX ioold_i ON src.ioold (a);
+});
+{
+	my $before = $bytes->($node, 'postgres', 'ioold');
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', q{ALTER INDEX src.ioold_i SET (fillfactor = 50); ALTER TABLE src.ioold CLUSTER ON ioold_i});
+	is($old->query_safe(q{SELECT encode(test_ws_schema_bytes('src', 'ioold'), 'hex')}), $before,
+		'settings since a snapshot not in what it reads');
+	$old->query('ROLLBACK');
+	$old->quit;
+	isnt($bytes->($node, 'postgres', 'ioold'), $before, '(though they are in what is read now)');
 }
 
 # an exclusion dropped since the reader's snapshot, its row there but not its text
@@ -1472,7 +1572,15 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 		qq{SET client_encoding = UTF8; SELECT test_ws_schema_set_inherited(decode('$inh_utf8', 'hex'), 'lié');});
 	like($err, qr/table "enfanté" says "colonné" is inherited/, 'a lie told in the server\'s encoding');
 }
-# storage parameters' text in each encoding (the server takes any name in a toast's place: only a value it would refuse, none here)
+{
+	# (the name in the server's encoding, in what is refused)
+	$node->safe_psql('lat', q{SET client_encoding = UTF8;
+		CREATE TABLE enc."toasté" (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE enc."toasté" DROP COLUMN t});
+	my ($ret, $out, $err) = $node->psql('lat', q{SET client_encoding = UTF8; SELECT test_ws_schema_bytes('enc', 'toasté')});
+	like($err, qr/table "toasté" cannot be read yet/, 'a TOAST table\'s refusal in the server\'s encoding');
+}
+
+# settings around names in each encoding (parameters themselves are ASCII: the server refuses any other)
 my $so_sql = q{
 	SET client_encoding = UTF8;
 	CREATE TABLE enc."stocké" ("colonné" text STORAGE EXTERNAL) WITH (fillfactor = 50);
