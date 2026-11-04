@@ -244,6 +244,24 @@ count_table(void *arg, const char *name, const VcTable *entry)
 	return true;
 }
 
+ENGINE_TEST(test_roles)
+{
+	WsObject	v = example();
+	WsObject	p = {.kind = WS_OBJ_POLICY,.name = "y",.args = "t",
+	.definition = "CREATE POLICY y ON t AS PERMISSIVE FOR ALL TO a, \"B c\", PUBLIC USING (true)"};
+	char	  **names = NULL;
+	int			n = 0;
+
+	ws_obj_roles(&v, &names, &n);
+	CHECK_EQ(n, 3);				/* (its owner, and h twice, for the object and a column) */
+	CHECK(strcmp(names[0], "g") == 0 && strcmp(names[1], "h") == 0);
+	names = NULL;
+	n = 0;
+	ws_obj_roles(&p, &names, &n);
+	CHECK_EQ(n, 2);
+	CHECK(strcmp(names[0], "a") == 0 && strcmp(names[1], "B c") == 0);
+}
+
 ENGINE_TEST(test_positions)
 {
 	ChunkStore *cs = memstore_create();
@@ -457,11 +475,14 @@ ENGINE_TEST(test_refused_statements)
 				"CREATE INDEX IF NOT EXISTS v ON t (a)",
 				"CREATE INDEX v ON t (a) TABLESPACE p",
 				"CREATE INDEX v ON t (a); DROP TABLE t",
+				"CREATE INDEX ON t (a)",
+				"CREATE INDEX v ON ONLY t (a)",
 			};
 			static const char *const defaults[] = {
 				"ALTER VIEW other ALTER COLUMN v SET DEFAULT 1",
 				"ALTER VIEW t ALTER COLUMN other SET DEFAULT 1",
 				"ALTER VIEW t ALTER COLUMN v DROP DEFAULT",
+				"ALTER VIEW IF EXISTS t ALTER COLUMN v SET DEFAULT 1",
 				"ALTER VIEW t OWNER TO g",
 				"ALTER TABLE t ALTER COLUMN v SET DEFAULT 1",
 				"ALTER VIEW t ALTER COLUMN v SET DEFAULT 1, ALTER COLUMN x SET DEFAULT 2",
@@ -554,6 +575,7 @@ static const ProllyUnitTest tests[] = {
 	{"problems", test_problems},
 	{"map", test_map},
 	{"positions", test_positions},
+	{"roles", test_roles},
 	{"restore_order", test_restore_order},
 	{"statements", test_statements},
 	{"refused_statements", test_refused_statements},

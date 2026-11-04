@@ -752,13 +752,23 @@ $node->safe_psql('postgres', q{
 	CREATE CONSTRAINT TRIGGER con AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION trf();
 	CREATE TRIGGER on_view INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION trf();
 	CREATE TRIGGER on_parted BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
+	CREATE TRIGGER off_for_now BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf();
+	CREATE TRIGGER replica_only BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf();
+	CREATE TRIGGER always_on BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf();
+	CREATE TRIGGER " ON tr.t x" BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION trf();
+	CREATE RULE off_rule AS ON DELETE TO t DO ALSO NOTIFY watchers;
+	CREATE RULE " TO tr.t y" AS ON INSERT TO t DO ALSO NOTIFY watchers;
+	ALTER TABLE t DISABLE TRIGGER off_for_now;
+	ALTER TABLE t ENABLE REPLICA TRIGGER replica_only;
+	ALTER TABLE t ENABLE ALWAYS TRIGGER always_on;
+	ALTER TABLE t DISABLE RULE off_rule;
 	CREATE RULE log_it AS ON UPDATE TO t WHERE NEW.a > 1 DO ALSO INSERT INTO audit VALUES (NEW.a);
 	CREATE RULE noop AS ON DELETE TO audit DO INSTEAD NOTHING;
 	CREATE RULE view_rule AS ON DELETE TO v DO INSTEAD DELETE FROM t WHERE a = OLD.a;
 	CREATE RULE notifies AS ON INSERT TO audit DO ALSO NOTIFY watchers;
 	ALTER TABLE t ENABLE ROW LEVEL SECURITY;
 	CREATE POLICY mine ON t USING (a > 0);
-	CREATE POLICY read_it ON t AS RESTRICTIVE FOR SELECT TO g_trread, PUBLIC USING (b <> 'x') ;
+	CREATE POLICY read_it ON t AS RESTRICTIVE FOR SELECT TO g_trread, g_trowner USING (b <> 'x') ;
 	CREATE POLICY ins ON t FOR INSERT TO g_trread WITH CHECK (a < 100);
 	COMMENT ON TRIGGER before_ins ON t IS 'a trigger';
 	COMMENT ON RULE noop ON audit IS 'a rule';
@@ -769,7 +779,9 @@ my %tr_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, 
 ok($tr_val{$_}, "$_ is held") for ('trigger/before_ins(t)', 'trigger/Odd name(t)', 'trigger/con(t)', 'trigger/on_view(v)', 'trigger/on_parted(p)',
 	'rule/log_it(t)', 'rule/noop(audit)', 'rule/view_rule(v)', 'rule/notifies(audit)', 'policy/mine(t)', 'policy/read_it(t)', 'policy/ins(t)');
 ok(!$tr_val{'trigger/on_parted(p1)'}, 'a partition\'s clone is its table\'s');
-unlike(join('', values %tr_val), qr/\btr\./, 'none names its schema');
+like($tr_val{'trigger/ ON tr.t x(t)'}, qr/x" BEFORE UPDATE ON t FOR/, 'a name like the text of its table is left, and its table is bare');
+like($tr_val{'rule/ TO tr.t y(t)'}, qr/ON INSERT TO t DO/, 'as for a rule');
+unlike(join('', map { $tr_val{$_} } grep { !/ tr\.t / } keys %tr_val), qr/\btr\./, 'none else names its schema');
 like($tr_val{'trigger/before_ins(t)'}, qr/function\/trf\(\)/, 'a trigger says its function is needed');
 like($tr_val{'trigger/on_view(v)'}, qr/view\/v/, 'and what view it is on');
 like($tr_val{'rule/view_rule(v)'}, qr/view\/v/, 'as a rule does');
@@ -788,15 +800,24 @@ my $tr_dump = sub {
 			UNION ALL SELECT pg_get_ruledef(w.oid) FROM pg_rewrite w JOIN pg_class c ON c.oid = w.ev_class WHERE c.relnamespace = '$s'::regnamespace AND w.rulename <> '_RETURN'
 			UNION ALL SELECT format('%s %s %s %s %s %s %s', policyname, tablename, permissive, roles, cmd, qual, with_check) FROM pg_policies WHERE schemaname = '$s'
 			UNION ALL SELECT obj_description(g.oid, 'pg_trigger') FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid WHERE c.relnamespace = '$s'::regnamespace AND obj_description(g.oid, 'pg_trigger') IS NOT NULL) y});
+	$out =~ s/ ON tr\.t x/NAME1/g;
+	$out =~ s/ TO tr\.t y/NAME2/g;
 	$out =~ s/\b\Q$s\E\.//g;
 	return $out;
 };
 is($tr_dump->('tr2'), $tr_dump->('tr'), 'the same by the catalogs');
 is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_trigger g WHERE g.tgrelid = 'tr2.p1'::regclass AND tgname = 'on_parted'}), '1', 'a partition has its clone');
+is( $node->safe_psql('postgres', q{SELECT string_agg(tgname || ' ' || tgenabled::text, ', ' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'tr2.t'::regclass AND tgname IN ('off_for_now', 'replica_only', 'always_on')}),
+	'always_on A, off_for_now D, replica_only R', 'a trigger fires as it did');
+is($node->safe_psql('postgres', q{SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'off_rule' AND ev_class = 'tr2.t'::regclass}), 'D', 'and a rule');
 
 my @tr_refused = (
-	[ q{CREATE TABLE t (a int); CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f(); ALTER TABLE t DISABLE TRIGGER g}, 'disabled' ],
-	[ q{CREATE TABLE t (a int); CREATE RULE r AS ON DELETE TO t DO INSTEAD NOTHING; ALTER TABLE t DISABLE RULE r}, 'disabled' ],
+	[ q{CREATE TABLE pg_stats (a int); CREATE RULE r AS ON DELETE TO tr5.pg_stats DO INSTEAD NOTHING}, 'named as one in the catalogs' ],
+	[ q{CREATE TABLE pg_class (a int); CREATE POLICY y ON tr5.pg_class USING (true)}, 'named as one in the catalogs' ],
+	[ q{CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (9); CREATE TRIGGER g BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION f(); ALTER TABLE p1 DISABLE TRIGGER g}, 'fires otherwise than its table' ],
+	[ q{CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE FOREIGN DATA WRAPPER fdw_tr; CREATE SERVER srv_tr FOREIGN DATA WRAPPER fdw_tr; CREATE FOREIGN TABLE ft (a int) SERVER srv_tr; CREATE TRIGGER g BEFORE INSERT ON ft FOR EACH ROW EXECUTE FUNCTION f()}, 'what no commit holds' ],
+	[ q{CREATE TYPE "text" AS ENUM ('a'); CREATE TABLE t (a int); CREATE POLICY y ON t USING (NULL::tr5."text" IS NULL)}, "say a schema's name" ],
+	[ q{CREATE TYPE "text" AS ENUM ('a'); CREATE TABLE t (a int); CREATE RULE r AS ON DELETE TO t WHERE NULL::tr5."text" IS NULL DO ALSO DELETE FROM t}, "say a schema's name" ],
 	[ q{CREATE TABLE t (a int); CREATE POLICY y ON t TO x_person USING (true)}, 'a role that cannot travel' ],
 	[ q{CREATE TABLE t (a int); CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION public.tr_else()}, 'another schema' ],
 	[ q{CREATE TABLE t (a int); CREATE POLICY y ON t USING (a > 0 AND public.tr_pred())}, 'another schema' ],
@@ -806,7 +827,7 @@ $node->safe_psql('postgres', q{CREATE FUNCTION public.tr_else() RETURNS trigger 
 for my $case (@tr_refused)
 {
 	my ($sql, $why) = @$case;
-	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS tr5 CASCADE; CREATE SCHEMA tr5; SET search_path = tr5; $sql});
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS tr5 CASCADE; DROP SERVER IF EXISTS srv_tr CASCADE; DROP FOREIGN DATA WRAPPER IF EXISTS fdw_tr CASCADE; CREATE SCHEMA tr5; SET search_path = tr5; $sql});
 	my ($rc6, $out6, $err6) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('tr5')});
 	isnt($rc6, 0, "refused: $sql");
 	like($err6, qr/\Q$why\E/, "for why: $sql");
@@ -850,6 +871,7 @@ unlike(join('', values %ve_val), qr/\bve\./, 'none names its schema');
 like($ve_val{'index/m_a(m)'}, qr/matview\/m/, 'an index needs its materialized view');
 like($ve_val{'index/m_expr(m)'}, qr/function\/vf\(integer\)/, 'and what it calls');
 like($ve_val{'default/a(v)'}, qr/view\/v/, 'and a default its view');
+like($ve_val{'index/m_a(m)'}, qr/an index/, 'an index has its comment');
 like($ve_val{'default/b(v)'}, qr/it''s @@ here/, 'with its @ doubled');
 
 $node->safe_psql('postgres', q{CREATE SCHEMA ve2 AUTHORIZATION g_veowner; SET ROLE g_veowner; CREATE TABLE ve2.t (a integer, b text)});
@@ -866,13 +888,50 @@ my $ve_dump = sub {
 };
 is($ve_dump->('ve2'), $ve_dump->('ve'), 'the same by the catalogs');
 
+# a view default on a function needing a view is no table's need
+$node->safe_psql('postgres', q{CREATE SCHEMA ve6 AUTHORIZATION g_veowner; SET ROLE g_veowner; SET search_path = ve6;
+	CREATE TABLE t (a integer); CREATE VIEW v AS SELECT a FROM t; CREATE VIEW w AS SELECT 1 AS x;
+	CREATE FUNCTION f() RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT x FROM w; END;
+	ALTER VIEW v ALTER COLUMN a SET DEFAULT f()});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ve6')}), qr/^default\/a\(v\)\t/m, 'a default on a function that needs a view is held');
+
+# comments go before owners: who restores may not own an index by the time of its own
+$node->safe_psql('postgres', q{CREATE ROLE g_ve_noinherit NOLOGIN; GRANT g_veowner TO g_ve_noinherit WITH INHERIT FALSE, SET TRUE;
+	CREATE SCHEMA ve7 AUTHORIZATION g_veowner; GRANT CREATE, USAGE ON SCHEMA ve7 TO g_ve_noinherit;
+	CREATE SCHEMA ve8 AUTHORIZATION g_veowner; GRANT USAGE ON SCHEMA ve8 TO g_ve_noinherit;
+	SET ROLE g_veowner; CREATE TABLE ve8.t (a integer); CREATE MATERIALIZED VIEW ve8.m AS SELECT a FROM ve8.t WITH NO DATA; CREATE INDEX i ON ve8.m (a); COMMENT ON INDEX ve8.i IS 'on it';
+	GRANT SELECT ON ve8.t TO g_ve_noinherit; CREATE TABLE ve7.t (a integer); GRANT SELECT ON ve7.t TO g_ve_noinherit});
+is($node->psql('postgres', q{SET ROLE g_ve_noinherit; SELECT test_ws_obj_copy('ve8', 've7')}), 0, 'a restorer with SET and no INHERIT on the owner can comment on an index');
+is($node->safe_psql('postgres', q{SELECT obj_description('ve7.i'::regclass, 'pg_class')}), 'on it', 'and the comment arrives');
+
+# since a snapshot, one to try again
+for my $change (q{ALTER VIEW ve.v ALTER COLUMN a SET DEFAULT 8}, q{ALTER INDEX ve.m_a SET (fillfactor = 60)}, q{COMMENT ON INDEX ve.m_a IS 'later'})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('ve')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+
 my @ve_refused = (
 	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE UNIQUE INDEX ix ON m (a); CLUSTER m USING ix}, 'clustered' ],
 	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (public.ve_else(a))}, 'another schema' ],
 	[ q{CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; ALTER VIEW v ALTER COLUMN a SET DEFAULT public.ve_else(1)}, 'another schema' ],
 	[ q{CREATE COLLATION mine FROM "C"; CREATE TABLE t (a text); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (a COLLATE mine)}, 'no commit holds yet' ],
+	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m ((a + 1)); ALTER INDEX ix ALTER COLUMN 1 SET STATISTICS 5}, 'its own statistics' ],
+	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (a) TABLESPACE ve_ts}, 'in a tablespace' ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (a) WHERE 'a'::ve5."date" IS NOT NULL}, "say a schema's name" ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; ALTER VIEW v ALTER COLUMN a SET DEFAULT ('a'::ve5."date" IS NOT NULL)::int}, "say a schema's name" ],
 );
 $node->safe_psql('postgres', q{CREATE FUNCTION public.ve_else(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1'});
+{
+	my $ts_dir = PostgreSQL::Test::Utils::tempdir();
+	$node->safe_psql('postgres', qq{CREATE TABLESPACE ve_ts LOCATION '$ts_dir'});
+}
 for my $case (@ve_refused)
 {
 	my ($sql, $why) = @$case;
