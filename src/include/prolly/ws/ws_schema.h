@@ -314,6 +314,12 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
+ * A record does not name the schema it is of: it says mood, not src.mood, as a commit
+ * can be restored under any name.  So it is read, and its statements are run, under
+ * ws_schema_path_begin with the schema they are in; what it uses in another schema it
+ * says by that schema's name.  A table using something of its schema that would have
+ * to be told from the catalogs' by naming it raises ERRCODE_FEATURE_NOT_SUPPORTED.
+ *
  * The schema of a table, from the catalogs, through WsSql (its foreign keys,
  * which no one record holds, from ws_fk_read, though one no commit can hold
  * refuses the table here too): false if the schema
@@ -480,6 +486,13 @@ extern void ws_schema_set_inherited(const char *schema, const WsTableSchema *s);
  */
 extern char *ws_name_to_utf8(const char *name);
 extern char *ws_name_from_utf8(const char *name);
+
+/*
+ * The search path a record or definition is read and run under, the schema it is of
+ * after the catalogs, until ws_schema_path_end is given the level this gives.
+ */
+extern int	ws_schema_path_begin(const char *schema);
+extern void ws_schema_path_end(int nest);
 
 /* Text as a commit holds it, and as this database holds it: refusing what it cannot. */
 extern char *ws_text_to_utf8(const char *text);

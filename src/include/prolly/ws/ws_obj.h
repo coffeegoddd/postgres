@@ -146,4 +146,7 @@ extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema,
  */
 extern void ws_obj_restore(const WsObject *objs, int n, const char *schema);
 
+/* Whether an expression as the catalogs print it says a schema's name, by the grammar. */
+extern bool ws_expression_names_schema(const char *expression, const char *schema);
+
 #endif							/* PROLLY_WS_OBJ_H */

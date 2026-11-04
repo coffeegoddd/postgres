@@ -473,29 +473,6 @@ compute_order(const WsObject *objs, int n, int *order)
 
 /* ---------------------------------------------------------- the catalogs */
 
-/*
- * The search path a definition is written and run under.  The catalogs come first
- * and temporary objects last, so that nothing of the schema's can be taken for
- * theirs or the other way about: a name the schema shadows is written qualified.
- */
-static int
-path_begin(const char *schema)
-{
-	int			nest = NewGUCNestLevel();
-	char	   *path = psprintf("pg_catalog, %s, pg_temp", quote_identifier(schema));
-
-	(void) set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
-	pfree(path);
-	return nest;
-}
-
-static void
-path_end(int nest)
-{
-	AtEOXact_GUC(true, nest);
-}
-
 /* What no commit can hold of an object in the schema, the first of it. */
 static const char *const refusal_sql =
 "SELECT c.relname::text, CASE "
@@ -661,18 +638,25 @@ push_locked_snapshot(const char *schema)
 typedef struct NamesSchema
 {
 	const char *why;
+	const char *only;			/* this schema's name, or NULL: any but the catalogs' */
 } NamesSchema;
 
 static bool
-qualified(List *names)
+qualifier_counts(const char *qualifier, const char *only)
+{
+	return only != NULL ? strcmp(qualifier, only) == 0 : strcmp(qualifier, "pg_catalog") != 0;
+}
+
+static bool
+qualified(List *names, const char *only)
 {
 	return list_length(names) >= 2 && IsA(linitial(names), String) &&
-		strcmp(strVal(linitial(names)), "pg_catalog") != 0;
+		qualifier_counts(strVal(linitial(names)), only);
 }
 
 /* (a reg* constant is a name in a string, which only the type it is cast to says) */
 static bool
-string_is_qualified(const char *s)
+string_is_qualified(const char *s, const char *only)
 {
 	const char *p = s;
 	bool		quoted = false;
@@ -688,8 +672,16 @@ string_is_qualified(const char *s)
 		else if (!quoted && *p == '(')
 			return false;
 		else if (!quoted && *p == '.')
-			return !((size_t) (p - start) == strlen("pg_catalog") &&
-					 strncmp(start, "pg_catalog", p - start) == 0);
+		{
+			char	   *qualifier = pnstrdup(start, p - start);
+			bool		counts;
+
+			if (qualifier[0] == '"' && p - start >= 2)
+				qualifier = pnstrdup(start + 1, p - start - 2);
+			counts = qualifier_counts(qualifier, only);
+			pfree(qualifier);
+			return counts;
+		}
 	}
 	return false;
 }
@@ -706,29 +698,29 @@ names_schema_walker(Node *node, void *arg)
 	{
 		case T_RangeVar:
 			named = ((RangeVar *) node)->schemaname != NULL &&
-				strcmp(((RangeVar *) node)->schemaname, "pg_catalog") != 0;
+				qualifier_counts(((RangeVar *) node)->schemaname, n->only);
 			break;
 		case T_TypeName:
-			named = qualified(((TypeName *) node)->names);
+			named = qualified(((TypeName *) node)->names, n->only);
 			break;
 		case T_FuncCall:
-			named = qualified(((FuncCall *) node)->funcname);
+			named = qualified(((FuncCall *) node)->funcname, n->only);
 			break;
 		case T_A_Expr:
-			named = qualified(((A_Expr *) node)->name);
+			named = qualified(((A_Expr *) node)->name, n->only);
 			break;
 		case T_CollateClause:
-			named = qualified(((CollateClause *) node)->collname);
+			named = qualified(((CollateClause *) node)->collname, n->only);
 			break;
 		case T_SortBy:
-			named = qualified(((SortBy *) node)->useOp);
+			named = qualified(((SortBy *) node)->useOp, n->only);
 			break;
 		case T_TypeCast:
 			{
 				TypeCast   *c = (TypeCast *) node;
 				const char *type = strVal(llast(c->typeName->names));
 
-				if (strncmp(type, "reg", 3) == 0 && c->typeName->arrayBounds != NIL)
+				if (n->only == NULL && strncmp(type, "reg", 3) == 0 && c->typeName->arrayBounds != NIL)
 				{
 					/* (no dependency is held for a name in one, nor is it one name) */
 					n->why = "it has an array of reg* names, which say nothing of what they need";
@@ -736,7 +728,7 @@ names_schema_walker(Node *node, void *arg)
 				}
 				if (strncmp(type, "reg", 3) == 0 && IsA(c->arg, A_Const) &&
 					IsA(&((A_Const *) c->arg)->val, String) &&
-					string_is_qualified(strVal(&((A_Const *) c->arg)->val)))
+					string_is_qualified(strVal(&((A_Const *) c->arg)->val), n->only))
 					named = true;
 				break;
 			}
@@ -748,7 +740,7 @@ names_schema_walker(Node *node, void *arg)
 				 * (VALUES with column names prints as a subquery that prints
 				 * otherwise once it is one: two sets of bytes for one view)
 				 */
-				if (r->alias != NULL && strcmp(r->alias->aliasname, "*VALUES*") == 0)
+				if (n->only == NULL && r->alias != NULL && strcmp(r->alias->aliasname, "*VALUES*") == 0)
 				{
 					n->why = "it is a VALUES list with column names, which does not print as itself";
 					return true;
@@ -766,12 +758,21 @@ names_schema_walker(Node *node, void *arg)
 	return raw_expression_tree_walker(node, names_schema_walker, arg);
 }
 
+bool
+ws_expression_names_schema(const char *expression, const char *schema)
+{
+	List	   *parsed = raw_parser(psprintf("SELECT (%s)", expression), RAW_PARSE_DEFAULT);
+	NamesSchema n = {NULL, schema};
+
+	return list_length(parsed) == 1 && names_schema_walker(linitial_node(RawStmt, parsed)->stmt, &n);
+}
+
 /* Refuses a printed query that would not mean the same in another schema. */
 static void
 check_query_is_portable(const char *name, const char *schema, const char *query)
 {
 	List	   *parsed = raw_parser(query, RAW_PARSE_DEFAULT);
-	NamesSchema n = {NULL};
+	NamesSchema n = {NULL, NULL};
 
 	if (list_length(parsed) != 1)
 		elog(ERROR, "a view's definition is not one query");
@@ -996,7 +997,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 				 errmsg("permission denied for schema %s", schema)));
 	push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
-	nest = path_begin(schema);
+	nest = ws_schema_path_begin(schema);
 
 	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, pg_get_viewdef(c.oid, false), "
 				"  (SELECT string_agg(quote_ident(split_part(o, '=', 1)) || ' = ' || "
@@ -1064,7 +1065,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	*n = rels.nrows;
 	*out = objs;
 	ws_sql_rows_free(&rels);
-	path_end(nest);
+	ws_schema_path_end(nest);
 	PopActiveSnapshot();
 	WsSql->end(level);
 }
@@ -1432,7 +1433,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema)
 	ws_schema_check_relation_defaults(schema);
 	level = WsSql->begin();
 	check_nothing_captures(schema);
-	nest = path_begin(schema);
+	nest = ws_schema_path_begin(schema);
 	for (int i = 0; i < n; i++)
 	{
 		Buf			sql = BUF_INIT;
@@ -1440,7 +1441,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema)
 		ws_obj_create_statement(&objs[order[i]], schema, &sql);
 		run_statement(&sql);
 	}
-	path_end(nest);
+	ws_schema_path_end(nest);
 	for (int i = 0; i < n; i++)
 	{
 		const WsObject *o = &objs[order[i]];

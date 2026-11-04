@@ -2043,5 +2043,57 @@ isnt($node->safe_psql('sqlascii',
 		q{SELECT attcoltag FROM pg_attribute WHERE attrelid = 'v.t1'::regclass AND attname = 'a'}),
 	'0', 'and keeps its tags');
 
+# a record does not name the schema it is of, so it restores under any name
+my $make_names = sub {
+	my ($s) = @_;
+	$node->safe_psql('postgres', qq{
+		CREATE SCHEMA $s VERSIONED;
+		CREATE TYPE $s.mood AS ENUM ('a', 'b');
+		CREATE DOMAIN $s.pos AS integer CHECK (VALUE > 0);
+		CREATE COLLATION $s.coll FROM "C";
+		CREATE FUNCTION $s.f() RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+		CREATE OPERATOR $s.=== (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4eq);
+	});
+};
+$make_names->('nm1');
+$make_names->('nm2');
+$node->safe_psql('postgres', q{
+	CREATE TABLE nm1.uses (a integer, m nm1.mood, p nm1.pos, ms nm1.mood[], c text COLLATE nm1.coll,
+		d integer DEFAULT nm1.f(), g integer GENERATED ALWAYS AS (nm1.f() + a) STORED,
+		CONSTRAINT ck CHECK (nm1.f() > 0 AND m <> 'a'::nm1.mood));
+	CREATE INDEX uses_ex ON nm1.uses ((a OPERATOR(nm1.===) nm1.f()));
+	CREATE INDEX uses_co ON nm1.uses (c COLLATE nm1.coll);
+});
+my $nm_hex = $bytes->($node, 'postgres', 'uses', undef, 'nm1');
+unlike(pack('H*', $nm_hex), qr/nm1/, 'a record does not name its schema');
+$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$nm_hex', 'hex'), 'nm2')});
+is( $node->safe_psql('postgres', q{SELECT DISTINCT n.nspname FROM pg_depend d CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i
+	JOIN pg_namespace n ON n.nspname = i.schema WHERE d.classid = 'pg_class'::regclass AND d.objid = 'nm2.uses'::regclass AND n.nspname LIKE 'nm%'
+	UNION SELECT DISTINCT i.schema FROM pg_attrdef ad JOIN pg_depend d ON d.classid = 'pg_attrdef'::regclass AND d.objid = ad.oid
+	CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i WHERE ad.adrelid = 'nm2.uses'::regclass AND i.schema LIKE 'nm%' ORDER BY 1}),
+	'nm2', 'restored, it uses only what the destination has');
+is($bytes->($node, 'postgres', 'uses', undef, 'nm2'), $nm_hex, 'and has the same bytes');
+$node->safe_psql('postgres', 'ALTER SCHEMA nm1 RENAME TO nm1_new');
+is($bytes->($node, 'postgres', 'uses', undef, 'nm1_new'), $nm_hex, 'renaming a schema changes no record');
+
+# what could only be told from the catalogs' by naming its schema is refused
+$node->safe_psql('postgres', q{CREATE SCHEMA nm3 VERSIONED});
+for my $case (
+	[ q{CREATE TYPE nm3."text" AS ENUM ('a'); CREATE TABLE nm3.r1 (a nm3."text")}, 'r1', 'a column of a type named as a catalog type is' ],
+	[ q{CREATE FUNCTION nm3.now() RETURNS timestamptz LANGUAGE sql STABLE AS 'SELECT pg_catalog.now()'; CREATE TABLE nm3.r2 (a timestamptz DEFAULT nm3.now())}, 'r2', 'a default of a function named as a catalog function is' ],
+	[ q{CREATE TABLE nm3.r3 (a oid DEFAULT 'nm3.pg_class'::regclass); }, 'r3', 'a default of a reg* constant naming its schema' ],
+	[ q{CREATE COLLATION nm3."C" FROM "POSIX"; CREATE TABLE nm3.r4 (a text COLLATE nm3."C")}, 'r4', 'a collation named as a catalog collation is' ])
+{
+	my ($sql, $table, $what) = @$case;
+	$node->safe_psql('postgres', 'CREATE TABLE IF NOT EXISTS nm3.pg_class (x integer)') if $table eq 'r3';
+	$node->safe_psql('postgres', $sql);
+	my ($rc, $out, $err) = $node->psql('postgres', "SELECT test_ws_schema_bytes('nm3', '$table')");
+	like($err, qr/table "$table" in schema "nm3" cannot be held in a commit: it must say its schema's name/, "$what is refused");
+}
+
+# what is in another schema is said by its name, as ever
+$node->safe_psql('postgres', q{CREATE TABLE nm2.other_schema (a other.cdom)});
+like(pack('H*', $bytes->($node, 'postgres', 'other_schema', undef, 'nm2')), qr/other\.cdom/, 'another schema is named');
+
 $node->stop;
 done_testing();

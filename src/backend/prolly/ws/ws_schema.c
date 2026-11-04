@@ -65,12 +65,14 @@
 #include "parser/parser.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_fk.h"
+#include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
@@ -2077,6 +2079,29 @@ put_expression(const WsTableSchema *s, const char *stored, Buf *out)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("an expression of table \"%s\" refers to column tag " UINT64_FORMAT ", which it does not have",
 						s->name, missing)));
+}
+
+/*
+ * The catalogs come first and temporary objects last, so that nothing of the schema's
+ * can be taken for theirs or the other way about: what the schema shadows is printed
+ * qualified, which a record refuses.
+ */
+int
+ws_schema_path_begin(const char *schema)
+{
+	int			nest = NewGUCNestLevel();
+	char	   *path = psprintf("pg_catalog, %s, pg_temp", quote_identifier(schema));
+
+	(void) set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	pfree(path);
+	return nest;
+}
+
+void
+ws_schema_path_end(int nest)
+{
+	AtEOXact_GUC(true, nest);
 }
 
 void
@@ -4343,6 +4368,8 @@ check_snapshot_current(const char *table, Oid relid, const WsSqlRows *cols)
 /* (the columns' names in the server's encoding, as an expression prints them) */
 typedef struct ReadCols
 {
+	const char *schema;
+	const char *table;
 	int			n;
 	const char **names;
 	uint64	   *tags;
@@ -4396,12 +4423,71 @@ index_col_tag(const char *table, ReadCols *rc, const char *name)
 	return tag;
 }
 
+pg_noreturn static void
+says_its_schema(const char *schema, const char *table)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("table \"%s\" in schema \"%s\" cannot be held in a commit: it must say its schema's name",
+					table, schema),
+			 errdetail("What it uses in its schema has a name the catalogs also have, which a record would have to tell apart by naming the schema.")));
+}
+
+/* (a commit does not name the schema it is of, so it can be restored into any) */
+static void
+check_says_no_schema(const ReadCols *rc, const char *expression)
+{
+	if (ws_expression_names_schema(expression, rc->schema))
+		says_its_schema(rc->schema, rc->table);
+}
+
+/* Whether a name as the catalogs print it is qualified by a schema's name. */
+static bool
+name_says_schema(const char *name, const char *schema)
+{
+	const char *q = quote_identifier(schema);
+	size_t		n = strlen(q);
+
+	return name != NULL && (strncmp(name, q, n) == 0 && name[n] == '.');
+}
+
+static void
+check_key_says_no_schema(const WsIndexKey *key, const char *schema, const char *table)
+{
+	char	   *op = key->op != NULL ? psprintf("%s", key->op) : NULL;
+
+	if (name_says_schema(key->collation, schema) || name_says_schema(key->opclass, schema))
+		says_its_schema(schema, table);
+	if (op != NULL && strncmp(op, "OPERATOR(", 9) == 0 && name_says_schema(op + 9, schema))
+		says_its_schema(schema, table);
+	if (name_says_schema(op, schema))
+		says_its_schema(schema, table);
+}
+
+/* The record's names that are not in an expression, which what read those has checked. */
+static void
+check_record_says_no_schema(const WsTableSchema *s, const char *schema, const char *table)
+{
+	for (int i = 0; i < s->ncols; i++)
+		if (name_says_schema(s->cols[i].type, schema) || name_says_schema(s->cols[i].collation, schema))
+			says_its_schema(schema, table);
+	for (int i = 0; i < s->nconstraints; i++)
+		for (int k = 0; k < s->constraints[i].excl.nkeys; k++)
+			check_key_says_no_schema(&s->constraints[i].excl.keys[k], schema, table);
+	for (int i = 0; i < s->nindexes; i++)
+		for (int k = 0; k < s->indexes[i].nkeys; k++)
+			check_key_says_no_schema(&s->indexes[i].keys[k], schema, table);
+	for (int k = 0; k < s->npartition; k++)
+		check_key_says_no_schema(&s->partition_keys[k], schema, table);
+}
+
 static char *
 stored_expression(const char *expression, ReadCols *rc)
 {
 	Buf			stored = BUF_INIT;
 	char	   *utf8;
 
+	check_says_no_schema(rc, expression);
 	ws_tags_template(expression, read_tag_of, rc, &stored);
 	buf_append_byte(&stored, 0);
 	utf8 = to_utf8((char *) stored.data);
@@ -5099,12 +5185,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 {
 	const char *params[2] = {schema, table};
 	int			level = WsSql->begin();
+	int			nest = ws_schema_path_begin(schema);
 	WsSqlRows	rel,
 				cols,
 				key,
 				others,
 				idxs;
-	ReadCols	rc = {0};
+	ReadCols	rc = {.schema = schema,.table = table};
 	const char *relkind,
 			   *persistence;
 
@@ -5141,6 +5228,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	if (rel.nrows == 0)
 	{
 		ws_sql_rows_free(&rel);
+		ws_schema_path_end(nest);
 		WsSql->end(level);
 		return false;
 	}
@@ -5149,6 +5237,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	if (relkind[0] != RELKIND_RELATION && relkind[0] != RELKIND_PARTITIONED_TABLE)
 	{
 		ws_sql_rows_free(&rel);
+		ws_schema_path_end(nest);
 		WsSql->end(level);
 		return false;
 	}
@@ -5190,7 +5279,9 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				    "  a.attidentity::text, a.attgenerated::text, "
 				    "  pg_get_expr(d.adbin, d.adrelid), "
 				    "  CASE WHEN a.attcollation <> t.typcollation THEN "
-				    "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
+				    "    CASE WHEN co.collnamespace = (SELECT relnamespace FROM pg_class WHERE oid = a.attrelid) "
+				    "        AND pg_collation_is_visible(co.oid) THEN quote_ident(co.collname) "
+				    "      ELSE quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END END, "
 				    "  a.attcoltag::text, "
 				    "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
 				    "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
@@ -5291,6 +5382,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		{
 			Buf			stored = BUF_INIT;
 
+			check_says_no_schema(&rc, expr);
 			ws_tags_template(expr, read_tag_of, &rc, &stored);
 			buf_append_byte(&stored, 0);
 			out->cols[i].def = to_utf8((char *) stored.data);
@@ -5321,6 +5413,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		{
 			Buf			stored = BUF_INIT;
 
+			check_says_no_schema(&rc, ws_sql_value(&others, i, 2));
 			ws_tags_template(ws_sql_value(&others, i, 2), read_tag_of, &rc, &stored);
 			buf_append_byte(&stored, 0);
 			con->expr = to_utf8((char *) stored.data);
@@ -5395,6 +5488,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
 	PopActiveSnapshot();
+	check_record_says_no_schema(out, schema, table);
+	ws_schema_path_end(nest);
 	WsSql->end(level);
 	return true;
 }

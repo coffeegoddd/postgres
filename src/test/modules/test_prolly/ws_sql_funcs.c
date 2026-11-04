@@ -100,6 +100,7 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	WsSqlRows	rows;
 	Buf			sql = BUF_INIT;
 	int			level = WsSql->begin();
+	int			nest = ws_schema_path_begin(schema);
 	text	   *out;
 
 	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
@@ -147,6 +148,7 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	}
 	ws_schema_set_tags(schema, &s);
 	CommandCounterIncrement();
+	ws_schema_path_end(nest);
 	WsSql->end(level);
 	out = cstring_to_text((char *) sql.data);
 	ws_schema_free(&s);
@@ -168,6 +170,7 @@ test_ws_schema_add_checks(PG_FUNCTION_ARGS)
 	WsSqlRows	rows;
 	StringInfoData out;
 	int			level = WsSql->begin();
+	int			nest = ws_schema_path_begin(schema);
 
 	initStringInfo(&out);
 	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
@@ -184,6 +187,7 @@ test_ws_schema_add_checks(PG_FUNCTION_ARGS)
 		appendStringInfo(&out, "%s\n", (char *) sql.data);
 		buf_free(&sql);
 	}
+	ws_schema_path_end(nest);
 	WsSql->end(level);
 	ws_schema_free(&s);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
