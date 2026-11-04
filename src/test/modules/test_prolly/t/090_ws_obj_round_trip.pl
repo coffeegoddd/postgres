@@ -344,6 +344,21 @@ is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ty2')}), $ty_held, '
 is( $node->safe_psql('postgres', q{SET search_path = ty2; INSERT INTO b_uses (m) VALUES ('meh'); SELECT p, m > 'sad', m < 'happy' FROM b_uses}),
 	'1|t|t', 'a default and an order as they were');
 
+# under an old snapshot, a type's change or its roles' is one to try again
+for my $change (q{ALTER TYPE ty.z_mood ADD VALUE 'later'}, q{ALTER DOMAIN ty.y_pos DROP CONSTRAINT y_pos_nn},
+	q{ALTER ROLE g_tyuser RENAME TO g_tyuser2}, q{ALTER ROLE g_tyowner RENAME TO g_tyowner2})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('ty')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+$node->safe_psql('postgres', q{ALTER ROLE g_tyuser2 RENAME TO g_tyuser; ALTER ROLE g_tyowner2 RENAME TO g_tyowner});
+
 # a type whose owner cannot travel goes to who restores it, unlike a view
 $node->safe_psql('postgres', q{CREATE SCHEMA ty3; CREATE TYPE ty3.login_owned AS ENUM ('a'); ALTER TYPE ty3.login_owned OWNER TO x_person; CREATE SCHEMA ty4});
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ty3', 'ty4')});
