@@ -60,6 +60,38 @@ typedef struct WsConstraint
 	bool		initdeferred;
 } WsConstraint;
 
+#define WS_INDEX_ORDER_DEFAULT 'd'
+#define WS_INDEX_ORDER_DESC 'D'
+/* (the default's the other: first if descending, else last) */
+#define WS_INDEX_NULLS_DEFAULT 'd'
+#define WS_INDEX_NULLS_FIRST 'f'
+#define WS_INDEX_NULLS_LAST 'l'
+
+/* One of an index's keys: a column's tag, or an expression (tag 0). */
+typedef struct WsIndexKey
+{
+	uint64		tag;
+	char	   *expr;			/* as stored, or NULL: a column */
+	char	   *collation;		/* quoted, qualified if not visible, or NULL: the default */
+	char	   *opclass;		/* quoted, qualified if not visible, or NULL: the default */
+	char		order;			/* WS_INDEX_ORDER_* */
+	char		nulls;			/* WS_INDEX_NULLS_* */
+} WsIndexKey;
+
+/* An index no constraint has: a statement of its own, after the table's. */
+typedef struct WsIndex
+{
+	char	   *name;
+	char	   *method;			/* its access method's name */
+	bool		unique;
+	bool		nulls_not_distinct;
+	int			nkeys;
+	WsIndexKey *keys;
+	int			ninclude;
+	uint64	   *include;		/* INCLUDE's tags */
+	char	   *predicate;		/* as stored, or NULL: not partial */
+} WsIndex;
+
 typedef struct WsTableSchema
 {
 	char	   *name;
@@ -70,6 +102,8 @@ typedef struct WsTableSchema
 	uint64	   *key;			/* the primary key's tags */
 	int			nconstraints;
 	WsConstraint *constraints;	/* other than the key, by name in UTF8's order */
+	int			nindexes;
+	WsIndex    *indexes;		/* those no constraint has, by name in UTF8's order */
 } WsTableSchema;
 
 /*
@@ -81,7 +115,10 @@ typedef struct WsTableSchema
  * null and distinct; other constraints in order by name, none named as another
  * or as the key, a check with its expression and nothing else, a unique one
  * with its columns, its own, stored and distinct, initially deferred only if
- * deferrable.  NULL if it is so, or what is wrong.
+ * deferrable; indexes in order by name, none named as a unique constraint or the key,
+ * with a method and keys, each a column of its own or an expression, not both,
+ * INCLUDE's columns its own, an order of nulls only if it is not the default,
+ * and NULLS NOT DISTINCT only if unique.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -125,7 +162,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance and partitions,
  * storage settings, a key's options, a sequence's, a default using one, foreign
- * keys, exclusion constraints, an index no constraint has, comments, grants)
+ * keys, exclusion constraints, an index's options or its dependence on an
+ * extension, comments, grants)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
  * sequence's are not held, and are made again, and neither is the table's owner,
@@ -136,7 +174,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * dropped since the transaction's snapshot raises
  * ERRCODE_T_R_SERIALIZATION_FAILURE.  Other objects' names (a type's, a
  * function's in a default) are printed as they are now, so a reader on an old
- * snapshot must hold those still itself.  A sequence a default names only by
+ * snapshot must hold those still itself.  An index dropped since that snapshot
+ * raises ERRCODE_T_R_SERIALIZATION_FAILURE too.  A sequence a default names only by
  * text has no dependency to see, so the record holds that default as it is.
  * What it gives is the caller's to ws_schema_free.
  */
@@ -164,5 +203,13 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * with the inserter's privileges.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
+
+/*
+ * The CREATE INDEX statement for the table's nth index, in the named schema,
+ * appended to out, to run after the table's: checked as the table's is, one
+ * statement of just this index on just this table, or it raises
+ * ERRCODE_DATA_CORRUPTED and is not given back.
+ */
+extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 #endif							/* PROLLY_WS_SCHEMA_H */

@@ -58,7 +58,8 @@ test_bytes(void)
 		"\x01"					/* columns */
 		"\x07" "\x02" "id" "\x06" "bigint" "s" "\x01" "a" "\x00" "\x00"
 		"\x02" "pk" "\x01\x07"	/* key: its name, its columns */
-		"\x00";					/* constraints */
+		"\x00"					/* constraints */
+		"\x00";					/* indexes */
 	WsColumn	cols[] = {{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,
 		.not_null = true,.identity = WS_IDENTITY_ALWAYS}};
 	WsTableSchema s = {.name = "t",.ncols = 1,
@@ -77,7 +78,7 @@ test_bytes(void)
 			"\x07" "\x01" "k" "\x01" "i" "s" "\x01" "d" "\x00" "\x00"
 			"\xac\x02" "\x01" "v" "\x01" "t" "s" "\x00" "\x00" "\x03" "\'x\'" "\x03" "\"C\""
 			"\x05" "\x01" "g" "\x01" "i" "g" "\x00" "\x00" "\x01" "1" "\x00"
-			"\x02" "pk" "\x01\x07" "\x00";
+			"\x02" "pk" "\x01\x07" "\x00" "\x00";
 		WsColumn	c2[] = {
 			{.tag = 7,.name = "k",.type = "i",.kind = WS_COL_STORED,.not_null = true,
 			.identity = WS_IDENTITY_BY_DEFAULT},
@@ -531,25 +532,31 @@ test_malformed(void)
 		size_t		len;
 		const char *why;
 	}			bad[] = {
-		{"\x02" "\x01" "t" "\x00" "\x00" "\x00" "\x00", 7, "a version not known"},
-		{"\x01" "\x02" "t\0" "\x00" "\x00" "\x00" "\x00", 8, "a NUL"},
+		{"\x02" "\x01" "t" "\x00" "\x00" "\x00" "\x00" "\x00", 8, "a version not known"},
+		{"\x01" "\x02" "t\0" "\x00" "\x00" "\x00" "\x00" "\x00", 9, "a NUL"},
 		{"\x01" "\x09" "t", 3, "runs past its end"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 18, "neither"},
-		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00", 7, "more columns than a table can have"},
-		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00", 9, "a key of more columns"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 19, "neither"},
+		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00" "\x00", 8, "more columns than a table can have"},
+		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00" "\x00", 10, "a key of more columns"},
 		/* constraints */
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x08" "\x01" "x", 23, "flags not known"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "z" "\x00" "\x01" "\x07", 23, "no known kind"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x7f" "\x01", 18, "more constraints than bytes"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x02" "\x07" "\x07", 24, "more columns than the table has"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x01" "\x09", 23, "does not have"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x00" "\x01" "@", 23, "malformed"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x08" "\x01" "x" "\x00", 24, "flags not known"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "z" "\x00" "\x01" "\x07" "\x00", 24, "no known kind"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x7f" "\x01" "\x00", 19, "more constraints than bytes"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x02" "\x07" "\x07" "\x00", 25, "more columns than the table has"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x01" "\x09" "\x00", 24, "does not have"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x00" "\x01" "@" "\x00", 24, "malformed"},
+		/* indexes */
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "x" "\x01" "m" "\x04" "\x01" "\x07" "\x00" "\x00" "d" "d" "\x00" "\x00", 31, "index's flags not known"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x7f", 18, "more indexes than bytes"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "x" "\x01" "m" "\x00" "\xff\x01" "\x00" "\x00" "\x00", 27, "too many keys"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "x" "\x01" "m" "\x00" "\x01" "\x09" "\x00" "\x00" "d" "d" "\x00" "\x00", 31, "does not have"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "x" "\x01" "m" "\x00" "\x01" "\x07" "\x00" "\x00" "z" "d" "\x00" "\x00", 31, "no known order"},
 		/* a number not in its shortest form: one schema, other bytes */
-		{"\x01" "\x81\x00" "t" "\x00" "\x00" "\x00" "\x00", 8, "shortest form"},
-		{"\x01" "\x01" "t" "\x80\x00" "\x00" "\x00" "\x00", 8, "shortest form"},
-		{"\x01" "\x01" "t" "\x00" "\x00" "\x80\x80\x00" "\x00", 9, "shortest form"},
+		{"\x01" "\x81\x00" "t" "\x00" "\x00" "\x00" "\x00" "\x00", 9, "shortest form"},
+		{"\x01" "\x01" "t" "\x80\x00" "\x00" "\x00" "\x00" "\x00", 9, "shortest form"},
+		{"\x01" "\x01" "t" "\x00" "\x00" "\x80\x80\x00" "\x00" "\x00", 10, "shortest form"},
 		/* a tag of bits past the 64th, dropped on reading */
-		{"\x01" "\x01" "t" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 26, "shortest form"},
+		{"\x01" "\x01" "t" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 27, "shortest form"},
 	};
 
 	WsSchemaCodec->encode(&s, &b);
@@ -712,6 +719,10 @@ test_create_table_injection(void)
 		{.type = "integer", .def = "1); --"},
 		/* a comment in the type, and an expression other than the record reads */
 		{.type = "text --", .def = "'harmless\nDEFAULT (pg_read_file('/etc/passwd')) --'"},
+		/* a collation not in its one form, or cut short */
+		{.type = "text", .collation = " \"C\""},
+		{.type = "text", .collation = "pg_catalog . \"C\""},
+		{.type = "text", .collation = "12345678901234567890123456789012345678901234567890123456789012345678"},
 		/* a clause standing in for another */
 		{.type = "integer --", .not_null = true, .def = "1\nNOT NULL NOT NULL --"},
 		{.type = "integer", .not_null = true, .def = "1) NOT NULL NO INHERIT --"},
@@ -842,7 +853,8 @@ test_constraints(void)
 		"\x00" "\x00"			/* no key */
 		"\x02"					/* constraints */
 		"\x09" "Odd Check" "c" "\x00" "\x0d" "(@{7} > @{8})"
-		"\x01" "u" "u" "\x07" "\x02\x08\x07";
+		"\x01" "u" "u" "\x07" "\x02\x08\x07"
+		"\x00";					/* indexes */
 	Buf			b = BUF_INIT;
 	Buf			sql = BUF_INIT;
 	WsTableSchema got;
@@ -1004,6 +1016,271 @@ test_constraint_injection(void)
 	expect_error(check_spanning, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 }
 
+/* An index: the record, its bytes and its statement. */
+static void
+test_indexes(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "Odd",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsIndexKey keys[] = {
+		{.tag = 7,.collation = "pg_catalog.\"C\"",.opclass = "pg_catalog.text_pattern_ops",
+		.order = WS_INDEX_ORDER_DESC,.nulls = WS_INDEX_NULLS_LAST},
+		{.expr = "lower(@{7})",.order = WS_INDEX_ORDER_DEFAULT,.nulls = WS_INDEX_NULLS_DEFAULT},
+	};
+	uint64		inc[] = {8};
+	WsIndex		ix = {.name = "Odd Idx",.method = "btree",.unique = true,.nulls_not_distinct = true,
+		.nkeys = 2,.keys = keys,.ninclude = 1,.include = inc,.predicate = "(@{8} > 0)"};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nindexes = 1,.indexes = &ix};
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK_EQ(got.nindexes, 1);
+	CHECK(strcmp(got.indexes[0].keys[1].expr, "lower(@{7})") == 0);
+	CHECK(got.indexes[0].keys[0].order == WS_INDEX_ORDER_DESC && got.indexes[0].unique);
+	CHECK(got.indexes[0].include[0] == 8 && strcmp(got.indexes[0].predicate, "(@{8} > 0)") == 0);
+	{
+		Buf			again = BUF_INIT;
+
+		WsSchemaCodec->encode(&got, &again);
+		CHECK(again.len == b.len && memcmp(again.data, b.data, b.len) == 0);
+		buf_free(&again);
+	}
+	ws_schema_free(&got);
+	ws_schema_create_index(&s, 0, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE UNIQUE INDEX \"Odd Idx\" ON x.t USING btree "
+				 "(a COLLATE pg_catalog.\"C\" pg_catalog.text_pattern_ops DESC NULLS LAST, (lower(a))) "
+				 "INCLUDE (\"Odd\") NULLS NOT DISTINCT WHERE ((\"Odd\" > 0))") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+static void
+index_invalid(WsIndex *ix, const char *why)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED}};
+	static uint64 tags[] = {7};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = tags};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con,
+	.nindexes = 1,.indexes = ix};
+	const char *problem = ws_schema_problem(&s);
+
+	if (problem == NULL || strstr(problem, why) == NULL)
+		elog(ERROR, "for \"%s\": %s", why, problem ? problem : "no problem found");
+}
+
+static void
+test_index_problems(void)
+{
+	static const struct
+	{
+		const char *why;
+		WsIndex		ix;
+		WsIndexKey	key;
+	}			cases[] = {
+#define OK_KEY {.tag = 7,.order = WS_INDEX_ORDER_DEFAULT,.nulls = WS_INDEX_NULLS_DEFAULT}
+		{"no name", {.method = "btree"}, OK_KEY},
+		{"no method", {.name = "x"}, OK_KEY},
+		{"too long", {.name = "1234567890123456789012345678901234567890123456789012345678901234",
+		.method = "btree"}, OK_KEY},
+		{"named as a unique constraint", {.name = "c",.method = "btree"}, OK_KEY},
+		{"does not have", {.name = "x",.method = "btree",.predicate = "(@{9} > 0)"}, OK_KEY},
+		{"malformed", {.name = "x",.method = "btree",.predicate = "@"}, OK_KEY},
+		{"no known order", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'a',.nulls = 'd'}},
+		{"its default order of nulls", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'd',.nulls = 'l'}},
+		{"its default order of nulls", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'D',.nulls = 'f'}},
+		{"not unique", {.name = "x",.method = "btree",.nulls_not_distinct = true}, OK_KEY},
+		{"neither", {.name = "x",.method = "btree"}, {.order = 'd',.nulls = 'd'}},
+		{"neither", {.name = "x",.method = "btree"}, {.tag = 7,.expr = "true",.order = 'd',.nulls = 'd'}},
+		{"does not have", {.name = "x",.method = "btree"}, {.tag = 9,.order = 'd',.nulls = 'd'}},
+		{"does not have", {.name = "x",.method = "btree"}, {.expr = "(@{9})",.order = 'd',.nulls = 'd'}},
+		{"malformed", {.name = "x",.method = "btree"}, {.expr = "@",.order = 'd',.nulls = 'd'}},
+		{"no known order", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'z',.nulls = 'd'}},
+		{"order of nulls", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'd',.nulls = 'z'}},
+		{"empty collation", {.name = "x",.method = "btree"}, {.tag = 7,.collation = "",.order = 'd',.nulls = 'd'}},
+#undef OK_KEY
+	};
+
+	for (int i = 0; i < lengthof(cases); i++)
+	{
+		WsIndex		ix = cases[i].ix;
+		WsIndexKey	key = cases[i].key;
+
+		ix.nkeys = 1;
+		ix.keys = &key;
+		index_invalid(&ix, cases[i].why);
+	}
+	{
+		WsIndex		ix = {.name = "x",.method = "btree"};
+
+		index_invalid(&ix, "no keys");
+	}
+	{
+		WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+		uint64		none[] = {9};
+		WsIndex		ix = {.name = "x",.method = "btree",.nkeys = 1,.keys = &key,.ninclude = 1,.include = none};
+
+		index_invalid(&ix, "including a column the table does not have");
+		ix.ninclude = INDEX_MAX_KEYS;
+		index_invalid(&ix, "too many columns");
+	}
+	{
+		/* a key's name; indexes out of order; a check's name is free to take */
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.not_null = true}};
+		uint64		a[] = {7};
+		WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+		WsConstraint check = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+		WsIndex		two[] = {
+			{.name = "y",.method = "btree",.nkeys = 1,.keys = &key},
+			{.name = "x",.method = "btree",.nkeys = 1,.keys = &key},
+		};
+		WsIndex		named = {.name = "k",.method = "btree",.nkeys = 1,.keys = &key};
+		WsIndex		as_check = {.name = "c",.method = "btree",.nkeys = 1,.keys = &key};
+		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 2,.indexes = two};
+
+		CHECK(strstr(ws_schema_problem(&s), "not in order") != NULL);
+		s.nindexes = 1;
+		s.indexes = &named;
+		s.key_name = "k";
+		s.nkey = 1;
+		s.key = a;
+		CHECK(strstr(ws_schema_problem(&s), "named as the key") != NULL);
+		s.key_name = NULL;
+		s.nkey = 0;
+		s.key = NULL;
+		s.indexes = &as_check;
+		s.nconstraints = 1;
+		s.constraints = &check;
+		CHECK(ws_schema_problem(&s) == NULL);
+	}
+}
+
+/* What an index's text could add to the statement is refused. */
+typedef struct IndexAttack
+{
+	const char *method;
+	const char *expr;
+	const char *collation;
+	const char *opclass;
+	const char *predicate;
+} IndexAttack;
+
+static void
+index_injected(void *arg)
+{
+	const IndexAttack *in = arg;
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED}};
+	WsIndexKey	key = {.tag = in->expr ? 0 : 7,.expr = (char *) in->expr,.collation = (char *) in->collation,
+	.opclass = (char *) in->opclass,.order = 'd',.nulls = 'd'};
+	WsIndex		ix = {.name = "i",.method = (char *) (in->method ? in->method : "btree"),.nkeys = 1,.keys = &key,
+	.predicate = (char *) in->predicate};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 1,.indexes = &ix};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_index(&s, 0, "x", &b);
+}
+
+static void
+index_spanned(void *arg)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "text",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	keys[] = {
+		{.expr = "1) --",.order = 'd',.nulls = 'd'},
+		{.expr = (char *) arg,.order = 'd',.nulls = 'd'},
+	};
+	uint64		b_tag[] = {8};
+	const char *expr = arg;
+	WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 2,.keys = keys};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nindexes = 1,.indexes = &ix};
+	Buf			b = BUF_INIT;
+
+	/* (INCLUDE compared whole: the count alone would refuse it otherwise) */
+	if (strstr(expr, "INCLUDE (b ") != NULL || strstr(expr, "INCLUDE ((b") != NULL)
+	{
+		ix.ninclude = 1;
+		ix.include = b_tag;
+	}
+	ws_schema_create_index(&s, 0, "x", &b);
+}
+
+static void
+test_index_injection(void)
+{
+	static const IndexAttack bad[] = {
+		{.expr = "1), (2"},
+		{.expr = "1)) WITH (fillfactor=10) --"},
+		{.expr = "@{7})) INCLUDE (a) --"},
+		{.expr = "@{7})) WHERE (true) --"},
+		{.collation = " \"C\""},
+		{.collation = "\"C\" "},
+		{.collation = "pg_catalog . \"C\""},
+		{.collation = "12345678901234567890123456789012345678901234567890123456789012345678"},
+		{.collation = "\"C\" text_ops"},
+		{.collation = "\"C\" DESC"},
+		{.collation = "\"C\", a"},
+		{.collation = "\"C\") WITH (fillfactor = 10) --"},
+		{.opclass = "text_ops DESC"},
+		{.opclass = "text_ops (siglen = 1)"},
+		{.opclass = "text_ops, a"},
+		{.opclass = "text_ops) WHERE (true) --"},
+		{.predicate = "true) TABLESPACE x --"},
+		{.predicate = "true) FROM y WHERE (true"},
+		{.predicate = "true) AS foo --"},
+	};
+	static const char *const same[] = {"true) AND (false", "true) --"};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(index_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+
+	/*
+	 * A comment in one key's expression and a newline in the next's, so that
+	 * the statement says more after them; each alone is the expression it was.
+	 */
+	{
+		static const char *const clause[] = {
+			"2 /*\n, ((2))) INCLUDE (b DESC) -- */",
+			"2 /*\n, ((2))) INCLUDE (b NULLS LAST) -- */",
+			"2 /*\n, ((2))) INCLUDE (b COLLATE \"C\") -- */",
+			"2 /*\n, ((2))) INCLUDE (b int4_ops) -- */",
+			"2 /*\n, ((2))) INCLUDE (b int4_ops (x = 1)) -- */",
+			"2 /*\n, ((2))) INCLUDE ((b)) -- */",
+			"2 /*\n, ((2))) INCLUDE (b) -- */",
+			"2 /*\n, ((2))) WITH (fillfactor = 10) -- */",
+			"2 /*\n, ((2))) TABLESPACE x -- */",
+			"2 /*\n, ((2))) WHERE (true) -- */",
+			"2 /*\n, ((2))) NULLS NOT DISTINCT -- */",
+		};
+
+		for (int i = 0; i < lengthof(clause); i++)
+			expect_error(index_spanned, (void *) clause[i], ERRCODE_DATA_CORRUPTED, NULL);
+	}
+
+	/* (these make what they say: an expression's tree is what is compared) */
+	for (int i = 0; i < lengthof(same); i++)
+	{
+		Buf			b = BUF_INIT;
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED}};
+		WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+		WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 1,.keys = &key,
+		.predicate = (char *) same[i]};
+		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 1,.indexes = &ix};
+
+		ws_schema_create_index(&s, 0, "x", &b);
+		buf_append_byte(&b, 0);
+		CHECK(strstr((char *) b.data, same[i]) != NULL);
+		buf_free(&b);
+	}
+}
+
 /* An expression's references take the names the record has now. */
 static void
 test_create_table_renamed(void)
@@ -1149,6 +1426,9 @@ static const ProllyUnitTest tests[] = {
 	{"constraints", test_constraints},
 	{"constraint_problems", test_constraint_problems},
 	{"constraint_injection", test_constraint_injection},
+	{"indexes", test_indexes},
+	{"index_problems", test_index_problems},
+	{"index_injection", test_index_injection},
 	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},

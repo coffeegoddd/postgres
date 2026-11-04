@@ -86,6 +86,16 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	buf_append_byte(&sql, 0);
 	WsSql->run((char *) sql.data, 0, NULL, &rows);
 	ws_sql_rows_free(&rows);
+	for (int i = 0; i < s.nindexes; i++)
+	{
+		Buf			ix = BUF_INIT;
+
+		ws_schema_create_index(&s, i, schema, &ix);
+		buf_append_byte(&ix, 0);
+		WsSql->run((char *) ix.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		buf_free(&ix);
+	}
 	ws_schema_set_tags(schema, &s);
 	CommandCounterIncrement();
 	WsSql->end(level);
