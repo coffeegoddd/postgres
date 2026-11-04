@@ -426,6 +426,34 @@ $node->safe_psql('postgres', q{
 	COMMENT ON TABLE src.cm_part IS 'the parent';
 	CREATE TABLE src.cm_part1 PARTITION OF src.cm_part FOR VALUES FROM (0) TO (1);
 	COMMENT ON TABLE src.cm_part1 IS 'its partition';
+	CREATE ROLE rg_owner NOLOGIN;
+	CREATE ROLE rg_read NOLOGIN;
+	CREATE ROLE rg_write NOLOGIN;
+	CREATE ROLE "Odd Role" NOLOGIN;
+	CREATE ROLE rg_login LOGIN;
+	CREATE ROLE rg_powers NOLOGIN BYPASSRLS;
+	GRANT USAGE ON SCHEMA src TO rg_read;
+	CREATE TABLE src.g_all (a integer GENERATED ALWAYS AS IDENTITY, b integer, "Odd" text);
+	GRANT SELECT, INSERT ON src.g_all TO rg_read;
+	GRANT DELETE, TRUNCATE ON src.g_all TO rg_write;
+	GRANT UPDATE ON src.g_all TO rg_write WITH GRANT OPTION;
+	GRANT SELECT ON src.g_all TO PUBLIC;
+	GRANT REFERENCES, TRIGGER, MAINTAIN ON src.g_all TO "Odd Role";
+	GRANT SELECT (b, "Odd"), UPDATE (b) ON src.g_all TO rg_write;
+	GRANT INSERT ("Odd") ON src.g_all TO rg_write WITH GRANT OPTION;
+	GRANT USAGE, SELECT ON SEQUENCE src.g_all_a_seq TO rg_read;
+	GRANT UPDATE ON SEQUENCE src.g_all_a_seq TO rg_write WITH GRANT OPTION;
+	CREATE TABLE src.g_owned (a integer GENERATED ALWAYS AS IDENTITY, b integer);
+	ALTER TABLE src.g_owned OWNER TO rg_owner;
+	GRANT SELECT ON src.g_owned TO rg_read;
+	CREATE TABLE src.g_part (a integer) PARTITION BY RANGE (a);
+	ALTER TABLE src.g_part OWNER TO rg_owner;
+	GRANT SELECT ON src.g_part TO rg_read;
+	CREATE TABLE src.g_part1 PARTITION OF src.g_part FOR VALUES FROM (0) TO (10);
+	GRANT INSERT ON src.g_part1 TO rg_write;
+	CREATE TABLE src.g_ren (a integer);
+	GRANT SELECT (a) ON src.g_ren TO rg_read;
+	ALTER TABLE src.g_ren RENAME a TO z;
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -451,7 +479,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
 	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk',
 	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1', 'rs_fkp', 'rs_fkc',
-	'cm', 'cm_ren', 'cm_part', 'cm_part1');
+	'cm', 'cm_ren', 'cm_part', 'cm_part1', 'g_all', 'g_owned', 'g_part', 'g_part1', 'g_ren');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -503,6 +531,7 @@ for my $table (@tables)
 # comments, on all that is made by now; row security last, after the rows and the
 # foreign keys; the same bytes
 $restore_step->('test_ws_schema_comments', @tables);
+$restore_step->('test_ws_schema_grants', @tables);
 $restore_step->('test_ws_schema_row_security', @tables);
 for my $table (@tables)
 {
@@ -903,6 +932,32 @@ isnt($node->safe_psql('postgres', sprintf($cmts, 'src')), '', '(there are some)'
 is($node->safe_psql('postgres', sprintf($cmts, 'dst')), $node->safe_psql('postgres', sprintf($cmts, 'src')), 'comments as they were');
 is($node->safe_psql('postgres', q{SELECT col_description('dst.cm_ren'::regclass, 1)}), 'followed', 'a comment follows its column by tag');
 
+# owners and grants as they were
+my $acls = q{SELECT string_agg(q.relname || ' ' || coalesce(q.relacl::text, '-') || ' ' || pg_get_userbyid(q.relowner) || ' ' ||
+		coalesce((SELECT string_agg(a.attname || ':' || a.attacl::text, ',' ORDER BY a.attnum) FROM pg_attribute a
+			WHERE a.attrelid = q.oid AND a.attacl IS NOT NULL), ''), E'\n' ORDER BY q.relname)
+	FROM pg_class q WHERE q.relnamespace = '%s'::regnamespace AND q.relname LIKE 'g\_%%'};
+my $canon_acl = sub { join("\n", map { join(',', sort split(/[{},]/, $_)) } split(/\n/, $_[0])) };
+is($canon_acl->($node->safe_psql('postgres', sprintf($acls, 'dst'))), $canon_acl->($node->safe_psql('postgres', sprintf($acls, 'src'))),
+	'owners and grants as they were');
+is($node->safe_psql('postgres', q{SELECT has_column_privilege('rg_read', 'dst.g_ren', 'z', 'SELECT')}), 't', 'a grant follows its column by tag');
+is($node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'dst.g_owned_a_seq'::regclass}), 'rg_owner',
+	'an identity\'s sequence goes with its table\'s owner');
+
+# an owner that can log in is not held: whoever makes it owns it
+$node->safe_psql('postgres', q{CREATE ROLE rg_person LOGIN; GRANT CREATE, USAGE ON SCHEMA src TO rg_person;
+	CREATE TABLE src.g_person (a integer); ALTER TABLE src.g_person OWNER TO rg_person;
+	GRANT SELECT ON src.g_person TO rg_read;
+	CREATE SCHEMA g_dst VERSIONED;});
+{
+	my $hex = $bytes->($node, 'postgres', 'g_person');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'g_dst');
+		SELECT test_ws_schema_grants(decode('$hex', 'hex'), 'g_dst')});
+	is($bytes->($node, 'postgres', 'g_person', undef, 'g_dst'), $hex, 'the same bytes, whoever owns it');
+	isnt($node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'g_dst.g_person'::regclass}),
+		'rg_person', '(not the person who did)');
+}
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -945,7 +1000,8 @@ my %refused_for = (
 	uover => 'over a period', uspc => 'has a tablespace',
 	iext => 'depends on an extension', 
 	ispc => 'has a tablespace', 
-	grt => 'grants', cgrt => 'grants', seqgrt => 'grants',
+	gl => 'can log in', gsu => 'powers no commit holds', gby => 'other than its owner', gown => 'other rights', gsuo => 'its owner has powers',
+	gcown => 'other rights',
 	dup => 'two constraints alike', dupk => 'two constraints alike');
 for my $t (
 	[ 'pxs', q{CREATE SCHEMA ptother VERSIONED; CREATE TABLE src.pxs (a int) PARTITION BY RANGE (a); CREATE TABLE ptother.pxs1 PARTITION OF src.pxs FOR VALUES FROM (0) TO (1)} ],
@@ -999,16 +1055,19 @@ for my $t (
 	[ 'xoptd', 'CREATE TABLE src.xoptd (r int4range, CONSTRAINT xoptd_1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xoptd ADD CONSTRAINT xoptd_2 EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50)' ],
 	[ 'ixo1', q{CREATE TABLE src.ixo (a integer) PARTITION BY RANGE (a); CREATE INDEX ixo_1 ON src.ixo (a); CREATE INDEX ixo_2 ON src.ixo (a) WITH (fillfactor = 50); CREATE TABLE src.ixo1 PARTITION OF src.ixo FOR VALUES FROM (0) TO (10)} ],
 	[ 'fkcom', q{CREATE TABLE src.fkcom_p (id int PRIMARY KEY); CREATE TABLE src.fkcom (a int, CONSTRAINT fkcom_k FOREIGN KEY (a) REFERENCES src.fkcom_p (id)); COMMENT ON CONSTRAINT fkcom_k ON src.fkcom IS 'x'} ],
+	[ 'gl', q{CREATE TABLE src.gl (a int); GRANT SELECT ON src.gl TO rg_login} ],
+	[ 'gsu', q{CREATE TABLE src.gsu (a int); GRANT SELECT ON src.gsu TO rg_powers} ],
+	[ 'gby', q{CREATE TABLE src.gby (a int); GRANT SELECT ON src.gby TO rg_read WITH GRANT OPTION; SET ROLE rg_read; GRANT SELECT ON src.gby TO rg_write; RESET ROLE} ],
+	[ 'gown', q{CREATE TABLE src.gown (a int); REVOKE DELETE ON src.gown FROM CURRENT_USER} ],
+	[ 'gcown', q{CREATE TABLE src.gcown (a int); GRANT SELECT (a) ON src.gcown TO CURRENT_USER} ],
+	[ 'gsuo', q{CREATE TABLE src.gsuo (a int); ALTER TABLE src.gsuo OWNER TO rg_powers} ],
 	[ 'xdup', 'CREATE TABLE src.xdup (r int4range, CONSTRAINT x1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xdup ADD CONSTRAINT x2 EXCLUDE USING gist (r WITH &&)' ],
 	[ 'xspc', 'CREATE TABLE src.xspc (r int4range, EXCLUDE USING gist (r WITH &&) USING INDEX TABLESPACE t86)' ],
 	[ 'xext', 'CREATE TABLE src.xext (r int4range, CONSTRAINT xext_x EXCLUDE USING gist (r WITH &&)); ALTER INDEX src.xext_x DEPENDS ON EXTENSION test_prolly' ],
 	[ 'iext', 'CREATE TABLE src.iext (a int); CREATE INDEX iext_i ON src.iext (a); ALTER INDEX src.iext_i DEPENDS ON EXTENSION test_prolly' ],
 	[ 'ispc', 'CREATE TABLE src.ispc (a int); CREATE INDEX ON src.ispc (a) TABLESPACE t86' ],
-	[ 'grt', 'CREATE TABLE src.grt (a int); GRANT SELECT ON src.grt TO PUBLIC' ],
-	[ 'cgrt', 'CREATE TABLE src.cgrt (a int); GRANT SELECT (a) ON src.cgrt TO PUBLIC' ],
 	[ 'dup', 'CREATE TABLE src.dup (a int, CONSTRAINT dup1 UNIQUE (a)); ALTER TABLE src.dup ADD CONSTRAINT dup2 UNIQUE (a)' ],
 	[ 'dupk', 'CREATE TABLE src.dupk (a int PRIMARY KEY); ALTER TABLE src.dupk ADD CONSTRAINT dupk_u UNIQUE (a)' ],
-	[ 'seqgrt', 'CREATE TABLE src.seqgrt (a int GENERATED ALWAYS AS IDENTITY); GRANT SELECT ON src.seqgrt_a_seq TO PUBLIC' ],
 	[ 'uover', 'CREATE TABLE src.uover (a int4range, r int4range, UNIQUE (a, r WITHOUT OVERLAPS))' ],
 	[ 'uspc', "CREATE TABLE src.uspc (a int, UNIQUE (a) USING INDEX TABLESPACE t86)" ],
 	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
@@ -1610,6 +1669,24 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 	my ($ret, $out, $err) = $node->psql('lat', q{SET client_encoding = UTF8; SELECT test_ws_schema_bytes('enc', 'toasté')});
 	like($err, qr/table "toasté" cannot be read yet/, 'a TOAST table\'s refusal in the server\'s encoding');
 }
+
+# roles' names in each encoding
+my $gr_sql = q{
+	SET client_encoding = UTF8;
+	CREATE TABLE enc."droité" ("colonné" integer GENERATED ALWAYS AS IDENTITY);
+	ALTER TABLE enc."droité" OWNER TO "propriété";
+	GRANT SELECT ON enc."droité" TO "lecteuré";
+	GRANT SELECT ("colonné") ON enc."droité" TO "lecteuré";
+};
+# (a shared catalog's names are in whatever bytes made them, so each database makes its own)
+$node->safe_psql($_, q{SET client_encoding = UTF8; CREATE ROLE "propriété" NOLOGIN; CREATE ROLE "lecteuré" NOLOGIN}) for ('postgres', 'lat');
+$node->safe_psql($_, $gr_sql) for ('postgres', 'lat');
+my $gr_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('%s', 'droité'), 'hex')};
+my $gr_utf8 = $node->safe_psql('postgres', sprintf($gr_enc, 'enc'));
+is($node->safe_psql('lat', sprintf($gr_enc, 'enc')), $gr_utf8, 'an owner and grants the same bytes in LATIN1 as in UTF8');
+$node->safe_psql('lat', qq{SET client_encoding = UTF8; SELECT test_ws_schema_create(decode('$gr_utf8', 'hex'), 'dst');
+	SELECT test_ws_schema_grants(decode('$gr_utf8', 'hex'), 'dst')});
+is($node->safe_psql('lat', sprintf($gr_enc, 'dst')), $gr_utf8, 'and made there, read again');
 
 # a comment's text and targets in each encoding
 my $cm_sql = q{

@@ -29,7 +29,9 @@
  * uvarint noptions, names and values; and with 'x', a flags byte for the key and
  * row security, a replica identity byte, its index's name if by index, and the clustered index's
  * name or nothing; and comments with 'm', uvarint n, and each one's kind byte, tag
- * or name as its kind has, and text.  Any other ends there.
+ * or name as its kind has, and text; and who may do what with 'g', its owner's name
+ * or nothing, uvarint n, and each grant's target byte, tag if not the table's,
+ * grantee or nothing, grant option byte and privileges.  Any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -497,6 +499,95 @@ comments_problem(const WsTableSchema *s)
 	return NULL;
 }
 
+/* The privileges each target can have, in order by byte. */
+static const char *
+grantable_letters(char target)
+{
+	switch (target)
+	{
+		case WS_GRANT_TABLE:
+			return "Ddamrtwx";
+		case WS_GRANT_COLUMN:
+			return "arwx";
+		case WS_GRANT_SEQUENCE:
+			return "Urw";
+	}
+	return NULL;
+}
+
+static const char *
+grants_problem(const WsTableSchema *s)
+{
+	if (s->owner != NULL && (s->owner[0] == '\0' || strlen(s->owner) >= NAMEDATALEN))
+		return "an owner of no name, or too long a one";
+	if (s->ngrants < 0)
+		return "a negative number of grants";
+	for (int i = 0; i < s->ngrants; i++)
+	{
+		const WsGrant *g = &s->grants[i];
+		const char *allowed = grantable_letters(g->target);
+
+		CHECK_FOR_INTERRUPTS();
+		if (allowed == NULL)
+			return "a grant on no known kind of thing";
+		if (g->target == WS_GRANT_TABLE)
+		{
+			if (g->tag != 0)
+				return "a table's grant on something else";
+		}
+		else
+		{
+			const WsColumn *col = ws_schema_column(s, g->tag);
+
+			if (col == NULL || (g->target == WS_GRANT_SEQUENCE && col->identity_seq == NULL))
+				return "a grant on what the table does not have";
+		}
+		if (g->grantee != NULL && (g->grantee[0] == '\0' || strlen(g->grantee) >= NAMEDATALEN))
+			return "a grantee of no name, or too long a one";
+		if (g->grantee != NULL && s->owner != NULL && strcmp(g->grantee, s->owner) == 0)
+			return "a grant to the table's owner";
+		if (g->privileges == NULL || g->privileges[0] == '\0')
+			return "a grant of no privileges";
+		for (const char *l = g->privileges; *l; l++)
+		{
+			if (strchr(allowed, *l) == NULL)
+				return "a privilege that target cannot have";
+			if (l > g->privileges && (unsigned char) l[-1] >= (unsigned char) *l)
+				return "privileges not in order";
+		}
+		if (i > 0)
+		{
+			const WsGrant *prior = &s->grants[i - 1];
+			int			cmp = (unsigned char) prior->target - (unsigned char) g->target;
+
+			if (cmp == 0 && prior->tag != g->tag)
+				cmp = prior->tag < g->tag ? -1 : 1;
+			if (cmp == 0)
+			{
+				if ((prior->grantee == NULL) != (g->grantee == NULL))
+					cmp = prior->grantee == NULL ? -1 : 1;
+				else if (g->grantee != NULL)
+					cmp = strcmp(prior->grantee, g->grantee);
+			}
+			if (cmp == 0)
+			{
+				if (prior->grant_option == g->grant_option)
+					cmp = 1;
+				else
+				{
+					cmp = prior->grant_option ? 1 : -1;
+					for (const char *l = g->privileges; *l; l++)
+						if (strchr(prior->privileges, *l) != NULL)
+							return "a privilege granted twice";
+				}
+			}
+			if (cmp >= 0)
+				return "grants not in order";
+		}
+	}
+	return NULL;
+}
+
 static const char *
 inheritance_problem(const WsTableSchema *s)
 {
@@ -948,6 +1039,9 @@ ws_schema_problem(const WsTableSchema *s)
 		problem = comments_problem(s);
 		if (problem != NULL)
 			return problem;
+		problem = grants_problem(s);
+		if (problem != NULL)
+			return problem;
 	}
 	return column_names_problem(s);
 }
@@ -959,6 +1053,7 @@ ws_schema_problem(const WsTableSchema *s)
 #define WS_INDEX_SETTINGS 'j'
 #define WS_TABLE_SETTINGS 'x'
 #define WS_COMMENTS 'm'
+#define WS_GRANTS 'g'
 #define KEY_DEFERRABLE 0x01
 #define KEY_INITDEFERRED 0x02
 #define TABLE_ROW_SECURITY 0x04
@@ -1223,6 +1318,23 @@ schema_encode(const WsTableSchema *s, Buf *out)
 			else if (m->kind != WS_COMMENT_TABLE)
 				put_string(out, m->name);
 			put_string(out, m->text);
+		}
+	}
+	if (s->owner != NULL || s->ngrants > 0)
+	{
+		buf_append_byte(out, WS_GRANTS);
+		put_optional(out, s->owner);
+		buf_append_uvarint(out, (uint64) s->ngrants);
+		for (int i = 0; i < s->ngrants; i++)
+		{
+			const WsGrant *g = &s->grants[i];
+
+			buf_append_byte(out, (uint8) g->target);
+			if (g->target != WS_GRANT_TABLE)
+				buf_append_uvarint(out, g->tag);
+			put_optional(out, g->grantee);
+			buf_append_byte(out, g->grant_option ? 1 : 0);
+			put_string(out, g->privileges);
 		}
 	}
 }
@@ -1516,7 +1628,7 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	}
 	if (p != end && *p != WS_PARTITION_OF && *p != WS_INHERITS && *p != WS_OPTIONS &&
 		*p != WS_COLUMN_SETTINGS && *p != WS_INDEX_SETTINGS && *p != WS_TABLE_SETTINGS &&
-		*p != WS_COMMENTS)
+		*p != WS_COMMENTS && *p != WS_GRANTS)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -1735,6 +1847,42 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			m->text = get_string(&p, end);
 		}
 	}
+	if (p != end && *p == WS_GRANTS)
+	{
+		p++;
+		s->owner = get_optional(&p, end);
+		n = get_uvarint(&p, end);
+		if (n == 0 && s->owner == NULL)
+			malformed("it says it has no owner and no grants, at length");
+		/* (each is at least four bytes: target, grantee's length, option, privileges' length) */
+		if (n > (uint64) (end - p) / 4)
+			malformed("more grants than bytes");
+		s->grants = px_malloc((size_t) Max(Min(n, 16), 1) * sizeof(WsGrant));
+		memset(s->grants, 0, (size_t) Max(Min(n, 16), 1) * sizeof(WsGrant));
+		for (uint64 i = 0; i < n; i++)
+		{
+			WsGrant    *g;
+			uint8		option;
+
+			/* (grown as they are read: each is bigger here than there) */
+			if (i >= 16 && (i & (i - 1)) == 0)
+			{
+				s->grants = px_realloc(s->grants, (size_t) Min(i * 2, n) * sizeof(WsGrant));
+				memset(s->grants + i, 0, (size_t) (Min(i * 2, n) - i) * sizeof(WsGrant));
+			}
+			s->ngrants = (int) i + 1;
+			g = &s->grants[i];
+			g->target = (char) get_byte(&p, end);
+			if (g->target != WS_GRANT_TABLE)
+				g->tag = get_uvarint(&p, end);
+			g->grantee = get_optional(&p, end);
+			option = get_byte(&p, end);
+			if (option > 1)
+				malformed("a grant's option is neither");
+			g->grant_option = option == 1;
+			g->privileges = get_string(&p, end);
+		}
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_schema_problem(s);
@@ -1797,6 +1945,13 @@ ws_schema_free(WsTableSchema *s)
 		px_free(s->comments[i].text);
 	}
 	px_free(s->comments);
+	px_free(s->owner);
+	for (int i = 0; i < s->ngrants; i++)
+	{
+		px_free(s->grants[i].grantee);
+		px_free(s->grants[i].privileges);
+	}
+	px_free(s->grants);
 	px_free(s->index_settings);
 	px_free(s->replica_index);
 	px_free(s->clustered);
@@ -3177,6 +3332,131 @@ check_comment_statement(const WsTableSchema *s, const WsComment *m, const char *
 		not_the_record(s, "another comment");
 }
 
+/* A privilege's keyword, from its letter. */
+static const char *
+privilege_word(char letter)
+{
+	switch (letter)
+	{
+		case 'a':
+			return "INSERT";
+		case 'r':
+			return "SELECT";
+		case 'w':
+			return "UPDATE";
+		case 'd':
+			return "DELETE";
+		case 'D':
+			return "TRUNCATE";
+		case 'x':
+			return "REFERENCES";
+		case 't':
+			return "TRIGGER";
+		case 'm':
+			return "MAINTAIN";
+	}
+	return "USAGE";
+}
+
+static void
+write_grant(const WsTableSchema *s, const WsGrant *g, const char *schema, Buf *out)
+{
+	const WsColumn *col = g->tag != 0 ? ws_schema_column(s, g->tag) : NULL;
+
+	ws_put_text(out, "GRANT ");
+	for (const char *l = g->privileges; *l; l++)
+	{
+		if (l > g->privileges)
+			ws_put_text(out, ", ");
+		ws_put_text(out, privilege_word(*l));
+		if (g->target == WS_GRANT_COLUMN)
+		{
+			ws_put_text(out, " (");
+			ws_put_identifier(out, col->name);
+			ws_put_text(out, ")");
+		}
+	}
+	ws_put_text(out, g->target == WS_GRANT_SEQUENCE ? " ON SEQUENCE " : " ON TABLE ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, g->target == WS_GRANT_SEQUENCE ? col->identity_seq : s->name);
+	ws_put_text(out, " TO ");
+	if (g->grantee == NULL)
+		ws_put_text(out, "PUBLIC");
+	else
+		ws_put_identifier(out, g->grantee);
+	if (g->grant_option)
+		ws_put_text(out, " WITH GRANT OPTION");
+}
+
+/* One GRANT, of just these, on just this, to just this role. */
+static void
+check_grant_statement(const WsTableSchema *s, const WsGrant *g, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	const WsColumn *col = g->tag != 0 ? ws_schema_column(s, g->tag) : NULL;
+	GrantStmt  *stmt;
+	RangeVar   *on;
+	RoleSpec   *to;
+	ListCell   *lc;
+	const char *l = g->privileges;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, GrantStmt))
+		not_the_record(s, "it is not one GRANT");
+	stmt = (GrantStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (!stmt->is_grant || stmt->targtype != ACL_TARGET_OBJECT || stmt->grantor != NULL ||
+		stmt->objtype != (g->target == WS_GRANT_SEQUENCE ? OBJECT_SEQUENCE : OBJECT_TABLE) ||
+		stmt->grant_option != g->grant_option ||
+		list_length(stmt->objects) != 1 || list_length(stmt->grantees) != 1 ||
+		list_length(stmt->privileges) != (int) strlen(g->privileges))
+		not_the_record(s, "another grant");
+	on = linitial_node(RangeVar, stmt->objects);
+	if (on->catalogname != NULL || on->schemaname == NULL || strcmp(on->schemaname, schema) != 0 ||
+		strcmp(on->relname, g->target == WS_GRANT_SEQUENCE ? col->identity_seq : s->name) != 0)
+		not_the_record(s, "a grant on something else");
+	to = linitial_node(RoleSpec, stmt->grantees);
+	if (g->grantee == NULL ? to->roletype != ROLESPEC_PUBLIC :
+		(to->roletype != ROLESPEC_CSTRING || strcmp(to->rolename, g->grantee) != 0))
+		not_the_record(s, "a grant to someone else");
+	foreach(lc, stmt->privileges)
+	{
+		AccessPriv *priv = lfirst_node(AccessPriv, lc);
+
+		if (pg_strcasecmp(priv->priv_name, privilege_word(*l)) != 0)
+			not_the_record(s, "another grant");
+		l++;
+		if (g->target == WS_GRANT_COLUMN)
+		{
+			if (list_length(priv->cols) != 1 || strcmp(strVal(linitial(priv->cols)), col->name) != 0)
+				not_the_record(s, "another grant");
+		}
+		else if (priv->cols != NIL)
+			not_the_record(s, "another grant");
+	}
+}
+
+/* One ALTER TABLE ONLY of this table, of just its owner. */
+static void
+check_owner_statement(const WsTableSchema *s, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	AlterTableCmd *cmd;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
+		not_the_record(s, "another table");
+	cmd = linitial_node(AlterTableCmd, stmt->cmds);
+	if (cmd->subtype != AT_ChangeOwner || cmd->newowner == NULL ||
+		cmd->newowner->roletype != ROLESPEC_CSTRING || strcmp(cmd->newowner->rolename, s->owner) != 0)
+		not_the_record(s, "another owner");
+}
+
 /* One ALTER TABLE ONLY of this table, of just its row security. */
 static void
 check_row_security_statement(const WsTableSchema *s, const char *schema, const char *sql)
@@ -3417,6 +3697,13 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 		here.comments[i].name = ws_name_from_utf8(s->comments[i].name);
 		here.comments[i].text = from_utf8(s->comments[i].text);
 	}
+	here.owner = ws_name_from_utf8(s->owner);
+	here.grants = palloc_array(WsGrant, Max(s->ngrants, 1));
+	for (int i = 0; i < s->ngrants; i++)
+	{
+		here.grants[i] = s->grants[i];
+		here.grants[i].grantee = ws_name_from_utf8(s->grants[i].grantee);
+	}
 	here.inherits = palloc_array(char *, Max(s->ninherits, 1));
 	for (int i = 0; i < s->ninherits; i++)
 		here.inherits[i] = ws_name_from_utf8(s->inherits[i]);
@@ -3589,6 +3876,51 @@ ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out)
 }
 
 void
+ws_schema_owner(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (s->owner == NULL)
+		return;
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	ws_put_text(&sql, "ALTER TABLE ONLY ");
+	ws_put_identifier(&sql, schema);
+	ws_put_text(&sql, ".");
+	ws_put_identifier(&sql, here.name);
+	ws_put_text(&sql, " OWNER TO ");
+	ws_put_identifier(&sql, here.owner);
+	buf_append_byte(&sql, 0);
+	check_owner_statement(&here, schema, (char *) sql.data);
+	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_grant(const WsTableSchema *s, int n, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (n < 0 || n >= s->ngrants)
+		elog(ERROR, "no grant %d", n);
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	write_grant(&here, &here.grants[n], schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_grant_statement(&here, &here.grants[n], schema, (char *) sql.data);
+	statement_end(cxt, &sql, out);
+}
+
+void
 ws_schema_row_security(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
@@ -3697,7 +4029,15 @@ static const char *const unsupported_sql =
 "  UNION ALL SELECT x.indexrelid FROM pg_index x WHERE x.indrelid = $1::oid "
 "  UNION ALL SELECT p.objid FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
 "    AND p.refclassid = 'pg_class'::regclass AND p.refobjid = $1::oid AND p.deptype = 'i' "
-"    AND p.refobjsubid > 0) "
+"    AND p.refobjsubid > 0), "
+"acls(grantor, grantee, is_table, owner) AS ( "
+"  SELECT e.grantor, e.grantee, true, q.relowner FROM pg_class q, aclexplode(q.relacl) e "
+"    WHERE q.oid = $1::oid "
+"  UNION ALL SELECT e.grantor, e.grantee, false, q.relowner FROM pg_class q "
+"    JOIN pg_attribute a ON a.attrelid = q.oid, aclexplode(a.attacl) e "
+"    WHERE q.oid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+"  UNION ALL SELECT e.grantor, e.grantee, true, q.relowner FROM pg_class q, aclexplode(q.relacl) e "
+"    WHERE q.oid IN (SELECT o FROM own) AND q.relkind = 'S') "
 "SELECT CASE "
 "  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
 "               WHERE c.relispartition AND i.inhrelid = c.oid AND "
@@ -3785,12 +4125,23 @@ static const char *const unsupported_sql =
 "    THEN 'a foreign key has a comment' "
 "  WHEN EXISTS (SELECT FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass "
 "               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
-"  WHEN (c.relacl IS NOT NULL AND c.relacl <> acldefault('r', c.relowner)) OR "
-"       EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid "
-"               AND a.attacl IS NOT NULL) OR "
-"       EXISTS (SELECT FROM pg_class q WHERE q.oid IN (SELECT o FROM own) AND q.relkind = 'S' "
-"               AND q.relacl IS NOT NULL AND q.relacl <> acldefault('s', q.relowner)) "
-"    THEN 'it has grants' "
+"  WHEN EXISTS (SELECT FROM acls g WHERE g.grantor <> g.owner) "
+"    THEN 'it has a grant by someone other than its owner' "
+"  WHEN EXISTS (SELECT FROM acls g JOIN pg_roles r ON r.oid = g.grantee WHERE g.grantee <> g.owner AND "
+"               (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)) "
+"    THEN 'it has a grant to a role that can log in, or with powers no commit holds: use a group role' "
+"  WHEN EXISTS (SELECT FROM pg_roles r WHERE r.oid = c.relowner AND NOT r.rolcanlogin AND "
+"               (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)) "
+"    THEN 'its owner has powers no commit holds' "
+"  WHEN EXISTS (SELECT FROM pg_class q WHERE (q.oid = c.oid OR (q.oid IN (SELECT o FROM own) AND q.relkind = 'S')) "
+"               AND q.relacl IS NOT NULL AND "
+"               (SELECT array_agg(e.privilege_type ORDER BY e.privilege_type) "
+"                  FROM aclexplode(q.relacl) e WHERE e.grantee = q.relowner) IS DISTINCT FROM "
+"               (SELECT array_agg(e.privilege_type ORDER BY e.privilege_type) "
+"                  FROM aclexplode(acldefault(CASE q.relkind WHEN 'S' THEN 's' ELSE 'r' END::\"char\", q.relowner)) e)) "
+"    THEN 'its owner has other rights than owning gives' "
+"  WHEN EXISTS (SELECT FROM acls g WHERE NOT g.is_table AND g.grantee = g.owner) "
+"    THEN 'its owner has other rights than owning gives' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
 "               (NOT k.convalidated OR k.connoinherit)) "
 "    THEN 'it has a not-null constraint not valid or no inherit' "
@@ -4427,6 +4778,89 @@ read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 	ws_sql_rows_free(&rows);
 }
 
+static int
+grant_cmp(const void *a, const void *b)
+{
+	const WsGrant *x = a;
+	const WsGrant *y = b;
+
+	if (x->target != y->target)
+		return (unsigned char) x->target < (unsigned char) y->target ? -1 : 1;
+	if (x->tag != y->tag)
+		return x->tag < y->tag ? -1 : 1;
+	if ((x->grantee == NULL) != (y->grantee == NULL))
+		return x->grantee == NULL ? -1 : 1;
+	if (x->grantee != NULL && strcmp(x->grantee, y->grantee) != 0)
+		return strcmp(x->grantee, y->grantee);
+	return (int) x->grant_option - (int) y->grant_option;
+}
+
+/* Its owner, if the record holds it, and what it has granted, all refused above if not by it. */
+static void
+read_grants(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner "
+			   "WHERE c.oid = $1::oid AND NOT r.rolcanlogin", 1, params, &rows);
+	if (rows.nrows == 1)
+		out->owner = ws_name_to_utf8(ws_sql_value(&rows, 0, 0));
+	ws_sql_rows_free(&rows);
+	WsSql->run("WITH g(target, attnum, grantee, owner, is_grantable, privilege_type) AS ( "
+			   "  SELECT 't', NULL::int2, e.grantee, c.relowner, e.is_grantable, e.privilege_type "
+			   "    FROM pg_class c, aclexplode(c.relacl) e WHERE c.oid = $1::oid "
+			   "  UNION ALL SELECT 'c', a.attnum, e.grantee, c.relowner, e.is_grantable, e.privilege_type "
+			   "    FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid, aclexplode(a.attacl) e "
+			   "    WHERE c.oid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+			   "  UNION ALL SELECT 's', p.refobjsubid::int2, e.grantee, q.relowner, e.is_grantable, e.privilege_type "
+			   "    FROM pg_depend p JOIN pg_class q ON q.oid = p.objid, aclexplode(q.relacl) e "
+			   "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+			   "      AND p.refobjid = $1::oid AND p.deptype = 'i' AND q.relkind = 'S') "
+			   "SELECT g.target, g.attnum::text, (SELECT r.rolname::text FROM pg_roles r WHERE r.oid = g.grantee), "
+			   "  g.is_grantable::text, string_agg(CASE g.privilege_type WHEN 'INSERT' THEN 'a' WHEN 'SELECT' THEN 'r' "
+			   "    WHEN 'UPDATE' THEN 'w' WHEN 'DELETE' THEN 'd' WHEN 'TRUNCATE' THEN 'D' WHEN 'REFERENCES' THEN 'x' "
+			   "    WHEN 'TRIGGER' THEN 't' WHEN 'MAINTAIN' THEN 'm' WHEN 'USAGE' THEN 'U' END, '') "
+			   "FROM g WHERE g.grantee <> g.owner GROUP BY 1, 2, 3, 4", 1, params, &rows);
+	if (rows.nrows > 0)
+	{
+		out->grants = px_malloc((size_t) rows.nrows * sizeof(WsGrant));
+		memset(out->grants, 0, (size_t) rows.nrows * sizeof(WsGrant));
+		out->ngrants = rows.nrows;
+		for (int i = 0; i < rows.nrows; i++)
+		{
+			WsGrant    *g = &out->grants[i];
+			char	   *letters = px_memdup(ws_sql_value(&rows, i, 4), strlen(ws_sql_value(&rows, i, 4)) + 1);
+			int			n = (int) strlen(letters);
+
+			g->target = ws_sql_value(&rows, i, 0)[0];
+			if (g->target != WS_GRANT_TABLE)
+			{
+				for (int k = 0; k < cols->nrows && g->tag == 0; k++)
+					if (strcmp(ws_sql_value(cols, k, 0), ws_sql_value(&rows, i, 1)) == 0)
+						g->tag = out->cols[k].tag;
+				if (g->tag == 0)
+					elog(ERROR, "a grant on a column the table does not have");
+			}
+			g->grantee = ws_sql_value(&rows, i, 2) ? ws_name_to_utf8(ws_sql_value(&rows, i, 2)) : NULL;
+			g->grant_option = ws_sql_value(&rows, i, 3)[0] == 't';
+			/* (in order by byte, whatever order aclexplode gave them in) */
+			for (int a = 1; a < n; a++)
+				for (int b = a; b > 0 && (unsigned char) letters[b - 1] > (unsigned char) letters[b]; b--)
+				{
+					char		swap = letters[b];
+
+					letters[b] = letters[b - 1];
+					letters[b - 1] = swap;
+				}
+			g->privileges = letters;
+		}
+		if (out->ngrants > 1)
+			qsort(out->grants, out->ngrants, sizeof(WsGrant), grant_cmp);
+	}
+	ws_sql_rows_free(&rows);
+}
+
 /* Its row security, replica identity and clustered index. */
 static void
 read_table_settings(const char *table, const char *oid, WsTableSchema *out)
@@ -4779,6 +5213,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	read_index_settings(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_table_settings(table, ws_sql_value(&rel, 0, 0), out);
 	read_comments(ws_sql_value(&rel, 0, 0), &cols, out);
+	read_grants(ws_sql_value(&rel, 0, 0), &cols, out);
 	/* (their keys' parameters, in the settings, tell them apart) */
 	for (int i = 0; i < out->nconstraints; i++)
 		for (int j = 0; j < i; j++)

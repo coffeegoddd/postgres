@@ -169,6 +169,25 @@ typedef struct WsComment
 	char	   *text;
 } WsComment;
 
+#define WS_GRANT_COLUMN 'c'		/* a column's, by tag */
+#define WS_GRANT_SEQUENCE 's'	/* an identity's sequence's, by its column's tag */
+#define WS_GRANT_TABLE 't'		/* the table's */
+
+/*
+ * What a role is granted on the table, beyond what its owner has by owning it, one
+ * for what it can pass on and one for what it cannot.  Privileges are aclitem's
+ * letters, in order by byte.  A grant is by the owner, to PUBLIC or a group role:
+ * no role that can log in is named in a commit.
+ */
+typedef struct WsGrant
+{
+	char		target;			/* WS_GRANT_* */
+	uint64		tag;
+	char	   *grantee;		/* NULL: PUBLIC */
+	bool		grant_option;
+	char	   *privileges;
+} WsGrant;
+
 #define WS_REPLICA_DEFAULT '\0'
 #define WS_REPLICA_FULL 'f'
 #define WS_REPLICA_NOTHING 'n'
@@ -218,6 +237,10 @@ typedef struct WsTableSchema
 	bool		force_row_security; /* FORCE ROW LEVEL SECURITY */
 	int			ncomments;
 	WsComment  *comments;		/* by kind's byte, then tag or name in UTF8's order */
+	char	   *owner;			/* its owner, if a group role, or NULL: whoever makes it */
+	int			ngrants;
+	WsGrant    *grants;			/* by target's byte, tag, grantee in UTF8's order (PUBLIC
+								 * first), without then with grant option */
 } WsTableSchema;
 
 /*
@@ -250,7 +273,9 @@ typedef struct WsTableSchema
  * expressions, its columns' parameters only on a key with an operator class; a
  * replica identity known, by index only if it names one that is unique, not partial
  * and not deferrable; a clustered index one it has; and comments in order, each
- * on what it has and not empty.  NULL if it is so, or what is wrong.
+ * on what it has and not empty; grants in order, each on what it has, of privileges
+ * that target can have, in order, and neither twice to one grantee, none to the owner.
+ * NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -300,12 +325,14 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * a default using one, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
- * a policy, an index's dependence on an extension, a foreign key's comment, grants, two
+ * a policy, an index's dependence on an extension, a foreign key's comment, a
+ * grant to a role that can log in or by anyone but the owner, an owner's rights
+ * changed, a role with powers no commit holds, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A partition's identity is its table's, and not held
- * in its own record.  The table's owner is not held, and is whoever makes
- * it.  Triggers, rules and the like are objects of their own, not their table's.
+ * in its own record.  An owner that can log in is not held: whoever makes the table
+ * owns it.  Triggers, rules and the like are objects of their own, not their table's.
  *
  * It locks the table till the transaction ends, and a column renamed, retyped or
  * dropped since the transaction's snapshot raises
@@ -404,6 +431,15 @@ extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *sch
  * after the rows.  Checked as the table's statement is.
  */
 extern void ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE ONLY giving a table its owner, in the named schema, appended to
+ * out; nothing, if the record holds none.  The GRANT giving the nth of its grants.
+ * To run once everything is made, the owner first, the roles they name there
+ * already.  Checked as the table's statement is.
+ */
+extern void ws_schema_owner(const WsTableSchema *s, const char *schema, Buf *out);
+extern void ws_schema_grant(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
  * The ALTER TABLE ONLY enabling and forcing a table's row security, in the named

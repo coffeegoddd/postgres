@@ -2544,6 +2544,142 @@ test_comment_quoted(void)
 	buf_free(&b);
 }
 
+/* An owner and grants: bytes, and each one's statement. */
+static void
+test_grants(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn",
+		.identity = WS_IDENTITY_ALWAYS,.identity_seq = "sq"},
+	};
+	WsGrant		grants[] = {
+		{.target = 'c',.tag = 7,.grantee = "g",.privileges = "ar"},
+		{.target = 's',.tag = 7,.grantee = "g",.privileges = "Ur"},
+		{.target = 't',.privileges = "r"},
+		{.target = 't',.grantee = "Odd Role",.privileges = "Dd"},
+		{.target = 't',.grantee = "Odd Role",.grant_option = true,.privileges = "ar"},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.owner = "own",.ngrants = 5,.grants = grants};
+	static const char *const want[] = {
+		"GRANT INSERT (a), SELECT (a) ON TABLE x.t TO g",
+		"GRANT USAGE, SELECT ON SEQUENCE x.sq TO g",
+		"GRANT SELECT ON TABLE x.t TO PUBLIC",
+		"GRANT TRUNCATE, DELETE ON TABLE x.t TO \"Odd Role\"",
+		"GRANT INSERT, SELECT ON TABLE x.t TO \"Odd Role\" WITH GRANT OPTION",
+	};
+	Buf			b = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(strcmp(got.owner, "own") == 0 && got.ngrants == 5);
+	CHECK(got.grants[0].tag == 7 && got.grants[2].grantee == NULL);
+	CHECK(got.grants[4].grant_option && strcmp(got.grants[4].privileges, "ar") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+	for (int i = 0; i < 5; i++)
+	{
+		b = (Buf) BUF_INIT;
+		ws_schema_grant(&s, i, "x", &b);
+		buf_append_byte(&b, 0);
+		CHECK(strcmp((char *) b.data, want[i]) == 0);
+		buf_free(&b);
+	}
+	b = (Buf) BUF_INIT;
+	ws_schema_owner(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "ALTER TABLE ONLY x.t OWNER TO own") == 0);
+	buf_free(&b);
+#define HAS(why, ...) \
+	do { \
+		WsGrant		one[] = {__VA_ARGS__}; \
+		s.grants = one; \
+		s.ngrants = lengthof(one); \
+		CHECK(problem_has(ws_schema_problem(&s), why)); \
+	} while (0)
+	HAS("no known kind", {.target = 'z',.privileges = "r"});
+	HAS("something else", {.target = 't',.tag = 7,.privileges = "r"});
+	HAS("does not have", {.target = 'c',.tag = 9,.privileges = "r"});
+	HAS("no privileges", {.target = 't'});
+	HAS("no privileges", {.target = 't',.privileges = ""});
+	HAS("cannot have", {.target = 't',.privileges = "U"});
+	HAS("cannot have", {.target = 'c',.tag = 7,.privileges = "d"});
+	HAS("cannot have", {.target = 's',.tag = 7,.privileges = "a"});
+	HAS("not in order", {.target = 't',.privileges = "ra"});
+	HAS("not in order", {.target = 't',.privileges = "aa"});
+	HAS("no name", {.target = 't',.grantee = "",.privileges = "r"});
+	HAS("to the table's owner", {.target = 't',.grantee = "own",.privileges = "r"});
+	HAS("not in order", {.target = 't',.privileges = "r"}, {.target = 'c',.tag = 7,.privileges = "r"});
+	HAS("not in order", {.target = 't',.privileges = "r"}, {.target = 't',.privileges = "w"});
+	HAS("not in order", {.target = 't',.grantee = "b",.privileges = "r"}, {.target = 't',.grantee = "a",.privileges = "r"});
+	HAS("not in order", {.target = 't',.grantee = "a",.privileges = "r"}, {.target = 't',.privileges = "r"});
+	HAS("not in order", {.target = 't',.grant_option = true,.privileges = "r"}, {.target = 't',.privileges = "w"});
+	HAS("granted twice", {.target = 't',.privileges = "r"}, {.target = 't',.grant_option = true,.privileges = "r"});
+#undef HAS
+	cols[0].identity = WS_IDENTITY_NONE;
+	cols[0].identity_seq = NULL;
+	{
+		WsGrant		one = {.target = 's',.tag = 7,.privileges = "r"};
+
+		s.grants = &one;
+		s.ngrants = 1;
+		CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	}
+	s.ngrants = 0;
+	s.owner = "";
+	CHECK(problem_has(ws_schema_problem(&s), "owner of no name"));
+	s.owner = NULL;
+	b = (Buf) BUF_INIT;
+	ws_schema_owner(&s, "x", &b);
+	CHECK_EQ(b.len, 0);
+	buf_free(&b);
+	{
+		static const char none[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "g" "\x00" "\x00";
+		static const char many[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "g" "\x00" "\x7f";
+		static const char option[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "g" "\x00" "\x01" "t" "\x00" "\x02" "\x01" "r";
+
+		check_refused(none, sizeof(none) - 1, "no owner and no grants");
+		check_refused(many, sizeof(many) - 1, "more grants than bytes");
+		check_refused(option, sizeof(option) - 1, "option is neither");
+	}
+}
+
+/* A name that would read as something else, were it not quoted, or as PUBLIC. */
+static void
+grant_public_named(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsGrant		g = {.target = 't',.grantee = (char *) arg,.privileges = "r"};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.ngrants = 1,.grants = &g};
+	Buf			b = BUF_INIT;
+
+	ws_schema_grant(&s, 0, "x", &b);
+}
+
+static void
+test_grant_names(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsGrant		g = {.target = 't',.grantee = "x TO y, z; DROP TABLE x.t; --",.privileges = "r"};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.owner = "o; DROP",.ngrants = 1,.grants = &g};
+	Buf			b = BUF_INIT;
+
+	ws_schema_grant(&s, 0, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "TO \"x TO y, z; DROP TABLE x.t; --\"") != NULL);
+	buf_free(&b);
+	b = (Buf) BUF_INIT;
+	ws_schema_owner(&s, "x", &b);
+	buf_free(&b);
+	expect_error(grant_public_named, "public", ERRCODE_DATA_CORRUPTED, NULL);
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -3179,6 +3315,8 @@ static const ProllyUnitTest tests[] = {
 	{"row_security", test_row_security},
 	{"comments", test_comments},
 	{"comment_quoted", test_comment_quoted},
+	{"grants", test_grants},
+	{"grant_names", test_grant_names},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},
