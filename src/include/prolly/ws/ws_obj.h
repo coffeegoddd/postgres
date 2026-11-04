@@ -18,7 +18,10 @@
  *
  * A view has an owner that can travel, as it reads with its owner's rights: any other
  * owner could show other rows.  A type's owner that cannot is not held, and whoever
- * restores it owns it, as a table's does.  A commit's own definitions are trusted, as a
+ * restores it owns it, as a table's does.  So too a function's, but for one that is
+ * SECURITY DEFINER, which reads with its owner's rights as a view does.  A function's
+ * body in text is not looked into: if it names its schema, it says so as written.  A
+ * commit's own definitions are trusted, as a
  * remote is, as what a pg_dump wrote is: they are checked only to be what they say.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -35,7 +38,9 @@
 typedef enum WsObjectKind
 {
 	WS_OBJ_DOMAIN,
+	WS_OBJ_FUNCTION,
 	WS_OBJ_MATVIEW,
+	WS_OBJ_PROCEDURE,
 	WS_OBJ_TYPE,				/* an enum, composite or range type */
 	WS_OBJ_VIEW,
 } WsObjectKind;
@@ -60,7 +65,10 @@ typedef struct WsObject
 {
 	WsObjectKind kind;
 	char	   *name;
+	char	   *args;			/* a function's input types, as printed, or "" if none; else NULL */
 	char	   *definition;		/* its statement after its name, as stored text (ws_tags.h) */
+	bool		after_tables;	/* a function that needs one, so made after them */
+	bool		public_revoked; /* what PUBLIC would have is revoked from it */
 	int			ndeps;
 	char	  **deps;			/* the keys of the objects it needs, in order */
 	char	   *owner;			/* NULL: whoever restores it, for what may have none */
@@ -96,13 +104,13 @@ extern PGDLLIMPORT const WsObjectCodecRoutine BinaryWsObjectCodec;
 /* The implementation in use. */
 extern PGDLLIMPORT const WsObjectCodecRoutine *WsObjectCodec;
 
-/* Whether a kind is made before a commit's tables, which may use it, or after. */
-extern bool ws_obj_before_tables(WsObjectKind kind);
+/* Whether an object is made before a commit's tables, which may use it, or after. */
+extern bool ws_obj_before_tables(const WsObject *o);
 
 extern void ws_obj_free(WsObject *o);
 
-/* The key of an object of a kind and name, UTF8, appended to out. */
-extern void ws_obj_key(WsObjectKind kind, const char *name, Buf *out);
+/* The key of an object of a kind, name and args (NULL but for a function), UTF8, appended to out. */
+extern void ws_obj_key(WsObjectKind kind, const char *name, const char *args, Buf *out);
 
 /*
  * The objects of a schema from the catalogs as they are now, each locked, with what

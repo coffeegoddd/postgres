@@ -18,10 +18,12 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/htup_details.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
 #include "common/int.h"
 #include "lib/binaryheap.h"
 #include "mb/pg_wchar.h"
@@ -42,28 +44,44 @@
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
+#include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 const WsObjectCodecRoutine *WsObjectCodec = &BinaryWsObjectCodec;
 
+#define OBJ_AFTER_TABLES 0x01
+#define OBJ_PUBLIC_REVOKED 0x02
+
 static const char *const kind_words[] = {
 	[WS_OBJ_DOMAIN] = "domain",
+	[WS_OBJ_FUNCTION] = "function",
 	[WS_OBJ_MATVIEW] = "matview",
+	[WS_OBJ_PROCEDURE] = "procedure",
 	[WS_OBJ_TYPE] = "type",
 	[WS_OBJ_VIEW] = "view",
 };
 
 static const char *const kind_sql[] = {
 	[WS_OBJ_DOMAIN] = "DOMAIN",
+	[WS_OBJ_FUNCTION] = "FUNCTION",
 	[WS_OBJ_MATVIEW] = "MATERIALIZED VIEW",
+	[WS_OBJ_PROCEDURE] = "PROCEDURE",
 	[WS_OBJ_TYPE] = "TYPE",
 	[WS_OBJ_VIEW] = "VIEW",
 };
 
-bool
-ws_obj_before_tables(WsObjectKind kind)
+static bool
+is_function(WsObjectKind kind)
 {
-	return kind == WS_OBJ_DOMAIN || kind == WS_OBJ_TYPE;
+	return kind == WS_OBJ_FUNCTION || kind == WS_OBJ_PROCEDURE;
+}
+
+bool
+ws_obj_before_tables(const WsObject *o)
+{
+	return o->kind == WS_OBJ_DOMAIN || o->kind == WS_OBJ_TYPE ||
+		(is_function(o->kind) && !o->after_tables);
 }
 
 static bool
@@ -79,7 +97,7 @@ privileges_problem(const char *p)
 		return true;
 	for (; *p; p++)
 	{
-		if (strchr("adDmrtUwx", *p) == NULL)
+		if (strchr("adDmrtUwxX", *p) == NULL)
 			return true;
 		if (p[1] != '\0' && (unsigned char) p[0] >= (unsigned char) p[1])
 			return true;
@@ -109,7 +127,11 @@ key_known(const char *key)
 	{
 		size_t		n = strlen(kind_words[i]);
 
-		if (strncmp(key, kind_words[i], n) == 0 && key[n] == '/' && !bad_name(key + n + 1))
+		if (strncmp(key, kind_words[i], n) != 0 || key[n] != '/')
+			continue;
+		if (is_function((WsObjectKind) i))
+			return key[n + 1] != '\0' && key[strlen(key) - 1] == ')';
+		if (!bad_name(key + n + 1))
 			return true;
 	}
 	return false;
@@ -129,7 +151,11 @@ ws_obj_problem(const WsObject *o)
 		return "a definition that is not stored text";
 	if (o->owner == NULL ? is_relation(o->kind) : bad_name(o->owner) || IsReservedName(o->owner))
 		return "no owner, or one no commit holds";
-	ws_obj_key(o->kind, o->name, &self);
+	if (is_function(o->kind) != (o->args != NULL))
+		return "a function with no input types, or something else with them";
+	if ((o->after_tables || o->public_revoked) && !is_function(o->kind))
+		return "a setting its kind cannot have";
+	ws_obj_key(o->kind, o->name, o->args, &self);
 	buf_append_byte(&self, 0);
 	for (int i = 0; i < o->ndeps; i++)
 	{
@@ -188,11 +214,17 @@ ws_obj_problem(const WsObject *o)
 }
 
 void
-ws_obj_key(WsObjectKind kind, const char *name, Buf *out)
+ws_obj_key(WsObjectKind kind, const char *name, const char *args, Buf *out)
 {
 	ws_put_text(out, kind_words[kind]);
 	ws_put_text(out, "/");
 	ws_put_text(out, name);
+	if (args != NULL)
+	{
+		ws_put_text(out, "(");
+		ws_put_text(out, args);
+		ws_put_text(out, ")");
+	}
 }
 
 static void
@@ -202,7 +234,7 @@ obj_encode_key(const WsObject *o, Buf *out)
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
-	ws_obj_key(o->kind, o->name, out);
+	ws_obj_key(o->kind, o->name, o->args, out);
 }
 
 static void
@@ -223,6 +255,8 @@ obj_encode_value(const WsObject *o, Buf *out)
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	put_string(out, o->definition);
+	buf_append_byte(out, (o->after_tables ? OBJ_AFTER_TABLES : 0) | (o->public_revoked ? OBJ_PUBLIC_REVOKED : 0));
+	put_string(out, o->args);
 	buf_append_uvarint(out, (uint64) o->ndeps);
 	for (int i = 0; i < o->ndeps; i++)
 		put_string(out, o->deps[i]);
@@ -332,6 +366,25 @@ obj_decode(const uint8 *key, size_t klen, const uint8 *val, size_t vlen, WsObjec
 	o->name = name;
 
 	o->definition = get_string(&p, end, false);
+	if (p >= end || (*p & ~(OBJ_AFTER_TABLES | OBJ_PUBLIC_REVOKED)) != 0)
+		malformed("flags not known");
+	o->after_tables = (*p & OBJ_AFTER_TABLES) != 0;
+	o->public_revoked = (*p & OBJ_PUBLIC_REVOKED) != 0;
+	p++;
+	o->args = get_string(&p, end, true);
+	if (is_function(o->kind))
+	{
+		/* (the name is what is before them, in a key that says them) */
+		size_t		nargs = o->args != NULL ? strlen(o->args) : 0;
+		size_t		nname = strlen(o->name);
+
+		if (o->args == NULL)
+			o->args = px_memdup("", 1);
+		if (nname < nargs + 2 || o->name[nname - 1] != ')' || o->name[nname - nargs - 2] != '(' ||
+			strncmp(o->name + nname - nargs - 1, o->args, nargs) != 0)
+			malformed("a key that does not say a function's input types");
+		o->name[nname - nargs - 2] = '\0';
+	}
 	o->ndeps = get_count(&p, end, 1);
 	o->deps = zeroed(o->ndeps, sizeof(char *));
 	for (int i = 0; i < o->ndeps; i++)
@@ -375,6 +428,7 @@ void
 ws_obj_free(WsObject *o)
 {
 	px_free(o->name);
+	px_free(o->args);
 	px_free(o->definition);
 	px_free(o->owner);
 	for (int i = 0; i < o->ndeps; i++)
@@ -410,7 +464,7 @@ find_object(const WsObject *objs, int n, const char *key)
 		Buf			k = BUF_INIT;
 		int			c;
 
-		ws_obj_key(objs[mid].kind, objs[mid].name, &k);
+		ws_obj_key(objs[mid].kind, objs[mid].name, objs[mid].args, &k);
 		buf_append_byte(&k, 0);
 		c = strcmp(key, (char *) k.data);
 		buf_free(&k);
@@ -536,8 +590,7 @@ static const char *const refusal_sql =
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND NOT ( "
 "        (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "           AND (q.relkind IN ('r', 'p', 'v', 'm', 'c') OR q.relnamespace = 'pg_catalog'::regnamespace))) "
-"        OR (d.refclassid = 'pg_proc'::regclass AND EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass "
-"           AND x.objid = d.refobjid AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass)) "
+"        OR d.refclassid = 'pg_proc'::regclass "
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k "
 "           WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
 "        OR d.refclassid = 'pg_type'::regclass "
@@ -914,8 +967,38 @@ grant_cmp(const void *a, const void *b)
  * a multirange its range's, which are what is made.  A table is no need: tables are
  * all made, or a type that needs one is refused.
  */
+static char *
+function_args(const char *schema, Oid oid, char *prokind)
+{
+	HeapTuple	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(oid));
+	Form_pg_proc form;
+	char	   *args;
+
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": it changed while it was being read", schema)));
+	form = (Form_pg_proc) GETSTRUCT(tup);
+	args = ws_schema_print(schema, oidvectortypes, 1, PointerGetDatum(&form->proargtypes), 0, 0);
+	if (prokind != NULL)
+		*prokind = form->prokind;
+	ReleaseSysCache(tup);
+	return args;
+}
+
+/* A function's key, as what needs it holds it. */
 static void
-read_deps(WsObject *o, const char *oid, const char *source)
+function_key(const char *schema, Oid oid, Buf *key)
+{
+	char		prokind;
+	char	   *args = ws_text_to_utf8(function_args(schema, oid, &prokind));
+
+	ws_obj_key(prokind == PROKIND_PROCEDURE ? WS_OBJ_PROCEDURE : WS_OBJ_FUNCTION,
+			   ws_name_to_utf8(get_func_name(oid)), args, key);
+}
+
+static void
+read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
@@ -931,7 +1014,12 @@ read_deps(WsObject *o, const char *oid, const char *source)
 				   "    ELSE coalesce(e.typrelid, t.typrelid) END "
 				   "WHERE q.relkind IN ('v', 'm', 'c') AND q.oid <> $1::oid "
 				   "  AND q.reltype <> $1::oid AND q.relnamespace = (SELECT nsp FROM (SELECT relnamespace AS nsp FROM pg_class WHERE oid = $1::oid "
-				   "    UNION ALL SELECT typnamespace FROM pg_type WHERE oid = $1::oid) n LIMIT 1) "
+				   "    UNION ALL SELECT typnamespace FROM pg_type WHERE oid = $1::oid "
+				   "    UNION ALL SELECT pronamespace FROM pg_proc WHERE oid = $1::oid) n LIMIT 1) "
+				   "UNION SELECT 'F', p.oid::text FROM d JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
+				   "WHERE p.oid <> $1::oid AND p.pronamespace <> 'pg_catalog'::regnamespace "
+				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass AND x.objid = p.oid "
+				   "    AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass) "
 				   "UNION SELECT CASE b.typtype WHEN 'd' THEN 'D' ELSE 'T' END, b.typname::text FROM ( "
 				   "    SELECT d.refobjid AS typ FROM d WHERE d.refclassid = 'pg_type'::regclass "
 				   "    UNION SELECT x.refobjid FROM d JOIN pg_depend x ON d.refclassid = 'pg_proc'::regclass "
@@ -951,11 +1039,13 @@ read_deps(WsObject *o, const char *oid, const char *source)
 	for (int i = 0; i < rows.nrows; i++)
 	{
 		Buf			key = BUF_INIT;
-		char	   *name = ws_name_to_utf8(ws_sql_value(&rows, i, 1));
 		char		k = ws_sql_value(&rows, i, 0)[0];
 
-		ws_obj_key(k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN : WS_OBJ_TYPE,
-				   name, &key);
+		if (k == 'F')
+			function_key(schema, atooid(ws_sql_value(&rows, i, 1)), &key);
+		else
+			ws_obj_key(k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN : WS_OBJ_TYPE,
+					   ws_name_to_utf8(ws_sql_value(&rows, i, 1)), NULL, &key);
 		buf_append_byte(&key, 0);
 		o->deps[i] = px_memdup(key.data, key.len);
 		buf_free(&key);
@@ -1084,9 +1174,18 @@ object_cmp(const void *a, const void *b)
 {
 	const WsObject *x = a;
 	const WsObject *y = b;
-	int			c = strcmp(kind_words[x->kind], kind_words[y->kind]);
+	Buf			kx = BUF_INIT;
+	Buf			ky = BUF_INIT;
+	int			c;
 
-	return c != 0 ? c : strcmp(x->name, y->name);
+	ws_obj_key(x->kind, x->name, x->args, &kx);
+	buf_append_byte(&kx, 0);
+	ws_obj_key(y->kind, y->name, y->args, &ky);
+	buf_append_byte(&ky, 0);
+	c = strcmp((char *) kx.data, (char *) ky.data);
+	buf_free(&kx);
+	buf_free(&ky);
+	return c;
 }
 
 /* ---------------------------------------------------------------- types */
@@ -1163,8 +1262,7 @@ static const char *const type_refusal_sql =
 "      WHERE d.deptype = 'n' AND d.refclassid <> 'pg_type'::regclass "
 "        AND NOT (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid AND s.classid <> 'pg_constraint'::regclass) "
 "        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind = 'c')) "
-"        AND NOT (d.refclassid = 'pg_proc'::regclass AND EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass "
-"          AND x.objid = d.refobjid AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass)) "
+"        AND d.refclassid <> 'pg_proc'::regclass "
 "        AND NOT coalesce((SELECT i.schema = 'pg_catalog' "
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
 "    THEN 'it needs an object no commit holds yet' "
@@ -1506,12 +1604,263 @@ read_types(const char *schema, WsObject *objs, int *n)
 										  "  AND (typdefaultbin IS NOT NULL OR EXISTS (SELECT 1 FROM pg_constraint WHERE contypid = $1::oid AND contype = 'c')) "
 										  "UNION SELECT d.refobjid::text FROM pg_constraint c JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass "
 										  "  AND d.objid = c.oid WHERE c.contypid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
-		read_deps(o, oid, TYPE_SOURCE_OF("$1::oid"));
+		read_deps(o, schema, oid, TYPE_SOURCE_OF("$1::oid"));
 		read_type_comments(o, oid);
 		read_type_owner_and_grants(o, oid, name);
 	}
 	ws_sql_rows_free(&types);
 	return objs;
+}
+
+/* ------------------------------------------------------------ functions */
+
+/* The functions of a schema that are objects of their own: not a range's constructors. */
+#define FUNCTIONS_OF_SCHEMA \
+	"FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang " \
+	"JOIN pg_roles r ON r.oid = p.proowner " \
+	"WHERE n.nspname = $1::name AND NOT EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass " \
+	"  AND x.objid = p.oid AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass) "
+
+static const char *const function_refusal_sql =
+"SELECT p.proname::text, CASE "
+"  WHEN p.prokind = 'a' THEN 'it is an aggregate, which no commit holds yet' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension, or depends on one' "
+"  WHEN l.lanname IN ('c', 'internal') THEN 'it is in a language whose code no commit can bring' "
+"  WHEN EXISTS (SELECT 1 FROM pg_proc c WHERE c.proname = p.proname AND c.pronamespace = 'pg_catalog'::regnamespace) "
+"    THEN 'it is named as one in the catalogs, which a name could be taken for' "
+"  WHEN p.prosecdef AND (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls "
+"      OR r.rolname ~ '^pg_') THEN 'it is SECURITY DEFINER, and owned by a role that cannot travel' "
+"  WHEN EXISTS (SELECT 1 FROM pg_seclabel s WHERE s.classoid = 'pg_proc'::regclass AND s.objoid = p.oid) THEN 'it has a security label' "
+"  WHEN EXISTS (SELECT 1 FROM aclexplode(p.proacl) e WHERE e.grantor <> p.proowner) THEN 'it has a grant by a role that does not own it' "
+"  WHEN p.proacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) e WHERE e.grantee = p.proowner) "
+"    THEN 'its owner''s rights have been changed' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i "
+"      WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' AND i.schema IS NOT NULL "
+"        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' "
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass) "
+"        OR (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid) "
+"        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
+"          AND q.relkind IN ('r', 'p', 'v', 'm', 'c'))) "
+"        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
+"        OR coalesce((SELECT i.schema = 'pg_catalog' FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false))) "
+"    THEN 'it needs an object no commit holds yet' "
+"  END " FUNCTIONS_OF_SCHEMA "ORDER BY 1";
+
+/* Refuses a qualified name in a function's statement, or a path naming its schema. */
+static void
+check_function_is_portable(const char *name, const char *schema, const char *tail)
+{
+	List	   *parsed = raw_parser(psprintf("CREATE FUNCTION x %s", tail), RAW_PARSE_DEFAULT);
+	CreateFunctionStmt *f;
+	NamesSchema n = {NULL, NULL};
+	bool		named = false;
+	ListCell   *lc;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateFunctionStmt))
+		elog(ERROR, "function \"%s\" printed as something else", name);
+	f = (CreateFunctionStmt *) linitial_node(RawStmt, parsed)->stmt;
+	foreach(lc, f->parameters)
+	{
+		FunctionParameter *p = lfirst_node(FunctionParameter, lc);
+
+		named = named || names_schema_walker((Node *) p->argType, &n) || names_schema_walker(p->defexpr, &n);
+	}
+	named = named || names_schema_walker((Node *) f->returnType, &n) || names_schema_walker(f->sql_body, &n);
+	foreach(lc, f->options)
+	{
+		DefElem    *d = lfirst_node(DefElem, lc);
+
+		if (strcmp(d->defname, "set") == 0 && IsA(d->arg, VariableSetStmt) &&
+			pg_strcasecmp(((VariableSetStmt *) d->arg)->name, "search_path") == 0)
+		{
+			ListCell   *a;
+
+			foreach(a, ((VariableSetStmt *) d->arg)->args)
+			{
+				Node	   *v = lfirst(a);
+
+				if (IsA(v, A_Const) && IsA(&((A_Const *) v)->val, String) &&
+					strcmp(strVal(&((A_Const *) v)->val), schema) == 0)
+				{
+					n.why = "it sets a search path that names its schema";
+					named = true;
+				}
+			}
+		}
+	}
+	if (named)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: %s", name, schema, n.why)));
+}
+
+/* Its owner, if it can travel, what is revoked from PUBLIC, and what it has granted. */
+static void
+read_function_owner_and_grants(WsObject *o, const char *oid, const char *name)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT r.rolname::text, p.proacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) e "
+				"    WHERE e.grantee = 0 AND e.privilege_type = 'EXECUTE'), "
+				"  NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls) "
+				"FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.oid = $1::oid", 1, params, &rows);
+	if (rows.nrows != 1)
+		printed_or_retry(name, NULL);
+	if (ws_sql_value(&rows, 0, 2)[0] == 't' && !IsReservedName(ws_sql_value(&rows, 0, 0)))
+		o->owner = role_in_commit(name, ws_sql_value(&rows, 0, 0));
+	o->public_revoked = ws_sql_value(&rows, 0, 1)[0] == 't';
+	ws_sql_rows_free(&rows);
+
+	WsSql->read("SELECT r.rolname::text, e.is_grantable::text, "
+				"  (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)::text "
+				"FROM pg_proc p, aclexplode(p.proacl) e JOIN pg_roles r ON r.oid = e.grantee "
+				"WHERE p.oid = $1::oid AND e.grantee <> p.proowner", 1, params, &rows);
+	o->grants = zeroed(rows.nrows, sizeof(WsObjectGrant));
+	o->ngrants = rows.nrows;
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		const char *grantee = ws_sql_value(&rows, i, 0);
+
+		if (IsReservedName(grantee) || ws_sql_value(&rows, i, 2)[0] == 't')
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" cannot be held in a commit: it has a grant to role \"%s\", which cannot travel",
+							name, grantee)));
+		o->grants[i].grantee = role_in_commit(name, grantee);
+		o->grants[i].grant_option = ws_sql_value(&rows, i, 1)[0] == 't';
+		o->grants[i].privileges = px_memdup("X", 2);
+	}
+	if (o->ngrants > 1)
+		qsort(o->grants, o->ngrants, sizeof(WsObjectGrant), grant_cmp);
+	ws_sql_rows_free(&rows);
+}
+
+/* Adds the functions of a schema to objs, of *n and room for it. */
+static WsObject *
+read_functions(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	funcs;
+
+	WsSql->read("SELECT p.oid::text, p.proname::text, p.prokind::text "
+				FUNCTIONS_OF_SCHEMA, 1, params, &funcs);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + funcs.nrows, 1));
+	for (int i = 0; i < funcs.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&funcs, i, 0);
+		const char *name = ws_sql_value(&funcs, i, 1);
+		bool		procedure = ws_sql_value(&funcs, i, 2)[0] == PROKIND_PROCEDURE;
+		char	   *printed = printed_or_retry(schema, ws_schema_print(schema, pg_get_functiondef, 1,
+																	   ObjectIdGetDatum(atooid(oid)), 0, 0));
+		char	   *head = psprintf("CREATE OR REPLACE %s %s", procedure ? "PROCEDURE" : "FUNCTION",
+									quote_qualified_identifier(schema, name));
+		size_t		len;
+		char	   *tail;
+		Buf			stored = BUF_INIT;
+		const char *self_params[1] = {oid};
+		WsSqlRows	rows;
+
+		CHECK_FOR_INTERRUPTS();
+		if (strncmp(printed, head, strlen(head)) != 0)
+			elog(ERROR, "function \"%s\" printed as something else", name);
+		tail = printed + strlen(head);
+		len = strlen(tail);
+		while (len > 0 && (tail[len - 1] == '\n' || tail[len - 1] == ' '))
+			tail[--len] = '\0';
+		check_function_is_portable(name, schema, tail);
+		o->kind = procedure ? WS_OBJ_PROCEDURE : WS_OBJ_FUNCTION;
+		o->name = ws_name_to_utf8(name);
+		o->args = ws_text_to_utf8(function_args(schema, atooid(oid), NULL));
+		ws_tags_escape(ws_text_to_utf8(tail), &stored);
+		buf_append_byte(&stored, 0);
+		o->definition = px_memdup(stored.data, stored.len);
+		buf_free(&stored);
+		read_deps(o, schema, oid, "SELECT 'pg_proc'::regclass::oid, $1::oid");
+
+		/* (it needs a table if a body or a type of it does) */
+		WsSql->read("SELECT 1 FROM pg_depend d LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
+					"LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
+					"JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid ELSE coalesce(e.typrelid, t.typrelid) END "
+					"WHERE d.classid = 'pg_proc'::regclass AND d.objid = $1::oid AND d.deptype = 'n' AND q.relkind <> 'c' LIMIT 1",
+					1, self_params, &rows);
+		o->after_tables = rows.nrows > 0;
+		ws_sql_rows_free(&rows);
+
+		WsSql->read("SELECT NULL::text, description FROM pg_description WHERE classoid = 'pg_proc'::regclass AND objoid = $1::oid",
+					1, self_params, &rows);
+		o->comments = zeroed(rows.nrows, sizeof(WsObjectComment));
+		o->ncomments = rows.nrows;
+		for (int c = 0; c < rows.nrows; c++)
+			o->comments[c].text = ws_text_to_utf8(ws_sql_value(&rows, c, 1));
+		ws_sql_rows_free(&rows);
+		read_function_owner_and_grants(o, oid, name);
+		pfree(head);
+	}
+	ws_sql_rows_free(&funcs);
+	return objs;
+}
+
+/*
+ * A function that needs what is made after tables is too, and a type cannot be, as
+ * tables may need it.  Nor may a table need such a function.
+ */
+static void
+settle_phases(const char *schema, WsObject *objs, int n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+	bool		changed = true;
+
+	while (changed)
+	{
+		changed = false;
+		for (int i = 0; i < n; i++)
+			if (ws_obj_before_tables(&objs[i]))
+				for (int d = 0; d < objs[i].ndeps; d++)
+				{
+					int			of = find_object(objs, n, objs[i].deps[d]);
+
+					if (of < 0 || ws_obj_before_tables(&objs[of]))
+						continue;
+					if (!is_function(objs[i].kind))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: it needs \"%s\", which needs a table, and a table may need it",
+										objs[i].name, schema, objs[of].name)));
+					objs[i].after_tables = true;
+					changed = true;
+				}
+	}
+	WsSql->read("WITH src(classid, objid) AS ( "
+				"  SELECT 'pg_attrdef'::regclass::oid, a.oid FROM pg_attrdef a JOIN pg_class c ON c.oid = a.adrelid "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') "
+				"  UNION ALL SELECT 'pg_class'::regclass::oid, i.indexrelid FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p')) "
+				"SELECT DISTINCT d.refobjid::text FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
+				"JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
+				"JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		Buf			key = BUF_INIT;
+		int			of;
+
+		function_key(schema, atooid(ws_sql_value(&rows, i, 0)), &key);
+		buf_append_byte(&key, 0);
+		of = find_object(objs, n, (char *) key.data);
+		if (of >= 0 && !ws_obj_before_tables(&objs[of]))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: a table needs it, and it needs a table",
+							objs[of].name, schema)));
+		buf_free(&key);
+	}
+	ws_sql_rows_free(&rows);
 }
 
 void
@@ -1529,6 +1878,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_what_cannot_be_held(schema);
 	refuse_types(schema, type_refusal_sql);
 	refuse_types(schema, cast_refusal_sql);
+	refuse_types(schema, function_refusal_sql);
 
 	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, NULL::text, "
 				"  (SELECT string_agg(quote_ident(split_part(o, '=', 1)) || ' = ' || "
@@ -1582,14 +1932,16 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		check_constants_hold_no_names(name, schema, oid,
 									  "SELECT d.refobjid::text FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass "
 									  "AND d.objid = r.oid WHERE r.ev_class = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
-		read_deps(o, oid, "SELECT 'pg_rewrite'::regclass::oid, oid FROM pg_rewrite WHERE ev_class = $1::oid");
+		read_deps(o, schema, oid, "SELECT 'pg_rewrite'::regclass::oid, oid FROM pg_rewrite WHERE ev_class = $1::oid");
 		read_comments(o, oid);
 		read_owner_and_grants(o, oid, name);
 	}
 	total = rels.nrows;
 	objs = read_types(schema, objs, &total);
+	objs = read_functions(schema, objs, &total);
 	if (total > 1)
 		qsort(objs, total, sizeof(WsObject), object_cmp);
+	settle_phases(schema, objs, total);
 	{
 		/* (views can be made to need each other, which no restore could make) */
 		int		   *order = palloc_array(int, Max(total, 1));
@@ -1798,6 +2150,18 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 					not_the_object(o, "another view");
 				break;
 			}
+		case WS_OBJ_FUNCTION:
+		case WS_OBJ_PROCEDURE:
+			{
+				CreateFunctionStmt *f = (CreateFunctionStmt *) node;
+
+				if (node == NULL || !IsA(node, CreateFunctionStmt))
+					not_the_object(o, "it is not one CREATE FUNCTION or PROCEDURE");
+				if (f->replace || f->is_procedure != (o->kind == WS_OBJ_PROCEDURE) ||
+					!names_it(f->funcname, schema, here))
+					not_the_object(o, "another function");
+				break;
+			}
 		case WS_OBJ_DOMAIN:
 			{
 				CreateDomainStmt *d = (CreateDomainStmt *) node;
@@ -1861,6 +2225,15 @@ put_object(const WsObject *o, const char *schema, Buf *sql)
 	ws_put_text(sql, ".");
 	ws_put_identifier(sql, here);
 	pfree(here);
+	if (o->args != NULL)
+	{
+		char	   *args = ws_text_from_utf8(o->args);
+
+		ws_put_text(sql, "(");
+		ws_put_text(sql, args);
+		ws_put_text(sql, ")");
+		pfree(args);
+	}
 }
 
 void
@@ -1945,7 +2318,7 @@ ws_obj_grant_statement(const WsObject *o, int k, const char *schema, Buf *out)
 		}
 	}
 	ws_put_text(out, " ON ");
-	ws_put_text(out, is_relation(o->kind) ? "TABLE" : kind_sql[o->kind]);
+	ws_put_text(out, is_relation(o->kind) ? "TABLE" : is_function(o->kind) ? "ROUTINE" : kind_sql[o->kind]);
 	ws_put_text(out, " ");
 	put_object(o, schema, out);
 	ws_put_text(out, " TO ");
@@ -2024,34 +2397,38 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 
 	ws_obj_restore_order(objs, n, order);
 	for (int i = 0; i < n; i++)
-		any |= ws_obj_before_tables(objs[i].kind) == before_tables;
+		any |= ws_obj_before_tables(&objs[i]) == before_tables;
 	if (!any)
 	{
 		pfree(order);
 		return;
 	}
 	for (int i = 0; i < n; i++)
-		if (ws_obj_before_tables(objs[i].kind) == before_tables)
-			ws_schema_check_defaults(schema, before_tables ? DEFACLOBJ_TYPE : DEFACLOBJ_RELATION);
+		if (ws_obj_before_tables(&objs[i]) == before_tables)
+			ws_schema_check_defaults(schema, is_function(objs[i].kind) ? DEFACLOBJ_FUNCTION :
+									 is_relation(objs[i].kind) ? DEFACLOBJ_RELATION : DEFACLOBJ_TYPE);
 	level = WsSql->begin();
 	check_nothing_captures(schema);
 	nest = ws_schema_path_begin(schema);
+	/* (a body in text names what may not be made yet, as a function needing another may) */
+	(void) set_config_option("check_function_bodies", "off", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 	for (int i = 0; i < n; i++)
 	{
 		Buf			sql = BUF_INIT;
 
-		if (ws_obj_before_tables(objs[order[i]].kind) != before_tables)
+		if (ws_obj_before_tables(&objs[order[i]]) != before_tables)
 			continue;
 		ws_obj_create_statement(&objs[order[i]], schema, &sql);
 		run_statement(&sql);
 	}
-	ws_schema_path_end(nest);
+	/* (under the path still: a function's statements say its input types bare) */
 	for (int i = 0; i < n; i++)
 	{
 		const WsObject *o = &objs[order[i]];
 		Buf			owner = BUF_INIT;
 
-		if (ws_obj_before_tables(o->kind) != before_tables)
+		if (ws_obj_before_tables(o) != before_tables)
 			continue;
 		for (int k = 0; k < o->ncomments; k++)
 		{
@@ -2064,6 +2441,15 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		if (owner.len > 0)
 			run_statement(&owner);
 		buf_free(&owner);
+		if (o->public_revoked)
+		{
+			Buf			sql = BUF_INIT;
+
+			ws_put_text(&sql, "REVOKE ALL ON ROUTINE ");
+			put_object(o, schema, &sql);
+			ws_put_text(&sql, " FROM PUBLIC");
+			run_statement(&sql);
+		}
 		/* (after its owner: as owner, a grant to who restores it would be no grant) */
 		for (int k = 0; k < o->ngrants; k++)
 		{
@@ -2073,6 +2459,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 			run_statement(&sql);
 		}
 	}
+	ws_schema_path_end(nest);
 	WsSql->end(level);
 	pfree(order);
 }

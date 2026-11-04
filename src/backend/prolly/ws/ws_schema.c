@@ -3489,6 +3489,8 @@ ws_privilege_word(char letter)
 			return "TRIGGER";
 		case 'm':
 			return "MAINTAIN";
+		case 'X':
+			return "EXECUTE";
 	}
 	return "USAGE";
 }

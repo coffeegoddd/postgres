@@ -63,6 +63,31 @@ ENGINE_TEST(test_bytes)
 	WsObjectCodec->encode_key(&o, &k);
 	WsObjectCodec->encode_value(&o, &v);
 	CHECK(k.len == 6 && memcmp(k.data, "view/v", 6) == 0);
+	{
+		WsObject	f = {.kind = WS_OBJ_FUNCTION,.name = "f",.args = "integer, mood",.definition = "x",
+		.after_tables = true,.public_revoked = true};
+		WsObject	f0 = {.kind = WS_OBJ_PROCEDURE,.name = "a(b",.args = "",.definition = "x"};
+		WsObject	fback;
+		Buf			fk = BUF_INIT;
+		Buf			fv = BUF_INIT;
+
+		WsObjectCodec->encode_key(&f, &fk);
+		WsObjectCodec->encode_value(&f, &fv);
+		CHECK(fk.len == strlen("function/f(integer, mood)"));
+		WsObjectCodec->decode(fk.data, fk.len, fv.data, fv.len, &fback);
+		CHECK(strcmp(fback.name, "f") == 0 && strcmp(fback.args, "integer, mood") == 0);
+		CHECK(fback.after_tables && fback.public_revoked);
+		ws_obj_free(&fback);
+		fk.len = 0;
+		fv.len = 0;
+		WsObjectCodec->encode_key(&f0, &fk);
+		WsObjectCodec->encode_value(&f0, &fv);
+		WsObjectCodec->decode(fk.data, fk.len, fv.data, fv.len, &fback);
+		CHECK(strcmp(fback.name, "a(b") == 0 && fback.args[0] == '\0');
+		ws_obj_free(&fback);
+		buf_free(&fk);
+		buf_free(&fv);
+	}
 	WsObjectCodec->decode(k.data, k.len, v.data, v.len, &back);
 	check_same(&o, &back);
 	CHECK(strcmp(back.deps[0], "view/a") == 0);
@@ -96,7 +121,7 @@ decode_bad(void *arg)
 
 ENGINE_TEST(test_malformed)
 {
-#define D 1, 'x'				/* a definition */
+#define D 1, 'x', 0, 0			/* a definition, no flags, no args */
 #define O 1, 'g'				/* an owner */
 	static const uint8 ok[] = {D, 0, O, 0, 0};
 	static const uint8 cut[] = {D, 0, O, 0};
@@ -136,6 +161,8 @@ ENGINE_TEST(test_malformed)
 		{"table/v", ok, sizeof(ok)},
 		{"view/", ok, sizeof(ok)},
 		{"view/\xff", ok, sizeof(ok)},
+		{"function/f", ok, sizeof(ok)},
+		{"function/f(x)", ok, sizeof(ok)},
 	};
 #undef D
 #undef O
@@ -371,6 +398,20 @@ ENGINE_TEST(test_refused_statements)
 		"(x) AS SELECT 1 WITH NO DATA",
 	};
 
+	{
+		static const char *const functions[] = {
+			"() RETURNS integer LANGUAGE sql AS 'SELECT 1'; DROP TABLE t",
+			"AS 'SELECT 1'",
+			"",
+		};
+
+		for (int i = 0; i < lengthof(functions); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_FUNCTION,.name = "v",.args = "",.definition = (char *) functions[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
 	{
 		static const char *const types[] = {
 			"AS ENUM ('a'); DROP TABLE t",

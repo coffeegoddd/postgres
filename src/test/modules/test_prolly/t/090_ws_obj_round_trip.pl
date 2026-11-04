@@ -99,7 +99,6 @@ $node->safe_psql('postgres', q{DROP MATERIALIZED VIEW "S rc".m_runs; DROP FUNCTI
 # what a commit cannot hold is refused by name, nothing left out in silence
 my @refused = (
 	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int); GRANT SELECT ON public.o TO g_owner', 'DROP TABLE public.o CASCADE' ],
-	[ q{CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE VIEW r_func AS SELECT f()}, 'no commit holds yet', undef, 'DROP FUNCTION "S rc".f() CASCADE' ],
 	[ q{CREATE SEQUENCE q; CREATE VIEW r_seq AS SELECT nextval('q'::regclass)}, 'no commit holds yet', undef, 'DROP SEQUENCE "S rc".q CASCADE' ],
 	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
 	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
@@ -404,9 +403,8 @@ $node->safe_psql('postgres', q{
 	CREATE VIEW tyc.v AS SELECT a FROM tyc.ran;
 	ALTER VIEW tyc.v OWNER TO g_tyc;
 });
-my $tyc = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyc')});
-my %tyc_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $tyc;
-like($tyc_val{'type/c'}, qr/AS \(x integer, y e\)/, 'a type is not captured by a function of its schema');
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('tyc')});
+like($err, qr/it is named as one in the catalogs/, 'a function named as a catalog function is refused, not taken for it');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM tyc.ran'), '0', 'and runs none of them');
 
 # a domain whose constant could hold names says so; one naming a schema is refused
@@ -485,7 +483,6 @@ like($err, qr/default privileges would change what is made/, 'default privileges
 # what a commit cannot hold of a type, by name
 my @ty_refused = (
 	[ q{CREATE TYPE r_shell}, 'no definition yet' ],
-	[ q{CREATE FUNCTION rf(int) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE DOMAIN r_fn AS int CHECK (rf(VALUE))}, 'no commit holds yet' ],
 	[ q{CREATE TABLE rt (a int); CREATE TYPE r_rowtype AS (r rt)}, 'a table' ],
 	[ q{CREATE TABLE rt2 (a int); CREATE TYPE r_rowtype2 AS (r rt2[])}, 'a table' ],
 	[ q{CREATE VIEW vv AS SELECT 1 AS a; CREATE DOMAIN r_viewdom AS vv[]}, 'a view' ],
@@ -525,6 +522,108 @@ for my $i (0 .. $#ty_refused)
 	isnt($rc2, 0, "refused: $sql");
 	like($err2, qr/\Q$why\E/, "for why: $sql");
 }
+
+# functions and procedures: most made before tables, which may use them
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_fnowner NOLOGIN;
+	CREATE ROLE g_fnuser NOLOGIN;
+	CREATE SCHEMA fn AUTHORIZATION g_fnowner;
+	SET ROLE g_fnowner;
+	SET search_path = fn;
+	CREATE TYPE fmood AS ENUM ('a', 'b');
+	CREATE FUNCTION overload(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+	CREATE FUNCTION overload(text, fmood DEFAULT 'a') RETURNS text LANGUAGE sql STABLE COST 7 AS $$ SELECT $1 || ' it''s @ here' $$;
+	CREATE FUNCTION "Odd name(1"() RETURNS void LANGUAGE plpgsql AS $$ BEGIN PERFORM overload(1); END $$;
+	CREATE FUNCTION outs(a integer, OUT b integer, OUT c text) RETURNS record LANGUAGE sql AS 'SELECT $1, $1::text';
+	CREATE PROCEDURE proc(integer) LANGUAGE sql AS 'SELECT $1';
+	CREATE FUNCTION definer() RETURNS integer LANGUAGE sql SECURITY DEFINER SET work_mem = '1MB' AS 'SELECT 1';
+	CREATE FUNCTION revoked() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+	REVOKE ALL ON FUNCTION revoked() FROM PUBLIC;
+	GRANT EXECUTE ON FUNCTION revoked() TO g_fnuser;
+	CREATE FUNCTION granted() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+	GRANT EXECUTE ON FUNCTION granted() TO g_fnuser WITH GRANT OPTION;
+	COMMENT ON FUNCTION overload(integer) IS 'it''s one';
+	COMMENT ON PROCEDURE proc(integer) IS 'a procedure';
+	CREATE DOMAIN fpos AS integer CHECK (overload(VALUE) > 0);
+	CREATE TABLE uses (a integer DEFAULT overload(1), p fpos, CHECK (overload(a) > 0));
+	CREATE FUNCTION atomic_body() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM uses; END;
+	CREATE FUNCTION of_row(uses) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+	CREATE FUNCTION needs_after() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT atomic_body(); END;
+	CREATE VIEW calls AS SELECT overload(1) AS o, atomic_body() AS n;
+});
+my $fn_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('fn')});
+my %fn_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $fn_held;
+ok($fn_val{$_}, "$_ is held") for ('function/overload(integer)', 'function/overload(text, fmood)', 'function/Odd name(1()', 'function/outs(integer)', 'procedure/proc(integer)', 'function/of_row(uses)');
+unlike(join('', values %fn_val), qr/\bfn\./, 'no definition names its schema');
+like($fn_val{'function/overload(text, fmood)'}, qr/it''s @@ here/, 'an @ of a body is doubled');
+like($fn_val{'function/overload(text, fmood)'}, qr/type\/fmood/, 'a function says what type it needs');
+like($fn_val{'domain/fpos'}, qr/function\/overload\(integer\)/, 'a domain says what function it needs');
+like($fn_val{'view/calls'}, qr/function\/atomic_body\(\).*function\/overload\(integer\)/s, 'and a view');
+
+$node->safe_psql('postgres', q{CREATE SCHEMA fn2 AUTHORIZATION g_fnowner});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('fn', 'fn2', 'before')});
+is( $node->safe_psql('postgres', q{SELECT string_agg(proname::text, ' ' ORDER BY proname) FROM pg_proc WHERE pronamespace = 'fn2'::regnamespace AND proname IN ('overload', 'atomic_body', 'of_row', 'needs_after')}),
+	'overload overload', 'before tables are those that need none');
+$node->safe_psql('postgres', q{SET ROLE g_fnowner; SET search_path = fn2; CREATE TABLE uses (a integer DEFAULT overload(1), p fpos, CHECK (overload(a) > 0))});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('fn', 'fn2', 'after')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('fn2')}), $fn_held, 'the same bytes restored');
+my $fn_dump = sub {
+	my ($s) = @_;
+	my $out = $node->safe_psql('postgres', qq{SELECT string_agg(format('%s(%s) %s %s owner=%s acl=%s comment=%s',
+		proname, oidvectortypes(proargtypes), prokind, prosecdef, pg_get_userbyid(proowner),
+		(SELECT array_agg(x::text ORDER BY x::text) FROM unnest(proacl) x), obj_description(oid, 'pg_proc')), E'\\n' ORDER BY proname, oidvectortypes(proargtypes))
+		FROM pg_proc WHERE pronamespace = '$s'::regnamespace});
+	$out =~ s/\b\Q$s\E\.//g;
+	return $out;
+};
+is($fn_dump->('fn2'), $fn_dump->('fn'), 'the same by the catalogs, grants and all');
+is( $node->safe_psql('postgres', q{SELECT has_function_privilege('g_tyuser', 'fn2.revoked()', 'EXECUTE'), has_function_privilege('g_fnuser', 'fn2.revoked()', 'EXECUTE')}),
+	'f|t', 'and what was revoked from PUBLIC stays so');
+is($node->safe_psql('postgres', q{SET search_path = fn2; SELECT overload('x')}), "x it's @ here", 'and it runs');
+
+# a function whose owner cannot travel goes to who restores it, unless it acts as them
+$node->safe_psql('postgres', q{CREATE SCHEMA fn3; CREATE FUNCTION fn3.mine() RETURNS integer LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION fn3.mine() OWNER TO x_person; CREATE SCHEMA fn4});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('fn3', 'fn4')});
+is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(proowner) = current_user FROM pg_proc WHERE oid = 'fn4.mine()'::regprocedure}), 't', 'a function of a login role goes to who restores it');
+
+my @fn_refused = (
+	[ q{CREATE FUNCTION r() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION r() OWNER TO x_person}, 'SECURITY DEFINER, and owned by a role that cannot travel' ],
+	[ q{CREATE FUNCTION now() RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'named as one in the catalogs' ],
+	[ q{CREATE AGGREGATE r_agg(int) (SFUNC = int4pl, STYPE = int)}, 'an aggregate' ],
+	[ q{CREATE FUNCTION r_c() RETURNS int LANGUAGE internal AS 'int4pl'}, 'a language' ],
+	[ q{CREATE FUNCTION r_sp() RETURNS int LANGUAGE sql SET search_path = fn5 AS 'SELECT 1'}, 'a search path that names its schema' ],
+	[ q{CREATE TYPE public.fn_else AS ENUM ('a'); CREATE FUNCTION r_o(public.fn_else) RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'another schema' ],
+	[ q{CREATE TABLE t (a int); CREATE FUNCTION r_t() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM t; END; ALTER TABLE t ADD CHECK (r_t() >= 0)}, 'a table needs it, and it needs a table' ],
+	[ q{CREATE TABLE t (a int); CREATE FUNCTION r_t() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM t; END; CREATE DOMAIN r_d AS bigint CHECK (VALUE > r_t())}, 'which needs a table' ],
+	[ q{CREATE SEQUENCE s; CREATE FUNCTION r_s() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('s'::regclass); END}, 'no commit holds yet' ],
+	[ q{CREATE FUNCTION r_g() RETURNS int LANGUAGE sql AS 'SELECT 1'; GRANT EXECUTE ON FUNCTION r_g() TO x_person}, 'which cannot travel' ],
+);
+for my $case (@fn_refused)
+{
+	my ($sql, $why) = @$case;
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS fn5 CASCADE; DROP TYPE IF EXISTS public.fn_else CASCADE; CREATE SCHEMA fn5; SET search_path = fn5, public; $sql});
+	my ($rc4, $out4, $err4) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('fn5')});
+	isnt($rc4, 0, "refused: $sql");
+	like($err4, qr/\Q$why\E/, "for why: $sql");
+}
+
+# a function renamed while being read is one to try again, by key or by need
+for my $change (q{ALTER FUNCTION fn.granted() RENAME TO granted2}, q{DROP FUNCTION fn.granted2()})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('fn')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+
+# default privileges on functions refuse
+$node->safe_psql('postgres', q{CREATE SCHEMA fn6; ALTER DEFAULT PRIVILEGES IN SCHEMA fn6 GRANT EXECUTE ON FUNCTIONS TO g_fnuser});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('fn3', 'fn6')});
+like($err, qr/default privileges would change what is made/, 'default privileges on functions refuse a restore');
 
 $node->stop;
 done_testing();
