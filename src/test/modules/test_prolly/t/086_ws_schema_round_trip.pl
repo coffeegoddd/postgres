@@ -193,6 +193,8 @@ $node->safe_psql('postgres', q{
 		CONSTRAINT pk_part_x EXCLUDE USING btree (id WITH =, a WITH =) WHERE (a > 0)) PARTITION BY RANGE (id);
 	CREATE INDEX pk_part_i ON src.pk_part (a);
 	CREATE INDEX pk_part_e ON src.pk_part (lower(r));
+	CREATE TABLE src.pchk (a integer, CONSTRAINT pchk_ne CHECK (a > 1) NOT ENFORCED) PARTITION BY RANGE (a);
+	ALTER TABLE src.pchk ADD CONSTRAINT pchk_nv CHECK (a > 0) NOT VALID;
 	CREATE TABLE src.pren (a integer, b integer) PARTITION BY RANGE ((a + b), a);
 	ALTER TABLE src.pren RENAME a TO z;
 	CREATE TABLE src.pfk_p (id integer PRIMARY KEY) PARTITION BY HASH (id);
@@ -272,7 +274,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_defp', 'fk_defc', 'fk_self', 'fk_selfu', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats',
 	'excl', 'excl_ren', 'excl_key', 'chk', 'chk_only', 'chk_ren', 'chk_nn',
 	'xnn', 'unn', 'knn', 'xseq', 'useq', 'iseq', 'nn_ren', 'nn_named', 'nn_seqtab', 'nn_seqtab_a_seq', 'nn_fk',
-	'pr', 'pl', 'ph', 'pe', 'po', 'pk_part', 'pren', 'pfk_p', 'pfk_c',
+	'pr', 'pl', 'ph', 'pe', 'po', 'pk_part', 'pchk', 'pren', 'pfk_p', 'pfk_c',
 	'pt', 'pt1', 'pt2', 'Odd Default', 'ptl', 'ptl1', 'pth', 'pth0', 'pth1', 'ptd', 'ptd1', 'ptm', 'ptm1', 'ptm1a',
 	'ptf_p', 'ptf_p1', 'ptf_c', 'ptf_c1',
 	'idt', 'idm', 'idl', 'pnv', 'pnv1', 'pnv2', 'ptbd', 'ptbd1', 'ptbn', 'ptbn1', 'ptby', 'ptby1', 'ptbs', 'ptbs1', 'ptbt', 'ptbt1',
@@ -381,7 +383,7 @@ $node->safe_psql('postgres', "CREATE TABLESPACE t86 LOCATION '$tsdir'");
 # a check's flags made again as they were
 my $checks = q{SELECT string_agg(conname || ': ' || pg_get_constraintdef(oid) || ' ' || convalidated || connoinherit || conenforced, E'\n' ORDER BY conname)
 	FROM pg_constraint WHERE contype = 'c' AND conrelid = '%s.%s'::regclass};
-for my $table ('chk', 'chk_only')
+for my $table ('chk', 'chk_only', 'pchk')
 {
 	my $want = $node->safe_psql('postgres', sprintf($checks, 'src', $table));
 	isnt($want, '', "$table has checks");
@@ -1196,7 +1198,8 @@ my $part_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes(
 my $part_sql = q{
 	SET client_encoding = UTF8;
 	CREATE COLLATION "sché"."collé" FROM "C";
-	CREATE TABLE enc."parté" ("colonné" text, b integer) PARTITION BY RANGE ((b + length('é')), "colonné" COLLATE "sché"."collé");
+	CREATE TABLE enc."parté" ("colonné" text, b integer, c text)
+		PARTITION BY RANGE ((b + length('é')), "colonné" COLLATE "sché"."collé", c "sché"."classé");
 };
 $node->safe_psql($_, $part_sql) for ('postgres', 'lat');
 my $part_utf8 = $node->safe_psql('postgres', sprintf($part_enc, 'enc'));
