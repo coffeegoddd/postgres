@@ -144,10 +144,10 @@ typedef struct WsTableSchema
  * index or the key, with a method and keys, each a column of its own or an
  * expression, not both, and no operator, INCLUDE's columns its own, an order of
  * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique;
- * a known way to partition with keys, one if by list or range's many, none
- * if not partitioned, each key as an index's with no order or operator; a
- * partition with its bound, and of another table.  NULL if it is so, or what is
- * wrong.
+ * a known way to partition with keys, one if by list, no more than a partition
+ * key can have otherwise, none if not partitioned, each key as an index's with no
+ * order or operator; a partition with its bound, and of another table.  NULL if
+ * it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -191,9 +191,9 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * refuses the table here too): false if the schema
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
- * What the record cannot yet hold and would lose (inheritance, a partition
- * or partitioned table across schemas,
- * storage settings, a key's options, a sequence's, a default using one,
+ * What the record cannot yet hold and would lose (inheritance, a partition or
+ * partitioned table across schemas, storage settings, a key's options, a
+ * sequence's, a default using one,
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit

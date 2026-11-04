@@ -1464,6 +1464,7 @@ static void
 test_partition_injection(void)
 {
 	static const PartitionAttack bad[] = {
+		{.expr = "@{7})) -- "},
 		{.expr = "1), (2"},
 		{.expr = "1)) TABLESPACE x --"},
 		{.expr = "1)) USING heap --"},

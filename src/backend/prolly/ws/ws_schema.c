@@ -59,6 +59,11 @@
 
 const WsSchemaCodecRoutine *WsSchemaCodec = &BinaryWsSchemaCodec;
 
+/* (a commit's bytes are the record's, whatever the parser calls these) */
+StaticAssertDecl(WS_PARTITION_RANGE == PARTITION_STRATEGY_RANGE, "partition kinds differ");
+StaticAssertDecl(WS_PARTITION_LIST == PARTITION_STRATEGY_LIST, "partition kinds differ");
+StaticAssertDecl(WS_PARTITION_HASH == PARTITION_STRATEGY_HASH, "partition kinds differ");
+
 static const char *
 own_column_name(void *arg, uint64 tag)
 {
@@ -118,11 +123,11 @@ static const char *
 index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 {
 	if ((key->tag != 0) == (key->expr != NULL))
-		return "an index's key neither a column nor an expression, or both";
+		return "a key neither a column nor an expression, or both";
 	if (key->tag != 0)
 	{
 		if (ws_schema_column(s, key->tag) == NULL)
-			return "an index with a column the table does not have";
+			return "a key with a column the table does not have";
 	}
 	else
 	{
@@ -133,7 +138,7 @@ index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 	}
 	if ((key->collation != NULL && key->collation[0] == '\0') ||
 		(key->opclass != NULL && key->opclass[0] == '\0'))
-		return "an index's key with an empty collation or opclass";
+		return "a key with an empty collation or opclass";
 	return NULL;
 }
 
@@ -1603,7 +1608,8 @@ check_partitioning(const WsTableSchema *s, const PartitionSpec *spec)
 
 /*
  * The statement as written is the one the record says, by the grammar: one
- * CREATE TABLE, of this name, these columns, key and constraints, and nothing else.
+ * CREATE TABLE, of this name, these columns, key, constraints and partitioning,
+ * and nothing else.
  * Text in a commit may have come from anywhere, and checking each piece alone
  * says nothing of what the pieces make together: a comment in one hides a
  * quote in the next.  So the whole is what is checked.
@@ -2062,10 +2068,10 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND "
-"                 ((k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
+"                 (NOT x.indisvalid OR (k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
 "                  x.indnkeyatts <> x.indnatts OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
-"    THEN 'a key or unique constraint has more than columns' "
+"    THEN 'a key or unique constraint has more than columns, or is not valid' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_constraint k2 ON k2.conrelid = k.conrelid AND k2.oid > k.oid "
 "               JOIN pg_index x2 ON x2.indexrelid = k2.conindid "

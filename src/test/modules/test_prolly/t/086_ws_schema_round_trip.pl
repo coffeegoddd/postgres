@@ -319,6 +319,11 @@ is( $bytes->(
 	$base,
 	'the bytes whatever the session is set to');
 is( $bytes->(
+		$node, 'postgres', 'pe',
+		q{SET DateStyle = 'SQL, DMY'; SET TimeZone = 'Asia/Tokyo'; SET search_path = pg_temp, public; SET quote_all_identifiers = on; SET extra_float_digits = -5; }),
+	$bytes->($node, 'postgres', 'pe'),
+	'a partition key\'s too, its expressions deparsed in place');
+is( $bytes->(
 		$node, 'postgres', 'Odd Table',
 		q{SET quote_all_identifiers = on; }),
 	$bytes->($node, 'postgres', 'Odd Table'),
@@ -428,6 +433,34 @@ $node->safe_psql('postgres', q{DELETE FROM dst.pt});
 is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_constraint WHERE conrelid = 'dst.ptf_c1'::regclass AND contype = 'f' AND conparentid <> 0}),
 	'1', 'a partition\'s foreign key its table\'s');
 
+# a partitioned table's partitions all gone: it reads, and so does one that was
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.pgone (a int) PARTITION BY RANGE (a);
+	CREATE TABLE src.pgone1 PARTITION OF src.pgone FOR VALUES FROM (0) TO (1);
+	ALTER TABLE src.pgone DETACH PARTITION src.pgone1;
+	CREATE SCHEMA dst_gone VERSIONED;
+});
+for my $table ('pgone', 'pgone1')
+{
+	my $hex = $bytes->($node, 'postgres', $table);
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst_gone')});
+	is($bytes->($node, 'postgres', $table, undef, 'dst_gone'), $hex, "$table, its partition detached, read and made again");
+}
+
+# a column of a key renamed since the reader's snapshot
+$node->safe_psql('postgres', q{CREATE TABLE src.psnap (a int, b int) PARTITION BY RANGE ((a + b))});
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', q{ALTER TABLE src.psnap RENAME a TO z});
+	$old->query(q{SELECT test_ws_schema_bytes('src', 'psnap')});
+	like($old->{stderr}, qr/renamed, retyped or dropped since this transaction's snapshot/,
+		'a partition key\'s column renamed since a snapshot refused');
+	$old->query('ROLLBACK');
+	$old->quit;
+}
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -462,6 +495,7 @@ my %refused_for = (
 	xclu => 'an index has options', xstat => 'an index has options', xcmt => 'a comment',
 	xicmt => 'a comment', xext => 'depends on an extension', fksopt => 'an index has options',
 	seqother => 'its sequence in another schema',
+	ponly => 'or is not valid', ponlyk => 'or is not valid',
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
 	ptfn => 'named otherwise', pam => 'another access method', psp => 'a tablespace',
 	cni => 'a check not valid', cne => 'a check not valid',
@@ -482,6 +516,11 @@ for my $t (
 	[ 'pxd', q{CREATE TABLE src.pxd (a int) PARTITION BY RANGE (a); CREATE TABLE src.pxd1 PARTITION OF src.pxd FOR VALUES FROM (0) TO (1); UPDATE pg_inherits SET inhdetachpending = true WHERE inhrelid = 'src.pxd1'::regclass} ],
 	[ 'pxe', 'SELECT 1', 'pxd1' ],
 	[ 'ptfn', q{CREATE TABLE src.ptfn (id integer, r integer, CONSTRAINT own FOREIGN KEY (r) REFERENCES src.ptf_p (id)); ALTER TABLE src.ptf_c ATTACH PARTITION src.ptfn FOR VALUES FROM (10) TO (20)} ],
+	[ 'ponly', q{CREATE TABLE src.ponly (a int) PARTITION BY RANGE (a); CREATE TABLE src.ponly1 PARTITION OF src.ponly FOR VALUES FROM (0) TO (1);
+		ALTER TABLE ONLY src.ponly ADD CONSTRAINT ponly_u UNIQUE (a); ALTER TABLE src.ponly DETACH PARTITION src.ponly1} ],
+	[ 'ponlyk', q{CREATE TABLE src.ponlyk (a int NOT NULL) PARTITION BY RANGE (a); CREATE TABLE src.ponlyk1 PARTITION OF src.ponlyk FOR VALUES FROM (0) TO (1);
+		ALTER TABLE ONLY src.ponlyk ADD CONSTRAINT ponlyk_k PRIMARY KEY (a); ALTER TABLE src.ponlyk DETACH PARTITION src.ponlyk1} ],
+	[ 'pwhole', q{CREATE TABLE src.pwhole (a int) PARTITION BY RANGE ((pwhole IS NOT NULL))} ],
 	[ 'pam', 'CREATE TABLE src.pam (a int) PARTITION BY RANGE (a) ; ALTER TABLE src.pam SET ACCESS METHOD heap' ],
 	[ 'psp', 'CREATE TABLE src.psp (a int) PARTITION BY RANGE (a) TABLESPACE t86' ],
 	[ 'child', 'CREATE TABLE src.child () INHERITS (src.parent)' ],
@@ -1072,6 +1111,17 @@ is( $node->safe_psql(
 	't',
 	'and an exclusion with it, in its names and its text');
 is($enc_dst->('lat'), $in_utf8, 'and the same bytes, read there again');
+my $part_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('%s', 'parté'), 'hex')};
+my $part_sql = q{
+	SET client_encoding = UTF8;
+	CREATE COLLATION "sché"."collé" FROM "C";
+	CREATE TABLE enc."parté" ("colonné" text, b integer) PARTITION BY RANGE ((b + length('é')), "colonné" COLLATE "sché"."collé");
+};
+$node->safe_psql($_, $part_sql) for ('postgres', 'lat');
+my $part_utf8 = $node->safe_psql('postgres', sprintf($part_enc, 'enc'));
+is($node->safe_psql('lat', sprintf($part_enc, 'enc')), $part_utf8, 'a partitioned table the same bytes in LATIN1 as in UTF8');
+$node->safe_psql('lat', qq{SELECT test_ws_schema_create(decode('$part_utf8', 'hex'), 'dst')});
+is($node->safe_psql('lat', sprintf($part_enc, 'dst')), $part_utf8, 'and made there, read again');
 
 # a name that fits here and not in a commit, as part of another's: refused as too long
 my $over = 'é' x 40;
@@ -1092,8 +1142,10 @@ $node->safe_psql('lat', qq{
 	CREATE TABLE enc.l_iops (a integer);
 	CREATE INDEX ON enc.l_iops (a "$over".o);
 	CREATE TABLE enc.l_xop (a integer, EXCLUDE USING btree (a enc.o WITH OPERATOR("$over".===)));
+	CREATE TABLE enc.l_pcoll (a text) PARTITION BY RANGE (a COLLATE "$over".c);
+	CREATE TABLE enc.l_pops (a integer) PARTITION BY RANGE (a "$over".o);
 });
-for my $table ('l_coll', 'l_type', 'l_ikey', 'l_iops', 'l_xop')
+for my $table ('l_coll', 'l_type', 'l_ikey', 'l_iops', 'l_xop', 'l_pcoll', 'l_pops')
 {
 	my ($lret, $lout, $lerr) = $node->psql('lat', qq{SELECT test_ws_schema_bytes('enc', '$table')});
 	like($lerr, qr/too long for version control/, "$table: a qualifier too long for a commit refused");
