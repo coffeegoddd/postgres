@@ -30,6 +30,7 @@
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_tags.h"
 #include "utils/builtins.h"
+#include "utils/regproc.h"
 
 #define WS_SCHEMA_VERSION 1
 
@@ -443,9 +444,19 @@ not_the_record(const WsTableSchema *s, const char *what)
 			 errmsg("the schema of table \"%s\" does not make that table: %s", s->name, what)));
 }
 
-/* The statement's text as parse trees, or a refusal: it is the record's fault. */
+/* Whether a parser's error is the text's fault, and so the record's. */
+static bool
+is_texts_fault(int code)
+{
+	int			class = ERRCODE_TO_CATEGORY(code);
+
+	return class == ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION ||
+		class == ERRCODE_DATA_EXCEPTION || class == ERRCODE_FEATURE_NOT_SUPPORTED;
+}
+
+/* The text as parse trees, or a refusal: it is the record's fault. */
 static List *
-parse_statement(const WsTableSchema *s, const char *sql)
+parse_text(const WsTableSchema *s, const char *sql)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	List	   *volatile parsed = NIL;
@@ -460,7 +471,7 @@ parse_statement(const WsTableSchema *s, const char *sql)
 
 		MemoryContextSwitchTo(cxt);
 		edata = CopyErrorData();
-		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION)
+		if (!is_texts_fault(edata->sqlerrcode))
 			PG_RE_THROW();
 		FlushErrorState();
 		not_the_record(s, edata->message);
@@ -487,7 +498,7 @@ parse_type(const WsTableSchema *s, const char *type)
 
 		MemoryContextSwitchTo(cxt);
 		edata = CopyErrorData();
-		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION)
+		if (!is_texts_fault(edata->sqlerrcode))
 			PG_RE_THROW();
 		FlushErrorState();
 		not_the_record(s, edata->message);
@@ -496,6 +507,33 @@ parse_type(const WsTableSchema *s, const char *type)
 	if (parsed == NULL)
 		not_the_record(s, "a column's type");
 	return parsed;
+}
+
+/*
+ * A column's expression as written, parsed alone, is the expression the
+ * statement holds: what a comment elsewhere in the statement could otherwise
+ * put in its place, while the record reads as something else.
+ */
+static void
+check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
+{
+	Buf			text = BUF_INIT;
+	char	   *sql;
+	List	   *parsed;
+	SelectStmt *select;
+
+	put_expression(s, c->def, &text);
+	buf_append_byte(&text, 0);
+	sql = psprintf("SELECT (%s)", (char *) text.data);
+	parsed = parse_text(s, sql);
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
+		not_the_record(s, "a column's expression");
+	select = (SelectStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (list_length(select->targetList) != 1 ||
+		!equal(linitial_node(ResTarget, select->targetList)->val, in_statement))
+		not_the_record(s, "a column's expression");
+	pfree(sql);
+	buf_free(&text);
 }
 
 /* Whether a type name would create a sequence too: CREATE TABLE's serial types. */
@@ -518,9 +556,10 @@ static void
 check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 {
 	TypeName   *type = parse_type(s, c->type);
-	int			want = (c->not_null ? 1 : 0) + (c->kind != WS_COL_STORED ? 1 : 0) +
-		(c->identity != WS_IDENTITY_NONE ? 1 : 0) +
-		(c->kind == WS_COL_STORED && c->identity == WS_IDENTITY_NONE && c->def != NULL ? 1 : 0);
+	int			not_null = 0,
+				deflt = 0,
+				identity = 0,
+				generated = 0;
 	ListCell   *lc;
 
 	if (!equal(type, def->typeName))
@@ -531,44 +570,57 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 		not_the_record(s, "a column's name");
 	if ((def->collClause != NULL) != (c->collation != NULL))
 		not_the_record(s, "a column's collation");
-	if (c->collation != NULL &&
-		(def->collClause->arg != NULL ||
-		 strcmp(NameListToQuotedString(def->collClause->collname), c->collation) != 0))
-		not_the_record(s, "a column's collation");
+	if (c->collation != NULL)
+	{
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
+		List	   *names = stringToQualifiedNameList(c->collation, (Node *) &escontext);
+
+		/* (as lists of names: their quoting follows quote_all_identifiers) */
+		if (names == NIL || def->collClause->arg != NULL ||
+			!equal(names, def->collClause->collname))
+			not_the_record(s, "a column's collation");
+	}
 	if (def->storage_name != NULL || def->compression != NULL || def->fdwoptions != NIL)
 		not_the_record(s, "a column's clause");
-	if (list_length(def->constraints) != want)
-		not_the_record(s, "a column's clauses");
 	foreach(lc, def->constraints)
 	{
 		Constraint *con = lfirst_node(Constraint, lc);
-		bool		ok = false;
 
+		if (con->conname != NULL || con->is_no_inherit || con->deferrable || con->initdeferred)
+			not_the_record(s, "a column's clause");
 		switch (con->contype)
 		{
 			case CONSTR_NOTNULL:
-				ok = c->not_null;
+				not_null++;
 				break;
 			case CONSTR_DEFAULT:
-				ok = c->kind == WS_COL_STORED && c->identity == WS_IDENTITY_NONE && c->def != NULL;
+				deflt++;
+				check_expression(s, c, con->raw_expr);
 				break;
 			case CONSTR_IDENTITY:
-				ok = con->options == NIL &&
-					con->generated_when == (c->identity == WS_IDENTITY_ALWAYS ?
-											ATTRIBUTE_IDENTITY_ALWAYS : ATTRIBUTE_IDENTITY_BY_DEFAULT) &&
-					c->identity != WS_IDENTITY_NONE;
+				identity++;
+				if (con->options != NIL ||
+					con->generated_when != (c->identity == WS_IDENTITY_ALWAYS ?
+											ATTRIBUTE_IDENTITY_ALWAYS : ATTRIBUTE_IDENTITY_BY_DEFAULT))
+					not_the_record(s, "a column's identity");
 				break;
 			case CONSTR_GENERATED:
-				ok = c->kind != WS_COL_STORED &&
-					con->generated_kind == (c->kind == WS_COL_GENERATED_STORED ?
-											ATTRIBUTE_GENERATED_STORED : ATTRIBUTE_GENERATED_VIRTUAL);
+				generated++;
+				if (con->generated_kind != (c->kind == WS_COL_GENERATED_STORED ?
+											ATTRIBUTE_GENERATED_STORED : ATTRIBUTE_GENERATED_VIRTUAL))
+					not_the_record(s, "a column's generation");
+				check_expression(s, c, con->raw_expr);
 				break;
 			default:
-				break;
+				not_the_record(s, "a column's clause");
 		}
-		if (!ok || con->conname != NULL)
-			not_the_record(s, "a column's clause");
 	}
+	/* (exactly one of each kind the record has, and none other: no standing in) */
+	if (not_null != (c->not_null ? 1 : 0) ||
+		identity != (c->identity != WS_IDENTITY_NONE ? 1 : 0) ||
+		generated != (c->kind != WS_COL_STORED ? 1 : 0) ||
+		deflt != (c->kind == WS_COL_STORED && c->identity == WS_IDENTITY_NONE && c->def != NULL ? 1 : 0))
+		not_the_record(s, "a column's clauses");
 }
 
 /*
@@ -581,7 +633,7 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 static void
 check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 {
-	List	   *parsed = parse_statement(s, sql);
+	List	   *parsed = parse_text(s, sql);
 	CreateStmt *create;
 	ListCell   *lc;
 	int			i = 0;

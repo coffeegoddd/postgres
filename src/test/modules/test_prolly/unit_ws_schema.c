@@ -19,6 +19,7 @@
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "test_prolly.h"
+#include "utils/guc.h"
 
 /* t (id bigint PRIMARY KEY, v text COLLATE "C" DEFAULT '', g bigint GENERATED, w ...) */
 static WsColumn example_cols[] = {
@@ -660,6 +661,7 @@ typedef struct Injection
 	const char *type;
 	const char *collation;
 	const char *def;
+	bool		not_null;
 } Injection;
 
 static void
@@ -667,7 +669,7 @@ create_injected(void *arg)
 {
 	Injection  *in = arg;
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = (char *) in->type,.kind = WS_COL_STORED,
-	.collation = (char *) in->collation,.def = (char *) in->def}};
+	.collation = (char *) in->collation,.def = (char *) in->def,.not_null = in->not_null}};
 	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
 
@@ -706,6 +708,17 @@ test_create_table_injection(void)
 		{.type = "integer", .def = "1) NOT NULL DEFAULT (2"},
 		{.type = "integer", .def = "1) CHECK (false"},
 		{.type = "integer", .def = "1); --"},
+		/* a comment in the type, and an expression other than the record reads */
+		{.type = "text --", .def = "'harmless\nDEFAULT (pg_read_file('/etc/passwd')) --'"},
+		/* a clause standing in for another */
+		{.type = "integer --", .not_null = true, .def = "1\nNOT NULL NOT NULL --"},
+		{.type = "integer", .not_null = true, .def = "1) NOT NULL NO INHERIT --"},
+		/* the text's fault, by each class a parser raises */
+		{.type = "float(0)"},
+		{.type = "integer", .def = "1::float(0)"},
+		{.type = "text", .def = "E'\\u12'"},
+		{.type = "text", .def = "E'\\xFF'"},
+		{.type = "integer", .def = "1) UNIQUE (SELECT 1"},
 	};
 	static const Injection good[] = {
 		{.type = "character varying(10)"},
@@ -738,11 +751,41 @@ create_unchecked(void *arg)
 	ws_schema_create_table(&s, "x", &b);
 }
 
+/* (a generated column whose clause another stands in for) */
+static void
+generated_replaced(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer --",.not_null = true,
+	.kind = WS_COL_GENERATED_STORED,.def = "1\nNOT NULL NOT NULL --"}};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* A collation is checked as names, under whichever quoting the session has. */
+static void
+test_create_table_quoting(void)
+{
+	int			level = NewGUCNestLevel();
+	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "text",.kind = WS_COL_STORED,
+	.collation = "pg_catalog.\"C\""}};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	(void) set_config_option("quote_all_identifiers", "on", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	ws_schema_create_table(&s, "x", &b);
+	buf_free(&b);
+	AtEOXact_GUC(true, level);
+}
+
 /* A schema with a problem, a merge's not yet checked, gives no statement. */
 static void
 test_create_table_unchecked(void)
 {
 	expect_error(create_unchecked, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	expect_error(generated_replaced, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 }
 
 /* (what failed, in the log: always false, for a CHECK to fail on) */
@@ -846,6 +889,7 @@ static const ProllyUnitTest tests[] = {
 	{"create_table_dangling", test_create_table_dangling},
 	{"create_table_injection", test_create_table_injection},
 	{"create_table_unchecked", test_create_table_unchecked},
+	{"create_table_quoting", test_create_table_quoting},
 	{"create_table_runs", test_create_table_runs},
 };
 
