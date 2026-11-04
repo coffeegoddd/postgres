@@ -3715,6 +3715,9 @@ describeRoles(const char *pattern, bool verbose, bool showSystem)
 	}
 	appendPQExpBufferStr(&buf, "\n, r.rolreplication");
 	appendPQExpBufferStr(&buf, "\n, r.rolbypassrls");
+	/* (a server of this version may be one without it: asked for by name) */
+	if (pset.sversion >= 200000)
+		appendPQExpBufferStr(&buf, "\n, (pg_catalog.to_jsonb(r)->>'roltravels')::pg_catalog.bool AS roltravels");
 
 	appendPQExpBufferStr(&buf, "\nFROM pg_catalog.pg_roles r\n");
 
@@ -3771,6 +3774,10 @@ describeRoles(const char *pattern, bool verbose, bool showSystem)
 
 		if (strcmp(PQgetvalue(res, i, (verbose ? 10 : 9)), "t") == 0)
 			add_role_attribute(&buf, _("Bypass RLS"));
+
+		if (PQfnumber(res, "roltravels") >= 0 &&
+			strcmp(PQgetvalue(res, i, PQfnumber(res, "roltravels")), "t") == 0)
+			add_role_attribute(&buf, _("Travels"));
 
 		conns = atoi(PQgetvalue(res, i, 6));
 		if (conns >= 0)

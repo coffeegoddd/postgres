@@ -45,16 +45,13 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
-#include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "catalog/indexing.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_authid.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_type.h"
@@ -68,6 +65,7 @@
 #include "parser/parser.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_fk.h"
+#include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
@@ -3930,65 +3928,21 @@ ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out)
 }
 
 /*
- * Roles are shared by a cluster's databases and a name's bytes are in the encoding
- * of whichever made it, so a name not in ASCII may be another name, if their
- * encodings differ, or not this encoding at all, if one that did has gone.
- */
-static void
-check_role_name_is_one(const char *table, const char *role)
-{
-	bool		ascii = true;
-	int			encoding = -1;
-	bool		many = false;
-	Relation	databases;
-	TableScanDesc scan;
-	HeapTuple	tup;
-
-	for (const char *b = role; *b; b++)
-		ascii &= !IS_HIGHBIT_SET(*b);
-	if (ascii)
-		return;
-	databases = table_open(DatabaseRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(databases, 0, NULL);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		int			here = ((Form_pg_database) GETSTRUCT(tup))->encoding;
-
-		many |= encoding >= 0 && here != encoding;
-		encoding = here;
-	}
-	table_endscan(scan);
-	table_close(databases, AccessShareLock);
-	if (many || !pg_verifymbstr(role, (int) strlen(role), true))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("table \"%s\" names a role not in ASCII, in a cluster whose databases' encodings differ, or not in this one's",
-						table)));
-}
-
-/*
- * A record may name any role here.  One that can log in, or with powers no commit
- * holds, it could not have been read with, so it came from somewhere it should not.
+ * A record may name any role here.  One that cannot travel it could not have been
+ * read with, so it came from somewhere it should not.
  */
 static void
 check_role_may_travel(const WsTableSchema *s, const char *role)
 {
-	HeapTuple	tup;
+	char	   *what;
 
 	if (IsReservedName(role))
 		not_the_record(s, "a predefined role");
-	check_role_name_is_one(s->name, role);
-	tup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
-	if (HeapTupleIsValid(tup))
-	{
-		Form_pg_authid r = (Form_pg_authid) GETSTRUCT(tup);
-		bool		bad = r->rolcanlogin || r->rolsuper || r->rolcreaterole || r->rolcreatedb ||
-			r->rolreplication || r->rolbypassrls;
-
-		ReleaseSysCache(tup);
-		if (bad)
-			not_the_record(s, "a role that can log in, or with powers no commit holds");
-	}
+	what = psprintf("table \"%s\"", s->name);
+	ws_role_check_name(what, role);
+	pfree(what);
+	if (ws_role_travel_problem(role) != NULL)
+		not_the_record(s, "a role that can log in, or with powers no commit holds");
 }
 
 void
@@ -4937,7 +4891,10 @@ read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 static char *
 role_name_to_utf8(const char *table, const char *role)
 {
-	check_role_name_is_one(table, role);
+	char	   *what = psprintf("table \"%s\"", table);
+
+	ws_role_check_name(what, role);
+	pfree(what);
 	return ws_name_to_utf8(role);
 }
 

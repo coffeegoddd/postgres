@@ -26,6 +26,7 @@ static const char *const map_keys[] = {
 	[WS_ROOT_SEQUENCES] = "~seq",
 	[WS_ROOT_VIOLATIONS] = "~viol",
 	[WS_ROOT_FOREIGN_KEYS] = "~fk",
+	[WS_ROOT_ROLES] = "~roles",
 };
 
 pg_noreturn static void

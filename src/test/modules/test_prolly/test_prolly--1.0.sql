@@ -751,6 +751,18 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 -- A table's foreign keys' bytes; and those keys added to its copy in another
 -- schema, through their bytes, the statements that did it.
+CREATE FUNCTION test_ws_role_bytes(names text[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_ws_role_mark(bytes text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_ws_role_restore(bytes text, previous text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_ws_fk_bytes(schema text, tab text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

@@ -14,12 +14,15 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "prolly/ws/ws_fk.h"
+#include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "varatt.h"
 
@@ -34,6 +37,9 @@ PG_FUNCTION_INFO_V1(test_ws_schema_set_inherited);
 PG_FUNCTION_INFO_V1(test_ws_schema_add_checks);
 PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
+PG_FUNCTION_INFO_V1(test_ws_role_bytes);
+PG_FUNCTION_INFO_V1(test_ws_role_mark);
+PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 
 /*
@@ -364,6 +370,126 @@ test_ws_schema_set_inherited(PG_FUNCTION_ARGS)
 	ws_schema_set_inherited(schema, &s);
 	CommandCounterIncrement();
 	ws_schema_free(&s);
+	PG_RETURN_VOID();
+}
+
+/* A hex string's bytes. */
+static uint8 *
+role_hex_bytes(const char *hex, size_t n)
+{
+	uint8	   *out = palloc(Max(n / 2, 1));
+
+	for (size_t i = 0; i < n / 2; i++)
+	{
+		unsigned int b;
+
+		if (sscanf(hex + i * 2, "%2x", &b) != 1)
+			elog(ERROR, "not hex: %s", hex);
+		out[i] = (uint8) b;
+	}
+	return out;
+}
+
+/* Roles from test_ws_role_bytes's text, each palloc'd. */
+static void
+role_lines(const char *text, WsRole **out, int *n)
+{
+	int			cap = 1;
+
+	for (const char *p = text; *p; p++)
+		cap += *p == '\n';
+	*out = palloc0_array(WsRole, cap);
+	*n = 0;
+	while (*text)
+	{
+		const char *colon = strchr(text, ':');
+		const char *nl = strchr(text, '\n');
+		size_t		klen;
+		size_t		vlen;
+		uint8	   *k;
+		uint8	   *v;
+
+		if (colon == NULL || nl == NULL)
+			elog(ERROR, "not a role's bytes: %s", text);
+		klen = colon - text;
+		vlen = nl - colon - 1;
+		k = role_hex_bytes(text, klen);
+		v = role_hex_bytes(colon + 1, vlen);
+		WsRoleCodec->decode(k, klen / 2, v, vlen / 2, &(*out)[(*n)++]);
+		text = nl + 1;
+	}
+}
+
+/*
+ * test_ws_role_bytes(names text[]) returns text: those roles' and all they are
+ * members of's bytes, in hex, a line each
+ */
+Datum
+test_ws_role_bytes(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	Datum	   *elems;
+	int			nnames;
+	const char **names;
+	WsRole	   *roles;
+	int			n;
+	StringInfoData out;
+
+	deconstruct_array_builtin(arr, TEXTOID, &elems, NULL, &nnames);
+	names = palloc_array(const char *, Max(nnames, 1));
+	for (int i = 0; i < nnames; i++)
+		names[i] = TextDatumGetCString(elems[i]);
+	initStringInfo(&out);
+	ws_role_read(names, nnames, &roles, &n);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			k = BUF_INIT;
+		Buf			v = BUF_INIT;
+
+		WsRoleCodec->encode_key(&roles[i], &k);
+		WsRoleCodec->encode_value(&roles[i], &v);
+		for (size_t j = 0; j < k.len; j++)
+			appendStringInfo(&out, "%02x", k.data[j]);
+		appendStringInfoChar(&out, ':');
+		for (size_t j = 0; j < v.len; j++)
+			appendStringInfo(&out, "%02x", v.data[j]);
+		appendStringInfoChar(&out, '\n');
+		buf_free(&k);
+		buf_free(&v);
+		ws_role_free(&roles[i]);
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_role_mark(bytes text) returns void: capture's marking of those roles
+ */
+Datum
+test_ws_role_mark(PG_FUNCTION_ARGS)
+{
+	WsRole	   *roles;
+	int			n;
+
+	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(0)), &roles, &n);
+	ws_role_mark(roles, n);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_role_restore(bytes text, previous text) returns void: makes the roles of
+ * test_ws_role_bytes's first text here, as a database whose root held its second
+ */
+Datum
+test_ws_role_restore(PG_FUNCTION_ARGS)
+{
+	WsRole	   *roles;
+	WsRole	   *previous;
+	int			n;
+	int			nprevious;
+
+	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(0)), &roles, &n);
+	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(1)), &previous, &nprevious);
+	ws_role_restore(roles, n, previous, nprevious);
 	PG_RETURN_VOID();
 }
 

@@ -32,6 +32,7 @@ CREATE ROLE <replaceable class="parameter">name</replaceable> [ [ WITH ] <replac
     | LOGIN | NOLOGIN
     | REPLICATION | NOREPLICATION
     | BYPASSRLS | NOBYPASSRLS
+    | TRAVELS | NOTRAVELS
     | CONNECTION LIMIT <replaceable class="parameter">connlimit</replaceable>
     | [ ENCRYPTED ] PASSWORD '<replaceable class="parameter">password</replaceable>' | PASSWORD NULL
     | VALID UNTIL '<replaceable class="parameter">timestamp</replaceable>'
@@ -198,6 +199,20 @@ in sync when changing the above synopsis!
         <literal>NOREPLICATION</literal> is the default.
         Only superuser roles or roles with <literal>REPLICATION</literal>
         can specify <literal>REPLICATION</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>TRAVELS</literal></term>
+      <term><literal>NOTRAVELS</literal></term>
+      <listitem>
+       <para>
+        These clauses determine whether a role is held by a versioned
+        database's commits, so that a commit arriving on this cluster may
+        change it.  Without this, a commit naming a role of that name is
+        refused.  <literal>NOTRAVELS</literal> is the default.  Only superuser
+        roles can specify these.
        </para>
       </listitem>
      </varlistentry>

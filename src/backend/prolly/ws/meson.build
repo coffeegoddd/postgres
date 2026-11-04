@@ -2,6 +2,7 @@
 
 backend_sources += files(
   'ws_fk.c',
+  'ws_role.c',
   'ws_root.c',
   'ws_row.c',
   'ws_schema.c',
