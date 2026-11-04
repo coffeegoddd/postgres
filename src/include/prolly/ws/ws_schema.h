@@ -157,12 +157,13 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
- * The schema of a table, from the catalogs, through WsSql: false if the schema
+ * The schema of a table, from the catalogs, through WsSql (its foreign keys,
+ * which no one record holds, from ws_fk_read): false if the schema
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance and partitions,
- * storage settings, a key's options, a sequence's, a default using one, foreign
- * keys, exclusion constraints, an index's options or its dependence on an
+ * storage settings, a key's options, a sequence's, a default using one,
+ * exclusion constraints, an index's options or its dependence on an
  * extension, comments, grants)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity

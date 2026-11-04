@@ -15,6 +15,9 @@
 
 #include "access/xact.h"
 #include "fmgr.h"
+#include "lib/stringinfo.h"
+#include "mb/pg_wchar.h"
+#include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
@@ -23,6 +26,8 @@
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
 PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
+PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
+PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 
 /*
  * test_ws_schema_bytes(schema text, table text) returns bytea: the table's
@@ -103,4 +108,90 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	ws_schema_free(&s);
 	buf_free(&sql);
 	PG_RETURN_TEXT_P(out);
+}
+
+/*
+ * test_ws_fk_bytes(schema text, tab text) returns text: the table's foreign
+ * keys' bytes, in hex, a line each
+ */
+Datum
+test_ws_fk_bytes(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsForeignKey *fks;
+	int			n;
+	StringInfoData out;
+
+	initStringInfo(&out);
+	ws_fk_read(schema, table, &fks, &n);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			k = BUF_INIT;
+		Buf			v = BUF_INIT;
+
+		WsFkCodec->encode_key(&fks[i], &k);
+		WsFkCodec->encode_value(&fks[i], &v);
+		for (size_t j = 0; j < k.len; j++)
+			appendStringInfo(&out, "%02x", k.data[j]);
+		appendStringInfoChar(&out, ':');
+		for (size_t j = 0; j < v.len; j++)
+			appendStringInfo(&out, "%02x", v.data[j]);
+		appendStringInfoChar(&out, '\n');
+		buf_free(&k);
+		buf_free(&v);
+		ws_fk_free(&fks[i]);
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_fk_copy(from_schema text, tab text, to_schema text) returns text: the
+ * table's foreign keys, through their bytes, added to its copy in to_schema;
+ * the statements
+ */
+Datum
+test_ws_fk_copy(PG_FUNCTION_ARGS)
+{
+	char	   *from = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *to = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	WsForeignKey *fks;
+	int			n;
+	StringInfoData out;
+	int			level = WsSql->begin();
+
+	initStringInfo(&out);
+	ws_fk_read(from, table, &fks, &n);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			k = BUF_INIT;
+		Buf			v = BUF_INIT;
+		Buf			sql = BUF_INIT;
+		WsForeignKey fk;
+		WsTableSchema child;
+		WsTableSchema parent;
+		WsSqlRows	rows;
+
+		WsFkCodec->encode_key(&fks[i], &k);
+		WsFkCodec->encode_value(&fks[i], &v);
+		WsFkCodec->decode(k.data, k.len, v.data, v.len, &fk);
+		if (!ws_schema_read(from, table, &child) ||
+			!ws_schema_read(from, pg_any_to_server(fk.ref_table, (int) strlen(fk.ref_table), PG_UTF8), &parent))
+			elog(ERROR, "no such table");
+		ws_fk_add_statement(&fk, &child, &parent, to, &sql);
+		buf_append_byte(&sql, 0);
+		WsSql->run((char *) sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		appendStringInfo(&out, "%s\n", (char *) sql.data);
+		ws_schema_free(&child);
+		ws_schema_free(&parent);
+		ws_fk_free(&fk);
+		ws_fk_free(&fks[i]);
+		buf_free(&k);
+		buf_free(&v);
+		buf_free(&sql);
+	}
+	WsSql->end(level);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }

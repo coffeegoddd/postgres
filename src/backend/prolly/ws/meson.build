@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 backend_sources += files(
+  'ws_fk.c',
   'ws_root.c',
   'ws_row.c',
   'ws_schema.c',

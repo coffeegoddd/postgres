@@ -76,6 +76,25 @@ $node->safe_psql('postgres', q{
 	ALTER TABLE src.idx_ren RENAME a TO z;
 	CREATE TABLE src.idx_key (id integer PRIMARY KEY, a integer UNIQUE);
 	CREATE UNIQUE INDEX idx_key_also ON src.idx_key (id);
+	CREATE TABLE src.fk_p (id integer PRIMARY KEY, u integer UNIQUE, a integer, b integer,
+		"Odd Ref" integer, UNIQUE (a, b), UNIQUE ("Odd Ref"));
+	CREATE TABLE src.fk_c (id integer PRIMARY KEY, x integer DEFAULT 0, y integer, z integer, "Odd" integer,
+		CONSTRAINT simple FOREIGN KEY (x) REFERENCES src.fk_p (id),
+		CONSTRAINT other_col FOREIGN KEY (z) REFERENCES src.fk_p (u) ON UPDATE CASCADE ON DELETE RESTRICT,
+		CONSTRAINT composite FOREIGN KEY (x, y) REFERENCES src.fk_p (a, b) MATCH FULL ON DELETE SET NULL,
+		CONSTRAINT set_some FOREIGN KEY (y, z) REFERENCES src.fk_p (a, b) ON DELETE SET NULL (z),
+		CONSTRAINT set_dflt FOREIGN KEY (x) REFERENCES src.fk_p (u) ON DELETE SET DEFAULT,
+		CONSTRAINT "Odd Key" FOREIGN KEY ("Odd") REFERENCES src.fk_p ("Odd Ref") DEFERRABLE,
+		CONSTRAINT later FOREIGN KEY (z) REFERENCES src.fk_p (id) DEFERRABLE INITIALLY DEFERRED);
+	ALTER TABLE src.fk_c ADD CONSTRAINT nv FOREIGN KEY (y) REFERENCES src.fk_p (id) NOT VALID;
+	CREATE TABLE src.fk_self (id integer PRIMARY KEY, parent integer REFERENCES src.fk_self (id));
+	CREATE TABLE src.fk_m1 (id integer PRIMARY KEY, o integer);
+	CREATE TABLE src.fk_m2 (id integer PRIMARY KEY, o integer REFERENCES src.fk_m1 (id));
+	ALTER TABLE src.fk_m1 ADD CONSTRAINT back FOREIGN KEY (o) REFERENCES src.fk_m2 (id);
+	CREATE TABLE src.fk_rp (a integer PRIMARY KEY);
+	CREATE TABLE src.fk_rc (b integer REFERENCES src.fk_rp (a));
+	ALTER TABLE src.fk_rp RENAME a TO new_a;
+	ALTER TABLE src.fk_rc RENAME b TO new_b;
 	CREATE TABLE src.renamed (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
 	ALTER TABLE src.renamed RENAME a TO z;
 	CREATE SCHEMA other;
@@ -93,7 +112,8 @@ $node->safe_psql('postgres', q{
 });
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
-	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key', 'settings', 'names', 'ats');
+	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key',
+	'fk_p', 'fk_c', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -115,6 +135,18 @@ for my $table (@tables)
 	is($bytes->($node, 'postgres', $table, undef, 'dst'), $hex, "$table the same bytes, made again");
 }
 
+# the foreign keys, through their bytes, added after every table and index,
+# mutual ones too; the same bytes
+for my $table (@tables)
+{
+	(my $lit = $table) =~ s/'/''/g;
+	$node->safe_psql('postgres', qq{SELECT test_ws_fk_copy('src', '$lit', 'dst')});
+	is( $node->safe_psql('postgres', qq{SELECT test_ws_fk_bytes('dst', '$lit')}),
+		$node->safe_psql('postgres', qq{SELECT test_ws_fk_bytes('src', '$lit')}),
+		"$table: the same foreign keys' bytes");
+}
+isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fk_c')}), '', 'a table has some');
+
 # by pg_dump, the same table, but for its schema's name (the types a table
 # names are named by the record, src's in dst too)
 my $dump = sub {
@@ -128,6 +160,8 @@ my $dump = sub {
 		'>', \$stdout, '2>', \$stderr) or die "pg_dump: $stderr";
 	$stdout =~ s/\b(?:src|dst)\b/SCHEMA/g;
 	$stdout =~ s/^\\(un)?restrict .*$//mg;
+	# (a not-null constraint's name is not held, and a rename leaves it stale)
+	$stdout =~ s/ CONSTRAINT \S+_not_null NOT NULL/ NOT NULL/g;
 	return $stdout;
 };
 my ($from, $to) = ($dump->('src'), $dump->('dst'));
@@ -157,7 +191,7 @@ $node->safe_psql('postgres', "CREATE TABLESPACE t86 LOCATION '$tsdir'");
 $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
-	fk => 'a foreign key', excl => 'an exclusion', cnv => 'a check not valid',
+	excl => 'an exclusion', cnv => 'a check not valid',
 	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
@@ -189,7 +223,6 @@ for my $t (
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
-	[ 'fk', 'CREATE TABLE src.fk (a int REFERENCES src.keyed (id))' ],
 	[ 'excl', 'CREATE TABLE src.excl (r int4range, EXCLUDE USING gist (r WITH &&))' ],
 	[ 'cnv', 'CREATE TABLE src.cnv (a int); ALTER TABLE src.cnv ADD CONSTRAINT c CHECK (a > 0) NOT VALID' ],
 	[ 'cni', 'CREATE TABLE src.cni (a int, CONSTRAINT c CHECK (a > 0) NO INHERIT)' ],
@@ -314,6 +347,26 @@ $node->safe_psql('postgres', q{
 });
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'lab') IS NOT NULL}),
 	't', 'a label cleared reads');
+
+# a key to a table outside its schema works on the live database, and no commit
+# holds it; nor one not enforced
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA sharedfk;
+	CREATE TABLE sharedfk.p (id int PRIMARY KEY);
+	INSERT INTO sharedfk.p VALUES (1);
+	CREATE TABLE src.fko (a int, CONSTRAINT to_shared FOREIGN KEY (a) REFERENCES sharedfk.p (id));
+	CREATE TABLE dst.fkv (id int PRIMARY KEY);
+	CREATE TABLE src.fkv2 (a int, CONSTRAINT to_other FOREIGN KEY (a) REFERENCES dst.fkv (id));
+	CREATE TABLE src.fkne (a int, CONSTRAINT ne FOREIGN KEY (a) REFERENCES src.keyed (id) NOT ENFORCED);
+});
+my ($fret, $fout, $ferr) = $node->psql('postgres', 'INSERT INTO src.fko VALUES (99)');
+like($ferr, qr/violates foreign key constraint/, 'a key to a shared table enforced');
+for my $t (['fko', 'to_shared', 'outside its schema'], ['fkv2', 'to_other', 'outside its schema'],
+	['fkne', 'ne', 'not enforced'])
+{
+	($fret, $fout, $ferr) = $node->psql('postgres', qq{SELECT test_ws_fk_bytes('src', '$t->[0]')});
+	like($ferr, qr/foreign key "$t->[1]" of table "$t->[0]".*$t->[2]/, "$t->[1] refused");
+}
 
 # an index no longer valid: refused
 $node->safe_psql('postgres', q{
