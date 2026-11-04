@@ -2161,8 +2161,12 @@ collation_as_held(const char *schema, Oid collation)
 	bool		bare;
 	int			nest;
 
+	/* (read under an old snapshot, it may be gone by now, as an index may) */
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for collation %u", collation);
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": a collation has been dropped since this transaction's snapshot",
+						schema)));
 	form = (Form_pg_collation) GETSTRUCT(tup);
 	nsp = get_namespace_name(form->collnamespace);
 	nest = ws_schema_path_begin(schema);
@@ -4514,7 +4518,7 @@ says_its_schema(const char *schema, const char *table)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("table \"%s\" in schema \"%s\" cannot be held in a commit: it must say its schema's name",
 					table, schema),
-			 errdetail("What it uses in its schema has a name the catalogs also have, which a record would have to tell apart by naming the schema.")));
+			 errdetail("What it uses in its schema has a name the catalogs also have, or a constant of it holds names, which a record could not hold without saying the schema.")));
 }
 
 /* (a commit does not name the schema it is of, so it can be restored into any) */
@@ -4536,10 +4540,11 @@ name_says_schema(const char *name, const char *schema)
 }
 
 static void
-check_key_says_no_schema(const WsIndexKey *key, const char *schema, const char *table)
+check_key_says_no_schema(const WsIndexKey *key, const char *in_commit, const char *schema,
+						 const char *table)
 {
-	if (name_says_schema(key->collation, schema) || name_says_schema(key->opclass, schema) ||
-		name_says_schema(key->op, schema))
+	if (name_says_schema(key->collation, in_commit) || name_says_schema(key->opclass, in_commit) ||
+		name_says_schema(key->op, in_commit))
 		says_its_schema(schema, table);
 }
 
@@ -4551,9 +4556,10 @@ static bool
 type_means_something_else(const char *type)
 {
 	static const char *const names[] = {"serial", "bigserial", "smallserial", "serial2", "serial4", "serial8"};
+	size_t		n = strcspn(type, "[");
 
 	for (int i = 0; i < lengthof(names); i++)
-		if (strcmp(type, names[i]) == 0)
+		if (strlen(names[i]) == n && strncmp(type, names[i], n) == 0)
 			return true;
 	return false;
 }
@@ -4582,7 +4588,16 @@ check_catalog_named_needs(const char *schema, const char *table, const char *oid
 				"UNION ALL SELECT 1 FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
 				"JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid "
 				"WHERE o.oprnamespace = (SELECT relnamespace FROM own) AND EXISTS (SELECT 1 FROM pg_operator c "
-				"  WHERE c.oprname = o.oprname AND c.oprnamespace = 'pg_catalog'::regnamespace) LIMIT 1",
+				"  WHERE c.oprname = o.oprname AND c.oprnamespace = 'pg_catalog'::regnamespace) "
+				/* (a constant of a composite holding names says them in its text) */
+				"UNION ALL SELECT 1 FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
+				"JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
+				"JOIN pg_attribute a ON a.attrelid = t.typrelid AND t.typrelid <> 0 AND NOT a.attisdropped "
+				"JOIN pg_type f ON f.oid = a.atttypid "
+				"WHERE t.typnamespace = (SELECT relnamespace FROM own) AND f.typnamespace = 'pg_catalog'::regnamespace "
+				"  AND coalesce((SELECT e.typname FROM pg_type e WHERE e.oid = f.typelem AND e.typarray = f.oid), f.typname) IN "
+				"    ('regclass', 'regcollation', 'regconfig', 'regdatabase', 'regdictionary', 'regnamespace', 'regoper', "
+				"     'regoperator', 'regproc', 'regprocedure', 'regrole', 'regtype') LIMIT 1",
 				1, params, &rows);
 	found = rows.nrows > 0;
 	ws_sql_rows_free(&rows);
@@ -4592,20 +4607,21 @@ check_catalog_named_needs(const char *schema, const char *table, const char *oid
 
 /* The record's names that are not in an expression, which what read those has checked. */
 static void
-check_record_says_no_schema(const WsTableSchema *s, const char *schema, const char *table)
+check_record_says_no_schema(const WsTableSchema *s, const char *in_commit, const char *schema,
+							const char *table)
 {
 	for (int i = 0; i < s->ncols; i++)
-		if (name_says_schema(s->cols[i].type, schema) || name_says_schema(s->cols[i].collation, schema) ||
+		if (name_says_schema(s->cols[i].type, in_commit) || name_says_schema(s->cols[i].collation, in_commit) ||
 			type_means_something_else(s->cols[i].type))
 			says_its_schema(schema, table);
 	for (int i = 0; i < s->nconstraints; i++)
 		for (int k = 0; k < s->constraints[i].excl.nkeys; k++)
-			check_key_says_no_schema(&s->constraints[i].excl.keys[k], schema, table);
+			check_key_says_no_schema(&s->constraints[i].excl.keys[k], in_commit, schema, table);
 	for (int i = 0; i < s->nindexes; i++)
 		for (int k = 0; k < s->indexes[i].nkeys; k++)
-			check_key_says_no_schema(&s->indexes[i].keys[k], schema, table);
+			check_key_says_no_schema(&s->indexes[i].keys[k], in_commit, schema, table);
 	for (int k = 0; k < s->npartition; k++)
-		check_key_says_no_schema(&s->partition_keys[k], schema, table);
+		check_key_says_no_schema(&s->partition_keys[k], in_commit, schema, table);
 }
 
 static char *
@@ -5652,7 +5668,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
 	PopActiveSnapshot();
-	check_record_says_no_schema(out, ws_name_to_utf8(schema), table);
+	check_record_says_no_schema(out, ws_text_to_utf8(schema), schema, table);
 	WsSql->end(level);
 	return true;
 }

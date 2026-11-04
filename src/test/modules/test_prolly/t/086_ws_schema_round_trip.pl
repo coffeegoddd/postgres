@@ -2125,6 +2125,47 @@ like($err_u, qr/permission denied for schema nm2/, 'a role with no USAGE on the 
 $node->safe_psql('postgres', q{CREATE TYPE nm2.region AS ENUM ('nm2.west'); CREATE TABLE nm2.regional (a nm2.region DEFAULT 'nm2.west'::nm2.region)});
 isnt($bytes->($node, 'postgres', 'regional', undef, 'nm2'), '', 'a label like a qualified name of a type like a reg* is held');
 
+# partitioned, with exclusions, by what is in its own schema
+$make_names->('nm5');
+$make_names->('nm6');
+$node->safe_psql('postgres', q{
+	CREATE OPERATOR CLASS nm5.ops FOR TYPE integer USING btree AS OPERATOR 3 nm5.===, FUNCTION 1 btint4cmp(integer, integer);
+	CREATE OPERATOR CLASS nm6.ops FOR TYPE integer USING btree AS OPERATOR 3 nm6.===, FUNCTION 1 btint4cmp(integer, integer);
+	CREATE TABLE nm5.parted (a integer, t text) PARTITION BY RANGE (nm5.f(), t COLLATE nm5.coll, a nm5.ops);
+	CREATE TABLE nm5.excl (a integer, c text COLLATE "C", EXCLUDE USING btree (a nm5.ops WITH OPERATOR(nm5.===)));
+});
+for my $table ('parted', 'excl')
+{
+	my $hex = $bytes->($node, 'postgres', $table, undef, 'nm5');
+	unlike(pack('H*', $hex), qr/nm5/, "$table does not name its schema");
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'nm6')});
+	is($bytes->($node, 'postgres', $table, undef, 'nm6'), $hex, "$table is the same bytes restored");
+}
+
+# more that cannot be held without naming the schema
+for my $case (
+	[ q{CREATE TABLE nm3.r11 (a nm3.serial[])}, 'r11', 'an array of a type named as a serial is' ],
+	[ q{CREATE TABLE nm3.r12 (a regnamespace) PARTITION BY LIST (a)}, 'r12', 'a partition key whose values are names' ],
+	[ q{CREATE TYPE nm3.holds AS (r regclass); CREATE TABLE nm3.r13 (a nm3.holds DEFAULT '(pg_class)'::nm3.holds)}, 'r13', 'a constant of a composite holding names' ],
+	[ q{CREATE OPERATOR CLASS nm3.int4_ops FOR TYPE integer USING btree AS OPERATOR 3 =, FUNCTION 1 btint4cmp(integer, integer); CREATE TABLE nm3.r14 (a integer); CREATE INDEX ON nm3.r14 (a nm3.int4_ops)}, 'r14', 'an index key of an opclass named as a catalog opclass is' ])
+{
+	my ($sql, $table, $what) = @$case;
+	$node->safe_psql('postgres', $sql);
+	my ($rc, $out, $err) = $node->psql('postgres', "SELECT test_ws_schema_bytes('nm3', '$table')");
+	like($err, qr/table "$table" in schema "nm3" cannot be held in a commit: it must say its schema's name/, "$what is refused");
+}
+
+# a quoted schema, in a constant
+$node->safe_psql('postgres', q{CREATE SCHEMA "q""s" VERSIONED; CREATE TABLE "q""s".pg_class (a integer);
+	CREATE TABLE "q""s".r (a oid DEFAULT '"q""s".pg_class'::regclass)});
+my ($rc_q, $out_q, $err_q) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('q"s', 'r')});
+like($err_q, qr/it must say its schema's name/, 'a constant naming a schema with a quote in its name is refused');
+
+# a schema "$user" means something else to a path
+$node->safe_psql('postgres', q{CREATE SCHEMA "$user" VERSIONED; CREATE TABLE "$user".t (a integer)});
+($rc_q, $out_q, $err_q) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('$user', 't')});
+like($err_q, qr/a schema named "\$user" cannot be held in a commit/, 'a schema named $user is refused');
+
 # what is in another schema is said by its name, as ever
 $node->safe_psql('postgres', q{CREATE TABLE nm2.other_schema (a other.cdom)});
 like(pack('H*', $bytes->($node, 'postgres', 'other_schema', undef, 'nm2')), qr/other\.cdom/, 'another schema is named');

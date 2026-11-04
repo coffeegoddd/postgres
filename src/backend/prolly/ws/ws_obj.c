@@ -674,7 +674,20 @@ string_is_qualified(const char *s, const char *only)
 			bool		counts;
 
 			if (qualifier[0] == '"' && p - start >= 2)
-				qualifier = pnstrdup(start + 1, p - start - 2);
+			{
+				/* (as quote_identifier wrote it: an inner quote doubled) */
+				char	   *undoubled = palloc(p - start);
+				int			u = 0;
+
+				for (const char *q = start + 1; q < p - 1; q++)
+				{
+					undoubled[u++] = *q;
+					if (q[0] == '"' && q[1] == '"')
+						q++;
+				}
+				undoubled[u] = '\0';
+				qualifier = undoubled;
+			}
 			counts = qualifier_counts(qualifier, only);
 			pfree(qualifier);
 			if (counts)
@@ -685,9 +698,8 @@ string_is_qualified(const char *s, const char *only)
 	return false;
 }
 
-/* Whether a type's name is one of those whose values are names. */
-static bool
-is_reg_type(const char *type)
+bool
+ws_is_reg_type(const char *type)
 {
 	static const char *const names[] = {"regclass", "regcollation", "regconfig", "regdatabase", "regdictionary",
 		"regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype"};
@@ -732,13 +744,13 @@ names_schema_walker(Node *node, void *arg)
 				TypeCast   *c = (TypeCast *) node;
 				const char *type = strVal(llast(c->typeName->names));
 
-				if (is_reg_type(type) && c->typeName->arrayBounds != NIL)
+				if (ws_is_reg_type(type) && c->typeName->arrayBounds != NIL)
 				{
 					/* (no dependency is held for a name in one, nor is it one name) */
 					n->why = "it has an array of reg* names, which say nothing of what they need";
 					return true;
 				}
-				if (is_reg_type(type) && IsA(c->arg, A_Const) &&
+				if (ws_is_reg_type(type) && IsA(c->arg, A_Const) &&
 					IsA(&((A_Const *) c->arg)->val, String))
 				{
 					const char *value = strVal(&((A_Const *) c->arg)->val);
