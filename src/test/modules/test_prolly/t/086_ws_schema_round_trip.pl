@@ -826,6 +826,12 @@ $node->safe_psql('postgres', qq{
 ($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_c')});
 like($ferr, qr/numbered rows of so long a name/, 'a key whose numbered rows could take another key\'s name refused');
 isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_ok')}), '', 'and the same names, to a table with no partitions, read');
+my $longo = 'ab' . ('x' x 61);
+$node->safe_psql('postgres', qq{
+	CREATE TABLE src.fkl_far (a integer, b integer, CONSTRAINT ab_1 FOREIGN KEY (a) REFERENCES src.fkl_q (id));
+	ALTER TABLE src.fkl_far ADD CONSTRAINT "$longo" FOREIGN KEY (b) REFERENCES src.fkl_p (id);
+});
+isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_far')}), '', 'a name near the limit, and a short one its cut could never reach, read');
 ($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('sharedfk', 'p')});
 like($ferr, qr/is not in a versioned schema/, 'a shared table\'s keys are no commit\'s');
 
@@ -1229,6 +1235,20 @@ my $part_utf8 = $node->safe_psql('postgres', sprintf($part_enc, 'enc'));
 is($node->safe_psql('lat', sprintf($part_enc, 'enc')), $part_utf8, 'a partitioned table the same bytes in LATIN1 as in UTF8');
 $node->safe_psql('lat', qq{SELECT test_ws_schema_create(decode('$part_utf8', 'hex'), 'dst')});
 is($node->safe_psql('lat', sprintf($part_enc, 'dst')), $part_utf8, 'and made there, read again');
+
+# a key's numbered rows, cut short in UTF8's bytes though not in this encoding's
+{
+	my ($kl, $ks) = ('é' x 31, ('é' x 30) . '_1');
+	$node->safe_psql('lat', qq{
+		SET client_encoding = UTF8;
+		CREATE TABLE enc.fkl_q (id integer PRIMARY KEY);
+		CREATE TABLE enc.fkl_p (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+		CREATE TABLE enc.fkl_c (a integer, b integer, CONSTRAINT "$ks" FOREIGN KEY (a) REFERENCES enc.fkl_q (id));
+		ALTER TABLE enc.fkl_c ADD CONSTRAINT "$kl" FOREIGN KEY (b) REFERENCES enc.fkl_p (id);
+	});
+	my ($ret, $out, $err) = $node->psql('lat', q{SELECT test_ws_fk_bytes('enc', 'fkl_c')});
+	like($err, qr/numbered rows of so long a name/, 'a key near the limit in UTF8 refused from LATIN1');
+}
 
 # a name that fits here and not in a commit, as part of another's: refused as too long
 my $over = 'é' x 40;
