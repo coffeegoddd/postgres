@@ -304,6 +304,24 @@ $node->safe_psql('postgres', q{
 	ALTER TABLE src.ine_k ADD CONSTRAINT ine_c CHECK (a > 0) NOT VALID;
 	ALTER TABLE src.ine_k INHERIT src.ine_p;
 	CREATE TABLE src.ine_g () INHERITS (src.ine_k);
+	CREATE TABLE src.so_tab (a integer, t text) WITH (autovacuum_enabled = false, autovacuum_vacuum_scale_factor = 0.5,
+		fillfactor = 50, parallel_workers = 2, toast.autovacuum_enabled = false);
+	CREATE TABLE src.so_cols (a integer, s1 text STORAGE EXTERNAL, s2 text STORAGE MAIN, s3 text STORAGE PLAIN, s4 text COMPRESSION pglz,
+		s5 text STORAGE EXTENDED, j jsonb STORAGE EXTERNAL COMPRESSION pglz, "Odd Stat" integer);
+	ALTER TABLE src.so_cols ALTER a SET STATISTICS 5, ALTER "Odd Stat" SET STATISTICS 0, ALTER s1 SET STATISTICS 10000,
+		ALTER a SET (n_distinct = 5, n_distinct_inherited = 7), ALTER s2 SET (n_distinct = -0.5);
+	CREATE TABLE src.so_part (a integer, t text STORAGE EXTERNAL) PARTITION BY RANGE (a);
+	ALTER TABLE src.so_part ALTER a SET STATISTICS 7, ALTER a SET (n_distinct = 3);
+	CREATE TABLE src.so_part1 PARTITION OF src.so_part FOR VALUES FROM (0) TO (10) WITH (fillfactor = 70);
+	ALTER TABLE src.so_part1 ALTER a SET STATISTICS 9, ALTER t SET STORAGE MAIN;
+	CREATE TABLE src.so_inh (a integer, t text STORAGE EXTERNAL);
+	ALTER TABLE src.so_inh ALTER a SET STATISTICS 11;
+	CREATE TABLE src.so_inh1 () INHERITS (src.so_inh);
+	ALTER TABLE ONLY src.so_inh1 ALTER a SET STATISTICS 13;
+	CREATE TABLE src.so_inh2 () INHERITS (src.so_inh);
+	CREATE TABLE src.so_ren (a integer, t text STORAGE EXTERNAL);
+	ALTER TABLE src.so_ren ALTER a SET STATISTICS 3;
+	ALTER TABLE src.so_ren RENAME a TO z;
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -323,7 +341,8 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'idt', 'idm', 'idl', 'pnv', 'pnv1', 'pnv2', 'ptbd', 'ptbd1', 'ptbn', 'ptbn1', 'ptby', 'ptby1', 'ptbs', 'ptbs1', 'ptbt', 'ptbt1',
 	'fkn_q', 'fkn_p', 'fkn_p1', 'fkn_c', 'fks', 'fksm', 'fksl', 'fknv', 'fknv1',
 	'ixp', 'ixp1', 'ixn', 'ixn1', 'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c',
-	'ip1', 'ip2', 'ichild', 'ilocal', 'imulti', 'ialter', 'igrand', 'inv', 'inv1', 'ino', 'ino1', 'iren', 'iren1', 'ine_p', 'ine_k', 'ine_g');
+	'ip1', 'ip2', 'ichild', 'ilocal', 'imulti', 'ialter', 'igrand', 'inv', 'inv1', 'ino', 'ino1', 'iren', 'iren1', 'ine_p', 'ine_k', 'ine_g',
+	'so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 'so_inh2', 'so_ren');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -647,6 +666,22 @@ $node->safe_psql('postgres', q{
 		$alone, 'a temporary child no matter to its parent');
 }
 
+# storage parameters and columns' settings as they were
+my $sopts = q{SELECT c.relname || ' ' || coalesce(c.reloptions::text, '') || ' ' || coalesce(t.reloptions::text, '')
+	FROM pg_class c LEFT JOIN pg_class t ON t.oid = c.reltoastrelid WHERE c.oid = '%s.%s'::regclass};
+my $scols = q{SELECT string_agg(attname || ' ' || attstorage::text || ' ' || attcompression::text || ' ' || coalesce(attstattarget::text, '-') || ' ' || coalesce(attoptions::text, '-'), E'\n' ORDER BY attnum)
+	FROM pg_attribute WHERE attrelid = '%s.%s'::regclass AND attnum > 0 AND NOT attisdropped};
+for my $table ('so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 'so_inh2', 'so_ren')
+{
+	my $sorted = sub { join(',', sort split(/[{},]/, $_[0])) };
+	is($sorted->($node->safe_psql('postgres', sprintf($sopts, 'dst', $table))),
+		$sorted->($node->safe_psql('postgres', sprintf($sopts, 'src', $table))), "$table its parameters as they were");
+	my $canon = sub { join("\n", map { join(',', sort split(/[{},]/, $_)) } split(/\n/, $_[0])) };
+	is($canon->($node->safe_psql('postgres', sprintf($scols, 'dst', $table))),
+		$canon->($node->safe_psql('postgres', sprintf($scols, 'src', $table))), "$table its columns' settings as they were");
+}
+isnt($node->safe_psql('postgres', q{SELECT reloptions FROM pg_class WHERE oid = 'src.so_tab'::regclass}), '', '(it has some)');
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -729,16 +764,11 @@ for my $t (
 	[ 'ihy', q{CREATE TABLE src.ihy (a int); CREATE TABLE ptother.ihy1 () INHERITS (src.ihy)} ],
 	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],
 	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
-	[ 'fill', 'CREATE TABLE src.fill (a int) WITH (fillfactor = 50)' ],
 	[ 'keyfill', 'CREATE TABLE src.keyfill (a int PRIMARY KEY WITH (fillfactor = 50))' ],
 	[ 'ident', 'CREATE TABLE src.replident (a int); ALTER TABLE src.replident REPLICA IDENTITY FULL' , 'replident' ],
 	[ 'rls', 'CREATE TABLE src.rls (a int); ALTER TABLE src.rls ENABLE ROW LEVEL SECURITY' ],
 	[ 'nv', 'CREATE TABLE src.nv (a int); ALTER TABLE src.nv ADD CONSTRAINT nn NOT NULL a NOT VALID' ],
 	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
-	[ 'store', 'CREATE TABLE src.store (a text STORAGE EXTERNAL)' ],
-	[ 'comp', 'CREATE TABLE src.comp (a text COMPRESSION pglz)' ],
-	[ 'stat', 'CREATE TABLE src.stat (a int); ALTER TABLE src.stat ALTER a SET STATISTICS 5' ],
-	[ 'opt', 'CREATE TABLE src.opt (a int); ALTER TABLE src.opt ALTER a SET (n_distinct = 5)' ],
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
@@ -777,7 +807,6 @@ for my $t (
 	[ 'seqgrt', 'CREATE TABLE src.seqgrt (a int GENERATED ALWAYS AS IDENTITY); GRANT SELECT ON src.seqgrt_a_seq TO PUBLIC' ],
 	[ 'uover', 'CREATE TABLE src.uover (a int4range, r int4range, UNIQUE (a, r WITHOUT OVERLAPS))' ],
 	[ 'uspc', "CREATE TABLE src.uspc (a int, UNIQUE (a) USING INDEX TABLESPACE t86)" ],
-	[ 'toastp', 'CREATE TABLE src.toastp (a text) WITH (toast.autovacuum_enabled = false)' ],
 	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
 	[ 'clus', 'CREATE TABLE src.clus (a int PRIMARY KEY); ALTER TABLE src.clus CLUSTER ON clus_pkey' ],
 	[ 'pol', 'CREATE TABLE src.pol (a int); CREATE POLICY p ON src.pol USING (true)' ],
@@ -1372,6 +1401,17 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 		qq{SET client_encoding = UTF8; SELECT test_ws_schema_set_inherited(decode('$inh_utf8', 'hex'), 'lié');});
 	like($err, qr/table "enfanté" says "colonné" is inherited/, 'a lie told in the server\'s encoding');
 }
+# storage parameters' text in each encoding (the server takes any name in a toast's place: only a value it would refuse, none here)
+my $so_sql = q{
+	SET client_encoding = UTF8;
+	CREATE TABLE enc."stocké" ("colonné" text STORAGE EXTERNAL) WITH (fillfactor = 50);
+	ALTER TABLE enc."stocké" ALTER "colonné" SET STATISTICS 5, ALTER "colonné" SET (n_distinct = 5);
+};
+$node->safe_psql($_, $so_sql) for ('postgres', 'lat');
+my $so_utf8 = $node->safe_psql('postgres', sprintf($inh_enc, 'enc', 'stocké'));
+is($node->safe_psql('lat', sprintf($inh_enc, 'enc', 'stocké')), $so_utf8, 'a table\'s settings the same bytes in LATIN1 as in UTF8');
+$node->safe_psql('lat', qq{SET client_encoding = UTF8; SELECT test_ws_schema_create(decode('$so_utf8', 'hex'), 'dst')});
+is($node->safe_psql('lat', sprintf($inh_enc, 'dst', 'stocké')), $so_utf8, 'and made there, read again');
 
 # a key's numbered rows, cut short in UTF8's bytes though not in this encoding's
 {

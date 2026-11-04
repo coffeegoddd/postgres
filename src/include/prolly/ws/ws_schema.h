@@ -33,6 +33,17 @@
 #define WS_IDENTITY_ALWAYS 'a'
 #define WS_IDENTITY_BY_DEFAULT 'd'
 
+/* A storage parameter: a table's, of its TOAST table if toast, or a column's. */
+typedef struct WsOption
+{
+	bool		toast;
+	char	   *name;
+	char	   *value;
+} WsOption;
+
+#define WS_STORAGE_DEFAULT '\0'	/* the type's */
+#define WS_COMPRESSION_DEFAULT '\0'
+
 typedef struct WsColumn
 {
 	uint64		tag;
@@ -44,6 +55,12 @@ typedef struct WsColumn
 	char	   *identity_seq;	/* an identity's sequence's name, in the table's schema */
 	char	   *def;			/* default or generation expression, or NULL */
 	char	   *collation;		/* qualified and quoted, or NULL: the type's */
+	char		storage;		/* TYPSTORAGE_*, only if other than the type's */
+	char		compression;	/* TOAST_*_COMPRESSION, or WS_COMPRESSION_DEFAULT */
+	bool		has_stattarget;
+	int			stattarget;		/* SET STATISTICS, if it has one */
+	int			noptions;
+	WsOption   *options;		/* by name in UTF8's order */
 } WsColumn;
 
 #define WS_INDEX_ORDER_DEFAULT 'd'
@@ -134,6 +151,8 @@ typedef struct WsTableSchema
 	uint64	   *inherited_cols; /* tags of those columns it has only by inheriting, in attribute order */
 	int			ninherited_cons;
 	char	  **inherited_cons; /* names of those constraints likewise, in UTF8's order */
+	int			noptions;
+	WsOption   *options;		/* the table's, then its TOAST table's, each by name in UTF8's order */
 } WsTableSchema;
 
 /*
@@ -158,8 +177,9 @@ typedef struct WsTableSchema
  * order or operator; a partition with its bound, of another table and with no
  * identity; a table inheriting from no more than WS_MAX_PARENTS others, distinct
  * and not itself, neither a partition nor partitioned, what it has only by doing so its own columns in attribute order and
- * its own checks' and not-null constraints' names in order.  NULL if it is so, or
- * what is wrong.
+ * its own checks' and not-null constraints' names in order; storage parameters
+ * named, valued and in order, a column's storage, compression and statistics
+ * target known ones.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -204,7 +224,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance or a partition or
- * partitioned table across schemas, storage settings, a key's options, a
+ * partitioned table across schemas, a tablespace or another access method, a
+ * replica identity, a key's options, a
  * sequence's, a default using one, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
@@ -249,6 +270,14 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * with the inserter's privileges.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE ONLY giving the table's columns their statistics targets and
+ * storage parameters, which CREATE TABLE has no clause for, in the named schema,
+ * appended to out, to run right after the table's own statement; nothing, if none
+ * has any.  Checked as that statement is.
+ */
+extern void ws_schema_column_settings(const WsTableSchema *s, const char *schema, Buf *out);
 
 /*
  * The CREATE INDEX statement for the table's nth index, in the named schema,
