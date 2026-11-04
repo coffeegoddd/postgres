@@ -60,6 +60,7 @@ static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_engine_rewrite_suite,
 	&unit_ws_row_suite,
 	&unit_ws_sql_suite,
+	&unit_ws_schema_suite,
 };
 
 static const ProllyConformanceSuite *const conformance_suites[] = {

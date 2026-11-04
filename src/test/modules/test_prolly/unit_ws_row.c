@@ -335,6 +335,11 @@ test_malformed(void)
 		{"", 0, "", 0, 0},
 		/* a value's cell for the key's column */
 		{"\x01" "a", 2, "\x01\x01q", 3, 1},
+		/* numbers not in their shortest form: one row, other bytes */
+		{"\x81\x00" "a", 3, "", 0, 1},
+		{"\x01" "a", 2, "\x82\x00\x01q", 4, 1},
+		{"\x01" "a", 2, "\x02\x81\x00q", 4, 1},
+		{"\x01" "a", 2, "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\x01q", 12, 1},
 	};
 	Buf			wide = BUF_INIT;
 	Decoding	d = {"\x01" "a", 2, NULL, 0, 1};
