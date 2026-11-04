@@ -95,6 +95,8 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.fk_oc (a integer REFERENCES src.fk_old (id));
 	ALTER TABLE src.fk_old RENAME TO fk_newp;
 	ALTER TABLE src.fk_oc RENAME TO fk_newc;
+	CREATE TABLE src.fk_defp (a integer, CONSTRAINT fk_defp_d UNIQUE (a) DEFERRABLE, CONSTRAINT fk_defp_u UNIQUE (a));
+	CREATE TABLE src.fk_defc (x integer, CONSTRAINT defk FOREIGN KEY (x) REFERENCES src.fk_defp (a));
 	CREATE TABLE src.fk_self (id integer PRIMARY KEY, parent integer REFERENCES src.fk_self (id));
 	CREATE TABLE src.fk_m1 (id integer PRIMARY KEY, o integer);
 	CREATE TABLE src.fk_m2 (id integer PRIMARY KEY, o integer REFERENCES src.fk_m1 (id));
@@ -121,7 +123,7 @@ $node->safe_psql('postgres', q{
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
 	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key',
-	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats');
+	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_defp', 'fk_defc', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -154,6 +156,10 @@ for my $table (@tables)
 		"$table: the same foreign keys' bytes");
 }
 isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fk_c')}), '', 'a table has some');
+is( $node->safe_psql('postgres',
+		q{SELECT conindid::regclass FROM pg_constraint WHERE conrelid = 'dst.fk_defc'::regclass AND contype = 'f'}),
+	'dst.fk_defp_u',
+	'a deferrable index, which no key can use, does not count: the key on the one that can');
 
 # by pg_dump, the same table, but for its schema's name (the types a table
 # names are named by the record, src's in dst too)

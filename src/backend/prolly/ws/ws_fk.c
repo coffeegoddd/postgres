@@ -295,7 +295,7 @@ static const char *const refusal_sql =
 "               AND d.classoid = 'pg_trigger'::regclass WHERE t.tgconstraint = k.oid) "
 "    THEN 'cannot be read yet: its triggers have comments' "
 "  WHEN (SELECT count(*) FROM pg_index x WHERE x.indrelid = k.confrelid AND x.indisunique "
-"        AND x.indisvalid AND x.indpred IS NULL AND x.indexprs IS NULL "
+"        AND x.indisvalid AND x.indimmediate AND x.indpred IS NULL AND x.indexprs IS NULL "
 "        AND x.indnkeyatts = cardinality(k.confkey) AND "
 "          (SELECT array_agg(a ORDER BY a) FROM unnest((x.indkey::int2[])[0:x.indnkeyatts - 1]) a) = "
 "          (SELECT array_agg(a ORDER BY a) FROM unnest(k.confkey) a)) > 1 "
