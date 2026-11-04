@@ -32,6 +32,7 @@ CREATE GROUP <replaceable class="parameter">name</replaceable> [ [ WITH ] <repla
     | LOGIN | NOLOGIN
     | REPLICATION | NOREPLICATION
     | BYPASSRLS | NOBYPASSRLS
+    | TRAVELS | NOTRAVELS
     | CONNECTION LIMIT <replaceable class="parameter">connlimit</replaceable>
     | [ ENCRYPTED ] PASSWORD '<replaceable class="parameter">password</replaceable>' | PASSWORD NULL
     | VALID UNTIL '<replaceable class="parameter">timestamp</replaceable>'

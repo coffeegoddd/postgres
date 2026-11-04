@@ -2556,7 +2556,8 @@ match_previous_words(int pattern_id,
 					  "NOCREATEDB", "NOCREATEROLE", "NOINHERIT",
 					  "NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
 					  "RENAME TO", "REPLICATION", "RESET", "SET", "SUPERUSER",
-					  "VALID UNTIL", "WITH");
+					  "VALID UNTIL", "WITH",
+					  "NOTRAVELS", "TRAVELS");
 	/* ALTER USER,ROLE <name> IN */
 	else if (Matches("ALTER", "USER|ROLE", MatchAny, "IN"))
 		COMPLETE_WITH("DATABASE");
@@ -2585,7 +2586,8 @@ match_previous_words(int pattern_id,
 					  "NOCREATEDB", "NOCREATEROLE", "NOINHERIT",
 					  "NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
 					  "RENAME TO", "REPLICATION", "RESET", "SET", "SUPERUSER",
-					  "VALID UNTIL");
+					  "VALID UNTIL",
+					  "NOTRAVELS", "TRAVELS");
 
 	/* ALTER DEFAULT PRIVILEGES */
 	else if (Matches("ALTER", "DEFAULT", "PRIVILEGES"))
@@ -4104,7 +4106,8 @@ match_previous_words(int pattern_id,
 					  "NOCREATEDB", "NOCREATEROLE", "NOINHERIT",
 					  "NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
 					  "REPLICATION", "ROLE", "SUPERUSER", "SYSID",
-					  "VALID UNTIL", "WITH");
+					  "VALID UNTIL", "WITH",
+					  "NOTRAVELS", "TRAVELS");
 
 /* CREATE ROLE,USER,GROUP <name> WITH */
 	else if (Matches("CREATE", "ROLE|GROUP|USER", MatchAny, "WITH"))
@@ -4115,7 +4118,8 @@ match_previous_words(int pattern_id,
 					  "NOCREATEDB", "NOCREATEROLE", "NOINHERIT",
 					  "NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
 					  "REPLICATION", "ROLE", "SUPERUSER", "SYSID",
-					  "VALID UNTIL");
+					  "VALID UNTIL",
+					  "NOTRAVELS", "TRAVELS");
 
 	/* complete CREATE ROLE,USER,GROUP <name> IN with ROLE,GROUP */
 	else if (Matches("CREATE", "ROLE|USER|GROUP", MatchAny, "IN"))

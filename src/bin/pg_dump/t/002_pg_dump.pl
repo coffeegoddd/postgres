@@ -805,7 +805,7 @@ my %tests = (
 		regexp => qr/^
 			\QALTER ROLE regress_dump_test_role WITH \E
 			\QNOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB NOLOGIN \E
-			\QNOREPLICATION NOBYPASSRLS;\E
+			\QNOREPLICATION NOBYPASSRLS NOTRAVELS;\E
 			/xm,
 		like => {
 			pg_dumpall_dbprivs => 1,

@@ -101,42 +101,52 @@ extern void ws_role_list(ProllyCtx *ctx, const PHash *map, WsRole **out, int *n)
 /*
  * Marks roles here as held by commits (pg_authid.roltravels), so that a commit may
  * later change them: what capture does with what ws_role_read gave it, once it is
- * allowed to write.  Marking one not yet marked takes ADMIN on it, as a mark lets a
- * commit say who is a member of it: ERRCODE_INSUFFICIENT_PRIVILEGE otherwise.  The
- * mark goes with the role.  A mark says only that some versioned database of this
- * cluster holds it, and those that hold one name share it.
+ * allowed to write, as the role committing.  Marking one not yet marked takes a
+ * superuser, as ALTER ROLE ... TRAVELS does, since a mark lets a commit say who is a
+ * member of it: ERRCODE_INSUFFICIENT_PRIVILEGE otherwise.  A role already marked
+ * needs nothing.  The mark goes with the role.  A mark says only that some versioned
+ * database of this cluster holds it, and those that hold one name share it.
  */
 extern void ws_role_mark(const WsRole *roles, int n);
 
 /*
- * Whether roles from a commit may arrive here: raises ERRCODE_DATA_CORRUPTED if one
- * is a member of a role not among them, and ERRCODE_FEATURE_NOT_SUPPORTED if one is
- * here already and not marked, as what the commit grants would reach that role's
- * members; if one here cannot travel; or if a membership it would add or widen
- * reaches, by memberships made here, a role not among them, which would give the
- * members of its role what no commit could hold.  roles is in order.  To call
- * before making anything.
+ * Whether roles from a commit may arrive here, previous being those of the root this
+ * database was on: raises ERRCODE_DATA_CORRUPTED if one is a member of a role not
+ * among them, and ERRCODE_FEATURE_NOT_SUPPORTED if one is here already and not
+ * marked, as what the commit grants would reach that role's members; if one here
+ * cannot travel; or if a membership it would add or widen reaches, by memberships
+ * made here that it would not remove, a role not among them, which would give the
+ * members of its role what no commit could hold.  roles is in order.  To call before
+ * making anything.
+ *
+ * A role's other powers here are its own affair: what it owns or was granted on this
+ * cluster reaches its members, as it would by a GRANT made here.
  */
-extern void ws_role_check_arrival(const WsRole *roles, int n);
+extern void ws_role_check_arrival(const WsRole *roles, int n, const WsRole *previous, int nprevious);
 
 /*
  * The statement making a role here as it is held, appended to out: a CREATE ROLE, an
- * ALTER ROLE if it is here otherwise, or nothing.  The GRANT making it a member of
- * its kth, to run once they are all made.  The REVOKE of a membership of of, by a
- * grantor.  Each checked by the grammar, as a table's statement is: anything else
- * raises ERRCODE_DATA_CORRUPTED.
+ * ALTER ROLE if it is here otherwise, or nothing; a role a commit may not change
+ * raises ERRCODE_FEATURE_NOT_SUPPORTED.  The GRANT making it a member of its kth, by
+ * a grantor or by default if NULL, to run once they are all made.  The REVOKE of a
+ * membership of of, by a grantor.  Each checked by the grammar, as a table's
+ * statement is: anything else raises ERRCODE_DATA_CORRUPTED.
  */
 extern void ws_role_make_statement(const WsRole *r, Buf *out);
-extern void ws_role_grant_statement(const WsRole *r, int k, Buf *out);
+extern void ws_role_grant_statement(const WsRole *r, int k, const char *grantor, Buf *out);
 extern void ws_role_revoke_statement(const char *member, const char *of, const char *grantor, Buf *out);
 
 /*
  * Makes roles from a commit here, through WsSql, once ws_role_check_arrival has
  * allowed them, each before any membership, and marks them.  A membership is left
- * exactly as held, whoever granted what was here.  One that previous, the roles of
- * the root this database was on, held and these do not is revoked if these hold
- * both its roles: the commit removed it.  One made here is not, and no role is ever
- * dropped, as this cluster's other databases may use it.  previous is in order.
+ * exactly as held, whoever granted what was here, and one previous held and these do
+ * not is revoked, if both its roles are marked and can travel: the commit removed
+ * it.  Roles are the cluster's, so that is for all its databases, whose next capture
+ * sees it gone.  One made here is not revoked, and no role is ever dropped.  Changing
+ * what another role granted takes what the server asks of that, so a role with
+ * CREATEROLE and ADMIN may be refused what a superuser granted; taking the ADMIN
+ * option from a role that has used it here raises
+ * ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST.  previous is in order.
  */
 extern void ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int nprevious);
 

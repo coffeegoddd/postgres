@@ -840,9 +840,22 @@ dumpRoles(PGconn *conn)
 				i_rolvaliduntil,
 				i_rolreplication,
 				i_rolbypassrls,
+				i_roltravels,
 				i_rolcomment,
 				i_is_current_user;
 	int			i;
+	bool		has_travels = false;
+
+	/* (asked of the catalogs, as a server of its version may be one without it) */
+	if (server_version >= 200000)
+	{
+		res = executeQuery(conn,
+						   "SELECT 1 FROM pg_catalog.pg_attribute "
+						   "WHERE attrelid = 'pg_catalog.pg_authid'::pg_catalog.regclass "
+						   "AND attname = 'roltravels'");
+		has_travels = PQntuples(res) == 1;
+		PQclear(res);
+	}
 
 	/*
 	 * Notes: rolconfig is dumped later, and pg_authid must be used for
@@ -853,11 +866,14 @@ dumpRoles(PGconn *conn)
 					  "rolcreaterole, rolcreatedb, "
 					  "rolcanlogin, rolconnlimit, rolpassword, "
 					  "rolvaliduntil, rolreplication, rolbypassrls, "
+					  "%s, "
 					  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
 					  "rolname = current_user AS is_current_user "
 					  "FROM %s "
 					  "WHERE rolname !~ '^pg_' "
-					  "ORDER BY 2", role_catalog);
+					  "ORDER BY 2",
+					  has_travels ? "roltravels" : "NULL as roltravels",
+					  role_catalog);
 
 	res = executeQuery(conn, buf->data);
 
@@ -873,6 +889,7 @@ dumpRoles(PGconn *conn)
 	i_rolvaliduntil = PQfnumber(res, "rolvaliduntil");
 	i_rolreplication = PQfnumber(res, "rolreplication");
 	i_rolbypassrls = PQfnumber(res, "rolbypassrls");
+	i_roltravels = PQfnumber(res, "roltravels");
 	i_rolcomment = PQfnumber(res, "rolcomment");
 	i_is_current_user = PQfnumber(res, "is_current_user");
 
@@ -951,6 +968,10 @@ dumpRoles(PGconn *conn)
 			appendPQExpBufferStr(buf, " BYPASSRLS");
 		else
 			appendPQExpBufferStr(buf, " NOBYPASSRLS");
+
+		if (has_travels)
+			appendPQExpBufferStr(buf, strcmp(PQgetvalue(res, i, i_roltravels), "t") == 0 ?
+								 " TRAVELS" : " NOTRAVELS");
 
 		if (strcmp(PQgetvalue(res, i, i_rolconnlimit), "-1") != 0)
 			appendPQExpBuffer(buf, " CONNECTION LIMIT %s",

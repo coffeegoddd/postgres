@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "engine_test_util.h"
+#include "miscadmin.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_root.h"
 #include "test_prolly.h"
@@ -222,6 +223,14 @@ ENGINE_TEST(test_map)
 	}
 }
 
+static void
+make_for(void *arg)
+{
+	Buf			b = BUF_INIT;
+
+	ws_role_make_statement(arg, &b);
+}
+
 ENGINE_TEST(test_statements)
 {
 	WsRole		r = {.name = "ws role no such one"};
@@ -237,13 +246,26 @@ ENGINE_TEST(test_statements)
 	CHECK(b.len == strlen("CREATE ROLE \"ws role no such one\" NOLOGIN NOINHERIT"));
 	CHECK(memcmp(b.data, "CREATE ROLE \"ws role no such one\" NOLOGIN NOINHERIT", b.len) == 0);
 	b.len = 0;
-	ws_role_grant_statement(&g, 0, &b);
+	ws_role_grant_statement(&g, 0, NULL, &b);
 	CHECK(b.len == strlen("GRANT a TO g WITH ADMIN TRUE, INHERIT FALSE, SET TRUE"));
 	CHECK(memcmp(b.data, "GRANT a TO g WITH ADMIN TRUE, INHERIT FALSE, SET TRUE", b.len) == 0);
 	b.len = 0;
-	ws_role_grant_statement(&g, 1, &b);
+	ws_role_grant_statement(&g, 1, NULL, &b);
 	CHECK(b.len == strlen("GRANT b TO g WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"));
 	CHECK(memcmp(b.data, "GRANT b TO g WITH ADMIN FALSE, INHERIT TRUE, SET FALSE", b.len) == 0);
+	b.len = 0;
+	ws_role_grant_statement(&g, 1, "z", &b);
+	CHECK(b.len == strlen("GRANT b TO g WITH ADMIN FALSE, INHERIT TRUE, SET FALSE GRANTED BY z"));
+	b.len = 0;
+	ws_role_revoke_statement("g", "a", "z", &b);
+	CHECK(b.len == strlen("REVOKE a FROM g GRANTED BY z"));
+	CHECK(memcmp(b.data, "REVOKE a FROM g GRANTED BY z", b.len) == 0);
+	{
+		/* (what acts on a role checks again: one here that is not a commit's stays so) */
+		WsRole		here = {.name = GetUserNameFromId(GetUserId(), false)};
+
+		expect_error(make_for, &here, ERRCODE_FEATURE_NOT_SUPPORTED, NULL);
+	}
 	buf_free(&b);
 }
 
@@ -262,7 +284,7 @@ ENGINE_TEST(test_statement_quoting)
 	b.len = 0;
 	r.member_of = of;
 	r.nmember_of = 1;
-	ws_role_grant_statement(&r, 0, &b);
+	ws_role_grant_statement(&r, 0, NULL, &b);
 	CHECK(b.len == strlen(want_grant) && memcmp(b.data, want_grant, b.len) == 0);
 	buf_free(&b);
 }
