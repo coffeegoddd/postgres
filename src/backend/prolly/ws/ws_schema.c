@@ -19,8 +19,11 @@
  * uvarint nkeys and each key (uvarint tag, 0 for an expression's, expression if
  * so, collation, opclass); a partition with 'o', its table's name and bound; and
  * a table inheriting with 'i', uvarint nparents and names, uvarint ncols and tags,
- * uvarint nconstraints and names, of what it has only by inheriting; any other
- * ends there.
+ * uvarint nconstraints and names, of what it has only by inheriting; storage
+ * parameters with 'w', uvarint n and each one's toast byte, name and value; and
+ * columns' settings with 'c', uvarint n, and each column that has any: uvarint tag,
+ * storage byte, compression byte, statistics target plus one or 0, uvarint n and
+ * each option's name and value.  Any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -33,12 +36,16 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/toast_compression.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_partitioned_table.h"
+#include "catalog/pg_type.h"
+#include "commands/vacuum.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
@@ -144,6 +151,47 @@ index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 		(key->opclass != NULL && key->opclass[0] == '\0'))
 		return "a key with an empty collation or opclass";
 	return NULL;
+}
+
+static const char *
+options_problem(const WsOption *options, int n)
+{
+	if (n < 0 || n > WS_MAX_OPTIONS)
+		return "a number of options no table has";
+	for (int i = 0; i < n; i++)
+	{
+		const WsOption *o = &options[i];
+
+		if (o->name == NULL || o->name[0] == '\0' || strlen(o->name) >= NAMEDATALEN)
+			return "an option of no name, or too long a one";
+		if (o->value == NULL)
+			return "an option with no value";
+		/* (one order, so one set of bytes) */
+		if (i > 0 && (options[i - 1].toast > o->toast ||
+					  (options[i - 1].toast == o->toast &&
+					   strcmp(options[i - 1].name, o->name) >= 0)))
+			return "options not in order";
+	}
+	return NULL;
+}
+
+static const char *
+column_settings_problem(const WsColumn *c)
+{
+	if (c->storage != WS_STORAGE_DEFAULT && c->storage != TYPSTORAGE_PLAIN &&
+		c->storage != TYPSTORAGE_EXTERNAL && c->storage != TYPSTORAGE_EXTENDED &&
+		c->storage != TYPSTORAGE_MAIN)
+		return "a column of no known storage";
+	if (c->compression != WS_COMPRESSION_DEFAULT && c->compression != TOAST_PGLZ_COMPRESSION &&
+		c->compression != TOAST_LZ4_COMPRESSION)
+		return "a column of no known compression";
+	if (c->has_stattarget ? (c->stattarget < 0 || c->stattarget > MAX_STATISTICS_TARGET) :
+		c->stattarget != 0)
+		return "a column's statistics target out of range";
+	for (int i = 0; i < c->noptions; i++)
+		if (c->options[i].toast)
+			return "a column's option of a TOAST table";
+	return options_problem(c->options, c->noptions);
 }
 
 static const char *
@@ -407,6 +455,12 @@ ws_schema_problem(const WsTableSchema *s)
 			return "an empty collation";
 		if (c->def != NULL && !ws_tags_well_formed(c->def))
 			return "an expression with malformed column references";
+		{
+			const char *problem = column_settings_problem(c);
+
+			if (problem != NULL)
+				return problem;
+		}
 		for (int j = 0; j < i; j++)
 		{
 			if (s->cols[j].tag == c->tag)
@@ -564,12 +618,17 @@ ws_schema_problem(const WsTableSchema *s)
 		problem = inheritance_problem(s);
 		if (problem != NULL)
 			return problem;
+		problem = options_problem(s->options, s->noptions);
+		if (problem != NULL)
+			return problem;
 	}
 	return column_names_problem(s);
 }
 
 #define WS_PARTITION_OF 'o'
 #define WS_INHERITS 'i'
+#define WS_OPTIONS 'w'
+#define WS_COLUMN_SETTINGS 'c'
 #define CON_NULLS_NOT_DISTINCT 0x01
 #define CON_DEFERRABLE 0x02
 #define CON_INITDEFERRED 0x04
@@ -616,6 +675,13 @@ put_index_body(Buf *out, const WsIndex *ix, bool exclusion)
 	for (int k = 0; k < ix->ninclude; k++)
 		buf_append_uvarint(out, ix->include[k]);
 	put_optional(out, ix->predicate);
+}
+
+static bool
+has_settings(const WsColumn *c)
+{
+	return c->storage != WS_STORAGE_DEFAULT || c->compression != WS_COMPRESSION_DEFAULT ||
+		c->has_stattarget || c->noptions > 0;
 }
 
 static void
@@ -718,6 +784,45 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		buf_append_uvarint(out, (uint64) s->ninherited_cons);
 		for (int i = 0; i < s->ninherited_cons; i++)
 			put_string(out, s->inherited_cons[i]);
+	}
+	if (s->noptions > 0)
+	{
+		buf_append_byte(out, WS_OPTIONS);
+		buf_append_uvarint(out, (uint64) s->noptions);
+		for (int i = 0; i < s->noptions; i++)
+		{
+			buf_append_byte(out, s->options[i].toast ? 1 : 0);
+			put_string(out, s->options[i].name);
+			put_string(out, s->options[i].value);
+		}
+	}
+	{
+		int			n = 0;
+
+		for (int i = 0; i < s->ncols; i++)
+			n += has_settings(&s->cols[i]) ? 1 : 0;
+		if (n > 0)
+		{
+			buf_append_byte(out, WS_COLUMN_SETTINGS);
+			buf_append_uvarint(out, (uint64) n);
+			for (int i = 0; i < s->ncols; i++)
+			{
+				const WsColumn *col = &s->cols[i];
+
+				if (!has_settings(col))
+					continue;
+				buf_append_uvarint(out, col->tag);
+				buf_append_byte(out, (uint8) col->storage);
+				buf_append_byte(out, (uint8) col->compression);
+				buf_append_uvarint(out, col->has_stattarget ? (uint64) col->stattarget + 1 : 0);
+				buf_append_uvarint(out, (uint64) col->noptions);
+				for (int k = 0; k < col->noptions; k++)
+				{
+					put_string(out, col->options[k].name);
+					put_string(out, col->options[k].value);
+				}
+			}
+		}
 	}
 }
 
@@ -942,7 +1047,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		ix->nulls_not_distinct = (flags & IDX_NULLS_NOT_DISTINCT) != 0;
 		get_index_body(&p, end, ix, false);
 	}
-	if (p != end && *p != WS_PARTITION_OF && *p != WS_INHERITS)
+	if (p != end && *p != WS_PARTITION_OF && *p != WS_INHERITS && *p != WS_OPTIONS &&
+		*p != WS_COLUMN_SETTINGS)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -1006,6 +1112,87 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		for (int i = 0; i < s->ninherited_cons; i++)
 			s->inherited_cons[i] = get_string(&p, end);
 	}
+	if (p != end && *p == WS_OPTIONS)
+	{
+		p++;
+		n = get_uvarint(&p, end);
+		if (n == 0)
+			malformed("it has no options, at length");
+		if (n > WS_MAX_OPTIONS)
+			malformed("more options than a table has");
+		/* (each is at least three bytes: its toast byte and two lengths) */
+		if (n > (uint64) (end - p) / 3)
+			malformed("more options than bytes");
+		s->options = px_malloc((size_t) n * sizeof(WsOption));
+		memset(s->options, 0, (size_t) n * sizeof(WsOption));
+		s->noptions = (int) n;
+		for (int i = 0; i < s->noptions; i++)
+		{
+			uint8		toast = get_byte(&p, end);
+
+			if (toast > 1)
+				malformed("an option's toast is neither");
+			s->options[i].toast = toast == 1;
+			s->options[i].name = get_string(&p, end);
+			s->options[i].value = get_string(&p, end);
+		}
+	}
+	if (p != end && *p == WS_COLUMN_SETTINGS)
+	{
+		int			last = -1;
+
+		p++;
+		n = get_uvarint(&p, end);
+		if (n == 0)
+			malformed("it has no column settings, at length");
+		if (n > (uint64) s->ncols)
+			malformed("settings for more columns than the table has");
+		for (uint64 i = 0; i < n; i++)
+		{
+			uint64		tag = get_uvarint(&p, end);
+			int			at = -1;
+			WsColumn   *col;
+			uint64		target;
+
+			for (int k = 0; k < s->ncols && at < 0; k++)
+				if (s->cols[k].tag == tag)
+					at = k;
+			if (at < 0)
+				malformed("settings for a column the table does not have");
+			/* (one order, so one set of bytes) */
+			if (at <= last)
+				malformed("column settings not in attribute order");
+			last = at;
+			col = &s->cols[at];
+			col->storage = (char) get_byte(&p, end);
+			col->compression = (char) get_byte(&p, end);
+			target = get_uvarint(&p, end);
+			if (target > (uint64) MAX_STATISTICS_TARGET + 1)
+				malformed("a column's statistics target out of range");
+			col->has_stattarget = target > 0;
+			col->stattarget = target > 0 ? (int) target - 1 : 0;
+			target = get_uvarint(&p, end);
+			if (target > WS_MAX_OPTIONS)
+				malformed("more options than a table has");
+			/* (each is at least two bytes: two lengths) */
+			if (target > (uint64) (end - p) / 2)
+				malformed("more options than bytes");
+			if (target > 0)
+			{
+				col->options = px_malloc((size_t) target * sizeof(WsOption));
+				memset(col->options, 0, (size_t) target * sizeof(WsOption));
+				col->noptions = (int) target;
+				for (int k = 0; k < col->noptions; k++)
+				{
+					col->options[k].name = get_string(&p, end);
+					col->options[k].value = get_string(&p, end);
+				}
+			}
+			/* (a column with none is not listed) */
+			if (!has_settings(col))
+				malformed("settings for a column saying it has none");
+		}
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_schema_problem(s);
@@ -1036,9 +1223,23 @@ index_free(WsIndex *ix)
 	px_free(ix->predicate);
 }
 
+static void
+options_free(WsOption *options, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		px_free(options[i].name);
+		px_free(options[i].value);
+	}
+	px_free(options);
+}
+
 void
 ws_schema_free(WsTableSchema *s)
 {
+	options_free(s->options, s->noptions);
+	for (int i = 0; i < s->ncols; i++)
+		options_free(s->cols[i].options, s->cols[i].noptions);
 	px_free(s->name);
 	for (int i = 0; i < s->ncols; i++)
 	{
@@ -1219,6 +1420,62 @@ put_index_predicate(const WsTableSchema *s, const WsIndex *ix, Buf *out)
 	}
 }
 
+/* Whether a list of parameters as parsed is the record's: names, values and all. */
+static bool
+same_options(const WsOption *options, int n, List *parsed)
+{
+	int			i = 0;
+	ListCell   *lc;
+
+	if (list_length(parsed) != n)
+		return false;
+	foreach(lc, parsed)
+	{
+		DefElem    *d = lfirst_node(DefElem, lc);
+		const WsOption *o = &options[i++];
+
+		if (d->defaction != DEFELEM_UNSPEC || strcmp(d->defname, o->name) != 0 ||
+			(d->defnamespace != NULL) != o->toast ||
+			(d->defnamespace != NULL && strcmp(d->defnamespace, "toast") != 0) ||
+			d->arg == NULL || !IsA(d->arg, String) || strcmp(strVal(d->arg), o->value) != 0)
+			return false;
+	}
+	return true;
+}
+
+static const char *
+storage_word(char storage)
+{
+	switch (storage)
+	{
+		case TYPSTORAGE_PLAIN:
+			return "plain";
+		case TYPSTORAGE_EXTERNAL:
+			return "external";
+		case TYPSTORAGE_MAIN:
+			return "main";
+	}
+	return "extended";
+}
+
+/* A list of parameters' name = 'value', each value a string, for WITH or SET. */
+static void
+put_options(const WsOption *options, int n, Buf *out)
+{
+	ws_put_text(out, "(");
+	for (int i = 0; i < n; i++)
+	{
+		if (i > 0)
+			ws_put_text(out, ", ");
+		if (options[i].toast)
+			ws_put_text(out, "toast.");
+		ws_put_identifier(out, options[i].name);
+		ws_put_text(out, " = ");
+		ws_put_text(out, quote_literal_cstr(options[i].value));
+	}
+	ws_put_text(out, ")");
+}
+
 /* A check's clause, but for NOT VALID. */
 static void
 put_check(const WsTableSchema *s, const WsConstraint *con, Buf *out)
@@ -1252,6 +1509,13 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 		ws_put_identifier(out, c->name);
 		ws_put_text(out, " ");
 		ws_put_text(out, c->type);
+		if (c->storage != WS_STORAGE_DEFAULT)
+		{
+			ws_put_text(out, " STORAGE ");
+			ws_put_text(out, storage_word(c->storage));
+		}
+		if (c->compression != WS_COMPRESSION_DEFAULT)
+			ws_put_text(out, c->compression == TOAST_LZ4_COMPRESSION ? " COMPRESSION lz4" : " COMPRESSION pglz");
 		if (c->collation != NULL)
 		{
 			ws_put_text(out, " COLLATE ");
@@ -1335,6 +1599,11 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 			ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
 	}
 	ws_put_text(out, any ? "\n)" : ")");
+	if (s->noptions > 0 && s->partition == WS_PARTITION_NONE)
+	{
+		ws_put_text(out, " WITH ");
+		put_options(s->options, s->noptions, out);
+	}
 	if (s->partition != WS_PARTITION_NONE)
 	{
 		ws_put_text(out, s->partition == WS_PARTITION_RANGE ? " PARTITION BY RANGE (" :
@@ -1592,7 +1861,12 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def, co
 		if (def->collClause->arg != NULL || !same_names(c->collation, def->collClause->collname))
 			not_the_record(s, "a column's collation");
 	}
-	if (def->storage_name != NULL || def->compression != NULL || def->fdwoptions != NIL)
+	if (def->fdwoptions != NIL ||
+		(def->storage_name != NULL) != (c->storage != WS_STORAGE_DEFAULT) ||
+		(def->compression != NULL) != (c->compression != WS_COMPRESSION_DEFAULT) ||
+		(def->storage_name != NULL && strcmp(def->storage_name, storage_word(c->storage)) != 0) ||
+		(def->compression != NULL &&
+		 strcmp(def->compression, c->compression == TOAST_LZ4_COMPRESSION ? "lz4" : "pglz") != 0))
 		not_the_record(s, "a column's clause");
 	foreach(lc, def->constraints)
 	{
@@ -1783,9 +2057,11 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 	if (create->relation->relpersistence != RELPERSISTENCE_PERMANENT)
 		not_the_record(s, "another persistence");
 	check_partitioning(s, create->partspec);
+	if (!same_options(s->options, s->partition == WS_PARTITION_NONE ? s->noptions : 0, create->options))
+		not_the_record(s, "other storage parameters");
 	if (create->inhRelations != NIL || create->partbound != NULL ||
 		create->ofTypename != NULL || create->constraints != NIL || create->nnconstraints != NIL ||
-		create->options != NIL || create->oncommit != ONCOMMIT_NOOP ||
+		create->oncommit != ONCOMMIT_NOOP ||
 		create->tablespacename != NULL || create->accessMethod != NULL || create->if_not_exists)
 		not_the_record(s, "a clause the record does not have");
 	if (list_length(create->tableElts) != s->ncols + (s->nkey > 0 ? 1 : 0) + nmade)
@@ -2016,6 +2292,91 @@ check_attach_statement(const WsTableSchema *s, const char *schema, const char *s
 		not_the_record(s, "a bound of more than constants");
 }
 
+static void
+write_column_settings(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	bool		any = false;
+
+	ws_put_text(out, "ALTER TABLE ONLY ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->name);
+	for (int i = 0; i < s->ncols; i++)
+	{
+		const WsColumn *col = &s->cols[i];
+
+		if (col->has_stattarget)
+		{
+			char		target[16];
+
+			snprintf(target, sizeof(target), "%d", col->stattarget);
+			ws_put_text(out, any ? ", ALTER " : " ALTER ");
+			any = true;
+			ws_put_identifier(out, col->name);
+			ws_put_text(out, " SET STATISTICS ");
+			ws_put_text(out, target);
+		}
+		if (col->noptions > 0)
+		{
+			ws_put_text(out, any ? ", ALTER " : " ALTER ");
+			any = true;
+			ws_put_identifier(out, col->name);
+			ws_put_text(out, " SET ");
+			put_options(col->options, col->noptions, out);
+		}
+	}
+}
+
+/* One ALTER TABLE ONLY of this table, of just these columns' settings. */
+static void
+check_column_settings_statement(const WsTableSchema *s, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	ListCell   *lc;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok)
+		not_the_record(s, "another table");
+	lc = list_head(stmt->cmds);
+	for (int i = 0; i < s->ncols; i++)
+	{
+		const WsColumn *col = &s->cols[i];
+
+		for (int step = 0; step < 2; step++)
+		{
+			AlterTableCmd *cmd;
+
+			if (step == 0 ? !col->has_stattarget : col->noptions == 0)
+				continue;
+			if (lc == NULL)
+				not_the_record(s, "too few changes");
+			cmd = lfirst_node(AlterTableCmd, lc);
+			lc = lnext(stmt->cmds, lc);
+			if (cmd->name == NULL || strcmp(cmd->name, col->name) != 0 || cmd->num != 0 ||
+				cmd->newowner != NULL || cmd->missing_ok ||
+				cmd->subtype != (step == 0 ? AT_SetStatistics : AT_SetOptions))
+				not_the_record(s, "another change");
+			if (step == 0)
+			{
+				if (cmd->def == NULL || !IsA(cmd->def, Integer) ||
+					intVal(cmd->def) != col->stattarget)
+					not_the_record(s, "another statistics target");
+			}
+			else if (cmd->def == NULL || !IsA(cmd->def, List) ||
+					 !same_options(col->options, col->noptions, (List *) cmd->def))
+				not_the_record(s, "other storage parameters");
+		}
+	}
+	if (lc != NULL)
+		not_the_record(s, "too many changes");
+}
+
 /* One ALTER TABLE, of this table, inheriting from this parent, and nothing else. */
 static void
 check_inherit_statement(const WsTableSchema *s, const char *parent, const char *schema, const char *sql)
@@ -2098,6 +2459,20 @@ check_add_check_statement(const WsTableSchema *s, const WsConstraint *con, const
 	check_constraint(s, con, (Constraint *) cmd->def);
 }
 
+static WsOption *
+options_in_server_encoding(const WsOption *options, int n)
+{
+	WsOption   *here = palloc_array(WsOption, Max(n, 1));
+
+	for (int i = 0; i < n; i++)
+	{
+		here[i] = options[i];
+		here[i].name = ws_name_from_utf8(options[i].name);
+		here[i].value = from_utf8(options[i].value);
+	}
+	return here;
+}
+
 /* A copy of a schema with its strings in the server's encoding. */
 static void
 schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
@@ -2116,6 +2491,7 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 		here.cols[i].collation = from_utf8(s->cols[i].collation);
 		here.cols[i].not_null = ws_name_from_utf8(s->cols[i].not_null);
 		here.cols[i].identity_seq = ws_name_from_utf8(s->cols[i].identity_seq);
+		here.cols[i].options = options_in_server_encoding(s->cols[i].options, s->cols[i].noptions);
 	}
 	here.constraints = palloc_array(WsConstraint, Max(s->nconstraints, 1));
 	for (int i = 0; i < s->nconstraints; i++)
@@ -2139,6 +2515,7 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	}
 	here.partition_of = ws_name_from_utf8(s->partition_of);
 	here.partition_bound = from_utf8(s->partition_bound);
+	here.options = options_in_server_encoding(s->options, s->noptions);
 	here.inherits = palloc_array(char *, Max(s->ninherits, 1));
 	for (int i = 0; i < s->ninherits; i++)
 		here.inherits[i] = ws_name_from_utf8(s->inherits[i]);
@@ -2218,6 +2595,28 @@ ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out)
 	write_attach(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_attach_statement(&here, schema, (char *) sql.data);
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
+void
+ws_schema_column_settings(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	bool		any = false;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	for (int i = 0; i < s->ncols; i++)
+		any |= s->cols[i].has_stattarget || s->cols[i].noptions > 0;
+	if (!any)
+		return;
+	schema_in_server_encoding(s, &here);
+	write_column_settings(&here, schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_column_settings_statement(&here, schema, (char *) sql.data);
 	buf_append(out, sql.data, sql.len - 1);
 	buf_free(&sql);
 }
@@ -2334,8 +2733,6 @@ static const char *const unsupported_sql =
 "  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
 "    THEN 'it has another access method' "
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
-"  WHEN c.reloptions IS NOT NULL OR tc.reloptions IS NOT NULL "
-"    THEN 'it has storage parameters' "
 "  WHEN c.relreplident <> 'd' THEN 'it has a replica identity' "
 "  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
 "       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
@@ -2385,11 +2782,6 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
 "               (NOT k.convalidated OR k.connoinherit)) "
 "    THEN 'it has a not-null constraint not valid or no inherit' "
-"  WHEN EXISTS (SELECT FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid "
-"               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND "
-"                 (a.attstorage <> t.typstorage OR a.attcompression <> '' OR "
-"                  a.attstattarget IS NOT NULL OR a.attoptions IS NOT NULL)) "
-"    THEN 'a column has storage, compression, statistics or options set' "
 "  WHEN EXISTS (SELECT FROM pg_attrdef d JOIN pg_depend p ON p.classid = 'pg_attrdef'::regclass "
 "                 AND p.objid = d.oid AND p.refclassid = 'pg_class'::regclass "
 "               JOIN pg_class q ON q.oid = p.refobjid "
@@ -2421,7 +2813,7 @@ static const char *const unsupported_sql =
 "    THEN 'a column owns the identity sequence of another table' "
 "  END "
 "FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam "
-"LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid WHERE c.oid = $1::oid";
+"WHERE c.oid = $1::oid";
 
 /*
  * The columns as this snapshot saw them have the names they have now: names
@@ -2749,6 +3141,118 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 }
 
 static int
+option_cmp(const void *a, const void *b)
+{
+	const WsOption *x = a;
+	const WsOption *y = b;
+
+	if (x->toast != y->toast)
+		return x->toast ? 1 : -1;
+	return strcmp(x->name, y->name);
+}
+
+/* name=value, as a catalog's options array holds each, each part in a commit's encoding. */
+static void
+read_option(const char *held, bool toast, WsOption *o)
+{
+	const char *eq = strchr(held, '=');
+
+	if (eq == NULL)
+		elog(ERROR, "an option with no value: \"%s\"", held);
+	o->toast = toast;
+	o->name = ws_name_to_utf8(pnstrdup(held, eq - held));
+	o->value = to_utf8(eq + 1);
+}
+
+/* The table's storage parameters, its TOAST table's, and its columns'. */
+static void
+read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
+			   "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
+			   "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
+	/*
+	 * A TOAST table outlives the need for one, and its parameters with it, where
+	 * CREATE TABLE would make none and lose them: what decides is what it would.
+	 * That looks at the table as it is now, so the columns must be as this
+	 * snapshot saw them, under the lock, for its answer to be about them.
+	 */
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_sql_value(&rows, i, 1)[0] == 't')
+		{
+			Relation	r = relation_open(atooid(oid), NoLock);
+			TupleDesc	desc = RelationGetDescr(r);
+			int			live = 0;
+			bool		same = true;
+			bool		needs;
+
+			for (int a = 0; a < desc->natts; a++)
+				live += TupleDescAttr(desc, a)->attisdropped ? 0 : 1;
+			same = live == cols->nrows;
+			for (int k = 0; k < cols->nrows && same; k++)
+			{
+				int			attnum = atoi(ws_sql_value(cols, k, 0));
+
+				same = attnum <= desc->natts &&
+					TupleDescAttr(desc, attnum - 1)->attstorage == ws_sql_value(cols, k, 17)[0] &&
+					TupleDescAttr(desc, attnum - 1)->atttypmod == atoi(ws_sql_value(cols, k, 18));
+			}
+			needs = table_relation_needs_toast_table(r);
+			relation_close(r, NoLock);
+			if (!same)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("a column of table \"%s\" was added, or its size or storage changed, since this transaction's snapshot",
+								table)));
+			if (!needs)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the schema of table \"%s\" cannot be read yet: its TOAST table has parameters, and it no longer needs one",
+								table)));
+			break;
+		}
+	if (rows.nrows > 0)
+	{
+		out->options = px_malloc((size_t) rows.nrows * sizeof(WsOption));
+		memset(out->options, 0, (size_t) rows.nrows * sizeof(WsOption));
+		out->noptions = rows.nrows;
+		for (int i = 0; i < rows.nrows; i++)
+			read_option(ws_sql_value(&rows, i, 0), ws_sql_value(&rows, i, 1)[0] == 't', &out->options[i]);
+		if (out->noptions > 1)
+			qsort(out->options, out->noptions, sizeof(WsOption), option_cmp);
+	}
+	ws_sql_rows_free(&rows);
+	WsSql->run("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
+			   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
+	for (int r = 0; r < rows.nrows;)
+	{
+		int			same = 1;
+		int			at = -1;
+
+		while (r + same < rows.nrows &&
+			   strcmp(ws_sql_value(&rows, r, 0), ws_sql_value(&rows, r + same, 0)) == 0)
+			same++;
+		for (int i = 0; i < cols->nrows && at < 0; i++)
+			if (strcmp(ws_sql_value(cols, i, 0), ws_sql_value(&rows, r, 0)) == 0)
+				at = i;
+		if (at < 0)
+			elog(ERROR, "options of a column the table does not have");
+		out->cols[at].options = px_malloc((size_t) same * sizeof(WsOption));
+		memset(out->cols[at].options, 0, (size_t) same * sizeof(WsOption));
+		out->cols[at].noptions = same;
+		for (int k = 0; k < same; k++)
+			read_option(ws_sql_value(&rows, r + k, 1), false, &out->cols[at].options[k]);
+		if (same > 1)
+			qsort(out->cols[at].options, same, sizeof(WsOption), option_cmp);
+		r += same;
+	}
+	ws_sql_rows_free(&rows);
+}
+
+static int
 name_cmp(const void *a, const void *b)
 {
 	return strcmp(*(char *const *) a, *(char *const *) b);
@@ -2900,7 +3404,10 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "      AND p.deptype = 'i' AND q.relkind = 'S'), "
 				   "  a.atttypid::text, a.attislocal::text, "
 				   "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
-				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum) "
+				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
+				   "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
+				   "  a.attcompression::text, a.attstattarget::text, a.attstorage::text, "
+				   "  a.atttypmod::text "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
@@ -2968,6 +3475,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		if (collation != NULL)
 			names_fit(stringToQualifiedNameList(collation, NULL));
 		c->collation = collation ? to_utf8(collation) : NULL;
+		c->storage = ws_sql_value(&cols, i, 14) ? ws_sql_value(&cols, i, 14)[0] : WS_STORAGE_DEFAULT;
+		c->compression = ws_sql_value(&cols, i, 15)[0];
+		if (ws_sql_value(&cols, i, 16) != NULL)
+		{
+			c->has_stattarget = true;
+			c->stattarget = atoi(ws_sql_value(&cols, i, 16));
+		}
 		c->tag = (uint64) strtoi64(ws_sql_value(&cols, i, 8), NULL, 10);
 		rc.tags[i] = c->tag;
 	}
@@ -3058,6 +3572,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
+	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	if (ws_sql_value(&rel, 0, 4)[0] != 't')
 		read_inheritance(ws_sql_value(&rel, 0, 0), &cols, &others, out);
 	if (ws_sql_value(&rel, 0, 4)[0] == 't')

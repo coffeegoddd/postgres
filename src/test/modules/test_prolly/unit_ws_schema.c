@@ -15,6 +15,7 @@
 
 #include "access/xact.h"
 #include "engine_test_util.h"
+#include "parser/parser.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "test_prolly.h"
@@ -1810,6 +1811,239 @@ test_inherit_quoted(void)
 	expect_error(inherit_of_no_parent, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
+/* Storage parameters and a column's settings: bytes, and which statement says each. */
+static void
+test_storage(void)
+{
+	WsOption	copts[] = {{.name = "n_distinct",.value = "5"}};
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.storage = 'e',.compression = 'p'},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED,.has_stattarget = true,.stattarget = 0,
+		.noptions = 1,.options = copts},
+		{.tag = 9,.name = "c",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsOption	opts[] = {
+		{.name = "fillfactor",.value = "50"},
+		{.name = "odd name",.value = "it's"},
+		{.toast = true,.name = "autovacuum_enabled",.value = "false"},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 3,.cols = cols,.noptions = 3,.options = opts};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x03"
+		"\x07" "\x01" "a" "\x04" "text" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x08" "\x01" "b" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x09" "\x01" "c" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00" "\x00" "\x00"
+		"w" "\x03"
+		"\x00" "\x0a" "fillfactor" "\x02" "50"
+		"\x00" "\x08" "odd name" "\x04" "it's"
+		"\x01" "\x12" "autovacuum_enabled" "\x05" "false"
+		"c" "\x02"
+		"\x07" "e" "p" "\x00" "\x00"
+		"\x08" "\x00" "\x00" "\x01" "\x01" "\x0a" "n_distinct" "\x01" "5";
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.noptions == 3 && got.options[2].toast && strcmp(got.options[2].value, "false") == 0);
+	CHECK(got.cols[0].storage == 'e' && got.cols[0].compression == 'p' && !got.cols[0].has_stattarget);
+	CHECK(got.cols[1].has_stattarget && got.cols[1].stattarget == 0);
+	CHECK(got.cols[1].noptions == 1 && strcmp(got.cols[1].options[0].value, "5") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a text STORAGE external COMPRESSION pglz,\n"
+				 "    b integer,\n"
+				 "    c integer\n"
+				 ") WITH (fillfactor = '50', \"odd name\" = 'it''s', toast.autovacuum_enabled = 'false')") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_column_settings(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "ALTER TABLE ONLY x.t ALTER b SET STATISTICS 0, ALTER b SET (n_distinct = '5')") == 0);
+	buf_free(&sql);
+
+	/* (each word as it says it, on a build with no lz4 too) */
+	{
+		WsColumn	words[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.storage = 'p',.compression = 'l'}};
+		WsTableSchema w = {.name = "t",.ncols = 1,.cols = words};
+		Buf			text = BUF_INIT;
+
+		ws_schema_create_table(&w, "x", &text);
+		buf_append_byte(&text, 0);
+		CHECK(strstr((char *) text.data, "a text STORAGE plain COMPRESSION lz4") != NULL);
+		buf_free(&text);
+	}
+
+	/* (none to give: nothing) */
+	{
+		WsTableSchema plain = {.name = "t",.ncols = 1,.cols = &cols[2]};
+		Buf			none = BUF_INIT;
+
+		ws_schema_column_settings(&plain, "x", &none);
+		CHECK_EQ(none.len, 0);
+		buf_free(&none);
+	}
+}
+
+static const char *
+one_column_problem(const WsColumn *c, const WsOption *table_options, int n)
+{
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = (WsColumn *) c,.noptions = n,.options = (WsOption *) table_options};
+
+	return ws_schema_problem(&s);
+}
+
+static void
+test_storage_problems(void)
+{
+#define COL(...) (&(WsColumn) {.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED, __VA_ARGS__})
+	WsOption	toasted = {.toast = true,.name = "x",.value = "1"};
+	WsOption	noname = {.value = "1"};
+	WsOption	novalue = {.name = "x"};
+	WsOption	backwards[] = {{.name = "b",.value = "1"}, {.name = "a",.value = "1"}};
+	WsOption	twice[] = {{.name = "a",.value = "1"}, {.name = "a",.value = "2"}};
+	WsOption	toastfirst[] = {{.toast = true,.name = "a",.value = "1"}, {.name = "b",.value = "1"}};
+
+	CHECK(problem_has(one_column_problem(COL(.storage = 'z'), NULL, 0), "no known storage"));
+	CHECK(problem_has(one_column_problem(COL(.compression = 'z'), NULL, 0), "no known compression"));
+	CHECK(problem_has(one_column_problem(COL(.has_stattarget = true,.stattarget = -1), NULL, 0), "out of range"));
+	CHECK(problem_has(one_column_problem(COL(.has_stattarget = true,.stattarget = 10001), NULL, 0), "out of range"));
+	CHECK(problem_has(one_column_problem(COL(.stattarget = 5), NULL, 0), "out of range"));
+	CHECK(problem_has(one_column_problem(COL(.noptions = 1,.options = &toasted), NULL, 0), "of a TOAST table"));
+	CHECK(problem_has(one_column_problem(COL(.noptions = 1,.options = &noname), NULL, 0), "no name"));
+	CHECK(problem_has(one_column_problem(COL(.noptions = 1,.options = &novalue), NULL, 0), "no value"));
+	CHECK(problem_has(one_column_problem(COL(.noptions = 2,.options = backwards), NULL, 0), "not in order"));
+	CHECK(problem_has(one_column_problem(COL(), twice, 2), "not in order"));
+	CHECK(problem_has(one_column_problem(COL(), toastfirst, 2), "not in order"));
+	CHECK(one_column_problem(COL(.storage = 'x',.compression = 'l',.has_stattarget = true,.stattarget = 10000), &toasted, 1) == NULL);
+	CHECK(problem_has(one_column_problem(COL(), &toasted, WS_MAX_OPTIONS + 1), "no table has"));
+#undef COL
+	{
+		static const char zero[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "w" "\x00";
+		static const char many[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "w" "\x7f" "\x00";
+		static const char neither[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "w" "\x01" "\x02" "\x01" "x" "\x01" "y";
+		static const char nocols[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x00";
+		static const char morecols[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char absent[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x09" "e" "\x00" "\x00" "\x00";
+		static const char saysnone[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x00";
+		static const char outorder[] =
+			"\x01" "\x01" "t" "\x02" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x08" "\x01" "b" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x08" "e" "\x00" "\x00" "\x00" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char dup[] =
+			"\x01" "\x01" "t" "\x02" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x08" "\x01" "b" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x07" "e" "\x00" "\x00" "\x00" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char coloptions[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x7f";
+		static const char toomany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "w" "\x81\x02";
+		static const char colmany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x81\x02";
+		static const char wrongorder[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "e" "\x00" "\x00" "\x00" "w" "\x01" "\x00" "\x01" "x" "\x01" "y";
+		static const char target[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\xff\x7f" "\x00";
+
+		check_refused(zero, sizeof(zero) - 1, "no options");
+		check_refused(many, sizeof(many) - 1, "more options than bytes");
+		check_refused(neither, sizeof(neither) - 1, "toast is neither");
+		check_refused(nocols, sizeof(nocols) - 1, "no column settings");
+		check_refused(morecols, sizeof(morecols) - 1, "more columns than the table has");
+		check_refused(absent, sizeof(absent) - 1, "does not have");
+		check_refused(saysnone, sizeof(saysnone) - 1, "saying it has none");
+		check_refused(target, sizeof(target) - 1, "out of range");
+		check_refused(outorder, sizeof(outorder) - 1, "not in attribute order");
+		check_refused(dup, sizeof(dup) - 1, "not in attribute order");
+		check_refused(coloptions, sizeof(coloptions) - 1, "more options than bytes");
+		check_refused(toomany, sizeof(toomany) - 1, "more options than a table has");
+		check_refused(colmany, sizeof(colmany) - 1, "more options than a table has");
+		check_refused(wrongorder, sizeof(wrongorder) - 1, "left over");
+	}
+}
+
+typedef struct StorageAttack
+{
+	const char *def;
+	char		storage;
+} StorageAttack;
+
+/* What a column's text could add to the statement, in place of what the record says. */
+static void
+storage_injected(void *arg)
+{
+	const StorageAttack *in = arg;
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "text --",.kind = WS_COL_STORED,.def = (char *) in->def,.storage = in->storage},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* A name or value is quoted, whatever it holds: nothing to refuse, and nothing added. */
+static void
+test_storage_quoted(void)
+{
+	static const StorageAttack bad[] = {
+		{.def = "'x'\nSTORAGE external DEFAULT ('x') --"},
+		{.def = "'x'\nCOMPRESSION pglz DEFAULT ('x') --"},
+		{.def = "'x'\nDEFAULT ('x') --",.storage = 'e'},
+	};
+	WsOption	opts[] = {
+		{.name = "a) TABLESPACE x --",.value = "1') --"},
+		{.name = "b",.value = "\\'; DROP TABLE x.t; --"},
+	};
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.noptions = 2,.options = opts}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.noptions = 2,.options = opts};
+	Buf			b = BUF_INIT;
+	List	   *parsed;
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(storage_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	ws_schema_create_table(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	parsed = raw_parser((char *) b.data, RAW_PARSE_DEFAULT);
+	CHECK_EQ(list_length(parsed), 1);
+	buf_free(&b);
+	b = (Buf) BUF_INIT;
+	ws_schema_column_settings(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	parsed = raw_parser((char *) b.data, RAW_PARSE_DEFAULT);
+	CHECK_EQ(list_length(parsed), 1);
+	buf_free(&b);
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -2436,6 +2670,9 @@ static const ProllyUnitTest tests[] = {
 	{"partition_refused", test_partition_refused},
 	{"inheriting", test_inheriting},
 	{"inherit_quoted", test_inherit_quoted},
+	{"storage", test_storage},
+	{"storage_problems", test_storage_problems},
+	{"storage_quoted", test_storage_quoted},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},

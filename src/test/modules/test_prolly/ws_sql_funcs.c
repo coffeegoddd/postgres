@@ -95,6 +95,18 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	buf_append_byte(&sql, 0);
 	WsSql->run((char *) sql.data, 0, NULL, &rows);
 	ws_sql_rows_free(&rows);
+	{
+		Buf			set = BUF_INIT;
+
+		ws_schema_column_settings(&s, schema, &set);
+		if (set.len > 0)
+		{
+			buf_append_byte(&set, 0);
+			WsSql->run((char *) set.data, 0, NULL, &rows);
+			ws_sql_rows_free(&rows);
+		}
+		buf_free(&set);
+	}
 	for (int i = 0; i < s.nindexes; i++)
 	{
 		Buf			ix = BUF_INIT;
