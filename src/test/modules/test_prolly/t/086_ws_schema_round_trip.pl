@@ -357,12 +357,24 @@ $node->safe_psql('postgres', q{
 	CREATE SCHEMA dst3 VERSIONED;
 });
 my $re = $bytes->($node, 'postgres', 're');
+# (in one transaction, whose relcache keeps a table it made: rebuilt, not dropped)
 $node->safe_psql('postgres', qq{
+	BEGIN;
 	SELECT test_ws_schema_create(decode('$re', 'hex'), 'dst3');
 	ALTER TABLE dst3.re ADD COLUMN a integer;
+	COMMIT;
 });
 is($tag->('dst3.re', 'r'), $tag->('src.re', 'r'), 'a table made again has the record\'s tag');
 isnt($tag->('dst3.re', 'a'), $tag->('dst3.re', 'r'), 'and a column added in that session another');
+
+# a table with a column its record lacks would hold a tag twice
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA dst4 VERSIONED;
+	CREATE TABLE dst4.re (r integer, extra integer);
+});
+($sret, $sout, $serr) = $node->psql('postgres',
+	qq{SELECT test_ws_schema_set_tags(decode('$re', 'hex'), 'dst4')});
+like($serr, qr/has 2 columns, its record 1/, 'tags are not given to a table its record does not describe');
 
 # another encoding: the same bytes, UTF8; and what it cannot hold refused
 $node->safe_psql('postgres', q{
@@ -444,6 +456,18 @@ like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a table renamed so re
 $node->safe_psql('sqlascii', q{CREATE SCHEMA sh; CREATE TABLE sh.t (a integer)});
 $node->safe_psql('sqlascii', qq{ALTER TABLE sh.t RENAME a TO "c\xe9"; VACUUM FULL sh.t});
 pass('a shared table is as it ever was');
+
+# a rewrite derives no tags, so a type renamed to such a name does not stop it
+$node->safe_psql('sqlascii', qq{
+	CREATE DOMAIN v.d AS integer;
+	CREATE TABLE v.t1 (a v.d);
+	ALTER DOMAIN v.d RENAME TO "d\xe9";
+	VACUUM FULL v.t1;
+});
+pass('a table of a type renamed so can be rewritten');
+isnt($node->safe_psql('sqlascii',
+		q{SELECT attcoltag FROM pg_attribute WHERE attrelid = 'v.t1'::regclass AND attname = 'a'}),
+	'0', 'and keeps its tags');
 
 $node->stop;
 done_testing();

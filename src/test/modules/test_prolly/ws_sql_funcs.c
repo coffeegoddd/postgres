@@ -22,6 +22,7 @@
 
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
+PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 
 /*
  * test_ws_schema_bytes(schema text, table text) returns bytea: the table's
@@ -45,6 +46,23 @@ test_ws_schema_bytes(PG_FUNCTION_ARGS)
 	ws_schema_free(&s);
 	buf_free(&b);
 	PG_RETURN_BYTEA_P(out);
+}
+
+/*
+ * test_ws_schema_set_tags(bytes bytea, schema text) returns void: a schema's
+ * bytes' tags given to its table in the schema
+ */
+Datum
+test_ws_schema_set_tags(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	ws_schema_set_tags(schema, &s);
+	ws_schema_free(&s);
+	PG_RETURN_VOID();
 }
 
 /*

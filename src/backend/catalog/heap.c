@@ -1485,7 +1485,7 @@ heap_create_with_catalog(const char *relname,
 	/*
 	 * now add tuples to pg_attribute for the attributes in our new relation.
 	 */
-	ws_tags_assign(new_rel_desc);
+	ws_tags_assign(new_rel_desc, !OidIsValid(relrewrite));
 	AddNewAttributeTuples(relid, new_rel_desc->rd_att, relkind);
 
 	/*

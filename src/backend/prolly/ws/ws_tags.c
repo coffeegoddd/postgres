@@ -127,13 +127,13 @@ ws_tag_new_column(Relation rel, const FormData_pg_attribute *att)
 }
 
 void
-ws_tags_assign(Relation rel)
+ws_tags_assign(Relation rel, bool assign)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
 
 	for (int i = 0; i < desc->natts; i++)
 		TupleDescAttr(desc, i)->attcoltag = 0;
-	for (int i = 0; i < desc->natts; i++)
+	for (int i = 0; assign && i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 

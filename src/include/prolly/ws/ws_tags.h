@@ -54,13 +54,16 @@ extern uint64 ws_tag_new_column(Relation rel, const FormData_pg_attribute *att);
 
 /*
  * Refuses a new name for a table in a versioned schema, or for one of its
- * columns, that has no UTF8: a tag could not be derived from it, and a table's
- * rewrite derives them.
+ * columns, that has no UTF8: no commit could hold it.
  */
 extern void ws_tags_check_name(Relation rel, const char *name);
 
-/* Gives a new relation's columns their tags (a copied descriptor holds its source's). */
-extern void ws_tags_assign(Relation rel);
+/*
+ * Sets a new relation's columns' tags: none, if !assign (a table's rewrite: a
+ * transient heap's rows are thrown away, and the table's own keep their tags),
+ * and the next tag of each otherwise.  A copied descriptor holds its source's.
+ */
+extern void ws_tags_assign(Relation rel, bool assign);
 
 /*
  * The expression of a parse of "SELECT (text)", or NULL if the text was
