@@ -760,16 +760,19 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.ot2 (a int, t text) WITH (toast.autovacuum_enabled = false);
 	ALTER TABLE src.ot2 DROP COLUMN t;
 	CREATE TABLE src.ot3 (a int, t text) WITH (toast.autovacuum_enabled = false);
+	CREATE TABLE src.ot4 (a int, t text, u varchar(10)) WITH (toast.autovacuum_enabled = false);
+	ALTER TABLE src.ot4 DROP COLUMN t;
 });
 for my $t ([ 'ot1', 'ALTER TABLE src.ot1 ALTER t SET STORAGE EXTENDED' ], [ 'ot2', 'ALTER TABLE src.ot2 ADD u text' ],
-	[ 'ot3', 'ALTER TABLE src.ot3 ALTER t SET STORAGE PLAIN' ])
+	[ 'ot3', 'ALTER TABLE src.ot3 ALTER t SET STORAGE PLAIN' ],
+	[ 'ot4', 'ALTER TABLE src.ot4 ALTER u TYPE varchar(100000)' ])
 {
 	my $old = $node->background_psql('postgres', on_error_stop => 0);
 	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 	$old->query_safe('SELECT count(*) FROM pg_class');
 	$node->safe_psql('postgres', $t->[1]);
 	$old->query(qq{SELECT test_ws_schema_bytes('src', '$t->[0]')});
-	like($old->{stderr}, qr/added or its storage changed since this transaction's snapshot/,
+	like($old->{stderr}, qr/added, or its size or storage changed, since this transaction's snapshot/,
 		"$t->[0] changed since a snapshot refused as such");
 	$old->query('ROLLBACK');
 	$old->quit;

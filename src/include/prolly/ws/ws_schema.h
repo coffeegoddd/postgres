@@ -318,7 +318,7 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * not given back.  A schema with a problem raises an error.  What an
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.
-  *
+ *
  * A column's STORAGE plain is in this statement, before any rows.  A row made
  * before that was set, too long to fit without TOAST, is refused when made again,
  * as it is by restoring from pg_dump.
