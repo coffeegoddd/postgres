@@ -22,38 +22,38 @@ snapshot
 t       
 (1 row)
 
-step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+step f_free: SELECT test_chunk_free('crs_l', 'crs_i', crs_h(crs_parent())) AS freed;
 freed
 -----
     2
 (1 row)
 
-step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+step r_parent: SELECT test_chunk_get('crs_l', 'crs_i', crs_h(crs_parent())) IS NOT NULL AS parent;
 parent
 ------
 t     
 (1 row)
 
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
 \x0a 
 (1 row)
 
-step r_has: SELECT test_chunk_has('rs_l', 'rs_i', rs_h('\x0a')) AS has;
+step r_has: SELECT test_chunk_has('crs_l', 'crs_i', crs_h('\x0a')) AS has;
 has
 ---
 f  
 (1 row)
 
 step r_commit: COMMIT;
-step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+step r_parent: SELECT test_chunk_get('crs_l', 'crs_i', crs_h(crs_parent())) IS NOT NULL AS parent;
 parent
 ------
 f     
 (1 row)
 
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
      
@@ -83,19 +83,19 @@ t
 (1 row)
 
 step f_begin: BEGIN;
-step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+step f_free: SELECT test_chunk_free('crs_l', 'crs_i', crs_h(crs_parent())) AS freed;
 freed
 -----
     2
 (1 row)
 
-step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+step r_parent: SELECT test_chunk_get('crs_l', 'crs_i', crs_h(crs_parent())) IS NOT NULL AS parent;
 parent
 ------
 t     
 (1 row)
 
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
 \x0a 
@@ -103,7 +103,7 @@ child
 
 step f_commit: COMMIT;
 step r_commit: COMMIT;
-step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+step r_parent: SELECT test_chunk_get('crs_l', 'crs_i', crs_h(crs_parent())) IS NOT NULL AS parent;
 parent
 ------
 f     
@@ -127,20 +127,20 @@ test_chunk_format_refs
 (1 row)
 
 step f_begin: BEGIN;
-step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+step f_free: SELECT test_chunk_free('crs_l', 'crs_i', crs_h(crs_parent())) AS freed;
 freed
 -----
     2
 (1 row)
 
 step f_rollback: ROLLBACK;
-step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+step r_parent: SELECT test_chunk_get('crs_l', 'crs_i', crs_h(crs_parent())) IS NOT NULL AS parent;
 parent
 ------
 t     
 (1 row)
 
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
 \x0a 
@@ -169,19 +169,19 @@ snapshot
 t       
 (1 row)
 
-step r_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+step r_free: SELECT test_chunk_free('crs_l', 'crs_i', crs_h(crs_parent())) AS freed;
 freed
 -----
     2
 (1 row)
 
-step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+step r_parent: SELECT test_chunk_get('crs_l', 'crs_i', crs_h(crs_parent())) IS NOT NULL AS parent;
 parent
 ------
 f     
 (1 row)
 
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
      
@@ -211,26 +211,26 @@ snapshot
 t       
 (1 row)
 
-step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+step f_free: SELECT test_chunk_free('crs_l', 'crs_i', crs_h(crs_parent())) AS freed;
 freed
 -----
     2
 (1 row)
 
-step f_put: SELECT test_chunk_put('rs_l', 'rs_i', rs_h('\x0a'), '\x0a') AS stored;
+step f_put: SELECT test_chunk_put('crs_l', 'crs_i', crs_h('\x0a'), '\x0a') AS stored;
 stored
 ------
 t     
 (1 row)
 
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
 \x0a 
 (1 row)
 
 step r_commit: COMMIT;
-step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+step r_child: SELECT test_chunk_get('crs_l', 'crs_i', crs_h('\x0a')) AS child;
 child
 -----
 \x0a 
