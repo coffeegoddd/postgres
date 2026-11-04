@@ -1204,7 +1204,7 @@ index_spanned(void *arg)
 	Buf			b = BUF_INIT;
 
 	/* (INCLUDE compared whole: the count alone would refuse it otherwise) */
-	if (strstr(expr, "INCLUDE (b DESC)") != NULL)
+	if (strstr(expr, "INCLUDE (b ") != NULL || strstr(expr, "INCLUDE ((b") != NULL)
 	{
 		ix.ninclude = 1;
 		ix.include = b_tag;
@@ -1248,6 +1248,11 @@ test_index_injection(void)
 	{
 		static const char *const clause[] = {
 			"2 /*\n, ((2))) INCLUDE (b DESC) -- */",
+			"2 /*\n, ((2))) INCLUDE (b NULLS LAST) -- */",
+			"2 /*\n, ((2))) INCLUDE (b COLLATE \"C\") -- */",
+			"2 /*\n, ((2))) INCLUDE (b int4_ops) -- */",
+			"2 /*\n, ((2))) INCLUDE (b int4_ops (x = 1)) -- */",
+			"2 /*\n, ((2))) INCLUDE ((b)) -- */",
 			"2 /*\n, ((2))) INCLUDE (b) -- */",
 			"2 /*\n, ((2))) WITH (fillfactor = 10) -- */",
 			"2 /*\n, ((2))) TABLESPACE x -- */",
