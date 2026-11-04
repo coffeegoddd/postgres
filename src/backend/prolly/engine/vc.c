@@ -136,6 +136,23 @@ vc_schema_get(ProllyCtx *ctx, const PHash *schema, size_t *len)
 	return out;
 }
 
+void
+vc_table_decode(const uint8 *val, size_t len, VcTable *out)
+{
+	entry_decode(val, len, out);
+}
+
+void
+vc_table_put(ProllyCtx *ctx, const PHash *rv, const char *name, const void *schema,
+			 size_t slen, const PHash *data, PHash *out)
+{
+	VcTable		t;
+
+	t.schema = put_schema(ctx, schema, slen);
+	t.data = *data;
+	*out = put_entry(ctx, rv, name, &t);
+}
+
 int
 vc_table_create(ProllyCtx *ctx, const PHash *rv, const char *name,
 				const void *schema, size_t slen, PHash *out)
