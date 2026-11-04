@@ -448,6 +448,38 @@ ENGINE_TEST(test_refused_statements)
 			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
 			expect_error(statement_of, &r, ERRCODE_DATA_CORRUPTED, NULL);
 		}
+		{
+			static const char *const indexes[] = {
+				"CREATE INDEX v ON other (a)",
+				"CREATE INDEX other ON t (a)",
+				"CREATE INDEX v ON s.t (a)",
+				"CREATE INDEX CONCURRENTLY v ON t (a)",
+				"CREATE INDEX IF NOT EXISTS v ON t (a)",
+				"CREATE INDEX v ON t (a) TABLESPACE p",
+				"CREATE INDEX v ON t (a); DROP TABLE t",
+			};
+			static const char *const defaults[] = {
+				"ALTER VIEW other ALTER COLUMN v SET DEFAULT 1",
+				"ALTER VIEW t ALTER COLUMN other SET DEFAULT 1",
+				"ALTER VIEW t ALTER COLUMN v DROP DEFAULT",
+				"ALTER VIEW t OWNER TO g",
+				"ALTER TABLE t ALTER COLUMN v SET DEFAULT 1",
+				"ALTER VIEW t ALTER COLUMN v SET DEFAULT 1, ALTER COLUMN x SET DEFAULT 2",
+			};
+
+			for (int i = 0; i < lengthof(indexes); i++)
+			{
+				WsObject	x = {.kind = WS_OBJ_INDEX,.name = "v",.args = "t",.definition = (char *) indexes[i]};
+
+				expect_error(statement_of, &x, ERRCODE_DATA_CORRUPTED, NULL);
+			}
+			for (int i = 0; i < lengthof(defaults); i++)
+			{
+				WsObject	x = {.kind = WS_OBJ_DEFAULT,.name = "v",.args = "t",.definition = (char *) defaults[i]};
+
+				expect_error(statement_of, &x, ERRCODE_DATA_CORRUPTED, NULL);
+			}
+		}
 	}
 	{
 		static const char *const sequences[] = {
