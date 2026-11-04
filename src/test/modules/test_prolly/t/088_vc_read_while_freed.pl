@@ -78,6 +78,26 @@ is($reader->{stderr}, '', 'the read reads what it found');
 like($result, qr/^t\n/, 'a log');
 $reader->quit;
 
+# many at once, the same: a snapshot holds a chunk freed since, among those not
+my $main = $node->safe_psql('postgres',
+	q{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'vc/branch/main'});
+my $many = $node->background_psql('postgres');
+$many->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$many->query_safe('SELECT count(*) FROM pg_class');
+$node->safe_psql('postgres', q{
+	SELECT test_vc_commit('main', 'after that snapshot');
+	SELECT test_cs_free_unheld('pages');
+});
+is( $node->safe_psql('postgres', qq{SELECT test_cs_has('pages', decode('$main', 'hex'))}),
+	'f',
+	'the branch chunk that snapshot could see is freed');
+like(
+	$many->query_safe(
+		qq{SELECT (test_cs_get_many('pages', ARRAY[decode('$main', 'hex')]))[1] IS NOT NULL}),
+	qr/^t$/m,
+	'and a read of many under it finds it');
+$many->quit;
+
 # a later read, with a later snapshot, finds the branch as it is now
 like($node->safe_psql('postgres', q{SELECT test_vc_log('main')}), qr/\S/, 'and one after it');
 

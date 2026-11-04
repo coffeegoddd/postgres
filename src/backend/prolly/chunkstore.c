@@ -22,7 +22,6 @@
 #include "prolly/chunkstore.h"
 #include "prolly/registry.h"
 #include "storage/lmgr.h"
-#include "utils/snapmgr.h"
 
 static void
 register_stores(void)

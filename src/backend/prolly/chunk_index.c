@@ -254,11 +254,16 @@ chunk_readable(ChunkIndexEntry *e, Buffer buf, Snapshot snap, bool since)
 			return false;
 		if (TransactionIdIsCurrentTransactionId(e->xmin))
 			return true;
-		if (since ? TransactionIdIsInProgress(e->xmin) : XidInMVCCSnapshot(e->xmin, snap))
+		if (!since && XidInMVCCSnapshot(e->xmin, snap))
 			return false;
-		if (!(e->flags & CHUNK_ENTRY_COMMITTED) &&
-			!hinted_commit(e, buf, e->xmin, CHUNK_ENTRY_COMMITTED, CHUNK_ENTRY_ABORTED))
-			return false;
+		if (!(e->flags & CHUNK_ENTRY_COMMITTED))
+		{
+			/* (the flag first: this reads under the bucket's lock, each read) */
+			if (since && TransactionIdIsInProgress(e->xmin))
+				return false;
+			if (!hinted_commit(e, buf, e->xmin, CHUNK_ENTRY_COMMITTED, CHUNK_ENTRY_ABORTED))
+				return false;
+		}
 	}
 	if (!TransactionIdIsValid(e->xmax) || (e->flags & CHUNK_ENTRY_XMAX_ABORTED))
 		return true;

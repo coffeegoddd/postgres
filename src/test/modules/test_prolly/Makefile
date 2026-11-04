@@ -40,7 +40,7 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_holds chunk_reclaim chunk_compact chunk_abandoned \
 	history_pointers chunk_store_pages chunk_store_memory chunk_store_tier history_push chunk_pack_reclaim object_store_directory vc_cancel chunk_format
 ISOLATION = bmap_shared_writers chunk_index_put_wait chunk_roots_wait chunk_free_wait \
-	chunk_pack_put_wait chunk_vacuum_cancel chunk_pack_pins chunk_take_back chunk_hold chunk_run_seal chunk_free_order chunk_move history_push_inflight history_push_races
+	chunk_pack_put_wait chunk_vacuum_cancel chunk_pack_pins chunk_take_back chunk_hold chunk_run_seal chunk_free_order chunk_read_snapshot chunk_move history_push_inflight history_push_races
 REGRESS_OPTS = --temp-config=$(srcdir)/chunk_store.conf
 ISOLATION_OPTS = --temp-config=$(srcdir)/chunk_store_isolation.conf
 TAP_TESTS = 1

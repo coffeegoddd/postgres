@@ -25,7 +25,6 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "prolly/engine/vc.h"
-#include "utils/injection_point.h"
 #include "utils/builtins.h"
 #include "utils/injection_point.h"
 #include "utils/timestamp.h"

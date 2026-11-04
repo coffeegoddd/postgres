@@ -219,7 +219,9 @@ typedef struct ChunkIndexRoutine
 	 * in something it read at or after snap: its insert committed, whenever,
 	 * and its freeing not before snap.  What the name was found in held the
 	 * chunk when it was read, so its freeing came after snap, and the entry
-	 * and bytes stay while snap is held.  So this waits for nothing.
+	 * and bytes stay while snap is held.  So this waits for nothing.  It gives
+	 * the first such entry: one this transaction freed may still answer if an
+	 * older entry of the same chunk is there, the same bytes.
 	 */
 	bool		(*lookup_to_read) (Relation idx, const uint8 *hash,
 								   Snapshot snap, ChunkIndexEntry *out);

@@ -1,0 +1,238 @@
+Parsed test spec with 2 sessions
+
+starting permutation: r_begin f_free r_parent r_child r_has r_commit r_parent r_child
+test_chunk_put
+--------------
+t             
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) > 0 AS snapshot FROM pg_class;
+snapshot
+--------
+t       
+(1 row)
+
+step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+parent
+------
+t     
+(1 row)
+
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+\x0a 
+(1 row)
+
+step r_has: SELECT test_chunk_has('rs_l', 'rs_i', rs_h('\x0a')) AS has;
+has
+---
+f  
+(1 row)
+
+step r_commit: COMMIT;
+step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+parent
+------
+f     
+(1 row)
+
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+     
+(1 row)
+
+
+starting permutation: r_begin f_begin f_free r_parent r_child f_commit r_commit r_parent
+test_chunk_put
+--------------
+t             
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) > 0 AS snapshot FROM pg_class;
+snapshot
+--------
+t       
+(1 row)
+
+step f_begin: BEGIN;
+step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+parent
+------
+t     
+(1 row)
+
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+\x0a 
+(1 row)
+
+step f_commit: COMMIT;
+step r_commit: COMMIT;
+step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+parent
+------
+f     
+(1 row)
+
+
+starting permutation: f_begin f_free f_rollback r_parent r_child
+test_chunk_put
+--------------
+t             
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step f_begin: BEGIN;
+step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step f_rollback: ROLLBACK;
+step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+parent
+------
+t     
+(1 row)
+
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+\x0a 
+(1 row)
+
+
+starting permutation: r_begin r_free r_parent r_child r_commit
+test_chunk_put
+--------------
+t             
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) > 0 AS snapshot FROM pg_class;
+snapshot
+--------
+t       
+(1 row)
+
+step r_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step r_parent: SELECT test_chunk_get('rs_l', 'rs_i', rs_h(rs_parent())) IS NOT NULL AS parent;
+parent
+------
+f     
+(1 row)
+
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+     
+(1 row)
+
+step r_commit: COMMIT;
+
+starting permutation: r_begin f_free f_put r_child r_commit r_child
+test_chunk_put
+--------------
+t             
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) > 0 AS snapshot FROM pg_class;
+snapshot
+--------
+t       
+(1 row)
+
+step f_free: SELECT test_chunk_free('rs_l', 'rs_i', rs_h(rs_parent())) AS freed;
+freed
+-----
+    2
+(1 row)
+
+step f_put: SELECT test_chunk_put('rs_l', 'rs_i', rs_h('\x0a'), '\x0a') AS stored;
+stored
+------
+t     
+(1 row)
+
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+\x0a 
+(1 row)
+
+step r_commit: COMMIT;
+step r_child: SELECT test_chunk_get('rs_l', 'rs_i', rs_h('\x0a')) AS child;
+child
+-----
+\x0a 
+(1 row)
+

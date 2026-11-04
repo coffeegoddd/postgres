@@ -58,6 +58,7 @@ test_prolly_isolation = [
   'chunk_hold',
   'chunk_run_seal',
   'chunk_free_order',
+  'chunk_read_snapshot',
   'chunk_move',
   'history_push_inflight',
   'history_push_races',
