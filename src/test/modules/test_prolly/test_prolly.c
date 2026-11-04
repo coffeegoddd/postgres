@@ -61,6 +61,7 @@ static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_ws_row_suite,
 	&unit_ws_sql_suite,
 	&unit_ws_schema_suite,
+	&unit_ws_tags_suite,
 };
 
 static const ProllyConformanceSuite *const conformance_suites[] = {

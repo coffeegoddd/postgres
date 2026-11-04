@@ -22,6 +22,7 @@ OBJS = \
 	unit_ws_row.o \
 	unit_ws_schema.o \
 	unit_ws_sql.o \
+	unit_ws_tags.o \
 	vc_sql.o \
 	unit_bufmgr.o \
 	unit_harness.o \

@@ -72,6 +72,7 @@ extern const ProllyUnitSuite unit_engine_rewrite_suite;
 extern const ProllyUnitSuite unit_ws_row_suite;
 extern const ProllyUnitSuite unit_ws_sql_suite;
 extern const ProllyUnitSuite unit_ws_schema_suite;
+extern const ProllyUnitSuite unit_ws_tags_suite;
 extern const ProllyConformanceSuite conformance_test_checksum_suite;
 extern const ProllyConformanceSuite conformance_branch_ids_suite;
 extern const ProllyConformanceSuite conformance_branch_map_suite;
