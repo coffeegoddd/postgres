@@ -1872,6 +1872,18 @@ test_storage(void)
 				 "ALTER TABLE ONLY x.t ALTER b SET STATISTICS 0, ALTER b SET (n_distinct = '5')") == 0);
 	buf_free(&sql);
 
+	/* (each word as it says it, on a build with no lz4 too) */
+	{
+		WsColumn	words[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.storage = 'p',.compression = 'l'}};
+		WsTableSchema w = {.name = "t",.ncols = 1,.cols = words};
+		Buf			text = BUF_INIT;
+
+		ws_schema_create_table(&w, "x", &text);
+		buf_append_byte(&text, 0);
+		CHECK(strstr((char *) text.data, "a text STORAGE plain COMPRESSION lz4") != NULL);
+		buf_free(&text);
+	}
+
 	/* (none to give: nothing) */
 	{
 		WsTableSchema plain = {.name = "t",.ncols = 1,.cols = &cols[2]};
@@ -1914,6 +1926,7 @@ test_storage_problems(void)
 	CHECK(problem_has(one_column_problem(COL(), twice, 2), "not in order"));
 	CHECK(problem_has(one_column_problem(COL(), toastfirst, 2), "not in order"));
 	CHECK(one_column_problem(COL(.storage = 'x',.compression = 'l',.has_stattarget = true,.stattarget = 10000), &toasted, 1) == NULL);
+	CHECK(problem_has(one_column_problem(COL(), &toasted, WS_MAX_OPTIONS + 1), "no table has"));
 #undef COL
 	{
 		static const char zero[] =
@@ -1937,6 +1950,26 @@ test_storage_problems(void)
 		static const char saysnone[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x00";
+		static const char outorder[] =
+			"\x01" "\x01" "t" "\x02" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x08" "\x01" "b" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x08" "e" "\x00" "\x00" "\x00" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char dup[] =
+			"\x01" "\x01" "t" "\x02" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x08" "\x01" "b" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x02" "\x07" "e" "\x00" "\x00" "\x00" "\x07" "e" "\x00" "\x00" "\x00";
+		static const char coloptions[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x7f";
+		static const char toomany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "w" "\x81\x02";
+		static const char colmany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x81\x02";
+		static const char wrongorder[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "e" "\x00" "\x00" "\x00" "w" "\x01" "\x00" "\x01" "x" "\x01" "y";
 		static const char target[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\xff\x7f" "\x00";
@@ -1949,6 +1982,12 @@ test_storage_problems(void)
 		check_refused(absent, sizeof(absent) - 1, "does not have");
 		check_refused(saysnone, sizeof(saysnone) - 1, "saying it has none");
 		check_refused(target, sizeof(target) - 1, "out of range");
+		check_refused(outorder, sizeof(outorder) - 1, "not in attribute order");
+		check_refused(dup, sizeof(dup) - 1, "not in attribute order");
+		check_refused(coloptions, sizeof(coloptions) - 1, "more options than bytes");
+		check_refused(toomany, sizeof(toomany) - 1, "more options than a table has");
+		check_refused(colmany, sizeof(colmany) - 1, "more options than a table has");
+		check_refused(wrongorder, sizeof(wrongorder) - 1, "left over");
 	}
 }
 
@@ -1956,7 +1995,6 @@ typedef struct StorageAttack
 {
 	const char *def;
 	char		storage;
-	bool		settings;
 } StorageAttack;
 
 /* What a column's text could add to the statement, in place of what the record says. */
@@ -2024,7 +2062,7 @@ test_index_settings(void)
 		{.tag = 8,.opclass = "o.c",.order = 'd',.nulls = 'd'},
 		{.expr = "(@{7} + 1)",.order = 'd',.nulls = 'd'},
 	};
-	WsIndex		ix = {.name = "i",.method = "gist",.nkeys = 2,.keys = ikeys};
+	WsIndex		ix = {.name = "i",.method = "gist",.unique = true,.nkeys = 2,.keys = ikeys};
 	WsIndexSettings sets[] = {
 		{.index = "i",.noptions = 1,.options = ff,.nstats = 1,.stats = stats,.nkeyoptions = 1,.keyoptions = kopts},
 		{.index = "k",.ninclude = 1,.include = inc,.noptions = 1,.options = ff},
@@ -2068,7 +2106,7 @@ test_index_settings(void)
 	ws_schema_create_index(&s, 0, "x", &sql);
 	buf_append_byte(&sql, 0);
 	CHECK(strcmp((char *) sql.data,
-				 "CREATE INDEX i ON x.t USING gist (b o.c (siglen = '100'), ((a + 1))) WITH (fillfactor = '50')") == 0);
+				 "CREATE UNIQUE INDEX i ON x.t USING gist (b o.c (siglen = '100'), ((a + 1))) WITH (fillfactor = '50')") == 0);
 	buf_free(&sql);
 	sql = (Buf) BUF_INIT;
 	ws_schema_table_settings(&s, "x", &sql);
@@ -2122,9 +2160,10 @@ test_index_settings_problems(void)
 	CHECK(ws_schema_problem(&s) == NULL);
 	set.include = bad;
 	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	/* (Postgres takes a column twice in INCLUDE, and so does a record) */
 	set.ninclude = 2;
 	set.include = twice;
-	CHECK(problem_has(ws_schema_problem(&s), "column twice"));
+	CHECK(ws_schema_problem(&s) == NULL);
 	set.ninclude = 0;
 	set.noptions = 1;
 	set.options = &toast;
@@ -2132,31 +2171,101 @@ test_index_settings_problems(void)
 	set.options = &ff;
 	set.index = "i";
 	{
+		WsIndexStat notexpr[] = {{.column = 1,.target = 1}};
 		WsIndexStat out[] = {{.column = 0,.target = 1}};
 		WsIndexStat high[] = {{.column = 1,.target = 10001}};
 		WsIndexStat order[] = {{.column = 2,.target = 1}, {.column = 1,.target = 1}};
 
 		set.nstats = 1;
+		set.stats = notexpr;
+		CHECK(problem_has(ws_schema_problem(&s), "that is no expression"));
 		set.stats = out;
 		CHECK(problem_has(ws_schema_problem(&s), "no column"));
 		set.stats = high;
 		CHECK(problem_has(ws_schema_problem(&s), "out of range"));
-		set.nstats = 2;
-		set.stats = order;
-		CHECK(problem_has(ws_schema_problem(&s), "not in order"));
+		{
+			WsIndexKey	exprs[] = {
+				{.expr = "1",.order = 'd',.nulls = 'd'},
+				{.expr = "2",.order = 'd',.nulls = 'd'},
+			};
+
+			ix.keys = exprs;
+			ix.nkeys = 2;
+			set.nstats = 2;
+			set.stats = order;
+			CHECK(problem_has(ws_schema_problem(&s), "not in order"));
+			ix.keys = &ikey;
+			ix.nkeys = 1;
+		}
 		set.nstats = 0;
 	}
 	{
 		WsKeyOptions noclass = {.column = 1,.noptions = 1,.options = &ff};
+		WsIndexKey	classed[] = {
+			{.tag = 7,.opclass = "o.c",.order = 'd',.nulls = 'd'},
+			{.tag = 8,.opclass = "o.c",.order = 'd',.nulls = 'd'},
+		};
+		WsKeyOptions empty = {.column = 1};
+		WsKeyOptions toasted = {.column = 1,.noptions = 1,.options = &toast};
+		WsKeyOptions backwards[] = {
+			{.column = 2,.noptions = 1,.options = &ff},
+			{.column = 1,.noptions = 1,.options = &ff},
+		};
 
 		set.nkeyoptions = 1;
 		set.keyoptions = &noclass;
 		CHECK(problem_has(ws_schema_problem(&s), "no operator class"));
+		ix.keys = classed;
+		ix.nkeys = 2;
+		set.keyoptions = &empty;
+		CHECK(problem_has(ws_schema_problem(&s), "saying it has none"));
+		set.keyoptions = &toasted;
+		CHECK(problem_has(ws_schema_problem(&s), "of a TOAST table"));
+		set.nkeyoptions = 2;
+		set.keyoptions = backwards;
+		CHECK(problem_has(ws_schema_problem(&s), "not in order"));
 		set.nkeyoptions = 0;
+		ix.keys = &ikey;
+		ix.nkeys = 1;
 	}
 	s.key_initdeferred = true;
 	CHECK(problem_has(ws_schema_problem(&s), "initially deferred"));
 	s.key_initdeferred = false;
+	{
+		WsIndexSettings two[] = {{.index = "k",.noptions = 1,.options = &ff}, {.index = "i",.noptions = 1,.options = &ff}};
+		WsIndexSettings unnamed = {.noptions = 1,.options = &ff};
+		WsTableSchema t = s;
+
+		t.nindex_settings = 2;
+		t.index_settings = two;
+		CHECK(problem_has(ws_schema_problem(&t), "not in order"));
+		t.nindex_settings = 1;
+		t.index_settings = &unnamed;
+		CHECK(problem_has(ws_schema_problem(&t), "no name"));
+		t = s;
+		t.key_name = NULL;
+		t.nkey = 0;
+		t.nindex_settings = 0;
+		t.key_deferrable = true;
+		CHECK(problem_has(ws_schema_problem(&t), "with no key"));
+	}
+	{
+		/* a replica identity's index must be able to be one */
+		WsTableSchema t = s;
+
+		t.replica_identity = WS_REPLICA_INDEX;
+		t.replica_index = "i";
+		CHECK(problem_has(ws_schema_problem(&t), "not a unique one"));
+		ix.unique = true;
+		CHECK(ws_schema_problem(&t) == NULL);
+		ix.predicate = "true";
+		CHECK(problem_has(ws_schema_problem(&t), "a partial index"));
+		ix.predicate = NULL;
+		ix.unique = false;
+		t.replica_index = "k";
+		t.key_deferrable = true;
+		CHECK(problem_has(ws_schema_problem(&t), "deferrable"));
+	}
 	s.replica_identity = 'z';
 	CHECK(problem_has(ws_schema_problem(&s), "no known kind"));
 	s.replica_identity = WS_REPLICA_INDEX;
@@ -2206,6 +2315,70 @@ test_index_settings_problems(void)
 		check_refused(none, sizeof(none) - 1, "saying it has none");
 		check_refused(flags, sizeof(flags) - 1, "flags not known");
 	}
+	{
+		/* more settings than the decoder first makes room for */
+		WsIndexKey	k = {.tag = 8,.order = 'd',.nulls = 'd'};
+		WsIndex		many[40];
+		WsIndexSettings manysets[40];
+		char		names[40][8];
+		WsTableSchema t = {.name = "t",.ncols = 2,.cols = cols,.nindexes = 40,.indexes = many,
+		.nindex_settings = 40,.index_settings = manysets};
+		Buf			b = BUF_INIT;
+		WsTableSchema got;
+
+		memset(many, 0, sizeof(many));
+		memset(manysets, 0, sizeof(manysets));
+		for (int i = 0; i < 40; i++)
+		{
+			snprintf(names[i], sizeof(names[i]), "i%02d", i);
+			many[i].name = names[i];
+			many[i].method = "btree";
+			many[i].nkeys = 1;
+			many[i].keys = &k;
+			manysets[i].index = names[i];
+			manysets[i].noptions = 1;
+			manysets[i].options = &ff;
+		}
+		WsSchemaCodec->encode(&t, &b);
+		WsSchemaCodec->decode(b.data, b.len, &got);
+		CHECK_EQ(got.nindex_settings, 40);
+		for (int i = 0; i < 40; i++)
+			CHECK(strcmp(got.index_settings[i].index, names[i]) == 0);
+		ws_schema_free(&got);
+		buf_free(&b);
+	}
+}
+
+/* An exclusion's keys' parameters: in its statement, and telling two apart. */
+static void
+test_exclusion_key_options(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key = {.tag = 7,.opclass = "o.c",.order = 'd',.nulls = 'd',.op = "="};
+	WsOption	small = {.name = "siglen",.value = "1"};
+	WsOption	large = {.name = "siglen",.value = "2"};
+	WsKeyOptions kx = {.column = 1,.noptions = 1,.options = &small};
+	WsKeyOptions ky = {.column = 1,.noptions = 1,.options = &large};
+	WsConstraint cons[] = {
+		{.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,.excl = {.method = "gist",.nkeys = 1,.keys = &key}},
+		{.name = "y",.kind = WS_CONSTRAINT_EXCLUSION,.excl = {.method = "gist",.nkeys = 1,.keys = &key}},
+	};
+	WsIndexSettings sets[] = {
+		{.index = "x",.nkeyoptions = 1,.keyoptions = &kx},
+		{.index = "y",.nkeyoptions = 1,.keyoptions = &ky},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 2,.constraints = cons,
+	.nindex_settings = 2,.index_settings = sets};
+	Buf			b = BUF_INIT;
+
+	CHECK(ws_schema_problem(&s) == NULL);
+	ws_schema_create_table(&s, "z", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "(a o.c (siglen = '1') WITH OPERATOR(=))") != NULL);
+	CHECK(strstr((char *) b.data, "(a o.c (siglen = '2') WITH OPERATOR(=))") != NULL);
+	buf_free(&b);
+	sets[1].keyoptions = &kx;
+	CHECK(problem_has(ws_schema_problem(&s), "two exclusions alike"));
 }
 
 /* A column's not-null constraint's and sequence's names: what they must be. */
@@ -2839,6 +3012,7 @@ static const ProllyUnitTest tests[] = {
 	{"storage_quoted", test_storage_quoted},
 	{"index_settings", test_index_settings},
 	{"index_settings_problems", test_index_settings_problems},
+	{"exclusion_key_options", test_exclusion_key_options},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},

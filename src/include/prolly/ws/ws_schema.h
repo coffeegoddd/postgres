@@ -41,6 +41,9 @@ typedef struct WsOption
 	char	   *value;
 } WsOption;
 
+/* Far more than Postgres has of any kind: a record from anywhere could say more. */
+#define WS_MAX_OPTIONS 256
+
 #define WS_STORAGE_DEFAULT '\0'	/* the type's */
 #define WS_COMPRESSION_DEFAULT '\0'
 
@@ -224,8 +227,8 @@ typedef struct WsTableSchema
  * its own checks' and not-null constraints' names in order; storage parameters
  * named, valued and in order, a column's storage, compression and statistics
  * target known ones; an index's settings each for an index it has, in order, its
- * INCLUDE only on a key or unique constraint, its columns' parameters only on a key
- * with an operator class; a replica identity known, naming an index only by index,
+ * INCLUDE only on a key or unique constraint, its statistics targets only on
+ * expressions, its columns' parameters only on a key with an operator class; a replica identity known, naming an index only by index,
  * and a clustered index one it has.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
@@ -272,7 +275,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance or a partition or
  * partitioned table across schemas, a tablespace or another access method, a
- * sequence's, a default using one, a partition detached, of another identity
+ * TOAST table's parameters where no TOAST table is needed any more, a sequence's,
+ * a default using one, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
  * an index's dependence on an extension, comments, grants, two
@@ -314,6 +318,10 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * not given back.  A schema with a problem raises an error.  What an
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.
+  *
+ * A column's STORAGE plain is in this statement, before any rows.  A row made
+ * before that was set, too long to fit without TOAST, is refused when made again,
+ * as it is by restoring from pg_dump.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
 
@@ -363,7 +371,8 @@ extern void ws_schema_table_settings(const WsTableSchema *s, const char *schema,
 
 /*
  * The ALTER INDEX giving the nth of a table's index_settings its statistics
- * targets, in the named schema, appended to out, to run after its indexes; nothing,
+ * targets, in the named schema, appended to out, to run after its indexes and before
+ * it attaches anything: on a partitioned index, it reaches its partitions'.  Nothing,
  * if it has none.  Checked as the table's statement is.
  */
 extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out);
