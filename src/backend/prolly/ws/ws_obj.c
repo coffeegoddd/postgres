@@ -60,8 +60,10 @@ const WsObjectCodecRoutine *WsObjectCodec = &BinaryWsObjectCodec;
 #define OBJ_FLAGS (OBJ_AFTER_TABLES | OBJ_PUBLIC_REVOKED | OBJ_FIRES_DISABLED | OBJ_FIRES_REPLICA | OBJ_FIRES_ALWAYS)
 
 static const char *const kind_words[] = {
+	[WS_OBJ_DEFAULT] = "default",
 	[WS_OBJ_DOMAIN] = "domain",
 	[WS_OBJ_FUNCTION] = "function",
+	[WS_OBJ_INDEX] = "index",
 	[WS_OBJ_MATVIEW] = "matview",
 	[WS_OBJ_POLICY] = "policy",
 	[WS_OBJ_PROCEDURE] = "procedure",
@@ -73,8 +75,10 @@ static const char *const kind_words[] = {
 };
 
 static const char *const kind_sql[] = {
+	[WS_OBJ_DEFAULT] = "DEFAULT",
 	[WS_OBJ_DOMAIN] = "DOMAIN",
 	[WS_OBJ_FUNCTION] = "FUNCTION",
+	[WS_OBJ_INDEX] = "INDEX",
 	[WS_OBJ_MATVIEW] = "MATERIALIZED VIEW",
 	[WS_OBJ_POLICY] = "POLICY",
 	[WS_OBJ_PROCEDURE] = "PROCEDURE",
@@ -95,7 +99,8 @@ is_function(WsObjectKind kind)
 static bool
 is_of_table(WsObjectKind kind)
 {
-	return kind == WS_OBJ_TRIGGER || kind == WS_OBJ_RULE || kind == WS_OBJ_POLICY;
+	return kind == WS_OBJ_TRIGGER || kind == WS_OBJ_RULE || kind == WS_OBJ_POLICY ||
+		kind == WS_OBJ_INDEX || kind == WS_OBJ_DEFAULT;
 }
 
 static bool
@@ -601,8 +606,9 @@ static const char *const refusal_sql =
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace of its own' "
 "  WHEN c.relkind = 'm' AND c.relam <> (SELECT oid FROM pg_am WHERE amname = 'heap') "
 "    THEN 'it has another access method' "
-"  WHEN EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid) THEN 'it has an index' "
-"  WHEN EXISTS (SELECT 1 FROM pg_attrdef a WHERE a.adrelid = c.oid) THEN 'it has a default on a column' "
+"  WHEN EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid WHERE i.indrelid = c.oid "
+"      AND (i.indisclustered OR ic.reltablespace <> 0 OR NOT i.indisvalid OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = ic.oid "
+"        AND a.attstattarget >= 0))) THEN 'it has an index clustered on, in a tablespace, invalid or with its own statistics' "
 "  WHEN EXISTS (SELECT 1 FROM pg_statistic_ext s WHERE s.stxrelid = c.oid) THEN 'it has a statistics object' "
 "  WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 "
 "      AND (a.attstattarget >= 0 OR a.attoptions IS NOT NULL)) THEN 'it has settings on a column' "
@@ -697,6 +703,10 @@ relations_version(const char *schema)
 				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description "
 				"    FROM pg_description d JOIN pg_proc p ON p.oid = d.objoid JOIN pg_namespace n ON n.oid = p.pronamespace "
 				"    WHERE d.classoid = 'pg_proc'::regclass AND n.nspname = $1::name "
+				"  UNION ALL SELECT 'x' || i.indexrelid || ':' || i.xmin FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'w' || w.oid || ':' || w.xmin FROM pg_attrdef w JOIN pg_class c ON c.oid = w.adrelid "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'g' || g.oid || ':' || g.xmin FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'y' || y.oid || ':' || y.xmin FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid "
@@ -1887,6 +1897,18 @@ OF_TABLE_NEEDS("pg_rewrite", "w.oid")
 "  END FROM pg_rewrite w JOIN pg_class c ON c.oid = w.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace "
 "WHERE n.nspname = $1::name AND w.rulename <> '_RETURN' ORDER BY 1";
 
+static const char *const index_refusal_sql =
+"SELECT ic.relname::text, CASE "
+OF_TABLE_NEEDS("pg_class", "ic.oid")
+"  END FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class c ON c.oid = i.indrelid "
+"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind = 'm' ORDER BY 1";
+
+static const char *const default_refusal_sql =
+"SELECT a.attname::text, CASE "
+OF_TABLE_NEEDS("pg_attrdef", "ad.oid")
+"  END FROM pg_attrdef ad JOIN pg_class c ON c.oid = ad.adrelid JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind = 'v' ORDER BY 1";
+
 static const char *const policy_refusal_sql =
 "SELECT y.polname::text, CASE "
 "  WHEN EXISTS (SELECT 1 FROM unnest(y.polroles) u(o) JOIN pg_roles r ON r.oid = u.o WHERE r.rolcanlogin OR r.rolsuper "
@@ -1949,6 +1971,28 @@ check_of_table_is_portable(const char *name, const char *schema, const char *sql
 	else if (IsA(node, CreatePolicyStmt))
 		named = names_schema_walker(((CreatePolicyStmt *) node)->qual, &n) ||
 			names_schema_walker(((CreatePolicyStmt *) node)->with_check, &n);
+	else if (IsA(node, IndexStmt))
+	{
+		IndexStmt  *ix = (IndexStmt *) node;
+		ListCell   *lc;
+
+		named = names_schema_walker(ix->whereClause, &n);
+		foreach(lc, ix->indexParams)
+		{
+			IndexElem  *e = lfirst_node(IndexElem, lc);
+
+			named = named || names_schema_walker(e->expr, &n) || qualified(e->collation, NULL) ||
+				qualified(e->opclass, NULL);
+		}
+		foreach(lc, ix->indexIncludingParams)
+			named = named || names_schema_walker(lfirst_node(IndexElem, lc)->expr, &n);
+	}
+	else if (IsA(node, AlterTableStmt))
+	{
+		AlterTableCmd *cmd = linitial_node(AlterTableCmd, ((AlterTableStmt *) node)->cmds);
+
+		named = names_schema_walker(cmd->def, &n);
+	}
 	else
 		elog(ERROR, "\"%s\" printed as something else", name);
 	if (named)
@@ -2007,7 +2051,22 @@ of_table_statement(WsObjectKind kind, const char *schema, const char *oid, const
 
 	if (kind == WS_OBJ_POLICY)
 		return policy_statement(schema, oid, name, table, relid);
-	printed = printed_or_retry(schema, ws_schema_print(schema, kind == WS_OBJ_TRIGGER ? pg_get_triggerdef : pg_get_ruledef, 1,
+	if (kind == WS_OBJ_DEFAULT)
+	{
+		const char *params[1] = {oid};
+		WsSqlRows	rows;
+		char	   *expr;
+
+		WsSql->read("SELECT adbin::text FROM pg_attrdef WHERE oid = $1::oid", 1, params, &rows);
+		if (rows.nrows != 1)
+			printed_or_retry(schema, NULL);
+		expr = printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 0)),
+														ObjectIdGetDatum(relid), 0));
+		ws_sql_rows_free(&rows);
+		return psprintf("ALTER VIEW %s ALTER COLUMN %s SET DEFAULT %s", quote_identifier(table), quote_identifier(name), expr);
+	}
+	printed = printed_or_retry(schema, ws_schema_print(schema, kind == WS_OBJ_TRIGGER ? pg_get_triggerdef :
+													   kind == WS_OBJ_INDEX ? pg_get_indexdef : pg_get_ruledef, 1,
 													   ObjectIdGetDatum(atooid(oid)), 0, 0));
 	len = strlen(printed);
 	while (len > 0 && (printed[len - 1] == ';' || printed[len - 1] == '\n' || printed[len - 1] == ' '))
@@ -2040,7 +2099,8 @@ static WsObject *
 read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 {
 	const char *params[1] = {schema};
-	const char *catalog = kind == WS_OBJ_TRIGGER ? "pg_trigger" : kind == WS_OBJ_RULE ? "pg_rewrite" : "pg_policy";
+	const char *catalog = kind == WS_OBJ_TRIGGER ? "pg_trigger" : kind == WS_OBJ_RULE ? "pg_rewrite" :
+		kind == WS_OBJ_INDEX ? "pg_class" : kind == WS_OBJ_DEFAULT ? "pg_attrdef" : "pg_policy";
 	WsSqlRows	rows;
 
 	WsSql->read(kind == WS_OBJ_TRIGGER ?
@@ -2051,6 +2111,14 @@ read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 				"SELECT w.oid::text, w.rulename::text, c.relname::text, c.oid::text, c.relkind::text, w.ev_enabled::text FROM pg_rewrite w "
 				"JOIN pg_class c ON c.oid = w.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"WHERE n.nspname = $1::name AND w.rulename <> '_RETURN'" :
+				kind == WS_OBJ_INDEX ?
+				"SELECT i.indexrelid::text, ic.relname::text, c.relname::text, c.oid::text, c.relkind::text FROM pg_index i "
+				"JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class c ON c.oid = i.indrelid "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind = 'm'" :
+				kind == WS_OBJ_DEFAULT ?
+				"SELECT ad.oid::text, a.attname::text, c.relname::text, c.oid::text, c.relkind::text FROM pg_attrdef ad "
+				"JOIN pg_class c ON c.oid = ad.adrelid JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind = 'v'" :
 				"SELECT y.oid::text, y.polname::text, c.relname::text, c.oid::text, c.relkind::text FROM pg_policy y "
 				"JOIN pg_class c ON c.oid = y.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"WHERE n.nspname = $1::name", 1, params, &rows);
@@ -2339,7 +2407,7 @@ settle_phases(const char *schema, WsObject *objs, int n)
 	}
 	WsSql->read("WITH src(classid, objid) AS ( "
 				"  SELECT 'pg_attrdef'::regclass::oid, a.oid FROM pg_attrdef a JOIN pg_class c ON c.oid = a.adrelid "
-				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') "
 				"  UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') "
 				"  UNION ALL SELECT 'pg_class'::regclass::oid, i.indexrelid FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
@@ -2388,6 +2456,8 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_types(schema, trigger_clone_refusal_sql);
 	refuse_types(schema, rule_refusal_sql);
 	refuse_types(schema, policy_refusal_sql);
+	refuse_types(schema, index_refusal_sql);
+	refuse_types(schema, default_refusal_sql);
 
 	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, NULL::text, "
 				"  (SELECT string_agg(quote_ident(split_part(o, '=', 1)) || ' = ' || "
@@ -2452,6 +2522,8 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	objs = read_of_table(schema, WS_OBJ_TRIGGER, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_RULE, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_POLICY, objs, &total);
+	objs = read_of_table(schema, WS_OBJ_INDEX, objs, &total);
+	objs = read_of_table(schema, WS_OBJ_DEFAULT, objs, &total);
 	if (total > 1)
 		qsort(objs, total, sizeof(WsObject), object_cmp);
 	settle_phases(schema, objs, total);
@@ -2743,6 +2815,8 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 		case WS_OBJ_TRIGGER:
 		case WS_OBJ_RULE:
 		case WS_OBJ_POLICY:
+		case WS_OBJ_INDEX:
+		case WS_OBJ_DEFAULT:
 			{
 				char	   *table = ws_name_from_utf8(o->args);
 				RangeVar   *on = NULL;
@@ -2764,7 +2838,23 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 					on = ((CreatePolicyStmt *) node)->table;
 					made = ((CreatePolicyStmt *) node)->policy_name;
 				}
-				if (on == NULL || on->schemaname != NULL || on->catalogname != NULL ||
+				else if (node != NULL && o->kind == WS_OBJ_INDEX && IsA(node, IndexStmt) &&
+						 !((IndexStmt *) node)->concurrent && !((IndexStmt *) node)->if_not_exists &&
+						 ((IndexStmt *) node)->tableSpace == NULL)
+				{
+					on = ((IndexStmt *) node)->relation;
+					made = ((IndexStmt *) node)->idxname;
+				}
+				else if (node != NULL && o->kind == WS_OBJ_DEFAULT && IsA(node, AlterTableStmt) &&
+						 ((AlterTableStmt *) node)->objtype == OBJECT_VIEW && !((AlterTableStmt *) node)->missing_ok &&
+						 list_length(((AlterTableStmt *) node)->cmds) == 1 &&
+						 linitial_node(AlterTableCmd, ((AlterTableStmt *) node)->cmds)->subtype == AT_ColumnDefault &&
+						 linitial_node(AlterTableCmd, ((AlterTableStmt *) node)->cmds)->def != NULL)
+				{
+					on = ((AlterTableStmt *) node)->relation;
+					made = linitial_node(AlterTableCmd, ((AlterTableStmt *) node)->cmds)->name;
+				}
+				if (on == NULL || made == NULL || !on->inh || on->schemaname != NULL || on->catalogname != NULL ||
 					strcmp(on->relname, table) != 0 || strcmp(made, here) != 0)
 					not_the_object(o, "it is not one statement making it, on its table");
 				pfree(table);
@@ -2871,6 +2961,21 @@ ws_obj_comment_statement(const WsObject *o, int k, const char *schema, Buf *out)
 		elog(ERROR, "no comment %d", k);
 	c = &o->comments[k];
 	ws_put_text(out, "COMMENT ON ");
+	if (o->kind == WS_OBJ_INDEX)
+	{
+		char	   *here = ws_name_from_utf8(o->name);
+
+		ws_put_text(out, "INDEX ");
+		ws_put_identifier(out, schema);
+		ws_put_text(out, ".");
+		ws_put_identifier(out, here);
+		ws_put_text(out, " IS ");
+		text = ws_text_from_utf8(c->text);
+		ws_put_text(out, quote_literal_cstr(text));
+		pfree(text);
+		pfree(here);
+		return;
+	}
 	if (is_of_table(o->kind))
 	{
 		char	   *here = ws_name_from_utf8(o->name);
@@ -3153,11 +3258,14 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		ws_obj_create_statement(&objs[order[i]], schema, &sql);
 		run_statement(&sql);
 	}
-	/* (under the path still: a function's statements say its input types bare) */
+	/*
+	 * Comments first, all of them, as who restores may not own them once owners are
+	 * set: a relation's owner is its index's too.  Under the path still, as a function's
+	 * statements say its input types bare.
+	 */
 	for (int i = 0; i < n; i++)
 	{
 		const WsObject *o = &objs[order[i]];
-		Buf			owner = BUF_INIT;
 
 		if (ws_obj_before_tables(o) != before_tables)
 			continue;
@@ -3168,6 +3276,14 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 			ws_obj_comment_statement(o, k, schema, &sql);
 			run_statement(&sql);
 		}
+	}
+	for (int i = 0; i < n; i++)
+	{
+		const WsObject *o = &objs[order[i]];
+		Buf			owner = BUF_INIT;
+
+		if (ws_obj_before_tables(o) != before_tables)
+			continue;
 		ws_obj_owner_statement(o, schema, &owner);
 		if (owner.len > 0)
 			run_statement(&owner);

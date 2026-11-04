@@ -14,7 +14,7 @@
  * written with its schema's name, being named as something in the catalogs is.
  *
  * A trigger, rule or policy is of its table, whose name is in its key, and has no owner
- * or grants of its own.
+ * or grants of its own, as is a materialized view's index and a view column's default.
  *
  * What is made before an object is named rather than found by trying, as the order
  * of a restore must not depend on what fails.
@@ -42,8 +42,10 @@
 
 typedef enum WsObjectKind
 {
+	WS_OBJ_DEFAULT,				/* a view column's: its name, and its view */
 	WS_OBJ_DOMAIN,
 	WS_OBJ_FUNCTION,
+	WS_OBJ_INDEX,				/* a materialized view's: a table's is in its record */
 	WS_OBJ_MATVIEW,
 	WS_OBJ_POLICY,
 	WS_OBJ_PROCEDURE,

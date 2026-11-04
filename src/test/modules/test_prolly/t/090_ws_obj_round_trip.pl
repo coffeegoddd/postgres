@@ -99,8 +99,6 @@ $node->safe_psql('postgres', q{DROP MATERIALIZED VIEW "S rc".m_runs; DROP FUNCTI
 # what a commit cannot hold is refused by name, nothing left out in silence
 my @refused = (
 	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int); GRANT SELECT ON public.o TO g_owner', 'DROP TABLE public.o CASCADE' ],
-	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
-	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
 	[ q{CREATE TABLE pg_class (x int); CREATE VIEW r_shadow AS SELECT x FROM "S rc".pg_class}, "say a schema's name", undef, 'DROP TABLE "S rc".pg_class CASCADE' ],
 	[ q{CREATE TABLE "text" (x int); CREATE VIEW r_rowtype AS SELECT NULL::"S rc"."text" AS y}, "say a schema's name", undef, 'DROP TABLE "S rc"."text" CASCADE' ],
 	[ q{CREATE VIEW r_nsp AS SELECT '"S rc"'::regnamespace AS n}, 'no commit holds yet', undef, 'DROP VIEW "S rc".r_nsp' ],
@@ -859,6 +857,101 @@ for my $change (q{COMMENT ON POLICY mine ON tr.t IS 'later'}, q{COMMENT ON TRIGG
 	$old->query(q{SELECT test_ws_obj_bytes('tr')});
 	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
 	$old->quit;
+}
+
+# a materialized view's indexes and a view's column defaults
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_veowner NOLOGIN;
+	CREATE SCHEMA ve AUTHORIZATION g_veowner;
+	SET ROLE g_veowner;
+	SET search_path = ve;
+	CREATE FUNCTION vf(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+	CREATE TABLE t (a integer, b text);
+	CREATE MATERIALIZED VIEW m AS SELECT a, b FROM t WITH NO DATA;
+	CREATE UNIQUE INDEX m_a ON m (a);
+	CREATE INDEX "Odd ix" ON m USING btree (b COLLATE "C" text_pattern_ops DESC NULLS LAST) INCLUDE (a) WITH (fillfactor = 50) WHERE a > 0;
+	CREATE INDEX m_expr ON m (vf(a));
+	COMMENT ON INDEX m_a IS 'an index';
+	CREATE VIEW v AS SELECT a, b FROM t;
+	ALTER VIEW v ALTER COLUMN a SET DEFAULT 7;
+	ALTER VIEW v ALTER COLUMN b SET DEFAULT 'it''s @ here';
+});
+my $ve_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ve')});
+my %ve_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $ve_held;
+ok($ve_val{$_}, "$_ is held") for ('index/m_a(m)', 'index/Odd ix(m)', 'index/m_expr(m)', 'default/a(v)', 'default/b(v)');
+unlike(join('', values %ve_val), qr/\bve\./, 'none names its schema');
+like($ve_val{'index/m_a(m)'}, qr/matview\/m/, 'an index needs its materialized view');
+like($ve_val{'index/m_expr(m)'}, qr/function\/vf\(integer\)/, 'and what it calls');
+like($ve_val{'default/a(v)'}, qr/view\/v/, 'and a default its view');
+like($ve_val{'index/m_a(m)'}, qr/an index/, 'an index has its comment');
+like($ve_val{'default/b(v)'}, qr/it''s @@ here/, 'with its @ doubled');
+
+$node->safe_psql('postgres', q{CREATE SCHEMA ve2 AUTHORIZATION g_veowner; SET ROLE g_veowner; CREATE TABLE ve2.t (a integer, b text)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ve', 've2')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ve2')}), $ve_held, 'the same bytes restored');
+my $ve_dump = sub {
+	my ($s) = @_;
+	my $out = $node->safe_psql('postgres', qq{SELECT string_agg(x, E'\\n' ORDER BY x) FROM (
+		SELECT pg_get_indexdef(i.indexrelid) AS x FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid WHERE c.relnamespace = '$s'::regnamespace AND c.relkind = 'm'
+		UNION ALL SELECT a.attname || ' ' || pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid
+			JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE c.relnamespace = '$s'::regnamespace AND c.relkind = 'v') y});
+	$out =~ s/\b\Q$s\E\.//g;
+	return $out;
+};
+is($ve_dump->('ve2'), $ve_dump->('ve'), 'the same by the catalogs');
+
+# a view default on a function needing a view is no table's need
+$node->safe_psql('postgres', q{CREATE SCHEMA ve6 AUTHORIZATION g_veowner; SET ROLE g_veowner; SET search_path = ve6;
+	CREATE TABLE t (a integer); CREATE VIEW v AS SELECT a FROM t; CREATE VIEW w AS SELECT 1 AS x;
+	CREATE FUNCTION f() RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT x FROM w; END;
+	ALTER VIEW v ALTER COLUMN a SET DEFAULT f()});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ve6')}), qr/^default\/a\(v\)\t/m, 'a default on a function that needs a view is held');
+
+# comments go before owners: who restores may not own an index by the time of its own
+$node->safe_psql('postgres', q{CREATE ROLE g_ve_noinherit NOLOGIN; GRANT g_veowner TO g_ve_noinherit WITH INHERIT FALSE, SET TRUE;
+	CREATE SCHEMA ve7 AUTHORIZATION g_veowner; GRANT CREATE, USAGE ON SCHEMA ve7 TO g_ve_noinherit;
+	CREATE SCHEMA ve8 AUTHORIZATION g_veowner; GRANT USAGE ON SCHEMA ve8 TO g_ve_noinherit;
+	SET ROLE g_veowner; CREATE TABLE ve8.t (a integer); CREATE MATERIALIZED VIEW ve8.m AS SELECT a FROM ve8.t WITH NO DATA; CREATE INDEX i ON ve8.m (a); COMMENT ON INDEX ve8.i IS 'on it';
+	GRANT SELECT ON ve8.t TO g_ve_noinherit; CREATE TABLE ve7.t (a integer); GRANT SELECT ON ve7.t TO g_ve_noinherit});
+is($node->psql('postgres', q{SET ROLE g_ve_noinherit; SELECT test_ws_obj_copy('ve8', 've7')}), 0, 'a restorer with SET and no INHERIT on the owner can comment on an index');
+is($node->safe_psql('postgres', q{SELECT obj_description('ve7.i'::regclass, 'pg_class')}), 'on it', 'and the comment arrives');
+
+# since a snapshot, one to try again
+for my $change (q{ALTER VIEW ve.v ALTER COLUMN a SET DEFAULT 8}, q{ALTER INDEX ve.m_a SET (fillfactor = 60)}, q{COMMENT ON INDEX ve.m_a IS 'later'})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('ve')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+
+my @ve_refused = (
+	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE UNIQUE INDEX ix ON m (a); CLUSTER m USING ix}, 'clustered' ],
+	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (public.ve_else(a))}, 'another schema' ],
+	[ q{CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; ALTER VIEW v ALTER COLUMN a SET DEFAULT public.ve_else(1)}, 'another schema' ],
+	[ q{CREATE COLLATION mine FROM "C"; CREATE TABLE t (a text); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (a COLLATE mine)}, 'no commit holds yet' ],
+	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m ((a + 1)); ALTER INDEX ix ALTER COLUMN 1 SET STATISTICS 5}, 'its own statistics' ],
+	[ q{CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (a) TABLESPACE ve_ts}, 'in a tablespace' ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE TABLE t (a int); CREATE MATERIALIZED VIEW m AS SELECT a FROM t; CREATE INDEX ix ON m (a) WHERE 'a'::ve5."date" IS NOT NULL}, "say a schema's name" ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; ALTER VIEW v ALTER COLUMN a SET DEFAULT ('a'::ve5."date" IS NOT NULL)::int}, "say a schema's name" ],
+);
+$node->safe_psql('postgres', q{CREATE FUNCTION public.ve_else(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1'});
+{
+	my $ts_dir = PostgreSQL::Test::Utils::tempdir();
+	$node->safe_psql('postgres', qq{CREATE TABLESPACE ve_ts LOCATION '$ts_dir'});
+}
+for my $case (@ve_refused)
+{
+	my ($sql, $why) = @$case;
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS ve5 CASCADE; CREATE SCHEMA ve5; CREATE ROLE g_ve5 NOLOGIN; ALTER SCHEMA ve5 OWNER TO g_ve5; SET search_path = ve5; $sql; ALTER MATERIALIZED VIEW IF EXISTS ve5.m OWNER TO g_ve5; ALTER VIEW IF EXISTS ve5.v OWNER TO g_ve5});
+	my ($rc7, $out7, $err7) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('ve5')});
+	isnt($rc7, 0, "refused: $sql");
+	like($err7, qr/\Q$why\E/, "for why: $sql");
+	$node->safe_psql('postgres', q{DROP SCHEMA ve5 CASCADE; DROP ROLE g_ve5});
 }
 
 $node->stop;
