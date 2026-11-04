@@ -1039,7 +1039,7 @@ $node->safe_psql('postgres', q{
 		my $old = $node->background_psql('postgres', on_error_stop => 0);
 		$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 		$old->query_safe('SELECT count(*) FROM pg_class');
-		$node->safe_psql('postgres', q{CREATE SCHEMA dprr VERSIONED; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO rg_read});
+		$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO rg_read});
 		$old->query(qq{SELECT test_ws_schema_create(decode('$plain', 'hex'), 'gl_dst')});
 		like($old->{stderr}, qr/default privileges would change what is made/, 'defaults since this transaction\'s snapshot refused too');
 		$old->query('ROLLBACK');
