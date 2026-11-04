@@ -2147,12 +2147,47 @@ for my $case (
 	[ q{CREATE TABLE nm3.r11 (a nm3.serial[])}, 'r11', 'an array of a type named as a serial is' ],
 	[ q{CREATE TABLE nm3.r12 (a regnamespace) PARTITION BY LIST (a)}, 'r12', 'a partition key whose values are names' ],
 	[ q{CREATE TYPE nm3.holds AS (r regclass); CREATE TABLE nm3.r13 (a nm3.holds DEFAULT '(pg_class)'::nm3.holds)}, 'r13', 'a constant of a composite holding names' ],
+	[ q{CREATE TABLE nm3.r15 (a nm3.holds[] DEFAULT '{}')}, 'r15', 'a default of an array of a composite holding names' ],
+	[ q{CREATE TYPE nm3.holds2 AS (h nm3.holds); CREATE TABLE nm3.r16 (a nm3.holds2 DEFAULT '("(pg_class)")')}, 'r16', 'a default of a composite of one' ],
+	[ q{CREATE DOMAIN nm3.dreg AS regnamespace; CREATE TABLE nm3.r17 (a nm3.dreg) PARTITION BY LIST (a)}, 'r17', 'a partition key of a domain over a reg* type' ],
+	[ q{CREATE TABLE nm3.r18 (a oid) PARTITION BY LIST ((a::regnamespace))}, 'r18', 'a partition key by an expression of a reg* type' ],
 	[ q{CREATE OPERATOR CLASS nm3.int4_ops FOR TYPE integer USING btree AS OPERATOR 3 =, FUNCTION 1 btint4cmp(integer, integer); CREATE TABLE nm3.r14 (a integer); CREATE INDEX ON nm3.r14 (a nm3.int4_ops)}, 'r14', 'an index key of an opclass named as a catalog opclass is' ])
 {
 	my ($sql, $table, $what) = @$case;
 	$node->safe_psql('postgres', $sql);
 	my ($rc, $out, $err) = $node->psql('postgres', "SELECT test_ws_schema_bytes('nm3', '$table')");
 	like($err, qr/table "$table" in schema "nm3" cannot be held in a commit: it must say its schema's name/, "$what is refused");
+}
+
+# a column holding names is no constant, with none to say them in
+$node->safe_psql('postgres', q{CREATE TYPE nm2.holds AS (r regclass); CREATE TABLE nm2.plain_holds (p nm2.holds)});
+isnt($bytes->($node, 'postgres', 'plain_holds', undef, 'nm2'), '', 'a column of a composite holding names, with no constant, is held');
+
+# a collation dropped since a snapshot is one to try again
+$node->safe_psql('postgres', q{CREATE COLLATION nm2.gone FROM "C"; CREATE TABLE nm2.coll_gone (a text COLLATE nm2.gone)});
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', q{ALTER TABLE nm2.coll_gone ALTER a TYPE text COLLATE "C"; DROP COLLATION nm2.gone});
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_schema_bytes('nm2', 'coll_gone')});
+	like($old->{stderr}, qr/a collation has been dropped since|changed|renamed, retyped/, 'a collation gone since the snapshot is to be tried again');
+	unlike($old->{stderr}, qr/cache lookup failed/, 'with no internal error');
+	$old->quit;
+}
+
+# a schema's name too long in UTF8 is no matter, as no record holds it
+$node->safe_psql('postgres', q{CREATE DATABASE lat_names TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+{
+	my $lat_branch = $prepare->('lat_names');
+	local $ENV{PGOPTIONS} = "-c catalog_branch=$lat_branch";
+	$node->safe_psql('lat_names', q{DO $$ BEGIN
+		EXECUTE format('CREATE SCHEMA %I VERSIONED', repeat(chr(233), 40));
+		EXECUTE format('CREATE TABLE %I.t (a integer)', repeat(chr(233), 40));
+	END $$});
+	isnt($node->safe_psql('lat_names', q{SELECT encode(test_ws_schema_bytes(repeat(chr(233), 40), 't'), 'hex')}), '',
+		'a long schema name in another encoding does not stop its table being held');
 }
 
 # a quoted schema, in a constant

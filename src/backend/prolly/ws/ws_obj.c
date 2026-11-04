@@ -795,8 +795,9 @@ names_schema_walker(Node *node, void *arg)
 					const char *value = strVal(&((A_Const *) c->arg)->val);
 
 					named = string_is_qualified(value, n->only) ||
-						(strcmp(type, "regnamespace") == 0 && n->only != NULL &&
-						 (strcmp(value, n->only) == 0 || strcmp(value, quote_identifier(n->only)) == 0));
+						(strcmp(type, "regnamespace") == 0 &&
+						 (n->only != NULL ? (strcmp(value, n->only) == 0 || strcmp(value, quote_identifier(n->only)) == 0) :
+						  strcmp(value, "pg_catalog") != 0));
 				}
 				break;
 			}
@@ -961,6 +962,27 @@ read_deps(WsObject *o, const char *oid, const char *source)
 	}
 	if (o->ndeps > 1)
 		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
+	ws_sql_rows_free(&rows);
+}
+
+/*
+ * Refuses an object whose text may have a constant of a type holding names (of the
+ * types a query gives): such a constant is one string no grammar sees into, so it
+ * could name the schema there.
+ */
+static void
+check_constants_hold_no_names(const char *name, const char *schema, const char *oid, const char *types)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->read(types, 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_type_holds_names(atooid(ws_sql_value(&rows, i, 0))))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: a constant of it may hold names no grammar reads",
+							name, schema)));
 	ws_sql_rows_free(&rows);
 }
 
@@ -1224,13 +1246,28 @@ check_type_is_portable(const char *name, const char *schema, const char *head, c
 }
 
 /*
+ * What a printing function gives, which is nothing for what was dropped since this
+ * read's snapshot: to try again, as what a read overtaken ends with anyway.
+ */
+static char *
+printed_or_retry(const char *schema, char *printed)
+{
+	if (printed == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": it changed while it was being read", schema)));
+	return printed;
+}
+
+/*
  * A type as the statement says it, printed under the schema's path, as nothing else
  * here runs: what is in the schema is not named.
  */
 static char *
 print_type(const char *schema, Oid typid, int32 typmod)
 {
-	return ws_schema_print(schema, format_type, 2, ObjectIdGetDatum(typid), Int32GetDatum(typmod), 0);
+	return printed_or_retry(schema, ws_schema_print(schema, format_type, 2, ObjectIdGetDatum(typid),
+													Int32GetDatum(typmod), 0));
 }
 
 /* The statement after its name of a type of each kind, into text. */
@@ -1306,9 +1343,9 @@ type_definition(const char *schema, char typtype, const char *oid, Buf *text)
 				if (ws_sql_value(&rows, 0, 3) != NULL)
 				{
 					ws_put_text(text, " DEFAULT ");
-					ws_put_text(text, ws_schema_print(schema, pg_get_expr, 2,
-													  CStringGetTextDatum(ws_sql_value(&rows, 0, 3)),
-													  ObjectIdGetDatum(InvalidOid), 0));
+					ws_put_text(text, printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2,
+																			   CStringGetTextDatum(ws_sql_value(&rows, 0, 3)),
+																			   ObjectIdGetDatum(InvalidOid), 0)));
 				}
 				WsSql->read("SELECT quote_ident(conname), oid::text FROM pg_constraint WHERE contypid = $1::oid "
 							"ORDER BY conname", 1, params, &cons);
@@ -1317,8 +1354,9 @@ type_definition(const char *schema, char typtype, const char *oid, Buf *text)
 					ws_put_text(text, " CONSTRAINT ");
 					ws_put_text(text, ws_sql_value(&cons, i, 0));
 					ws_put_text(text, " ");
-					ws_put_text(text, ws_schema_print(schema, pg_get_constraintdef, 1,
-													  ObjectIdGetDatum(atooid(ws_sql_value(&cons, i, 1))), 0, 0));
+					INJECTION_POINT("ws-obj-print-constraint", NULL);
+					ws_put_text(text, printed_or_retry(schema, ws_schema_print(schema, pg_get_constraintdef, 1,
+																			   ObjectIdGetDatum(atooid(ws_sql_value(&cons, i, 1))), 0, 0)));
 				}
 				ws_sql_rows_free(&cons);
 				break;
@@ -1462,6 +1500,12 @@ read_types(const char *schema, WsObject *objs, int *n)
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
 		buf_free(&text);
+		if (typtype == 'd')
+			check_constants_hold_no_names(name, schema, oid,
+										  "SELECT typbasetype::text FROM pg_type WHERE oid = $1::oid "
+										  "  AND (typdefaultbin IS NOT NULL OR EXISTS (SELECT 1 FROM pg_constraint WHERE contypid = $1::oid AND contype = 'c')) "
+										  "UNION SELECT d.refobjid::text FROM pg_constraint c JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass "
+										  "  AND d.objid = c.oid WHERE c.contypid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
 		read_deps(o, oid, TYPE_SOURCE_OF("$1::oid"));
 		read_type_comments(o, oid);
 		read_type_owner_and_grants(o, oid, name);
@@ -1498,8 +1542,9 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		const char *oid = ws_sql_value(&rels, i, 0);
 		bool		matview = ws_sql_value(&rels, i, 1)[0] == 'm';
 		const char *name = ws_sql_value(&rels, i, 2);
-		char	   *viewdef = ws_schema_print(schema, pg_get_viewdef_ext, 2, ObjectIdGetDatum(atooid(oid)),
-											  BoolGetDatum(false), 0);
+		char	   *viewdef = printed_or_retry(schema, ws_schema_print(schema, pg_get_viewdef_ext, 2,
+																	   ObjectIdGetDatum(atooid(oid)),
+																	   BoolGetDatum(false), 0));
 		const char *options = ws_sql_value(&rels, i, 4);
 		Buf			text = BUF_INIT;
 		Buf			stored = BUF_INIT;
@@ -1534,6 +1579,9 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
 		buf_free(&text);
+		check_constants_hold_no_names(name, schema, oid,
+									  "SELECT d.refobjid::text FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass "
+									  "AND d.objid = r.oid WHERE r.ev_class = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
 		read_deps(o, oid, "SELECT 'pg_rewrite'::regclass::oid, oid FROM pg_rewrite WHERE ev_class = $1::oid");
 		read_comments(o, oid);
 		read_owner_and_grants(o, oid, name);

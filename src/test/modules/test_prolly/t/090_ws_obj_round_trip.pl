@@ -409,6 +409,17 @@ my %tyc_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/,
 like($tyc_val{'type/c'}, qr/AS \(x integer, y e\)/, 'a type is not captured by a function of its schema');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM tyc.ran'), '0', 'and runs none of them');
 
+# a domain whose constant could hold names says so; one naming a schema is refused
+for my $case (
+	[ q{CREATE DOMAIN tyh.dn AS regnamespace DEFAULT 'tyh'::regnamespace}, "say a schema's name" ],
+	[ q{CREATE TYPE tyh.holds AS (r regclass); CREATE DOMAIN tyh.dh AS tyh.holds DEFAULT '(pg_class)'}, 'may hold names' ])
+{
+	my ($sql, $why) = @$case;
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS tyh CASCADE; CREATE SCHEMA tyh; $sql});
+	my ($rc3, $out3, $err3) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('tyh')});
+	like($err3, qr/\Q$why\E/, "refused: $sql");
+}
+
 # a long name's multirange is as CREATE TYPE names it, and held
 for my $long ('b' x 55, 'c' x 63)
 {
@@ -444,6 +455,20 @@ if ($ENV{enable_injection_points} eq 'yes' && $node->check_extension('injection_
 	like($reader2->{stderr}, qr/it changed while it was being read/, 'a read overtaken by a rename is to be tried again');
 	$reader2->quit;
 	$node->safe_psql('postgres', q{ALTER TYPE ty.z_mood2 RENAME TO z_mood});
+
+	# a constraint gone by when it is printed: not a crash, a read to try again
+	$node->safe_psql('postgres', q{CREATE SCHEMA tyg; CREATE DOMAIN tyg.d AS integer CONSTRAINT zz CHECK (VALUE > 0);
+		SELECT injection_points_attach('ws-obj-print-constraint', 'wait')});
+	my $reader3 = $node->background_psql('postgres', on_error_stop => 0);
+	$reader3->query_until(qr/reading/, "\\echo reading\nSELECT test_ws_obj_bytes('tyg');\n\\echo done\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event = 'ws-obj-print-constraint'}) or die 'no reader';
+	$node->safe_psql('postgres', q{ALTER DOMAIN tyg.d DROP CONSTRAINT zz;
+		SELECT injection_points_wakeup('ws-obj-print-constraint');
+		SELECT injection_points_detach('ws-obj-print-constraint');});
+	$reader3->query_until(qr/finished/, "\\echo finished\n");
+	like($reader3->{stderr}, qr/it changed while it was being read/, 'a constraint dropped mid-read is a read to try again');
+	$reader3->quit;
+	is($node->safe_psql('postgres', 'SELECT 1'), '1', 'and the server is still up');
 }
 
 # a type whose owner cannot travel goes to who restores it, unlike a view

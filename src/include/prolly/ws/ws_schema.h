@@ -506,6 +506,12 @@ extern void ws_schema_path_end(int nest);
  */
 extern char *ws_schema_print(const char *schema, PGFunction fn, int nargs, Datum a, Datum b, Datum c);
 
+/*
+ * Whether a constant of a type may hold a name in a string no grammar sees into: an
+ * array of a reg* type, a domain over one or a composite with one in it, however deep.
+ */
+extern bool ws_type_holds_names(Oid typid);
+
 /* Raises ERRCODE_INSUFFICIENT_PRIVILEGE without USAGE on the schema. */
 extern void ws_schema_check_usage(const char *schema);
 

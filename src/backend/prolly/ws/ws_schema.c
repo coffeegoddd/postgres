@@ -62,6 +62,7 @@
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
@@ -4556,6 +4557,75 @@ type_means_something_else(const char *type)
 }
 
 /*
+ * Whether a value of a type holds a name, however deep: a reg* type itself, an array
+ * of one, a domain over one, or a composite with such a field, not looked into by
+ * anything that reads an expression.  A scalar reg* constant is another matter,
+ * which the grammar sees: the caller says which it means by which it asks of.
+ */
+static bool
+is_reg_type_oid(Oid typid)
+{
+	switch (typid)
+	{
+		case REGCLASSOID:
+		case REGCOLLATIONOID:
+		case REGCONFIGOID:
+		case REGDATABASEOID:
+		case REGDICTIONARYOID:
+		case REGNAMESPACEOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGROLEOID:
+		case REGTYPEOID:
+			return true;
+	}
+	return false;
+}
+
+static bool
+holds_names(Oid typid, int depth)
+{
+	Oid			element;
+	Oid			relid;
+
+	check_stack_depth();
+	if (is_reg_type_oid(typid))
+		return true;
+	if (depth > 64)
+		return true;
+	if (get_typtype(typid) == TYPTYPE_DOMAIN)
+		return holds_names(getBaseType(typid), depth + 1);
+	element = get_element_type(typid);
+	if (OidIsValid(element))
+		return holds_names(element, depth + 1);
+	relid = get_typ_typrelid(typid);
+	if (OidIsValid(relid))
+		for (AttrNumber a = 1;; a++)
+		{
+			HeapTuple	tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(a));
+			bool		found;
+
+			if (!HeapTupleIsValid(tup))
+				break;
+			found = !((Form_pg_attribute) GETSTRUCT(tup))->attisdropped &&
+				holds_names(((Form_pg_attribute) GETSTRUCT(tup))->atttypid, depth + 1);
+			ReleaseSysCache(tup);
+			if (found)
+				return true;
+		}
+	return false;
+}
+
+bool
+ws_type_holds_names(Oid typid)
+{
+	/* (a scalar reg* constant the grammar does see into) */
+	return !is_reg_type_oid(typid) && holds_names(typid, 0);
+}
+
+/*
  * Refuses what a table's expressions need of its schema with a name the catalogs also
  * have: printed bare, in a schema without it, it would quietly mean theirs instead.
  */
@@ -4580,20 +4650,26 @@ check_catalog_named_needs(const char *schema, const char *table, const char *oid
 				"JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid "
 				"WHERE o.oprnamespace = (SELECT relnamespace FROM own) AND EXISTS (SELECT 1 FROM pg_operator c "
 				"  WHERE c.oprname = o.oprname AND c.oprnamespace = 'pg_catalog'::regnamespace) "
-				/* (a constant of a composite holding names says them in its text) */
-				"UNION ALL SELECT 1 FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
-				"JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
-				"JOIN pg_attribute a ON a.attrelid = t.typrelid AND t.typrelid <> 0 AND NOT a.attisdropped "
-				"JOIN pg_type f ON f.oid = a.atttypid "
-				"WHERE t.typnamespace = (SELECT relnamespace FROM own) AND f.typnamespace = 'pg_catalog'::regnamespace "
-				"  AND coalesce((SELECT e.typname FROM pg_type e WHERE e.oid = f.typelem AND e.typarray = f.oid), f.typname) IN "
-				"    ('regclass', 'regcollation', 'regconfig', 'regdatabase', 'regdictionary', 'regnamespace', 'regoper', "
-				"     'regoperator', 'regproc', 'regprocedure', 'regrole', 'regtype') LIMIT 1",
+				"LIMIT 1",
 				1, params, &rows);
 	found = rows.nrows > 0;
 	ws_sql_rows_free(&rows);
 	if (found)
 		says_its_schema(schema, table);
+
+	/* (a column's type is no constant: only what its expressions name, not its row) */
+	WsSql->read("WITH src(classid, objid) AS ( "
+				"  SELECT 'pg_attrdef'::regclass::oid, oid FROM pg_attrdef WHERE adrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_constraint'::regclass::oid, oid FROM pg_constraint WHERE conrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_class'::regclass::oid, indexrelid FROM pg_index WHERE indrelid = $1::oid) "
+				"SELECT DISTINCT d.refobjid::text FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
+				"WHERE d.refclassid = 'pg_type'::regclass "
+				"UNION SELECT a.atttypid::text FROM pg_attrdef ad JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+				"WHERE ad.adrelid = $1::oid", 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_type_holds_names(atooid(ws_sql_value(&rows, i, 0))))
+			says_its_schema(schema, table);
+	ws_sql_rows_free(&rows);
 }
 
 /* The record's names that are not in an expression, which what read those has checked. */
@@ -4614,13 +4690,6 @@ check_record_says_no_schema(const WsTableSchema *s, const char *in_commit, const
 	for (int k = 0; k < s->npartition; k++)
 	{
 		check_key_says_no_schema(&s->partition_keys[k], in_commit, schema, table);
-
-		/* (its partitions' bounds would hold names, in values no grammar reads) */
-		if (s->partition_keys[k].tag != 0)
-			for (int i = 0; i < s->ncols; i++)
-				if (s->cols[i].tag == s->partition_keys[k].tag &&
-					ws_is_reg_type(s->cols[i].type))
-					says_its_schema(schema, table);
 	}
 }
 
@@ -4825,16 +4894,26 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 		PartitionElem *elem = lfirst_node(PartitionElem, lc);
 		WsIndexKey *key = &out->partition_keys[k++];
 
+		Oid			key_type;
+
 		if (elem->name != NULL)
+		{
 			key->tag = index_col_tag(table, rc, elem->name);
+			key_type = get_atttype(atooid(oid), get_attnum(atooid(oid), elem->name));
+		}
 		else
 		{
 			int			nest = ws_schema_path_begin(rc->schema);
-			char	   *expression = deparse_expression(list_nth(exprs, nexpr++), context, false, false);
+			Node	   *keyexpr = list_nth(exprs, nexpr++);
+			char	   *expression = deparse_expression(keyexpr, context, false, false);
 
 			ws_schema_path_end(nest);
 			key->expr = stored_expression(expression, rc);
+			key_type = exprType(keyexpr);
 		}
+		/* (its partitions' bounds would hold names, in values no grammar reads) */
+		if (holds_names(key_type, 0))
+			says_its_schema(rc->schema, table);
 		names_fit(elem->collation);
 		names_fit(elem->opclass);
 		key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
