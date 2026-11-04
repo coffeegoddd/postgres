@@ -67,6 +67,7 @@
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
+#include "prolly/ws/ws_tags.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
@@ -792,6 +793,7 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 		slot[slotCount]->tts_values[Anum_pg_attribute_attislocal - 1] = BoolGetDatum(attrs->attislocal);
 		slot[slotCount]->tts_values[Anum_pg_attribute_attinhcount - 1] = Int16GetDatum(attrs->attinhcount);
 		slot[slotCount]->tts_values[Anum_pg_attribute_attcollation - 1] = ObjectIdGetDatum(attrs->attcollation);
+		slot[slotCount]->tts_values[Anum_pg_attribute_attcoltag - 1] = Int64GetDatum(attrs->attcoltag);
 		if (attrs_extra)
 		{
 			slot[slotCount]->tts_values[Anum_pg_attribute_attstattarget - 1] = attrs_extra->attstattarget.value;
@@ -1483,6 +1485,7 @@ heap_create_with_catalog(const char *relname,
 	/*
 	 * now add tuples to pg_attribute for the attributes in our new relation.
 	 */
+	ws_tags_assign(new_rel_desc);
 	AddNewAttributeTuples(relid, new_rel_desc->rd_att, relkind);
 
 	/*

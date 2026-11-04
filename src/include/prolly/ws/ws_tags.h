@@ -18,7 +18,9 @@
 #ifndef PROLLY_WS_TAGS_H
 #define PROLLY_WS_TAGS_H
 
+#include "access/tupdesc.h"
 #include "prolly/engine/util.h"
+#include "utils/relcache.h"
 
 /* A column's name by tag (as it is, not quoted), or NULL if it has none. */
 typedef const char *(*WsTagNameFn) (void *arg, uint64 tag);
@@ -33,12 +35,23 @@ typedef bool (*WsTagOfFn) (void *arg, const char *name, uint64 *tag);
 extern bool ws_tags_well_formed(const char *stored);
 
 /*
- * A column's tag if it is new: from its table's name, its own name and its
- * type (their UTF8), so that two branches adding the same column agree on
- * it.  attempt is 0, or more if the table has another column of that tag.
+ * A tag from a table's name, a column's name and its type (their UTF8), so
+ * that two branches adding the same column agree on it, in every cluster.
+ * attempt is 0, or more if the table has another column of that tag.
  */
 extern uint64 ws_tag_derive(const char *table, const char *column, const char *type,
 							int attempt);
+
+/*
+ * The tag of a column being added to a table, none of the table's others: 0
+ * if the table is not an ordinary or partitioned one in a versioned schema.
+ * A table cannot move out of or into versioned schemas, so that is for life.
+ * Text the name is in that has no UTF8 raises an error: no commit could hold it.
+ */
+extern uint64 ws_tag_new_column(Relation rel, const FormData_pg_attribute *att);
+
+/* The tags of a new relation's columns (a descriptor copied holds its source's). */
+extern void ws_tags_assign(Relation rel);
 
 /*
  * An expression as the catalogs print it, as stored text appended to out:

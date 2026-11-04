@@ -105,25 +105,20 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
- * A column's tag, by the caller's table of them; attempt as ws_tag_derive's.
- * table, column and type are UTF8.
- */
-typedef uint64 (*WsSchemaTagFn) (void *arg, const char *table, const char *column,
-								 const char *type, int attnum, int attempt);
-
-/* (the tag a new column gets, for callers that keep none) */
-extern uint64 ws_schema_derived_tag(void *arg, const char *table, const char *column,
-									const char *type, int attnum, int attempt);
-
-/*
  * The schema of a table, from the catalogs, through WsSql: false if the
  * schema has no ordinary table of that name.  What the record cannot yet hold
  * and would lose (a key with INCLUDE columns or deferrable, a temporary or
  * partitioned table) raises ERRCODE_FEATURE_NOT_SUPPORTED.  What it gives is
  * the caller's to ws_schema_free.
  */
-extern bool ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag, void *arg,
-						   WsTableSchema *out);
+extern bool ws_schema_read(const char *schema, const char *table, WsTableSchema *out);
+
+/*
+ * Gives the columns of a table just made from a record the tags the record
+ * says, in place of those they were given as new.  The caller makes them
+ * visible, with CommandCounterIncrement.
+ */
+extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
 
 /*
  * The CREATE TABLE statement for the table, in the named schema, appended to
@@ -133,9 +128,9 @@ extern bool ws_schema_read(const char *schema, const char *table, WsSchemaTagFn 
  * have come from anywhere: the whole statement is parsed and compared with
  * the record, and if it is anything but one CREATE TABLE of just these
  * columns, types, clauses, expressions and key, it raises
- * ERRCODE_DATA_CORRUPTED and is not given back.  A schema with a problem raises an error.  What an
- * expression does is not checked: a default runs as it is, on later inserts,
- * with the inserter's privileges.
+ * ERRCODE_DATA_CORRUPTED and is not given back.  A schema with a problem
+ * raises an error.  What an expression does is not checked: a default runs
+ * as it is, on later inserts, with the inserter's privileges.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
 

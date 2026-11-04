@@ -735,6 +735,8 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 			return false;
 		if (attr1->attcollation != attr2->attcollation)
 			return false;
+		if (attr1->attcoltag != attr2->attcoltag)
+			return false;
 		/* variable-length fields are not even present... */
 	}
 

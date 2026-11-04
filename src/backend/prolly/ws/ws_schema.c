@@ -18,7 +18,10 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/table.h"
 #include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
@@ -32,7 +35,9 @@
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/regproc.h"
+#include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
 
@@ -531,7 +536,15 @@ check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
 		not_the_record(s, "a column's expression");
 	select = (SelectStmt *) linitial_node(RawStmt, parsed)->stmt;
+	/* (one target, and no other clause: nothing of a query but the expression) */
 	if (list_length(select->targetList) != 1 ||
+		select->fromClause != NIL || select->whereClause != NULL ||
+		select->groupClause != NIL || select->havingClause != NULL ||
+		select->windowClause != NIL || select->sortClause != NIL ||
+		select->limitOffset != NULL || select->limitCount != NULL ||
+		select->lockingClause != NIL || select->withClause != NULL ||
+		select->distinctClause != NIL || select->valuesLists != NIL ||
+		select->intoClause != NULL || select->op != SETOP_NONE ||
 		!equal(linitial_node(ResTarget, select->targetList)->val, in_statement))
 		not_the_record(s, "a column's expression");
 	pfree(sql);
@@ -597,6 +610,8 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 				break;
 			case CONSTR_DEFAULT:
 				deflt++;
+				if (c->kind != WS_COL_STORED || c->identity != WS_IDENTITY_NONE || c->def == NULL)
+					not_the_record(s, "a default the column does not have");
 				check_expression(s, c, con->raw_expr);
 				break;
 			case CONSTR_IDENTITY:
@@ -608,7 +623,8 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 				break;
 			case CONSTR_GENERATED:
 				generated++;
-				if (con->generated_kind != (c->kind == WS_COL_GENERATED_STORED ?
+				if (c->kind == WS_COL_STORED ||
+					con->generated_kind != (c->kind == WS_COL_GENERATED_STORED ?
 											ATTRIBUTE_GENERATED_STORED : ATTRIBUTE_GENERATED_VIRTUAL))
 					not_the_record(s, "a column's generation");
 				check_expression(s, c, con->raw_expr);
@@ -722,13 +738,6 @@ ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 	buf_free(&sql);
 }
 
-uint64
-ws_schema_derived_tag(void *arg, const char *table, const char *column, const char *type,
-					  int attnum, int attempt)
-{
-	return ws_tag_derive(table, column, type, attempt);
-}
-
 static char *
 to_utf8(const char *text)
 {
@@ -760,8 +769,7 @@ read_tag_of(void *arg, const char *name, uint64 *tag)
 }
 
 bool
-ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void *arg,
-			   WsTableSchema *out)
+ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 {
 	const char *params[2] = {schema, table};
 	int			level = WsSql->begin();
@@ -806,7 +814,8 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 				   "  a.attidentity::text, a.attgenerated::text, "
 				   "  pg_get_expr(d.adbin, d.adrelid), "
 				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
-				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END "
+				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
+				   "  a.attcoltag::text "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
@@ -833,8 +842,6 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 		const char *identity = ws_sql_value(&cols, i, 4);
 		const char *generated = ws_sql_value(&cols, i, 5);
 		const char *collation = ws_sql_value(&cols, i, 7);
-		bool		again;
-		int			attempt = 0;
 
 		rc.names[i] = ws_sql_value(&cols, i, 1);
 		c->name = to_utf8(rc.names[i]);
@@ -844,15 +851,12 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 		c->kind = generated[0] == ATTRIBUTE_GENERATED_STORED ? WS_COL_GENERATED_STORED :
 			generated[0] == ATTRIBUTE_GENERATED_VIRTUAL ? WS_COL_GENERATED_VIRTUAL : WS_COL_STORED;
 		c->collation = collation ? to_utf8(collation) : NULL;
-		/* (a tag another column of the table has: the next one) */
-		do
-		{
-			c->tag = tag_fn(arg, out->name, c->name, c->type, atoi(ws_sql_value(&cols, i, 0)),
-							attempt++);
-			again = false;
-			for (int j = 0; j < i; j++)
-				again |= out->cols[j].tag == c->tag;
-		} while (again);
+		c->tag = (uint64) strtoi64(ws_sql_value(&cols, i, 8), NULL, 10);
+		/* (a table in no versioned schema: its columns have none) */
+		if (c->tag == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("table \"%s\" is not in a versioned schema", table)));
 		rc.tags[i] = c->tag;
 	}
 	/* (once every column has its tag: an expression may refer to any) */
@@ -908,4 +912,30 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 	ws_sql_rows_free(&key);
 	WsSql->end(level);
 	return true;
+}
+
+void
+ws_schema_set_tags(const char *schema, const WsTableSchema *s)
+{
+	char	   *table = from_utf8(s->name);
+	Oid			relid = get_relname_relid(table, get_namespace_oid(schema, false));
+	Relation	attrs;
+
+	if (!OidIsValid(relid))
+		elog(ERROR, "no table \"%s\" in schema \"%s\"", table, schema);
+	attrs = table_open(AttributeRelationId, RowExclusiveLock);
+	for (int i = 0; i < s->ncols; i++)
+	{
+		char	   *name = from_utf8(s->cols[i].name);
+		HeapTuple	tup = SearchSysCacheCopyAttName(relid, name);
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "no column \"%s\" in table \"%s\"", name, table);
+		((Form_pg_attribute) GETSTRUCT(tup))->attcoltag = (int64) s->cols[i].tag;
+		CatalogTupleUpdate(attrs, &tup->t_self, tup);
+		heap_freetuple(tup);
+		pfree(name);
+	}
+	table_close(attrs, RowExclusiveLock);
+	pfree(table);
 }

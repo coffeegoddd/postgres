@@ -176,15 +176,23 @@ test_template_refused(void)
 	expect_error(template_qualified, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
-/* The tag a new column gets: the same as the prototype's, and on any cluster. */
+/*
+ * The tag a new column gets: this value on every cluster, or two branches'
+ * clones would disagree; different for anything else it is derived from, and
+ * no parts run together.
+ */
 static void
 test_derive(void)
 {
-	/* (md5('t/a/integer/0') is 0d1c3f...: its first 60 bits, as SQL gives them) */
-	CHECK_EQ(ws_tag_derive("t", "a", "integer", 0), ws_tag_derive("t", "a", "integer", 0));
-	CHECK(ws_tag_derive("t", "a", "integer", 0) != ws_tag_derive("t", "a", "integer", 1));
-	CHECK(ws_tag_derive("t", "a", "integer", 0) != ws_tag_derive("t", "b", "integer", 0));
-	CHECK(ws_tag_derive("t", "a", "integer", 0) < (UINT64CONST(1) << 60));
+	uint64		tag = ws_tag_derive("t", "a", "pg_catalog.int4(-1)", 0);
+
+	CHECK_EQ(tag, UINT64CONST(254872713275789205));
+	CHECK(tag < (UINT64CONST(1) << 60));
+	CHECK(tag != ws_tag_derive("t", "a", "pg_catalog.int4(-1)", 1));
+	CHECK(tag != ws_tag_derive("t", "b", "pg_catalog.int4(-1)", 0));
+	CHECK(tag != ws_tag_derive("u", "a", "pg_catalog.int4(-1)", 0));
+	CHECK(tag != ws_tag_derive("t", "a", "pg_catalog.int8(-1)", 0));
+	CHECK(ws_tag_derive("ab", "c", "t", 0) != ws_tag_derive("a", "bc", "t", 0));
 }
 
 static const ProllyUnitTest tests[] = {

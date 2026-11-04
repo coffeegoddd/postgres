@@ -89,6 +89,7 @@
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_log.h"
+#include "prolly/ws/ws_tags.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
@@ -7479,6 +7480,8 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	CheckAttributeType(NameStr(attribute->attname), attribute->atttypid, attribute->attcollation,
 					   list_make1_oid(rel->rd_rel->reltype),
 					   (attribute->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? CHKATYPE_IS_VIRTUAL : 0));
+
+	attribute->attcoltag = (int64) ws_tag_new_column(rel, attribute);
 
 	InsertPgAttributeTuples(attrdesc, tupdesc, myrelid, NULL, NULL);
 
