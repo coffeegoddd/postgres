@@ -214,6 +214,17 @@ typedef struct ChunkIndexRoutine
 	 */
 	bool		(*lookup_as_of) (Relation idx, const uint8 *hash,
 								 Snapshot snap, ChunkIndexEntry *out);
+	/*
+	 * A chunk's entry for a reader whose snapshot is snap, who found its name
+	 * in something it read at or after snap: its insert committed, whenever,
+	 * and its freeing not before snap.  What the name was found in held the
+	 * chunk when it was read, so its freeing came after snap, and the entry
+	 * and bytes stay while snap is held.  So this waits for nothing.  It gives
+	 * the first such entry: one this transaction freed may still answer if an
+	 * older entry of the same chunk is there, the same bytes.
+	 */
+	bool		(*lookup_to_read) (Relation idx, const uint8 *hash,
+								   Snapshot snap, ChunkIndexEntry *out);
 	void		(*visit_as_of) (Relation idx, Snapshot snap,
 								bool (*fn) (void *arg, const ChunkIndexEntry *e),
 								void *arg);

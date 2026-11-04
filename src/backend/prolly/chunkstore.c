@@ -22,7 +22,6 @@
 #include "prolly/chunkstore.h"
 #include "prolly/registry.h"
 #include "storage/lmgr.h"
-#include "utils/snapmgr.h"
 
 static void
 register_stores(void)
@@ -145,28 +144,19 @@ pages_has(ChunkStore *cs, const uint8 *hash)
 }
 
 /*
- * A chunk the store has not now: if pushed history may be read (asof, a
- * store history is pushed from), its bytes as of the reader's snapshot,
- * when that is older than its freeing (they are kept until no snapshot
- * could find them), whatever came of it since; else, if it was pushed
- * (the index history is pushed to has it), an error, until it is fetched
- * back; NULL if it was not.  For a root taken (asof false), only the
- * error.
+ * A chunk the store has not for this reader: if it was pushed (the index
+ * history is pushed to has it), an error, until it is fetched back; NULL if
+ * it was not.
  */
 static void *
-pushed_chunk(ChunkStore *cs, Relation log, Relation idx, const uint8 *hash,
-			 bool asof, uint32 *len)
+pushed_chunk(ChunkStore *cs, const uint8 *hash)
 {
 	RelationsStore *rs = (RelationsStore *) cs;
 	Relation	tier;
 	bool		pushed;
-	void	   *data;
 
 	if (rs->pushed_relid == NULL)
 		return NULL;
-	if (asof && ActiveSnapshotSet() &&
-		(data = ChunkStoreGetAsOf(log, idx, hash, GetActiveSnapshot(), len)) != NULL)
-		return data;
 	tier = relation_open(rs->pushed_relid(), AccessShareLock);
 	pushed = ChunkStoreHas(NULL, tier, hash);
 	relation_close(tier, NoLock);
@@ -189,7 +179,7 @@ pages_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 	open_store(cs, AccessShareLock, &log, &idx);
 	data = ChunkStoreGet(log, idx, hash, len);
 	if (data == NULL)
-		data = pushed_chunk(cs, log, idx, hash, true, len);
+		data = pushed_chunk(cs, hash);
 	close_store(log, idx);
 	return data;
 }
@@ -205,7 +195,7 @@ pages_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out,
 	ChunkStoreGetMany(log, idx, hashes, n, out, lens);
 	for (int i = 0; i < n; i++)
 		if (out[i] == NULL)
-			out[i] = pushed_chunk(cs, log, idx, hashes + (Size) i * CHUNK_HASH_LEN, true, &lens[i]);
+			out[i] = pushed_chunk(cs, hashes + (Size) i * CHUNK_HASH_LEN);
 	close_store(log, idx);
 }
 
@@ -244,7 +234,7 @@ pages_root(ChunkStore *cs, const uint8 *hash, bool ref)
 
 	open_store(cs, RowExclusiveLock, NULL, &idx);
 	if (ref && !ChunkStoreHas(NULL, idx, hash))
-		(void) pushed_chunk(cs, NULL, idx, hash, false, NULL);
+		(void) pushed_chunk(cs, hash);
 	if (ref)
 		ChunkStoreRefRoot(idx, hash, &e);
 	else

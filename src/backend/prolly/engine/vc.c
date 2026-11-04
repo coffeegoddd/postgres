@@ -918,12 +918,14 @@ branch_read(VcRepo *r, const char *name, VcRefLock lock, VcBranch *out)
 	if (!branch_name_ok(name))
 		return false;
 	ref = branch_ref(name);
+	INJECTION_POINT("vc-branch-read-pointer", NULL);
 	found = vc_refs_get(r->refs, ref, lock, &h);
 
 	pfree(ref);
 	if (!found)
 		return false;
 	out->name = pstrdup(name);
+	INJECTION_POINT("vc-branch-read-chunk", NULL);
 	branch_decode(&r->ctx, &h, out);
 	return true;
 }

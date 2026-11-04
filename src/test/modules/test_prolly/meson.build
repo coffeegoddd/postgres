@@ -59,6 +59,7 @@ test_prolly_isolation = [
   'chunk_hold',
   'chunk_run_seal',
   'chunk_free_order',
+  'chunk_read_snapshot',
   'chunk_move',
   'history_push_inflight',
   'history_push_races',
@@ -210,6 +211,7 @@ tests += {
       't/085_vc_deep_bench.pl',
       't/086_ws_schema_round_trip.pl',
       't/087_branch_copy_minimal_wal.pl',
+      't/088_vc_read_while_freed.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
