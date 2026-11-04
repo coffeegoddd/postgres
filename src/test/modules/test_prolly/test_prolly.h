@@ -69,6 +69,7 @@ extern const ProllyUnitSuite unit_engine_vc_suite;
 extern const ProllyUnitSuite unit_engine_window_suite;
 extern const ProllyUnitSuite unit_engine_remote_suite;
 extern const ProllyUnitSuite unit_engine_rewrite_suite;
+extern const ProllyUnitSuite unit_ws_root_suite;
 extern const ProllyUnitSuite unit_ws_row_suite;
 extern const ProllyUnitSuite unit_ws_sql_suite;
 extern const ProllyUnitSuite unit_ws_schema_suite;
