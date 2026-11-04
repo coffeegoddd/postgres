@@ -261,6 +261,14 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.fknv (id integer, r integer) PARTITION BY RANGE (id);
 	CREATE TABLE src.fknv1 PARTITION OF src.fknv FOR VALUES FROM (0) TO (10);
 	ALTER TABLE src.fknv ADD CONSTRAINT fknv_k FOREIGN KEY (r) REFERENCES src.fkn_q (id) NOT VALID;
+	CREATE TABLE src.ixp (a integer, CONSTRAINT ixp_k PRIMARY KEY (a)) PARTITION BY RANGE (a);
+	CREATE TABLE src.ixp1 (a integer NOT NULL);
+	CREATE UNIQUE INDEX ixp1_older ON src.ixp1 (a);
+	ALTER TABLE src.ixp ATTACH PARTITION src.ixp1 FOR VALUES FROM (0) TO (10);
+	CREATE TABLE src.ixn (a integer NOT NULL) PARTITION BY RANGE (a);
+	CREATE TABLE src.ixn1 PARTITION OF src.ixn FOR VALUES FROM (0) TO (10);
+	ALTER TABLE src.ixn1 ADD CONSTRAINT ixn1_k PRIMARY KEY (a);
+	CREATE UNIQUE INDEX ixn1_also ON src.ixn1 (a);
 	CREATE TABLE src.ixx (r int4range, a integer) PARTITION BY RANGE (a);
 	CREATE TABLE src.ixx1 PARTITION OF src.ixx FOR VALUES FROM (0) TO (10);
 	ALTER TABLE src.ixx1 ADD CONSTRAINT ixx1_x EXCLUDE USING gist (r WITH &&);
@@ -288,7 +296,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'ptf_p', 'ptf_p1', 'ptf_c', 'ptf_c1',
 	'idt', 'idm', 'idl', 'pnv', 'pnv1', 'pnv2', 'ptbd', 'ptbd1', 'ptbn', 'ptbn1', 'ptby', 'ptby1', 'ptbs', 'ptbs1', 'ptbt', 'ptbt1',
 	'fkn_q', 'fkn_p', 'fkn_p1', 'fkn_c', 'fks', 'fksm', 'fksl', 'fknv', 'fknv1',
-	'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c');
+	'ixp', 'ixp1', 'ixn', 'ixn1', 'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -567,7 +575,7 @@ my %refused_for = (
 	ponly => 'or is not valid', ponlyk => 'or is not valid',
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
 	ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
-	ixa1 => 'one for the other', ixd1 => 'one for the other', ixp1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
+	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
 	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
@@ -595,9 +603,9 @@ for my $t (
 		CREATE TABLE src.ixa1 PARTITION OF src.ixa FOR VALUES FROM (0) TO (10)} ],
 	[ 'ixd1', q{CREATE TABLE src.ixd (a integer, CONSTRAINT z UNIQUE (a) DEFERRABLE, CONSTRAINT y UNIQUE (a)) PARTITION BY RANGE (a);
 		CREATE TABLE src.ixd1 PARTITION OF src.ixd FOR VALUES FROM (0) TO (10)} ],
-	[ 'ixp1', q{CREATE TABLE src.ixp (a integer, CONSTRAINT ixp_k UNIQUE (a)) PARTITION BY RANGE (a);
-		CREATE TABLE src.ixp1 (a integer, CONSTRAINT ixp1_u UNIQUE (a)); CREATE UNIQUE INDEX ixp1_alike ON src.ixp1 (a);
-		ALTER TABLE src.ixp ATTACH PARTITION src.ixp1 FOR VALUES FROM (0) TO (10)} ],
+	[ 'ixq1', q{CREATE TABLE src.ixq (a integer) PARTITION BY RANGE (a); CREATE UNIQUE INDEX ixq_i ON src.ixq (a);
+		CREATE TABLE src.ixq1 (a integer, CONSTRAINT ixq1_u UNIQUE (a)); CREATE UNIQUE INDEX ixq1_alike ON src.ixq1 (a);
+		ALTER TABLE src.ixq ATTACH PARTITION src.ixq1 FOR VALUES FROM (0) TO (10)} ],
 	[ 'ptfn', q{CREATE TABLE src.ptfn (id integer, r integer, CONSTRAINT own FOREIGN KEY (r) REFERENCES src.ptf_p (id)); ALTER TABLE src.ptf_c ATTACH PARTITION src.ptfn FOR VALUES FROM (10) TO (20)} ],
 	[ 'ponly', q{CREATE TABLE src.ponly (a int) PARTITION BY RANGE (a); CREATE TABLE src.ponly1 PARTITION OF src.ponly FOR VALUES FROM (0) TO (1);
 		ALTER TABLE ONLY src.ponly ADD CONSTRAINT ponly_u UNIQUE (a); ALTER TABLE src.ponly DETACH PARTITION src.ponly1} ],
@@ -803,6 +811,21 @@ for my $t (
 }
 is($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkpart1')}), '',
 	'a key from a partitioned table is that table\'s, and not read as the partition\'s');
+# a key name so long that its numbered row is cut short to another key's
+my $longk = 'a' x 63;
+my $shortk = ('a' x 61) . '_1';
+$node->safe_psql('postgres', qq{
+	CREATE TABLE src.fkl_q (id integer PRIMARY KEY);
+	CREATE TABLE src.fkl_p (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+	CREATE TABLE src.fkl_p1 PARTITION OF src.fkl_p FOR VALUES FROM (0) TO (10);
+	CREATE TABLE src.fkl_c (a integer, b integer, CONSTRAINT "$shortk" FOREIGN KEY (a) REFERENCES src.fkl_q (id));
+	ALTER TABLE src.fkl_c ADD CONSTRAINT "$longk" FOREIGN KEY (b) REFERENCES src.fkl_p (id);
+	CREATE TABLE src.fkl_ok (a integer, b integer, CONSTRAINT "$shortk" FOREIGN KEY (a) REFERENCES src.fkl_q (id),
+		CONSTRAINT "${longk}" FOREIGN KEY (b) REFERENCES src.fkl_q (id));
+});
+($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_c')});
+like($ferr, qr/numbered rows of so long a name/, 'a key whose numbered rows could take another key\'s name refused');
+isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_ok')}), '', 'and the same names, to a table with no partitions, read');
 ($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('sharedfk', 'p')});
 like($ferr, qr/is not in a versioned schema/, 'a shared table\'s keys are no commit\'s');
 
