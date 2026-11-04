@@ -40,7 +40,8 @@ $node->safe_psql('postgres', q{
 	CREATE ROLE g_owner NOLOGIN;
 	CREATE ROLE g_read NOLOGIN;
 	CREATE ROLE x_person LOGIN;
-	CREATE SCHEMA "S rc";
+	CREATE SCHEMA "S rc" AUTHORIZATION g_owner;
+	SET ROLE g_owner;
 	SET search_path = "S rc";
 	CREATE TABLE t (a int PRIMARY KEY, b text, "Odd c" int);
 	CREATE TABLE pg_class_like (x int);
@@ -56,8 +57,6 @@ $node->safe_psql('postgres', q{
 	COMMENT ON VIEW a_top IS 'the ''top''';
 	COMMENT ON COLUMN a_top.note IS 'a note';
 	COMMENT ON MATERIALIZED VIEW m_base IS 'on the base';
-	ALTER VIEW a_top OWNER TO g_owner;
-	ALTER MATERIALIZED VIEW m_base OWNER TO g_owner;
 	GRANT SELECT ON a_top TO g_read;
 	GRANT SELECT ON a_top TO PUBLIC;
 	GRANT SELECT (a) ON z_base TO g_read WITH GRANT OPTION;
@@ -88,8 +87,9 @@ is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('Dest ination')}), $h
 
 # (restoring a matview runs nothing, and what is needed elsewhere is refused)
 $node->safe_psql('postgres', q{
-	SET search_path = "S rc";
 	CREATE FUNCTION public.ws_explode() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RAISE 'ran it'; END $$;
+	SET ROLE g_owner;
+	SET search_path = "S rc";
 	CREATE MATERIALIZED VIEW m_runs AS SELECT public.ws_explode() AS x WITH NO DATA;
 });
 my ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('S rc')});
@@ -98,7 +98,7 @@ $node->safe_psql('postgres', q{DROP MATERIALIZED VIEW "S rc".m_runs; DROP FUNCTI
 
 # what a commit cannot hold is refused by name, nothing left out in silence
 my @refused = (
-	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int)', 'DROP TABLE public.o CASCADE' ],
+	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int); GRANT SELECT ON public.o TO g_owner', 'DROP TABLE public.o CASCADE' ],
 	[ q{CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE VIEW r_func AS SELECT f()}, 'no commit holds yet', undef, 'DROP FUNCTION "S rc".f() CASCADE' ],
 	[ q{CREATE TYPE e AS ENUM ('a'); CREATE VIEW r_type AS SELECT 'a'::e AS x}, 'no commit holds yet', undef, 'DROP TYPE "S rc".e CASCADE' ],
 	[ q{CREATE SEQUENCE q; CREATE VIEW r_seq AS SELECT nextval('q'::regclass)}, 'no commit holds yet', undef, 'DROP SEQUENCE "S rc".q CASCADE' ],
@@ -123,21 +123,42 @@ for my $case (@refused)
 {
 	my ($sql, $why, $before, $undo) = @$case;
 	$node->safe_psql('postgres', $before) if $before;
-	$node->safe_psql('postgres', qq{SET search_path = "S rc"; $sql});
+	$node->safe_psql('postgres', qq{SET ROLE g_owner; SET search_path = "S rc"; $sql});
 	my ($rc2, $out2, $err2) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('S rc')});
 	isnt($rc2, 0, "refused: $sql");
 	like($err2, qr/\Q$why\E/, "for why: $sql");
 	$node->safe_psql('postgres', $undo);
 }
 
-# a login owner is not held: whoever restores owns it
-$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW by_person AS SELECT a FROM t; ALTER VIEW by_person OWNER TO x_person});
-$fresh->('D2');
-$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D2')});
-is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = '"D2".by_person'::regclass}),
-	$node->safe_psql('postgres', 'SELECT current_user'),
-	'a login role is not an owner in a commit');
-$node->safe_psql('postgres', 'DROP VIEW "S rc".by_person');
+# a view reads with its owner's rights, so one whose owner cannot travel is refused
+for my $owner (['x_person', 'a login role'], ['g_power', 'a role with a power'], ['pg_monitor', 'a predefined role'])
+{
+	my ($role, $what) = @$owner;
+	$node->safe_psql('postgres', 'CREATE ROLE g_power NOLOGIN CREATEDB') if $role eq 'g_power';
+	$node->safe_psql('postgres', qq{SET search_path = "S rc"; CREATE VIEW by_other AS SELECT a FROM t; ALTER VIEW by_other OWNER TO $role});
+	($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('S rc')});
+	like($err, qr/"by_other" cannot be held in a commit: it is owned by a role that cannot travel/, "owned by $what is refused");
+	$node->safe_psql('postgres', 'DROP VIEW "S rc".by_other');
+}
+is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = '"Dest ination".a_top'::regclass}),
+	'g_owner', 'and one that can travel owns it after a restore');
+
+# restoring a materialized view runs nothing
+$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE MATERIALIZED VIEW m_lock AS SELECT pg_advisory_lock(42) AS x WITH NO DATA});
+$fresh->('D6');
+is( $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D6'); SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()}),
+	"\n0", 'a materialized view is restored without running what it would fill itself with');
+$node->safe_psql('postgres', 'DROP MATERIALIZED VIEW "S rc".m_lock');
+
+# in another encoding, the same bytes
+$node->safe_psql('postgres', q{CREATE DATABASE latin TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+$node->safe_psql('latin', q{CREATE EXTENSION test_prolly; CREATE SCHEMA s AUTHORIZATION g_owner; SET ROLE g_owner; SET search_path = s;
+	CREATE TABLE t (a int); CREATE VIEW v AS SELECT a, 'caf} . "\xe9" . q{'::text AS note FROM t});
+$node->safe_psql('postgres', q{CREATE SCHEMA enc AUTHORIZATION g_owner; SET ROLE g_owner; SET search_path = enc;
+	CREATE TABLE t (a int); CREATE VIEW v AS SELECT a, 'café'::text AS note FROM t});
+is( $node->safe_psql('latin', q{SELECT test_ws_obj_bytes('s')}),
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('enc')}),
+	'a definition is the same whatever the encoding it was read in');
 
 # default privileges would add grants a commit does not hold
 $fresh->('D3');
@@ -146,7 +167,7 @@ $node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA "D3" GRANT SEL
 like($err, qr/default privileges would change what is made/, 'default privileges refuse a restore');
 
 # what an unqualified name could be taken for is refused, the catalogs coming first or not
-$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW uses_json AS SELECT to_json(1) AS j});
+$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE VIEW uses_json AS SELECT to_json(1) AS j});
 $fresh->('D4');
 $node->safe_psql('postgres', q{CREATE FUNCTION "D4".to_json(integer) RETURNS text LANGUAGE sql AS $$SELECT 'shadow'$$});
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D4')});
@@ -157,11 +178,11 @@ is( $node->safe_psql('postgres', q{SELECT format_type(atttypid, NULL) FROM pg_at
 	'json', 'and without one it means what it did');
 
 # one point in time, by what every read of a definition sees: the catalogs as they are
-$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW now_a AS SELECT a AS was FROM t});
+$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE VIEW now_a AS SELECT a AS was FROM t});
 my $s = $node->background_psql('postgres');
 $s->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $s->query_safe('SELECT count(*) FROM pg_class');
-$node->safe_psql('postgres', q{SET search_path = "S rc"; ALTER TABLE t RENAME COLUMN a TO a_new; CREATE VIEW later AS SELECT 1 AS x});
+$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; ALTER TABLE t RENAME COLUMN a TO a_new; CREATE VIEW later AS SELECT 1 AS x});
 my $rr = $s->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
 $s->query_safe('COMMIT');
 is($rr, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('S rc')}), 'an old snapshot reads what a new one does');

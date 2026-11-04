@@ -16,6 +16,10 @@
  * What is made before an object is named rather than found by trying, as the order
  * of a restore must not depend on what fails.
  *
+ * An object has an owner that can travel, as it reads with its owner's rights: any
+ * other owner could show other rows.  A commit's own definitions are trusted, as a
+ * remote is, as what a pg_dump wrote is: they are checked only to be what they say.
+ *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
  * src/include/prolly/ws/ws_obj.h
@@ -56,7 +60,7 @@ typedef struct WsObject
 	char	   *definition;		/* its statement after its name, as stored text (ws_tags.h) */
 	int			ndeps;
 	char	  **deps;			/* the keys of the objects it needs, in order */
-	char	   *owner;			/* NULL: whoever restores it */
+	char	   *owner;
 	int			ncomments;
 	WsObjectComment *comments;	/* in order: the object's, then by column */
 	int			ngrants;

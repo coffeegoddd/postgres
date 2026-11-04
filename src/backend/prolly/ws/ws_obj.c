@@ -5,7 +5,7 @@
  *	  "binary", their codec.
  *
  * Its key: kind's word, a slash, name.  Its value, each string a uvarint length and
- * bytes: definition; uvarint ndeps and keys; owner, empty for none; uvarint ncomments
+ * bytes: definition; uvarint ndeps and keys; owner; uvarint ncomments
  * and each one's column, empty for none, and text; uvarint ngrants and each one's
  * column, empty for none, grantee, empty for PUBLIC, grant option byte, privileges.
  *
@@ -106,8 +106,8 @@ ws_obj_problem(const WsObject *o)
 		return "an object of no name, or one too long";
 	if (o->definition == NULL || !ws_tags_well_formed(o->definition))
 		return "a definition that is not stored text";
-	if (o->owner != NULL && (bad_name(o->owner) || IsReservedName(o->owner)))
-		return "an owner no commit holds";
+	if (bad_name(o->owner) || IsReservedName(o->owner))
+		return "no owner, or one no commit holds";
 	ws_obj_key(o->kind, o->name, &self);
 	buf_append_byte(&self, 0);
 	for (int i = 0; i < o->ndeps; i++)
@@ -315,7 +315,7 @@ obj_decode(const uint8 *key, size_t klen, const uint8 *val, size_t vlen, WsObjec
 	o->deps = zeroed(o->ndeps, sizeof(char *));
 	for (int i = 0; i < o->ndeps; i++)
 		o->deps[i] = get_string(&p, end, false);
-	o->owner = get_string(&p, end, true);
+	o->owner = get_string(&p, end, false);
 	o->ncomments = get_count(&p, end, 2);
 	o->comments = zeroed(o->ncomments, sizeof(WsObjectComment));
 	for (int i = 0; i < o->ncomments; i++)
@@ -797,10 +797,14 @@ read_owner_and_grants(WsObject *o, const char *oid, const char *name)
 	WsSql->read("SELECT r.rolname::text, r.rolcanlogin::text, "
 				"  (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)::text "
 				"FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner WHERE c.oid = $1::oid", 1, params, &rows);
-	/* (a table's owner rule: one that cannot travel is no one's to restore) */
-	if (rows.nrows == 1 && ws_sql_value(&rows, 0, 1)[0] != 't' && ws_sql_value(&rows, 0, 2)[0] != 't' &&
-		!IsReservedName(ws_sql_value(&rows, 0, 0)))
-		o->owner = role_in_commit(name, ws_sql_value(&rows, 0, 0));
+	/* (it reads with its owner's rights, so another owner could show other rows) */
+	if (rows.nrows != 1 || ws_sql_value(&rows, 0, 1)[0] == 't' || ws_sql_value(&rows, 0, 2)[0] == 't' ||
+		IsReservedName(ws_sql_value(&rows, 0, 0)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" cannot be held in a commit: it is owned by a role that cannot travel", name),
+				 errhint("Make a role that cannot log in and holds no powers its owner, with ALTER ... OWNER TO.")));
+	o->owner = role_in_commit(name, ws_sql_value(&rows, 0, 0));
 	ws_sql_rows_free(&rows);
 
 	WsSql->read("WITH g(attname, grantee, grantor, owner, is_grantable, privilege_type) AS ( "
@@ -1194,8 +1198,6 @@ ws_obj_owner_statement(const WsObject *o, const char *schema, Buf *out)
 	char	   *what;
 	const char *problem;
 
-	if (o->owner == NULL)
-		return;
 	owner = ws_name_from_utf8(o->owner);
 	what = psprintf("object \"%s\"", o->name);
 	ws_role_check_name(what, owner);
@@ -1250,11 +1252,6 @@ ws_obj_grant_statement(const WsObject *o, int k, const char *schema, Buf *out)
 		pfree(what);
 		if (ws_role_travel_problem(grantee) != NULL)
 			not_the_object(o, "a role that can log in, or with powers no commit holds");
-		/* (who restores owns it if no one is held, and a grant to its owner is none) */
-		if (o->owner == NULL && strcmp(grantee, GetUserNameFromId(GetUserId(), false)) == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("object \"%s\" has a grant to role \"%s\", who would own it", o->name, grantee)));
 		ws_put_identifier(out, grantee);
 		pfree(grantee);
 	}
@@ -1347,7 +1344,6 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema)
 			ws_obj_grant_statement(o, k, schema, &sql);
 			run_statement(&sql);
 		}
-		if (o->owner != NULL)
 		{
 			Buf			sql = BUF_INIT;
 

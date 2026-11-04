@@ -97,22 +97,24 @@ decode_bad(void *arg)
 ENGINE_TEST(test_malformed)
 {
 #define D 1, 'x'				/* a definition */
-	static const uint8 ok[] = {D, 0, 0, 0, 0};
-	static const uint8 cut[] = {D, 0, 0, 0};
-	static const uint8 left[] = {D, 0, 0, 0, 0, 0};
-	static const uint8 long_num[] = {D, 0x80, 0x00, 0, 0, 0};
-	static const uint8 huge[] = {D, 0xff, 0xff, 0xff, 0xff, 0x0f, 0, 0, 0};
-	static const uint8 past[] = {9, 'x', 0, 0, 0, 0};
-	static const uint8 nul[] = {2, 'x', 0, 0, 0, 0, 0};
-	static const uint8 not_utf8[] = {1, 0xff, 0, 0, 0, 0};
-	static const uint8 lone_at[] = {1, '@', 0, 0, 0, 0};
-	static const uint8 dep_nothing[] = {D, 1, 1, 'q', 0, 0, 0};
-	static const uint8 dep_kindless[] = {D, 1, 3, 'x', '/', 'a', 0, 0, 0};
-	static const uint8 dep_self[] = {D, 1, 6, 'v', 'i', 'e', 'w', '/', 'v', 0, 0, 0};
-	static const uint8 grant_option[] = {D, 0, 0, 0, 1, 0, 0, 2, 1, 'r'};
-	static const uint8 privilege[] = {D, 0, 0, 0, 1, 0, 0, 0, 1, 'Z'};
-	static const uint8 order[] = {D, 0, 0, 0, 1, 0, 0, 0, 2, 'r', 'a'};
+#define O 1, 'g'				/* an owner */
+	static const uint8 ok[] = {D, 0, O, 0, 0};
+	static const uint8 cut[] = {D, 0, O, 0};
+	static const uint8 left[] = {D, 0, O, 0, 0, 0};
+	static const uint8 long_num[] = {D, 0x80, 0x00, O, 0, 0};
+	static const uint8 huge[] = {D, 0xff, 0xff, 0xff, 0xff, 0x0f, O, 0, 0};
+	static const uint8 past[] = {9, 'x', 0, O, 0, 0};
+	static const uint8 nul[] = {2, 'x', 0, 0, O, 0, 0};
+	static const uint8 not_utf8[] = {1, 0xff, 0, O, 0, 0};
+	static const uint8 lone_at[] = {1, '@', 0, O, 0, 0};
+	static const uint8 dep_nothing[] = {D, 1, 1, 'q', O, 0, 0};
+	static const uint8 dep_kindless[] = {D, 1, 3, 'x', '/', 'a', O, 0, 0};
+	static const uint8 dep_self[] = {D, 1, 6, 'v', 'i', 'e', 'w', '/', 'v', O, 0, 0};
+	static const uint8 grant_option[] = {D, 0, O, 0, 1, 0, 0, 2, 1, 'r'};
+	static const uint8 privilege[] = {D, 0, O, 0, 1, 0, 0, 0, 1, 'Z'};
+	static const uint8 order[] = {D, 0, O, 0, 1, 0, 0, 0, 2, 'r', 'a'};
 	static const uint8 predefined[] = {D, 0, 9, 'p', 'g', '_', 'm', 'o', 'n', 'i', 't', 'o', 0, 0};
+	static const uint8 no_owner[] = {D, 0, 0, 0, 0};
 	Bad			bad[] = {
 		{"view/v", cut, sizeof(cut)},
 		{"view/v", left, sizeof(left)},
@@ -129,12 +131,14 @@ ENGINE_TEST(test_malformed)
 		{"view/v", privilege, sizeof(privilege)},
 		{"view/v", order, sizeof(order)},
 		{"view/v", predefined, sizeof(predefined)},
+		{"view/v", no_owner, sizeof(no_owner)},
 		{"v", ok, sizeof(ok)},
 		{"table/v", ok, sizeof(ok)},
 		{"view/", ok, sizeof(ok)},
 		{"view/\xff", ok, sizeof(ok)},
 	};
 #undef D
+#undef O
 
 	for (int i = 0; i < lengthof(bad); i++)
 		expect_error(decode_bad, &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
@@ -173,6 +177,8 @@ ENGINE_TEST(test_problems)
 	o = example();
 	o.owner = "pg_monitor";
 	CHECK(ws_obj_problem(&o) != NULL);
+	o.owner = NULL;
+	CHECK(ws_obj_problem(&o) != NULL);
 	{
 		WsObjectComment empty[] = {{.text = ""}};
 		WsObjectGrant to_owner[] = {{.grantee = "g",.privileges = "r"}};
@@ -210,7 +216,7 @@ ENGINE_TEST(test_map)
 {
 	ChunkStore *cs = memstore_create();
 	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
-	WsObject	a = {.kind = WS_OBJ_MATVIEW,.name = "m",.definition = "x"};
+	WsObject	a = {.kind = WS_OBJ_MATVIEW,.name = "m",.definition = "x",.owner = "g"};
 	WsObject	b = example();
 	WsObject	in_order[] = {a, b};
 	WsObject	reversed[] = {b, a};
@@ -253,19 +259,19 @@ ENGINE_TEST(test_restore_order)
 	char	   *needs_b[] = {"view/b"};
 	char	   *needs_none[] = {"view/z"};
 	WsObject	chain[] = {
-		{.kind = WS_OBJ_VIEW,.name = "a",.definition = "x",.ndeps = 1,.deps = needs_c},
-		{.kind = WS_OBJ_VIEW,.name = "b",.definition = "x"},
-		{.kind = WS_OBJ_VIEW,.name = "c",.definition = "x",.ndeps = 1,.deps = needs_b},
+		{.kind = WS_OBJ_VIEW,.name = "a",.definition = "x",.owner = "g",.ndeps = 1,.deps = needs_c},
+		{.kind = WS_OBJ_VIEW,.name = "b",.definition = "x",.owner = "g"},
+		{.kind = WS_OBJ_VIEW,.name = "c",.definition = "x",.owner = "g",.ndeps = 1,.deps = needs_b},
 	};
 	WsObject	cycle[] = {
-		{.kind = WS_OBJ_VIEW,.name = "a",.definition = "x",.ndeps = 1,.deps = needs_c},
-		{.kind = WS_OBJ_VIEW,.name = "b",.definition = "x",.ndeps = 1,.deps = needs_a},
-		{.kind = WS_OBJ_VIEW,.name = "c",.definition = "x",.ndeps = 1,.deps = needs_b},
+		{.kind = WS_OBJ_VIEW,.name = "a",.definition = "x",.owner = "g",.ndeps = 1,.deps = needs_c},
+		{.kind = WS_OBJ_VIEW,.name = "b",.definition = "x",.owner = "g",.ndeps = 1,.deps = needs_a},
+		{.kind = WS_OBJ_VIEW,.name = "c",.definition = "x",.owner = "g",.ndeps = 1,.deps = needs_b},
 	};
 	WsObject	missing[] = {
-		{.kind = WS_OBJ_VIEW,.name = "a",.definition = "x"},
-		{.kind = WS_OBJ_VIEW,.name = "b",.definition = "x",.ndeps = 1,.deps = needs_none},
-		{.kind = WS_OBJ_VIEW,.name = "c",.definition = "x"},
+		{.kind = WS_OBJ_VIEW,.name = "a",.definition = "x",.owner = "g"},
+		{.kind = WS_OBJ_VIEW,.name = "b",.definition = "x",.owner = "g",.ndeps = 1,.deps = needs_none},
+		{.kind = WS_OBJ_VIEW,.name = "c",.definition = "x",.owner = "g"},
 	};
 	int			order[3];
 
@@ -279,9 +285,9 @@ ENGINE_TEST(test_statements)
 {
 	WsObject	v = example();
 	WsObject	m = {.kind = WS_OBJ_MATVIEW,.name = "m",
-		.definition = "AS SELECT 1 AS c WITH NO DATA"};
+		.definition = "AS SELECT 1 AS c WITH NO DATA",.owner = "g"};
 	WsObject	at = {.kind = WS_OBJ_VIEW,.name = "at",
-		.definition = "AS SELECT 'a@@b'::text AS c"};
+		.definition = "AS SELECT 'a@@b'::text AS c",.owner = "g"};
 	Buf			b = BUF_INIT;
 	static const char want[] = "CREATE VIEW s.at AS SELECT 'a@b'::text AS c";
 	static const char want_m_made[] = "CREATE MATERIALIZED VIEW s.m AS SELECT 1 AS c WITH NO DATA";
@@ -345,13 +351,13 @@ ENGINE_TEST(test_refused_statements)
 
 	for (int i = 0; i < lengthof(views); i++)
 	{
-		WsObject	o = {.kind = WS_OBJ_VIEW,.name = "v",.definition = (char *) views[i]};
+		WsObject	o = {.kind = WS_OBJ_VIEW,.name = "v",.definition = (char *) views[i],.owner = "g"};
 
 		expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
 	}
 	for (int i = 0; i < lengthof(matviews); i++)
 	{
-		WsObject	o = {.kind = WS_OBJ_MATVIEW,.name = "v",.definition = (char *) matviews[i]};
+		WsObject	o = {.kind = WS_OBJ_MATVIEW,.name = "v",.definition = (char *) matviews[i],.owner = "g"};
 
 		expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
 	}
