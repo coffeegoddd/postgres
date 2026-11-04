@@ -77,18 +77,33 @@ type_identity(Oid typid, int32 typmod)
 	return text;
 }
 
+/* Whether a relation's columns have tags. */
+static bool
+has_tags(Relation rel)
+{
+	char		relkind = rel->rd_rel->relkind;
+
+	return !IsBootstrapProcessingMode() &&
+		(relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE) &&
+		NamespaceBranch(RelationGetNamespace(rel)) != 0;
+}
+
+void
+ws_tags_check_name(Relation rel, const char *name)
+{
+	if (has_tags(rel))
+		(void) pg_server_to_any(name, strlen(name), PG_UTF8);
+}
+
 uint64
 ws_tag_new_column(Relation rel, const FormData_pg_attribute *att)
 {
-	char		relkind = rel->rd_rel->relkind;
 	TupleDesc	desc = RelationGetDescr(rel);
 	char	   *table;
 	char	   *column;
 	char	   *type;
 
-	if (IsBootstrapProcessingMode() || att->attisdropped ||
-		(relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE) ||
-		NamespaceBranch(RelationGetNamespace(rel)) == 0)
+	if (att->attisdropped || !has_tags(rel))
 		return 0;
 	table = pg_server_to_any(RelationGetRelationName(rel),
 							 strlen(RelationGetRelationName(rel)), PG_UTF8);

@@ -3924,6 +3924,7 @@ renameatt_internal(Oid myrelid,
 	 */
 	targetrelation = relation_open(myrelid, AccessExclusiveLock);
 	renameatt_check(myrelid, RelationGetForm(targetrelation), recursing);
+	ws_tags_check_name(targetrelation, newattname);
 
 	/*
 	 * if the 'recurse' flag is set then we are supposed to rename this
@@ -4350,6 +4351,7 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 	 * specially.
 	 */
 	targetrelation = relation_open(myrelid, is_index ? ShareUpdateExclusiveLock : AccessExclusiveLock);
+	ws_tags_check_name(targetrelation, newrelname);
 	namespaceId = RelationGetNamespace(targetrelation);
 
 	/*

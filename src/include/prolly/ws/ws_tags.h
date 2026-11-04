@@ -52,6 +52,13 @@ extern uint64 ws_tag_derive(const char *table, const char *column, const char *t
  */
 extern uint64 ws_tag_new_column(Relation rel, const FormData_pg_attribute *att);
 
+/*
+ * Refuses a new name for a table in a versioned schema, or for one of its
+ * columns, that has no UTF8: a tag could not be derived from it, and a table's
+ * rewrite derives them.
+ */
+extern void ws_tags_check_name(Relation rel, const char *name);
+
 /* Gives a new relation's columns their tags (a copied descriptor holds its source's). */
 extern void ws_tags_assign(Relation rel);
 

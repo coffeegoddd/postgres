@@ -341,6 +341,28 @@ $node->safe_psql('postgres', q{CREATE SCHEMA plainsch; CREATE TABLE plainsch.t (
 is($tag->('plainsch.t', 'a'), '0', 'a shared table has no tags');
 my ($sret, $sout, $serr) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('plainsch', 't')});
 like($serr, qr/is not in a versioned schema/, 'and is refused');
+$node->safe_psql('postgres', q{CREATE TABLE plainsch.empty ()});
+($sret, $sout, $serr) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('plainsch', 'empty')});
+like($serr, qr/is not in a versioned schema/, 'with no columns too');
+my $hex_plain = $bytes->($node, 'postgres', 'plain');
+($sret, $sout, $serr) = $node->psql('postgres',
+	qq{SELECT test_ws_schema_create(decode('$hex_plain', 'hex'), 'plainsch')});
+like($serr, qr/is not versioned, and its columns have no tags/, 'and takes no tags');
+
+# a column added to a table made again passes over the tag its record gave
+# another column
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.re (a integer);
+	ALTER TABLE src.re RENAME a TO r;
+	CREATE SCHEMA dst3 VERSIONED;
+});
+my $re = $bytes->($node, 'postgres', 're');
+$node->safe_psql('postgres', qq{
+	SELECT test_ws_schema_create(decode('$re', 'hex'), 'dst3');
+	ALTER TABLE dst3.re ADD COLUMN a integer;
+});
+is($tag->('dst3.re', 'r'), $tag->('src.re', 'r'), 'a table made again has the record\'s tag');
+isnt($tag->('dst3.re', 'a'), $tag->('dst3.re', 'r'), 'and a column added in that session another');
 
 # another encoding: the same bytes, UTF8; and what it cannot hold refused
 $node->safe_psql('postgres', q{
@@ -403,6 +425,25 @@ $node->safe_psql('tw', 'CREATE SCHEMA dst VERSIONED');
 ($ret, $out, $err) = $node->psql('tw',
 	qq{SELECT test_ws_schema_create(decode('$wide_hex', 'hex'), 'dst')});
 like($err, qr/too long in this database's encoding/, 'a name too long here refused, not cut');
+
+# a name with no UTF8 cannot come into a versioned schema by a rename, where a
+# table's next rewrite could not derive its tags
+$node->safe_psql('postgres',
+	q{CREATE DATABASE sqlascii ENCODING SQL_ASCII TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
+is($prepare->('sqlascii'), $branch, '(and in the SQL_ASCII one)');
+$node->safe_psql('sqlascii', q{
+	CREATE SCHEMA v VERSIONED;
+	CREATE TABLE v.t (a integer);
+});
+($ret, $out, $err) = $node->psql('sqlascii', qq{CREATE TABLE v."x\xe9" (a integer)});
+like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a new table of such a name refused');
+($ret, $out, $err) = $node->psql('sqlascii', qq{ALTER TABLE v.t RENAME a TO "c\xe9"});
+like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a column renamed so refused');
+($ret, $out, $err) = $node->psql('sqlascii', qq{ALTER TABLE v.t RENAME TO "t\xe9"});
+like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a table renamed so refused');
+$node->safe_psql('sqlascii', q{CREATE SCHEMA sh; CREATE TABLE sh.t (a integer)});
+$node->safe_psql('sqlascii', qq{ALTER TABLE sh.t RENAME a TO "c\xe9"; VACUUM FULL sh.t});
+pass('a shared table is as it ever was');
 
 $node->stop;
 done_testing();

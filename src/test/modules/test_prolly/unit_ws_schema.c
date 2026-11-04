@@ -28,7 +28,7 @@ static WsColumn example_cols[] = {
 	.collation = "pg_catalog.\"C\""},
 	{.tag = 5,.name = "g",.type = "bigint",.kind = WS_COL_GENERATED_STORED,.def = "(@{7} * 2)"},
 	{.tag = 9,.name = "w",.type = "bigint",.kind = WS_COL_GENERATED_VIRTUAL,.def = "(@{7} + 1)"},
-	{.tag = 0,.name = "e",.type = "integer",.kind = WS_COL_STORED,.def = "0"},
+	{.tag = 11,.name = "e",.type = "integer",.kind = WS_COL_STORED,.def = "0"},
 };
 
 static uint64 example_key[] = {7};
@@ -151,7 +151,7 @@ test_find(void)
 	WsTableSchema s = example();
 
 	CHECK(ws_schema_column(&s, 300) == &s.cols[1]);
-	CHECK(ws_schema_column(&s, 0) == &s.cols[4]);
+	CHECK(ws_schema_column(&s, 11) == &s.cols[4]);
 	CHECK(ws_schema_column(&s, 1) == NULL);
 	CHECK(ws_schema_column_named(&s, "g") == &s.cols[2]);
 	CHECK(ws_schema_column_named(&s, "nope") == NULL);
@@ -169,13 +169,13 @@ test_row_shape(void)
 
 	ws_schema_row_shape(&s, &shape);
 	CHECK(shape.nkey == 1 && shape.nstored == 4);
-	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
+	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 11);
 	CHECK_EQ(ws_row_shape_at(&shape, 9), -1);
 	ws_row_shape_free(&shape);
 
 	/* a key on later attributes, out of their order: the key first, in its order */
 	{
-		uint64		key[] = {0, 300};
+		uint64		key[] = {11, 300};
 		WsColumn	cols[lengthof(example_cols)];
 
 		memcpy(cols, example_cols, sizeof(cols));
@@ -187,7 +187,7 @@ test_row_shape(void)
 		CHECK(ws_schema_problem(&s) == NULL);
 		ws_schema_row_shape(&s, &shape);
 		CHECK(shape.nkey == 2 && shape.nstored == 4);
-		CHECK(shape.tags[0] == 0 && shape.tags[1] == 300 && shape.tags[2] == 7 && shape.tags[3] == 5);
+		CHECK(shape.tags[0] == 11 && shape.tags[1] == 300 && shape.tags[2] == 7 && shape.tags[3] == 5);
 		ws_row_shape_free(&shape);
 	}
 
@@ -197,7 +197,7 @@ test_row_shape(void)
 	s.key_name = NULL;
 	ws_schema_row_shape(&s, &shape);
 	CHECK(shape.nkey == 0 && shape.nstored == 4);
-	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
+	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 11);
 	ws_row_shape_free(&shape);
 }
 
@@ -233,7 +233,7 @@ test_wide_and_odd(void)
 
 	for (int i = 0; i < WS_MAX_COLS; i++)
 	{
-		cols[i].tag = (uint64) i * 1000;
+		cols[i].tag = (uint64) (i + 1) * 1000;
 		cols[i].name = psprintf("c\n%d", i);
 		cols[i].type = "a type";
 		cols[i].kind = WS_COL_STORED;
@@ -252,6 +252,12 @@ typedef struct Invalid
 	const char *problem;
 	void		(*spoil) (WsTableSchema *s);
 } Invalid;
+
+static void
+col_no_tag(WsTableSchema *s)
+{
+	s->cols[0].tag = 0;
+}
 
 static void
 no_name(WsTableSchema *s)
@@ -410,6 +416,7 @@ key_too_many(WsTableSchema *s)
 }
 
 static const Invalid invalid[] = {
+	{"a column with no tag", col_no_tag},
 	{"a table's name too long", name_long},
 	{"a column's name too long", col_name_long},
 	{"an identity column that may be null", identity_nullable},

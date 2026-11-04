@@ -19,6 +19,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -30,6 +31,7 @@
 #include "nodes/parsenodes.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
@@ -37,6 +39,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
@@ -58,6 +61,8 @@ ws_schema_problem(const WsTableSchema *s)
 
 		if (c->name == NULL || c->name[0] == '\0')
 			return "a column with no name";
+		if (c->tag == 0)
+			return "a column with no tag";
 		if (strlen(c->name) >= NAMEDATALEN)
 			return "a column's name too long";
 		if (c->type == NULL || c->type[0] == '\0')
@@ -801,12 +806,10 @@ static const char *const unsupported_sql =
 "                 AND p.refobjid = c.oid AND p.deptype = 'a') "
 "    THEN 'it owns a sequence' "
 "  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
-"               JOIN pg_class qc ON qc.oid = q.seqrelid "
 "               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
 "               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
 "                 AND p.refobjid = c.oid AND p.deptype = 'i' AND a.attidentity <> '' AND "
-"                 (qc.relpersistence <> c.relpersistence OR "
-"                  q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
+"                 (q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
@@ -889,7 +892,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		Oid			now;
 
-		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text "
+		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text "
 				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
 		now = rel.nrows == 0 ? InvalidOid : atooid(ws_sql_value(&rel, 0, 0));
@@ -924,6 +927,10 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the schema of temporary table \"%s\" cannot be read yet", table)));
+	if (atoi(ws_sql_value(&rel, 0, 3)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" is not in a versioned schema", table)));
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 		WsSqlRows	why;
@@ -984,11 +991,6 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 			generated[0] == ATTRIBUTE_GENERATED_VIRTUAL ? WS_COL_GENERATED_VIRTUAL : WS_COL_STORED;
 		c->collation = collation ? to_utf8(collation) : NULL;
 		c->tag = (uint64) strtoi64(ws_sql_value(&cols, i, 8), NULL, 10);
-		/* (a table in no versioned schema: its columns have none) */
-		if (c->tag == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("table \"%s\" is not in a versioned schema", table)));
 		rc.tags[i] = c->tag;
 	}
 	/* (once every column has its tag: an expression may refer to any) */
@@ -1043,16 +1045,34 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 void
 ws_schema_set_tags(const char *schema, const WsTableSchema *s)
 {
-	char	   *table = from_utf8(s->name);
-	Oid			relid = get_relname_relid(table, get_namespace_oid(schema, false));
+	const char *problem = ws_schema_problem(s);
+	char	   *table;
+	Oid			nsp = get_namespace_oid(schema, false);
+	Oid			relid;
+	Relation	rel;
 	Relation	attrs;
+	int			live = 0;
 
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (NamespaceBranch(nsp) == 0)
+		elog(ERROR, "schema \"%s\" is not versioned, and its columns have no tags", schema);
+	table = name_from_utf8(s->name);
+	relid = get_relname_relid(table, nsp);
 	if (!OidIsValid(relid))
 		elog(ERROR, "no table \"%s\" in schema \"%s\"", table, schema);
+	rel = relation_open(relid, AccessExclusiveLock);
+	for (int i = 0; i < RelationGetNumberOfAttributes(rel); i++)
+		if (!TupleDescAttr(RelationGetDescr(rel), i)->attisdropped)
+			live++;
+	/* (every column the record's, or the table could hold a tag twice) */
+	if (live != s->ncols)
+		elog(ERROR, "table \"%s\" has %d columns, its record %d", table, live, s->ncols);
+	relation_close(rel, NoLock);
 	attrs = table_open(AttributeRelationId, RowExclusiveLock);
 	for (int i = 0; i < s->ncols; i++)
 	{
-		char	   *name = from_utf8(s->cols[i].name);
+		char	   *name = name_from_utf8(s->cols[i].name);
 		HeapTuple	tup = SearchSysCacheCopyAttName(relid, name);
 
 		if (!HeapTupleIsValid(tup))
