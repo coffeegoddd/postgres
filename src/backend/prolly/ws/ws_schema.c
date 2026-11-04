@@ -66,10 +66,12 @@
 #include "prolly/ws/ws_tags.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
@@ -469,8 +471,23 @@ comments_problem(const WsTableSchema *s)
 					if (m->tag != 0 || m->name == NULL)
 						return "a comment on a constraint the table does not have";
 					found = s->key_name != NULL && strcmp(s->key_name, m->name) == 0;
-					for (int k = 0; k < s->nconstraints && !found; k++)
-						found = strcmp(s->constraints[k].name, m->name) == 0;
+					/* (in order by name, already checked: a record may hold a great many) */
+					{
+						int			lo = 0,
+									hi = s->nconstraints - 1;
+
+						while (lo <= hi && !found)
+						{
+							int			mid = lo + (hi - lo) / 2;
+							int			cmp = strcmp(m->name, s->constraints[mid].name);
+
+							found = cmp == 0;
+							if (cmp < 0)
+								hi = mid - 1;
+							else
+								lo = mid + 1;
+						}
+					}
 					for (int k = 0; k < s->ncols && !found; k++)
 						found = s->cols[k].not_null != NULL && strcmp(s->cols[k].not_null, m->name) == 0;
 					if (!found)
@@ -3783,6 +3800,11 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
 "                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'f')) "
 "    THEN 'a foreign key has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_type'::regclass AND d.objoid = c.reltype) "
+"    THEN 'its row type has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d JOIN pg_index x ON x.indexrelid = d.objoid "
+"               WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = c.reltoastrelid) "
+"    THEN 'its TOAST table has a comment' "
 "  WHEN EXISTS (SELECT FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass "
 "               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
 "  WHEN (c.relacl IS NOT NULL AND c.relacl <> acldefault('r', c.relowner)) OR "
@@ -3961,7 +3983,7 @@ read_index_key(const char *table, const char *index_oid, int k, const IndexElem 
 		WsSqlRows	one;
 
 		snprintf(colno, sizeof(colno), "%d", k + 1);
-		WsSql->run("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
+		WsSql->read("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
 		if (ws_sql_value(&one, 0, 0) == NULL)
 			index_gone(table);
 		key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
@@ -3995,7 +4017,7 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(atooid(index_oid))))
 		index_gone(table);
-	WsSql->run("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
+	WsSql->read("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
 	if (ws_sql_value(&printed, 0, 0) == NULL)
 		index_gone(table);
 	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", ws_sql_value(&printed, 0, 0)),
@@ -4101,7 +4123,7 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 			exprs = (List *) stringToNode(TextDatumGetCString(datum));
 	}
 	ReleaseSysCache(tup);
-	WsSql->run("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
+	WsSql->read("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
 	if (ws_sql_value(&printed, 0, 0) == NULL)
 		elog(ERROR, "partitioned table \"%s\" printed no partitioning", table);
 	parsed = raw_parser(psprintf("CREATE TABLE t () PARTITION BY %s", ws_sql_value(&printed, 0, 0)),
@@ -4165,7 +4187,7 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
+	WsSql->read("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
 			   "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
 			   "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
 	/*
@@ -4219,7 +4241,7 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 			qsort(out->options, out->noptions, sizeof(WsOption), option_cmp);
 	}
 	ws_sql_rows_free(&rows);
-	WsSql->run("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
+	WsSql->read("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
 			   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
 	for (int r = 0; r < rows.nrows;)
 	{
@@ -4284,7 +4306,7 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	WsSqlRows	idx;
 	int			n = 0;
 
-	WsSql->run("SELECT ic.relname::text, ic.oid::text, "
+	WsSql->read("SELECT ic.relname::text, ic.oid::text, "
 			   "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
 			   "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
 			   "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
@@ -4307,14 +4329,14 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 			set->include = px_malloc((size_t) set->ninclude * sizeof(uint64));
 			read_col_tags(table, cols, out, ws_sql_value(&idx, r, 3), set->ninclude, set->include);
 		}
-		WsSql->run("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
+		WsSql->read("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
 		if (opts.nrows > 0)
 		{
 			set->options = read_option_rows(&opts, 0, 0, opts.nrows);
 			set->noptions = opts.nrows;
 		}
 		ws_sql_rows_free(&opts);
-		WsSql->run("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
+		WsSql->read("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
 				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
 				   "ORDER BY a.attnum", 1, iparams, &atts);
 		if (atts.nrows > 0)
@@ -4328,7 +4350,7 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 			}
 		}
 		ws_sql_rows_free(&atts);
-		WsSql->run("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
+		WsSql->read("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
 				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
 		if (keyopts.nrows > 0)
 		{
@@ -4376,14 +4398,18 @@ comment_cmp(const void *a, const void *b)
 	return x->name != NULL && y->name != NULL ? strcmp(x->name, y->name) : 0;
 }
 
-/* The comments on what the record holds; on any other, refused above. */
+/*
+ * The comments on what the record holds: those on a foreign key, a row type or a
+ * TOAST table are refused above, and those on triggers and the like go with those
+ * objects, which are not the table's.
+ */
 static void
 read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT 't', NULL::text, d.description FROM pg_description d "
+	WsSql->read("SELECT 't', NULL::text, d.description FROM pg_description d "
 			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid = 0 "
 			   "UNION ALL SELECT 'c', d.objsubid::text, d.description FROM pg_description d "
 			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid > 0 "
@@ -4434,7 +4460,7 @@ read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT c.relreplident::text, "
+	WsSql->read("SELECT c.relreplident::text, "
 			   "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
 			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 			   "    WHERE i.indrelid = c.oid AND i.indisreplident), "
@@ -4475,7 +4501,7 @@ read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others
 	WsSqlRows	parents;
 	int			n = 0;
 
-	WsSql->run("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+	WsSql->read("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
 			   "WHERE i.inhrelid = $1::oid ORDER BY i.inhseqno", 1, params, &parents);
 	if (parents.nrows > 0)
 	{
@@ -4581,11 +4607,19 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("table \"%s\" is not in a versioned schema", table)));
+
+	/*
+	 * All the rest under one snapshot, taken now the lock is held, as that lock
+	 * keeps out only some of what can change a table's record: another
+	 * transaction's comment, or an index renamed, between one read and the next.
+	 */
+	PushCopiedSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 		WsSqlRows	why;
 
-		WsSql->run(unsupported_sql, 1, oid, &why);
+		WsSql->read(unsupported_sql, 1, oid, &why);
 		if (why.nrows == 1 && ws_sql_value(&why, 0, 0) != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -4598,7 +4632,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 
-		WsSql->run("SELECT a.attnum::text, a.attname::text, "
+		WsSql->read("SELECT a.attnum::text, a.attname::text, "
 				   "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
 				   "  a.attidentity::text, a.attgenerated::text, "
 				   "  pg_get_expr(d.adbin, d.adrelid), "
@@ -4624,7 +4658,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
 				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
 				   "ORDER BY a.attnum", 1, oid, &cols);
-		WsSql->run("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
+		WsSql->read("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
 				   "  con.oid::text, "
@@ -4633,14 +4667,14 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  con.conislocal::text "
 				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
 				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
-		WsSql->run("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
+		WsSql->read("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
 				   "  pg_get_expr(i.indpred, i.indrelid) "
 				   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 				   "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
 				   "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
 				   "    AND k.contype <> 'f')",
 				   1, oid, &idxs);
-		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
+		WsSql->read("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
 				   "  con.condeferrable::text, "
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				   "  con.condeferred::text "
@@ -4775,6 +4809,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
+	INJECTION_POINT("ws-schema-read-between", NULL);
 	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_index_settings(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_table_settings(table, ws_sql_value(&rel, 0, 0), out);
@@ -4805,6 +4840,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&key);
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
+	PopActiveSnapshot();
 	WsSql->end(level);
 	return true;
 }

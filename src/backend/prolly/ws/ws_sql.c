@@ -107,7 +107,7 @@ statements_own_error(int code)
 /* The statement run under SPI, its rows copied into cxt. */
 static void
 spi_run_in(const char *sql, int nparams, const char *const *params, WsSqlRows *rows,
-		   MemoryContext cxt)
+		   MemoryContext cxt, bool read_only)
 {
 	Oid		   *types = NULL;
 	Datum	   *values = NULL;
@@ -132,7 +132,7 @@ spi_run_in(const char *sql, int nparams, const char *const *params, WsSqlRows *r
 			values[i] = params[i] ? CStringGetTextDatum(params[i]) : (Datum) 0;
 		}
 	}
-	rc = SPI_execute_with_args(sql, nparams, types, values, nulls, false, 0);
+	rc = SPI_execute_with_args(sql, nparams, types, values, nulls, read_only, 0);
 	if (rc < 0)
 		elog(ERROR, "\"%s\" failed: %s", sql, SPI_result_code_string(rc));
 	rows->processed = SPI_processed;
@@ -164,7 +164,7 @@ spi_run_in(const char *sql, int nparams, const char *const *params, WsSqlRows *r
 static void
 spi_run(const char *sql, int nparams, const char *const *params, WsSqlRows *rows)
 {
-	spi_run_in(sql, nparams, params, rows, CurrentMemoryContext);
+	spi_run_in(sql, nparams, params, rows, CurrentMemoryContext, false);
 }
 
 /* (as PL/pgSQL's block with an exception clause: a subtransaction) */
@@ -222,7 +222,7 @@ attempt_statement(void *arg)
 {
 	AttemptArgs *a = arg;
 
-	spi_run_in(a->sql, a->nparams, a->params, a->rows, a->cxt);
+	spi_run_in(a->sql, a->nparams, a->params, a->rows, a->cxt, false);
 }
 
 static bool
@@ -237,11 +237,18 @@ spi_attempt(const char *sql, int nparams, const char *const *params, WsSqlRows *
 	return false;
 }
 
+static void
+spi_read(const char *sql, int nparams, const char *const *params, WsSqlRows *rows)
+{
+	spi_run_in(sql, nparams, params, rows, CurrentMemoryContext, true);
+}
+
 const WsSqlRoutine SpiWsSql = {
 	.name = "spi",
 	.begin = spi_begin_scope,
 	.end = spi_end_scope,
 	.run = spi_run,
+	.read = spi_read,
 	.attempt = spi_attempt,
 	.attempt_fn = spi_attempt_fn,
 };

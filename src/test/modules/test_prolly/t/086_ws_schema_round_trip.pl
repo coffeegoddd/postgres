@@ -426,6 +426,14 @@ $node->safe_psql('postgres', q{
 	COMMENT ON TABLE src.cm_part IS 'the parent';
 	CREATE TABLE src.cm_part1 PARTITION OF src.cm_part FOR VALUES FROM (0) TO (1);
 	COMMENT ON TABLE src.cm_part1 IS 'its partition';
+	CREATE TABLE src.cm_clone (a integer NOT NULL, CONSTRAINT cm_clone_k PRIMARY KEY (a), CONSTRAINT cm_clone_c CHECK (a > 0)) PARTITION BY RANGE (a);
+	CREATE TABLE src.cm_clone1 PARTITION OF src.cm_clone FOR VALUES FROM (0) TO (1);
+	COMMENT ON CONSTRAINT cm_clone1_pkey ON src.cm_clone1 IS 'cm a partition''s key';
+	COMMENT ON CONSTRAINT cm_clone_c ON src.cm_clone1 IS 'cm an inherited check';
+	COMMENT ON INDEX src.cm_clone1_pkey IS 'cm a partition''s index';
+	CREATE TABLE src.cm_inh (a integer, CONSTRAINT cm_inh_c CHECK (a > 0));
+	CREATE TABLE src.cm_inh1 () INHERITS (src.cm_inh);
+	COMMENT ON CONSTRAINT cm_inh_c ON src.cm_inh1 IS 'cm an inherited check of a child';
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -451,7 +459,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
 	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk',
 	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1', 'rs_fkp', 'rs_fkc',
-	'cm', 'cm_ren', 'cm_part', 'cm_part1');
+	'cm', 'cm_ren', 'cm_part', 'cm_part1', 'cm_clone', 'cm_clone1', 'cm_inh', 'cm_inh1');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -895,13 +903,44 @@ $node->safe_psql('postgres', q{
 my $cmts = q{SELECT string_agg(d.classoid::regclass::text || ' ' ||
 		coalesce((SELECT relname FROM pg_class WHERE oid = d.objoid AND d.classoid = 'pg_class'::regclass),
 			(SELECT conname FROM pg_constraint WHERE oid = d.objoid AND d.classoid = 'pg_constraint'::regclass)) || ' ' ||
-		d.objsubid || ': ' || d.description, E'\n' ORDER BY 1)
+		d.objsubid || ': ' || d.description, E'\n' ORDER BY d.classoid::regclass::text, d.objsubid, d.description)
 	FROM pg_description d WHERE (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT oid FROM pg_class WHERE relnamespace = '%1$s'::regnamespace AND relname LIKE 'cm%%'))
 		OR (d.classoid = 'pg_constraint'::regclass AND d.objoid IN (SELECT oid FROM pg_constraint WHERE connamespace = '%1$s'::regnamespace AND conname LIKE 'cm%%'))};
-$cmts =~ s/ORDER BY 1\)/ORDER BY d.classoid::regclass::text, d.description)/;
 isnt($node->safe_psql('postgres', sprintf($cmts, 'src')), '', '(there are some)');
 is($node->safe_psql('postgres', sprintf($cmts, 'dst')), $node->safe_psql('postgres', sprintf($cmts, 'src')), 'comments as they were');
-is($node->safe_psql('postgres', q{SELECT col_description('dst.cm_ren'::regclass, 1)}), 'followed', 'a comment follows its column by tag');
+is($node->safe_psql('postgres', q{SELECT col_description('dst.cm_ren'::regclass, 1)}), 'followed', 'a comment on a renamed column made again');
+
+# one read, one snapshot: what commits between its queries is not half in it
+if ($ENV{enable_injection_points} eq 'yes' && $node->check_extension('injection_points'))
+{
+	$node->safe_psql('postgres', q{
+		CREATE EXTENSION IF NOT EXISTS injection_points;
+		CREATE TABLE src.mid_p (id integer PRIMARY KEY);
+		CREATE TABLE src.mid (a integer, CONSTRAINT mid_k FOREIGN KEY (a) REFERENCES src.mid_p (id));
+		CREATE INDEX mid_i ON src.mid (a);
+		COMMENT ON INDEX src.mid_i IS 'an index';
+	});
+	my $before = $bytes->($node, 'postgres', 'mid');
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('ws-schema-read-between', 'wait')});
+	my $reader = $node->background_psql('postgres', on_error_stop => 0);
+	$reader->query_until(qr/reading/, q{\echo reading
+		SELECT encode(test_ws_schema_bytes('src', 'mid'), 'hex');
+		\echo done
+});
+	$node->poll_query_until('postgres',
+		q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event = 'ws-schema-read-between'}) or die 'no reader waiting';
+	$node->safe_psql('postgres', q{
+		ALTER INDEX src.mid_i RENAME TO mid_j;
+		COMMENT ON CONSTRAINT mid_k ON src.mid IS 'too late';
+		SELECT injection_points_wakeup('ws-schema-read-between');
+		SELECT injection_points_detach('ws-schema-read-between');
+	});
+	my $read = $reader->query_until(qr/done/, q{});
+	like($read, qr/\Q$before\E/, 'a read as of its one snapshot, not what committed since it began');
+	is($reader->{stderr}, '', '(and no error)');
+	$reader->quit;
+	$node->safe_psql('postgres', q{COMMENT ON CONSTRAINT mid_k ON src.mid IS NULL});
+}
 
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
@@ -933,7 +972,7 @@ $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
 	ctrg => 'a constraint trigger',
-	fkcom => 'a foreign key has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace', 
+	fkcom => 'a foreign key has a comment', cmty => 'row type has a comment', cmto => 'TOAST table has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace', 
 	repgone => 'no longer has', repgonek => 'no longer has', uoptd => 'two constraints alike', kuoptd => 'two constraints alike',
 	xoptd => 'two constraints alike', ixo1 => 'one for the other',
 	xext => 'depends on an extension', fksopt => 'has a tablespace',
@@ -998,6 +1037,9 @@ for my $t (
 	[ 'kuoptd', 'CREATE TABLE src.kuoptd (a int PRIMARY KEY); ALTER TABLE src.kuoptd ADD CONSTRAINT kuoptd_2 UNIQUE (a) WITH (fillfactor = 50)' ],
 	[ 'xoptd', 'CREATE TABLE src.xoptd (r int4range, CONSTRAINT xoptd_1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xoptd ADD CONSTRAINT xoptd_2 EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50)' ],
 	[ 'ixo1', q{CREATE TABLE src.ixo (a integer) PARTITION BY RANGE (a); CREATE INDEX ixo_1 ON src.ixo (a); CREATE INDEX ixo_2 ON src.ixo (a) WITH (fillfactor = 50); CREATE TABLE src.ixo1 PARTITION OF src.ixo FOR VALUES FROM (0) TO (10)} ],
+	[ 'cmty', q{CREATE TABLE src.cmty (a int); COMMENT ON TYPE src.cmty IS 'x'} ],
+	[ 'cmto', q{CREATE TABLE src.cmto (a text);
+		SELECT format('COMMENT ON INDEX pg_toast.%I IS ''x''', i.relname) FROM pg_class t JOIN pg_index x ON x.indrelid = t.reltoastrelid JOIN pg_class i ON i.oid = x.indexrelid WHERE t.oid = 'src.cmto'::regclass \gexec} ],
 	[ 'fkcom', q{CREATE TABLE src.fkcom_p (id int PRIMARY KEY); CREATE TABLE src.fkcom (a int, CONSTRAINT fkcom_k FOREIGN KEY (a) REFERENCES src.fkcom_p (id)); COMMENT ON CONSTRAINT fkcom_k ON src.fkcom IS 'x'} ],
 	[ 'xdup', 'CREATE TABLE src.xdup (r int4range, CONSTRAINT x1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xdup ADD CONSTRAINT x2 EXCLUDE USING gist (r WITH &&)' ],
 	[ 'xspc', 'CREATE TABLE src.xspc (r int4range, EXCLUDE USING gist (r WITH &&) USING INDEX TABLESPACE t86)' ],
@@ -1609,6 +1651,15 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 		CREATE TABLE enc."toasté" (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE enc."toasté" DROP COLUMN t});
 	my ($ret, $out, $err) = $node->psql('lat', q{SET client_encoding = UTF8; SELECT test_ws_schema_bytes('enc', 'toasté')});
 	like($err, qr/table "toasté" cannot be read yet/, 'a TOAST table\'s refusal in the server\'s encoding');
+}
+
+# a comment this encoding cannot hold, in a table made there: refused from the start
+{
+	$node->safe_psql('postgres', q{SET client_encoding = UTF8;
+		CREATE TABLE enc.cm_euro (a integer); COMMENT ON TABLE enc.cm_euro IS '€'});
+	my $hex = $node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('enc', 'cm_euro'), 'hex')});
+	my ($ret, $out, $err) = $node->psql('lat', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst')});
+	like($err, qr/has no equivalent in encoding/, 'a comment LATIN1 cannot hold refused');
 }
 
 # a comment's text and targets in each encoding
