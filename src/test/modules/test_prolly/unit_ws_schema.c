@@ -57,7 +57,8 @@ test_bytes(void)
 		"\x01" "t"				/* name */
 		"\x01"					/* columns */
 		"\x07" "\x02" "id" "\x06" "bigint" "s" "\x01" "a" "\x00" "\x00"
-		"\x02" "pk" "\x01\x07";	/* key: its name, its columns */
+		"\x02" "pk" "\x01\x07"	/* key: its name, its columns */
+		"\x00";					/* constraints */
 	WsColumn	cols[] = {{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,
 		.not_null = true,.identity = WS_IDENTITY_ALWAYS}};
 	WsTableSchema s = {.name = "t",.ncols = 1,
@@ -76,7 +77,7 @@ test_bytes(void)
 			"\x07" "\x01" "k" "\x01" "i" "s" "\x01" "d" "\x00" "\x00"
 			"\xac\x02" "\x01" "v" "\x01" "t" "s" "\x00" "\x00" "\x03" "\'x\'" "\x03" "\"C\""
 			"\x05" "\x01" "g" "\x01" "i" "g" "\x00" "\x00" "\x01" "1" "\x00"
-			"\x02" "pk" "\x01\x07";
+			"\x02" "pk" "\x01\x07" "\x00";
 		WsColumn	c2[] = {
 			{.tag = 7,.name = "k",.type = "i",.kind = WS_COL_STORED,.not_null = true,
 			.identity = WS_IDENTITY_BY_DEFAULT},
@@ -530,18 +531,18 @@ test_malformed(void)
 		size_t		len;
 		const char *why;
 	}			bad[] = {
-		{"\x02" "\x01" "t" "\x00" "\x00" "\x00", 6, "a version not known"},
-		{"\x01" "\x02" "t\0" "\x00" "\x00" "\x00", 7, "a NUL"},
+		{"\x02" "\x01" "t" "\x00" "\x00" "\x00" "\x00", 7, "a version not known"},
+		{"\x01" "\x02" "t\0" "\x00" "\x00" "\x00" "\x00", 8, "a NUL"},
 		{"\x01" "\x09" "t", 3, "runs past its end"},
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 17, "neither"},
-		{"\x01" "\x01" "t" "\xc1\x0c" "\x00", 6, "more columns than a table can have"},
-		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07", 8, "a key of more columns"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 18, "neither"},
+		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00", 7, "more columns than a table can have"},
+		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00", 9, "a key of more columns"},
 		/* a number not in its shortest form: one schema, other bytes */
-		{"\x01" "\x81\x00" "t" "\x00" "\x00" "\x00", 7, "shortest form"},
-		{"\x01" "\x01" "t" "\x80\x00" "\x00" "\x00", 7, "shortest form"},
-		{"\x01" "\x01" "t" "\x00" "\x00" "\x80\x80\x00", 8, "shortest form"},
+		{"\x01" "\x81\x00" "t" "\x00" "\x00" "\x00" "\x00", 8, "shortest form"},
+		{"\x01" "\x01" "t" "\x80\x00" "\x00" "\x00" "\x00", 8, "shortest form"},
+		{"\x01" "\x01" "t" "\x00" "\x00" "\x80\x80\x00" "\x00", 9, "shortest form"},
 		/* a tag of bits past the 64th, dropped on reading */
-		{"\x01" "\x01" "t" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 25, "shortest form"},
+		{"\x01" "\x01" "t" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 26, "shortest form"},
 	};
 
 	WsSchemaCodec->encode(&s, &b);
@@ -811,6 +812,140 @@ test_create_table_stray_clause(void)
 					   "a column's generation");
 }
 
+/* A check and a unique constraint: the record, its bytes and its statement. */
+static void
+test_constraints(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	uint64		both[] = {8, 7};
+	WsConstraint cons[] = {
+		{.name = "Odd Check",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > @{8})"},
+		{.name = "u",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 2,.cols = both,
+		.nulls_not_distinct = true,.deferrable = true,.initdeferred = true},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 2,.constraints = cons};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x02"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x08" "\x01" "b" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"			/* no key */
+		"\x02"					/* constraints */
+		"\x09" "Odd Check" "c" "\x00" "\x0d" "(@{7} > @{8})"
+		"\x01" "u" "u" "\x07" "\x02\x08\x07";
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK_EQ(got.nconstraints, 2);
+	CHECK(strcmp(got.constraints[0].expr, "(@{7} > @{8})") == 0);
+	CHECK(got.constraints[1].cols[0] == 8 && got.constraints[1].initdeferred);
+	ws_schema_free(&got);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a integer,\n"
+				 "    b integer,\n"
+				 "    CONSTRAINT \"Odd Check\" CHECK ((a > b)),\n"
+				 "    CONSTRAINT u UNIQUE NULLS NOT DISTINCT (b, a) DEFERRABLE INITIALLY DEFERRED\n"
+				 ")") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+static void
+constraint_invalid(const WsConstraint *cons, int n, const char *why)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "v",.type = "integer",.kind = WS_COL_GENERATED_VIRTUAL,.def = "1"},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.key_name = NULL,
+	.nconstraints = n,.constraints = (WsConstraint *) cons};
+	const char *problem = ws_schema_problem(&s);
+
+	if (problem == NULL || strstr(problem, why) == NULL)
+		elog(ERROR, "for \"%s\": %s", why, problem ? problem : "no problem found");
+}
+
+static void
+test_constraint_problems(void)
+{
+	uint64		a[] = {7};
+	uint64		twice[] = {7, 7};
+	uint64		none[] = {9};
+	uint64		virt[] = {8};
+
+#define CHECK_C {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"}
+#define BAD(why, ...) \
+	do { \
+		const WsConstraint one[] = {__VA_ARGS__}; \
+		constraint_invalid(one, lengthof(one), why); \
+	} while (0)
+	BAD("no name", {.kind = WS_CONSTRAINT_CHECK,.expr = "true"});
+	BAD("no known kind", {.name = "x",.kind = 'z'});
+	BAD("not in order", {.name = "d",.kind = WS_CONSTRAINT_CHECK,.expr = "true"}, CHECK_C);
+	BAD("not in order", CHECK_C, CHECK_C);
+	BAD("no expression", {.name = "x",.kind = WS_CONSTRAINT_CHECK});
+	BAD("malformed", {.name = "x",.kind = WS_CONSTRAINT_CHECK,.expr = "@"});
+	BAD("unique constraint's fields", {.name = "x",.kind = WS_CONSTRAINT_CHECK,.expr = "true",.deferrable = true});
+	BAD("with an expression", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.expr = "true",.ncols = 1,.cols = a});
+	BAD("no columns", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE});
+	BAD("does not have", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = none});
+	BAD("column twice", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 2,.cols = twice});
+	BAD("virtual", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = virt});
+	BAD("not deferrable", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = a,.initdeferred = true});
+#undef BAD
+#undef CHECK_C
+	{
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = true}};
+		WsConstraint same = {.name = "k",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.key_name = "k",.nkey = 1,.key = a,
+		.nconstraints = 1,.constraints = &same};
+
+		CHECK(strstr(ws_schema_problem(&s), "named as the key") != NULL);
+	}
+}
+
+/* What a check's text could add to the statement is refused. */
+static void
+check_injection(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = (char *) arg};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+static void
+test_constraint_injection(void)
+{
+	static const char *const bad[] = {
+		"true) NO INHERIT --",
+		"true) NOT VALID --",
+		"true) NOT ENFORCED --",
+		"true); DROP TABLE x.y; --",
+		"true), CONSTRAINT d CHECK (false",
+		"true), UNIQUE (a",
+		"true)) INHERITS (x.y",
+		"true) FROM pg_authid WHERE (true",
+		"true) AS foo --",
+	};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(check_injection, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+}
+
 /* An expression's references take the names the record has now. */
 static void
 test_create_table_renamed(void)
@@ -953,6 +1088,9 @@ static const ProllyUnitTest tests[] = {
 	{"create_table_injection", test_create_table_injection},
 	{"create_table_unchecked", test_create_table_unchecked},
 	{"create_table_quoting", test_create_table_quoting},
+	{"constraints", test_constraints},
+	{"constraint_problems", test_constraint_problems},
+	{"constraint_injection", test_constraint_injection},
 	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},

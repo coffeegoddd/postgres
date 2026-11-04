@@ -48,6 +48,15 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src."Odd Table" ("Odd Name" integer, "select" integer DEFAULT 1,
 		"a""b" integer GENERATED ALWAYS AS ("Odd Name" + "select") STORED,
 		CONSTRAINT "Odd Key" PRIMARY KEY ("Odd Name"));
+	CREATE TABLE src.cons (a integer CHECK (a > 0), b integer, "Odd" text UNIQUE,
+		c integer GENERATED ALWAYS AS (a + 1) STORED,
+		CONSTRAINT "z check" CHECK (a < b AND "Odd" <> '@a'),
+		CONSTRAINT nnd UNIQUE NULLS NOT DISTINCT (b, a),
+		CONSTRAINT later UNIQUE (b) DEFERRABLE INITIALLY DEFERRED,
+		CONSTRAINT soon UNIQUE (a) DEFERRABLE);
+	CREATE TABLE src.cons_key (id integer PRIMARY KEY, a integer CHECK (a <> id));
+	CREATE TABLE src.cons_ren (a integer, CHECK (a > 0), UNIQUE (a));
+	ALTER TABLE src.cons_ren RENAME a TO z;
 	CREATE TABLE src.renamed (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
 	ALTER TABLE src.renamed RENAME a TO z;
 	CREATE SCHEMA other;
@@ -65,7 +74,7 @@ $node->safe_psql('postgres', q{
 });
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
-	'colls', 'Odd Table', 'renamed', 'dropped', 'settings', 'names', 'ats');
+	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -146,6 +155,20 @@ for my $t (
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
+	[ 'fk', 'CREATE TABLE src.fk (a int REFERENCES src.keyed (id))' ],
+	[ 'excl', 'CREATE TABLE src.excl (r int4range, EXCLUDE USING gist (r WITH &&))' ],
+	[ 'cnv', 'CREATE TABLE src.cnv (a int); ALTER TABLE src.cnv ADD CONSTRAINT c CHECK (a > 0) NOT VALID' ],
+	[ 'cni', 'CREATE TABLE src.cni (a int, CONSTRAINT c CHECK (a > 0) NO INHERIT)' ],
+	[ 'cne', 'CREATE TABLE src.cne (a int, CONSTRAINT c CHECK (a > 0) NOT ENFORCED)' ],
+	[ 'uinc', 'CREATE TABLE src.uinc (a int, b int, UNIQUE (a) INCLUDE (b))' ],
+	[ 'uopt', 'CREATE TABLE src.uopt (a int, UNIQUE (a) WITH (fillfactor = 50))' ],
+	[ 'uclu', 'CREATE TABLE src.uclu (a int, CONSTRAINT u UNIQUE (a)); ALTER TABLE src.uclu CLUSTER ON u' ],
+	[ 'idx', 'CREATE TABLE src.idx (a int); CREATE INDEX ON src.idx (a)' ],
+	[ 'cmt', q{CREATE TABLE src.cmt (a int); COMMENT ON TABLE src.cmt IS 'x'} ],
+	[ 'ccmt', q{CREATE TABLE src.ccmt (a int); COMMENT ON COLUMN src.ccmt.a IS 'x'} ],
+	[ 'kcmt', q{CREATE TABLE src.kcmt (a int, CONSTRAINT c CHECK (a > 0)); COMMENT ON CONSTRAINT c ON src.kcmt IS 'x'} ],
+	[ 'grt', 'CREATE TABLE src.grt (a int); GRANT SELECT ON src.grt TO PUBLIC' ],
+	[ 'cgrt', 'CREATE TABLE src.cgrt (a int); GRANT SELECT (a) ON src.cgrt TO PUBLIC' ],
 	[ 'toastp', 'CREATE TABLE src.toastp (a text) WITH (toast.autovacuum_enabled = false)' ],
 	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
 	[ 'clus', 'CREATE TABLE src.clus (a int PRIMARY KEY); ALTER TABLE src.clus CLUSTER ON clus_pkey' ],
@@ -382,6 +405,7 @@ $node->safe_psql('postgres', q{
 	CREATE SCHEMA enc VERSIONED;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
+		CONSTRAINT "écheck" CHECK ("colonné" > 0 AND b <> 'é'), CONSTRAINT zu UNIQUE (b),
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
 	CREATE TABLE enc."only €" (a integer);
 });
@@ -390,6 +414,7 @@ my $enc_sql = q{
 	CREATE SCHEMA enc VERSIONED;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
+		CONSTRAINT "écheck" CHECK ("colonné" > 0 AND b <> 'é'), CONSTRAINT zu UNIQUE (b),
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
 	CREATE SCHEMA dst VERSIONED;
 };
