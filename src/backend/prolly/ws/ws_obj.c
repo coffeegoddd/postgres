@@ -842,8 +842,26 @@ names_schema_walker(Node *node, void *arg)
 			named = qualified(((TypeName *) node)->names, n->only);
 			break;
 		case T_FuncCall:
-			named = qualified(((FuncCall *) node)->funcname, n->only);
-			break;
+			{
+				FuncCall   *call = (FuncCall *) node;
+				const char *fn = strVal(llast(call->funcname));
+
+				named = qualified(call->funcname, n->only);
+
+				/* (these take a name as text too, with no dependency to say so) */
+				if (!named && call->args != NIL &&
+					(strcmp(fn, "nextval") == 0 || strcmp(fn, "currval") == 0 || strcmp(fn, "setval") == 0))
+				{
+					Node	   *first = linitial(call->args);
+
+					/* (printed with casts around it, as text and then to regclass) */
+					while (IsA(first, TypeCast))
+						first = ((TypeCast *) first)->arg;
+					if (IsA(first, A_Const) && IsA(&((A_Const *) first)->val, String))
+						named = string_is_qualified(strVal(&((A_Const *) first)->val), n->only);
+				}
+				break;
+			}
 		case T_A_Expr:
 			named = qualified(((A_Expr *) node)->name, n->only);
 			break;
@@ -1660,6 +1678,11 @@ static const char *const sequence_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e') "
 "    THEN 'it belongs to an extension' "
 "  WHEN c.relpersistence <> 'p' THEN 'it is not logged' "
+"  WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attacl IS NOT NULL) "
+"    THEN 'it has a grant on a column' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d JOIN pg_class t ON t.oid = d.refobjid WHERE d.classid = 'pg_class'::regclass "
+"      AND d.objid = c.oid AND d.deptype = 'a' AND d.refclassid = 'pg_class'::regclass AND t.relkind NOT IN ('r', 'p', 'v')) "
+"    THEN 'it is owned by a column of what no commit holds' "
 "  WHEN EXISTS (SELECT 1 FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass AND l.objoid = c.oid) "
 "    THEN 'it has a security label' "
 "  WHEN c.relacl IS NOT NULL AND (SELECT count(*) FROM aclexplode(c.relacl) e WHERE e.grantee = c.relowner) <> "

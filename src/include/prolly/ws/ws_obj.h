@@ -133,7 +133,8 @@ extern void ws_obj_read(const char *schema, WsObject **out, int *n);
  * Where each of a schema's sequences is, an identity's too, as ~seq holds it (a
  * sequence's position is state, not its definition): by name in UTF8's order, in *out,
  * palloc'd.  It runs no user code to read or set them, and neither reads by a snapshot,
- * as a sequence does not.
+ * as a sequence does not: a capture must keep the schema from changing between this and
+ * ws_obj_read, or a position may not suit the definition held.  It takes SELECT on each.
  */
 typedef struct WsSeqPosition
 {

@@ -1189,6 +1189,7 @@ for my $t (
 	[ 'nv', 'CREATE TABLE src.nv (a int); ALTER TABLE src.nv ADD CONSTRAINT nn NOT NULL a NOT VALID' ],
 	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
 	[ 'seqelse', q{CREATE SEQUENCE other.seq_else; CREATE TABLE src.seqelse (a bigint DEFAULT nextval('other.seq_else'))} ],
+	[ 'seqid', q{CREATE TABLE src.seqid_p (id integer GENERATED ALWAYS AS IDENTITY); CREATE TABLE src.seqid (a bigint DEFAULT currval('src.seqid_p_id_seq'))} ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
 	[ 'ctrg', q{CREATE TABLE src.ctrg (a int); CREATE FUNCTION src.ctrg_f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
@@ -2157,6 +2158,13 @@ for my $case (
 	my ($rc, $out, $err) = $node->psql('postgres', "SELECT test_ws_schema_bytes('nm3', '$table')");
 	like($err, qr/table "$table" in schema "nm3" cannot be held in a commit: it must say its schema's name/, "$what is refused");
 }
+
+# a sequence named in text has no dependency to say so, but the grammar sees it
+$node->safe_psql('postgres', q{CREATE SEQUENCE nm3.txt; CREATE TABLE nm3.r19 (a bigint DEFAULT nextval('nm3.txt'::text))});
+my ($rc_t, $out_t, $err_t) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('nm3', 'r19')});
+like($err_t, qr/it must say its schema's name/, 'a sequence named by its schema in text is refused');
+$node->safe_psql('postgres', q{CREATE TABLE nm2.own_ident (i integer GENERATED ALWAYS AS IDENTITY, a bigint DEFAULT currval('nm2.own_ident_i_seq'))});
+isnt($bytes->($node, 'postgres', 'own_ident', undef, 'nm2'), '', 'a default on the table\'s own identity sequence is held');
 
 # a column holding names is no constant, with none to say them in
 $node->safe_psql('postgres', q{CREATE TYPE nm2.holds AS (r regclass); CREATE TABLE nm2.plain_holds (p nm2.holds)});

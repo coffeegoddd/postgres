@@ -664,6 +664,9 @@ $node->safe_psql('postgres', q{
 	CREATE SEQUENCE odd AS smallint INCREMENT BY -2 MINVALUE -100 MAXVALUE 50 START WITH 40 CACHE 3 CYCLE;
 	CREATE SEQUENCE "Odd name";
 	CREATE TABLE ser (id serial, other integer DEFAULT nextval('plain'), big bigserial);
+	CREATE TABLE idt (i integer GENERATED ALWAYS AS IDENTITY);
+	INSERT INTO idt DEFAULT VALUES;
+	INSERT INTO idt DEFAULT VALUES;
 	CREATE FUNCTION nexts() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('plain'::regclass); END;
 	CREATE VIEW nv AS SELECT nextval('plain'::regclass) AS n;
 	COMMENT ON SEQUENCE odd IS 'it''s odd';
@@ -673,6 +676,7 @@ $node->safe_psql('postgres', q{
 });
 my $sq_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sq')});
 my %sq_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $sq_held;
+ok(!$sq_val{'sequence/idt_i_seq'}, 'an identity sequence is its table\'s, not an object');
 ok($sq_val{$_}, "$_ is held") for ('sequence/plain', 'sequence/odd', 'sequence/Odd name', 'sequence/ser_id_seq', 'sequence/ser_big_seq');
 like($sq_val{'sequence/odd'}, qr/AS smallint INCREMENT BY -2 MINVALUE -100 MAXVALUE 50 START WITH 40 CACHE 3 CYCLE/, 'all of a sequence is said');
 like($sq_val{'sequence/ser_id_seq'}, qr/ser.*id/s, 'and what column owns it');
@@ -683,13 +687,16 @@ $node->safe_psql('postgres', q{CREATE SCHEMA sq2 AUTHORIZATION g_sqowner});
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sq', 'sq2', 'before')});
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_depend d JOIN pg_class c ON c.oid = d.objid WHERE c.relnamespace = 'sq2'::regnamespace AND c.relkind = 'S' AND d.deptype = 'a'}),
 	'0', 'not yet owned, its column not being there');
-$node->safe_psql('postgres', q{SET ROLE g_sqowner; CREATE TABLE sq2.ser (id integer NOT NULL DEFAULT nextval('sq2.ser_id_seq'), other integer DEFAULT nextval('sq2.plain'), big bigint NOT NULL DEFAULT nextval('sq2.ser_big_seq'))});
+$node->safe_psql('postgres', q{SET ROLE g_sqowner; CREATE TABLE sq2.ser (id integer NOT NULL DEFAULT nextval('sq2.ser_id_seq'), other integer DEFAULT nextval('sq2.plain'), big bigint NOT NULL DEFAULT nextval('sq2.ser_big_seq'));
+	CREATE TABLE sq2.idt (i integer GENERATED ALWAYS AS IDENTITY)});
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sq', 'sq2', 'after')});
 is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sq2')}), $sq_held, 'the same bytes restored');
 is( $node->safe_psql('postgres', q{SELECT pg_get_serial_sequence('sq2.ser', 'id')}), 'sq2.ser_id_seq', 'owned by its column');
 my $positions = $node->safe_psql('postgres', q{SELECT test_ws_seq_copy('sq', 'sq2')});
 like($positions, qr/^plain 41 1$/m, 'where a sequence is, is read');
 like($positions, qr/^odd 30 0$/m, 'and whether it has been called');
+like($positions, qr/^idt_i_seq 2 1$/m, 'and an identity sequence\'s too');
+is($node->safe_psql('postgres', q{INSERT INTO sq2.idt DEFAULT VALUES RETURNING i}), '3', 'so it goes on from there');
 is($node->safe_psql('postgres', q{SELECT last_value, is_called FROM sq2.plain}), '41|t', 'and set');
 is($node->safe_psql('postgres', q{SELECT nextval('sq2.odd')}), '30', 'so the next is the next');
 
@@ -711,11 +718,14 @@ is($node->safe_psql('postgres', q{SELECT nextval('sq2.odd')}), '30', 'so the nex
 my @sq_refused = (
 	[ q{CREATE UNLOGGED SEQUENCE r_u}, 'not logged' ],
 	[ q{CREATE SEQUENCE r_g; GRANT USAGE ON SEQUENCE r_g TO x_person}, 'which cannot travel' ],
+	[ q{CREATE SEQUENCE r_c; GRANT SELECT (last_value) ON TABLE r_c TO g_squser}, 'a grant on a column' ],
+	[ q{CREATE SEQUENCE r_r; REVOKE UPDATE ON SEQUENCE r_r FROM CURRENT_USER}, 'rights have been changed' ],
+	[ q{CREATE FOREIGN DATA WRAPPER fdw_sq; CREATE SERVER srv_sq FOREIGN DATA WRAPPER fdw_sq; CREATE FOREIGN TABLE ft (a int) SERVER srv_sq; CREATE SEQUENCE r_f OWNED BY ft.a}, 'what no commit holds' ],
 );
 for my $case (@sq_refused)
 {
 	my ($sql, $why) = @$case;
-	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS sq5 CASCADE; DROP TABLE IF EXISTS public.sq_else CASCADE; CREATE SCHEMA sq5; SET search_path = sq5, public; $sql});
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS sq5 CASCADE; DROP SERVER IF EXISTS srv_sq CASCADE; DROP FOREIGN DATA WRAPPER IF EXISTS fdw_sq CASCADE; CREATE SCHEMA sq5; SET search_path = sq5, public; $sql});
 	my ($rc5, $out5, $err5) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('sq5')});
 	isnt($rc5, 0, "refused: $sql");
 	like($err5, qr/\Q$why\E/, "for why: $sql");
