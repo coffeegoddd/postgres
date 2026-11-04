@@ -1238,7 +1238,6 @@ for my $t (
 	[ 'dupk', 'CREATE TABLE src.dupk (a int PRIMARY KEY); ALTER TABLE src.dupk ADD CONSTRAINT dupk_u UNIQUE (a)' ],
 	[ 'uover', 'CREATE TABLE src.uover (a int4range, r int4range, UNIQUE (a, r WITHOUT OVERLAPS))' ],
 	[ 'uspc', "CREATE TABLE src.uspc (a int, UNIQUE (a) USING INDEX TABLESPACE t86)" ],
-	[ 'pol', 'CREATE TABLE src.pol (a int); CREATE POLICY p ON src.pol USING (true)' ],
 	[ 'over', 'CREATE TABLE src.over (a int4range, r int4range, PRIMARY KEY (a, r WITHOUT OVERLAPS))' ],
 	[ 'toid', 'CREATE TABLE src.toid (a oid GENERATED ALWAYS AS (tableoid) STORED)' ])
 {

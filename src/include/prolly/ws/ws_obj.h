@@ -13,6 +13,9 @@
  * from any other schema but the catalogs is refused, and so is what would have to be
  * written with its schema's name, being named as something in the catalogs is.
  *
+ * A trigger, rule or policy is of its table, whose name is in its key, and has no owner
+ * or grants of its own.  A disabled one, or one a replica fires differently, is refused.
+ *
  * What is made before an object is named rather than found by trying, as the order
  * of a restore must not depend on what fails.
  *
@@ -42,8 +45,11 @@ typedef enum WsObjectKind
 	WS_OBJ_DOMAIN,
 	WS_OBJ_FUNCTION,
 	WS_OBJ_MATVIEW,
+	WS_OBJ_POLICY,
 	WS_OBJ_PROCEDURE,
+	WS_OBJ_RULE,
 	WS_OBJ_SEQUENCE,			/* not an identity's, which its table's record holds */
+	WS_OBJ_TRIGGER,
 	WS_OBJ_TYPE,				/* an enum, composite or range type */
 	WS_OBJ_VIEW,
 } WsObjectKind;
@@ -68,8 +74,10 @@ typedef struct WsObject
 {
 	WsObjectKind kind;
 	char	   *name;
-	char	   *args;			/* a function's input types, as printed, or "" if none; else NULL */
-	char	   *definition;		/* its statement after its name, as stored text (ws_tags.h) */
+	char	   *args;			/* a function's input types, as printed, or "" if none; a
+								 * trigger's, rule's or policy's table; else NULL */
+	char	   *definition;		/* its statement after its name, as stored text (ws_tags.h);
+								 * all of it for a trigger, rule or policy, naming its table bare */
 	bool		after_tables;	/* a function that needs one, so made after them */
 	bool		public_revoked; /* what PUBLIC would have is revoked from it */
 	char	   *owned_table;	/* a sequence's OWNED BY, or NULL */

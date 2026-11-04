@@ -4312,7 +4312,6 @@ static const char *const unsupported_sql =
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
 "  WHEN c.relreplident = 'i' AND NOT EXISTS (SELECT FROM pg_index x WHERE x.indrelid = c.oid AND x.indisreplident) "
 "    THEN 'its replica identity is by an index it no longer has' "
-"  WHEN EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has a policy' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND "
 "               k.contype NOT IN ('p', 'u', 'c', 'n', 'f', 'x')) "
 "    THEN 'it has a constraint trigger' "

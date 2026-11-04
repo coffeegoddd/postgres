@@ -425,6 +425,31 @@ ENGINE_TEST(test_refused_statements)
 	};
 
 	{
+		static const char *const of_table[] = {
+			"not sql",
+			"CREATE POLICY v ON other USING (true)",
+			"CREATE POLICY other ON t USING (true)",
+			"CREATE POLICY v ON s.t USING (true)",
+			"CREATE POLICY v ON t USING (true); DROP TABLE t",
+		};
+
+		for (int i = 0; i < lengthof(of_table); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_POLICY,.name = "v",.args = "t",.definition = (char *) of_table[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		{
+			WsObject	o = {.kind = WS_OBJ_TRIGGER,.name = "v",.args = "t",
+			.definition = "CREATE OR REPLACE TRIGGER v BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()"};
+			WsObject	r = {.kind = WS_OBJ_RULE,.name = "v",.args = "t",
+			.definition = "CREATE OR REPLACE RULE v AS ON INSERT TO t DO INSTEAD NOTHING"};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+			expect_error(statement_of, &r, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
+	{
 		static const char *const sequences[] = {
 			"AS bigint; DROP TABLE t",
 			"OWNED BY t.a",
