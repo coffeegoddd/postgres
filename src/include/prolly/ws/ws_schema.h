@@ -118,16 +118,26 @@ extern uint64 ws_schema_derived_tag(void *arg, const char *table, const char *co
 /*
  * The schema of a table, from the catalogs, through WsSql: false if the
  * schema has no ordinary table of that name.  What the record cannot yet hold
- * and would lose (a key with INCLUDE columns or deferrable, a temporary or
- * partitioned table) raises ERRCODE_FEATURE_NOT_SUPPORTED.  What it gives is
- * the caller's to ws_schema_free.
+ * and would lose (inheritance and partitions, storage settings, a key's
+ * options, a sequence's, a default using one) raises
+ * ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
+ * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
+ * sequence's are not held, and are made again.
+ *
+ * It locks the table till the transaction ends, and a table that has changed
+ * since the transaction's snapshot raises
+ * ERRCODE_T_R_SERIALIZATION_FAILURE.  Other objects' names (a type's, a
+ * function's in a default) are printed as they are now, so a reader on an old
+ * snapshot must hold those still itself.  What it gives is the caller's to
+ * ws_schema_free.
  */
 extern bool ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag, void *arg,
 						   WsTableSchema *out);
 
 /*
  * The CREATE TABLE statement for the table, in the named schema, appended to
- * out, in the server's encoding: text the encoding cannot hold raises an error; each expression's references the names of its table's columns.  Names
+ * out, in the server's encoding: text the encoding cannot hold raises an
+ * error, as does a name it holds in too many bytes; each expression's references the names of its table's columns.  Names
  * are quoted as quote_identifier does, under the session's settings: a scope
  * (prolly/ws/ws_sql.h) makes the text the same whoever asks.  A commit may
  * have come from anywhere: the whole statement is parsed and compared with

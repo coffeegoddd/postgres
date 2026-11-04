@@ -814,6 +814,23 @@ test_create_table_stray_clause(void)
 					   "a column's generation");
 }
 
+/* An expression's references take the names the record has now. */
+static void
+test_create_table_renamed(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "now_named",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_GENERATED_STORED,.def = "(@{7} * 2)"},
+	};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 2,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "(now_named * 2)") != NULL);
+	buf_free(&b);
+}
+
 /* A collation is checked as names, under whichever quoting the session has. */
 static void
 test_create_table_quoting(void)
@@ -941,6 +958,7 @@ static const ProllyUnitTest tests[] = {
 	{"create_table_injection", test_create_table_injection},
 	{"create_table_unchecked", test_create_table_unchecked},
 	{"create_table_quoting", test_create_table_quoting},
+	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},
 };

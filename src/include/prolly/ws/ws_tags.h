@@ -18,6 +18,8 @@
 #ifndef PROLLY_WS_TAGS_H
 #define PROLLY_WS_TAGS_H
 
+#include "nodes/nodes.h"
+#include "nodes/pg_list.h"
 #include "prolly/engine/util.h"
 
 /* A column's name by tag (as it is, not quoted), or NULL if it has none. */
@@ -39,6 +41,12 @@ extern bool ws_tags_well_formed(const char *stored);
  */
 extern uint64 ws_tag_derive(const char *table, const char *column, const char *type,
 							int attempt);
+
+/*
+ * The expression of a parse of "SELECT (text)", or NULL if the text was
+ * anything more than one: another clause, an alias, a semicolon.
+ */
+extern Node *ws_one_expression(List *parsed);
 
 /*
  * An expression as the catalogs print it, as stored text appended to out:

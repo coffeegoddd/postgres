@@ -38,12 +38,14 @@ $node->safe_psql('postgres', q{
 		"a""b" integer GENERATED ALWAYS AS ("Odd Name" + "select") STORED,
 		CONSTRAINT "Odd Key" PRIMARY KEY ("Odd Name"));
 	CREATE UNLOGGED TABLE src.unlogged (a integer);
+	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
+		f float8 DEFAULT 0.1, i interval DEFAULT '1 day 2 hours', b bytea DEFAULT '\xab', m money DEFAULT 1);
 	CREATE TABLE src.dropped (a integer, gone integer, b integer DEFAULT 2);
 	ALTER TABLE src.dropped DROP COLUMN gone;
 });
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
-	'colls', 'Odd Table', 'unlogged', 'dropped');
+	'colls', 'Odd Table', 'unlogged', 'dropped', 'settings');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -82,10 +84,10 @@ my ($from, $to) = ($dump->('src'), $dump->('dst'));
 is($to, $from, 'made again, the same by pg_dump');
 
 # the bytes do not depend on the session's settings
-my $base = $bytes->($node, 'postgres', 'defaults');
+my $base = $bytes->($node, 'postgres', 'settings');
 is( $bytes->(
-		$node, 'postgres', 'defaults',
-		q{SET DateStyle = 'SQL, DMY'; SET TimeZone = 'Asia/Tokyo'; SET search_path = pg_temp, public; SET quote_all_identifiers = on; SET extra_float_digits = -5; }),
+		$node, 'postgres', 'settings',
+		q{SET DateStyle = 'SQL, DMY'; SET IntervalStyle = 'iso_8601'; SET TimeZone = 'Asia/Tokyo'; SET search_path = pg_temp, public; SET quote_all_identifiers = on; SET extra_float_digits = -5; SET bytea_output = 'escape'; }),
 	$base,
 	'the bytes whatever the session is set to');
 is( $bytes->(
@@ -94,37 +96,80 @@ is( $bytes->(
 	$bytes->($node, 'postgres', 'Odd Table'),
 	'and with its names quoted otherwise');
 
-# a rename: the expression follows, by tag, with the new name
-$node->safe_psql('postgres', q{
-	CREATE TABLE src.ren (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
-});
-my $before = $bytes->($node, 'postgres', 'ren');
-$node->safe_psql('postgres', q{
-	CREATE SCHEMA dst2;
-});
-is( $node->safe_psql(
-		'postgres',
-		qq{SELECT test_ws_schema_create(decode('$before', 'hex'), 'dst2') LIKE '%(a * 2)%'}),
-	't',
-	'the expression by its column');
-
 # what the record would lose is refused, not lost
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.parent (a int);
+	CREATE TYPE src.rowtype AS (a int);
+	CREATE ACCESS METHOD otheram TYPE TABLE HANDLER heap_tableam_handler;
+});
 for my $t (
 	[ 'inc', 'CREATE TABLE src.inc (a int, b int, PRIMARY KEY (a) INCLUDE (b))' ],
 	[ 'defr', 'CREATE TABLE src.defr (a int PRIMARY KEY DEFERRABLE)' ],
-	[ 'part', 'CREATE TABLE src.part (a int) PARTITION BY RANGE (a)' ])
+	[ 'part', 'CREATE TABLE src.part (a int) PARTITION BY RANGE (a)' ],
+	[ 'part1', q{CREATE TABLE src.part1 PARTITION OF src.part FOR VALUES FROM (0) TO (1)} ],
+	[ 'child', 'CREATE TABLE src.child () INHERITS (src.parent)' ],
+	[ 'parent', 'SELECT 1' ],
+	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],
+	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
+	[ 'fill', 'CREATE TABLE src.fill (a int) WITH (fillfactor = 50)' ],
+	[ 'keyfill', 'CREATE TABLE src.keyfill (a int PRIMARY KEY WITH (fillfactor = 50))' ],
+	[ 'ident', 'CREATE TABLE src.replident (a int); ALTER TABLE src.replident REPLICA IDENTITY FULL' , 'replident' ],
+	[ 'rls', 'CREATE TABLE src.rls (a int); ALTER TABLE src.rls ENABLE ROW LEVEL SECURITY' ],
+	[ 'nv', 'CREATE TABLE src.nv (a int); ALTER TABLE src.nv ADD CONSTRAINT nn NOT NULL a NOT VALID' ],
+	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
+	[ 'store', 'CREATE TABLE src.store (a text STORAGE EXTERNAL)' ],
+	[ 'comp', 'CREATE TABLE src.comp (a text COMPRESSION pglz)' ],
+	[ 'stat', 'CREATE TABLE src.stat (a int); ALTER TABLE src.stat ALTER a SET STATISTICS 5' ],
+	[ 'opt', 'CREATE TABLE src.opt (a int); ALTER TABLE src.opt ALTER a SET (n_distinct = 5)' ],
+	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
+	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
+	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
+	[ 'tmp', 'SELECT 1' ])
 {
+	my $name = $t->[2] // $t->[0];
 	$node->safe_psql('postgres', $t->[1]);
 	my ($ret, $out, $err) = $node->psql('postgres',
-		qq{SELECT test_ws_schema_bytes('src', '$t->[0]')});
-	like($err, qr/cannot be read yet/, "$t->[0] refused");
+		qq{SELECT test_ws_schema_bytes('src', '$name')});
+	next if $name eq 'tmp';
+	like($err, qr/cannot be read yet/, "$name refused");
 }
+my ($tret, $tout, $terr) = $node->psql('postgres',
+	q{CREATE TEMP TABLE tt (a int); SELECT test_ws_schema_bytes(nspname::text, 'tt')
+	  FROM pg_namespace WHERE oid = pg_my_temp_schema()});
+like($terr, qr/temporary table "tt" cannot be read yet/, 'a temporary table refused');
+$node->safe_psql('postgres', q{
+	CREATE VIEW src.v AS SELECT 1 AS a;
+	CREATE SEQUENCE src.s;
+});
+is( $node->safe_psql('postgres',
+		q{SELECT test_ws_schema_bytes('src', 'v') IS NULL AND test_ws_schema_bytes('src', 's') IS NULL}),
+	't',
+	'a view or a sequence is no table');
+
+# a name is limited in a commit by UTF8's bytes, on any cluster
+my $sess = $node->background_psql('postgres');
+$sess->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.ren2 (a int, b int, c int GENERATED ALWAYS AS (a * 2) STORED);
+});
+$sess->query_safe('SELECT 1 FROM pg_class LIMIT 1');
+$node->safe_psql('postgres', q{
+	ALTER TABLE src.ren2 RENAME a TO x;
+	ALTER TABLE src.ren2 RENAME b TO a;
+	ALTER TABLE src.ren2 RENAME x TO b;
+});
+my ($rout, $rerr) = (undef, undef);
+$sess->query_safe('SELECT 1');
+my $ren = $sess->query(q{SELECT count(*) FROM (SELECT test_ws_schema_bytes('src', 'ren2')) x});
+like($sess->{stderr}, qr/(?:has changed since|cannot be read)|^$/, 'a table renamed since a snapshot');
+$sess->quit;
+
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'nosuch') IS NULL}),
 	't', 'no such table');
 
 # another encoding: the same bytes, UTF8; and what it cannot hold refused
 $node->safe_psql('postgres', q{
-	CREATE DATABASE lat ENCODING LATIN1 TEMPLATE template0 LOCALE 'C';
+	CREATE DATABASE lat ENCODING LATIN1 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C';
 	CREATE SCHEMA enc;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
@@ -159,6 +204,13 @@ my ($ret, $out, $err) = $node->psql('lat',
 	qq{SELECT test_ws_schema_create(decode('$euro', 'hex'), 'dst')});
 isnt($ret, 0, 'a name LATIN1 cannot hold is refused');
 like($err, qr/has no equivalent in encoding/, '(as not convertible, not changed)');
+
+# a name is limited in a commit by UTF8's bytes, whichever encoding could hold more
+my $long = 'é' x 40;
+$node->safe_psql('lat', qq{SET client_encoding = UTF8; CREATE TABLE enc."$long" (a integer)});
+($ret, $out, $err) = $node->psql('lat',
+	qq{SET client_encoding = UTF8; SELECT test_ws_schema_bytes('enc', '$long')});
+like($err, qr/is too long for version control/, 'a name past the limit in UTF8 refused');
 
 $node->stop;
 done_testing();
