@@ -20,7 +20,9 @@
  * owner could show other rows.  A type's owner that cannot is not held, and whoever
  * restores it owns it, as a table's does.  So too a function's, but for one that is
  * SECURITY DEFINER, which reads with its owner's rights as a view does.  A function's
- * body in text is not looked into: if it names its schema, it says so as written.  A
+ * body in text is not looked into: if it names its schema, it says so as written, and
+ * if it is inlined while a table is made, as an IMMUTABLE one may be in a generated
+ * column or partition key, it must find there what it names.  A
  * commit's own definitions are trusted, as a
  * remote is, as what a pg_dump wrote is: they are checked only to be what they say.
  *
@@ -179,8 +181,9 @@ extern void ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *o
  * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than they
  * are held, or if the schema holds a function or operator named as one in the
  * catalogs, as a definition's unqualified name could be taken for it.  Who restores them must be able to SET ROLE
- * to each owner, with its privileges, and each owner must have CREATE on the schema,
- * as the server asks of any change of owner.
+ * to each owner, and have its privileges if it has grants (ERRCODE_INSUFFICIENT_PRIVILEGE
+ * otherwise), and each owner must have CREATE on the schema, as the server asks of any
+ * change of owner.
  */
 extern void ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tables);
 
