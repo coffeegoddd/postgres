@@ -3197,14 +3197,15 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 				int			attnum = atoi(ws_sql_value(cols, k, 0));
 
 				same = attnum <= desc->natts &&
-					TupleDescAttr(desc, attnum - 1)->attstorage == ws_sql_value(cols, k, 17)[0];
+					TupleDescAttr(desc, attnum - 1)->attstorage == ws_sql_value(cols, k, 17)[0] &&
+					TupleDescAttr(desc, attnum - 1)->atttypmod == atoi(ws_sql_value(cols, k, 18));
 			}
 			needs = table_relation_needs_toast_table(r);
 			relation_close(r, NoLock);
 			if (!same)
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("a column of table \"%s\" was added or its storage changed since this transaction's snapshot",
+						 errmsg("a column of table \"%s\" was added, or its size or storage changed, since this transaction's snapshot",
 								table)));
 			if (!needs)
 				ereport(ERROR,
@@ -3405,7 +3406,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
 				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
 				   "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
-				   "  a.attcompression::text, a.attstattarget::text, a.attstorage::text "
+				   "  a.attcompression::text, a.attstattarget::text, a.attstorage::text, "
+				   "  a.atttypmod::text "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
