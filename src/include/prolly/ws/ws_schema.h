@@ -490,9 +490,10 @@ extern const char *ws_privilege_word(char letter);
 
 /*
  * Raises ERRCODE_FEATURE_NOT_SUPPORTED if default privileges for the role about to
- * make a relation in schema would make it other than it is held.
+ * make something of a pg_default_acl object type in schema would make it other than
+ * it is held.
  */
-extern void ws_schema_check_relation_defaults(const char *schema);
+extern void ws_schema_check_defaults(const char *schema, char objtype);
 
 /* Text of a statement being written; an identifier as quote_identifier quotes it. */
 extern void ws_put_text(Buf *out, const char *text);

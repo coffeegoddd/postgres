@@ -3756,16 +3756,16 @@ statement_end(MemoryContext cxt, Buf *sql, Buf *out)
 }
 
 void
-ws_schema_check_relation_defaults(const char *schema)
+ws_schema_check_defaults(const char *schema, char objtype)
 {
 	Oid			nsp = get_namespace_oid(schema, true);
 	Oid			role = GetUserId();
 
 	if (SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(InvalidOid),
-							  CharGetDatum(DEFACLOBJ_RELATION)) ||
+							  CharGetDatum(objtype)) ||
 		(OidIsValid(nsp) &&
 		 SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(nsp),
-							   CharGetDatum(DEFACLOBJ_RELATION))))
+							   CharGetDatum(objtype))))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("default privileges would change what is made in schema \"%s\"", schema)));
@@ -3780,22 +3780,13 @@ ws_schema_check_relation_defaults(const char *schema)
 static void
 check_destination(const WsTableSchema *s, const char *schema)
 {
-	Oid			nsp = get_namespace_oid(schema, true);
-	Oid			role = GetUserId();
 	bool		sequences = false;
 
-	ws_schema_check_relation_defaults(schema);
+	ws_schema_check_defaults(schema, DEFACLOBJ_RELATION);
 	for (int i = 0; i < s->ncols; i++)
 		sequences |= s->cols[i].identity != WS_IDENTITY_NONE;
-	if (sequences &&
-		(SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(InvalidOid),
-							   CharGetDatum(DEFACLOBJ_SEQUENCE)) ||
-		 (OidIsValid(nsp) &&
-		  SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(nsp),
-								CharGetDatum(DEFACLOBJ_SEQUENCE)))))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("default privileges would change what is made in schema \"%s\"", schema)));
+	if (sequences)
+		ws_schema_check_defaults(schema, DEFACLOBJ_SEQUENCE);
 }
 
 void

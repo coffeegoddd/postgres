@@ -529,8 +529,9 @@ test_ws_obj_bytes(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_ws_obj_copy(from_schema text, to_schema text) returns void: makes the
- * objects of the one in the other, through their bytes
+ * test_ws_obj_copy(from_schema text, to_schema text, which text) returns void: makes
+ * the objects of the one in the other, through their bytes: those that go 'before'
+ * tables, 'after', or 'both'
  */
 Datum
 test_ws_obj_copy(PG_FUNCTION_ARGS)
@@ -538,6 +539,7 @@ test_ws_obj_copy(PG_FUNCTION_ARGS)
 	WsObject   *objs;
 	WsObject   *back;
 	int			n;
+	char	   *which = text_to_cstring(PG_GETARG_TEXT_PP(2));
 
 	ws_obj_read(text_to_cstring(PG_GETARG_TEXT_PP(0)), &objs, &n);
 	back = palloc0_array(WsObject, Max(n, 1));
@@ -552,7 +554,10 @@ test_ws_obj_copy(PG_FUNCTION_ARGS)
 		buf_free(&k);
 		buf_free(&v);
 	}
-	ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	if (strcmp(which, "after") != 0)
+		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
+	if (strcmp(which, "before") != 0)
+		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), false);
 	PG_RETURN_VOID();
 }
 
