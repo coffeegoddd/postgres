@@ -1188,7 +1188,7 @@ for my $t (
 	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
 	[ 'nv', 'CREATE TABLE src.nv (a int); ALTER TABLE src.nv ADD CONSTRAINT nn NOT NULL a NOT VALID' ],
 	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
-	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
+	[ 'seqelse', q{CREATE SEQUENCE other.seq_else; CREATE TABLE src.seqelse (a bigint DEFAULT nextval('other.seq_else'))} ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
 	[ 'ctrg', q{CREATE TABLE src.ctrg (a int); CREATE FUNCTION src.ctrg_f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
@@ -1233,7 +1233,6 @@ for my $t (
 	[ 'dupk', 'CREATE TABLE src.dupk (a int PRIMARY KEY); ALTER TABLE src.dupk ADD CONSTRAINT dupk_u UNIQUE (a)' ],
 	[ 'uover', 'CREATE TABLE src.uover (a int4range, r int4range, UNIQUE (a, r WITHOUT OVERLAPS))' ],
 	[ 'uspc', "CREATE TABLE src.uspc (a int, UNIQUE (a) USING INDEX TABLESPACE t86)" ],
-	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
 	[ 'pol', 'CREATE TABLE src.pol (a int); CREATE POLICY p ON src.pol USING (true)' ],
 	[ 'over', 'CREATE TABLE src.over (a int4range, r int4range, PRIMARY KEY (a, r WITHOUT OVERLAPS))' ],
 	[ 'toid', 'CREATE TABLE src.toid (a oid GENERATED ALWAYS AS (tableoid) STORED)' ])

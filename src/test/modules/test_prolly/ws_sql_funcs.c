@@ -40,6 +40,7 @@ PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_copy);
+PG_FUNCTION_INFO_V1(test_ws_seq_copy);
 PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
 PG_FUNCTION_INFO_V1(test_ws_role_restore);
@@ -563,6 +564,25 @@ test_ws_obj_copy(PG_FUNCTION_ARGS)
 	if (strcmp(which, "before") != 0)
 		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), false);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_seq_copy(from_schema text, to_schema text) returns text: the positions of
+ * the sequences of the one, set in those of the other, a line each
+ */
+Datum
+test_ws_seq_copy(PG_FUNCTION_ARGS)
+{
+	WsSeqPosition *positions;
+	int			n;
+	StringInfoData out;
+
+	ws_seq_read(text_to_cstring(PG_GETARG_TEXT_PP(0)), &positions, &n);
+	ws_seq_restore(positions, n, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	initStringInfo(&out);
+	for (int i = 0; i < n; i++)
+		appendStringInfo(&out, "%s " INT64_FORMAT " %d\n", positions[i].name, positions[i].last_value, positions[i].is_called);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 
 /*

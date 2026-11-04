@@ -41,6 +41,7 @@ typedef enum WsObjectKind
 	WS_OBJ_FUNCTION,
 	WS_OBJ_MATVIEW,
 	WS_OBJ_PROCEDURE,
+	WS_OBJ_SEQUENCE,			/* not an identity's, which its table's record holds */
 	WS_OBJ_TYPE,				/* an enum, composite or range type */
 	WS_OBJ_VIEW,
 } WsObjectKind;
@@ -69,6 +70,8 @@ typedef struct WsObject
 	char	   *definition;		/* its statement after its name, as stored text (ws_tags.h) */
 	bool		after_tables;	/* a function that needs one, so made after them */
 	bool		public_revoked; /* what PUBLIC would have is revoked from it */
+	char	   *owned_table;	/* a sequence's OWNED BY, or NULL */
+	char	   *owned_column;
 	int			ndeps;
 	char	  **deps;			/* the keys of the objects it needs, in order */
 	char	   *owner;			/* NULL: whoever restores it, for what may have none */
@@ -124,6 +127,24 @@ extern void ws_obj_key(WsObjectKind kind, const char *name, const char *args, Bu
  */
 extern void ws_obj_read(const char *schema, WsObject **out, int *n);
 
+/*
+ * Where each of a schema's sequences is, an identity's too, as ~seq holds it (a
+ * sequence's position is state, not its definition): by name in UTF8's order, in *out,
+ * palloc'd.  It runs no user code to read or set them, and neither reads by a snapshot,
+ * as a sequence does not.
+ */
+typedef struct WsSeqPosition
+{
+	char	   *name;
+	int64		last_value;
+	bool		is_called;
+} WsSeqPosition;
+
+extern void ws_seq_read(const char *schema, WsSeqPosition **out, int *n);
+extern void ws_seq_map(ProllyCtx *ctx, const WsSeqPosition *positions, int n, PHash *map);
+extern void ws_seq_list(ProllyCtx *ctx, const PHash *map, WsSeqPosition **out, int *n);
+extern void ws_seq_restore(const WsSeqPosition *positions, int n, const char *schema);
+
 /* The ~obj map of these, its root in *map: their order does not matter. */
 extern void ws_obj_map(ProllyCtx *ctx, const WsObject *objs, int n, PHash *map);
 
@@ -148,10 +169,12 @@ extern void ws_obj_create_statement(const WsObject *o, const char *schema, Buf *
 extern void ws_obj_comment_statement(const WsObject *o, int k, const char *schema, Buf *out);
 extern void ws_obj_owner_statement(const WsObject *o, const char *schema, Buf *out);
 extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema, Buf *out);
+extern void ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out);
 
 /*
  * Makes the objects in schema that go before its tables, or after, through WsSql, in
- * restore order, each with its comments, then its owner, then its grants.  objs is
+ * restore order, each with its comments, then its owner, then its grants.  A sequence
+ * is made before, and owned by its column after, which needs the table's owner its own.  objs is
  * all of a commit's, as what comes after may need what comes before.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than they
  * are held, or if the schema holds a function or operator named as one in the

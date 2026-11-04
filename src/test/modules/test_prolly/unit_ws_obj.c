@@ -121,7 +121,7 @@ decode_bad(void *arg)
 
 ENGINE_TEST(test_malformed)
 {
-#define D 1, 'x', 0, 0			/* a definition, no flags, no args */
+#define D 1, 'x', 0, 0, 0, 0		/* a definition, no flags, args or owning column */
 #define O 1, 'g'				/* an owner */
 	static const uint8 ok[] = {D, 0, O, 0, 0};
 	static const uint8 cut[] = {D, 0, O, 0};
@@ -242,6 +242,32 @@ count_table(void *arg, const char *name, const VcTable *entry)
 {
 	(*(int *) arg)++;
 	return true;
+}
+
+ENGINE_TEST(test_positions)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	WsSeqPosition a = {.name = "a",.last_value = -5,.is_called = true};
+	WsSeqPosition b = {.name = "b",.last_value = 7,.is_called = false};
+	WsSeqPosition in_order[] = {a, b};
+	WsSeqPosition reversed[] = {b, a};
+	PHash		m1;
+	PHash		m2;
+	PHash		rv = vc_root_empty(&ctx);
+	PHash		got;
+	WsSeqPosition *list;
+	int			n;
+
+	ws_seq_map(&ctx, in_order, 2, &m1);
+	ws_seq_map(&ctx, reversed, 2, &m2);
+	CHECK(memcmp(m1.b, m2.b, PHASH_LEN) == 0);
+	WsRoot->put_map(&ctx, &rv, WS_ROOT_SEQUENCES, &m1, &rv);
+	CHECK(WsRoot->get_map(&ctx, &rv, WS_ROOT_SEQUENCES, &got));
+	ws_seq_list(&ctx, &got, &list, &n);
+	CHECK_EQ(n, 2);
+	CHECK(strcmp(list[0].name, "a") == 0 && list[0].last_value == -5 && list[0].is_called);
+	CHECK(strcmp(list[1].name, "b") == 0 && list[1].last_value == 7 && !list[1].is_called);
 }
 
 /* The map on a root value: one set of objects, one map, in any order. */
@@ -399,6 +425,20 @@ ENGINE_TEST(test_refused_statements)
 	};
 
 	{
+		static const char *const sequences[] = {
+			"AS bigint; DROP TABLE t",
+			"OWNED BY t.a",
+			"AS (a int)",
+		};
+
+		for (int i = 0; i < lengthof(sequences); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_SEQUENCE,.name = "v",.definition = (char *) sequences[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
+	{
 		static const char *const functions[] = {
 			"() RETURNS integer LANGUAGE sql AS 'SELECT 1'; DROP TABLE t",
 			"AS 'SELECT 1'",
@@ -456,6 +496,7 @@ static const ProllyUnitTest tests[] = {
 	{"malformed", test_malformed},
 	{"problems", test_problems},
 	{"map", test_map},
+	{"positions", test_positions},
 	{"restore_order", test_restore_order},
 	{"statements", test_statements},
 	{"refused_statements", test_refused_statements},

@@ -331,8 +331,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance or a partition or
  * partitioned table across schemas, a tablespace or another access method, a
- * TOAST table's parameters where no TOAST table is needed any more, a sequence's,
- * a default using one, a partition detached, of another identity
+ * TOAST table's parameters where no TOAST table is needed any more, an identity
+ * sequence's, a default using a sequence in another schema, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
  * a policy, an index's dependence on an extension, a foreign key's comment, a
