@@ -179,10 +179,11 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
- * ERRCODE_NAME_TOO_LONG.  The table's owner is not held, and is whoever makes it.  Triggers, rules and the like are objects of their
+ * ERRCODE_NAME_TOO_LONG.  The table's owner is not held, and is whoever makes
+ * it.  Triggers, rules and the like are objects of their
  * own, not their table's.
  *
- * It locks the table till the transaction ends, and a column renamed or
+ * It locks the table till the transaction ends, and a column renamed, retyped or
  * dropped since the transaction's snapshot raises
  * ERRCODE_T_R_SERIALIZATION_FAILURE.  Other objects' names (a type's, a
  * function's in a default) are printed as they are now, so a reader on an old

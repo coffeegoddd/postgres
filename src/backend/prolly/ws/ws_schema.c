@@ -4,16 +4,16 @@
  *	  The working-set model's table schemas (prolly/ws/ws_schema.h), and
  *	  "binary", their codec.
  *
- * version byte, name, uvarint ncols, then each column:
- * uvarint tag, name, type, kind byte, not-null constraint's name, identity byte
- * and if it has one its sequence's name, default, collation; then the key's name, uvarint nkey and the key's tags;
- * then uvarint nconstraints and each constraint: name, kind byte, flags byte,
- * and a check's expression, a unique constraint's uvarint ncols and tags, or an
- * exclusion's method and index body; then uvarint nindexes and each index: name,
- * method, flags byte and index body.  An index body is uvarint nkeys and each key
- * (uvarint tag, 0 for an expression's, expression if so, collation, opclass,
- * order byte, nulls byte, and an exclusion's operator), uvarint ninclude and
- * tags, predicate.  A string is its uvarint length and bytes, in its shortest
+ * version byte, name, uvarint ncols, then each column: uvarint tag, name, type,
+ * kind byte, not-null constraint's name, identity byte and if it has one its
+ * sequence's name, default, collation; then the key's name, uvarint nkey and the
+ * key's tags; then uvarint nconstraints and each constraint: name, kind byte,
+ * flags byte, and a check's expression, a unique constraint's uvarint ncols and
+ * tags, or an exclusion's method and index body; then uvarint nindexes and each
+ * index: name, method, flags byte and index body.  An index body is uvarint nkeys
+ * and each key (uvarint tag, 0 for an expression's, expression if so, collation,
+ * opclass, order byte, nulls byte, and an exclusion's operator), uvarint ninclude
+ * and tags, predicate.  A string is its uvarint length and bytes, in its shortest
  * form; a default, collation, not-null constraint's or key's name none is empty,
  * which none is if it is there.
  *
@@ -1756,6 +1756,12 @@ static const char *const unsupported_sql =
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
+"  WHEN EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attidentity <> '' "
+"               AND NOT a.attisdropped AND NOT EXISTS (SELECT FROM pg_depend p "
+"                 JOIN pg_class q ON q.oid = p.objid WHERE p.classid = 'pg_class'::regclass "
+"                 AND p.refclassid = 'pg_class'::regclass AND p.refobjid = c.oid "
+"                 AND p.refobjsubid = a.attnum AND p.deptype = 'i' AND q.relkind = 'S')) "
+"    THEN 'an identity has its sequence in another schema' "
 "  END "
 "FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam "
 "LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid WHERE c.oid = $1::oid";
@@ -1780,13 +1786,14 @@ check_snapshot_current(const char *table, Oid relid, const WsSqlRows *cols)
 		else
 		{
 			same = strcmp(NameStr(((Form_pg_attribute) GETSTRUCT(tup))->attname),
-						  ws_sql_value(cols, i, 1)) == 0;
+						  ws_sql_value(cols, i, 1)) == 0 &&
+				((Form_pg_attribute) GETSTRUCT(tup))->atttypid == atooid(ws_sql_value(cols, i, 11));
 			ReleaseSysCache(tup);
 		}
 		if (!same)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("a column of table \"%s\" was renamed or dropped since this transaction's snapshot",
+					 errmsg("a column of table \"%s\" was renamed, retyped or dropped since this transaction's snapshot",
 							table)));
 	}
 }
@@ -2126,7 +2133,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  (SELECT q.relname::text FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
 				   "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
 				   "      AND p.refobjid = a.attrelid AND p.refobjsubid = a.attnum "
-				   "      AND p.deptype = 'i' AND q.relkind = 'S') "
+				   "      AND p.deptype = 'i' AND q.relkind = 'S'), "
+				   "  a.atttypid::text "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
