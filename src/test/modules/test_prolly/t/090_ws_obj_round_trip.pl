@@ -536,6 +536,11 @@ $node->safe_psql('postgres', q{
 	CREATE FUNCTION "Odd name(1"() RETURNS void LANGUAGE plpgsql AS $$ BEGIN PERFORM overload(1); END $$;
 	CREATE FUNCTION outs(a integer, OUT b integer, OUT c text) RETURNS record LANGUAGE sql AS 'SELECT $1, $1::text';
 	CREATE PROCEDURE proc(integer) LANGUAGE sql AS 'SELECT $1';
+	CREATE FUNCTION std_return(a integer) RETURNS integer LANGUAGE sql RETURN a * 2;
+	CREATE FUNCTION small_cost() RETURNS integer LANGUAGE sql COST 0.1 AS 'SELECT 1';
+	CREATE FUNCTION std_atomic(a integer) RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT 1; RETURN a; END;
+	CREATE FUNCTION fdiff(float8, float8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT $1 - $2';
+	CREATE TYPE fspan_range AS RANGE (SUBTYPE = float8, SUBTYPE_DIFF = fdiff);
 	CREATE FUNCTION definer() RETURNS integer LANGUAGE sql SECURITY DEFINER SET work_mem = '1MB' AS 'SELECT 1';
 	CREATE FUNCTION revoked() RETURNS integer LANGUAGE sql AS 'SELECT 1';
 	REVOKE ALL ON FUNCTION revoked() FROM PUBLIC;
@@ -546,6 +551,7 @@ $node->safe_psql('postgres', q{
 	COMMENT ON PROCEDURE proc(integer) IS 'a procedure';
 	CREATE DOMAIN fpos AS integer CHECK (overload(VALUE) > 0);
 	CREATE TABLE uses (a integer DEFAULT overload(1), p fpos, CHECK (overload(a) > 0));
+	CREATE FUNCTION names_later() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM uses';
 	CREATE FUNCTION atomic_body() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM uses; END;
 	CREATE FUNCTION of_row(uses) RETURNS integer LANGUAGE sql AS 'SELECT 1';
 	CREATE FUNCTION needs_after() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT atomic_body(); END;
@@ -553,7 +559,8 @@ $node->safe_psql('postgres', q{
 });
 my $fn_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('fn')});
 my %fn_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $fn_held;
-ok($fn_val{$_}, "$_ is held") for ('function/overload(integer)', 'function/overload(text, fmood)', 'function/Odd name(1()', 'function/outs(integer)', 'procedure/proc(integer)', 'function/of_row(uses)');
+like($fn_val{'type/fspan_range'}, qr/SUBTYPE_DIFF = fdiff.*function\/fdiff/s, 'a range of its own subtype_diff says it bare, and needs it');
+ok($fn_val{$_}, "$_ is held") for ('function/std_return(integer)', 'function/std_atomic(integer)', 'function/names_later()', 'function/overload(integer)', 'function/overload(text, fmood)', 'function/Odd name(1()', 'function/outs(integer)', 'procedure/proc(integer)', 'function/of_row(uses)');
 unlike(join('', values %fn_val), qr/\bfn\./, 'no definition names its schema');
 like($fn_val{'function/overload(text, fmood)'}, qr/it''s @@ here/, 'an @ of a body is doubled');
 like($fn_val{'function/overload(text, fmood)'}, qr/type\/fmood/, 'a function says what type it needs');
@@ -589,6 +596,10 @@ is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(proowner) = current_us
 my @fn_refused = (
 	[ q{CREATE FUNCTION r() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION r() OWNER TO x_person}, 'SECURITY DEFINER, and owned by a role that cannot travel' ],
 	[ q{CREATE FUNCTION now() RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'named as one in the catalogs' ],
+	[ q{CREATE FUNCTION r_self(a int) RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE OR REPLACE FUNCTION r_self(a int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT r_self(a); END}, 'needs itself' ],
+	[ q{CREATE FUNCTION r_cost() RETURNS int LANGUAGE sql COST 1234567 AS 'SELECT 1'}, 'more digits' ],
+	[ q{CREATE TYPE h AS (r regclass); CREATE FUNCTION r_h(a h DEFAULT '(pg_class)') RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'may hold names' ],
+	[ q{CREATE TABLE z (a int); CREATE FUNCTION r_p(int) RETURNS int LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT count(*)::int FROM z; END; CREATE TABLE zp (a int) PARTITION BY LIST (r_p(a))}, 'a table needs it, and it needs a table' ],
 	[ q{CREATE AGGREGATE r_agg(int) (SFUNC = int4pl, STYPE = int)}, 'an aggregate' ],
 	[ q{CREATE FUNCTION r_c() RETURNS int LANGUAGE internal AS 'int4pl'}, 'a language' ],
 	[ q{CREATE FUNCTION r_sp() RETURNS int LANGUAGE sql SET search_path = fn5 AS 'SELECT 1'}, 'a search path that names its schema' ],
@@ -607,8 +618,17 @@ for my $case (@fn_refused)
 	like($err4, qr/\Q$why\E/, "for why: $sql");
 }
 
+# what restoring its grants takes, or a function meant to be closed is left open
+$node->safe_psql('postgres', q{CREATE SCHEMA fn7 AUTHORIZATION g_fnowner; CREATE ROLE g_rs_noinherit NOLOGIN CREATEROLE; GRANT g_fnowner TO g_rs_noinherit WITH INHERIT FALSE, SET TRUE;
+	GRANT CREATE, USAGE ON SCHEMA fn7 TO g_rs_noinherit; CREATE SCHEMA fn8 AUTHORIZATION g_fnowner;
+	CREATE FUNCTION fn8.closed() RETURNS integer LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION fn8.closed() OWNER TO g_fnowner; REVOKE ALL ON FUNCTION fn8.closed() FROM PUBLIC;
+	GRANT USAGE ON SCHEMA fn8 TO g_rs_noinherit});
+($rc, $out, $err) = $node->psql('postgres', q{SET ROLE g_rs_noinherit; SELECT test_ws_obj_copy('fn8', 'fn7')});
+like($err, qr/cannot restore the grants of "closed": this role does not have the privileges of its owner/, 'with no INHERIT on its owner, a restore of what is revoked refuses, and leaves nothing open');
+
 # a function renamed while being read is one to try again, by key or by need
-for my $change (q{ALTER FUNCTION fn.granted() RENAME TO granted2}, q{DROP FUNCTION fn.granted2()})
+for my $change (q{COMMENT ON FUNCTION fn.granted() IS 'later'}, q{ALTER ROLE g_fnuser RENAME TO g_fnuser2}, q{ALTER ROLE g_fnuser2 RENAME TO g_fnuser},
+	q{ALTER FUNCTION fn.granted() RENAME TO granted2}, q{DROP FUNCTION fn.granted2()})
 {
 	my $old = $node->background_psql('postgres', on_error_stop => 0);
 	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');

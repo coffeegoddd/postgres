@@ -4,10 +4,11 @@
  *	  A versioned schema's objects other than tables (prolly/ws/ws_obj.h), and
  *	  "binary", their codec.
  *
- * Its key: kind's word, a slash, name.  Its value, each string a uvarint length and
- * bytes: definition; uvarint ndeps and keys; owner, empty for none; uvarint ncomments
- * and each one's column, empty for none, and text; uvarint ngrants and each one's
- * column, empty for none, grantee, empty for PUBLIC, grant option byte, privileges.
+ * Its key: kind's word, a slash, name, and a function's input types in parentheses.
+ * Its value, each string a uvarint length and bytes: definition; a flags byte; those
+ * input types; uvarint ndeps and keys; owner, empty for none; uvarint ncomments and each
+ * one's column, empty for none, and text; uvarint ngrants and each one's column, empty
+ * for none, grantee, empty for PUBLIC, grant option byte, privileges.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -643,6 +644,13 @@ relations_version(const char *schema)
 				"    CROSS JOIN LATERAL aclexplode(t.typacl) e JOIN pg_roles r ON r.oid = e.grantee WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'f' || p.oid || ':' || p.xmin FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
 				"    WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'j' || p.oid || ':' || r.rolname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+				"    JOIN pg_roles r ON r.oid = p.proowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'l' || p.oid || ':' || r.rolname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+				"    CROSS JOIN LATERAL aclexplode(p.proacl) e JOIN pg_roles r ON r.oid = e.grantee WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description "
+				"    FROM pg_description d JOIN pg_proc p ON p.oid = d.objoid JOIN pg_namespace n ON n.oid = p.pronamespace "
+				"    WHERE d.classoid = 'pg_proc'::regclass AND n.nspname = $1::name "
 				"  UNION ALL SELECT 'e' || e.oid || ':' || e.xmin FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
 				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'k' || k.oid || ':' || k.xmin FROM pg_constraint k JOIN pg_type t ON t.oid = k.contypid "
@@ -854,6 +862,9 @@ names_schema_walker(Node *node, void *arg)
 				}
 				break;
 			}
+		case T_ReturnStmt:
+			/* (a function's RETURN, which the tree walker has no case for) */
+			return names_schema_walker(((ReturnStmt *) node)->returnval, arg);
 		case T_RangeSubselect:
 			{
 				RangeSubselect *r = (RangeSubselect *) node;
@@ -961,12 +972,6 @@ grant_cmp(const void *a, const void *b)
 	return c != 0 ? c : (int) x->grant_option - (int) y->grant_option;
 }
 
-/*
- * What an object needs among a schema's objects: of what depends for it (source, its
- * classid and objid, of $1), the views and the types.  An array is its element's and
- * a multirange its range's, which are what is made.  A table is no need: tables are
- * all made, or a type that needs one is refused.
- */
 static char *
 function_args(const char *schema, Oid oid, char *prokind)
 {
@@ -997,6 +1002,12 @@ function_key(const char *schema, Oid oid, Buf *key)
 			   ws_name_to_utf8(get_func_name(oid)), args, key);
 }
 
+/*
+ * What an object needs among a schema's objects: of what depends for it (source, its
+ * classid and objid, of $1), the views and the types.  An array is its element's and
+ * a multirange its range's, which are what is made.  A table is no need: tables are
+ * all made, or a type that needs one is refused.
+ */
 static void
 read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 {
@@ -1414,8 +1425,13 @@ type_definition(const char *schema, char typtype, const char *oid, Buf *text)
 						"  CASE WHEN r.rngcollation <> s.typcollation "
 						"    THEN ', COLLATION = ' || quote_ident(k.collname) ELSE '' END || "
 						"  CASE WHEN r.rngcanonical <> 0 THEN ', CANONICAL = ' || r.rngcanonical::regproc ELSE '' END || "
-						"  CASE WHEN r.rngsubdiff <> 0 THEN ', SUBTYPE_DIFF = ' || r.rngsubdiff::regproc ELSE '' END || ')' "
+						/* (one of its schema's is said bare: regproc here would say the schema) */
+						"  CASE WHEN r.rngsubdiff = 0 THEN '' "
+						"    WHEN d.pronamespace = (SELECT typnamespace FROM pg_type WHERE oid = r.rngtypid) "
+						"    THEN ', SUBTYPE_DIFF = ' || quote_ident(d.proname) "
+						"    ELSE ', SUBTYPE_DIFF = ' || r.rngsubdiff::regproc END || ')' "
 						"FROM pg_range r JOIN pg_type s ON s.oid = r.rngsubtype JOIN pg_opclass o ON o.oid = r.rngsubopc "
+						"LEFT JOIN pg_proc d ON d.oid = r.rngsubdiff "
 						"LEFT JOIN pg_collation k ON k.oid = r.rngcollation WHERE r.rngtypid = $1::oid", 1, params, &rows);
 			ws_put_text(text, "AS RANGE (SUBTYPE = ");
 			ws_put_text(text, print_type(schema, atooid(ws_sql_value(&rows, 0, 0)), -1));
@@ -1632,6 +1648,11 @@ static const char *const function_refusal_sql =
 "  WHEN p.prosecdef AND (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls "
 "      OR r.rolname ~ '^pg_') THEN 'it is SECURITY DEFINER, and owned by a role that cannot travel' "
 "  WHEN EXISTS (SELECT 1 FROM pg_seclabel s WHERE s.classoid = 'pg_proc'::regclass AND s.objoid = p.oid) THEN 'it has a security label' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' "
+"      AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = p.oid) THEN 'it needs itself, as no commit could make it' "
+"  WHEN p.procost <> to_char(p.procost::float8::numeric, '9.99999EEEE')::float4 "
+"      OR p.prorows <> to_char(p.prorows::float8::numeric, '9.99999EEEE')::float4 "
+"    THEN 'its COST or ROWS has more digits than a definition prints' "
 "  WHEN EXISTS (SELECT 1 FROM aclexplode(p.proacl) e WHERE e.grantor <> p.proowner) THEN 'it has a grant by a role that does not own it' "
 "  WHEN p.proacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) e WHERE e.grantee = p.proowner) "
 "    THEN 'its owner''s rights have been changed' "
@@ -1779,6 +1800,10 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		buf_append_byte(&stored, 0);
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
+		check_constants_hold_no_names(name, schema, oid,
+									  "SELECT d.refobjid::text FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass "
+									  "AND d.objid = p.oid WHERE p.oid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass "
+									  "AND (p.proargdefaults IS NOT NULL OR p.prosqlbody IS NOT NULL)");
 		read_deps(o, schema, oid, "SELECT 'pg_proc'::regclass::oid, $1::oid");
 
 		/* (it needs a table if a body or a type of it does) */
@@ -1841,6 +1866,8 @@ settle_phases(const char *schema, WsObject *objs, int n)
 				"  UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') "
 				"  UNION ALL SELECT 'pg_class'::regclass::oid, i.indexrelid FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
+				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') "
+				"  UNION ALL SELECT 'pg_class'::regclass::oid, c.oid FROM pg_class c "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p')) "
 				"SELECT DISTINCT d.refobjid::text FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
 				"JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
@@ -2441,6 +2468,22 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		if (owner.len > 0)
 			run_statement(&owner);
 		buf_free(&owner);
+
+		/*
+		 * With SET and not INHERIT on its owner, one may give it away and then a grant
+		 * or a revoke of it only warns, leaving it open.  Not with us.
+		 */
+		if ((o->ngrants > 0 || o->public_revoked) && o->owner != NULL)
+		{
+			char	   *owner_here = ws_name_from_utf8(o->owner);
+
+			if (!has_privs_of_role(GetUserId(), get_role_oid(owner_here, false)))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("cannot restore the grants of \"%s\": this role does not have the privileges of its owner \"%s\"",
+								o->name, owner_here)));
+			pfree(owner_here);
+		}
 		if (o->public_revoked)
 		{
 			Buf			sql = BUF_INIT;
