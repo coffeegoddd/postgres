@@ -119,6 +119,7 @@ my @refused = (
 	[ q{CREATE VIEW r_self1 AS SELECT 1 AS x; CREATE OR REPLACE VIEW r_self1 AS SELECT 1 AS x WHERE 'r_self1'::regclass::oid > 0}, 'needs itself', undef, 'DROP VIEW "S rc".r_self1' ],
 	[ q{CREATE TABLE pg_type (x int); CREATE VIEW r_regclass AS SELECT '"S rc".pg_type'::regclass::oid AS o}, "say a schema's name", undef, 'DROP TABLE "S rc".pg_type CASCADE' ],
 	[ q{COMMENT ON RULE "_RETURN" ON grouped IS 'on it'}, 'a comment on its rule', undef, q{COMMENT ON RULE "_RETURN" ON "S rc".grouped IS NULL} ],
+	[ q{CREATE VIEW r_regarr AS SELECT '{t}'::regclass[] AS a}, 'an array of reg* names', undef, 'DROP VIEW "S rc".r_regarr' ],
 	[ q{CREATE VIEW r_login AS SELECT a FROM t; GRANT SELECT ON r_login TO x_person}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_login' ],
 	[ q{CREATE VIEW r_pg AS SELECT a FROM t; GRANT SELECT ON r_pg TO pg_monitor}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_pg' ],
 );
@@ -174,7 +175,11 @@ $node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREAT
 $fresh->('D4');
 $node->safe_psql('postgres', q{CREATE FUNCTION "D4".to_json(integer) RETURNS text LANGUAGE sql AS $$SELECT 'shadow'$$});
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D4')});
-like($err, qr/schema "D4" holds a function no commit holds/, 'an overload in the destination refuses a restore');
+like($err, qr/schema "D4" holds a function named as one in the catalogs/, 'an overload in the destination refuses a restore');
+$fresh->('D4b');
+$node->safe_psql('postgres', q{CREATE FUNCTION "D4b".mine() RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE TYPE "D4b".ir AS RANGE (SUBTYPE = int4)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D4b')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_class WHERE oid = '"D4b".uses_json'::regclass}), '1', 'and one no catalog has a name of is nothing to it');
 $fresh->('D5');
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D5')});
 is( $node->safe_psql('postgres', q{SELECT format_type(atttypid, NULL) FROM pg_attribute WHERE attrelid = '"D5".uses_json'::regclass AND attname = 'j'}),
@@ -198,11 +203,14 @@ $node->safe_psql('postgres', q{CREATE ROLE g_rest NOLOGIN; GRANT g_owner TO g_re
 	RESET ROLE; CREATE SCHEMA d3 AUTHORIZATION g_rest; GRANT CREATE, USAGE ON SCHEMA d3 TO g_owner;
 	SET ROLE g_rest; CREATE TABLE d3.t3 (a int)});
 $node->safe_psql('postgres', q{SET ROLE g_rest; SELECT test_ws_obj_copy('s3', 'd3')});
-is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner), has_table_privilege('g_rest', oid, 'SELECT') FROM pg_class WHERE oid = 'd3.v3'::regclass}),
+is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner), relacl::text LIKE '%g_rest=r/g_owner%' FROM pg_class WHERE oid = 'd3.v3'::regclass}),
 	'g_owner|t', 'it restores, and a grant to the role restoring is not lost');
 $node->safe_psql('postgres', q{DROP VIEW d3.v3; GRANT USAGE ON SCHEMA s3 TO g_rest; REVOKE g_owner FROM g_rest});
 ($rc, $out, $err) = $node->psql('postgres', q{SET ROLE g_rest; SELECT test_ws_obj_copy('s3', 'd3')});
 like($err, qr/must be able to SET ROLE "g_owner"/, 'one that cannot become its owner is told so');
+$node->safe_psql('postgres', q{REVOKE USAGE ON SCHEMA s3 FROM g_rest});
+($rc, $out, $err) = $node->psql('postgres', q{SET ROLE g_rest; SELECT test_ws_obj_bytes('s3')});
+like($err, qr/permission denied for schema s3/, 'one with no USAGE on the schema is told that');
 
 # in a versioned schema
 {
@@ -232,6 +240,22 @@ $s->query(q{SELECT test_ws_obj_bytes('S rc')});
 like($s->{stderr}, qr/could not read schema "S rc": it has changed since this transaction's snapshot/, 'a schema changed since is to be tried again');
 $s->query('ROLLBACK');
 
+# a change that holds nothing new is no reason to try again; a rename of a role is
+for my $case (['TRUNCATE "S rc".t', 0, 'a TRUNCATE'], ['VACUUM FULL "S rc".t', 0, 'a VACUUM FULL'],
+	['ALTER ROLE g_read RENAME TO g_read2', 1, 'a grantee renamed'], ['ALTER ROLE g_read2 RENAME TO g_read', 1, 'a grantee renamed back'])
+{
+	my ($change, $fails, $what) = @$case;
+	$s->{stderr} = '';
+	$s->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$s->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$s->{stderr} = '';
+	$s->query(q{SELECT test_ws_obj_bytes('S rc')});
+	if ($fails) { like($s->{stderr}, qr/has changed since/, "$what is to be tried again"); }
+	else { unlike($s->{stderr}, qr/ERROR/, "$what is no reason to try again"); }
+	$s->query('ROLLBACK');
+}
+
 # what is read stays as it was read until the transaction ends
 my $holder = $node->background_psql('postgres');
 $holder->query_safe('BEGIN');
@@ -245,6 +269,7 @@ $holder->quit;
 my $renamer = $node->background_psql('postgres');
 $renamer->query_safe('BEGIN');
 $renamer->query_safe(q{ALTER TABLE "S rc".t RENAME COLUMN a_new TO a_rc});
+$renamer->query_safe(q{COMMENT ON VIEW "S rc".now_a IS 'with the rename'});
 my $reader = $node->background_psql('postgres');
 $reader->query_until(qr/started/, "\\echo started\nSELECT test_ws_obj_bytes('S rc');\n\\echo done\n");
 $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'it did not wait';
@@ -253,6 +278,7 @@ $reader->{stdin} .= "\\echo finished\n";
 $reader->{run}->pump until $reader->{stdout} =~ /finished/;
 my $line = (grep { /^view\/now_a\t/ } split /\n/, $reader->{stdout})[0];
 like(pack('H*', (split /\t/, $line)[1]), qr/a_rc AS was/, 'and read as it left things');
+like(pack('H*', (split /\t/, $line)[1]), qr/with the rename/, 'all of them, not a new definition with an old comment');
 $_->quit for ($renamer, $reader, $s);
 
 # types: made before tables, which may use them, and needed by views

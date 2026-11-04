@@ -19,7 +19,9 @@
 
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_namespace.h"
 #include "common/int.h"
 #include "lib/binaryheap.h"
 #include "mb/pg_wchar.h"
@@ -564,7 +566,11 @@ static const char *const refusal_sql =
 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 "WHERE n.nspname = $1::name AND c.relkind IN ('v', 'm') ORDER BY 1";
 
-/* (each relation's, column's, rule's and type's row version, as the active snapshot sees them) */
+/*
+ * (what the active snapshot sees of each relation that a definition or a record would
+ * hold, with its owner's and grantees' names: not its row's version, which a TRUNCATE
+ * or a VACUUM FULL changes with nothing held changed)
+ */
 static char *
 relations_version(const char *schema)
 {
@@ -572,9 +578,17 @@ relations_version(const char *schema)
 	WsSqlRows	rows;
 	char	   *version;
 
-	WsSql->read("SELECT coalesce(md5(string_agg(x, ',' ORDER BY x)), '') FROM ( "
-				"  SELECT 'c' || c.oid || ':' || c.xmin AS x FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+	WsSql->read("SELECT coalesce(encode(sha256(convert_to(string_agg(x, ',' ORDER BY x), 'UTF8')), 'hex'), '') FROM ( "
+				"  SELECT 'c' || c.oid || ':' || c.relname || ':' || c.relkind::text || ':' || coalesce(c.relacl::text, '') || ':' || "
+				"      coalesce(c.reloptions::text, '') AS x FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"    WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'o' || c.oid || ':' || r.rolname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    JOIN pg_roles r ON r.oid = c.relowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'g' || c.oid || ':' || r.rolname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    CROSS JOIN LATERAL aclexplode(c.relacl) e JOIN pg_roles r ON r.oid = e.grantee WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'h' || a.attrelid || '.' || a.attnum || ':' || r.rolname FROM pg_attribute a "
+				"    JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    CROSS JOIN LATERAL aclexplode(a.attacl) e JOIN pg_roles r ON r.oid = e.grantee WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'a' || a.attrelid || '.' || a.attnum || ':' || a.xmin FROM pg_attribute a "
 				"    JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"    WHERE n.nspname = $1::name "
@@ -736,6 +750,12 @@ names_schema_walker(Node *node, void *arg)
 				TypeCast   *c = (TypeCast *) node;
 				const char *type = strVal(llast(c->typeName->names));
 
+				if (strncmp(type, "reg", 3) == 0 && c->typeName->arrayBounds != NIL)
+				{
+					/* (no dependency is held for a name in one, nor is it one name) */
+					n->why = "it has an array of reg* names, which say nothing of what they need";
+					return true;
+				}
 				if (strncmp(type, "reg", 3) == 0 && IsA(c->arg, A_Const) &&
 					IsA(&((A_Const *) c->arg)->val, String) &&
 					string_is_qualified(strVal(&((A_Const *) c->arg)->val)))
@@ -762,7 +782,7 @@ names_schema_walker(Node *node, void *arg)
 	}
 	if (named)
 	{
-		n->why = "it must say a schema's name, having something named as the catalogs' is, or from a schema renamed under it";
+		n->why = "it must say a schema's name, as what it means has a name something else hides";
 		return true;
 	}
 	return raw_expression_tree_walker(node, names_schema_walker, arg);
@@ -1274,6 +1294,16 @@ read_types(const char *schema, WsObject *objs, int *n)
 	return objs;
 }
 
+/* (without it, what is in the schema could only be printed with its schema's name) */
+static bool
+has_usage_of_schema(const char *schema)
+{
+	Oid			nsp = get_namespace_oid(schema, true);
+
+	return !OidIsValid(nsp) ||
+		object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) == ACLCHECK_OK;
+}
+
 void
 ws_obj_read(const char *schema, WsObject **out, int *n)
 {
@@ -1284,6 +1314,10 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	WsObject   *objs;
 	int			total;
 
+	if (!has_usage_of_schema(schema))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for schema %s", schema)));
 	push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
 	refuse_types(schema, type_refusal_sql);
@@ -1731,10 +1765,12 @@ run_statement(Buf *sql)
 }
 
 /*
- * Refuses a schema with anything a definition's unqualified name could take for what
- * it meant: an exact match here is preferred to a polymorphic one in the catalogs,
- * though the catalogs come first.  A range type's constructors go with it.  Types and collations here, which a commit's
- * tables may need, are matched by name, so the catalogs' come first.
+ * Refuses a schema with a function or operator a definition's unqualified name could
+ * be taken for: an exact match here is preferred to a polymorphic one in the catalogs,
+ * though the catalogs come first.  So only one named as something in the catalogs can
+ * be: all others, such as a range type's constructors or what a commit's tables use,
+ * are nothing to a definition.  Types and collations are matched by name, so the
+ * catalogs' come first.
  */
 static void
 check_nothing_captures(const char *schema)
@@ -1743,14 +1779,15 @@ check_nothing_captures(const char *schema)
 	WsSqlRows	rows;
 
 	WsSql->run("SELECT what FROM (SELECT 'a function' AS what FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-			   "    WHERE n.nspname = $1::name AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass "
-			   "      AND d.objid = p.oid AND d.deptype = 'i' AND d.refclassid = 'pg_type'::regclass) "
+			   "    WHERE n.nspname = $1::name AND EXISTS (SELECT 1 FROM pg_proc c WHERE c.proname = p.proname "
+			   "      AND c.pronamespace = 'pg_catalog'::regnamespace) "
 			   "  UNION ALL SELECT 'an operator' FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace "
-			   "    WHERE n.nspname = $1::name) w LIMIT 1", 1, params, &rows);
+			   "    WHERE n.nspname = $1::name AND EXISTS (SELECT 1 FROM pg_operator c WHERE c.oprname = o.oprname "
+			   "      AND c.oprnamespace = 'pg_catalog'::regnamespace)) w LIMIT 1", 1, params, &rows);
 	if (rows.nrows > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("schema \"%s\" holds %s no commit holds, which the commit's definitions could be taken for",
+				 errmsg("schema \"%s\" holds %s named as one in the catalogs, which the commit's definitions could be taken for",
 						schema, ws_sql_value(&rows, 0, 0))));
 	ws_sql_rows_free(&rows);
 }
