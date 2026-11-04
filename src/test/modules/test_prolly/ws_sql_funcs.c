@@ -26,6 +26,7 @@
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
 PG_FUNCTION_INFO_V1(test_ws_schema_attach);
+PG_FUNCTION_INFO_V1(test_ws_schema_grants);
 PG_FUNCTION_INFO_V1(test_ws_schema_comments);
 PG_FUNCTION_INFO_V1(test_ws_schema_row_security);
 PG_FUNCTION_INFO_V1(test_ws_schema_inherit);
@@ -238,6 +239,44 @@ test_ws_schema_comments(PG_FUNCTION_ARGS)
 		WsSql->run((char *) sql.data, 0, NULL, &rows);
 		ws_sql_rows_free(&rows);
 		appendStringInfo(&out, "%s\n", (char *) sql.data);
+		buf_free(&sql);
+	}
+	WsSql->end(level);
+	ws_schema_free(&s);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_schema_grants(bytes bytea, schema text) returns text: the owner and grants
+ * of a schema's bytes given in the schema; the statements, a line each
+ */
+Datum
+test_ws_schema_grants(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+	StringInfoData out;
+	int			level = WsSql->begin();
+
+	initStringInfo(&out);
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	for (int i = -1; i < s.ngrants; i++)
+	{
+		Buf			sql = BUF_INIT;
+		WsSqlRows	rows;
+
+		if (i < 0)
+			ws_schema_owner(&s, schema, &sql);
+		else
+			ws_schema_grant(&s, i, schema, &sql);
+		if (sql.len > 0)
+		{
+			buf_append_byte(&sql, 0);
+			WsSql->run((char *) sql.data, 0, NULL, &rows);
+			ws_sql_rows_free(&rows);
+			appendStringInfo(&out, "%s\n", (char *) sql.data);
+		}
 		buf_free(&sql);
 	}
 	WsSql->end(level);

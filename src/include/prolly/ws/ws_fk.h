@@ -75,7 +75,8 @@ extern void ws_fk_free(WsForeignKey *fk);
 
 /*
  * A table's foreign keys, but those it has as its partitioned table's, which
- * adding that table's makes again, from the catalogs, through WsSql, by name in UTF8's
+ * adding that table's makes again, from the catalogs, through WsSql, by name in
+ * UTF8's
  * order, in *out, palloc'd, each the caller's to ws_fk_free.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED as ws_fk_refuse does, and if the table is in no
  * versioned schema.
@@ -84,12 +85,12 @@ extern void ws_fk_read(const char *schema, const char *table, WsForeignKey **out
 
 /*
  * Raises ERRCODE_FEATURE_NOT_SUPPORTED if a table (its object id as text, in a
- * WsSql scope, a snapshot pushed as WsSql's read needs) has a key no commit can hold or the record cannot yet: to a table
- * outside its schema, not enforced, over a period, named or validated otherwise
- * than the partitioned table's it comes from, so long a name that the numbered
- * rows it has for a partitioned table could take another key's,
- * with its triggers disabled or commented on, or that more than one unique index
- * could serve.
+ * WsSql scope, a snapshot pushed as WsSql's read needs) has a key no commit can
+ * hold or the record cannot yet: to a table outside its schema, not enforced, over a
+ * period, named or validated otherwise than the partitioned table's it comes from,
+ * so long a name that the numbered rows it has for a partitioned table could take
+ * another key's, with its triggers disabled or commented on, or that more than one
+ * unique index could serve.
  */
 extern void ws_fk_refuse(const char *oid, const char *table);
 
