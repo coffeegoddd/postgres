@@ -567,7 +567,6 @@ my %refused_for = (
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
 	ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
 	ixa1 => 'one for the other', ixd1 => 'one for the other', ixp1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
-	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
 	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
