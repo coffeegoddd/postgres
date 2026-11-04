@@ -101,10 +101,11 @@ extern void ws_role_list(ProllyCtx *ctx, const PHash *map, WsRole **out, int *n)
 /*
  * Marks roles here as held by commits (pg_authid.roltravels), so that a commit may
  * later change them: what capture does with what ws_role_read gave it, once it is
- * allowed to write.  Marking one not yet marked takes ADMIN on it, as a mark lets a
- * commit say who is a member of it: ERRCODE_INSUFFICIENT_PRIVILEGE otherwise.  The
- * mark goes with the role.  A mark says only that some versioned database of this
- * cluster holds it, and those that hold one name share it.
+ * allowed to write, as the role committing.  Marking one not yet marked takes a
+ * superuser, as ALTER ROLE ... TRAVELS does, since a mark lets a commit say who is a
+ * member of it: ERRCODE_INSUFFICIENT_PRIVILEGE otherwise.  A role already marked
+ * needs nothing.  The mark goes with the role.  A mark says only that some versioned
+ * database of this cluster holds it, and those that hold one name share it.
  */
 extern void ws_role_mark(const WsRole *roles, int n);
 
@@ -139,11 +140,13 @@ extern void ws_role_revoke_statement(const char *member, const char *of, const c
  * Makes roles from a commit here, through WsSql, once ws_role_check_arrival has
  * allowed them, each before any membership, and marks them.  A membership is left
  * exactly as held, whoever granted what was here, and one previous held and these do
- * not is revoked: the commit removed it.  One made here is not, and no role is ever
- * dropped, as this cluster's other databases may use it.  Changing what another role
- * granted takes what the server asks of that, so a role with CREATEROLE and ADMIN may
- * be refused what a superuser granted; taking the ADMIN option from a role that has
- * used it here raises ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST.  previous is in order.
+ * not is revoked, if both its roles are marked and can travel: the commit removed
+ * it.  Roles are the cluster's, so that is for all its databases, whose next capture
+ * sees it gone.  One made here is not revoked, and no role is ever dropped.  Changing
+ * what another role granted takes what the server asks of that, so a role with
+ * CREATEROLE and ADMIN may be refused what a superuser granted; taking the ADMIN
+ * option from a role that has used it here raises
+ * ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST.  previous is in order.
  */
 extern void ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int nprevious);
 

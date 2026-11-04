@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "engine_test_util.h"
+#include "miscadmin.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_root.h"
 #include "test_prolly.h"
@@ -222,6 +223,14 @@ ENGINE_TEST(test_map)
 	}
 }
 
+static void
+make_for(void *arg)
+{
+	Buf			b = BUF_INIT;
+
+	ws_role_make_statement(arg, &b);
+}
+
 ENGINE_TEST(test_statements)
 {
 	WsRole		r = {.name = "ws role no such one"};
@@ -251,6 +260,12 @@ ENGINE_TEST(test_statements)
 	ws_role_revoke_statement("g", "a", "z", &b);
 	CHECK(b.len == strlen("REVOKE a FROM g GRANTED BY z"));
 	CHECK(memcmp(b.data, "REVOKE a FROM g GRANTED BY z", b.len) == 0);
+	{
+		/* (what acts on a role checks again: one here that is not a commit's stays so) */
+		WsRole		here = {.name = GetUserNameFromId(GetUserId(), false)};
+
+		expect_error(make_for, &here, ERRCODE_FEATURE_NOT_SUPPORTED, NULL);
+	}
 	buf_free(&b);
 }
 

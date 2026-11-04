@@ -589,7 +589,28 @@ membership_widens(Oid member, Oid of, const WsRoleMembership *m)
 	return n == 0 || (m->admin && !admin) || (m->inherit && !inherit) || (m->set && !set);
 }
 
-/* Whether a membership, in commit names, is one previous holds and roles do not. */
+/* Whether a role is here, marked, and one that can travel: a commit's to change. */
+static bool
+role_is_a_commits(const char *name)
+{
+	char	   *here = ws_name_from_utf8(name);
+	HeapTuple	tup = SearchSysCache1(AUTHNAME, PointerGetDatum(here));
+	bool		marked = false;
+
+	if (HeapTupleIsValid(tup))
+	{
+		marked = ((Form_pg_authid) GETSTRUCT(tup))->roltravels;
+		ReleaseSysCache(tup);
+	}
+	marked = marked && ws_role_travel_problem(here) == NULL;
+	pfree(here);
+	return marked;
+}
+
+/*
+ * Whether a membership, in commit names, is one previous holds and roles do not, of
+ * two roles a commit may change: nothing else is the commit's to remove.
+ */
 static bool
 membership_removed(const WsRole *roles, int n, const WsRole *previous, int nprevious,
 				   const char *member, const char *of)
@@ -607,7 +628,7 @@ membership_removed(const WsRole *roles, int n, const WsRole *previous, int nprev
 			for (int k = 0; k < roles[i].nmember_of; k++)
 				if (strcmp(roles[i].member_of[k].role, of) == 0)
 					return false;
-	return true;
+	return role_is_a_commits(member) && role_is_a_commits(of);
 }
 
 /*
@@ -737,6 +758,34 @@ ws_role_check_arrival(const WsRole *roles, int n, const WsRole *previous, int np
 	}
 }
 
+/* (the role's lock, as AddRoleMems takes it, for one marking at a time) */
+static void
+mark_role(Relation rel, const char *here)
+{
+	Oid			oid = get_role_oid(here, false);
+	HeapTuple	tup;
+	Form_pg_authid form;
+	const char *problem = ws_role_travel_problem(here);
+
+	if (problem != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("role \"%s\" cannot travel with a commit: %s", here, problem)));
+	LockSharedObject(AuthIdRelationId, oid, 0, ShareUpdateExclusiveLock);
+	tup = SearchSysCacheCopy1(AUTHOID, ObjectIdGetDatum(oid));
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("role \"%s\" does not exist", here)));
+	form = (Form_pg_authid) GETSTRUCT(tup);
+	if (!form->roltravels)
+	{
+		form->roltravels = true;
+		CatalogTupleUpdate(rel, &tup->t_self, tup);
+	}
+	heap_freetuple(tup);
+}
+
 void
 ws_role_mark(const WsRole *roles, int n)
 {
@@ -745,35 +794,25 @@ ws_role_mark(const WsRole *roles, int n)
 	for (int i = 0; i < n; i++)
 	{
 		char	   *here = ws_name_from_utf8(roles[i].name);
-		Oid			oid = get_role_oid(here, false);
-		HeapTuple	tup;
-		Form_pg_authid form;
-		const char *problem;
+		HeapTuple	tup = SearchSysCache1(AUTHNAME, PointerGetDatum(here));
+		bool		marked;
 
-		/* (one marking at a time; then this role as whoever came first left it) */
-		LockSharedObject(AuthIdRelationId, oid, 0, AccessExclusiveLock);
-		tup = SearchSysCacheCopy1(AUTHOID, ObjectIdGetDatum(oid));
 		if (!HeapTupleIsValid(tup))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("role \"%s\" does not exist", here)));
-		form = (Form_pg_authid) GETSTRUCT(tup);
-		problem = ws_role_travel_problem(here);
-		if (problem != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("role \"%s\" cannot travel with a commit: %s", here, problem)));
-		if (!form->roltravels)
+		marked = ((Form_pg_authid) GETSTRUCT(tup))->roltravels;
+		ReleaseSysCache(tup);
+		/* (nothing to do takes no right and no lock: capture does this each time) */
+		if (!marked)
 		{
-			if (!superuser() && !is_admin_of_role(GetUserId(), form->oid))
+			if (!superuser())
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("permission denied to let role \"%s\" travel with a commit", here),
-						 errdetail("Only roles with the ADMIN option on it may do this.")));
-			form->roltravels = true;
-			CatalogTupleUpdate(rel, &tup->t_self, tup);
+						 errdetail("Only a superuser may do this, as a commit may then change that role.")));
+			mark_role(rel, here);
 		}
-		heap_freetuple(tup);
 		pfree(here);
 	}
 	table_close(rel, RowExclusiveLock);
@@ -1018,17 +1057,17 @@ run_role_statement(Buf *sql)
 }
 
 /*
- * Refuses to take from a role what it has passed on here, naming it: a commit has
- * no say in the grant that depends on it, and an error of the server's would offer
- * a CASCADE no one pulling can use.
+ * The first role a role has passed a membership of of to here, or InvalidOid: a
+ * commit has no say in that grant.
  */
-static void
-check_no_dependents(const char *member, Oid member_oid, const char *of, Oid of_oid)
+static Oid
+dependent_of(Oid member_oid, Oid of_oid)
 {
 	Relation	rel = table_open(AuthMemRelationId, AccessShareLock);
 	ScanKeyData key;
 	SysScanDesc scan;
 	HeapTuple	tup;
+	Oid			found = InvalidOid;
 
 	ScanKeyInit(&key, Anum_pg_auth_members_roleid, BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(of_oid));
@@ -1038,29 +1077,45 @@ check_no_dependents(const char *member, Oid member_oid, const char *of, Oid of_o
 		Form_pg_auth_members m = (Form_pg_auth_members) GETSTRUCT(tup);
 
 		if (m->grantor == member_oid)
-			ereport(ERROR,
-					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-					 errmsg("a commit takes the ADMIN option on role \"%s\" from role \"%s\", which granted it here to role \"%s\"",
-							of, member, GetUserNameFromId(m->member, false)),
-					 errhint("Revoke that grant here before the commit arrives.")));
+		{
+			found = m->member;
+			break;
+		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+	return found;
 }
 
-/* Revokes what is here of a membership, whoever granted it, past the first skip. */
+/* Refuses by name, as an error of the server's would offer a CASCADE no one pulling can use. */
 static void
-revoke_membership(const char *member, const char *of, int skip)
+check_no_dependents(const char *member, Oid member_oid, const char *of, Oid of_oid)
+{
+	Oid			dependent = dependent_of(member_oid, of_oid);
+
+	if (OidIsValid(dependent))
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("a commit takes the ADMIN option on role \"%s\" from role \"%s\", which granted it here to role \"%s\"",
+						of, member, GetUserNameFromId(dependent, false)),
+				 errhint("Revoke that grant here before the commit arrives.")));
+}
+
+/* Revokes what is here of a membership, whoever granted it, but for one row's grantor. */
+static void
+revoke_membership(const char *member, const char *of, Oid keep)
 {
 	HereRow    *rows;
 	Oid			member_oid = get_role_oid(member, false);
 	Oid			of_oid = get_role_oid(of, false);
 	int			n = memberships_here(member_oid, of_oid, &rows, NULL);
 
-	for (int i = skip; i < n; i++)
+	for (int i = 0; i < n; i++)
 	{
 		Buf			sql = BUF_INIT;
 
+		if (rows[i].grantor == keep)
+			continue;
 		ws_role_revoke_statement(member, of, GetUserNameFromId(rows[i].grantor, false), &sql);
 		run_role_statement(&sql);
 	}
@@ -1068,7 +1123,22 @@ revoke_membership(const char *member, const char *of, int skip)
 }
 
 /*
- * Leaves a membership as held: in place if it is here, as a row of another grantor
+ * The row of a membership to change in place, or -1: one whose grantor may still
+ * grant it.  A member is no grantor to itself, and one that has lost its ADMIN can
+ * only be replaced.
+ */
+static int
+row_to_keep(const HereRow *rows, int n, Oid member, Oid of)
+{
+	for (int i = 0; i < n; i++)
+		if (rows[i].grantor != member &&
+			(superuser_arg(rows[i].grantor) || is_admin_of_role(rows[i].grantor, of)))
+			return i;
+	return -1;
+}
+
+/*
+ * Leaves a membership as held: in place if it can be, as a row of another grantor
  * would keep what this one takes away, and revoking would take with it what depends
  * on it.
  */
@@ -1080,30 +1150,114 @@ set_membership(const WsRole *r, int k, const char *member)
 	Oid			member_oid = get_role_oid(member, false);
 	Oid			of_oid = get_role_oid(of, false);
 	HereRow    *rows;
-	int			n = memberships_here(member_oid, of_oid, &rows, NULL);
+	int			n;
+	int			keep;
+	bool		admin = false;
 	Buf			sql = BUF_INIT;
 
-	if (!membership_is_here(member_oid, of_oid, m))
+	/* (as AddRoleMems does: no grant by this role can come while this looks for them) */
+	LockSharedObject(AuthIdRelationId, of_oid, 0, ShareUpdateExclusiveLock);
+	if (membership_is_here(member_oid, of_oid, m))
 	{
-		bool		admin = false;
-
-		for (int i = 0; i < n; i++)
-			admin |= rows[i].admin;
-		if (admin && !m->admin)
-			check_no_dependents(member, member_oid, of, of_oid);
-		ws_role_grant_statement(r, k, n > 0 ? GetUserNameFromId(rows[0].grantor, false) : NULL, &sql);
+		pfree(of);
+		return;
+	}
+	n = memberships_here(member_oid, of_oid, &rows, NULL);
+	keep = row_to_keep(rows, n, member_oid, of_oid);
+	for (int i = 0; i < n; i++)
+		admin |= rows[i].admin;
+	if (admin && (!m->admin || keep < 0))
+		check_no_dependents(member, member_oid, of, of_oid);
+	if (keep >= 0)
+	{
+		/* (a grant of what it already says would only say so, in a NOTICE) */
+		if (rows[keep].admin != m->admin || rows[keep].inherit != m->inherit || rows[keep].set != m->set)
+		{
+			ws_role_grant_statement(r, k, GetUserNameFromId(rows[keep].grantor, false), &sql);
+			run_role_statement(&sql);
+		}
+		revoke_membership(member, of, rows[keep].grantor);
+	}
+	else
+	{
+		revoke_membership(member, of, InvalidOid);
+		ws_role_grant_statement(r, k, NULL, &sql);
 		run_role_statement(&sql);
-		revoke_membership(member, of, 1);
 	}
 	buf_free(&sql);
 	pfree(rows);
 	pfree(of);
 }
 
+/*
+ * Revokes what the commit removed, each once what it has passed on is gone, which
+ * may be by another removal, in whatever order their names are.
+ */
+static void
+remove_memberships(const WsRole *roles, int n, const WsRole *previous, int nprevious)
+{
+	bool		progress = true;
+	bool		pending = true;
+
+	while (pending && progress)
+	{
+		pending = false;
+		progress = false;
+		for (int i = 0; i < nprevious; i++)
+			for (int k = 0; k < previous[i].nmember_of; k++)
+			{
+				const char *of = previous[i].member_of[k].role;
+				char	   *here;
+				char	   *of_here;
+				Oid			member_oid;
+				Oid			of_oid;
+				Oid		   *ofs;
+
+				CHECK_FOR_INTERRUPTS();
+				if (!membership_removed(roles, n, previous, nprevious, previous[i].name, of))
+					continue;
+				here = ws_name_from_utf8(previous[i].name);
+				of_here = ws_name_from_utf8(of);
+				member_oid = get_role_oid(here, false);
+				of_oid = get_role_oid(of_here, false);
+				if (memberships_here(member_oid, of_oid, NULL, &ofs) > 0)
+				{
+					LockSharedObject(AuthIdRelationId, of_oid, 0, ShareUpdateExclusiveLock);
+					if (OidIsValid(dependent_of(member_oid, of_oid)))
+						pending = true;
+					else
+					{
+						revoke_membership(here, of_here, InvalidOid);
+						progress = true;
+					}
+				}
+				pfree(ofs);
+				pfree(of_here);
+				pfree(here);
+			}
+	}
+	if (!pending)
+		return;
+	/* (what is left depends on what no commit removes: say which) */
+	for (int i = 0; i < nprevious; i++)
+		for (int k = 0; k < previous[i].nmember_of; k++)
+			if (membership_removed(roles, n, previous, nprevious, previous[i].name,
+								   previous[i].member_of[k].role))
+			{
+				char	   *here = ws_name_from_utf8(previous[i].name);
+				char	   *of_here = ws_name_from_utf8(previous[i].member_of[k].role);
+
+				check_no_dependents(here, get_role_oid(here, false), of_here, get_role_oid(of_here, false));
+				pfree(of_here);
+				pfree(here);
+			}
+}
+
 void
 ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int nprevious)
 {
 	int			level;
+	Relation	rel;
 
 	ws_role_check_arrival(roles, n, previous, nprevious);
 	level = WsSql->begin();
@@ -1116,30 +1270,21 @@ ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int npreviou
 			run_role_statement(&sql);
 		buf_free(&sql);
 	}
-	ws_role_mark(roles, n);
+
+	/* (arrival allowed these: none here was not marked, and the rest it just made) */
+	rel = table_open(AuthIdRelationId, RowExclusiveLock);
+	for (int i = 0; i < n; i++)
+	{
+		char	   *here = ws_name_from_utf8(roles[i].name);
+
+		mark_role(rel, here);
+		pfree(here);
+	}
+	table_close(rel, RowExclusiveLock);
+	CommandCounterIncrement();
 
 	/* (what a commit removed first, so that it may reverse a membership) */
-	for (int i = 0; i < nprevious; i++)
-		for (int k = 0; k < previous[i].nmember_of; k++)
-		{
-			const char *of = previous[i].member_of[k].role;
-
-			if (membership_removed(roles, n, previous, nprevious, previous[i].name, of))
-			{
-				char	   *here = ws_name_from_utf8(previous[i].name);
-				char	   *of_here = ws_name_from_utf8(of);
-				Oid			member_oid = get_role_oid(here, true);
-				Oid			of_oid = get_role_oid(of_here, true);
-
-				if (OidIsValid(member_oid) && OidIsValid(of_oid))
-				{
-					check_no_dependents(here, member_oid, of_here, of_oid);
-					revoke_membership(here, of_here, 0);
-				}
-				pfree(of_here);
-				pfree(here);
-			}
-		}
+	remove_memberships(roles, n, previous, nprevious);
 	for (int i = 0; i < n; i++)
 	{
 		char	   *here = ws_name_from_utf8(roles[i].name);

@@ -211,7 +211,8 @@ in sync when changing the above synopsis!
         These clauses determine whether a role is held by a versioned
         database's commits, so that a commit arriving on this cluster may
         change it.  Without this, a commit naming a role of that name is
-        refused.  <literal>NOTRAVELS</literal> is the default.
+        refused.  <literal>NOTRAVELS</literal> is the default.  Only superuser
+        roles can specify these.
        </para>
       </listitem>
      </varlistentry>

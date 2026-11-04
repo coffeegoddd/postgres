@@ -325,6 +325,12 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 		bypassrls = boolVal(dbypassRLS->arg);
 	if (dtravels)
 		travels = boolVal(dtravels->arg);
+	if (dtravels && !superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to create role"),
+				 errdetail("Only roles with the %s attribute may specify the %s attribute.",
+						   "SUPERUSER", "TRAVELS")));
 
 	/* Check some permissions first */
 	if (!superuser_arg(currentUserId))
@@ -791,6 +797,13 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 				 errdetail("Only roles with the %s attribute may change the %s attribute.",
 						   "SUPERUSER", "SUPERUSER")));
 
+	if (dtravels && !superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to alter role"),
+				 errdetail("Only roles with the %s attribute may change the %s attribute.",
+						   "SUPERUSER", "TRAVELS")));
+
 	/*
 	 * Most changes to a role require that you both have CREATEROLE privileges
 	 * and also ADMIN OPTION on the role.
@@ -800,7 +813,7 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 	{
 		/* things an unprivileged user certainly can't do */
 		if (dinherit || dcreaterole || dcreatedb || dcanlogin || dconnlimit ||
-			dvalidUntil || disreplication || dbypassRLS || dtravels)
+			dvalidUntil || disreplication || dbypassRLS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to alter role"),

@@ -49,8 +49,11 @@ patch doc/src/sgml/config.sgml  1b  catalog_branch
 patch doc/src/sgml/libpq.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/protocol.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/ref/alter_role.sgml  4  TRAVELS
+patch doc/src/sgml/ref/alter_user.sgml  4  TRAVELS
+patch doc/src/sgml/ref/create_group.sgml  4  TRAVELS
 patch doc/src/sgml/ref/create_role.sgml  4  TRAVELS
 patch doc/src/sgml/ref/create_schema.sgml  1b  CREATE SCHEMA ... VERSIONED
+patch doc/src/sgml/ref/create_user.sgml  4  TRAVELS
 patch doc/src/sgml/ref/pg_dump.sgml  2  --no-history
 patch doc/src/sgml/ref/pg_dumpall.sgml  2  --no-history
 patch doc/src/sgml/system-views.sgml  4  pg_roles.roltravels documented
@@ -131,6 +134,7 @@ patch src/backend/utils/activity/pgstat.c  1a  the block map statistics kind (PG
 patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock
 patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
+patch src/backend/utils/adt/ddlutils.c  4  TRAVELS in a role's definition
 patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/ri_triggers.c  1b  a foreign key's queries resolve names on its table's branch, whatever branch the session is on
 patch src/backend/utils/adt/ruleutils.c  1b  a constraint rebuilt by DDL is looked up with a catalog snapshot
@@ -152,6 +156,7 @@ patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA .
 patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch; also (2) DO_HISTORY_DATA, HistoryDataInfo
 patch src/bin/pg_dump/pg_dump_sort.c  2  DO_HISTORY_DATA's place in the data section
 patch src/bin/pg_dump/pg_dumpall.c  2  --no-history, passed to pg_dump; also (4) a role's TRAVELS
+patch src/bin/pg_dump/t/002_pg_dump.pl  4  a role is dumped with NOTRAVELS
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
 patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) notes the databases whose history store's tier has packs, and refuses a new cluster whose tiers' place is another; the history store's relations are no sign of a new cluster not empty
@@ -164,7 +169,8 @@ patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation'
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source; also (2) the history store's (chunkdesc.c)
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager; also (2) prolly/chunk_xlog.h
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode; also (2) ChunkLog and ChunkIndex in the rmgr list
-patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED
+patch src/bin/psql/describe.c  4  \du shows TRAVELS
+patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED; also (4) TRAVELS
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly (and prolly/engine)
 patch src/include/access/heapam.h  1b  heap and index scans remember the branch whose catalog rows they see

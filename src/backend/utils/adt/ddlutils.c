@@ -216,6 +216,9 @@ pg_get_role_ddl_internal(Oid roleid, bool pretty, bool memberships)
 	append_ddl_option(&buf, pretty, 4, "%s",
 					  roleform->rolbypassrls ? "BYPASSRLS" : "NOBYPASSRLS");
 
+	if (roleform->roltravels)
+		append_ddl_option(&buf, pretty, 4, "%s", "TRAVELS");
+
 	/*
 	 * CONNECTION LIMIT is only interesting if it's not -1 (the default,
 	 * meaning no limit).
