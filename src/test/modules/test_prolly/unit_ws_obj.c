@@ -503,6 +503,37 @@ ENGINE_TEST(test_refused_statements)
 		}
 	}
 	{
+		static const char *const operators[] = {"(FUNCTION = f); DROP TABLE t", "AS ENUM ('a')", "not sql"};
+		static const char *const classes[] = {"FOR TYPE a USING b AS FUNCTION 1 f(a); DROP TABLE t", "USING b", "not sql"};
+		static const char *const links[] = {"ALTER OPERATOR <<< (a, a) OWNER TO x; DROP TABLE t", "DROP OPERATOR <<< (a, a)", "not sql"};
+		static const char *const members[] = {"ALTER OPERATOR FAMILY v USING b DROP FUNCTION 1 (a, a)", "DROP OPERATOR FAMILY v USING b", "not sql"};
+
+		for (int i = 0; i < lengthof(operators); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_OPERATOR,.name = "<<<",.args = "a, a",.definition = (char *) operators[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(classes); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_OPCLASS,.name = "v",.args = "b",.definition = (char *) classes[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(links); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_OPLINK,.name = "<<<",.args = "a, a",.definition = (char *) links[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(members); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_OPMEMBERS,.name = "v",.args = "b",.definition = (char *) members[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
+	{
 		static const char *const collations[] = {"(LOCALE = 'C'); DROP TABLE t", "FROM \"C\"; DROP TABLE t", "AS ENUM ('a')"};
 		static const char *const casts[] = {"CREATE CAST (a AS b) WITH INOUT; DROP TABLE t", "DROP CAST (a AS b)", "not sql"};
 		static const char *const conversions[] = {"FOR 'a' TO 'b' FROM f; DROP TABLE t", "not sql"};

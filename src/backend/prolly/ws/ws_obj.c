@@ -63,6 +63,11 @@ static const char *const kind_words[] = {
 	[WS_OBJ_CAST] = "cast",
 	[WS_OBJ_COLLATION] = "collation",
 	[WS_OBJ_CONVERSION] = "conversion",
+	[WS_OBJ_OPERATOR] = "operator",
+	[WS_OBJ_OPLINK] = "oplink",
+	[WS_OBJ_OPCLASS] = "opclass",
+	[WS_OBJ_OPFAMILY] = "opfamily",
+	[WS_OBJ_OPMEMBERS] = "opmembers",
 	[WS_OBJ_DEFAULT] = "default",
 	[WS_OBJ_DOMAIN] = "domain",
 	[WS_OBJ_FUNCTION] = "function",
@@ -81,6 +86,11 @@ static const char *const kind_sql[] = {
 	[WS_OBJ_CAST] = "CAST",
 	[WS_OBJ_COLLATION] = "COLLATION",
 	[WS_OBJ_CONVERSION] = "CONVERSION",
+	[WS_OBJ_OPERATOR] = "OPERATOR",
+	[WS_OBJ_OPLINK] = "OPERATOR",
+	[WS_OBJ_OPCLASS] = "OPERATOR CLASS",
+	[WS_OBJ_OPFAMILY] = "OPERATOR FAMILY",
+	[WS_OBJ_OPMEMBERS] = "OPERATOR FAMILY",
 	[WS_OBJ_DEFAULT] = "DEFAULT",
 	[WS_OBJ_DOMAIN] = "DOMAIN",
 	[WS_OBJ_FUNCTION] = "FUNCTION",
@@ -94,6 +104,13 @@ static const char *const kind_sql[] = {
 	[WS_OBJ_TYPE] = "TYPE",
 	[WS_OBJ_VIEW] = "VIEW",
 };
+
+static bool
+is_of_operators(WsObjectKind kind)
+{
+	return kind == WS_OBJ_OPERATOR || kind == WS_OBJ_OPLINK || kind == WS_OBJ_OPCLASS ||
+		kind == WS_OBJ_OPFAMILY || kind == WS_OBJ_OPMEMBERS;
+}
 
 static bool
 is_function(WsObjectKind kind)
@@ -112,14 +129,14 @@ is_of_table(WsObjectKind kind)
 static bool
 has_args(WsObjectKind kind)
 {
-	return is_function(kind) || is_of_table(kind) || kind == WS_OBJ_CAST;
+	return is_function(kind) || is_of_table(kind) || kind == WS_OBJ_CAST || is_of_operators(kind);
 }
 
 /* Whether its definition is its whole statement, not what follows its name. */
 static bool
 is_whole_statement(WsObjectKind kind)
 {
-	return is_of_table(kind) || kind == WS_OBJ_CAST;
+	return is_of_table(kind) || kind == WS_OBJ_CAST || kind == WS_OBJ_OPLINK || kind == WS_OBJ_OPMEMBERS;
 }
 
 bool
@@ -127,6 +144,7 @@ ws_obj_before_tables(const WsObject *o)
 {
 	return o->kind == WS_OBJ_DOMAIN || o->kind == WS_OBJ_TYPE || o->kind == WS_OBJ_SEQUENCE ||
 		o->kind == WS_OBJ_COLLATION || o->kind == WS_OBJ_CONVERSION || o->kind == WS_OBJ_CAST ||
+		is_of_operators(o->kind) ||
 		(is_function(o->kind) && !o->after_tables);
 }
 
@@ -161,7 +179,8 @@ bad_name(const char *name)
 static char *
 name_here(const WsObject *o, const char *name)
 {
-	return o->kind == WS_OBJ_CAST ? ws_text_from_utf8(name) : ws_name_from_utf8(name);
+	return o->kind == WS_OBJ_CAST || o->kind == WS_OBJ_OPERATOR || o->kind == WS_OBJ_OPLINK ?
+		ws_text_from_utf8(name) : ws_name_from_utf8(name);
 }
 
 /* (order: none first, then by name) */
@@ -209,6 +228,10 @@ ws_obj_problem(const WsObject *o)
 		return "a function with no input types, or something else with them";
 	if (is_of_table(o->kind) && (o->owner != NULL || o->ngrants > 0 || bad_name(o->args)))
 		return "something of a table with no table, or with an owner or grants of its own";
+	if (is_of_operators(o->kind) && (o->ngrants > 0 || o->args == NULL || o->args[0] == '\0'))
+		return "something of operators with grants, or with no types or method";
+	if ((o->kind == WS_OBJ_OPLINK || o->kind == WS_OBJ_OPMEMBERS) && (o->owner != NULL || o->ncomments > 0))
+		return "what comes after an operator or family, with an owner or comments of its own";
 	if (o->kind == WS_OBJ_CAST && (o->owner != NULL || o->ngrants > 0 || o->args == NULL || o->args[0] == '\0'))
 		return "a cast with no target, or with an owner or grants of its own";
 	if ((o->after_tables || o->public_revoked) && !is_function(o->kind))
@@ -665,7 +688,7 @@ static const char *const refusal_sql =
 "      WHERE r.ev_class = c.oid AND r.rulename = '_RETURN' AND d.deptype = 'n' AND NOT ( "
 "        (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "           AND (q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S') OR q.relnamespace = 'pg_catalog'::regnamespace))) "
-"        OR d.refclassid IN ('pg_proc'::regclass, 'pg_collation'::regclass) "
+"        OR d.refclassid IN ('pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) "
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k "
 "           WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
 "        OR d.refclassid = 'pg_type'::regclass "
@@ -741,6 +764,20 @@ relations_version(const char *schema)
 				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
 				"    JOIN pg_cast k ON d.classoid = 'pg_cast'::regclass AND k.oid = d.objoid JOIN pg_type t ON t.oid IN (k.castsource, k.casttarget) "
 				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'O' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace "
+				"    JOIN pg_roles r ON r.oid = o.oprowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'P' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_opclass o JOIN pg_namespace n ON n.oid = o.opcnamespace "
+				"    JOIN pg_roles r ON r.oid = o.opcowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'Q' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_opfamily o JOIN pg_namespace n ON n.oid = o.opfnamespace "
+				"    JOIN pg_roles r ON r.oid = o.opfowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'a' || a.oid || ':' || a.xmin FROM pg_amop a JOIN pg_opfamily o ON o.oid = a.amopfamily JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'b' || a.oid || ':' || a.xmin FROM pg_amproc a JOIN pg_opfamily o ON o.oid = a.amprocfamily JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_operator o ON d.classoid = 'pg_operator'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.oprnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_opclass o ON d.classoid = 'pg_opclass'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.opcnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_opfamily o ON d.classoid = 'pg_opfamily'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'x' || i.indexrelid || ':' || i.xmin FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'w' || w.oid || ':' || w.xmin FROM pg_attrdef w JOIN pg_class c ON c.oid = w.adrelid "
@@ -1125,6 +1162,54 @@ function_key(const char *schema, Oid oid, Buf *key)
 			   ws_name_to_utf8(get_func_name(oid)), args, key);
 }
 
+static char *print_type(const char *schema, Oid typid, int32 typmod);
+static char *printed_or_retry(const char *schema, char *printed);
+
+/* An operator's input types as printed, NONE for what it has not. */
+static char *
+operator_args(const char *schema, Oid left, Oid right)
+{
+	return psprintf("%s, %s", OidIsValid(left) ? print_type(schema, left, -1) : "NONE",
+					OidIsValid(right) ? print_type(schema, right, -1) : "NONE");
+}
+
+static void
+operator_key(const char *schema, Oid oid, Buf *key)
+{
+	const char *params[1];
+	WsSqlRows	rows;
+	char	   *text = psprintf("%u", oid);
+
+	params[0] = text;
+	WsSql->read("SELECT oprname::text, oprleft::text, oprright::text FROM pg_operator WHERE oid = $1::oid", 1, params, &rows);
+	if (rows.nrows != 1)
+		printed_or_retry(schema, NULL);
+	ws_obj_key(WS_OBJ_OPERATOR, ws_name_to_utf8(ws_sql_value(&rows, 0, 0)),
+			   ws_text_to_utf8(operator_args(schema, atooid(ws_sql_value(&rows, 0, 1)), atooid(ws_sql_value(&rows, 0, 2)))), key);
+	ws_sql_rows_free(&rows);
+	pfree(text);
+}
+
+/* The key of a class, or of a family, by its name and its method's. */
+static void
+method_key(bool is_class, Oid oid, Buf *key)
+{
+	const char *params[1];
+	WsSqlRows	rows;
+	char	   *text = psprintf("%u", oid);
+
+	params[0] = text;
+	WsSql->read(is_class ? "SELECT o.opcname::text, quote_ident(a.amname) FROM pg_opclass o JOIN pg_am a ON a.oid = o.opcmethod WHERE o.oid = $1::oid" :
+				"SELECT o.opfname::text, quote_ident(a.amname) FROM pg_opfamily o JOIN pg_am a ON a.oid = o.opfmethod WHERE o.oid = $1::oid",
+				1, params, &rows);
+	if (rows.nrows != 1)
+		elog(ERROR, "no operator class or family %u", oid);
+	ws_obj_key(is_class ? WS_OBJ_OPCLASS : WS_OBJ_OPFAMILY, ws_name_to_utf8(ws_sql_value(&rows, 0, 0)),
+			   ws_name_to_utf8(ws_sql_value(&rows, 0, 1)), key);
+	ws_sql_rows_free(&rows);
+	pfree(text);
+}
+
 /*
  * What an object needs among a schema's objects: of what depends for it (source, its
  * classid and objid, of $1), the views and the types.  An array is its element's and
@@ -1139,8 +1224,10 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 	char	   *sql;
 
 	sql = psprintf("WITH src(classid, objid) AS (%s), "
+				   /* (a family's members need what they hold only automatically) */
 				   "d AS (SELECT p.refclassid, p.refobjid FROM pg_depend p JOIN src ON p.classid = src.classid "
-				   "  AND p.objid = src.objid WHERE p.deptype = 'n') "
+				   "  AND p.objid = src.objid WHERE p.deptype = 'n' OR "
+				   "    (p.deptype = 'a' AND p.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass))) "
 				   "SELECT DISTINCT CASE q.relkind WHEN 'c' THEN 'T' ELSE q.relkind::text END, q.relname::text FROM d "
 				   "LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
 				   "LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
@@ -1152,6 +1239,12 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 				   "  AND q.reltype <> $1::oid AND q.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'L', l.collname::text FROM d JOIN pg_collation l ON d.refclassid = 'pg_collation'::regclass "
 				   "  AND l.oid = d.refobjid WHERE l.collnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'O', o.oid::text FROM d JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.oprnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'P', o.oid::text FROM d JOIN pg_opclass o ON d.refclassid = 'pg_opclass'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.opcnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'M', o.oid::text FROM d JOIN pg_opfamily o ON d.refclassid = 'pg_opfamily'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.opfnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'F', p.oid::text FROM d JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
 				   "WHERE p.oid <> $1::oid AND p.pronamespace <> 'pg_catalog'::regnamespace "
 				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass AND x.objid = p.oid "
@@ -1179,6 +1272,10 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 
 		if (k == 'F')
 			function_key(schema, atooid(ws_sql_value(&rows, i, 1)), &key);
+		else if (k == 'O')
+			operator_key(schema, atooid(ws_sql_value(&rows, i, 1)), &key);
+		else if (k == 'P' || k == 'M')
+			method_key(k == 'P', atooid(ws_sql_value(&rows, i, 1)), &key);
 		else
 			ws_obj_key(k == 'L' ? WS_OBJ_COLLATION : k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN :
 					   k == 'S' ? WS_OBJ_SEQUENCE : WS_OBJ_TYPE,
@@ -1404,7 +1501,7 @@ static const char *const type_refusal_sql =
 "        AND NOT (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid AND s.classid <> 'pg_constraint'::regclass) "
 "        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind IN ('c', 'S') "
 "          AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass))) "
-"        AND d.refclassid NOT IN ('pg_proc'::regclass, 'pg_collation'::regclass) "
+"        AND d.refclassid NOT IN ('pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) "
 "        AND NOT coalesce((SELECT i.schema = 'pg_catalog' "
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
 "    THEN 'it needs an object no commit holds yet' "
@@ -2087,6 +2184,373 @@ read_casts(const char *schema, WsObject *objs, int *n)
 	return objs;
 }
 
+/* ------------------------------------- operators, their classes and families */
+
+#define NEEDS_ANOTHER_SCHEMA(source) \
+"  WHEN EXISTS (SELECT 1 FROM " source " JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid " \
+"      CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i " \
+"      WHERE d.deptype IN ('n', 'a') AND i.schema IS NOT NULL AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) " \
+"    THEN 'it needs something in another schema' "
+
+static const char *const operator_refusal_sql =
+"SELECT o.oprname::text, CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_operator'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension' "
+"  WHEN EXISTS (SELECT 1 FROM pg_operator c WHERE c.oprname = o.oprname AND c.oprnamespace = 'pg_catalog'::regnamespace) "
+"    THEN 'it is named as one in the catalogs' "
+"  WHEN o.oprcode = 0 THEN 'it is a shell, named by another operator and never made' "
+"  WHEN EXISTS (SELECT 1 FROM pg_operator x WHERE x.oid IN (o.oprcom, o.oprnegate) AND x.oprnamespace <> o.oprnamespace) "
+"    THEN 'its commutator or negator is in another schema' "
+/* (setting one sets both, so a link only one side says could not be made again) */
+"  WHEN EXISTS (SELECT 1 FROM pg_operator x WHERE x.oid = o.oprcom AND x.oprcom <> o.oid) "
+"    THEN 'its commutator does not say it back, as ALTER OPERATOR SET would make it' "
+"  WHEN EXISTS (SELECT 1 FROM pg_operator x WHERE x.oid = o.oprnegate AND x.oprnegate <> o.oid) "
+"    THEN 'its negator does not say it back, as ALTER OPERATOR SET would make it' "
+NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_operator'::regclass::oid, o.oid) s(classid, objid)")
+"  END FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace WHERE n.nspname = $1::name ORDER BY 1";
+
+static const char *const opfamily_refusal_sql =
+"SELECT o.opfname::text, CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_opfamily'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension' "
+"  WHEN EXISTS (SELECT 1 FROM pg_opfamily c WHERE c.opfname = o.opfname AND c.opfmethod = o.opfmethod AND c.opfnamespace = 'pg_catalog'::regnamespace) "
+"    THEN 'it is named as one in the catalogs' "
+NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_amop'::regclass::oid, a.oid FROM pg_amop a WHERE a.amopfamily = o.oid UNION ALL SELECT 'pg_amproc'::regclass::oid, a.oid FROM pg_amproc a WHERE a.amprocfamily = o.oid) s(classid, objid)")
+"  END FROM pg_opfamily o JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name ORDER BY 1";
+
+static const char *const opclass_refusal_sql =
+"SELECT o.opcname::text, CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_opclass'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension' "
+"  WHEN EXISTS (SELECT 1 FROM pg_opclass c WHERE c.opcname = o.opcname AND c.opcmethod = o.opcmethod AND c.opcnamespace = 'pg_catalog'::regnamespace) "
+"    THEN 'it is named as one in the catalogs' "
+"  WHEN f.opfnamespace <> o.opcnamespace THEN 'its family is in another schema' "
+NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_opclass'::regclass::oid, o.oid) s(classid, objid)")
+"  END FROM pg_opclass o JOIN pg_namespace n ON n.oid = o.opcnamespace JOIN pg_opfamily f ON f.oid = o.opcfamily "
+"WHERE n.nspname = $1::name ORDER BY 1";
+
+/* What is of a schema, and held by a family that is not, would be lost. */
+static const char *const member_refusal_sql =
+"SELECT x.oprname::text, 'it is a member of a family in another schema' FROM pg_amop a JOIN pg_operator x ON x.oid = a.amopopr "
+"JOIN pg_opfamily f ON f.oid = a.amopfamily JOIN pg_namespace n ON n.oid = x.oprnamespace "
+"WHERE n.nspname = $1::name AND f.opfnamespace <> x.oprnamespace "
+"UNION ALL SELECT p.proname::text, 'it is a member of a family in another schema' FROM pg_amproc a JOIN pg_proc p ON p.oid = a.amproc "
+"JOIN pg_opfamily f ON f.oid = a.amprocfamily JOIN pg_namespace n ON n.oid = p.pronamespace "
+"WHERE n.nspname = $1::name AND f.opfnamespace <> p.pronamespace ORDER BY 1";
+
+/* An item of a class or family, to sort by, as nothing else is the same on every server. */
+typedef struct OpItem
+{
+	int			is_function;
+	int			number;
+	char	   *text;
+} OpItem;
+
+static int
+op_item_cmp(const void *a, const void *b)
+{
+	const OpItem *x = a;
+	const OpItem *y = b;
+
+	if (x->is_function != y->is_function)
+		return x->is_function - y->is_function;
+	if (x->number != y->number)
+		return x->number - y->number;
+	return strcmp(x->text, y->text);
+}
+
+/*
+ * The items of a class or family, as its statement says them: of what depends on it,
+ * oid, by deptype, a class's its own and a family's those of no class.
+ */
+static char *
+op_items(const char *schema, const char *oid, bool is_class)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	ops;
+	WsSqlRows	procs;
+	OpItem	   *items;
+	int			n = 0;
+	StringInfoData s;
+	const char *of = is_class ? "d.refclassid = 'pg_opclass'::regclass AND d.deptype = 'i'" :
+		"d.refclassid = 'pg_opfamily'::regclass AND d.deptype = 'a'";
+	char	   *ops_sql = psprintf("SELECT a.amopstrategy::text, x.oprname::text, a.amoplefttype::text, a.amoprighttype::text, "
+								   "  a.amoppurpose::text, a.amopsortfamily::text "
+								   "FROM pg_amop a JOIN pg_operator x ON x.oid = a.amopopr "
+								   "JOIN pg_depend d ON d.classid = 'pg_amop'::regclass AND d.objid = a.oid "
+								   "WHERE %s AND d.refobjid = $1::oid", of);
+	char	   *procs_sql = psprintf("SELECT a.amprocnum::text, a.amproclefttype::text, a.amprocrighttype::text, a.amproc::oid::text "
+									 "FROM pg_amproc a JOIN pg_depend d ON d.classid = 'pg_amproc'::regclass AND d.objid = a.oid "
+									 "WHERE %s AND d.refobjid = $1::oid", of);
+
+	WsSql->read(ops_sql, 1, params, &ops);
+	WsSql->read(procs_sql, 1, params, &procs);
+	items = palloc_array(OpItem, Max(ops.nrows + procs.nrows, 1));
+	for (int i = 0; i < ops.nrows; i++)
+	{
+		StringInfoData one;
+
+		initStringInfo(&one);
+		appendStringInfo(&one, "OPERATOR %s %s(%s)", ws_sql_value(&ops, i, 0), ws_sql_value(&ops, i, 1),
+						 operator_args(schema, atooid(ws_sql_value(&ops, i, 2)), atooid(ws_sql_value(&ops, i, 3))));
+		if (ws_sql_value(&ops, i, 4)[0] == 'o')
+		{
+			Buf			key = BUF_INIT;
+			WsSqlRows	fam;
+			const char *fp[1] = {ws_sql_value(&ops, i, 5)};
+
+			WsSql->read("SELECT opfname::text FROM pg_opfamily WHERE oid = $1::oid", 1, fp, &fam);
+			if (fam.nrows != 1)
+				printed_or_retry(schema, NULL);
+			appendStringInfo(&one, " FOR ORDER BY %s", quote_identifier(ws_sql_value(&fam, 0, 0)));
+			ws_sql_rows_free(&fam);
+			buf_free(&key);
+		}
+		items[n++] = (OpItem) {0, atoi(ws_sql_value(&ops, i, 0)), one.data};
+	}
+	for (int i = 0; i < procs.nrows; i++)
+	{
+		Oid			fn = atooid(ws_sql_value(&procs, i, 3));
+
+		items[n++] = (OpItem) {1, atoi(ws_sql_value(&procs, i, 0)),
+			psprintf("FUNCTION %s (%s) %s(%s)", ws_sql_value(&procs, i, 0),
+					 operator_args(schema, atooid(ws_sql_value(&procs, i, 1)), atooid(ws_sql_value(&procs, i, 2))),
+					 quote_identifier(get_func_name(fn)), function_args(schema, fn, NULL))};
+	}
+	if (n > 1)
+		qsort(items, n, sizeof(OpItem), op_item_cmp);
+	initStringInfo(&s);
+	for (int i = 0; i < n; i++)
+		appendStringInfo(&s, "%s%s", i > 0 ? ", " : "", items[i].text);
+	ws_sql_rows_free(&ops);
+	ws_sql_rows_free(&procs);
+	pfree(ops_sql);
+	pfree(procs_sql);
+	return n > 0 ? s.data : NULL;
+}
+
+/* One more need, of what read_deps does not see. */
+static void
+add_dep(WsObject *o, Buf *key)
+{
+	char	  **deps = zeroed(o->ndeps + 1, sizeof(char *));
+	bool		have = false;
+
+	buf_append_byte(key, 0);
+	for (int i = 0; i < o->ndeps; i++)
+	{
+		deps[i] = o->deps[i];
+		have |= strcmp(deps[i], (char *) key->data) == 0;
+	}
+	if (!have)
+		deps[o->ndeps++] = px_memdup(key->data, key->len);
+	px_free(o->deps);
+	o->deps = deps;
+	if (o->ndeps > 1)
+		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
+	buf_free(key);
+}
+
+#define OWNER_IF_IT_CAN_TRAVEL(catalog, column) \
+	"SELECT r.rolname::text FROM " catalog " o JOIN pg_roles r ON r.oid = o." column " WHERE o.oid = $1::oid " \
+	"AND NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)"
+
+static WsObject *
+read_operators(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT o.oid::text, o.oprname::text, o.oprleft::text, o.oprright::text, o.oprcode::oid::text, o.oprrest::oid::text, "
+				"  o.oprjoin::oid::text, o.oprcanhash::text, o.oprcanmerge::text, o.oprcom::text, o.oprnegate::text "
+				"FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	/* (a link may be needed for each) */
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + 2 * rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+		Oid			left = atooid(ws_sql_value(&rows, i, 2));
+		Oid			right = atooid(ws_sql_value(&rows, i, 3));
+		Oid			rest = atooid(ws_sql_value(&rows, i, 5));
+		Oid			join = atooid(ws_sql_value(&rows, i, 6));
+		Oid			com = atooid(ws_sql_value(&rows, i, 9));
+		Oid			neg = atooid(ws_sql_value(&rows, i, 10));
+		char	   *args = operator_args(schema, left, right);
+		StringInfoData s;
+
+		initStringInfo(&s);
+		appendStringInfoChar(&s, '(');
+		if (OidIsValid(left))
+			appendStringInfo(&s, "LEFTARG = %s, ", print_type(schema, left, -1));
+		if (OidIsValid(right))
+			appendStringInfo(&s, "RIGHTARG = %s, ", print_type(schema, right, -1));
+		appendStringInfo(&s, "FUNCTION = %s", quote_identifier(get_func_name(atooid(ws_sql_value(&rows, i, 4)))));
+		if (OidIsValid(rest))
+			appendStringInfo(&s, ", RESTRICT = %s", quote_identifier(get_func_name(rest)));
+		if (OidIsValid(join))
+			appendStringInfo(&s, ", JOIN = %s", quote_identifier(get_func_name(join)));
+		if (ws_sql_value(&rows, i, 7)[0] == 't')
+			appendStringInfoString(&s, ", HASHES");
+		if (ws_sql_value(&rows, i, 8)[0] == 't')
+			appendStringInfoString(&s, ", MERGES");
+		appendStringInfoChar(&s, ')');
+		check_of_table_is_portable(name, schema, psprintf("CREATE OPERATOR %s %s", name, s.data));
+		o->kind = WS_OBJ_OPERATOR;
+		o->name = ws_name_to_utf8(name);
+		o->args = ws_text_to_utf8(args);
+		set_definition(o, s.data);
+		px_free(o->deps);
+		o->deps = NULL;
+		read_deps(o, schema, oid, "SELECT 'pg_operator'::regclass::oid, $1::oid");
+		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_operator", "oprowner"), "pg_operator");
+		if (OidIsValid(com) || OidIsValid(neg))
+		{
+			WsObject   *link = &objs[(*n)++];
+			Buf			self = BUF_INIT;
+			StringInfoData l;
+			WsSqlRows	names;
+			char	   *comtext = psprintf("%u", com);
+			char	   *negtext = psprintf("%u", neg);
+			const char *lp[2] = {comtext, negtext};
+
+			WsSql->read("SELECT (SELECT oprname::text FROM pg_operator WHERE oid = $1::oid), "
+						"(SELECT oprname::text FROM pg_operator WHERE oid = $2::oid)", 2, lp, &names);
+			initStringInfo(&l);
+			appendStringInfo(&l, "ALTER OPERATOR %s (%s) SET (", name, args);
+			if (OidIsValid(com))
+				appendStringInfo(&l, "COMMUTATOR = %s", ws_sql_value(&names, 0, 0));
+			if (OidIsValid(neg))
+				appendStringInfo(&l, "%sNEGATOR = %s", OidIsValid(com) ? ", " : "", ws_sql_value(&names, 0, 1));
+			appendStringInfoChar(&l, ')');
+			link->kind = WS_OBJ_OPLINK;
+			link->name = ws_name_to_utf8(name);
+			link->args = ws_text_to_utf8(args);
+			set_definition(link, l.data);
+			ws_obj_key(WS_OBJ_OPERATOR, link->name, link->args, &self);
+			add_dep(link, &self);
+			if (OidIsValid(com))
+			{
+				Buf			key = BUF_INIT;
+
+				operator_key(schema, com, &key);
+				add_dep(link, &key);
+			}
+			if (OidIsValid(neg))
+			{
+				Buf			key = BUF_INIT;
+
+				operator_key(schema, neg, &key);
+				add_dep(link, &key);
+			}
+			ws_sql_rows_free(&names);
+			pfree(comtext);
+			pfree(negtext);
+		}
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
+static WsObject *
+read_opfamilies(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT o.oid::text, o.opfname::text, quote_ident(a.amname) FROM pg_opfamily o JOIN pg_am a ON a.oid = o.opfmethod "
+				"JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + 2 * rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+		const char *am = ws_sql_value(&rows, i, 2);
+		char	   *members = op_items(schema, oid, false);
+
+		o->kind = WS_OBJ_OPFAMILY;
+		o->name = ws_name_to_utf8(name);
+		o->args = ws_name_to_utf8(am);
+		set_definition(o, psprintf("USING %s", am));
+		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_opfamily", "opfowner"), "pg_opfamily");
+		if (members != NULL)
+		{
+			WsObject   *m = &objs[(*n)++];
+			Buf			key = BUF_INIT;
+			char	   *sql = psprintf("ALTER OPERATOR FAMILY %s USING %s ADD %s", quote_identifier(name), am, members);
+
+			check_of_table_is_portable(name, schema, sql);
+			m->kind = WS_OBJ_OPMEMBERS;
+			m->name = ws_name_to_utf8(name);
+			m->args = ws_name_to_utf8(am);
+			set_definition(m, sql);
+			px_free(m->deps);
+			m->deps = NULL;
+			read_deps(m, schema, oid,
+					  "SELECT d.classid, d.objid FROM pg_depend d WHERE d.refclassid = 'pg_opfamily'::regclass AND d.refobjid = $1::oid "
+					  "AND d.deptype = 'a' AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)");
+			ws_obj_key(WS_OBJ_OPFAMILY, o->name, o->args, &key);
+			add_dep(m, &key);
+		}
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
+static WsObject *
+read_opclasses(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT o.oid::text, o.opcname::text, quote_ident(a.amname), o.opcdefault::text, o.opcintype::text, o.opckeytype::text, f.opfname::text "
+				"FROM pg_opclass o JOIN pg_am a ON a.oid = o.opcmethod JOIN pg_opfamily f ON f.oid = o.opcfamily "
+				"JOIN pg_namespace n ON n.oid = o.opcnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+		const char *am = ws_sql_value(&rows, i, 2);
+		Oid			storage = atooid(ws_sql_value(&rows, i, 5));
+		char	   *items = op_items(schema, oid, true);
+		Buf			family = BUF_INIT;
+		StringInfoData s;
+
+		initStringInfo(&s);
+		appendStringInfo(&s, "%sFOR TYPE %s USING %s FAMILY %s AS ", ws_sql_value(&rows, i, 3)[0] == 't' ? "DEFAULT " : "",
+						 print_type(schema, atooid(ws_sql_value(&rows, i, 4)), -1), am, quote_identifier(ws_sql_value(&rows, i, 6)));
+		if (items != NULL)
+			appendStringInfoString(&s, items);
+		if (OidIsValid(storage))
+			appendStringInfo(&s, "%sSTORAGE %s", items != NULL ? ", " : "", print_type(schema, storage, -1));
+		if (items == NULL && !OidIsValid(storage))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: it has no members of its own, so no statement could make it",
+							name, schema)));
+		check_of_table_is_portable(name, schema, psprintf("CREATE OPERATOR CLASS %s %s", quote_identifier(name), s.data));
+		o->kind = WS_OBJ_OPCLASS;
+		o->name = ws_name_to_utf8(name);
+		o->args = ws_name_to_utf8(am);
+		set_definition(o, s.data);
+		px_free(o->deps);
+		o->deps = NULL;
+		read_deps(o, schema, oid,
+				  "SELECT 'pg_opclass'::regclass::oid, $1::oid UNION ALL SELECT d.classid, d.objid FROM pg_depend d "
+				  "WHERE d.refclassid = 'pg_opclass'::regclass AND d.refobjid = $1::oid AND d.deptype = 'i' "
+				  "AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)");
+		ws_obj_key(WS_OBJ_OPFAMILY, ws_name_to_utf8(ws_sql_value(&rows, i, 6)), o->args, &family);
+		add_dep(o, &family);
+		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_opclass", "opcowner"), "pg_opclass");
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
 /* ------------------------------------- triggers, rules and policies */
 
 /* What such a one needs that no commit can hold, of its row in a catalog and its source. */
@@ -2098,7 +2562,7 @@ read_casts(const char *schema, WsObject *objs, int *n)
 "      WHERE d.classid = '" catalog "'::regclass AND d.objid = " oid " AND d.deptype = 'n' AND i.schema IS NOT NULL " \
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' " \
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '" catalog "'::regclass AND d.objid = " oid " AND d.deptype = 'n' " \
-"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_collation'::regclass) " \
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) " \
 "        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid " \
 "          AND q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S'))) " \
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k WHERE k.oid = d.refobjid AND k.conrelid <> 0)) " \
@@ -2207,6 +2671,38 @@ check_of_table_is_portable(const char *name, const char *schema, const char *sql
 	else if (IsA(node, CreatePolicyStmt))
 		named = names_schema_walker(((CreatePolicyStmt *) node)->qual, &n) ||
 			names_schema_walker(((CreatePolicyStmt *) node)->with_check, &n);
+	else if (IsA(node, DefineStmt))
+	{
+		ListCell   *lc;
+
+		/* (HASHES and MERGES have no argument) */
+		foreach(lc, ((DefineStmt *) node)->definition)
+		{
+			Node	   *arg = lfirst_node(DefElem, lc)->arg;
+
+			named |= arg != NULL && IsA(arg, TypeName) && names_schema_walker(arg, &n);
+		}
+	}
+	else if (IsA(node, CreateOpClassStmt) || IsA(node, AlterOpFamilyStmt))
+	{
+		List	   *items = IsA(node, CreateOpClassStmt) ? ((CreateOpClassStmt *) node)->items : ((AlterOpFamilyStmt *) node)->items;
+		ListCell   *lc;
+
+		if (IsA(node, CreateOpClassStmt))
+			named = names_schema_walker((Node *) ((CreateOpClassStmt *) node)->datatype, &n);
+		foreach(lc, items)
+		{
+			CreateOpClassItem *item = lfirst_node(CreateOpClassItem, lc);
+			ListCell   *lt;
+
+			named |= names_schema_walker((Node *) item->storedtype, &n);
+			if (item->name != NULL)
+				foreach(lt, item->name->objargs)
+					named |= names_schema_walker(lfirst(lt), &n);
+			foreach(lt, item->class_args)
+				named |= names_schema_walker(lfirst(lt), &n);
+		}
+	}
 	else if (IsA(node, CreateCastStmt))
 	{
 		CreateCastStmt *k = (CreateCastStmt *) node;
@@ -2443,7 +2939,7 @@ static const char *const function_refusal_sql =
 "      WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' AND i.schema IS NOT NULL "
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' "
-"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass, 'pg_collation'::regclass) "
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) "
 "        OR (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid) "
 "        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "          AND q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S'))) "
@@ -2700,6 +3196,10 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_types(schema, policy_refusal_sql);
 	refuse_types(schema, collation_refusal_sql);
 	refuse_types(schema, conversion_refusal_sql);
+	refuse_types(schema, operator_refusal_sql);
+	refuse_types(schema, opfamily_refusal_sql);
+	refuse_types(schema, opclass_refusal_sql);
+	refuse_types(schema, member_refusal_sql);
 	refuse_types(schema, index_refusal_sql);
 	refuse_types(schema, default_refusal_sql);
 
@@ -2766,6 +3266,9 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	objs = read_collations(schema, objs, &total);
 	objs = read_conversions(schema, objs, &total);
 	objs = read_casts(schema, objs, &total);
+	objs = read_operators(schema, objs, &total);
+	objs = read_opfamilies(schema, objs, &total);
+	objs = read_opclasses(schema, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_TRIGGER, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_RULE, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_POLICY, objs, &total);
@@ -3025,7 +3528,10 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 		ws_put_text(&sql, " ");
 		ws_put_identifier(&sql, schema);
 		ws_put_text(&sql, ".");
-		ws_put_identifier(&sql, here);
+		if (o->kind == WS_OBJ_OPERATOR)
+			ws_put_text(&sql, here);
+		else
+			ws_put_identifier(&sql, here);
 		ws_put_text(&sql, " ");
 	}
 	if (!ws_tags_render(definition, no_name, NULL, &sql, &missing))
@@ -3107,6 +3613,27 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 				pfree(table);
 				break;
 			}
+		case WS_OBJ_OPERATOR:
+			if (node == NULL || !IsA(node, DefineStmt) || ((DefineStmt *) node)->kind != OBJECT_OPERATOR ||
+				!names_it(((DefineStmt *) node)->defnames, schema, here))
+				not_the_object(o, "it is not one CREATE OPERATOR of it");
+			break;
+		case WS_OBJ_OPLINK:
+			if (node == NULL || !IsA(node, AlterOperatorStmt))
+				not_the_object(o, "it is not one ALTER OPERATOR");
+			break;
+		case WS_OBJ_OPCLASS:
+			if (node == NULL || !IsA(node, CreateOpClassStmt) || !names_it(((CreateOpClassStmt *) node)->opclassname, schema, here))
+				not_the_object(o, "it is not one CREATE OPERATOR CLASS of it");
+			break;
+		case WS_OBJ_OPFAMILY:
+			if (node == NULL || !IsA(node, CreateOpFamilyStmt) || !names_it(((CreateOpFamilyStmt *) node)->opfamilyname, schema, here))
+				not_the_object(o, "it is not one CREATE OPERATOR FAMILY of it");
+			break;
+		case WS_OBJ_OPMEMBERS:
+			if (node == NULL || !IsA(node, AlterOpFamilyStmt) || ((AlterOpFamilyStmt *) node)->isDrop)
+				not_the_object(o, "it is not one ALTER OPERATOR FAMILY ADD");
+			break;
 		case WS_OBJ_CAST:
 			if (node == NULL || !IsA(node, CreateCastStmt))
 				not_the_object(o, "it is not one CREATE CAST");
@@ -3199,9 +3726,17 @@ put_object(const WsObject *o, const char *schema, Buf *sql)
 
 	ws_put_identifier(sql, schema);
 	ws_put_text(sql, ".");
-	ws_put_identifier(sql, here);
+	if (o->kind == WS_OBJ_OPERATOR)
+		ws_put_text(sql, here);
+	else
+		ws_put_identifier(sql, here);
 	pfree(here);
-	if (o->args != NULL)
+	if (o->kind == WS_OBJ_OPCLASS || o->kind == WS_OBJ_OPFAMILY)
+	{
+		ws_put_text(sql, " USING ");
+		ws_put_text(sql, o->args);
+	}
+	else if (o->args != NULL)
 	{
 		char	   *args = ws_text_from_utf8(o->args);
 
@@ -3518,7 +4053,8 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 	}
 	for (int i = 0; i < n; i++)
 		if (ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind) &&
-			objs[i].kind != WS_OBJ_CAST && objs[i].kind != WS_OBJ_COLLATION && objs[i].kind != WS_OBJ_CONVERSION)
+			objs[i].kind != WS_OBJ_CAST && objs[i].kind != WS_OBJ_COLLATION && objs[i].kind != WS_OBJ_CONVERSION &&
+			!is_of_operators(objs[i].kind))
 			ws_schema_check_defaults(schema, is_function(objs[i].kind) ? DEFACLOBJ_FUNCTION :
 									 is_relation(objs[i].kind) ? DEFACLOBJ_RELATION :
 									 objs[i].kind == WS_OBJ_SEQUENCE ? DEFACLOBJ_SEQUENCE : DEFACLOBJ_TYPE);

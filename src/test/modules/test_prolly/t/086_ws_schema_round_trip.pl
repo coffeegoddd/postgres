@@ -2237,5 +2237,18 @@ $node->safe_psql('postgres', q{CREATE COLLATION dst.own_coll FROM "C"; SELECT te
 is( $node->safe_psql('postgres', q{SELECT o.collnamespace::regnamespace FROM pg_attribute a JOIN pg_collation o ON o.oid = a.attcollation WHERE a.attrelid = 'dst.ocoll'::regclass AND a.attname = 'a'}),
 	'dst', 'and restores on the collation of the schema it arrives in');
 
+# an index on its schema's own operator class says it bare, and restores on the other's
+for my $s ('src', 'dst')
+{
+	$node->safe_psql('postgres', qq{CREATE OPERATOR CLASS $s.own_ops FOR TYPE text USING btree AS
+		OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 bttextcmp(text, text)});
+}
+$node->safe_psql('postgres', q{CREATE TABLE src.oclass (a text); CREATE INDEX oclass_a ON src.oclass (a src.own_ops)});
+is($node->safe_psql('postgres', q{SELECT position('own_ops'::bytea in test_ws_schema_bytes('src', 'oclass')) > 0}), 't', 'a table holds its schema\'s operator class, bare');
+is($node->safe_psql('postgres', q{SELECT position('src.'::bytea in test_ws_schema_bytes('src', 'oclass'))}), '0', 'not naming its schema');
+$node->safe_psql('postgres', q{SELECT test_ws_schema_create(test_ws_schema_bytes('src', 'oclass'), 'dst')});
+is( $node->safe_psql('postgres', q{SELECT o.opcnamespace::regnamespace FROM pg_index i JOIN pg_opclass o ON o.oid = i.indclass[0] WHERE i.indexrelid = 'dst.oclass_a'::regclass}),
+	'dst', 'and restores on the class of the schema it arrives in');
+
 $node->stop;
 done_testing();
