@@ -972,7 +972,7 @@ $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
 	ctrg => 'a constraint trigger',
-	fkcom => 'a foreign key has a comment', cmty => 'row type has a comment', cmto => 'TOAST table has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace', 
+	fkcom => 'a foreign key has a comment', cmty => 'row type has a comment', cmar => 'row type has a comment', cmto => 'TOAST table has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace',
 	repgone => 'no longer has', repgonek => 'no longer has', uoptd => 'two constraints alike', kuoptd => 'two constraints alike',
 	xoptd => 'two constraints alike', ixo1 => 'one for the other',
 	xext => 'depends on an extension', fksopt => 'has a tablespace',
@@ -982,8 +982,8 @@ my %refused_for = (
 	toastd => 'no longer needs one', toastp => 'no longer needs one', ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
 	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uover => 'over a period', uspc => 'has a tablespace',
-	iext => 'depends on an extension', 
-	ispc => 'has a tablespace', 
+	iext => 'depends on an extension',
+	ispc => 'has a tablespace',
 	grt => 'grants', cgrt => 'grants', seqgrt => 'grants',
 	dup => 'two constraints alike', dupk => 'two constraints alike');
 for my $t (
@@ -1037,6 +1037,7 @@ for my $t (
 	[ 'kuoptd', 'CREATE TABLE src.kuoptd (a int PRIMARY KEY); ALTER TABLE src.kuoptd ADD CONSTRAINT kuoptd_2 UNIQUE (a) WITH (fillfactor = 50)' ],
 	[ 'xoptd', 'CREATE TABLE src.xoptd (r int4range, CONSTRAINT xoptd_1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xoptd ADD CONSTRAINT xoptd_2 EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50)' ],
 	[ 'ixo1', q{CREATE TABLE src.ixo (a integer) PARTITION BY RANGE (a); CREATE INDEX ixo_1 ON src.ixo (a); CREATE INDEX ixo_2 ON src.ixo (a) WITH (fillfactor = 50); CREATE TABLE src.ixo1 PARTITION OF src.ixo FOR VALUES FROM (0) TO (10)} ],
+	[ 'cmar', q{CREATE TABLE src.cmar (a int); COMMENT ON TYPE src._cmar IS 'x'} ],
 	[ 'cmty', q{CREATE TABLE src.cmty (a int); COMMENT ON TYPE src.cmty IS 'x'} ],
 	[ 'cmto', q{CREATE TABLE src.cmto (a text);
 		SELECT format('COMMENT ON INDEX pg_toast.%I IS ''x''', i.relname) FROM pg_class t JOIN pg_index x ON x.indrelid = t.reltoastrelid JOIN pg_class i ON i.oid = x.indexrelid WHERE t.oid = 'src.cmto'::regclass \gexec} ],

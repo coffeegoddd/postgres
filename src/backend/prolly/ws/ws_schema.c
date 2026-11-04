@@ -3800,7 +3800,8 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
 "                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'f')) "
 "    THEN 'a foreign key has a comment' "
-"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_type'::regclass AND d.objoid = c.reltype) "
+"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_type'::regclass AND "
+"               (d.objoid = c.reltype OR d.objoid = (SELECT t.typarray FROM pg_type t WHERE t.oid = c.reltype))) "
 "    THEN 'its row type has a comment' "
 "  WHEN EXISTS (SELECT FROM pg_description d JOIN pg_index x ON x.indexrelid = d.objoid "
 "               WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = c.reltoastrelid) "
@@ -4188,8 +4189,8 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 	WsSqlRows	rows;
 
 	WsSql->read("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
-			   "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
-			   "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
+			    "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
+			    "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
 	/*
 	 * A TOAST table outlives the need for one, and its parameters with it, where
 	 * CREATE TABLE would make none and lose them: what decides is what it would.
@@ -4242,7 +4243,7 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 	}
 	ws_sql_rows_free(&rows);
 	WsSql->read("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
-			   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
+			    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
 	for (int r = 0; r < rows.nrows;)
 	{
 		int			same = 1;
@@ -4307,12 +4308,12 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	int			n = 0;
 
 	WsSql->read("SELECT ic.relname::text, ic.oid::text, "
-			   "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
-			   "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
-			   "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
-			   "  array_to_string((i.indkey::int2[])[i.indnkeyatts:i.indnatts - 1], ' ') "
-			   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-			   "WHERE i.indrelid = $1::oid", 1, params, &idx);
+			    "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
+			    "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
+			    "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
+			    "  array_to_string((i.indkey::int2[])[i.indnkeyatts:i.indnatts - 1], ' ') "
+			    "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			    "WHERE i.indrelid = $1::oid", 1, params, &idx);
 	out->index_settings = px_malloc((size_t) Max(idx.nrows, 1) * sizeof(WsIndexSettings));
 	memset(out->index_settings, 0, (size_t) Max(idx.nrows, 1) * sizeof(WsIndexSettings));
 	for (int r = 0; r < idx.nrows; r++)
@@ -4337,8 +4338,8 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 		}
 		ws_sql_rows_free(&opts);
 		WsSql->read("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
-				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
-				   "ORDER BY a.attnum", 1, iparams, &atts);
+				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
+				    "ORDER BY a.attnum", 1, iparams, &atts);
 		if (atts.nrows > 0)
 		{
 			set->stats = px_malloc((size_t) atts.nrows * sizeof(WsIndexStat));
@@ -4351,7 +4352,7 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 		}
 		ws_sql_rows_free(&atts);
 		WsSql->read("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
-				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
+				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
 		if (keyopts.nrows > 0)
 		{
 			set->keyoptions = px_malloc((size_t) keyopts.nrows * sizeof(WsKeyOptions));
@@ -4410,20 +4411,20 @@ read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 	WsSqlRows	rows;
 
 	WsSql->read("SELECT 't', NULL::text, d.description FROM pg_description d "
-			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid = 0 "
-			   "UNION ALL SELECT 'c', d.objsubid::text, d.description FROM pg_description d "
-			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid > 0 "
-			   "UNION ALL SELECT 'i', q.relname::text, d.description FROM pg_description d "
-			   "  JOIN pg_index x ON x.indexrelid = d.objoid JOIN pg_class q ON q.oid = x.indexrelid "
-			   "  WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = $1::oid "
-			   "UNION ALL SELECT 's', p.refobjsubid::text, d.description FROM pg_description d "
-			   "  JOIN pg_depend p ON p.objid = d.objoid AND p.classid = 'pg_class'::regclass "
-			   "    AND p.refclassid = 'pg_class'::regclass AND p.deptype = 'i' "
-			   "  JOIN pg_class q ON q.oid = p.objid AND q.relkind = 'S' "
-			   "  WHERE d.classoid = 'pg_class'::regclass AND p.refobjid = $1::oid "
-			   "UNION ALL SELECT 'k', k.conname::text, d.description FROM pg_description d "
-			   "  JOIN pg_constraint k ON k.oid = d.objoid "
-			   "  WHERE d.classoid = 'pg_constraint'::regclass AND k.conrelid = $1::oid", 1, params, &rows);
+			    "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid = 0 "
+			    "UNION ALL SELECT 'c', d.objsubid::text, d.description FROM pg_description d "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid > 0 "
+			    "UNION ALL SELECT 'i', q.relname::text, d.description FROM pg_description d "
+			    "  JOIN pg_index x ON x.indexrelid = d.objoid JOIN pg_class q ON q.oid = x.indexrelid "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = $1::oid "
+			    "UNION ALL SELECT 's', p.refobjsubid::text, d.description FROM pg_description d "
+			    "  JOIN pg_depend p ON p.objid = d.objoid AND p.classid = 'pg_class'::regclass "
+			    "    AND p.refclassid = 'pg_class'::regclass AND p.deptype = 'i' "
+			    "  JOIN pg_class q ON q.oid = p.objid AND q.relkind = 'S' "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND p.refobjid = $1::oid "
+			    "UNION ALL SELECT 'k', k.conname::text, d.description FROM pg_description d "
+			    "  JOIN pg_constraint k ON k.oid = d.objoid "
+			    "  WHERE d.classoid = 'pg_constraint'::regclass AND k.conrelid = $1::oid", 1, params, &rows);
 	if (rows.nrows > 0)
 	{
 		out->comments = px_malloc((size_t) rows.nrows * sizeof(WsComment));
@@ -4461,12 +4462,12 @@ read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 	WsSqlRows	rows;
 
 	WsSql->read("SELECT c.relreplident::text, "
-			   "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
-			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-			   "    WHERE i.indrelid = c.oid AND i.indisreplident), "
-			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-			   "    WHERE i.indrelid = c.oid AND i.indisclustered) "
-			   "FROM pg_class c WHERE c.oid = $1::oid", 1, params, &rows);
+			    "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
+			    "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			    "    WHERE i.indrelid = c.oid AND i.indisreplident), "
+			    "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			    "    WHERE i.indrelid = c.oid AND i.indisclustered) "
+			    "FROM pg_class c WHERE c.oid = $1::oid", 1, params, &rows);
 	out->row_security = ws_sql_value(&rows, 0, 1)[0] == 't';
 	out->force_row_security = ws_sql_value(&rows, 0, 2)[0] == 't';
 	switch (ws_sql_value(&rows, 0, 0)[0])
@@ -4502,7 +4503,7 @@ read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others
 	int			n = 0;
 
 	WsSql->read("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
-			   "WHERE i.inhrelid = $1::oid ORDER BY i.inhseqno", 1, params, &parents);
+			    "WHERE i.inhrelid = $1::oid ORDER BY i.inhseqno", 1, params, &parents);
 	if (parents.nrows > 0)
 	{
 		out->ninherits = parents.nrows;
@@ -4633,53 +4634,53 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 
 		WsSql->read("SELECT a.attnum::text, a.attname::text, "
-				   "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
-				   "  a.attidentity::text, a.attgenerated::text, "
-				   "  pg_get_expr(d.adbin, d.adrelid), "
-				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
-				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
-				   "  a.attcoltag::text, "
-				   "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
-				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
-				   "  (SELECT q.relname::text FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
-				   "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
-				   "      AND p.refobjid = a.attrelid AND p.refobjsubid = a.attnum "
-				   "      AND p.deptype = 'i' AND q.relkind = 'S'), "
-				   "  a.atttypid::text, a.attislocal::text, "
-				   "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
-				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
-				   "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
-				   "  a.attcompression::text, a.attstattarget::text, a.attstorage::text, "
-				   "  a.atttypmod::text "
-				   "FROM pg_attribute a "
-				   "JOIN pg_type t ON t.oid = a.atttypid "
-				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
-				   "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
-				   "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
-				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
-				   "ORDER BY a.attnum", 1, oid, &cols);
+				    "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
+				    "  a.attidentity::text, a.attgenerated::text, "
+				    "  pg_get_expr(d.adbin, d.adrelid), "
+				    "  CASE WHEN a.attcollation <> t.typcollation THEN "
+				    "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
+				    "  a.attcoltag::text, "
+				    "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
+				    "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
+				    "  (SELECT q.relname::text FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
+				    "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+				    "      AND p.refobjid = a.attrelid AND p.refobjsubid = a.attnum "
+				    "      AND p.deptype = 'i' AND q.relkind = 'S'), "
+				    "  a.atttypid::text, a.attislocal::text, "
+				    "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
+				    "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
+				    "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
+				    "  a.attcompression::text, a.attstattarget::text, a.attstorage::text, "
+				    "  a.atttypmod::text "
+				    "FROM pg_attribute a "
+				    "JOIN pg_type t ON t.oid = a.atttypid "
+				    "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+				    "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
+				    "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
+				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+				    "ORDER BY a.attnum", 1, oid, &cols);
 		WsSql->read("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
-				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
-				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
-				   "  con.oid::text, "
-				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
-				   "  con.convalidated::text, con.connoinherit::text, con.conenforced::text, "
-				   "  con.conislocal::text "
-				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
-				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
+				    "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
+				    "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
+				    "  con.oid::text, "
+				    "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
+				    "  con.convalidated::text, con.connoinherit::text, con.conenforced::text, "
+				    "  con.conislocal::text "
+				    "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
+				    "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
 		WsSql->read("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
-				   "  pg_get_expr(i.indpred, i.indrelid) "
-				   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-				   "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
-				   "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
-				   "    AND k.contype <> 'f')",
-				   1, oid, &idxs);
+				    "  pg_get_expr(i.indpred, i.indrelid) "
+				    "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+				    "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
+				    "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
+				    "    AND k.contype <> 'f')",
+				    1, oid, &idxs);
 		WsSql->read("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
-				   "  con.condeferrable::text, "
-				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
-				   "  con.condeferred::text "
-				   "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
-				   "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
+				    "  con.condeferrable::text, "
+				    "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
+				    "  con.condeferred::text "
+				    "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
+				    "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
 	}
 
 	check_snapshot_current(table, atooid(ws_sql_value(&rel, 0, 0)), &cols);
