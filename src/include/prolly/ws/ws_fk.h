@@ -104,7 +104,8 @@ extern void ws_fk_list(ProllyCtx *ctx, const PHash *map, WsForeignKey **out, int
  * table whose records are these, appended to out, in the server's encoding.  A
  * table's are added last name first: a key to a partitioned table has a row for
  * each of its partitions on the key's own table, named after it with a number,
- * which a name later in order may have, and a table's before its partitions'.
+ * which a name later in order may have, and a table's before its partitions'; all
+ * before any table's row security (ws_schema_row_security).
  * (Measured in UTF8's bytes, as a commit is: a key with such rows and a name near
  * the limit, and another of that name cut short and numbered, are refused.)  A
  * column neither has raises ERRCODE_DATA_CORRUPTED, as does anything of the

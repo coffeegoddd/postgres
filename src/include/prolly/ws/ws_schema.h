@@ -200,6 +200,8 @@ typedef struct WsTableSchema
 	char		replica_identity;	/* WS_REPLICA_* */
 	char	   *replica_index;	/* WS_REPLICA_INDEX's */
 	char	   *clustered;		/* the index CLUSTER uses, or NULL */
+	bool		row_security;	/* ENABLE ROW LEVEL SECURITY */
+	bool		force_row_security; /* FORCE ROW LEVEL SECURITY */
 } WsTableSchema;
 
 /*
@@ -282,7 +284,7 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * a default using one, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
- * an index's dependence on an extension, comments, grants, two
+ * a policy, an index's dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A partition's identity is its table's, and not held
@@ -379,6 +381,15 @@ extern void ws_schema_table_settings(const WsTableSchema *s, const char *schema,
  * if it has none.  Checked as the table's statement is.
  */
 extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE ONLY enabling and forcing a table's row security, in the named
+ * schema, appended to out, to run last, after its rows and every foreign key on it
+ * or to it: with it forced, a role that does not bypass it would have those rows
+ * refused, and the query checking a new key's rows is subject to it, unlike later
+ * ones.  Nothing, if it has neither.  Checked as the table's statement is.
+ */
+extern void ws_schema_row_security(const WsTableSchema *s, const char *schema, Buf *out);
 
 /*
  * The ALTER TABLE making a table inherit from its nth parent, in the named schema,
