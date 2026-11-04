@@ -309,7 +309,12 @@ $node->safe_psql('postgres', q{
 	CREATE TYPE s_changed AS (keep integer, gone integer, was integer);
 	ALTER TYPE s_changed DROP ATTRIBUTE gone;
 	ALTER TYPE s_changed RENAME ATTRIBUTE was TO now_is;
-	CREATE TYPE t_opc AS RANGE (SUBTYPE = int4, SUBTYPE_OPCLASS = int4_ops);
+	CREATE TYPE t_opc AS RANGE (SUBTYPE = text, SUBTYPE_OPCLASS = text_pattern_ops);
+	CREATE DOMAIN q_field AS x_pair CHECK ((VALUE).t IS NOT NULL);
+	CREATE TYPE u_ints AS RANGE (SUBTYPE = int4);
+	CREATE DOMAIN p_ctor AS integer CHECK (VALUE <@ u_ints(0, 100));
+	CREATE VIEW b_via_array AS SELECT 1 AS a;
+	CREATE VIEW a_via_array AS SELECT NULL::b_via_array[] AS arr;
 	CREATE TYPE r_range_range AS RANGE (SUBTYPE = int8);
 });
 my $tydump = sub {
@@ -339,6 +344,10 @@ like($ty_val{'type/x_pair'}, qr/domain\/a_pos2.*domain\/y_pos.*type\/z_mood/s, '
 like($ty_val{'view/over_types'}, qr/domain\/a_pos2.*type\/v_range.*type\/w_nest.*type\/z_mood/s, 'and a view, a multirange by its range');
 like($ty_val{'type/z_mood'}, qr/it''s @@ ok.*meh.*happy/s, 'an enum is in order, with its @ doubled');
 unlike(join('', values %ty_val), qr/\bty\./, 'no name of its schema');
+like($ty_val{'domain/q_field'}, qr/type\/x_pair/, 'a domain of a composite needs it');
+like($ty_val{'domain/p_ctor'}, qr/type\/u_ints/, 'a domain using a constructor needs its range');
+like($ty_val{'view/a_via_array'}, qr/view\/b_via_array/, 'a view of an array of a view needs that view');
+like($ty_val{'type/t_opc'}, qr/SUBTYPE_OPCLASS = text_pattern_ops/, 'an opclass not the default is said');
 like($ty_val{'view/fields'}, qr/type\/u_collrange.*type\/x_pair/s, 'a field and a constructor say whose they are');
 
 $node->safe_psql('postgres', q{CREATE SCHEMA ty2 AUTHORIZATION g_tyowner});
@@ -365,6 +374,21 @@ for my $change (q{ALTER TYPE ty.z_mood ADD VALUE 'later'}, q{ALTER DOMAIN ty.y_p
 	$old->quit;
 }
 $node->safe_psql('postgres', q{ALTER ROLE g_tyuser2 RENAME TO g_tyuser; ALTER ROLE g_tyowner2 RENAME TO g_tyowner});
+
+# default privileges on functions, which a range's constructors take, are no refusal
+$node->safe_psql('postgres', q{CREATE SCHEMA tyd; ALTER DEFAULT PRIVILEGES IN SCHEMA tyd GRANT EXECUTE ON FUNCTIONS TO g_tyuser; CREATE TYPE tyd.r AS RANGE (SUBTYPE = int4)});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyd')}), qr/^type\/r\t/, 'a range under default privileges on functions is held');
+$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA tyd REVOKE EXECUTE ON FUNCTIONS FROM g_tyuser; DROP SCHEMA tyd CASCADE});
+
+# a type's owner changed takes its range's functions with it
+$node->safe_psql('postgres', q{CREATE SCHEMA tyo; CREATE TYPE tyo.r AS RANGE (SUBTYPE = int4); ALTER TYPE tyo.r OWNER TO g_tyowner});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyo')}), qr/^type\/r\t/, 'a range given another owner is held');
+
+# a name too long for a commit, though not for this database
+$node->safe_psql('postgres', q{CREATE DATABASE tylatin TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+$node->safe_psql('tylatin', q{CREATE EXTENSION test_prolly; CREATE SCHEMA s; CREATE TYPE s.c AS ("} . ("\xe9" x 40) . q{" integer)});
+($rc, $out, $err) = $node->psql('tylatin', q{SELECT test_ws_obj_bytes('s')});
+like($err, qr/too long|longer than/, 'an attribute too long in UTF8 is refused');
 
 # a long name's multirange is as CREATE TYPE names it, and held
 for my $long ('b' x 55, 'c' x 63)
@@ -423,6 +447,17 @@ my @ty_refused = (
 	[ q{CREATE VIEW vv AS SELECT 1 AS a; CREATE DOMAIN r_viewdom AS vv[]}, 'a view' ],
 	[ q{CREATE DOMAIN r_self AS int; ALTER DOMAIN r_self SET DEFAULT (5::r_self)}, 'needs itself' ],
 	[ q{CREATE TYPE r_cast AS ENUM ('a'); CREATE CAST (r_cast AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TYPE r_cast2 AS ENUM ('a'); CREATE CAST (r_cast2[] AS text) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TYPE r_cast3 AS RANGE (SUBTYPE = int4); CREATE CAST (r_cast3_multirange AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TABLE r_cast4 (a int); CREATE CAST (r_cast4 AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE DOMAIN r_self2 AS int; ALTER DOMAIN r_self2 ADD CONSTRAINT k CHECK ('{}'::r_self2[] IS NOT NULL)}, 'needs itself' ],
+	[ q{CREATE TYPE range AS RANGE (SUBTYPE = int4)}, 'named as one in the catalogs' ],
+	[ q{CREATE TYPE r_ren AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_ren(int4, int4) RENAME TO r_ren2}, 'has been changed' ],
+	[ q{CREATE TYPE r_own AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_own(int4, int4) OWNER TO g_tyowner}, 'has been changed' ],
+	[ q{CREATE TYPE r_vol AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_vol(int4, int4) VOLATILE}, 'has been changed' ],
+	[ q{CREATE TYPE r_set AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_set(int4, int4) SET work_mem = '1MB'}, 'has been changed' ],
+	[ q{CREATE TYPE r_cm AS RANGE (SUBTYPE = int4); COMMENT ON FUNCTION r_cm(int4, int4) IS 'x'}, 'its own' ],
+	[ q{CREATE ROLE g_mid2 NOLOGIN; CREATE TYPE r_pub AS ENUM ('a'); REVOKE USAGE ON TYPE r_pub FROM PUBLIC; GRANT USAGE ON TYPE r_pub TO g_mid2 WITH GRANT OPTION; SET ROLE g_mid2; GRANT USAGE ON TYPE r_pub TO PUBLIC; RESET ROLE}, 'a grant by a role that does not own it' ],
 	[ q{CREATE TYPE lower AS RANGE (SUBTYPE = int4)}, 'named as one in the catalogs' ],
 	[ q{CREATE TYPE r_arrc AS ENUM ('a'); COMMENT ON TYPE _r_arrc IS 'x'}, 'its array type' ],
 	[ q{CREATE TYPE r_ctor AS RANGE (SUBTYPE = int4); REVOKE EXECUTE ON FUNCTION r_ctor(int4, int4) FROM PUBLIC}, 'a function of it' ],
@@ -441,7 +476,7 @@ for my $i (0 .. $#ty_refused)
 {
 	my ($sql, $why) = @{ $ty_refused[$i] };
 	my $sch = 'ty6';
-	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS $sch CASCADE; DROP TYPE IF EXISTS public.elsewhere CASCADE; CREATE SCHEMA $sch; SET search_path = $sch, public; $sql});
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS $sch CASCADE; DROP ROLE IF EXISTS g_mid2; DROP TYPE IF EXISTS public.elsewhere CASCADE; CREATE SCHEMA $sch; GRANT USAGE ON SCHEMA $sch TO PUBLIC; SET search_path = $sch, public; $sql});
 	my ($rc2, $out2, $err2) = $node->psql('postgres', qq{SELECT test_ws_obj_bytes('$sch')});
 	isnt($rc2, 0, "refused: $sql");
 	like($err2, qr/\Q$why\E/, "for why: $sql");

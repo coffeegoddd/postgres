@@ -544,7 +544,7 @@ static const char *const refusal_sql =
 "  WHEN c.relacl IS NOT NULL AND (SELECT count(*) FROM aclexplode(c.relacl) e WHERE e.grantee = c.relowner) <> "
 "      (SELECT count(*) FROM aclexplode(acldefault('r', c.relowner))) THEN 'its owner''s rights have been changed' "
 "  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
-"        JOIN pg_type t ON (d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid AND t.typrelid = c.oid) "
+"        JOIN pg_type t ON (d.refclassid = 'pg_type'::regclass AND d.refobjid IN (t.oid, t.typarray) AND t.typrelid = c.oid) "
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n') "
 "    OR EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND d.refclassid = 'pg_class'::regclass AND d.refobjid = c.oid) "
@@ -581,7 +581,7 @@ relations_version(const char *schema)
 	WsSqlRows	rows;
 	char	   *version;
 
-	WsSql->read("SELECT coalesce(encode(sha256(convert_to(string_agg(x, ',' ORDER BY x), 'UTF8')), 'hex'), '') FROM ( "
+	WsSql->read("SELECT coalesce(encode(sha256(textsend(string_agg(x, ',' ORDER BY x))), 'hex'), '') FROM ( "
 				"  SELECT 'c' || c.oid || ':' || c.relname || ':' || c.relkind::text || ':' || coalesce(c.relacl::text, '') || ':' || "
 				"      coalesce(c.reloptions::text, '') AS x FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"    WHERE n.nspname = $1::name "
@@ -610,6 +610,8 @@ relations_version(const char *schema)
 				"    JOIN pg_roles r ON r.oid = t.typowner WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'q' || t.oid || ':' || r.rolname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
 				"    CROSS JOIN LATERAL aclexplode(t.typacl) e JOIN pg_roles r ON r.oid = e.grantee WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'f' || p.oid || ':' || p.xmin FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+				"    WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'e' || e.oid || ':' || e.xmin FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
 				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'k' || k.oid || ':' || k.xmin FROM pg_constraint k JOIN pg_type t ON t.oid = k.contypid "
@@ -1060,20 +1062,25 @@ static const char *const type_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_description m ON m.classoid = 'pg_constraint'::regclass AND m.objoid = k.oid "
 "      WHERE k.contypid = t.oid) THEN 'it has a comment on a constraint' "
 "  WHEN EXISTS (SELECT 1 FROM pg_seclabel l WHERE (l.classoid = 'pg_type'::regclass AND l.objoid IN (t.oid, t.typarray, "
-"        (SELECT r.rngmultitypid FROM pg_range r WHERE r.rngtypid = t.oid))) "
+"        (SELECT r.rngmultitypid FROM pg_range r WHERE r.rngtypid = t.oid), "
+"        (SELECT m.typarray FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid WHERE r.rngtypid = t.oid))) "
 "      OR (l.classoid = 'pg_class'::regclass AND l.objoid = t.typrelid AND t.typrelid <> 0)) "
 "    THEN 'it has a security label' "
-"  WHEN EXISTS (SELECT 1 FROM pg_cast k WHERE (k.castsource = t.oid OR k.casttarget = t.oid) "
-"      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype = 'i')) "
-"    THEN 'it has a cast' "
 "  WHEN EXISTS (SELECT 1 FROM pg_description x WHERE x.classoid = 'pg_type'::regclass AND x.objoid IN (t.typarray, "
 "        (SELECT m.typarray FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid WHERE r.rngtypid = t.oid))) "
 "    THEN 'its array type has a comment of its own' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d JOIN pg_proc p ON p.oid = d.objid WHERE d.classid = 'pg_proc'::regclass AND d.deptype = 'i' "
 "      AND d.refclassid = 'pg_type'::regclass AND d.refobjid IN (t.oid, (SELECT r.rngmultitypid FROM pg_range r WHERE r.rngtypid = t.oid)) "
-"      AND (p.proacl IS NOT NULL OR EXISTS (SELECT 1 FROM pg_description x WHERE x.classoid = 'pg_proc'::regclass AND x.objoid = p.oid))) "
-"    THEN 'a function of it has a comment or grant of its own' "
-"  WHEN t.typtype = 'r' AND EXISTS (SELECT 1 FROM pg_proc c WHERE c.proname = t.typname AND c.pronamespace = 'pg_catalog'::regnamespace) "
+"      AND ((p.proacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) e WHERE e.grantee = 0 AND e.privilege_type = 'EXECUTE')) "
+"        OR EXISTS (SELECT 1 FROM pg_description x WHERE x.classoid = 'pg_proc'::regclass AND x.objoid = p.oid) "
+"        OR EXISTS (SELECT 1 FROM pg_seclabel l WHERE l.classoid = 'pg_proc'::regclass AND l.objoid = p.oid) "
+"        OR p.pronamespace <> t.typnamespace OR p.proowner <> 10::oid OR p.proconfig IS NOT NULL "
+"        OR p.provolatile <> 'i' OR p.prosecdef "
+"        OR p.proname NOT IN (t.typname, (SELECT m.typname FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid "
+"          WHERE r.rngtypid = t.oid)))) "
+"    THEN 'a function of it has been changed from what making it makes, or has a comment or grant of its own' "
+"  WHEN t.typtype = 'r' AND EXISTS (SELECT 1 FROM pg_proc c WHERE c.pronamespace = 'pg_catalog'::regnamespace AND c.proname IN (t.typname, "
+"      (SELECT m.typname FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid WHERE r.rngtypid = t.oid))) "
 "    THEN 'it would have a function named as one in the catalogs' "
 "  WHEN EXISTS (SELECT 1 FROM aclexplode(t.typacl) e WHERE e.grantor <> t.typowner) "
 "    THEN 'it has a grant by a role that does not own it' "
@@ -1098,7 +1105,7 @@ static const char *const type_refusal_sql =
 "        WHERE y.oid = d.refobjid AND q.relkind <> 'c')) "
 "    THEN 'it needs a table''s or a view''s row type, and a table may need it' "
 "  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
-"      WHERE d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass AND d.refobjid = t.oid) "
+"      WHERE d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass AND d.refobjid IN (t.oid, t.typarray)) "
 "    THEN 'it needs itself, as no commit could make it' "
 "  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
 "      WHERE d.deptype = 'n' AND d.refclassid <> 'pg_type'::regclass "
@@ -1110,6 +1117,13 @@ static const char *const type_refusal_sql =
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
 "    THEN 'it needs an object no commit holds yet' "
 "  END " TYPES_OF_SCHEMA "ORDER BY 1";
+
+/* A cast on anything in a schema, of what comes of a type too; not a range's own. */
+static const char *const cast_refusal_sql =
+"SELECT t.typname::text, 'it has a cast' FROM pg_cast k "
+"JOIN pg_type t ON t.oid IN (k.castsource, k.casttarget) JOIN pg_namespace n ON n.oid = t.typnamespace "
+"WHERE n.nspname = $1::name AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_cast'::regclass "
+"  AND d.objid = k.oid AND d.deptype = 'i') ORDER BY 1";
 
 static void
 refuse_types(const char *schema, const char *sql)
@@ -1404,6 +1418,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	version = push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
 	refuse_types(schema, type_refusal_sql);
+	refuse_types(schema, cast_refusal_sql);
 	nest = path_begin(schema);
 
 	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, pg_get_viewdef(c.oid, false), "
