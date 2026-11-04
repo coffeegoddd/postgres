@@ -120,6 +120,43 @@ typedef struct WsConstraint
 	WsIndex		excl;			/* an exclusion's index */
 } WsConstraint;
 
+/* A statistics target on an index's expression column, numbered from one. */
+typedef struct WsIndexStat
+{
+	int			column;
+	int			target;
+} WsIndexStat;
+
+/* The operator class parameters on one of an index's keys, numbered from one. */
+typedef struct WsKeyOptions
+{
+	int			column;
+	int			noptions;
+	WsOption   *options;		/* by name in UTF8's order */
+} WsKeyOptions;
+
+/*
+ * What an index has beyond its definition, by its name: a primary key's, a unique
+ * or exclusion constraint's, or one of its own.  Only one that has any is listed.
+ */
+typedef struct WsIndexSettings
+{
+	char	   *index;
+	int			ninclude;
+	uint64	   *include;		/* INCLUDE's tags, of a key or a unique constraint */
+	int			noptions;
+	WsOption   *options;		/* by name in UTF8's order */
+	int			nstats;
+	WsIndexStat *stats;			/* by column */
+	int			nkeyoptions;
+	WsKeyOptions *keyoptions;	/* by column */
+} WsIndexSettings;
+
+#define WS_REPLICA_DEFAULT '\0'
+#define WS_REPLICA_FULL 'f'
+#define WS_REPLICA_NOTHING 'n'
+#define WS_REPLICA_INDEX 'i'
+
 /* The tables one table's record can say it inherits from. */
 #define WS_MAX_PARENTS 1600
 
@@ -153,6 +190,13 @@ typedef struct WsTableSchema
 	char	  **inherited_cons; /* names of those constraints likewise, in UTF8's order */
 	int			noptions;
 	WsOption   *options;		/* the table's, then its TOAST table's, each by name in UTF8's order */
+	bool		key_deferrable;
+	bool		key_initdeferred;
+	int			nindex_settings;
+	WsIndexSettings *index_settings;	/* by index name in UTF8's order */
+	char		replica_identity;	/* WS_REPLICA_* */
+	char	   *replica_index;	/* WS_REPLICA_INDEX's */
+	char	   *clustered;		/* the index CLUSTER uses, or NULL */
 } WsTableSchema;
 
 /*
@@ -179,7 +223,10 @@ typedef struct WsTableSchema
  * and not itself, neither a partition nor partitioned, what it has only by doing so its own columns in attribute order and
  * its own checks' and not-null constraints' names in order; storage parameters
  * named, valued and in order, a column's storage, compression and statistics
- * target known ones.  NULL if it is so, or what is wrong.
+ * target known ones; an index's settings each for an index it has, in order, its
+ * INCLUDE only on a key or unique constraint, its columns' parameters only on a key
+ * with an operator class; a replica identity known, naming an index only by index,
+ * and a clustered index one it has.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -225,11 +272,10 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance or a partition or
  * partitioned table across schemas, a tablespace or another access method, a
- * replica identity, a key's options, a
  * sequence's, a default using one, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
- * an index's options or its dependence on an extension, comments, grants, two
+ * an index's dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A partition's identity is its table's, and not held
@@ -307,6 +353,20 @@ extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schem
  * nothing but constants.
  */
 extern void ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE ONLY giving a table its replica identity and clustered index, in
+ * the named schema, appended to out, to run after its indexes; nothing, if it has
+ * neither.  Checked as the table's statement is.
+ */
+extern void ws_schema_table_settings(const WsTableSchema *s, const char *schema, Buf *out);
+
+/*
+ * The ALTER INDEX giving the nth of a table's index_settings its statistics
+ * targets, in the named schema, appended to out, to run after its indexes; nothing,
+ * if it has none.  Checked as the table's statement is.
+ */
+extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
  * The ALTER TABLE making a table inherit from its nth parent, in the named schema,

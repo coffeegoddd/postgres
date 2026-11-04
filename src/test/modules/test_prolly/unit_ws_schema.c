@@ -1496,7 +1496,7 @@ test_partition_injection(void)
 			"\x00" "\x00" "\x00" "\x00" "r";
 		static const char over[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
-			"\x00" "\x00" "\x00" "\x00" "h" "\x01" "\x07" "\x00" "\x00" "x";
+			"\x00" "\x00" "\x00" "\x00" "h" "\x01" "\x07" "\x00" "\x00" "q";
 
 		check_refused(none, sizeof(none) - 1, "left over");
 		check_refused(many, sizeof(many) - 1, "too many keys");
@@ -2004,6 +2004,208 @@ test_storage_quoted(void)
 	parsed = raw_parser((char *) b.data, RAW_PARSE_DEFAULT);
 	CHECK_EQ(list_length(parsed), 1);
 	buf_free(&b);
+}
+
+/* Indexes' settings and a table's: bytes, and which statement says each. */
+static void
+test_index_settings(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn"},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	uint64		key[] = {7};
+	uint64		inc[] = {8};
+	WsOption	ff[] = {{.name = "fillfactor",.value = "50"}};
+	WsOption	sig[] = {{.name = "siglen",.value = "100"}};
+	WsKeyOptions kopts[] = {{.column = 1,.noptions = 1,.options = sig}};
+	WsIndexStat stats[] = {{.column = 2,.target = 5}};
+	WsIndexKey	ikeys[] = {
+		{.tag = 8,.opclass = "o.c",.order = 'd',.nulls = 'd'},
+		{.expr = "(@{7} + 1)",.order = 'd',.nulls = 'd'},
+	};
+	WsIndex		ix = {.name = "i",.method = "gist",.nkeys = 2,.keys = ikeys};
+	WsIndexSettings sets[] = {
+		{.index = "i",.noptions = 1,.options = ff,.nstats = 1,.stats = stats,.nkeyoptions = 1,.keyoptions = kopts},
+		{.index = "k",.ninclude = 1,.include = inc,.noptions = 1,.options = ff},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.key_name = "k",.nkey = 1,.key = key,
+		.key_deferrable = true,.key_initdeferred = true,.nindexes = 1,.indexes = &ix,
+		.nindex_settings = 2,.index_settings = sets,.replica_identity = WS_REPLICA_INDEX,.replica_index = "i",
+	.clustered = "k"};
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.key_deferrable && got.key_initdeferred);
+	CHECK(got.replica_identity == WS_REPLICA_INDEX && strcmp(got.replica_index, "i") == 0);
+	CHECK(strcmp(got.clustered, "k") == 0);
+	CHECK(got.nindex_settings == 2 && got.index_settings[1].include[0] == 8);
+	CHECK(got.index_settings[0].stats[0].column == 2 && got.index_settings[0].stats[0].target == 5);
+	CHECK(strcmp(got.index_settings[0].keyoptions[0].options[0].value, "100") == 0);
+	{
+		Buf			again = BUF_INIT;
+
+		WsSchemaCodec->encode(&got, &again);
+		CHECK(again.len == b.len && memcmp(again.data, b.data, b.len) == 0);
+		buf_free(&again);
+	}
+	ws_schema_free(&got);
+	buf_free(&b);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a integer CONSTRAINT nn NOT NULL,\n"
+				 "    b integer,\n"
+				 "    CONSTRAINT k PRIMARY KEY (a) INCLUDE (b) WITH (fillfactor = '50') DEFERRABLE INITIALLY DEFERRED\n"
+				 ")") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_create_index(&s, 0, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE INDEX i ON x.t USING gist (b o.c (siglen = '100'), ((a + 1))) WITH (fillfactor = '50')") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_table_settings(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data, "ALTER TABLE ONLY x.t REPLICA IDENTITY USING INDEX i, CLUSTER ON k") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_index_stats(&s, 0, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data, "ALTER INDEX x.i ALTER COLUMN 2 SET STATISTICS 5") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_index_stats(&s, 1, "x", &sql);
+	CHECK_EQ(sql.len, 0);
+	buf_free(&sql);
+}
+
+static void
+test_index_settings_problems(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn"},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	uint64		key[] = {7};
+	uint64		bad[] = {9};
+	uint64		twice[] = {8, 8};
+	uint64		inc[] = {8};
+	WsOption	ff = {.name = "fillfactor",.value = "50"};
+	WsOption	toast = {.toast = true,.name = "x",.value = "1"};
+	WsIndexKey	ikey = {.tag = 8,.order = 'd',.nulls = 'd'};
+	WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 1,.keys = &ikey};
+	WsConstraint chk = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+	WsIndexSettings set = {.index = "i",.noptions = 1,.options = &ff};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.key_name = "k",.nkey = 1,.key = key,
+		.nconstraints = 1,.constraints = &chk,.nindexes = 1,.indexes = &ix,
+	.nindex_settings = 1,.index_settings = &set};
+
+	CHECK(ws_schema_problem(&s) == NULL);
+	set.index = "nothing";
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	set.index = "c";
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	set.index = "i";
+	set.noptions = 0;
+	CHECK(problem_has(ws_schema_problem(&s), "saying it has none"));
+	set.ninclude = 1;
+	set.include = inc;
+	CHECK(problem_has(ws_schema_problem(&s), "INCLUDE in settings"));
+	set.index = "k";
+	CHECK(ws_schema_problem(&s) == NULL);
+	set.include = bad;
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	set.ninclude = 2;
+	set.include = twice;
+	CHECK(problem_has(ws_schema_problem(&s), "column twice"));
+	set.ninclude = 0;
+	set.noptions = 1;
+	set.options = &toast;
+	CHECK(problem_has(ws_schema_problem(&s), "of a TOAST table"));
+	set.options = &ff;
+	set.index = "i";
+	{
+		WsIndexStat out[] = {{.column = 0,.target = 1}};
+		WsIndexStat high[] = {{.column = 1,.target = 10001}};
+		WsIndexStat order[] = {{.column = 2,.target = 1}, {.column = 1,.target = 1}};
+
+		set.nstats = 1;
+		set.stats = out;
+		CHECK(problem_has(ws_schema_problem(&s), "no column"));
+		set.stats = high;
+		CHECK(problem_has(ws_schema_problem(&s), "out of range"));
+		set.nstats = 2;
+		set.stats = order;
+		CHECK(problem_has(ws_schema_problem(&s), "not in order"));
+		set.nstats = 0;
+	}
+	{
+		WsKeyOptions noclass = {.column = 1,.noptions = 1,.options = &ff};
+
+		set.nkeyoptions = 1;
+		set.keyoptions = &noclass;
+		CHECK(problem_has(ws_schema_problem(&s), "no operator class"));
+		set.nkeyoptions = 0;
+	}
+	s.key_initdeferred = true;
+	CHECK(problem_has(ws_schema_problem(&s), "initially deferred"));
+	s.key_initdeferred = false;
+	s.replica_identity = 'z';
+	CHECK(problem_has(ws_schema_problem(&s), "no known kind"));
+	s.replica_identity = WS_REPLICA_INDEX;
+	CHECK(problem_has(ws_schema_problem(&s), "with no index"));
+	s.replica_index = "nothing";
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	s.replica_identity = WS_REPLICA_FULL;
+	CHECK(problem_has(ws_schema_problem(&s), "no such identity"));
+	s.replica_index = NULL;
+	s.clustered = "nothing";
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	s.clustered = "c";
+	CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+	s.clustered = "i";
+	CHECK(ws_schema_problem(&s) == NULL);
+	{
+		/* (not alike the key: an INCLUDE tells them apart, as CREATE TABLE does) */
+		WsConstraint uq = {.name = "u",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = key};
+		WsIndexSettings kset = {.index = "k",.ninclude = 1,.include = inc};
+		WsTableSchema t = {.name = "t",.ncols = 2,.cols = cols,.key_name = "k",.nkey = 1,.key = key,
+		.nconstraints = 1,.constraints = &uq};
+
+		CHECK(problem_has(ws_schema_problem(&t), "alike the key"));
+		t.nindex_settings = 1;
+		t.index_settings = &kset;
+		CHECK(ws_schema_problem(&t) == NULL);
+		t.nindex_settings = 0;
+		t.key_deferrable = true;
+		CHECK(ws_schema_problem(&t) == NULL);
+	}
+	{
+		static const char noset[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "j" "\x00";
+		static const char many[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "j" "\x7f" "\x00";
+		static const char none[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "x" "\x00" "\x00" "\x00";
+		static const char flags[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "x" "\x04" "\x00" "\x00";
+
+		check_refused(noset, sizeof(noset) - 1, "no index settings");
+		check_refused(many, sizeof(many) - 1, "more index settings than bytes");
+		check_refused(none, sizeof(none) - 1, "saying it has none");
+		check_refused(flags, sizeof(flags) - 1, "flags not known");
+	}
 }
 
 /* A column's not-null constraint's and sequence's names: what they must be. */
@@ -2635,6 +2837,8 @@ static const ProllyUnitTest tests[] = {
 	{"storage", test_storage},
 	{"storage_problems", test_storage_problems},
 	{"storage_quoted", test_storage_quoted},
+	{"index_settings", test_index_settings},
+	{"index_settings_problems", test_index_settings_problems},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},
