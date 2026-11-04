@@ -2,8 +2,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A branch's catalog rows copied at wal_level minimal: the copies' storage is
-# new in the transaction, which skips WAL and syncs it at commit, and survives
-# a crash right after.
+# new in the transaction, which skips WAL until commit, and survives a crash
+# right after, with what that transaction wrote to it.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -45,6 +45,39 @@ is( $node->safe_psql('postgres', qq{
 		SELECT b FROM c.t WHERE a = 1}),
 	'x',
 	'and takes rows, its indexes too');
+
+# copied and written in one transaction, a value out of line and a sequence
+# moved on, and a crash
+my $to2 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$node->safe_psql('postgres', qq{
+	BEGIN;
+	SELECT pg_branch_catalog_copy($from, $to2);
+	SET LOCAL catalog_branch = $to2;
+	INSERT INTO c.t SELECT 2, string_agg(md5(g::text), '') FROM generate_series(1, 2000) g;
+	SELECT nextval('c.s');
+	COMMIT;
+});
+my $read2 = qq{SET catalog_branch = $to2;
+	SELECT a, length(b) FROM c.t; SELECT last_value FROM c.s};
+is($node->safe_psql('postgres', $read2), "2|64000\n6", 'written in the copying transaction');
+$node->stop('immediate');
+$node->start;
+is($node->safe_psql('postgres', $read2), "2|64000\n6", 'and after a crash');
+
+# a copy rolled back to a savepoint leaves nothing for commit to do
+my $to3 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$node->safe_psql('postgres', qq{
+	BEGIN;
+	SAVEPOINT s;
+	SELECT pg_branch_catalog_copy($from, $to3);
+	ROLLBACK TO s;
+	COMMIT;
+});
+is( $node->safe_psql('postgres', qq{
+		SET catalog_branch = $to3;
+		SELECT count(*) FROM pg_namespace WHERE nspname = 'c'}),
+	'0',
+	'a copy rolled back to a savepoint left nothing');
 
 $node->stop;
 done_testing();
