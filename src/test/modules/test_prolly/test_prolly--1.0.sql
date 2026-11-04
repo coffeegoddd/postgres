@@ -755,7 +755,11 @@ CREATE FUNCTION test_ws_role_bytes(names text[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_ws_role_restore(bytes text, known text)
+CREATE FUNCTION test_ws_role_mark(bytes text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_ws_role_restore(bytes text, previous text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 

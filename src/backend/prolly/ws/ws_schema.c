@@ -3947,9 +3947,13 @@ ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out)
 static void
 check_role_may_travel(const WsTableSchema *s, const char *role)
 {
-	char	   *what = psprintf("table \"%s\"", s->name);
+	char	   *what;
 
+	if (IsReservedName(role))
+		not_the_record(s, "a predefined role");
+	what = psprintf("table \"%s\"", s->name);
 	ws_role_check_name(what, role);
+	pfree(what);
 	if (ws_role_travel_problem(role) != NULL)
 		not_the_record(s, "a role that can log in, or with powers no commit holds");
 }

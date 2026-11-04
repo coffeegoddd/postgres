@@ -41,6 +41,7 @@ PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_copy);
 PG_FUNCTION_INFO_V1(test_ws_role_bytes);
+PG_FUNCTION_INFO_V1(test_ws_role_mark);
 PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 
@@ -464,20 +465,34 @@ test_ws_role_bytes(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_ws_role_restore(bytes text, known text) returns void: makes the roles of
- * test_ws_role_bytes's first text here, as a database that holds its second
+ * test_ws_role_mark(bytes text) returns void: capture's marking of those roles
+ */
+Datum
+test_ws_role_mark(PG_FUNCTION_ARGS)
+{
+	WsRole	   *roles;
+	int			n;
+
+	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(0)), &roles, &n);
+	ws_role_mark(roles, n);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_role_restore(bytes text, previous text) returns void: makes the roles of
+ * test_ws_role_bytes's first text here, as a database whose root held its second
  */
 Datum
 test_ws_role_restore(PG_FUNCTION_ARGS)
 {
 	WsRole	   *roles;
-	WsRole	   *known;
+	WsRole	   *previous;
 	int			n;
-	int			nknown;
+	int			nprevious;
 
 	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(0)), &roles, &n);
-	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(1)), &known, &nknown);
-	ws_role_restore(roles, n, known, nknown);
+	role_lines(text_to_cstring(PG_GETARG_TEXT_PP(1)), &previous, &nprevious);
+	ws_role_restore(roles, n, previous, nprevious);
 	PG_RETURN_VOID();
 }
 

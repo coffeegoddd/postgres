@@ -1583,6 +1583,16 @@
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>roltravels</structfield> <type>bool</type>
+      </para>
+      <para>
+       Role is held by a versioned database's commits, so a commit may change
+       it when it arrives on this cluster.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>rolconnlimit</structfield> <type>int4</type>
       </para>
       <para>
