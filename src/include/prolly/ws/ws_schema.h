@@ -45,6 +45,21 @@ typedef struct WsColumn
 	char	   *collation;		/* qualified and quoted, or NULL: the type's */
 } WsColumn;
 
+#define WS_CONSTRAINT_CHECK 'c'
+#define WS_CONSTRAINT_UNIQUE 'u'
+
+typedef struct WsConstraint
+{
+	char	   *name;
+	char		kind;			/* WS_CONSTRAINT_* */
+	char	   *expr;			/* a check's expression, as stored */
+	int			ncols;
+	uint64	   *cols;			/* a unique constraint's tags */
+	bool		nulls_not_distinct;
+	bool		deferrable;
+	bool		initdeferred;
+} WsConstraint;
+
 typedef struct WsTableSchema
 {
 	char	   *name;
@@ -53,6 +68,8 @@ typedef struct WsTableSchema
 	char	   *key_name;		/* the primary key's constraint, or NULL: none */
 	int			nkey;
 	uint64	   *key;			/* the primary key's tags */
+	int			nconstraints;
+	WsConstraint *constraints;	/* other than the key, by name in UTF8's order */
 } WsTableSchema;
 
 /*
@@ -61,8 +78,10 @@ typedef struct WsTableSchema
  * a generated column with its expression and no identity, an identity not
  * null, no empty expression or collation, an expression's references well
  * formed, a key named if it has columns, its columns its own, stored, not
- * null and distinct.  NULL if it is so, or what
- * is wrong.
+ * null and distinct; other constraints in order by name, none named as another
+ * or as the key, a check with its expression and nothing else, a unique one
+ * with its columns, its own, stored and distinct, initially deferred only if
+ * deferrable.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -105,10 +124,13 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance and partitions,
- * storage settings, a key's options, a sequence's, a default using one) raises
- * ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
+ * storage settings, a key's options, a sequence's, a default using one, foreign
+ * keys, exclusion constraints, an index no constraint has, comments, grants)
+ * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
- * sequence's are not held, and are made again.
+ * sequence's are not held, and are made again, and neither is the table's owner,
+ * which is whoever makes it.  Triggers, rules and the like are objects of their
+ * own, not their table's.
  *
  * It locks the table till the transaction ends, and a column renamed or
  * dropped since the transaction's snapshot raises
