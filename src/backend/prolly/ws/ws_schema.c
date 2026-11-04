@@ -1762,6 +1762,12 @@ static const char *const unsupported_sql =
 "                 AND p.refclassid = 'pg_class'::regclass AND p.refobjid = c.oid "
 "                 AND p.refobjsubid = a.attnum AND p.deptype = 'i' AND q.relkind = 'S')) "
 "    THEN 'an identity has its sequence in another schema' "
+"  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
+"               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
+"               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+"                 AND p.refobjid = c.oid AND p.deptype = 'i' AND q.relkind = 'S' "
+"                 AND a.attidentity = '') "
+"    THEN 'a column owns the identity sequence of another table' "
 "  END "
 "FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam "
 "LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid WHERE c.oid = $1::oid";
