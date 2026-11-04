@@ -547,7 +547,7 @@ test_malformed(void)
 		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00" "\x00", 8, "more columns than a table can have"},
 		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00" "\x00", 10, "a key of more columns"},
 		/* constraints */
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x08" "\x01" "x" "\x00", 24, "flags not known"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x40" "\x01" "x" "\x00", 24, "flags not known"},
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "z" "\x00" "\x01" "\x07" "\x00", 24, "no known kind"},
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x7f" "\x01" "\x00", 19, "more constraints than bytes"},
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x02" "\x07" "\x07" "\x00", 25, "more columns than the table has"},
@@ -1662,6 +1662,159 @@ test_exclusion_injection(void)
 	refused_saying(exclusion_spanned, "2 /*\n, ((2)) WITH OPERATOR(=)) -- */", "syntax error");
 }
 
+/* A check's flags: the bytes, and which statement says each. */
+static void
+test_check_flags(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint cons[] = {
+		{.name = "ni",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 1)",.no_inherit = true},
+		{.name = "not en",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 2)",.not_enforced = true},
+		{.name = "nv",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 3)",.not_valid = true},
+		{.name = "nv2",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 4)",.not_valid = true,.no_inherit = true},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 4,.constraints = cons};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x01"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"			/* no key */
+		"\x04"					/* constraints */
+		"\x02" "ni" "c" "\x10" "\x0a" "(@{7} > 1)"
+		"\x06" "not en" "c" "\x20" "\x0a" "(@{7} > 2)"
+		"\x02" "nv" "c" "\x08" "\x0a" "(@{7} > 3)"
+		"\x03" "nv2" "c" "\x18" "\x0a" "(@{7} > 4)"
+		"\x00";					/* indexes */
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.constraints[0].no_inherit && !got.constraints[0].not_valid && !got.constraints[0].not_enforced);
+	CHECK(got.constraints[1].not_enforced && !got.constraints[1].no_inherit);
+	CHECK(got.constraints[3].not_valid && got.constraints[3].no_inherit);
+	ws_schema_free(&got);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a integer,\n"
+				 "    CONSTRAINT ni CHECK ((a > 1)) NO INHERIT,\n"
+				 "    CONSTRAINT \"not en\" CHECK ((a > 2)) NOT ENFORCED\n"
+				 ")") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_add_check(&s, 3, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "ALTER TABLE x.t ADD CONSTRAINT nv2 CHECK ((a > 4)) NO INHERIT NOT VALID") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+static void
+check_flags_problem(const WsConstraint *con, const char *why)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = (WsConstraint *) con};
+	const char *problem = ws_schema_problem(&s);
+
+	if (problem == NULL || strstr(problem, why) == NULL)
+		elog(ERROR, "for \"%s\": %s", why, problem ? problem : "no problem found");
+}
+
+typedef struct AddCheck
+{
+	const char *expr;
+	bool		no_inherit;
+	int			n;
+} AddCheck;
+
+static void
+add_check(void *arg)
+{
+	const AddCheck *in = arg;
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = (char *) in->expr,
+	.not_valid = true,.no_inherit = in->no_inherit};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_add_check(&s, in->n, "x", &b);
+}
+
+static void
+add_check_of_valid(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_add_check(&s, 0, "x", &b);
+}
+
+/* A flag the record says, hidden from the statement by a comment in CREATE TABLE. */
+static void
+flag_hidden(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true) --",
+		.no_inherit = strcmp(arg, "no inherit") == 0,
+	.not_enforced = strcmp(arg, "not enforced") == 0};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+static void
+test_check_flags_refused(void)
+{
+	uint64		a[] = {7};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd',.op = "="};
+	const WsConstraint both = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true",.not_valid = true,.not_enforced = true};
+	const WsConstraint unique = {.name = "c",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = a,.not_valid = true};
+	const WsConstraint excl = {.name = "c",.kind = WS_CONSTRAINT_EXCLUSION,.no_inherit = true,
+	.excl = {.method = "gist",.nkeys = 1,.keys = &key}};
+	static const AddCheck bad[] = {
+		/* (the statement would validate it, or say more than the record) */
+		{.expr = "true) --"},
+		{.expr = "true) NO INHERIT --"},
+		{.expr = "true) NOT ENFORCED --"},
+		{.expr = "true) NOT VALID, ADD CHECK (false"},
+		{.expr = "true), ADD CHECK (false"},
+		{.expr = "true) NOT VALID; DROP TABLE x.t; --"},
+		{.expr = "true) --",.no_inherit = true},
+	};
+
+	check_flags_problem(&both, "both not valid and not enforced");
+	check_flags_problem(&unique, "a check's flags");
+	check_flags_problem(&excl, "a check's flags");
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(add_check, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	{
+		AddCheck	none = {.expr = "true",.n = 1};
+
+		expect_error(add_check, &none, ERRCODE_INTERNAL_ERROR, NULL);
+	}
+	expect_error(add_check_of_valid, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	refused_saying(flag_hidden, "no inherit", "another constraint");
+	refused_saying(flag_hidden, "not enforced", "another constraint");
+
+	/* a not-enforced check saying not valid too */
+	{
+		static const char two[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x01" "\x01" "c" "c" "\x28" "\x04" "true" "\x00";
+
+		check_refused(two, sizeof(two) - 1, "both not valid");
+	}
+}
+
 /* An expression's references take the names the record has now. */
 static void
 test_create_table_renamed(void)
@@ -1816,6 +1969,8 @@ static const ProllyUnitTest tests[] = {
 	{"exclusions", test_exclusions},
 	{"exclusion_problems", test_exclusion_problems},
 	{"exclusion_injection", test_exclusion_injection},
+	{"check_flags", test_check_flags},
+	{"check_flags_refused", test_check_flags_refused},
 	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},

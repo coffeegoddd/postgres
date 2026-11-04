@@ -140,6 +140,23 @@ $node->safe_psql('postgres', q{
 	ALTER TABLE src.excl_ren RENAME b TO z;
 	CREATE TABLE src.excl_key (id integer PRIMARY KEY, a integer UNIQUE, CONSTRAINT excl_key_x EXCLUDE (a WITH =));
 	CREATE INDEX excl_key_i ON src.excl_key (a);
+	CREATE TABLE src.chk (a integer, b integer,
+		CONSTRAINT chk_plain CHECK (a > 0),
+		CONSTRAINT chk_ni CHECK (a > 1) NO INHERIT,
+		CONSTRAINT chk_ne CHECK (a > 2) NOT ENFORCED,
+		CONSTRAINT chk_ne_ni CHECK (a > 3) NO INHERIT NOT ENFORCED);
+	ALTER TABLE src.chk ADD CONSTRAINT chk_nv CHECK (a > 4) NOT VALID,
+		ADD CONSTRAINT chk_nv_ni CHECK (a > 5) NO INHERIT NOT VALID,
+		ADD CONSTRAINT chk_ok CHECK (a > 6) NOT VALID;
+	ALTER TABLE src.chk VALIDATE CONSTRAINT chk_ok;
+	CREATE TABLE src.chk_only (a integer);
+	ALTER TABLE src.chk_only ADD CONSTRAINT chk_only_nv CHECK (a > 0) NOT VALID;
+	CREATE TABLE src.chk_ren (a integer);
+	ALTER TABLE src.chk_ren ADD CONSTRAINT chk_ren_nv CHECK (a > 0) NOT VALID;
+	ALTER TABLE src.chk_ren RENAME a TO z;
+	CREATE TABLE src.chk_nn (a int NOT NULL);
+	ALTER TABLE src.chk_nn RENAME a TO b;
+	ALTER TABLE src.chk_nn ADD CONSTRAINT chk_nn_b_not_null CHECK (b > 0) NOT VALID;
 	CREATE TABLE src.xnn (a int, CONSTRAINT xnn_a_not_null EXCLUDE (a WITH =));
 	ALTER TABLE src.xnn ALTER a SET NOT NULL;
 	CREATE TABLE src.unn (a int, CONSTRAINT unn_a_not_null UNIQUE (a));
@@ -174,7 +191,7 @@ $node->safe_psql('postgres', q{
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
 	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key',
 	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_defp', 'fk_defc', 'fk_self', 'fk_selfu', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats',
-	'excl', 'excl_ren', 'excl_key',
+	'excl', 'excl_ren', 'excl_key', 'chk', 'chk_only', 'chk_ren', 'chk_nn',
 	'xnn', 'unn', 'knn', 'xseq', 'useq', 'iseq', 'nn_ren', 'nn_named', 'nn_seqtab', 'nn_seqtab_a_seq', 'nn_fk');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
@@ -193,7 +210,8 @@ for my $table (@tables)
 	my $hex = $bytes->($node, 'postgres', $table);
 	isnt($hex, '', "$table read");
 	$node->safe_psql('postgres',
-		qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst')});
+		qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst');
+		   SELECT test_ws_schema_add_checks(decode('$hex', 'hex'), 'dst')});
 	is($bytes->($node, 'postgres', $table, undef, 'dst'), $hex, "$table the same bytes, made again");
 }
 
@@ -253,6 +271,37 @@ $node->safe_psql('postgres', q{
 my $tsdir = PostgreSQL::Test::Utils::tempdir();
 $node->safe_psql('postgres', "CREATE TABLESPACE t86 LOCATION '$tsdir'");
 
+# a check's flags made again as they were
+my $checks = q{SELECT string_agg(conname || ': ' || pg_get_constraintdef(oid) || ' ' || convalidated || connoinherit || conenforced, E'\n' ORDER BY conname)
+	FROM pg_constraint WHERE contype = 'c' AND conrelid = '%s.%s'::regclass};
+for my $table ('chk', 'chk_only')
+{
+	my $want = $node->safe_psql('postgres', sprintf($checks, 'src', $table));
+	isnt($want, '', "$table has checks");
+	is($node->safe_psql('postgres', sprintf($checks, 'dst', $table)), $want, "$table its checks made again");
+}
+like($node->safe_psql('postgres', sprintf($checks, 'src', 'chk')), qr/chk_nv: .*NOT VALID falsefalsetrue/,
+	'a check not valid is one');
+
+# rows a check not valid lets stand: in before it, and there after
+my $chk = $bytes->($node, 'postgres', 'chk_only');
+$node->safe_psql('postgres', q{CREATE SCHEMA dst_rows VERSIONED});
+$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$chk', 'hex'), 'dst_rows')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_constraint WHERE conrelid = 'dst_rows.chk_only'::regclass AND contype = 'c'}),
+	'0', 'a check not valid is not in its table\'s statement');
+$node->safe_psql('postgres', q{INSERT INTO dst_rows.chk_only VALUES (-1)});
+$node->safe_psql('postgres', qq{SELECT test_ws_schema_add_checks(decode('$chk', 'hex'), 'dst_rows')});
+is($node->safe_psql('postgres', q{SELECT a FROM dst_rows.chk_only}), '-1', 'the row it lets stand stands');
+my ($cret, $cout, $cerr) = $node->psql('postgres', q{INSERT INTO dst_rows.chk_only VALUES (-2)});
+like($cerr, qr/violates check constraint "chk_only_nv"/, 'and a new one is refused');
+($cret, $cout, $cerr) = $node->psql('postgres', q{ALTER TABLE dst_rows.chk_only VALIDATE CONSTRAINT chk_only_nv});
+like($cerr, qr/is violated by some row/, 'and it is still not valid');
+my $chkren = q!SELECT position('z > 0'::bytea in test_ws_schema_bytes('src', 'chk_ren')) = 0!;
+is($node->safe_psql('postgres', $chkren), 't', 'a check not valid stored by tag');
+is( $node->safe_psql('postgres',
+		q{SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'dst.chk_ren'::regclass AND contype = 'c'}),
+	'CHECK ((z > 0)) NOT VALID', 'and follows the new name');
+
 # names CREATE TABLE would otherwise choose, as they were
 my $names = q{SELECT string_agg(conname, ' ' ORDER BY conname) FROM pg_constraint WHERE conrelid = '%s.%s'::regclass};
 for my $table ('xnn', 'unn', 'knn', 'nn_ren', 'nn_named')
@@ -309,12 +358,11 @@ is( $node->safe_psql('postgres',
 $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
-	cnv => 'a check not valid', ctrg => 'a constraint trigger',
+	ctrg => 'a constraint trigger',
 	xdup => 'two constraints alike', xfill => 'an index has options', xspc => 'an index has options',
 	xclu => 'an index has options', xstat => 'an index has options', xcmt => 'a comment',
 	xicmt => 'a comment', xext => 'depends on an extension', fksopt => 'an index has options',
 	seqother => 'its sequence in another schema',
-	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
 	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
@@ -357,9 +405,6 @@ for my $t (
 	[ 'xcmt', q{CREATE TABLE src.xcmt (r int4range, CONSTRAINT xcmt_x EXCLUDE USING gist (r WITH &&)); COMMENT ON CONSTRAINT xcmt_x ON src.xcmt IS 'x'} ],
 	[ 'xicmt', q{CREATE TABLE src.xicmt (r int4range, CONSTRAINT xicmt_x EXCLUDE USING gist (r WITH &&)); COMMENT ON INDEX src.xicmt_x IS 'x'} ],
 	[ 'xext', 'CREATE TABLE src.xext (r int4range, CONSTRAINT xext_x EXCLUDE USING gist (r WITH &&)); ALTER INDEX src.xext_x DEPENDS ON EXTENSION test_prolly' ],
-	[ 'cnv', 'CREATE TABLE src.cnv (a int); ALTER TABLE src.cnv ADD CONSTRAINT c CHECK (a > 0) NOT VALID' ],
-	[ 'cni', 'CREATE TABLE src.cni (a int, CONSTRAINT c CHECK (a > 0) NO INHERIT)' ],
-	[ 'cne', 'CREATE TABLE src.cne (a int, CONSTRAINT c CHECK (a > 0) NOT ENFORCED)' ],
 	[ 'uinc', 'CREATE TABLE src.uinc (a int, b int, UNIQUE (a) INCLUDE (b))' ],
 	[ 'uopt', 'CREATE TABLE src.uopt (a int, UNIQUE (a) WITH (fillfactor = 50))' ],
 	[ 'uclu', 'CREATE TABLE src.uclu (a int, CONSTRAINT u UNIQUE (a)); ALTER TABLE src.uclu CLUSTER ON u' ],
