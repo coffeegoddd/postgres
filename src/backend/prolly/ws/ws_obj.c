@@ -517,6 +517,8 @@ static const char *const refusal_sql =
 "    THEN 'it has settings on its TOAST table' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'x') "
 "    THEN 'it depends on an extension' "
+"  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_description m ON m.classoid = 'pg_rewrite'::regclass AND m.objoid = r.oid "
+"      WHERE r.ev_class = c.oid) THEN 'it has a comment on its rule' "
 "  WHEN EXISTS (SELECT 1 FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass AND l.objoid = c.oid) "
 "    THEN 'it has a security label' "
 "  WHEN c.relacl IS NOT NULL AND (SELECT count(*) FROM aclexplode(c.relacl) e WHERE e.grantee = c.relowner) <> "
@@ -525,8 +527,7 @@ static const char *const refusal_sql =
 "        JOIN pg_type t ON (d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid AND t.typrelid = c.oid) "
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n') "
 "    OR EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
-"      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND d.refclassid = 'pg_class'::regclass AND d.refobjid = c.oid "
-"        AND d.refobjsubid <> 0) "
+"      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND d.refclassid = 'pg_class'::regclass AND d.refobjid = c.oid) "
 "    THEN 'it needs itself, as no commit could make it' "
 "  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
 "        CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i "
@@ -547,11 +548,37 @@ static const char *const refusal_sql =
 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 "WHERE n.nspname = $1::name AND c.relkind IN ('v', 'm') ORDER BY 1";
 
+/* (each relation's, column's and rule's row version, as the active snapshot sees them) */
+static char *
+relations_version(const char *schema)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+	char	   *version;
+
+	WsSql->read("SELECT coalesce(md5(string_agg(x, ',' ORDER BY x)), '') FROM ( "
+				"  SELECT 'c' || c.oid || ':' || c.xmin AS x FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'a' || a.attrelid || '.' || a.attnum || ':' || a.xmin FROM pg_attribute a "
+				"    JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'r' || r.oid || ':' || r.xmin FROM pg_rewrite r "
+				"    JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    WHERE n.nspname = $1::name) v", 1, params, &rows);
+	version = pstrdup(ws_sql_value(&rows, 0, 0));
+	ws_sql_rows_free(&rows);
+	return version;
+}
+
 /*
  * What prints a definition reads its names by the catalog as it is now, whatever
  * snapshot is active.  So read as it is now too: lock each object and what it needs,
  * which keeps them from being renamed, until a new snapshot names nothing more to
  * lock.  That snapshot stays pushed, for the caller to pop.
+ *
+ * A transaction on an old snapshot reads everything else as of then, so what it would
+ * read here could not go with it: raises ERRCODE_T_R_SERIALIZATION_FAILURE if the
+ * schema's relations differ from it, to try again.
  */
 static void
 push_locked_snapshot(const char *schema)
@@ -595,20 +622,62 @@ push_locked_snapshot(const char *schema)
 		PopActiveSnapshot();
 	}
 	hash_destroy(locked);
+	if (IsolationUsesXactSnapshot())
+	{
+		char	   *now = relations_version(schema);
+		char	   *then;
+
+		PushCopiedSnapshot(GetTransactionSnapshot());
+		UpdateActiveSnapshotCommandId();
+		then = relations_version(schema);
+		PopActiveSnapshot();
+		if (strcmp(now, then) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not read schema \"%s\": it has changed since this transaction's snapshot", schema)));
+		pfree(now);
+		pfree(then);
+	}
 }
 
-/* Whether a printed query must say what it can only say by naming its schema. */
+/*
+ * What a printed query says by a schema's name it says of that schema, which is no
+ * name another commit's restore would have: only the catalogs may be named.
+ */
 typedef struct NamesSchema
 {
-	const char *schema;
 	const char *why;
 } NamesSchema;
 
 static bool
-qualified_by(List *names, const char *schema)
+qualified(List *names)
 {
 	return list_length(names) >= 2 && IsA(linitial(names), String) &&
-		strcmp(strVal(linitial(names)), schema) == 0;
+		strcmp(strVal(linitial(names)), "pg_catalog") != 0;
+}
+
+/* (a reg* constant is a name in a string, which only the type it is cast to says) */
+static bool
+string_is_qualified(const char *s)
+{
+	const char *p = s;
+	bool		quoted = false;
+	const char *start;
+
+	while (*p == ' ')
+		p++;
+	start = p;
+	for (; *p; p++)
+	{
+		if (*p == '"')
+			quoted = !quoted;
+		else if (!quoted && *p == '(')
+			return false;
+		else if (!quoted && *p == '.')
+			return !((size_t) (p - start) == strlen("pg_catalog") &&
+					 strncmp(start, "pg_catalog", p - start) == 0);
+	}
+	return false;
 }
 
 static bool
@@ -623,23 +692,34 @@ names_schema_walker(Node *node, void *arg)
 	{
 		case T_RangeVar:
 			named = ((RangeVar *) node)->schemaname != NULL &&
-				strcmp(((RangeVar *) node)->schemaname, n->schema) == 0;
+				strcmp(((RangeVar *) node)->schemaname, "pg_catalog") != 0;
 			break;
 		case T_TypeName:
-			named = qualified_by(((TypeName *) node)->names, n->schema);
+			named = qualified(((TypeName *) node)->names);
 			break;
 		case T_FuncCall:
-			named = qualified_by(((FuncCall *) node)->funcname, n->schema);
+			named = qualified(((FuncCall *) node)->funcname);
 			break;
 		case T_A_Expr:
-			named = qualified_by(((A_Expr *) node)->name, n->schema);
+			named = qualified(((A_Expr *) node)->name);
 			break;
 		case T_CollateClause:
-			named = qualified_by(((CollateClause *) node)->collname, n->schema);
+			named = qualified(((CollateClause *) node)->collname);
 			break;
 		case T_SortBy:
-			named = qualified_by(((SortBy *) node)->useOp, n->schema);
+			named = qualified(((SortBy *) node)->useOp);
 			break;
+		case T_TypeCast:
+			{
+				TypeCast   *c = (TypeCast *) node;
+				const char *type = strVal(llast(c->typeName->names));
+
+				if (strncmp(type, "reg", 3) == 0 && IsA(c->arg, A_Const) &&
+					IsA(&((A_Const *) c->arg)->val, String) &&
+					string_is_qualified(strVal(&((A_Const *) c->arg)->val)))
+					named = true;
+				break;
+			}
 		case T_RangeSubselect:
 			{
 				RangeSubselect *r = (RangeSubselect *) node;
@@ -660,7 +740,7 @@ names_schema_walker(Node *node, void *arg)
 	}
 	if (named)
 	{
-		n->why = "it must say its schema's name, having something named as the catalogs' is";
+		n->why = "it must say a schema's name, having something named as the catalogs' is, or from a schema renamed under it";
 		return true;
 	}
 	return raw_expression_tree_walker(node, names_schema_walker, arg);
@@ -671,7 +751,7 @@ static void
 check_query_is_portable(const char *name, const char *schema, const char *query)
 {
 	List	   *parsed = raw_parser(query, RAW_PARSE_DEFAULT);
-	NamesSchema n = {schema, NULL};
+	NamesSchema n = {NULL};
 
 	if (list_length(parsed) != 1)
 		elog(ERROR, "a view's definition is not one query");
@@ -748,7 +828,8 @@ read_deps(WsObject *o, const char *oid)
 				"JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
 				"LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
 				"JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid ELSE t.typrelid END "
-				"WHERE r.ev_class = $1::oid AND d.deptype = 'n' AND q.oid <> $1::oid AND q.relkind IN ('v', 'm')",
+				"WHERE r.ev_class = $1::oid AND d.deptype = 'n' AND q.oid <> $1::oid AND q.relkind IN ('v', 'm') "
+				"AND q.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = $1::oid)",
 				1, params, &rows);
 	o->deps = zeroed(rows.nrows, sizeof(char *));
 	o->ndeps = rows.nrows;
@@ -1276,7 +1357,8 @@ run_statement(Buf *sql)
 /*
  * Refuses a schema with anything a definition's unqualified name could take for what
  * it meant: an exact match here is preferred to a polymorphic one in the catalogs,
- * though the catalogs come first.  A commit's tables are here, and name nothing.
+ * though the catalogs come first.  Types and collations here, which a commit's
+ * tables may need, are matched by name, so the catalogs' come first.
  */
 static void
 check_nothing_captures(const char *schema)
@@ -1287,12 +1369,7 @@ check_nothing_captures(const char *schema)
 	WsSql->run("SELECT what FROM (SELECT 'a function' AS what FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
 			   "    WHERE n.nspname = $1::name "
 			   "  UNION ALL SELECT 'an operator' FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace "
-			   "    WHERE n.nspname = $1::name "
-			   "  UNION ALL SELECT 'a collation' FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace "
-			   "    WHERE n.nspname = $1::name "
-			   "  UNION ALL SELECT 'a type' FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
-			   "    WHERE n.nspname = $1::name AND t.typrelid = 0 "
-			   "      AND NOT EXISTS (SELECT 1 FROM pg_type a WHERE a.typarray = t.oid)) w LIMIT 1", 1, params, &rows);
+			   "    WHERE n.nspname = $1::name) w LIMIT 1", 1, params, &rows);
 	if (rows.nrows > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1337,17 +1414,18 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema)
 			ws_obj_comment_statement(o, k, schema, &sql);
 			run_statement(&sql);
 		}
+		{
+			Buf			sql = BUF_INIT;
+
+			ws_obj_owner_statement(o, schema, &sql);
+			run_statement(&sql);
+		}
+		/* (after its owner: as owner, a grant to who restores it would be no grant) */
 		for (int k = 0; k < o->ngrants; k++)
 		{
 			Buf			sql = BUF_INIT;
 
 			ws_obj_grant_statement(o, k, schema, &sql);
-			run_statement(&sql);
-		}
-		{
-			Buf			sql = BUF_INIT;
-
-			ws_obj_owner_statement(o, schema, &sql);
 			run_statement(&sql);
 		}
 	}

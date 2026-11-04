@@ -99,11 +99,13 @@ extern void ws_obj_free(WsObject *o);
 extern void ws_obj_key(WsObjectKind kind, const char *name, Buf *out);
 
 /*
- * The objects of a schema from the catalogs as they are now, whatever this
- * transaction's snapshot, each locked, with what it needs, until the transaction
- * ends; through WsSql, in key order, in *out, palloc'd, each the caller's to
- * ws_obj_free.  An object it cannot hold raises ERRCODE_FEATURE_NOT_SUPPORTED,
- * naming it: nothing is left out of a commit in silence.
+ * The objects of a schema from the catalogs as they are now, each locked, with what
+ * it needs, until the transaction ends; through WsSql, in key order, in *out,
+ * palloc'd, each the caller's to ws_obj_free.  A transaction on a snapshot the
+ * schema's relations have changed since raises ERRCODE_T_R_SERIALIZATION_FAILURE, as
+ * ws_schema_read does, to try again: tables and objects are of one point in time.  An
+ * object it cannot hold raises ERRCODE_FEATURE_NOT_SUPPORTED, naming it: nothing is
+ * left out of a commit in silence.
  */
 extern void ws_obj_read(const char *schema, WsObject **out, int *n);
 
@@ -133,11 +135,13 @@ extern void ws_obj_owner_statement(const WsObject *o, const char *schema, Buf *o
 extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema, Buf *out);
 
 /*
- * Makes the objects in schema, through WsSql, in restore order, with their comments
- * and grants and then their owners, the tables being there already.  Raises
- * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than
- * they are held, or if the schema holds a function, operator, collation or type, as
- * a definition's unqualified name could be taken for it.
+ * Makes the objects in schema, through WsSql, in restore order, each with its
+ * comments, then its owner, then its grants, the tables being there already.  Raises
+ * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than they
+ * are held, or if the schema holds a function or operator, as a definition's
+ * unqualified name could be taken for it.  Who restores them must be able to SET ROLE
+ * to each owner, with its privileges, and each owner must have CREATE on the schema,
+ * as the server asks of any change of owner.
  */
 extern void ws_obj_restore(const WsObject *objs, int n, const char *schema);
 

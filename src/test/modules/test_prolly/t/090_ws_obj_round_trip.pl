@@ -85,7 +85,7 @@ is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_rewrite r
 	'0', 'and nothing of the source is used');
 is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('Dest ination')}), $held, 'and the same bytes there');
 
-# (restoring a matview runs nothing, and what is needed elsewhere is refused)
+# (what a view needs elsewhere is refused)
 $node->safe_psql('postgres', q{
 	CREATE FUNCTION public.ws_explode() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RAISE 'ran it'; END $$;
 	SET ROLE g_owner;
@@ -105,8 +105,8 @@ my @refused = (
 	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
 	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
 	[ q{CREATE VIEW r_rule AS SELECT a FROM t; CREATE RULE r AS ON DELETE TO r_rule DO INSTEAD NOTHING}, 'a rule', undef, 'DROP VIEW "S rc".r_rule' ],
-	[ q{CREATE TABLE pg_class (x int); CREATE VIEW r_shadow AS SELECT x FROM "S rc".pg_class}, "say its schema's name", undef, 'DROP TABLE "S rc".pg_class CASCADE' ],
-	[ q{CREATE TABLE "text" (x int); CREATE VIEW r_rowtype AS SELECT NULL::"S rc"."text" AS y}, "say its schema's name", undef, 'DROP TABLE "S rc"."text" CASCADE' ],
+	[ q{CREATE TABLE pg_class (x int); CREATE VIEW r_shadow AS SELECT x FROM "S rc".pg_class}, "say a schema's name", undef, 'DROP TABLE "S rc".pg_class CASCADE' ],
+	[ q{CREATE TABLE "text" (x int); CREATE VIEW r_rowtype AS SELECT NULL::"S rc"."text" AS y}, "say a schema's name", undef, 'DROP TABLE "S rc"."text" CASCADE' ],
 	[ q{CREATE VIEW r_nsp AS SELECT '"S rc"'::regnamespace AS n}, 'no commit holds yet', undef, 'DROP VIEW "S rc".r_nsp' ],
 	[ q{CREATE VIEW r_nsp2 AS SELECT 'public'::regnamespace AS n}, 'no commit holds yet', undef, 'DROP VIEW "S rc".r_nsp2' ],
 	[ q{CREATE VIEW r_values (x, y) AS VALUES (1, 2)}, 'a VALUES list', undef, 'DROP VIEW "S rc".r_values' ],
@@ -116,6 +116,10 @@ my @refused = (
 	[ q{CREATE MATERIALIZED VIEW r_comp AS SELECT b FROM t; ALTER MATERIALIZED VIEW r_comp ALTER COLUMN b SET COMPRESSION pglz}, 'stored its own way', undef, 'DROP MATERIALIZED VIEW "S rc".r_comp' ],
 	[ q{CREATE MATERIALIZED VIEW r_toast AS SELECT b FROM t; ALTER MATERIALIZED VIEW r_toast SET (toast.autovacuum_enabled = false)}, 'its TOAST table', undef, 'DROP MATERIALIZED VIEW "S rc".r_toast' ],
 	[ q{CREATE VIEW r_revoked AS SELECT a FROM t; REVOKE DELETE ON r_revoked FROM CURRENT_USER}, 'rights have been changed', undef, 'DROP VIEW "S rc".r_revoked' ],
+	[ q{CREATE VIEW r_self0 AS SELECT 1 AS x; CREATE OR REPLACE VIEW r_self0 AS SELECT 1 AS x FROM r_self0}, 'needs itself', undef, 'DROP VIEW "S rc".r_self0' ],
+	[ q{CREATE VIEW r_self1 AS SELECT 1 AS x; CREATE OR REPLACE VIEW r_self1 AS SELECT 1 AS x WHERE 'r_self1'::regclass::oid > 0}, 'needs itself', undef, 'DROP VIEW "S rc".r_self1' ],
+	[ q{CREATE TABLE pg_type (x int); CREATE VIEW r_regclass AS SELECT '"S rc".pg_type'::regclass::oid AS o}, "say a schema's name", undef, 'DROP TABLE "S rc".pg_type CASCADE' ],
+	[ q{COMMENT ON RULE "_RETURN" ON grouped IS 'on it'}, 'a comment on its rule', undef, q{COMMENT ON RULE "_RETURN" ON "S rc".grouped IS NULL} ],
 	[ q{CREATE VIEW r_login AS SELECT a FROM t; GRANT SELECT ON r_login TO x_person}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_login' ],
 	[ q{CREATE VIEW r_pg AS SELECT a FROM t; GRANT SELECT ON r_pg TO pg_monitor}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_pg' ],
 );
@@ -177,17 +181,66 @@ $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D5')});
 is( $node->safe_psql('postgres', q{SELECT format_type(atttypid, NULL) FROM pg_attribute WHERE attrelid = '"D5".uses_json'::regclass AND attname = 'j'}),
 	'json', 'and without one it means what it did');
 
-# one point in time, by what every read of a definition sees: the catalogs as they are
+# a view over a system view needs nothing a commit holds
+$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE VIEW over_system AS SELECT rolname FROM pg_roles});
+$fresh->('D7');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D7')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_class WHERE oid = '"D7".over_system'::regclass}), '1', 'a view over a system view is held');
+
+# a destination's own types, which a commit's tables may need, are no matter
+$fresh->('D8');
+$node->safe_psql('postgres', q{CREATE TYPE "D8".mood AS ENUM ('ok'); CREATE COLLATION "D8".c2 FROM "C"});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D8')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_class WHERE oid = '"D8".a_top'::regclass}), '1', 'a restore goes on with types there');
+
+# restoring as a role that is not a superuser, with a grant to that role
+$node->safe_psql('postgres', q{CREATE ROLE g_rest NOLOGIN; GRANT g_owner TO g_rest;
+	CREATE SCHEMA s3 AUTHORIZATION g_owner; SET ROLE g_owner; CREATE TABLE s3.t3 (a int); CREATE VIEW s3.v3 AS SELECT a FROM s3.t3; GRANT SELECT ON s3.v3 TO g_rest;
+	RESET ROLE; CREATE SCHEMA d3 AUTHORIZATION g_rest; GRANT CREATE, USAGE ON SCHEMA d3 TO g_owner;
+	SET ROLE g_rest; CREATE TABLE d3.t3 (a int)});
+$node->safe_psql('postgres', q{SET ROLE g_rest; SELECT test_ws_obj_copy('s3', 'd3')});
+is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner), has_table_privilege('g_rest', oid, 'SELECT') FROM pg_class WHERE oid = 'd3.v3'::regclass}),
+	'g_owner|t', 'it restores, and a grant to the role restoring is not lost');
+$node->safe_psql('postgres', q{DROP VIEW d3.v3; GRANT USAGE ON SCHEMA s3 TO g_rest; REVOKE g_owner FROM g_rest});
+($rc, $out, $err) = $node->psql('postgres', q{SET ROLE g_rest; SELECT test_ws_obj_copy('s3', 'd3')});
+like($err, qr/must be able to SET ROLE "g_owner"/, 'one that cannot become its owner is told so');
+
+# in a versioned schema
+{
+	my $branch = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+	local $ENV{PGOPTIONS} = "-c catalog_branch=$branch";
+	$node->safe_psql('postgres', q{CREATE SCHEMA vs AUTHORIZATION g_owner VERSIONED; CREATE SCHEMA vd AUTHORIZATION g_owner VERSIONED;
+		SET ROLE g_owner; CREATE TABLE vs.t (a int); CREATE VIEW vs.v AS SELECT a FROM vs.t; CREATE TABLE vd.t (a int)});
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('vs', 'vd')});
+	is( $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('vd')}),
+		$node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('vs')}),
+		'a versioned schema round-trips as any');
+}
+
+# an old snapshot with the schema changed since is one to try again, with tables
 $node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE VIEW now_a AS SELECT a AS was FROM t});
-my $s = $node->background_psql('postgres');
+my $s = $node->background_psql('postgres', on_error_stop => 0);
+$s->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$s->query_safe('SELECT count(*) FROM pg_class');
+my $unchanged = $s->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
+is($unchanged, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('S rc')}), 'an old snapshot reads a schema not changed since');
+$s->query_safe('COMMIT');
 $s->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $s->query_safe('SELECT count(*) FROM pg_class');
 $node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; ALTER TABLE t RENAME COLUMN a TO a_new; CREATE VIEW later AS SELECT 1 AS x});
-my $rr = $s->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
-$s->query_safe('COMMIT');
-is($rr, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('S rc')}), 'an old snapshot reads what a new one does');
-like($rr, qr/view\/later/, 'names and all');
-like(pack('H*', (split /\t/, (grep { /^view\/now_a\t/ } split /\n/, $rr)[0])[1]), qr/a_new AS was/, 'with no mix of old and new');
+$s->{stderr} = '';
+$s->query(q{SELECT test_ws_obj_bytes('S rc')});
+like($s->{stderr}, qr/could not read schema "S rc": it has changed since this transaction's snapshot/, 'a schema changed since is to be tried again');
+$s->query('ROLLBACK');
+
+# what is read stays as it was read until the transaction ends
+my $holder = $node->background_psql('postgres');
+$holder->query_safe('BEGIN');
+$holder->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
+($rc, $out, $err) = $node->psql('postgres', q{SET lock_timeout = '500ms'; ALTER TABLE "S rc".t RENAME COLUMN a_new TO a_mid});
+like($err, qr/canceling statement due to lock timeout/, 'what a view needs is locked, so it cannot be renamed under the read');
+$holder->query_safe('ROLLBACK');
+$holder->quit;
 
 # and in READ COMMITTED, a rename under way is waited for
 my $renamer = $node->background_psql('postgres');
