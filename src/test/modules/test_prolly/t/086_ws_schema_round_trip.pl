@@ -38,6 +38,14 @@ $node->safe_psql('postgres', q{
 		"a""b" integer GENERATED ALWAYS AS ("Odd Name" + "select") STORED,
 		CONSTRAINT "Odd Key" PRIMARY KEY ("Odd Name"));
 	CREATE UNLOGGED TABLE src.unlogged (a integer);
+	CREATE SCHEMA other;
+	CREATE COLLATION other."My Coll" FROM "C";
+	CREATE DOMAIN other.cdom AS text COLLATE "C";
+	CREATE TYPE public."integer" AS ENUM ('z');
+	CREATE TABLE src.names (a other.cdom, b other.cdom COLLATE "POSIX", c text[] COLLATE "C",
+		d text COLLATE other."My Coll", e public."integer", f integer, g other.cdom COLLATE "default");
+	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
+		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
 		f float8 DEFAULT 0.1, i interval DEFAULT '1 day 2 hours', b bytea DEFAULT '\xab', m money DEFAULT 1);
 	CREATE TABLE src.dropped (a integer, gone integer, b integer DEFAULT 2);
@@ -45,7 +53,7 @@ $node->safe_psql('postgres', q{
 });
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
-	'colls', 'Odd Table', 'unlogged', 'dropped', 'settings');
+	'colls', 'Odd Table', 'unlogged', 'dropped', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -123,14 +131,12 @@ for my $t (
 	[ 'opt', 'CREATE TABLE src.opt (a int); ALTER TABLE src.opt ALTER a SET (n_distinct = 5)' ],
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
-	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
-	[ 'tmp', 'SELECT 1' ])
+	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ])
 {
 	my $name = $t->[2] // $t->[0];
 	$node->safe_psql('postgres', $t->[1]);
 	my ($ret, $out, $err) = $node->psql('postgres',
 		qq{SELECT test_ws_schema_bytes('src', '$name')});
-	next if $name eq 'tmp';
 	like($err, qr/cannot be read yet/, "$name refused");
 }
 my ($tret, $tout, $terr) = $node->psql('postgres',
@@ -140,28 +146,31 @@ like($terr, qr/temporary table "tt" cannot be read yet/, 'a temporary table refu
 $node->safe_psql('postgres', q{
 	CREATE VIEW src.v AS SELECT 1 AS a;
 	CREATE SEQUENCE src.s;
+	CREATE FOREIGN DATA WRAPPER w;
+	CREATE SERVER srv FOREIGN DATA WRAPPER w;
+	CREATE FOREIGN TABLE src.f (a int) SERVER srv;
 });
 is( $node->safe_psql('postgres',
-		q{SELECT test_ws_schema_bytes('src', 'v') IS NULL AND test_ws_schema_bytes('src', 's') IS NULL}),
+		q{SELECT test_ws_schema_bytes('src', 'v') IS NULL AND test_ws_schema_bytes('src', 's') IS NULL
+		    AND test_ws_schema_bytes('src', 'f') IS NULL}),
 	't',
-	'a view or a sequence is no table');
+	'a view, a sequence or a foreign table is no table');
 
-# a name is limited in a commit by UTF8's bytes, on any cluster
-my $sess = $node->background_psql('postgres');
+# a column renamed since the reader's snapshot: not another column's name
+$node->safe_psql('postgres',
+	q{CREATE TABLE src.ren2 (a int, b int, c int GENERATED ALWAYS AS (a * 2) STORED)});
+my $sess = $node->background_psql('postgres', on_error_stop => 0);
 $sess->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
-$node->safe_psql('postgres', q{
-	CREATE TABLE src.ren2 (a int, b int, c int GENERATED ALWAYS AS (a * 2) STORED);
-});
-$sess->query_safe('SELECT 1 FROM pg_class LIMIT 1');
+$sess->query_safe('SELECT count(*) FROM pg_class');
 $node->safe_psql('postgres', q{
 	ALTER TABLE src.ren2 RENAME a TO x;
 	ALTER TABLE src.ren2 RENAME b TO a;
 	ALTER TABLE src.ren2 RENAME x TO b;
 });
-my ($rout, $rerr) = (undef, undef);
-$sess->query_safe('SELECT 1');
-my $ren = $sess->query(q{SELECT count(*) FROM (SELECT test_ws_schema_bytes('src', 'ren2')) x});
-like($sess->{stderr}, qr/(?:has changed since|cannot be read)|^$/, 'a table renamed since a snapshot');
+$sess->query(q{SELECT test_ws_schema_bytes('src', 'ren2')});
+like($sess->{stderr}, qr/was renamed or dropped since this transaction's snapshot/,
+	'columns swapped since a snapshot refused');
+$sess->query('ROLLBACK');
 $sess->quit;
 
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'nosuch') IS NULL}),
@@ -172,6 +181,7 @@ $node->safe_psql('postgres', q{
 	CREATE DATABASE lat ENCODING LATIN1 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C';
 	CREATE SCHEMA enc;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
+		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
 	CREATE TABLE enc."only €" (a integer);
 });
@@ -180,6 +190,7 @@ my $enc_sql = q{
 	CREATE EXTENSION test_prolly;
 	CREATE SCHEMA enc;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
+		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
 	CREATE SCHEMA dst;
 };
@@ -211,6 +222,20 @@ $node->safe_psql('lat', qq{SET client_encoding = UTF8; CREATE TABLE enc."$long" 
 ($ret, $out, $err) = $node->psql('lat',
 	qq{SET client_encoding = UTF8; SELECT test_ws_schema_bytes('enc', '$long')});
 like($err, qr/is too long for version control/, 'a name past the limit in UTF8 refused');
+
+# a name a commit can hold that another encoding holds in more bytes than a
+# name may have: refused, where the grammar would cut it short
+my $wide = "\x{4E42}" x 21;
+utf8::encode($wide);
+$node->safe_psql('postgres', qq{SET client_encoding = UTF8; CREATE TABLE enc."$wide" (a integer)});
+my $wide_hex = $node->safe_psql('postgres',
+	qq{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('enc', '$wide'), 'hex')});
+$node->safe_psql('postgres',
+	q{CREATE DATABASE tw ENCODING EUC_TW TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
+$node->safe_psql('tw', 'CREATE EXTENSION test_prolly; CREATE SCHEMA dst');
+($ret, $out, $err) = $node->psql('tw',
+	qq{SELECT test_ws_schema_create(decode('$wide_hex', 'hex'), 'dst')});
+like($err, qr/too long in this database's encoding/, 'a name too long here refused, not cut');
 
 $node->stop;
 done_testing();

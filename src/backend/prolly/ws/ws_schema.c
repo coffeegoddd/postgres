@@ -811,10 +811,10 @@ static const char *const unsupported_sql =
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
 "  END "
-"FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.oid = $1::oid";
+"FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam WHERE c.oid = $1::oid";
 
 /*
- * The catalogs' rows as this snapshot saw them are the rows there now: names
+ * The columns as this snapshot saw them have the names they have now: names
  * are printed from the caches, not the snapshot, so an older snapshot would
  * put another column's name in an expression.  Under the lock, it holds till
  * the transaction ends.
@@ -839,7 +839,8 @@ check_snapshot_current(const char *table, Oid relid, const WsSqlRows *cols)
 		if (!same)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("table \"%s\" has changed since this transaction's snapshot", table)));
+					 errmsg("a column of table \"%s\" was renamed or dropped since this transaction's snapshot",
+							table)));
 	}
 }
 
