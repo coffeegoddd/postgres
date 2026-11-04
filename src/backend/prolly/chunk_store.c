@@ -96,35 +96,15 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 	 * might have found it before: a reader without one has none of that
 	 * protection, as a TOAST fetch would not)
 	 */
-	if (!HaveRegisteredOrActiveSnapshot())
+	if (!ActiveSnapshotSet())
 		elog(ERROR, "cannot read the history store without an active snapshot");
-	if (!ChunkIndex->lookup(idx, hash, &e))
+	if (!ChunkIndex->lookup_to_read(idx, hash, GetActiveSnapshot(), &e))
 		return NULL;
 	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
 	/*
 	 * (not checked against its name: a page's checksum covers a read, and
 	 * the audit, and a put of bytes from elsewhere, check names)
 	 */
-	ChunkLogOf(log)->read(log, e.loc, data, e.len);
-	*len = e.len;
-	return data;
-}
-
-void *
-ChunkStoreGetAsOf(Relation log, Relation idx, const uint8 *hash, Snapshot snap,
-				  uint32 *len)
-{
-	ChunkIndexEntry e;
-	void	   *data;
-
-	/*
-	 * (one this transaction freed is gone to it, whatever its snapshot: as
-	 * a row it deleted)
-	 */
-	if (!ChunkIndex->lookup_as_of(idx, hash, snap, &e) ||
-		(TransactionIdIsValid(e.xmax) && TransactionIdIsCurrentTransactionId(e.xmax)))
-		return NULL;
-	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
 	ChunkLogOf(log)->read(log, e.loc, data, e.len);
 	*len = e.len;
 	return data;
@@ -155,7 +135,7 @@ ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes, int n,
 	ChunkPlace *places = palloc(Max(n, 1) * sizeof(ChunkPlace));
 	int			found = 0;
 
-	if (!HaveRegisteredOrActiveSnapshot())
+	if (!ActiveSnapshotSet())
 		elog(ERROR, "cannot read the history store without an active snapshot");
 	for (int i = 0; i < n; i++)
 	{
@@ -163,7 +143,8 @@ ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes, int n,
 
 		out[i] = NULL;
 		lens[i] = 0;
-		if (ChunkIndex->lookup(idx, hashes + i * CHUNK_HASH_LEN, &e))
+		if (ChunkIndex->lookup_to_read(idx, hashes + i * CHUNK_HASH_LEN,
+									   GetActiveSnapshot(), &e))
 		{
 			places[found].loc = e.loc;
 			places[found].len = e.len;

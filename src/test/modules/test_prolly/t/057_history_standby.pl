@@ -166,6 +166,23 @@ ok($ended || $count_seen eq '0',
 is($standby->safe_psql('postgres', $new), '1', 'a snapshot after it sees it');
 eval { $frozen_reader->quit; };
 
+# a chunk freed on the primary since a standby query's snapshot, the freeing
+# replayed: read as it was, and not by a snapshot after it
+$primary->safe_psql('postgres',
+	q{SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h('\x0e0e'), '\x0e0e')});
+$primary->wait_for_replay_catchup($standby);
+my $old_reader = $standby->background_psql('postgres');
+$old_reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$old_reader->query_safe('SELECT count(*) FROM pg_class');
+$primary->safe_psql('postgres',
+	q{SELECT test_chunk_free('pg_history.chunks', 'pg_history.chunk_index', h('\x0e0e'))});
+$primary->wait_for_replay_catchup($standby);
+is($standby->safe_psql('postgres', $has->('\x0e0e')), 'f', 'freed on the primary, gone to the standby');
+like($old_reader->query_safe($get->('\x0e0e')), qr/\\x0e0e/,
+	'a standby query whose snapshot is older reads it');
+$old_reader->quit;
+is($standby->safe_psql('postgres', $get->('\x0e0e') . ' IS NULL'), 't', 'a later snapshot does not');
+
 $standby->stop;
 $primary->stop;
 done_testing();
