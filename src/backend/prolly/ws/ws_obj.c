@@ -613,7 +613,7 @@ relations_version(const char *schema)
 	WsSqlRows	rows;
 	char	   *version;
 
-	WsSql->read("SELECT coalesce(encode(sha256(textsend(string_agg(x, ',' ORDER BY x))), 'hex'), '') FROM ( "
+	WsSql->read("SELECT coalesce(string_agg(x, ',' ORDER BY x), '') FROM ( "
 				"  SELECT 'c' || c.oid || ':' || c.relname || ':' || c.relkind::text || ':' || coalesce(c.relacl::text, '') || ':' || "
 				"      coalesce(c.reloptions::text, '') AS x FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"    WHERE n.nspname = $1::name "
@@ -1650,6 +1650,7 @@ static const char *const function_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_seclabel s WHERE s.classoid = 'pg_proc'::regclass AND s.objoid = p.oid) THEN 'it has a security label' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' "
 "      AND d.refclassid = 'pg_proc'::regclass AND d.refobjid = p.oid) THEN 'it needs itself, as no commit could make it' "
+"  WHEN p.procost = 'Infinity'::float4 OR p.prorows = 'Infinity'::float4 THEN 'its COST or ROWS is more than a definition can say' "
 "  WHEN p.procost <> to_char(p.procost::float8::numeric, '9.99999EEEE')::float4 "
 "      OR p.prorows <> to_char(p.prorows::float8::numeric, '9.99999EEEE')::float4 "
 "    THEN 'its COST or ROWS has more digits than a definition prints' "
@@ -1801,9 +1802,12 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
 		check_constants_hold_no_names(name, schema, oid,
-									  "SELECT d.refobjid::text FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass "
+									  /* (what a default has, and a body's other than its arguments' and result) */
+									  "SELECT a::text FROM pg_proc p, unnest(p.proargtypes::oid[]) WITH ORDINALITY u(a, i) "
+									  "WHERE p.oid = $1::oid AND i > p.pronargs - p.pronargdefaults "
+									  "UNION SELECT d.refobjid::text FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass "
 									  "AND d.objid = p.oid WHERE p.oid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass "
-									  "AND (p.proargdefaults IS NOT NULL OR p.prosqlbody IS NOT NULL)");
+									  "AND p.prosqlbody IS NOT NULL AND d.refobjid <> p.prorettype AND NOT d.refobjid = ANY (p.proargtypes::oid[])");
 		read_deps(o, schema, oid, "SELECT 'pg_proc'::regclass::oid, $1::oid");
 
 		/* (it needs a table if a body or a type of it does) */
