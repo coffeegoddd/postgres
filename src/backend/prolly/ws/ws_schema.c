@@ -15,7 +15,9 @@
  * opclass, order byte, nulls byte, and an exclusion's operator), uvarint ninclude
  * and tags, predicate.  A string is its uvarint length and bytes, in its shortest
  * form; a default, collation, not-null constraint's or key's name none is empty,
- * which none is if it is there.
+ * which none is if it is there.  A partitioned table goes on: its kind byte,
+ * uvarint nkeys and each key (uvarint tag, 0 for an expression's, expression if
+ * so, collation, opclass); any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -32,6 +34,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_partitioned_table.h"
 #include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodes.h"
@@ -47,12 +50,18 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
+#include "utils/ruleutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
 
 const WsSchemaCodecRoutine *WsSchemaCodec = &BinaryWsSchemaCodec;
+
+/* (a commit's bytes are the record's, whatever the parser calls these) */
+StaticAssertDecl(WS_PARTITION_RANGE == PARTITION_STRATEGY_RANGE, "partition kinds differ");
+StaticAssertDecl(WS_PARTITION_LIST == PARTITION_STRATEGY_LIST, "partition kinds differ");
+StaticAssertDecl(WS_PARTITION_HASH == PARTITION_STRATEGY_HASH, "partition kinds differ");
 
 static const char *
 own_column_name(void *arg, uint64 tag)
@@ -108,6 +117,56 @@ exclusions_alike(const WsConstraint *a, const WsConstraint *b)
 	return true;
 }
 
+/* What any key of an index or a partitioning has to be. */
+static const char *
+index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
+{
+	if ((key->tag != 0) == (key->expr != NULL))
+		return "a key neither a column nor an expression, or both";
+	if (key->tag != 0)
+	{
+		if (ws_schema_column(s, key->tag) == NULL)
+			return "a key with a column the table does not have";
+	}
+	else
+	{
+		if (key->expr[0] == '\0' || !ws_tags_well_formed(key->expr))
+			return "an expression with malformed column references";
+		if (!refers_to_own_columns(s, key->expr))
+			return "an expression referring to a column the table does not have";
+	}
+	if ((key->collation != NULL && key->collation[0] == '\0') ||
+		(key->opclass != NULL && key->opclass[0] == '\0'))
+		return "a key with an empty collation or opclass";
+	return NULL;
+}
+
+static const char *
+partitioning_problem(const WsTableSchema *s)
+{
+	if (s->partition == WS_PARTITION_NONE)
+		return s->npartition == 0 ? NULL : "partition keys with no partitioning";
+	if (s->partition != WS_PARTITION_RANGE && s->partition != WS_PARTITION_LIST &&
+		s->partition != WS_PARTITION_HASH)
+		return "a partitioning of no known kind";
+	if (s->npartition <= 0 || s->npartition > PARTITION_MAX_KEYS)
+		return "a partitioning of no keys, or too many";
+	if (s->partition == WS_PARTITION_LIST && s->npartition != 1)
+		return "a list partitioning of more than one key";
+	for (int k = 0; k < s->npartition; k++)
+	{
+		const WsIndexKey *key = &s->partition_keys[k];
+		const char *problem = index_key_problem(s, key);
+
+		if (problem != NULL)
+			return problem;
+		if (key->order != WS_INDEX_ORDER_DEFAULT || key->nulls != WS_INDEX_NULLS_DEFAULT ||
+			key->op != NULL)
+			return "a partition key with an order or an operator";
+	}
+	return NULL;
+}
+
 /* What an index and an exclusion's index have to be alike. */
 static const char *
 index_body_problem(const WsTableSchema *s, const WsIndex *ix, bool exclusion)
@@ -123,30 +182,15 @@ index_body_problem(const WsTableSchema *s, const WsIndex *ix, bool exclusion)
 	for (int k = 0; k < ix->nkeys; k++)
 	{
 		const WsIndexKey *key = &ix->keys[k];
+		const char *problem;
 
 		if ((key->op != NULL) != exclusion)
 			return exclusion ? "an exclusion's key with no operator" : "an index's key with an operator";
 		if (exclusion && key->op[0] == '\0')
 			return "an exclusion's key with no operator";
-		if ((key->tag != 0) == (key->expr != NULL))
-			return "an index's key neither a column nor an expression, or both";
-		if (key->tag != 0)
-		{
-			const WsColumn *c = ws_schema_column(s, key->tag);
-
-			if (c == NULL)
-				return "an index with a column the table does not have";
-		}
-		else
-		{
-			if (key->expr[0] == '\0' || !ws_tags_well_formed(key->expr))
-				return "an expression with malformed column references";
-			if (!refers_to_own_columns(s, key->expr))
-				return "an expression referring to a column the table does not have";
-		}
-		if ((key->collation != NULL && key->collation[0] == '\0') ||
-			(key->opclass != NULL && key->opclass[0] == '\0'))
-			return "an index's key with an empty collation or opclass";
+		problem = index_key_problem(s, key);
+		if (problem != NULL)
+			return problem;
 		if (key->order != WS_INDEX_ORDER_DEFAULT && key->order != WS_INDEX_ORDER_DESC)
 			return "an index's key of no known order";
 		if (key->nulls != WS_INDEX_NULLS_DEFAULT && key->nulls != WS_INDEX_NULLS_FIRST &&
@@ -412,6 +456,12 @@ ws_schema_problem(const WsTableSchema *s)
 		if (i > 0 && strcmp(s->indexes[i - 1].name, s->indexes[i].name) >= 0)
 			return "indexes not in order by name";
 	}
+	{
+		const char *problem = partitioning_problem(s);
+
+		if (problem != NULL)
+			return problem;
+	}
 	return column_names_problem(s);
 }
 
@@ -529,6 +579,21 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		buf_append_byte(out, (ix->unique ? IDX_UNIQUE : 0) |
 						(ix->nulls_not_distinct ? IDX_NULLS_NOT_DISTINCT : 0));
 		put_index_body(out, ix, false);
+	}
+	if (s->partition != WS_PARTITION_NONE)
+	{
+		buf_append_byte(out, (uint8) s->partition);
+		buf_append_uvarint(out, (uint64) s->npartition);
+		for (int k = 0; k < s->npartition; k++)
+		{
+			const WsIndexKey *key = &s->partition_keys[k];
+
+			buf_append_uvarint(out, key->tag);
+			if (key->tag == 0)
+				put_string(out, key->expr);
+			put_optional(out, key->collation);
+			put_optional(out, key->opclass);
+		}
 	}
 }
 
@@ -754,6 +819,30 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		get_index_body(&p, end, ix, false);
 	}
 	if (p != end)
+	{
+		s->partition = (char) get_byte(&p, end);
+		if (s->partition == WS_PARTITION_NONE)
+			malformed("it has bytes left over");
+		n = get_uvarint(&p, end);
+		if (n > PARTITION_MAX_KEYS)
+			malformed("a partitioning of too many keys");
+		s->npartition = (int) n;
+		s->partition_keys = px_malloc((size_t) Max(n, 1) * sizeof(WsIndexKey));
+		memset(s->partition_keys, 0, (size_t) Max(n, 1) * sizeof(WsIndexKey));
+		for (int k = 0; k < s->npartition; k++)
+		{
+			WsIndexKey *key = &s->partition_keys[k];
+
+			key->tag = get_uvarint(&p, end);
+			if (key->tag == 0)
+				key->expr = get_string(&p, end);
+			key->collation = get_optional(&p, end);
+			key->opclass = get_optional(&p, end);
+			key->order = WS_INDEX_ORDER_DEFAULT;
+			key->nulls = WS_INDEX_NULLS_DEFAULT;
+		}
+	}
+	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_schema_problem(s);
 	if (problem != NULL)
@@ -810,6 +899,13 @@ ws_schema_free(WsTableSchema *s)
 	for (int i = 0; i < s->nindexes; i++)
 		index_free(&s->indexes[i]);
 	px_free(s->indexes);
+	for (int k = 0; k < s->npartition; k++)
+	{
+		px_free(s->partition_keys[k].expr);
+		px_free(s->partition_keys[k].collation);
+		px_free(s->partition_keys[k].opclass);
+	}
+	px_free(s->partition_keys);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -1066,6 +1162,37 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 			ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
 	}
 	ws_put_text(out, any ? "\n)" : ")");
+	if (s->partition != WS_PARTITION_NONE)
+	{
+		ws_put_text(out, s->partition == WS_PARTITION_RANGE ? " PARTITION BY RANGE (" :
+					s->partition == WS_PARTITION_LIST ? " PARTITION BY LIST (" : " PARTITION BY HASH (");
+		for (int k = 0; k < s->npartition; k++)
+		{
+			const WsIndexKey *key = &s->partition_keys[k];
+
+			if (k > 0)
+				ws_put_text(out, ", ");
+			if (key->tag != 0)
+				ws_put_identifier(out, ws_schema_column(s, key->tag)->name);
+			else
+			{
+				ws_put_text(out, "(");
+				put_expression(s, key->expr, out);
+				ws_put_text(out, ")");
+			}
+			if (key->collation != NULL)
+			{
+				ws_put_text(out, " COLLATE ");
+				ws_put_text(out, key->collation);
+			}
+			if (key->opclass != NULL)
+			{
+				ws_put_text(out, " ");
+				ws_put_text(out, key->opclass);
+			}
+		}
+		ws_put_text(out, ")");
+	}
 }
 
 pg_noreturn static void
@@ -1413,9 +1540,49 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 	}
 }
 
+/* The statement's PARTITION BY is the record's, or there is none in either. */
+static void
+check_partitioning(const WsTableSchema *s, const PartitionSpec *spec)
+{
+	int			k = 0;
+	ListCell   *lc;
+
+	if (s->partition == WS_PARTITION_NONE)
+	{
+		if (spec != NULL)
+			not_the_record(s, "a clause the record does not have");
+		return;
+	}
+	if (spec == NULL || spec->strategy != (PartitionStrategy) s->partition ||
+		list_length(spec->partParams) != s->npartition)
+		not_the_record(s, "another partitioning");
+	foreach(lc, spec->partParams)
+	{
+		PartitionElem *elem = lfirst_node(PartitionElem, lc);
+		const WsIndexKey *key = &s->partition_keys[k++];
+
+		if (!same_names(key->collation, elem->collation) ||
+			!same_names(key->opclass, elem->opclass))
+			not_the_record(s, "another partitioning");
+		if (key->tag != 0)
+		{
+			if (elem->name == NULL || elem->expr != NULL ||
+				strcmp(elem->name, ws_schema_column(s, key->tag)->name) != 0)
+				not_the_record(s, "another partitioning");
+		}
+		else
+		{
+			if (elem->name != NULL || elem->expr == NULL)
+				not_the_record(s, "another partitioning");
+			check_expression(s, key->expr, elem->expr);
+		}
+	}
+}
+
 /*
  * The statement as written is the one the record says, by the grammar: one
- * CREATE TABLE, of this name, these columns, key and constraints, and nothing else.
+ * CREATE TABLE, of this name, these columns, key, constraints and partitioning,
+ * and nothing else.
  * Text in a commit may have come from anywhere, and checking each piece alone
  * says nothing of what the pieces make together: a comment in one hides a
  * quote in the next.  So the whole is what is checked.
@@ -1442,7 +1609,8 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		not_the_record(s, "another table's name");
 	if (create->relation->relpersistence != RELPERSISTENCE_PERMANENT)
 		not_the_record(s, "another persistence");
-	if (create->inhRelations != NIL || create->partbound != NULL || create->partspec != NULL ||
+	check_partitioning(s, create->partspec);
+	if (create->inhRelations != NIL || create->partbound != NULL ||
 		create->ofTypename != NULL || create->constraints != NIL || create->nnconstraints != NIL ||
 		create->options != NIL || create->oncommit != ONCOMMIT_NOOP ||
 		create->tablespacename != NULL || create->accessMethod != NULL || create->if_not_exists)
@@ -1677,6 +1845,14 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	here.indexes = palloc_array(WsIndex, Max(s->nindexes, 1));
 	for (int i = 0; i < s->nindexes; i++)
 		index_in_server_encoding(&s->indexes[i], &here.indexes[i]);
+	here.partition_keys = palloc_array(WsIndexKey, Max(s->npartition, 1));
+	for (int k = 0; k < s->npartition; k++)
+	{
+		here.partition_keys[k] = s->partition_keys[k];
+		here.partition_keys[k].expr = from_utf8(s->partition_keys[k].expr);
+		here.partition_keys[k].collation = from_utf8(s->partition_keys[k].collation);
+		here.partition_keys[k].opclass = from_utf8(s->partition_keys[k].opclass);
+	}
 	*here_out = here;
 }
 
@@ -1768,11 +1944,14 @@ static const char *const unsupported_sql =
 "    AND p.refclassid = 'pg_class'::regclass AND p.refobjid = $1::oid AND p.deptype = 'i' "
 "    AND p.refobjsubid > 0) "
 "SELECT CASE "
-"  WHEN c.relispartition OR c.relkind = 'p' THEN 'it is partitioned' "
+"  WHEN c.relispartition THEN 'it is a partition' "
+"  WHEN c.relkind = 'p' AND EXISTS (SELECT FROM pg_inherits i WHERE i.inhparent = c.oid) "
+"    THEN 'it has partitions' "
 "  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
 "  WHEN EXISTS (SELECT FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) "
 "    THEN 'it has inheritance' "
-"  WHEN am.amname <> 'heap' THEN 'it has another access method' "
+"  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
+"    THEN 'it has another access method' "
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
 "  WHEN c.reloptions IS NOT NULL OR tc.reloptions IS NOT NULL "
 "    THEN 'it has storage parameters' "
@@ -1785,10 +1964,10 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND "
-"                 ((k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
+"                 (NOT x.indisvalid OR (k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
 "                  x.indnkeyatts <> x.indnatts OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
-"    THEN 'a key or unique constraint has more than columns' "
+"    THEN 'a key or unique constraint has more than columns, or is not valid' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_constraint k2 ON k2.conrelid = k.conrelid AND k2.oid > k.oid "
 "               JOIN pg_index x2 ON x2.indexrelid = k2.conindid "
@@ -2126,6 +2305,68 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 	ix->predicate = predicate ? stored_expression(predicate, rc) : NULL;
 }
 
+/*
+ * How a partitioned table's rows divide, from the clause the server prints for
+ * it, as an index is above; but its expressions are one list in the catalog, with
+ * no way to print the nth but this.
+ */
+static void
+read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	printed;
+	List	   *parsed;
+	PartitionSpec *spec;
+	HeapTuple	tup = SearchSysCache1(PARTRELID, ObjectIdGetDatum(atooid(oid)));
+	List	   *exprs = NIL;
+	List	   *context = deparse_context_for(table, atooid(oid));
+	int			nexpr = 0;
+	int			k = 0;
+	ListCell   *lc;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "partitioned table \"%s\" has no partitioning", table);
+	{
+		bool		isnull;
+		Datum		datum = SysCacheGetAttr(PARTRELID, tup, Anum_pg_partitioned_table_partexprs, &isnull);
+
+		if (!isnull)
+			exprs = (List *) stringToNode(TextDatumGetCString(datum));
+	}
+	ReleaseSysCache(tup);
+	WsSql->run("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
+	if (ws_sql_value(&printed, 0, 0) == NULL)
+		elog(ERROR, "partitioned table \"%s\" printed no partitioning", table);
+	parsed = raw_parser(psprintf("CREATE TABLE t () PARTITION BY %s", ws_sql_value(&printed, 0, 0)),
+						RAW_PARSE_DEFAULT);
+	ws_sql_rows_free(&printed);
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateStmt))
+		elog(ERROR, "partitioned table \"%s\" printed as something else", table);
+	spec = ((CreateStmt *) linitial_node(RawStmt, parsed)->stmt)->partspec;
+	if (spec == NULL)
+		elog(ERROR, "partitioned table \"%s\" printed as something else", table);
+	out->partition = (char) spec->strategy;
+	out->npartition = list_length(spec->partParams);
+	out->partition_keys = px_malloc((size_t) Max(out->npartition, 1) * sizeof(WsIndexKey));
+	memset(out->partition_keys, 0, (size_t) Max(out->npartition, 1) * sizeof(WsIndexKey));
+	foreach(lc, spec->partParams)
+	{
+		PartitionElem *elem = lfirst_node(PartitionElem, lc);
+		WsIndexKey *key = &out->partition_keys[k++];
+
+		if (elem->name != NULL)
+			key->tag = index_col_tag(table, rc, elem->name);
+		else
+			key->expr = stored_expression(deparse_expression(list_nth(exprs, nexpr++), context, false, false), rc);
+		names_fit(elem->collation);
+		names_fit(elem->opclass);
+		key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
+		key->opclass = elem->opclass ? to_utf8(NameListToQuotedString(elem->opclass)) : NULL;
+		key->order = WS_INDEX_ORDER_DEFAULT;
+		key->nulls = WS_INDEX_NULLS_DEFAULT;
+	}
+}
+
 static int
 index_cmp(const void *a, const void *b)
 {
@@ -2385,6 +2626,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		read_index(table, &idxs, i, &rc, &out->indexes[i]);
 	if (out->nindexes > 1)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
+	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
+		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
 	pfree(rc.names);
 	pfree(rc.tags);
 	ws_sql_rows_free(&rel);
