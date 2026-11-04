@@ -526,11 +526,14 @@ check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
 	buf_append_byte(&text, 0);
 	sql = psprintf("SELECT (%s)", (char *) text.data);
 	parsed = parse_text(s, sql);
-	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
+	/* (a length only if a semicolon ended it, the wrapper's parenthesis then a comment) */
+	if (list_length(parsed) != 1 || linitial_node(RawStmt, parsed)->stmt_len != 0 ||
+		!IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
 		not_the_record(s, "a column's expression");
 	select = (SelectStmt *) linitial_node(RawStmt, parsed)->stmt;
 	/* (one target, and no other clause: nothing of a query but the expression) */
 	if (list_length(select->targetList) != 1 ||
+		linitial_node(ResTarget, select->targetList)->name != NULL ||
 		select->fromClause != NIL || select->whereClause != NULL ||
 		select->groupClause != NIL || select->havingClause != NULL ||
 		select->windowClause != NIL || select->sortClause != NIL ||

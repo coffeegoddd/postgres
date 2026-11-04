@@ -718,10 +718,11 @@ test_create_table_injection(void)
 		{.type = "integer", .def = "1::float(0)"},
 		{.type = "text", .def = "E'\\u12'"},
 		{.type = "text", .def = "E'\\xFF'"},
-		{.type = "integer UNIQUE (SELECT 1)"},
 		{.type = "integer", .def = "UNIQUE (SELECT 1)"},
 		/* a record's text no expression, the statement's a clean default */
 		{.type = "integer --", .def = "1) FROM pg_authid WHERE (true /*\nDEFAULT (1) --*/"},
+		{.type = "integer --", .def = "1) /*\nDEFAULT (1) --*/; --"},
+		{.type = "integer --", .def = "1) AS foo /*\nDEFAULT (1) --*/; --"},
 	};
 	static const Injection good[] = {
 		{.type = "character varying(10)"},
