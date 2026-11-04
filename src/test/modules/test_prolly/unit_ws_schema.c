@@ -1197,10 +1197,18 @@ index_spanned(void *arg)
 		{.expr = "1) --",.order = 'd',.nulls = 'd'},
 		{.expr = (char *) arg,.order = 'd',.nulls = 'd'},
 	};
+	uint64		b_tag[] = {8};
+	const char *expr = arg;
 	WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 2,.keys = keys};
 	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nindexes = 1,.indexes = &ix};
 	Buf			b = BUF_INIT;
 
+	/* (INCLUDE compared whole: the count alone would refuse it otherwise) */
+	if (strstr(expr, "INCLUDE (b DESC)") != NULL)
+	{
+		ix.ninclude = 1;
+		ix.include = b_tag;
+	}
 	ws_schema_create_index(&s, 0, "x", &b);
 }
 
