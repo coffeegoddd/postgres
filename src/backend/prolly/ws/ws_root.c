@@ -13,7 +13,7 @@
  */
 #include "postgres.h"
 
-#include "common/string.h"
+#include "mb/pg_wchar.h"
 #include "prolly/engine/vc.h"
 #include "prolly/ws/ws_root.h"
 #include "utils/builtins.h"
@@ -27,7 +27,7 @@ static const char *const map_keys[] = {
 	[WS_ROOT_VIOLATIONS] = "~viol",
 };
 
-static void
+pg_noreturn static void
 corrupt(const char *what)
 {
 	ereport(ERROR,
@@ -56,17 +56,11 @@ root_put_table(ProllyCtx *ctx, const PHash *rv, const WsTableSchema *s, const PH
 {
 	Buf			bytes = BUF_INIT;
 	char	   *key;
-	VcTable		was;
-	PHash		now;
 
 	/* (raises an error if the record has a problem) */
 	WsSchemaCodec->encode(s, &bytes);
 	key = table_key(s->name);
-	if (vc_table_get(ctx, rv, key, &was))
-		root_must(ctx, vc_table_alter(ctx, rv, key, bytes.data, bytes.len, &now));
-	else
-		root_must(ctx, vc_table_create(ctx, rv, key, bytes.data, bytes.len, &now));
-	root_must(ctx, vc_table_set_data(ctx, &now, key, rows, out));
+	vc_table_put(ctx, rv, key, bytes.data, bytes.len, rows, out);
 	pfree(key);
 	buf_free(&bytes);
 }
@@ -134,20 +128,21 @@ root_tables(ProllyCtx *ctx, const PHash *rv, WsRootTableFn fn, void *arg)
 	while (more && (rc = prolly_iter_next(it, &key, &klen, &val, &vlen)) > 0)
 	{
 		char	   *name;
-		char	   *entry;
+		size_t		nlen;
 		VcTable		t;
 
 		if (is_map_key(key, klen))
 			continue;
-		if (klen <= TABLE_PREFIX_LEN || memcmp(key, TABLE_PREFIX, TABLE_PREFIX_LEN) != 0 ||
-			memchr(key, 0, klen) != NULL)
+		if (klen <= TABLE_PREFIX_LEN || memcmp(key, TABLE_PREFIX, TABLE_PREFIX_LEN) != 0)
 			corrupt("has an entry that is nothing known");
-		name = pnstrdup((const char *) key + TABLE_PREFIX_LEN, klen - TABLE_PREFIX_LEN);
-		entry = table_key(name);
-		if (!vc_table_get(ctx, rv, entry, &t))
-			corrupt("lost an entry while it was read");
-		more = fn(arg, name, &t.data);
-		pfree(entry);
+		nlen = klen - TABLE_PREFIX_LEN;
+		/* (as a record's name is: the name a caller is given is a name) */
+		if (nlen >= NAMEDATALEN ||
+			!pg_verify_mbstr(PG_UTF8, (const char *) key + TABLE_PREFIX_LEN, (int) nlen, true))
+			corrupt("has a table's entry that names no table");
+		vc_table_decode(val, vlen, &t);
+		name = pnstrdup((const char *) key + TABLE_PREFIX_LEN, nlen);
+		more = fn(arg, name, &t);
 		pfree(name);
 	}
 	if (more)
@@ -155,20 +150,16 @@ root_tables(ProllyCtx *ctx, const PHash *rv, WsRootTableFn fn, void *arg)
 	prolly_iter_close(it);
 }
 
-static PHash
-root_get_map(ProllyCtx *ctx, const PHash *rv, WsRootMap which)
+static bool
+root_get_map(ProllyCtx *ctx, const PHash *rv, WsRootMap which, PHash *map)
 {
 	VcTable		t;
 	uint8	   *bytes;
 	size_t		len;
 	uint64		count;
-	PHash		empty;
 
 	if (!vc_table_get(ctx, rv, map_keys[which], &t))
-	{
-		root_must(ctx, prolly_empty(ctx, 0, &empty));
-		return empty;
-	}
+		return false;
 	bytes = vc_schema_get(ctx, &t.schema, &len);
 	if (bytes == NULL || len != 0)
 		corrupt("has a map's entry with a schema");
@@ -176,7 +167,8 @@ root_get_map(ProllyCtx *ctx, const PHash *rv, WsRootMap which)
 	root_must(ctx, prolly_count(ctx, &t.data, &count));
 	if (count == 0)
 		corrupt("has a map's entry with nothing in it");
-	return t.data;
+	*map = t.data;
+	return true;
 }
 
 static void
@@ -186,7 +178,6 @@ root_put_map(ProllyCtx *ctx, const PHash *rv, WsRootMap which, const PHash *map,
 	VcTable		t;
 	bool		has = vc_table_get(ctx, rv, key, &t);
 	uint64		count;
-	PHash		now;
 
 	root_must(ctx, prolly_count(ctx, map, &count));
 	if (count == 0)
@@ -197,11 +188,7 @@ root_put_map(ProllyCtx *ctx, const PHash *rv, WsRootMap which, const PHash *map,
 			*out = *rv;
 		return;
 	}
-	if (has)
-		now = *rv;
-	else
-		root_must(ctx, vc_table_create(ctx, rv, key, "", 0, &now));
-	root_must(ctx, vc_table_set_data(ctx, &now, key, map, out));
+	vc_table_put(ctx, rv, key, "", 0, map, out);
 }
 
 const WsRootRoutine MapWsRoot = {

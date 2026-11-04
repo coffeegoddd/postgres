@@ -17,7 +17,11 @@
  * reached.
  *
  * The columns' tags and names are in the tables' records and nowhere else, so
- * no second copy can disagree with them.
+ * no second copy can disagree with them.  A tag is unique within its table, not
+ * across them.
+ *
+ * Row maps and maps are of vrefs 0.  Merging these roots is this library's, not
+ * vc_merge_roots's, which would leave a map's entry with nothing in it.
  *
  * Reads raise ERRCODE_DATA_CORRUPTED for what no writer here makes, as a
  * commit may come from anywhere.  Holds are as prolly/engine/prolly.h says.
@@ -32,6 +36,7 @@
 #define PROLLY_WS_ROOT_H
 
 #include "prolly/engine/prolly.h"
+#include "prolly/engine/vc.h"
 #include "prolly/ws/ws_schema.h"
 
 typedef enum WsRootMap
@@ -41,8 +46,8 @@ typedef enum WsRootMap
 	WS_ROOT_VIOLATIONS,
 } WsRootMap;
 
-/* Each table's name (UTF8, in name order) and row map; ends early on false. */
-typedef bool (*WsRootTableFn) (void *arg, const char *name, const PHash *rows);
+/* Each table's name (UTF8, in name order) and entry; ends early on false. */
+typedef bool (*WsRootTableFn) (void *arg, const char *name, const VcTable *entry);
 
 typedef struct WsRootRoutine
 {
@@ -63,8 +68,8 @@ typedef struct WsRootRoutine
 	/* Every table; raises an error for an entry that is nothing here. */
 	void		(*tables) (ProllyCtx *ctx, const PHash *rv, WsRootTableFn fn, void *arg);
 
-	/* A map's root, an empty map if it has no entry. */
-	PHash		(*get_map) (ProllyCtx *ctx, const PHash *rv, WsRootMap which);
+	/* A map's root; false if it holds nothing.  Writes nothing, as a read must. */
+	bool		(*get_map) (ProllyCtx *ctx, const PHash *rv, WsRootMap which, PHash *map);
 
 	/* Sets a map, removing its entry if it holds nothing. */
 	void		(*put_map) (ProllyCtx *ctx, const PHash *rv, WsRootMap which,

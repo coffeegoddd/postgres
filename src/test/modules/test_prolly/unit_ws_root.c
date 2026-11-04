@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "engine_test_util.h"
 #include "prolly/ws/ws_root.h"
 #include "test_prolly.h"
@@ -50,6 +51,7 @@ ENGINE_TEST(test_tables)
 	PHash		empty_rv = rv;
 	PHash		rows = one_row_map(&ctx, "a");
 	WsTableSchema s = record_named("t");
+	WsTableSchema changed = record_named("t");
 	WsTableSchema got;
 	PHash		got_rows;
 	PHash		after;
@@ -69,6 +71,14 @@ ENGINE_TEST(test_tables)
 		CHECK(memcmp(after.b, rv.b, PHASH_LEN) != 0);
 		WsRoot->put_table(&ctx, &after, &s, &rows, &after);
 		CHECK(memcmp(after.b, rv.b, PHASH_LEN) == 0);
+
+		/* the record too */
+		changed.ncols = 1;
+		WsRoot->put_table(&ctx, &rv, &changed, &rows, &after);
+		CHECK(memcmp(after.b, rv.b, PHASH_LEN) != 0);
+		CHECK(WsRoot->get_table(&ctx, &after, "t", &got, &got_rows));
+		CHECK_EQ(got.ncols, 1);
+		ws_schema_free(&got);
 	}
 
 	CHECK(!WsRoot->drop_table(&ctx, &rv, "nosuch", &after));
@@ -88,13 +98,27 @@ ENGINE_TEST(test_names_apart)
 	WsTableSchema got;
 	PHash		got_rows;
 	PHash		map;
+	static const char *const odd[] = {
+		"a/b", "/", "t/x", "caf\xc3\xa9",
+		"123456789012345678901234567890123456789012345678901234567890123",
+	};
 
+	for (int i = 0; i < lengthof(odd); i++)
+	{
+		WsTableSchema named = record_named(odd[i]);
+		PHash		with;
+
+		WsRoot->put_table(&ctx, &rv, &named, &rows, &with);
+		CHECK(WsRoot->get_table(&ctx, &with, odd[i], &got, &got_rows));
+		CHECK(strcmp(got.name, odd[i]) == 0);
+		ws_schema_free(&got);
+	}
 	WsRoot->put_table(&ctx, &rv, &s, &rows, &rv);
 	WsRoot->put_map(&ctx, &rv, WS_ROOT_OBJECTS, &objs, &rv);
 	CHECK(WsRoot->get_table(&ctx, &rv, "~obj", &got, &got_rows));
 	CHECK(memcmp(got_rows.b, rows.b, PHASH_LEN) == 0);
 	ws_schema_free(&got);
-	map = WsRoot->get_map(&ctx, &rv, WS_ROOT_OBJECTS);
+	CHECK(WsRoot->get_map(&ctx, &rv, WS_ROOT_OBJECTS, &map));
 	CHECK(memcmp(map.b, objs.b, PHASH_LEN) == 0);
 }
 
@@ -106,7 +130,7 @@ typedef struct Seen
 } Seen;
 
 static bool
-see_table(void *arg, const char *name, const PHash *rows)
+see_table(void *arg, const char *name, const VcTable *entry)
 {
 	Seen	   *seen = arg;
 
@@ -156,17 +180,15 @@ ENGINE_TEST(test_maps)
 	PHash		out;
 
 	CHECK_EQ(prolly_empty(&ctx, 0, &empty), PROLLY_OK);
-	got = WsRoot->get_map(&ctx, &rv, WS_ROOT_VIOLATIONS);
-	CHECK(memcmp(got.b, empty.b, PHASH_LEN) == 0);
+	CHECK(!WsRoot->get_map(&ctx, &rv, WS_ROOT_VIOLATIONS, &got));
 
 	WsRoot->put_map(&ctx, &rv, WS_ROOT_VIOLATIONS, &empty, &out);
 	CHECK(memcmp(out.b, first.b, PHASH_LEN) == 0);
 
 	WsRoot->put_map(&ctx, &rv, WS_ROOT_VIOLATIONS, &map, &rv);
-	got = WsRoot->get_map(&ctx, &rv, WS_ROOT_VIOLATIONS);
+	CHECK(WsRoot->get_map(&ctx, &rv, WS_ROOT_VIOLATIONS, &got));
 	CHECK(memcmp(got.b, map.b, PHASH_LEN) == 0);
-	got = WsRoot->get_map(&ctx, &rv, WS_ROOT_OBJECTS);
-	CHECK(memcmp(got.b, empty.b, PHASH_LEN) == 0);
+	CHECK(!WsRoot->get_map(&ctx, &rv, WS_ROOT_OBJECTS, &got));
 
 	WsRoot->put_map(&ctx, &rv, WS_ROOT_VIOLATIONS, &map, &out);
 	CHECK(memcmp(out.b, rv.b, PHASH_LEN) == 0);
@@ -182,7 +204,7 @@ typedef struct Damage
 } Damage;
 
 static bool
-list_all(void *arg, const char *name, const PHash *rows)
+list_all(void *arg, const char *name, const VcTable *entry)
 {
 	return true;
 }
@@ -209,8 +231,40 @@ static void
 read_objects(void *arg)
 {
 	Damage	   *d = arg;
+	PHash		map;
 
-	(void) WsRoot->get_map(d->ctx, &d->rv, WS_ROOT_OBJECTS);
+	(void) WsRoot->get_map(d->ctx, &d->rv, WS_ROOT_OBJECTS, &map);
+}
+
+/* An error's code and message: a code alone could be any failure's. */
+static void
+check_refused(void (*fn) (void *), void *arg, int code, const char *why)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *edata = NULL;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		fn(arg);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (edata == NULL)
+		elog(ERROR, "no error, for: %s", why);
+	if (edata->sqlerrcode != code || strstr(edata->message, why) == NULL)
+		elog(ERROR, "not refused for %s: %s", why, edata->message);
+	FreeErrorData(edata);
 }
 
 static void
@@ -243,13 +297,26 @@ ENGINE_TEST(test_refused)
 
 	/* an entry that is nothing known */
 	CHECK_EQ(vc_table_create(&ctx, &empty_rv, "plain", "", 0, &d.rv), VC_OK);
-	expect_error(read_tables, &d, ERRCODE_DATA_CORRUPTED, NULL);
+	check_refused(read_tables, &d, ERRCODE_DATA_CORRUPTED, "nothing known");
+
+	/* a table's entry naming no table: not UTF8, and too long for a name */
+	CHECK_EQ(vc_table_create(&ctx, &empty_rv, "t/\xff", "", 0, &d.rv), VC_OK);
+	check_refused(read_tables, &d, ERRCODE_DATA_CORRUPTED, "names no table");
+	{
+		char		key[NAMEDATALEN + 8];
+
+		memset(key, 'x', sizeof(key));
+		memcpy(key, "t/", 2);
+		key[NAMEDATALEN + 2] = '\0';
+		CHECK_EQ(vc_table_create(&ctx, &empty_rv, key, "", 0, &d.rv), VC_OK);
+		check_refused(read_tables, &d, ERRCODE_DATA_CORRUPTED, "names no table");
+	}
 
 	/* a table's entry holding another table's record */
 	WsSchemaCodec->encode(&other, &bytes);
 	CHECK_EQ(vc_table_create(&ctx, &empty_rv, "t/t", bytes.data, bytes.len, &d.rv), VC_OK);
 	d.name = "t";
-	expect_error(read_table, &d, ERRCODE_DATA_CORRUPTED, NULL);
+	check_refused(read_table, &d, ERRCODE_DATA_CORRUPTED, "another table's record");
 
 	/* a table's entry holding no record */
 	CHECK_EQ(vc_table_create(&ctx, &empty_rv, "t/t", "junk", 4, &d.rv), VC_OK);
@@ -258,15 +325,36 @@ ENGINE_TEST(test_refused)
 	/* a map's entry with a schema */
 	CHECK_EQ(vc_table_create(&ctx, &empty_rv, "~obj", "x", 1, &d.rv), VC_OK);
 	CHECK_EQ(vc_table_set_data(&ctx, &d.rv, "~obj", &rows, &d.rv), VC_OK);
-	expect_error(read_objects, &d, ERRCODE_DATA_CORRUPTED, NULL);
+	check_refused(read_objects, &d, ERRCODE_DATA_CORRUPTED, "with a schema");
 
 	/* a map's entry with nothing in it: another root for one state */
 	CHECK_EQ(vc_table_create(&ctx, &empty_rv, "~obj", "", 0, &d.rv), VC_OK);
-	expect_error(read_objects, &d, ERRCODE_DATA_CORRUPTED, NULL);
+	check_refused(read_objects, &d, ERRCODE_DATA_CORRUPTED, "with nothing in it");
 
 	/* a record with a problem is not written */
 	d.rv = empty_rv;
-	expect_error(put_bad_record, &d, ERRCODE_INTERNAL_ERROR, NULL);
+	check_refused(put_bad_record, &d, ERRCODE_INTERNAL_ERROR, "more columns than the table has");
+}
+
+/* A read writes nothing: a root's maps, in a transaction that may not write. */
+ENGINE_TEST(test_read_only)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	PHash		rv = vc_root_empty(&ctx);
+	PHash		map;
+	bool		was = XactReadOnly;
+
+	XactReadOnly = true;
+	PG_TRY();
+	{
+		CHECK(!WsRoot->get_map(&ctx, &rv, WS_ROOT_VIOLATIONS, &map));
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was;
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -298,6 +386,7 @@ test_seq(void)
 	static const char *const bad[] = {
 		"", "t", "1", "1x", "01t", "+1t", " 1t", "1 t", "-0t", "1.5t",
 		"9223372036854775808t", "-9223372036854775809f", "1tt",
+		"99999999999999999999999999999999999999t",
 	};
 
 	for (int i = 0; i < lengthof(good); i++)
@@ -323,6 +412,7 @@ static const ProllyUnitTest tests[] = {
 	{"listing", test_listing},
 	{"maps", test_maps},
 	{"refused", test_refused},
+	{"read_only", test_read_only},
 	{"seq", test_seq},
 };
 

@@ -202,6 +202,11 @@ typedef void (*VcBranchFn) (void *arg, const VcBranch *b);
 extern PHash vc_root_empty(ProllyCtx *ctx);
 extern bool vc_table_get(ProllyCtx *ctx, const PHash *rv, const char *name,
 						 VcTable *out);
+/* A root value's entry from its value; raises an error if it is none. */
+extern void vc_table_decode(const uint8 *val, size_t len, VcTable *out);
+/* Sets an entry whole, new or in place of what it was. */
+extern void vc_table_put(ProllyCtx *ctx, const PHash *rv, const char *name,
+						 const void *schema, size_t slen, const PHash *data, PHash *out);
 extern int	vc_table_create(ProllyCtx *ctx, const PHash *rv, const char *name,
 							const void *schema, size_t slen, PHash *out);
 extern int	vc_table_alter(ProllyCtx *ctx, const PHash *rv, const char *name,
