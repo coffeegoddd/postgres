@@ -547,7 +547,7 @@ test_malformed(void)
 		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00" "\x00", 8, "more columns than a table can have"},
 		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00" "\x00", 10, "a key of more columns"},
 		/* constraints */
-		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x08" "\x01" "x" "\x00", 24, "flags not known"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x40" "\x01" "x" "\x00", 24, "flags not known"},
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "z" "\x00" "\x01" "\x07" "\x00", 24, "no known kind"},
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x7f" "\x01" "\x00", 19, "more constraints than bytes"},
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x02" "\x07" "\x07" "\x00", 25, "more columns than the table has"},
@@ -1503,6 +1503,129 @@ test_partition_injection(void)
 	}
 }
 
+/* A partition: the record, its bytes and its statement. */
+static void
+test_partition(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition = WS_PARTITION_RANGE,
+		.npartition = 1,.partition_keys = &key,.partition_of = "Odd Parent",
+	.partition_bound = "FOR VALUES FROM (1) TO (2)"};
+	static const char want[] =
+		"\x01" "\x01" "c" "\x01"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00" "\x00" "\x00"
+		"r" "\x01" "\x07" "\x00" "\x00"
+		"o" "\x0a" "Odd Parent" "\x1a" "FOR VALUES FROM (1) TO (2)";
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(strcmp(got.partition_of, "Odd Parent") == 0 && got.partition == WS_PARTITION_RANGE);
+	CHECK(strcmp(got.partition_bound, "FOR VALUES FROM (1) TO (2)") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+
+	/* (a partition that is not partitioned itself: the section alone) */
+	s.partition = WS_PARTITION_NONE;
+	s.npartition = 0;
+	s.partition_keys = NULL;
+	s.partition_bound = "DEFAULT";
+	b = (Buf) BUF_INIT;
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.partition == WS_PARTITION_NONE && strcmp(got.partition_bound, "DEFAULT") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+
+	ws_schema_attach(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data, "ALTER TABLE x.\"Odd Parent\" ATTACH PARTITION x.c DEFAULT") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	/* (the table's own statement says nothing of it) */
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strstr((char *) sql.data, "PARTITION") == NULL);
+	buf_free(&sql);
+
+	s.partition_of = NULL;
+	CHECK(problem_has(ws_schema_problem(&s), "no table or no bound"));
+	s.partition_of = "p";
+	s.partition_bound = NULL;
+	CHECK(problem_has(ws_schema_problem(&s), "no table or no bound"));
+	s.partition_bound = "";
+	CHECK(problem_has(ws_schema_problem(&s), "empty bound"));
+	s.partition_bound = "DEFAULT";
+	s.partition_of = "";
+	CHECK(problem_has(ws_schema_problem(&s), "no name"));
+	s.partition_of = "c";
+	CHECK(problem_has(ws_schema_problem(&s), "of itself"));
+}
+
+static void
+attach_injected(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition_of = "p",.partition_bound = (char *) arg};
+	Buf			b = BUF_INIT;
+
+	ws_schema_attach(&s, "x", &b);
+}
+
+static void
+attach_of_no_partition(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_attach(&s, "x", &b);
+}
+
+static void
+test_partition_refused(void)
+{
+	static const char *const bad[] = {
+		"DEFAULT; DROP TABLE x.c",
+		"DEFAULT; SELECT 1",
+		"FOR VALUES IN (1), ADD CHECK (false)",
+		"FOR VALUES IN (1) TABLESPACE x",
+		"FOR VALUES IN (1) USING heap",
+		"FOR VALUES IN (1) WITH (fillfactor = 10)",
+		"FOR VALUES IN (1) PARTITION BY HASH (a)",
+		"(a int) DEFAULT",
+		"DEFAULT CONCURRENTLY",
+		"CONCURRENTLY",
+		"FINALIZE",
+		"x",
+	};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(attach_injected, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(attach_of_no_partition, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	{
+		static const char cut[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "o" "\x01" "p";
+		static const char over[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "o" "\x01" "p" "\x01" "x" "o";
+		static const char swapped[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "o" "\x01" "p" "\x01" "x" "h" "\x01" "\x07" "\x00" "\x00";
+
+		check_refused(cut, sizeof(cut) - 1, "ends early");
+		check_refused(over, sizeof(over) - 1, "left over");
+		check_refused(swapped, sizeof(swapped) - 1, "left over");
+	}
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -1821,6 +1944,159 @@ test_exclusion_injection(void)
 	refused_saying(exclusion_spanned, "2 /*\n, ((2)) WITH OPERATOR(=)) -- */", "syntax error");
 }
 
+/* A check's flags: the bytes, and which statement says each. */
+static void
+test_check_flags(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint cons[] = {
+		{.name = "ni",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 1)",.no_inherit = true},
+		{.name = "not en",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 2)",.not_enforced = true},
+		{.name = "nv",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 3)",.not_valid = true},
+		{.name = "nv2",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{7} > 4)",.not_valid = true,.no_inherit = true},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 4,.constraints = cons};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x01"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"			/* no key */
+		"\x04"					/* constraints */
+		"\x02" "ni" "c" "\x10" "\x0a" "(@{7} > 1)"
+		"\x06" "not en" "c" "\x20" "\x0a" "(@{7} > 2)"
+		"\x02" "nv" "c" "\x08" "\x0a" "(@{7} > 3)"
+		"\x03" "nv2" "c" "\x18" "\x0a" "(@{7} > 4)"
+		"\x00";					/* indexes */
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.constraints[0].no_inherit && !got.constraints[0].not_valid && !got.constraints[0].not_enforced);
+	CHECK(got.constraints[1].not_enforced && !got.constraints[1].no_inherit);
+	CHECK(got.constraints[3].not_valid && got.constraints[3].no_inherit);
+	ws_schema_free(&got);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a integer,\n"
+				 "    CONSTRAINT ni CHECK ((a > 1)) NO INHERIT,\n"
+				 "    CONSTRAINT \"not en\" CHECK ((a > 2)) NOT ENFORCED\n"
+				 ")") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	ws_schema_add_check(&s, 3, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "ALTER TABLE x.t ADD CONSTRAINT nv2 CHECK ((a > 4)) NO INHERIT NOT VALID") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+static void
+check_flags_problem(const WsConstraint *con, const char *why)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = (WsConstraint *) con};
+	const char *problem = ws_schema_problem(&s);
+
+	if (problem == NULL || strstr(problem, why) == NULL)
+		elog(ERROR, "for \"%s\": %s", why, problem ? problem : "no problem found");
+}
+
+typedef struct AddCheck
+{
+	const char *expr;
+	bool		no_inherit;
+	int			n;
+} AddCheck;
+
+static void
+add_check(void *arg)
+{
+	const AddCheck *in = arg;
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = (char *) in->expr,
+	.not_valid = true,.no_inherit = in->no_inherit};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_add_check(&s, in->n, "x", &b);
+}
+
+static void
+add_check_of_valid(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_add_check(&s, 0, "x", &b);
+}
+
+/* A flag the record says, hidden from the statement by a comment in CREATE TABLE. */
+static void
+flag_hidden(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true) --",
+		.no_inherit = strcmp(arg, "no inherit") == 0,
+	.not_enforced = strcmp(arg, "not enforced") == 0};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+static void
+test_check_flags_refused(void)
+{
+	uint64		a[] = {7};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd',.op = "="};
+	const WsConstraint both = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true",.not_valid = true,.not_enforced = true};
+	const WsConstraint unique = {.name = "c",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = a,.not_valid = true};
+	const WsConstraint excl = {.name = "c",.kind = WS_CONSTRAINT_EXCLUSION,.no_inherit = true,
+	.excl = {.method = "gist",.nkeys = 1,.keys = &key}};
+	static const AddCheck bad[] = {
+		/* (the statement would validate it, or say more than the record) */
+		{.expr = "true) --"},
+		{.expr = "true) NO INHERIT --"},
+		{.expr = "true) NOT ENFORCED --"},
+		{.expr = "true) NOT VALID, ADD CHECK (false"},
+		{.expr = "true), ADD CHECK (false"},
+		{.expr = "true) NOT VALID; DROP TABLE x.t; --"},
+		{.expr = "true) --",.no_inherit = true},
+	};
+
+	check_flags_problem(&both, "both not valid and not enforced");
+	check_flags_problem(&unique, "a check's flags");
+	check_flags_problem(&excl, "a check's flags");
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(add_check, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	{
+		AddCheck	none = {.expr = "true",.n = 1};
+
+		expect_error(add_check, &none, ERRCODE_INTERNAL_ERROR, NULL);
+	}
+	expect_error(add_check_of_valid, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	refused_saying(flag_hidden, "no inherit", "another constraint");
+	refused_saying(flag_hidden, "not enforced", "another constraint");
+
+	/* a not-enforced check saying not valid too */
+	{
+		static const char two[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x01" "\x01" "c" "c" "\x28" "\x04" "true" "\x00";
+
+		check_refused(two, sizeof(two) - 1, "both not valid");
+	}
+}
+
 /* An expression's references take the names the record has now. */
 static void
 test_create_table_renamed(void)
@@ -1972,12 +2248,16 @@ static const ProllyUnitTest tests[] = {
 	{"partitioned", test_partitioned},
 	{"partitioning_problems", test_partitioning_problems},
 	{"partition_injection", test_partition_injection},
+	{"partition", test_partition},
+	{"partition_refused", test_partition_refused},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},
 	{"exclusions", test_exclusions},
 	{"exclusion_problems", test_exclusion_problems},
 	{"exclusion_injection", test_exclusion_injection},
+	{"check_flags", test_check_flags},
+	{"check_flags_refused", test_check_flags_refused},
 	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},

@@ -17,7 +17,8 @@
  * form; a default, collation, not-null constraint's or key's name none is empty,
  * which none is if it is there.  A partitioned table goes on: its kind byte,
  * uvarint nkeys and each key (uvarint tag, 0 for an expression's, expression if
- * so, collation, opclass); any other ends there.
+ * so, collation, opclass); and a partition with 'o', its table's name and bound;
+ * any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -139,6 +140,17 @@ index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 static const char *
 partitioning_problem(const WsTableSchema *s)
 {
+	if ((s->partition_of != NULL) != (s->partition_bound != NULL))
+		return "a partition with no table or no bound";
+	if (s->partition_of != NULL)
+	{
+		if (s->partition_of[0] == '\0' || strlen(s->partition_of) >= NAMEDATALEN)
+			return "a partition of a table of no name, or too long a one";
+		if (strcmp(s->partition_of, s->name) == 0)
+			return "a partition of itself";
+		if (s->partition_bound[0] == '\0')
+			return "a partition with an empty bound";
+	}
 	if (s->partition == WS_PARTITION_NONE)
 		return s->npartition == 0 ? NULL : "partition keys with no partitioning";
 	if (s->partition != WS_PARTITION_RANGE && s->partition != WS_PARTITION_LIST &&
@@ -361,6 +373,9 @@ ws_schema_problem(const WsTableSchema *s)
 			return "constraints not in order by name";
 		if (con->initdeferred && !con->deferrable)
 			return "a constraint initially deferred that is not deferrable";
+		if (con->kind != WS_CONSTRAINT_CHECK &&
+			(con->not_valid || con->no_inherit || con->not_enforced))
+			return "a constraint with a check's flags";
 		if (con->kind != WS_CONSTRAINT_EXCLUSION &&
 			(con->excl.name != NULL || con->excl.method != NULL || con->excl.nkeys != 0 ||
 			 con->excl.ninclude != 0 || con->excl.predicate != NULL ||
@@ -376,6 +391,9 @@ ws_schema_problem(const WsTableSchema *s)
 				return "an expression referring to a column the table does not have";
 			if (con->ncols != 0 || con->nulls_not_distinct || con->deferrable)
 				return "a check with a unique constraint's fields";
+			/* (one check, one set of bytes: not enforced says the other) */
+			if (con->not_valid && con->not_enforced)
+				return "a check both not valid and not enforced";
 		}
 		else if (con->kind == WS_CONSTRAINT_UNIQUE)
 		{
@@ -454,9 +472,13 @@ ws_schema_problem(const WsTableSchema *s)
 	return column_names_problem(s);
 }
 
+#define WS_PARTITION_OF 'o'
 #define CON_NULLS_NOT_DISTINCT 0x01
 #define CON_DEFERRABLE 0x02
 #define CON_INITDEFERRED 0x04
+#define CON_NOT_VALID 0x08
+#define CON_NO_INHERIT 0x10
+#define CON_NOT_ENFORCED 0x20
 #define IDX_UNIQUE 0x01
 #define IDX_NULLS_NOT_DISTINCT 0x02
 
@@ -537,7 +559,10 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		buf_append_byte(out, (uint8) con->kind);
 		buf_append_byte(out, (con->nulls_not_distinct ? CON_NULLS_NOT_DISTINCT : 0) |
 						(con->deferrable ? CON_DEFERRABLE : 0) |
-						(con->initdeferred ? CON_INITDEFERRED : 0));
+						(con->initdeferred ? CON_INITDEFERRED : 0) |
+						(con->not_valid ? CON_NOT_VALID : 0) |
+						(con->no_inherit ? CON_NO_INHERIT : 0) |
+						(con->not_enforced ? CON_NOT_ENFORCED : 0));
 		if (con->kind == WS_CONSTRAINT_CHECK)
 			put_string(out, con->expr);
 		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
@@ -577,6 +602,12 @@ schema_encode(const WsTableSchema *s, Buf *out)
 			put_optional(out, key->collation);
 			put_optional(out, key->opclass);
 		}
+	}
+	if (s->partition_of != NULL)
+	{
+		buf_append_byte(out, WS_PARTITION_OF);
+		put_string(out, s->partition_of);
+		put_string(out, s->partition_bound);
 	}
 }
 
@@ -753,11 +784,15 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		con->name = get_string(&p, end);
 		con->kind = (char) get_byte(&p, end);
 		flags = get_byte(&p, end);
-		if (flags & ~(CON_NULLS_NOT_DISTINCT | CON_DEFERRABLE | CON_INITDEFERRED))
+		if (flags & ~(CON_NULLS_NOT_DISTINCT | CON_DEFERRABLE | CON_INITDEFERRED |
+					  CON_NOT_VALID | CON_NO_INHERIT | CON_NOT_ENFORCED))
 			malformed("a constraint's flags not known");
 		con->nulls_not_distinct = (flags & CON_NULLS_NOT_DISTINCT) != 0;
 		con->deferrable = (flags & CON_DEFERRABLE) != 0;
 		con->initdeferred = (flags & CON_INITDEFERRED) != 0;
+		con->not_valid = (flags & CON_NOT_VALID) != 0;
+		con->no_inherit = (flags & CON_NO_INHERIT) != 0;
+		con->not_enforced = (flags & CON_NOT_ENFORCED) != 0;
 		if (con->kind == WS_CONSTRAINT_CHECK)
 			con->expr = get_string(&p, end);
 		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
@@ -797,7 +832,7 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		ix->nulls_not_distinct = (flags & IDX_NULLS_NOT_DISTINCT) != 0;
 		get_index_body(&p, end, ix, false);
 	}
-	if (p != end)
+	if (p != end && *p != WS_PARTITION_OF)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -820,6 +855,12 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			key->order = WS_INDEX_ORDER_DEFAULT;
 			key->nulls = WS_INDEX_NULLS_DEFAULT;
 		}
+	}
+	if (p != end && *p == WS_PARTITION_OF)
+	{
+		p++;
+		s->partition_of = get_string(&p, end);
+		s->partition_bound = get_string(&p, end);
 	}
 	if (p != end)
 		malformed("it has bytes left over");
@@ -885,6 +926,8 @@ ws_schema_free(WsTableSchema *s)
 		px_free(s->partition_keys[k].opclass);
 	}
 	px_free(s->partition_keys);
+	px_free(s->partition_of);
+	px_free(s->partition_bound);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -1025,6 +1068,19 @@ put_index_predicate(const WsTableSchema *s, const WsIndex *ix, Buf *out)
 	}
 }
 
+/* A check's clause, but for NOT VALID. */
+static void
+put_check(const WsTableSchema *s, const WsConstraint *con, Buf *out)
+{
+	ws_put_text(out, " CHECK (");
+	put_expression(s, con->expr, out);
+	ws_put_text(out, ")");
+	if (con->no_inherit)
+		ws_put_text(out, " NO INHERIT");
+	if (con->not_enforced)
+		ws_put_text(out, " NOT ENFORCED");
+}
+
 /* The statement, as the record has it. */
 static void
 write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
@@ -1096,14 +1152,14 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 	{
 		const WsConstraint *con = &s->constraints[i];
 
+		if (con->not_valid)
+			continue;
 		ws_put_text(out, any ? ",\n    CONSTRAINT " : "\n    CONSTRAINT ");
 		any = true;
 		ws_put_identifier(out, con->name);
 		if (con->kind == WS_CONSTRAINT_CHECK)
 		{
-			ws_put_text(out, " CHECK (");
-			put_expression(s, con->expr, out);
-			ws_put_text(out, ")");
+			put_check(s, con, out);
 			continue;
 		}
 		if (con->kind == WS_CONSTRAINT_EXCLUSION)
@@ -1439,7 +1495,6 @@ static void
 check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in_statement)
 {
 	if (in_statement->conname == NULL || strcmp(in_statement->conname, con->name) != 0 ||
-		in_statement->is_no_inherit || in_statement->skip_validation ||
 		in_statement->deferrable != con->deferrable ||
 		in_statement->initdeferred != con->initdeferred ||
 		in_statement->options != NIL ||
@@ -1454,7 +1509,10 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 	{
 		/* (the grammar says these of a check alone) */
 		if (in_statement->contype != CONSTR_CHECK || in_statement->keys != NIL ||
-			!in_statement->is_enforced || !in_statement->initially_valid)
+			in_statement->is_no_inherit != con->no_inherit ||
+			in_statement->is_enforced == con->not_enforced ||
+			in_statement->skip_validation != (con->not_valid || con->not_enforced) ||
+			in_statement->initially_valid == (con->not_valid || con->not_enforced))
 			not_the_record(s, "another constraint");
 		check_expression(s, con->expr, in_statement->raw_expr);
 	}
@@ -1465,6 +1523,7 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 		ListCell   *kc;
 
 		if (in_statement->contype != CONSTR_EXCLUSION || in_statement->raw_expr != NULL ||
+			in_statement->is_no_inherit || in_statement->skip_validation ||
 			in_statement->keys != NIL || in_statement->nulls_not_distinct ||
 			strcmp(in_statement->access_method, ix->method) != 0 ||
 			list_length(in_statement->exclusions) != ix->nkeys ||
@@ -1493,6 +1552,7 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 		ListCell   *kc;
 
 		if (in_statement->contype != CONSTR_UNIQUE || in_statement->raw_expr != NULL ||
+			in_statement->is_no_inherit || in_statement->skip_validation ||
 			in_statement->nulls_not_distinct != con->nulls_not_distinct ||
 			list_length(in_statement->keys) != con->ncols)
 			not_the_record(s, "another constraint");
@@ -1555,7 +1615,11 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 	CreateStmt *create;
 	ListCell   *lc;
 	int			i = 0;
+	int			next = 0;
+	int			nmade = 0;
 
+	for (int c = 0; c < s->nconstraints; c++)
+		nmade += s->constraints[c].not_valid ? 0 : 1;
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateStmt))
 		not_the_record(s, "it is not one CREATE TABLE");
 	create = (CreateStmt *) linitial_node(RawStmt, parsed)->stmt;
@@ -1572,7 +1636,7 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		create->options != NIL || create->oncommit != ONCOMMIT_NOOP ||
 		create->tablespacename != NULL || create->accessMethod != NULL || create->if_not_exists)
 		not_the_record(s, "a clause the record does not have");
-	if (list_length(create->tableElts) != s->ncols + (s->nkey > 0 ? 1 : 0) + s->nconstraints)
+	if (list_length(create->tableElts) != s->ncols + (s->nkey > 0 ? 1 : 0) + nmade)
 		not_the_record(s, "another number of columns or constraints");
 	foreach(lc, create->tableElts)
 	{
@@ -1588,8 +1652,9 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		{
 			if (!IsA(element, Constraint))
 				not_the_record(s, "a clause where a constraint should be");
-			check_constraint(s, &s->constraints[i - s->ncols - (s->nkey > 0 ? 1 : 0)],
-							 (Constraint *) element);
+			while (s->constraints[next].not_valid)
+				next++;
+			check_constraint(s, &s->constraints[next++], (Constraint *) element);
 		}
 		else
 		{
@@ -1716,6 +1781,56 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 }
 
 static void
+write_attach(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	ws_put_text(out, "ALTER TABLE ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->partition_of);
+	ws_put_text(out, " ATTACH PARTITION ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->name);
+	ws_put_text(out, " ");
+	ws_put_text(out, s->partition_bound);
+}
+
+/* One ALTER TABLE, of this table, attaching this partition by this bound, parsed alone. */
+static void
+check_attach_statement(const WsTableSchema *s, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	List	   *alone = parse_text(s, psprintf("CREATE TABLE t PARTITION OF p %s", s->partition_bound));
+	AlterTableStmt *stmt;
+	AlterTableCmd *cmd;
+	PartitionCmd *part;
+	CreateStmt *create;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->partition_of) != 0 || !stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
+		not_the_record(s, "another table");
+	cmd = linitial_node(AlterTableCmd, stmt->cmds);
+	if (cmd->subtype != AT_AttachPartition || !IsA(cmd->def, PartitionCmd))
+		not_the_record(s, "another change");
+	part = (PartitionCmd *) cmd->def;
+	if (part->concurrent || part->name->catalogname != NULL || part->name->schemaname == NULL ||
+		strcmp(part->name->schemaname, schema) != 0 || strcmp(part->name->relname, s->name) != 0)
+		not_the_record(s, "another partition");
+	if (list_length(alone) != 1 || !IsA(linitial_node(RawStmt, alone)->stmt, CreateStmt))
+		not_the_record(s, "a bound that is no bound");
+	create = (CreateStmt *) linitial_node(RawStmt, alone)->stmt;
+	if (create->partbound == NULL || create->partspec != NULL || create->tableElts != NIL ||
+		create->options != NIL || create->tablespacename != NULL || create->accessMethod != NULL ||
+		create->oncommit != ONCOMMIT_NOOP || !equal(create->partbound, part->bound))
+		not_the_record(s, "a bound that is no bound");
+}
+
+static void
 index_in_server_encoding(const WsIndex *ix, WsIndex *here)
 {
 	*here = *ix;
@@ -1731,6 +1846,43 @@ index_in_server_encoding(const WsIndex *ix, WsIndex *here)
 		here->keys[k].opclass = from_utf8(ix->keys[k].opclass);
 		here->keys[k].op = from_utf8(ix->keys[k].op);
 	}
+}
+
+static void
+write_add_check(const WsTableSchema *s, const WsConstraint *con, const char *schema, Buf *out)
+{
+	ws_put_text(out, "ALTER TABLE ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->name);
+	ws_put_text(out, " ADD CONSTRAINT ");
+	ws_put_identifier(out, con->name);
+	put_check(s, con, out);
+	ws_put_text(out, " NOT VALID");
+}
+
+/* One ALTER TABLE, of this table, adding this check, and nothing else. */
+static void
+check_add_check_statement(const WsTableSchema *s, const WsConstraint *con, const char *schema,
+						  const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	AlterTableCmd *cmd;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || !stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
+		not_the_record(s, "another table");
+	cmd = linitial_node(AlterTableCmd, stmt->cmds);
+	if (cmd->subtype != AT_AddConstraint || cmd->name != NULL || cmd->newowner != NULL ||
+		cmd->missing_ok || !IsA(cmd->def, Constraint))
+		not_the_record(s, "another change");
+	check_constraint(s, con, (Constraint *) cmd->def);
 }
 
 /* A copy of a schema with its strings in the server's encoding. */
@@ -1772,6 +1924,8 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 		here.partition_keys[k].collation = from_utf8(s->partition_keys[k].collation);
 		here.partition_keys[k].opclass = from_utf8(s->partition_keys[k].opclass);
 	}
+	here.partition_of = ws_name_from_utf8(s->partition_of);
+	here.partition_bound = from_utf8(s->partition_bound);
 	*here_out = here;
 }
 
@@ -1811,6 +1965,44 @@ ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *o
 	buf_free(&sql);
 }
 
+void
+ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (n < 0 || n >= s->nconstraints || !s->constraints[n].not_valid)
+		elog(ERROR, "no check not valid at %d", n);
+	schema_in_server_encoding(s, &here);
+	write_add_check(&here, &here.constraints[n], schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_add_check_statement(&here, &here.constraints[n], schema, (char *) sql.data);
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
+void
+ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (s->partition_of == NULL)
+		elog(ERROR, "table \"%s\" is no partition", s->name);
+	schema_in_server_encoding(s, &here);
+	write_attach(&here, schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_attach_statement(&here, schema, (char *) sql.data);
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
 static char *
 to_utf8(const char *text)
 {
@@ -1844,11 +2036,17 @@ static const char *const unsupported_sql =
 "    AND p.refclassid = 'pg_class'::regclass AND p.refobjid = $1::oid AND p.deptype = 'i' "
 "    AND p.refobjsubid > 0) "
 "SELECT CASE "
-"  WHEN c.relispartition THEN 'it is a partition' "
-"  WHEN c.relkind = 'p' AND EXISTS (SELECT FROM pg_inherits i WHERE i.inhparent = c.oid) "
-"    THEN 'it has partitions' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+"               WHERE c.relispartition AND i.inhrelid = c.oid AND "
+"                 (q.relnamespace <> c.relnamespace OR i.inhdetachpending)) "
+"    THEN 'it is a partition being detached, or of a table in another schema' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhrelid "
+"               WHERE c.relkind = 'p' AND i.inhparent = c.oid AND "
+"                 (q.relnamespace <> c.relnamespace OR q.relkind NOT IN ('r', 'p') OR i.inhdetachpending)) "
+"    THEN 'it has a partition being detached, in another schema, or not a table' "
 "  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
-"  WHEN EXISTS (SELECT FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) "
+"  WHEN EXISTS (SELECT FROM pg_inherits i WHERE (i.inhrelid = c.oid AND NOT c.relispartition) "
+"               OR (i.inhparent = c.oid AND c.relkind <> 'p')) "
 "    THEN 'it has inheritance' "
 "  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
 "    THEN 'it has another access method' "
@@ -1876,9 +2074,6 @@ static const char *const unsupported_sql =
 "                 AND x.indnullsnotdistinct = x2.indnullsnotdistinct "
 "                 AND k.condeferrable = k2.condeferrable AND k.condeferred = k2.condeferred) "
 "    THEN 'it has two constraints alike, of which CREATE TABLE makes one' "
-"  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'c' AND "
-"               (NOT k.convalidated OR k.connoinherit OR NOT k.conenforced)) "
-"    THEN 'it has a check not valid, no inherit or not enforced' "
 "  WHEN EXISTS (SELECT FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE x.indrelid = c.oid AND NOT EXISTS "
 "               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid "
@@ -1929,7 +2124,7 @@ static const char *const unsupported_sql =
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
-"  WHEN EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attidentity <> '' "
+"  WHEN NOT c.relispartition AND EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attidentity <> '' "
 "               AND NOT a.attisdropped AND NOT EXISTS (SELECT FROM pg_depend p "
 "                 JOIN pg_class q ON q.oid = p.objid WHERE p.classid = 'pg_class'::regclass "
 "                 AND p.refclassid = 'pg_class'::regclass AND p.refobjid = c.oid "
@@ -2306,7 +2501,10 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		Oid			now;
 
-		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text "
+		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text, "
+				   "  c.relispartition::text, pg_get_expr(c.relpartbound, c.oid), "
+				   "  (SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+				   "    WHERE c.relispartition AND i.inhrelid = c.oid) "
 				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
 		now = rel.nrows == 0 ? InvalidOid : atooid(ws_sql_value(&rel, 0, 0));
@@ -2387,7 +2585,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
 				   "  con.oid::text, "
-				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid) "
+				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
+				   "  con.convalidated::text, con.connoinherit::text, con.conenforced::text "
 				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
 				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
 		WsSql->run("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
@@ -2428,7 +2627,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				elog(ERROR, "column \"%s\" of table \"%s\" is not null by no constraint", rc.names[i], table);
 			c->not_null = ws_name_to_utf8(ws_sql_value(&cols, i, 9));
 		}
-		c->identity = identity[0];
+		/* (a partition's is its table's, which attaching gives it) */
+		c->identity = ws_sql_value(&rel, 0, 4)[0] == 't' ? WS_IDENTITY_NONE : identity[0];
 		if (c->identity != WS_IDENTITY_NONE)
 		{
 			if (ws_sql_value(&cols, i, 10) == NULL)
@@ -2484,6 +2684,9 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 			buf_append_byte(&stored, 0);
 			con->expr = to_utf8((char *) stored.data);
 			buf_free(&stored);
+			con->no_inherit = ws_sql_value(&others, i, 11)[0] == 't';
+			con->not_enforced = ws_sql_value(&others, i, 12)[0] != 't';
+			con->not_valid = !con->not_enforced && ws_sql_value(&others, i, 10)[0] != 't';
 		}
 		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
 		{
@@ -2527,6 +2730,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
+	if (ws_sql_value(&rel, 0, 4)[0] == 't')
+	{
+		if (ws_sql_value(&rel, 0, 5) == NULL || ws_sql_value(&rel, 0, 6) == NULL)
+			elog(ERROR, "partition \"%s\" has no bound, or no table", table);
+		out->partition_of = ws_name_to_utf8(ws_sql_value(&rel, 0, 6));
+		out->partition_bound = to_utf8(ws_sql_value(&rel, 0, 5));
+	}
 	pfree(rc.names);
 	pfree(rc.tags);
 	ws_sql_rows_free(&rel);

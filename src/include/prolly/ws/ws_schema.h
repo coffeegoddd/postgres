@@ -97,6 +97,9 @@ typedef struct WsConstraint
 	bool		nulls_not_distinct;
 	bool		deferrable;
 	bool		initdeferred;
+	bool		not_valid;		/* a check's: a statement of its own, after the rows */
+	bool		no_inherit;		/* a check's */
+	bool		not_enforced;	/* a check's; which says it is not valid, too */
 	WsIndex		excl;			/* an exclusion's index */
 } WsConstraint;
 
@@ -120,6 +123,8 @@ typedef struct WsTableSchema
 	char		partition;		/* WS_PARTITION_*: how its partitions divide its rows */
 	int			npartition;
 	WsIndexKey *partition_keys; /* a column or expression, its collation and opclass */
+	char	   *partition_of;	/* the partitioned table it is one of, in its schema, or NULL */
+	char	   *partition_bound;	/* its FOR VALUES or DEFAULT, as the server prints it */
 } WsTableSchema;
 
 /*
@@ -131,16 +136,18 @@ typedef struct WsTableSchema
  * no empty expression or collation, an expression's references well
  * formed, a key named if it has columns, its columns its own, stored, not
  * null and distinct; other constraints in order by name, none named as another
- * or as the key, a check with its expression and nothing else, a unique one
- * with its columns, its own, stored and distinct, an exclusion with an unnamed
+ * or as the key, a check with its expression and flags, not valid or not
+ * enforced and not both, a unique one with its columns, its own, stored and
+ * distinct, an exclusion with an unnamed
  * index and each key an operator, none alike another, initially deferred only
  * if deferrable; indexes in order by name, none named as a constraint with an
  * index or the key, with a method and keys, each a column of its own or an
  * expression, not both, and no operator, INCLUDE's columns its own, an order of
  * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique;
  * a known way to partition with keys, one if by list or range's many, none
- * if not partitioned, each key as an index's with no order or operator.  NULL if
- * it is so, or what is wrong.
+ * if not partitioned, each key as an index's with no order or operator; a
+ * partition with its bound, and of another table.  NULL if it is so, or what is
+ * wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -184,13 +191,14 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * refuses the table here too): false if the schema
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
- * What the record cannot yet hold and would lose (inheritance, partitions and a
- * partitioned table with any,
+ * What the record cannot yet hold and would lose (inheritance, a partition
+ * or partitioned table across schemas,
  * storage settings, a key's options, a sequence's, a default using one,
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
- * ERRCODE_NAME_TOO_LONG.  The table's owner is not held, and is whoever makes
+ * ERRCODE_NAME_TOO_LONG.  A partition's identity is its table's, and not held
+ * in its own record.  The table's owner is not held, and is whoever makes
  * it.  Triggers, rules and the like are objects of their own, not their table's.
  *
  * It locks the table till the transaction ends, and a column renamed, retyped or
@@ -220,7 +228,8 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * (prolly/ws/ws_sql.h) makes the text the same whoever asks.  A commit may
  * have come from anywhere: the whole statement is parsed and compared with the
  * record, and if it is anything but one CREATE TABLE of just these columns,
- * types, names, clauses, expressions and key, it raises ERRCODE_DATA_CORRUPTED and is
+ * types, names, clauses, expressions and key, and each constraint but a check not
+ * valid (ws_schema_add_check), it raises ERRCODE_DATA_CORRUPTED and is
  * not given back.  A schema with a problem raises an error.  What an
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.
@@ -234,6 +243,22 @@ extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, B
  * ERRCODE_DATA_CORRUPTED and is not given back.
  */
 extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE adding the table's nth constraint, a check not valid, in the
+ * named schema, appended to out, to run after the table's rows: on any earlier,
+ * the rows it lets stand would be refused.  Checked as the table's statement is.
+ */
+extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE attaching a partition to its partitioned table, in the named
+ * schema, appended to out, to run once both are made, with their indexes: an
+ * index of the partition's alike one of the table's becomes its partition.
+ * Checked as the table's statement is.  A partition's columns' and constraints'
+ * being its own as well as inherited is not held: as made this way, they are.
+ */
+extern void ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out);
 
 /*
  * A name as a commit holds it, raising ERRCODE_NAME_TOO_LONG past a commit's
