@@ -99,7 +99,6 @@ $node->safe_psql('postgres', q{DROP MATERIALIZED VIEW "S rc".m_runs; DROP FUNCTI
 # what a commit cannot hold is refused by name, nothing left out in silence
 my @refused = (
 	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int); GRANT SELECT ON public.o TO g_owner', 'DROP TABLE public.o CASCADE' ],
-	[ q{CREATE SEQUENCE q; CREATE VIEW r_seq AS SELECT nextval('q'::regclass)}, 'no commit holds yet', undef, 'DROP SEQUENCE "S rc".q CASCADE' ],
 	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
 	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
 	[ q{CREATE VIEW r_rule AS SELECT a FROM t; CREATE RULE r AS ON DELETE TO r_rule DO INSTEAD NOTHING}, 'a rule', undef, 'DROP VIEW "S rc".r_rule' ],
@@ -608,7 +607,6 @@ my @fn_refused = (
 	[ q{CREATE TYPE public.fn_else AS ENUM ('a'); CREATE FUNCTION r_o(public.fn_else) RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'another schema' ],
 	[ q{CREATE TABLE t (a int); CREATE FUNCTION r_t() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM t; END; ALTER TABLE t ADD CHECK (r_t() >= 0)}, 'a table needs it, and it needs a table' ],
 	[ q{CREATE TABLE t (a int); CREATE FUNCTION r_t() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM t; END; CREATE DOMAIN r_d AS bigint CHECK (VALUE > r_t())}, 'which needs a table' ],
-	[ q{CREATE SEQUENCE s; CREATE FUNCTION r_s() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('s'::regclass); END}, 'no commit holds yet' ],
 	[ q{CREATE FUNCTION r_g() RETURNS int LANGUAGE sql AS 'SELECT 1'; GRANT EXECUTE ON FUNCTION r_g() TO x_person}, 'which cannot travel' ],
 );
 for my $case (@fn_refused)
@@ -654,6 +652,90 @@ for my $change (q{ALTER FUNCTION fn.granted() OWNER TO g_tyowner}, q{ALTER FUNCT
 $node->safe_psql('postgres', q{CREATE SCHEMA fn6; ALTER DEFAULT PRIVILEGES IN SCHEMA fn6 GRANT EXECUTE ON FUNCTIONS TO g_fnuser});
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('fn3', 'fn6')});
 like($err, qr/default privileges would change what is made/, 'default privileges on functions refuse a restore');
+
+# sequences: made before tables, owned by a column after them, with where they are
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_sqowner NOLOGIN;
+	CREATE ROLE g_squser NOLOGIN;
+	CREATE SCHEMA sq AUTHORIZATION g_sqowner;
+	SET ROLE g_sqowner;
+	SET search_path = sq;
+	CREATE SEQUENCE plain;
+	CREATE SEQUENCE odd AS smallint INCREMENT BY -2 MINVALUE -100 MAXVALUE 50 START WITH 40 CACHE 3 CYCLE;
+	CREATE SEQUENCE "Odd name";
+	CREATE TABLE ser (id serial, other integer DEFAULT nextval('plain'), big bigserial);
+	CREATE TABLE idt (i integer GENERATED ALWAYS AS IDENTITY);
+	INSERT INTO idt DEFAULT VALUES;
+	INSERT INTO idt DEFAULT VALUES;
+	CREATE FUNCTION nexts() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('plain'::regclass); END;
+	CREATE VIEW nv AS SELECT nextval('plain'::regclass) AS n;
+	CREATE VIEW over_ident AS SELECT nextval('idt_i_seq'::regclass) AS n;
+	CREATE FUNCTION next_ident() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('idt_i_seq'::regclass); END;
+	COMMENT ON SEQUENCE odd IS 'it''s odd';
+	GRANT USAGE, SELECT ON SEQUENCE plain TO g_squser;
+	SELECT setval('plain', 41);
+	SELECT setval('odd', 30, false);
+});
+my $sq_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sq')});
+my %sq_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $sq_held;
+ok(!$sq_val{'sequence/idt_i_seq'}, 'an identity sequence is its table\'s, not an object');
+unlike($sq_val{'view/over_ident'}, qr/sequence\//, 'nor a need, being there with its table');
+ok($sq_val{$_}, "$_ is held") for ('sequence/plain', 'sequence/odd', 'sequence/Odd name', 'sequence/ser_id_seq', 'sequence/ser_big_seq');
+like($sq_val{'sequence/odd'}, qr/AS smallint INCREMENT BY -2 MINVALUE -100 MAXVALUE 50 START WITH 40 CACHE 3 CYCLE/, 'all of a sequence is said');
+like($sq_val{'sequence/ser_id_seq'}, qr/ser.*id/s, 'and what column owns it');
+like($sq_val{'view/nv'}, qr/sequence\/plain/, 'a view says it needs one');
+like($sq_val{'function/nexts()'}, qr/sequence\/plain/, 'and a function');
+
+$node->safe_psql('postgres', q{CREATE SCHEMA sq2 AUTHORIZATION g_sqowner});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sq', 'sq2', 'before')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_depend d JOIN pg_class c ON c.oid = d.objid WHERE c.relnamespace = 'sq2'::regnamespace AND c.relkind = 'S' AND d.deptype = 'a'}),
+	'0', 'not yet owned, its column not being there');
+$node->safe_psql('postgres', q{SET ROLE g_sqowner; CREATE TABLE sq2.ser (id integer NOT NULL DEFAULT nextval('sq2.ser_id_seq'), other integer DEFAULT nextval('sq2.plain'), big bigint NOT NULL DEFAULT nextval('sq2.ser_big_seq'));
+	CREATE TABLE sq2.idt (i integer GENERATED ALWAYS AS IDENTITY)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sq', 'sq2', 'after')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sq2')}), $sq_held, 'the same bytes restored');
+is( $node->safe_psql('postgres', q{SELECT pg_get_serial_sequence('sq2.ser', 'id')}), 'sq2.ser_id_seq', 'owned by its column');
+is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_proc WHERE oid = 'sq2.next_ident()'::regprocedure}), '1', 'a function needing an identity sequence is made after its table');
+my $positions = $node->safe_psql('postgres', q{SELECT test_ws_seq_copy('sq', 'sq2')});
+like($positions, qr/^plain 41 1$/m, 'where a sequence is, is read');
+like($positions, qr/^odd 30 0$/m, 'and whether it has been called');
+like($positions, qr/^idt_i_seq 2 1$/m, 'and an identity sequence\'s too');
+is($node->safe_psql('postgres', q{INSERT INTO sq2.idt DEFAULT VALUES RETURNING i}), '3', 'so it goes on from there');
+is($node->safe_psql('postgres', q{SELECT last_value, is_called FROM sq2.plain}), '41|t', 'and set');
+is($node->safe_psql('postgres', q{SELECT nextval('sq2.odd')}), '30', 'so the next is the next');
+
+# a table with a serial column is held, and names no schema
+{
+	my $branch = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+	local $ENV{PGOPTIONS} = "-c catalog_branch=$branch";
+	$node->safe_psql('postgres', q{CREATE SCHEMA sv VERSIONED; CREATE TABLE sv.t (id serial PRIMARY KEY, n bigserial); CREATE SEQUENCE sv.free; CREATE TABLE sv.u (a bigint DEFAULT nextval('sv.free')); CREATE SCHEMA sv2 VERSIONED});
+	my $t_bytes = pack('H*', unpack('H*', $node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('sv', 't'), 'escape')})));
+	unlike($t_bytes, qr/sv\./, 'a table of serial columns does not name its schema');
+	like($t_bytes, qr/t_id_seq/, 'and says its sequence');
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sv', 'sv2', 'before')});
+	$node->safe_psql('postgres', q{SELECT test_ws_schema_create(test_ws_schema_bytes('sv', 't'), 'sv2'); SELECT test_ws_schema_create(test_ws_schema_bytes('sv', 'u'), 'sv2')});
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sv', 'sv2', 'after')});
+	is($node->safe_psql('postgres', q{SELECT pg_get_serial_sequence('sv2.t', 'id')}), 'sv2.t_id_seq', 'restored, serial as it was');
+	is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('sv2', 't') = test_ws_schema_bytes('sv', 't')}), 't', 'and the same bytes');
+}
+
+my @sq_refused = (
+	[ q{CREATE UNLOGGED SEQUENCE r_u}, 'not logged' ],
+	[ q{CREATE SEQUENCE r_g; GRANT USAGE ON SEQUENCE r_g TO x_person}, 'which cannot travel' ],
+	[ q{CREATE VIEW r_txt AS SELECT nextval('sq5.x'::text) AS n}, "say a schema's name" ],
+	[ q{CREATE TABLE t (i integer GENERATED ALWAYS AS IDENTITY); CREATE DOMAIN r_dm AS bigint DEFAULT nextval('t_i_seq'::regclass)}, 'no commit holds yet' ],
+	[ q{CREATE SEQUENCE r_c; GRANT SELECT (last_value) ON TABLE r_c TO g_squser}, 'a grant on a column' ],
+	[ q{CREATE SEQUENCE r_r; REVOKE UPDATE ON SEQUENCE r_r FROM CURRENT_USER}, 'rights have been changed' ],
+	[ q{CREATE FOREIGN DATA WRAPPER fdw_sq; CREATE SERVER srv_sq FOREIGN DATA WRAPPER fdw_sq; CREATE FOREIGN TABLE ft (a int) SERVER srv_sq; CREATE SEQUENCE r_f OWNED BY ft.a}, 'what no commit holds' ],
+);
+for my $case (@sq_refused)
+{
+	my ($sql, $why) = @$case;
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS sq5 CASCADE; DROP SERVER IF EXISTS srv_sq CASCADE; DROP FOREIGN DATA WRAPPER IF EXISTS fdw_sq CASCADE; CREATE SCHEMA sq5; SET search_path = sq5, public; $sql});
+	my ($rc5, $out5, $err5) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('sq5')});
+	isnt($rc5, 0, "refused: $sql");
+	like($err5, qr/\Q$why\E/, "for why: $sql");
+}
 
 $node->stop;
 done_testing();
