@@ -362,6 +362,10 @@ my %refused_for = (
 	xdup => 'two constraints alike', xfill => 'an index has options', xspc => 'an index has options',
 	xclu => 'an index has options', xstat => 'an index has options', xcmt => 'a comment',
 	xicmt => 'a comment', xext => 'depends on an extension', fksopt => 'an index has options',
+<<<<<<< HEAD
+=======
+	cni => 'a check not valid', cne => 'a check not valid',
+>>>>>>> origin/layer4/ws-record-exclusion
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
 	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
