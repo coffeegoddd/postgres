@@ -607,7 +607,6 @@ $node->safe_psql('postgres', q{
 	CREATE SCHEMA lie VERSIONED;
 	CREATE TABLE lie.c (a int, b int);
 	CREATE TABLE lie.ckc (a int, CONSTRAINT pkc CHECK (a > 0));
-	CREATE TABLE lie.gone (a int);
 });
 my $ckhex = $bytes->($node, 'postgres', 'ckc', undef, 'dropsrc');
 for my $t ([ $chex, 'a column', qr/"a" is inherited, and it is not/ ], [ $ckhex, 'a constraint', qr/"pkc" is inherited, and it is not/ ])
@@ -622,6 +621,22 @@ $node->safe_psql('postgres', q{ALTER TABLE lie.ckc DROP CONSTRAINT pkc});
 	my ($ret, $out, $err) = $node->psql('postgres',
 		qq{\\set VERBOSITY verbose\nSELECT test_ws_schema_set_inherited(decode('$ckhex', 'hex'), 'lie');});
 	like($err, qr/XX001.*"pkc" is inherited/s, 'and one it does not have, the same');
+}
+
+# more parents than a commit holds
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA manyp VERSIONED;
+	CREATE TABLE manyp.c ();
+	DO $$ BEGIN
+		FOR i IN 1..1601 LOOP
+			EXECUTE format('CREATE TABLE manyp.p%s ()', i);
+			EXECUTE format('ALTER TABLE manyp.c INHERIT manyp.p%s', i);
+		END LOOP;
+	END $$;
+});
+{
+	my ($ret, $out, $err) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('manyp', 'c')});
+	like($err, qr/cannot be read yet: it inherits from more tables than a commit holds/, 'a table of too many parents refused');
 }
 
 # a temporary child is its session's: its parent reads as it did
@@ -1350,6 +1365,13 @@ for my $table ('parenté', 'enfanté')
 		SELECT test_ws_schema_set_inherited(decode('$hex', 'hex'), 'dst')});
 }
 is($node->safe_psql('lat', sprintf($inh_enc, 'dst', 'enfanté')), $inh_utf8, 'and made there, read again');
+$node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSIONED;
+	CREATE TABLE lié."enfanté" ("colonné" integer CONSTRAINT "nulé" NOT NULL, own text, CONSTRAINT "chequé" CHECK ("colonné" > 0))});
+{
+	my ($ret, $out, $err) = $node->psql('lat',
+		qq{SET client_encoding = UTF8; SELECT test_ws_schema_set_inherited(decode('$inh_utf8', 'hex'), 'lié');});
+	like($err, qr/table "enfanté" says "colonné" is inherited/, 'a lie told in the server\'s encoding');
+}
 
 # a key's numbered rows, cut short in UTF8's bytes though not in this encoding's
 {

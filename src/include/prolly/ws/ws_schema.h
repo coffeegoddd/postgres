@@ -156,8 +156,8 @@ typedef struct WsTableSchema
  * a known way to partition with keys, one if by list, no more than a partition
  * key can have otherwise, none if not partitioned, each key as an index's with no
  * order or operator; a partition with its bound, of another table and with no
- * identity; a table inheriting from others, distinct and not itself, not also a
- * partition, what it has only by doing so its own columns in attribute order and
+ * identity; a table inheriting from no more than WS_MAX_PARENTS others, distinct
+ * and not itself, neither a partition nor partitioned, what it has only by doing so its own columns in attribute order and
  * its own checks' and not-null constraints' names in order.  NULL if it is so, or
  * what is wrong.
  */
@@ -282,7 +282,8 @@ extern void ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *ou
 /*
  * The ALTER TABLE making a table inherit from its nth parent, in the named schema,
  * appended to out, to run in order, once both are made, with their rows and checks
- * not valid: a parent's check another's not valid is one of finds it only then.
+ * not valid: a parent's check not enforced needs the child's of that name, not
+ * valid, already there.
  * Checked as the table's statement is.
  */
 extern void ws_schema_inherit(const WsTableSchema *s, int n, const char *schema, Buf *out);

@@ -320,6 +320,8 @@ column_names_problem(const WsTableSchema *s)
 		const char *not_null = s->cols[i].not_null;
 		const char *seq = s->cols[i].identity_seq;
 
+		CHECK_FOR_INTERRUPTS();
+
 		if (not_null != NULL && s->key_name != NULL && strcmp(not_null, s->key_name) == 0)
 			return "a not-null constraint named as the key is";
 		if (seq != NULL && (strcmp(seq, s->name) == 0 ||
@@ -545,8 +547,10 @@ ws_schema_problem(const WsTableSchema *s)
 		return "a negative number of indexes";
 	for (int i = 0; i < s->nindexes; i++)
 	{
-		const char *problem = index_problem(s, &s->indexes[i]);
+		const char *problem;
 
+		CHECK_FOR_INTERRUPTS();
+		problem = index_problem(s, &s->indexes[i]);
 		if (problem != NULL)
 			return problem;
 		if (i > 0 && strcmp(s->indexes[i - 1].name, s->indexes[i].name) >= 0)
@@ -2321,7 +2325,7 @@ static const char *const unsupported_sql =
 "               WHERE NOT c.relispartition AND i.inhrelid = c.oid AND "
 "                 (q.relnamespace <> c.relnamespace OR q.relkind <> 'r')) "
 "    THEN 'it inherits from a table in another schema, or from no table' "
-"  WHEN (SELECT count(*) FROM pg_inherits i WHERE NOT c.relispartition AND i.inhrelid = c.oid) > 1600 "
+"  WHEN (SELECT count(*) FROM pg_inherits i WHERE NOT c.relispartition AND i.inhrelid = c.oid) > " CppAsString2(WS_MAX_PARENTS) " "
 "    THEN 'it inherits from more tables than a commit holds' "
 "  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhrelid "
 "               WHERE c.relkind <> 'p' AND i.inhparent = c.oid AND q.relpersistence <> 't' AND "

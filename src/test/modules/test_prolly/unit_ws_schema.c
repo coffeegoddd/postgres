@@ -1719,6 +1719,16 @@ test_inheriting(void)
 		s.ninherited_cons = 1;
 		s.inherited_cons = absent;
 		CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+		{
+			/* (a name it has, on a constraint that cannot be inherited) */
+			uint64		key[] = {7};
+			WsConstraint uq = {.name = "zz",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = key};
+			WsConstraint *check = s.constraints;
+
+			s.constraints = &uq;
+			CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+			s.constraints = check;
+		}
 		s.ninherited_cons = 0;
 		s.inherits = twice;
 		CHECK(problem_has(ws_schema_problem(&s), "a parent twice"));
