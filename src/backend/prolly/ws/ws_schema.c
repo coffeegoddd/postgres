@@ -1496,7 +1496,7 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		p++;
 		flags = get_byte(&p, end);
 		if (flags & ~(KEY_DEFERRABLE | KEY_INITDEFERRED | TABLE_ROW_SECURITY | TABLE_FORCE_ROW_SECURITY))
-			malformed("a key's flags not known");
+			malformed("a table's settings' flags not known");
 		s->key_deferrable = (flags & KEY_DEFERRABLE) != 0;
 		s->key_initdeferred = (flags & KEY_INITDEFERRED) != 0;
 		s->row_security = (flags & TABLE_ROW_SECURITY) != 0;

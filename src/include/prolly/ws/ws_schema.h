@@ -372,9 +372,10 @@ extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *sch
 
 /*
  * The ALTER TABLE ONLY enabling and forcing a table's row security, in the named
- * schema, appended to out, to run last, after its rows: with it on and no policy
- * yet, or a role that does not bypass it, they would be refused.  Nothing, if it
- * has neither.  Checked as the table's statement is.
+ * schema, appended to out, to run last, after its rows and every foreign key on it
+ * or to it: with it forced, a role that does not bypass it would have those rows
+ * refused, and the query checking a new key's rows is subject to it, unlike later
+ * ones.  Nothing, if it has neither.  Checked as the table's statement is.
  */
 extern void ws_schema_row_security(const WsTableSchema *s, const char *schema, Buf *out);
 

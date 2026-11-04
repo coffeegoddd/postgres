@@ -366,6 +366,10 @@ $node->safe_psql('postgres', q{
 	ALTER TABLE src.rs_part1 FORCE ROW LEVEL SECURITY;
 	CREATE TABLE src.rs_inh (a integer); ALTER TABLE src.rs_inh ENABLE ROW LEVEL SECURITY;
 	CREATE TABLE src.rs_inh1 () INHERITS (src.rs_inh);
+	CREATE TABLE src.rs_fkp (id integer PRIMARY KEY);
+	CREATE TABLE src.rs_fkc (r integer REFERENCES src.rs_fkp (id));
+	ALTER TABLE src.rs_fkp ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+	ALTER TABLE src.rs_fkc ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -389,7 +393,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 'so_inh2', 'so_ren',
 	'io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4',
 	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
-	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1');
+	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1', 'rs_fkp', 'rs_fkc');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -426,13 +430,6 @@ $restore_step->('test_ws_schema_attach', @tables);
 $restore_step->('test_ws_schema_add_checks', reverse @tables);
 $restore_step->('test_ws_schema_inherit', @tables);
 $restore_step->('test_ws_schema_set_inherited', @tables);
-$restore_step->('test_ws_schema_row_security', @tables);
-for my $table (@tables)
-{
-	is( $bytes->($node, 'postgres', $table, undef, 'dst'),
-		$bytes->($node, 'postgres', $table),
-		"$table the same bytes, made again");
-}
 
 # the foreign keys, through their bytes, added after every table and index,
 # mutual ones too; the same bytes
@@ -443,6 +440,15 @@ for my $table (@tables)
 	is( $node->safe_psql('postgres', qq{SELECT test_ws_fk_bytes('dst', '$lit')}),
 		$node->safe_psql('postgres', qq{SELECT test_ws_fk_bytes('src', '$lit')}),
 		"$table: the same foreign keys' bytes");
+}
+
+# row security last, after the rows and the foreign keys; the same bytes
+$restore_step->('test_ws_schema_row_security', @tables);
+for my $table (@tables)
+{
+	is( $bytes->($node, 'postgres', $table, undef, 'dst'),
+		$bytes->($node, 'postgres', $table),
+		"$table the same bytes, made again");
 }
 isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fk_c')}), '', 'a table has some');
 is( $node->safe_psql('postgres',
@@ -755,7 +761,6 @@ is($node->safe_psql('postgres', sprintf($rsec, 'dst')), $node->safe_psql('postgr
 		CREATE SCHEMA rs_dst VERSIONED;
 		CREATE ROLE regress_rs_owner;
 		GRANT CREATE, USAGE ON SCHEMA rs_dst TO regress_rs_owner;
-		GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO regress_rs_owner;
 	});
 	is( $node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'rs_dst') IS NOT NULL;
 			SELECT relrowsecurity OR relforcerowsecurity FROM pg_class WHERE oid = 'rs_dst.rs_both'::regclass}),
@@ -765,6 +770,25 @@ is($node->safe_psql('postgres', sprintf($rsec, 'dst')), $node->safe_psql('postgr
 	$node->safe_psql('postgres', qq{SELECT test_ws_schema_row_security(decode('$hex', 'hex'), 'rs_dst')});
 	my ($ret, $out, $err) = $node->psql('postgres', q{SET ROLE regress_rs_owner; INSERT INTO rs_dst.rs_both VALUES (2)});
 	like($err, qr/violates row-level security policy/, 'and on after: the same insert, by its owner, is refused');
+
+	# keys before it: by an owner it applies to, they are refused after, the check
+	# of their rows being subject to it, and restoring has row security off
+	$node->safe_psql('postgres', q{
+		SET ROLE regress_rs_owner;
+		CREATE TABLE rs_dst.fp (id integer PRIMARY KEY);
+		CREATE TABLE rs_dst.fc (r integer);
+		INSERT INTO rs_dst.fp VALUES (1);
+		INSERT INTO rs_dst.fc VALUES (1);
+		ALTER TABLE rs_dst.fc ADD CONSTRAINT fc_ok FOREIGN KEY (r) REFERENCES rs_dst.fp (id);
+		ALTER TABLE rs_dst.fp ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+		ALTER TABLE rs_dst.fc ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+		RESET ROLE;
+	});
+	is( $node->safe_psql('postgres', q{SELECT convalidated FROM pg_constraint WHERE conname = 'fc_ok' AND conrelid = 'rs_dst.fc'::regclass}),
+		't', 'a key before row security is checked and made');
+	($ret, $out, $err) = $node->psql('postgres', q{SET ROLE regress_rs_owner; SET row_security = off;
+		ALTER TABLE rs_dst.fc ADD CONSTRAINT fc_late FOREIGN KEY (r) REFERENCES rs_dst.fp (id)});
+	like($err, qr/would be affected by row-level security policy/, 'and one after it refused');
 	$node->safe_psql('postgres', q{DROP SCHEMA rs_dst CASCADE; DROP OWNED BY regress_rs_owner; DROP ROLE regress_rs_owner});
 }
 
