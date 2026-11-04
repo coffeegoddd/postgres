@@ -16,8 +16,9 @@
  * What is made before an object is named rather than found by trying, as the order
  * of a restore must not depend on what fails.
  *
- * An object has an owner that can travel, as it reads with its owner's rights: any
- * other owner could show other rows.  A commit's own definitions are trusted, as a
+ * A view has an owner that can travel, as it reads with its owner's rights: any other
+ * owner could show other rows.  A type's owner that cannot is not held, and whoever
+ * restores it owns it, as a table's does.  A commit's own definitions are trusted, as a
  * remote is, as what a pg_dump wrote is: they are checked only to be what they say.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -33,7 +34,9 @@
 
 typedef enum WsObjectKind
 {
+	WS_OBJ_DOMAIN,
 	WS_OBJ_MATVIEW,
+	WS_OBJ_TYPE,				/* an enum, composite or range type */
 	WS_OBJ_VIEW,
 } WsObjectKind;
 
@@ -60,7 +63,7 @@ typedef struct WsObject
 	char	   *definition;		/* its statement after its name, as stored text (ws_tags.h) */
 	int			ndeps;
 	char	  **deps;			/* the keys of the objects it needs, in order */
-	char	   *owner;
+	char	   *owner;			/* NULL: whoever restores it, for what may have none */
 	int			ncomments;
 	WsObjectComment *comments;	/* in order: the object's, then by column */
 	int			ngrants;
@@ -92,6 +95,9 @@ extern PGDLLIMPORT const WsObjectCodecRoutine BinaryWsObjectCodec;
 
 /* The implementation in use. */
 extern PGDLLIMPORT const WsObjectCodecRoutine *WsObjectCodec;
+
+/* Whether a kind is made before a commit's tables, which may use it, or after. */
+extern bool ws_obj_before_tables(WsObjectKind kind);
 
 extern void ws_obj_free(WsObject *o);
 
@@ -135,14 +141,15 @@ extern void ws_obj_owner_statement(const WsObject *o, const char *schema, Buf *o
 extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema, Buf *out);
 
 /*
- * Makes the objects in schema, through WsSql, in restore order, each with its
- * comments, then its owner, then its grants, the tables being there already.  Raises
+ * Makes the objects in schema that go before its tables, or after, through WsSql, in
+ * restore order, each with its comments, then its owner, then its grants.  objs is
+ * all of a commit's, as what comes after may need what comes before.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than they
  * are held, or if the schema holds a function or operator, as a definition's
  * unqualified name could be taken for it.  Who restores them must be able to SET ROLE
  * to each owner, with its privileges, and each owner must have CREATE on the schema,
  * as the server asks of any change of owner.
  */
-extern void ws_obj_restore(const WsObject *objs, int n, const char *schema);
+extern void ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tables);
 
 #endif							/* PROLLY_WS_OBJ_H */
