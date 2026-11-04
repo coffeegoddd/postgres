@@ -103,6 +103,9 @@ typedef struct WsConstraint
 	WsIndex		excl;			/* an exclusion's index */
 } WsConstraint;
 
+/* The tables one table's record can say it inherits from. */
+#define WS_MAX_PARENTS 1600
+
 #define WS_PARTITION_NONE '\0'
 #define WS_PARTITION_RANGE 'r'
 #define WS_PARTITION_LIST 'l'
@@ -202,7 +205,9 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance or a partition or
  * partitioned table across schemas, storage settings, a key's options, a
- * sequence's, a default using one,
+ * sequence's, a default using one, a partition detached, of another identity
+ * than its table's or with two indexes attaching could take for one another
+ * (a parent's constraint takes only a constraint's index: that one is not),
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
@@ -257,7 +262,8 @@ extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *sc
  * The ALTER TABLE adding the table's nth constraint, a check not valid, in the
  * named schema, appended to out, to run after the table's rows: on any earlier,
  * the rows it lets stand would be refused.  A partition's are added before its
- * table's, which then finds them, and is refused otherwise as one already there.
+ * table's, which then finds them, and is refused otherwise as one already there;
+ * and all before any table inherits, which needs them there.
  * Checked as the table's statement is.
  */
 extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out);
@@ -275,15 +281,16 @@ extern void ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *ou
 
 /*
  * The ALTER TABLE making a table inherit from its nth parent, in the named schema,
- * appended to out, to run in order, once both are made.  Checked as the table's
- * statement is.
+ * appended to out, to run in order, once both are made, with their rows and checks
+ * not valid: a parent's check another's not valid is one of finds it only then.
+ * Checked as the table's statement is.
  */
 extern void ws_schema_inherit(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
  * Marks what a table inheriting has only by inheriting as not its own, as making
  * it from its own statement could not: dropping it from a parent then drops it
- * here too.  To run after its parents and its checks not valid are added.  What
+ * here too.  To run after it has inherited from its parents.  What
  * the record says that it does not inherit raises ERRCODE_DATA_CORRUPTED.  The
  * caller makes it visible, with CommandCounterIncrement.
  */

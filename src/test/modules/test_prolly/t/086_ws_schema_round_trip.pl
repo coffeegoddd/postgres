@@ -261,6 +261,23 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.fknv (id integer, r integer) PARTITION BY RANGE (id);
 	CREATE TABLE src.fknv1 PARTITION OF src.fknv FOR VALUES FROM (0) TO (10);
 	ALTER TABLE src.fknv ADD CONSTRAINT fknv_k FOREIGN KEY (r) REFERENCES src.fkn_q (id) NOT VALID;
+	CREATE TABLE src.ixp (a integer, CONSTRAINT ixp_k PRIMARY KEY (a)) PARTITION BY RANGE (a);
+	CREATE TABLE src.ixp1 (a integer NOT NULL);
+	CREATE UNIQUE INDEX ixp1_older ON src.ixp1 (a);
+	ALTER TABLE src.ixp ATTACH PARTITION src.ixp1 FOR VALUES FROM (0) TO (10);
+	CREATE TABLE src.ixn (a integer NOT NULL) PARTITION BY RANGE (a);
+	CREATE TABLE src.ixn1 PARTITION OF src.ixn FOR VALUES FROM (0) TO (10);
+	ALTER TABLE src.ixn1 ADD CONSTRAINT ixn1_k PRIMARY KEY (a);
+	CREATE UNIQUE INDEX ixn1_also ON src.ixn1 (a);
+	CREATE TABLE src.ixx (r int4range, a integer) PARTITION BY RANGE (a);
+	CREATE TABLE src.ixx1 PARTITION OF src.ixx FOR VALUES FROM (0) TO (10);
+	ALTER TABLE src.ixx1 ADD CONSTRAINT ixx1_x EXCLUDE USING gist (r WITH &&);
+	ALTER TABLE src.ixx1 ADD CONSTRAINT ixx1_y EXCLUDE USING gist (r WITH -|-);
+	CREATE INDEX ixx1_i ON src.ixx1 USING gist (r);
+	CREATE TABLE src.fku_p (a integer, b integer, PRIMARY KEY (a, b)) PARTITION BY RANGE (a);
+	CREATE TABLE src.fku_p1 PARTITION OF src.fku_p FOR VALUES FROM (0) TO (10);
+	CREATE UNIQUE INDEX fku_p1_also ON src.fku_p1 (b, a);
+	CREATE TABLE src.fku_c (a integer, b integer, FOREIGN KEY (a, b) REFERENCES src.fku_p (a, b));
 	CREATE TABLE src.ip1 (a integer NOT NULL, b text DEFAULT 'x', g integer GENERATED ALWAYS AS (a * 2) STORED,
 		CONSTRAINT ip1_c CHECK (a > 0));
 	CREATE TABLE src.ip2 (b text, z integer, CONSTRAINT ip2_nn NOT NULL z);
@@ -282,6 +299,11 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.iren (a integer NOT NULL);
 	CREATE TABLE src.iren1 () INHERITS (src.iren);
 	ALTER TABLE src.iren RENAME a TO z;
+	CREATE TABLE src.ine_p (a integer, CONSTRAINT ine_c CHECK (a > 0) NOT ENFORCED);
+	CREATE TABLE src.ine_k (a integer);
+	ALTER TABLE src.ine_k ADD CONSTRAINT ine_c CHECK (a > 0) NOT VALID;
+	ALTER TABLE src.ine_k INHERIT src.ine_p;
+	CREATE TABLE src.ine_g () INHERITS (src.ine_k);
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -300,7 +322,8 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'ptf_p', 'ptf_p1', 'ptf_c', 'ptf_c1',
 	'idt', 'idm', 'idl', 'pnv', 'pnv1', 'pnv2', 'ptbd', 'ptbd1', 'ptbn', 'ptbn1', 'ptby', 'ptby1', 'ptbs', 'ptbs1', 'ptbt', 'ptbt1',
 	'fkn_q', 'fkn_p', 'fkn_p1', 'fkn_c', 'fks', 'fksm', 'fksl', 'fknv', 'fknv1',
-	'ip1', 'ip2', 'ichild', 'ilocal', 'imulti', 'ialter', 'igrand', 'inv', 'inv1', 'ino', 'ino1', 'iren', 'iren1');
+	'ixp', 'ixp1', 'ixn', 'ixn1', 'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c',
+	'ip1', 'ip2', 'ichild', 'ilocal', 'imulti', 'ialter', 'igrand', 'inv', 'inv1', 'ino', 'ino1', 'iren', 'iren1', 'ine_p', 'ine_k', 'ine_g');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -322,28 +345,21 @@ for my $table (@tables)
 }
 
 # partitions attached, once every table and its indexes are made, each table
-# before its own partitions (as this list has them); then checks not valid,
-# each partition's before its table's; the same bytes
-for my $table (@tables)
-{
-	my $hex = $bytes->($node, 'postgres', $table);
-	$node->safe_psql('postgres', qq{SELECT test_ws_schema_attach(decode('$hex', 'hex'), 'dst')});
-}
-for my $table (@tables)
-{
-	my $hex = $bytes->($node, 'postgres', $table);
-	$node->safe_psql('postgres', qq{SELECT test_ws_schema_inherit(decode('$hex', 'hex'), 'dst')});
-}
-for my $table (reverse @tables)
-{
-	my $hex = $bytes->($node, 'postgres', $table);
-	$node->safe_psql('postgres', qq{SELECT test_ws_schema_add_checks(decode('$hex', 'hex'), 'dst')});
-}
-for my $table (@tables)
-{
-	my $hex = $bytes->($node, 'postgres', $table);
-	$node->safe_psql('postgres', qq{SELECT test_ws_schema_set_inherited(decode('$hex', 'hex'), 'dst')});
-}
+# before its own partitions (as this list has them); then checks not valid, each
+# partition's before its table's; then inheriting, which needs those there; then
+# what is only inherited marked so; the same bytes
+my $restore_step = sub {
+	my ($function, @of) = @_;
+	for my $table (@of)
+	{
+		my $hex = $bytes->($node, 'postgres', $table);
+		$node->safe_psql('postgres', qq{SELECT $function(decode('$hex', 'hex'), 'dst')});
+	}
+};
+$restore_step->('test_ws_schema_attach', @tables);
+$restore_step->('test_ws_schema_add_checks', reverse @tables);
+$restore_step->('test_ws_schema_inherit', @tables);
+$restore_step->('test_ws_schema_set_inherited', @tables);
 for my $table (@tables)
 {
 	is( $bytes->($node, 'postgres', $table, undef, 'dst'),
@@ -551,15 +567,6 @@ my $nvchecks = q{SELECT string_agg(c.relname || '.' || k.conname || ' ' || k.con
 is($node->safe_psql('postgres', sprintf($nvchecks, 'dst')), $node->safe_psql('postgres', sprintf($nvchecks, 'src')),
 	'checks not valid across a partitioned table as they were');
 
-# a key's row on the referencing partition is not refused for the indexes of a partition it refers to
-$node->safe_psql('postgres', q{
-	CREATE TABLE src.fku_p (id integer PRIMARY KEY) PARTITION BY RANGE (id);
-	CREATE TABLE src.fku_p1 PARTITION OF src.fku_p FOR VALUES FROM (0) TO (10);
-	CREATE UNIQUE INDEX fku_p1_also ON src.fku_p1 (id);
-	CREATE TABLE src.fku_c (r integer REFERENCES src.fku_p (id));
-});
-isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fku_c')}), '', 'a key to a partitioned table reads, its partition\'s two indexes no matter');
-
 # inheritance as it was: what is whose, in what order, and what dropping does
 my $inh = q{SELECT string_agg(c.relname || '.' || a.attname || ' ' || a.attnum || ' ' || a.attislocal || a.attinhcount, E'\n' ORDER BY c.relname, a.attnum)
 	FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
@@ -594,12 +601,35 @@ for my $sch ('dropsrc', 'dropdst')
 }
 is( $node->safe_psql('postgres', q{SELECT string_agg(attname, ' ' ORDER BY attname) FROM pg_attribute WHERE attrelid = 'dropdst.c'::regclass AND attnum > 0 AND NOT attisdropped}),
 	'b', 'dropped from its parent: what was only inherited goes, what was its own stays');
+$node->safe_psql('postgres', q{
+	CREATE TABLE dropsrc.ckp (a int, CONSTRAINT pkc CHECK (a > 0));
+	CREATE TABLE dropsrc.ckc (a int) INHERITS (dropsrc.ckp);
+	CREATE SCHEMA lie VERSIONED;
+	CREATE TABLE lie.c (a int, b int);
+	CREATE TABLE lie.ckc (a int, CONSTRAINT pkc CHECK (a > 0));
+	CREATE TABLE lie.gone (a int);
+});
+my $ckhex = $bytes->($node, 'postgres', 'ckc', undef, 'dropsrc');
+for my $t ([ $chex, 'a column', qr/"a" is inherited, and it is not/ ], [ $ckhex, 'a constraint', qr/"pkc" is inherited, and it is not/ ])
 {
-	my ($ret, $out, $err) = $node->psql('postgres', qq{
-		CREATE SCHEMA lie VERSIONED;
-		CREATE TABLE lie.c (a int, b int);
-		SELECT test_ws_schema_set_inherited(decode('$chex', 'hex'), 'lie');});
-	like($err, qr/is inherited, and it is not/, 'a record saying more is inherited than is, refused');
+	my ($ret, $out, $err) = $node->psql('postgres',
+		qq{\\set VERBOSITY verbose\nSELECT test_ws_schema_set_inherited(decode('$t->[0]', 'hex'), 'lie');});
+	like($err, $t->[2], "a record saying $t->[1] is inherited that is not, refused");
+	like($err, qr/XX001/, '(as the record\'s fault)');
+}
+$node->safe_psql('postgres', q{ALTER TABLE lie.ckc DROP CONSTRAINT pkc});
+{
+	my ($ret, $out, $err) = $node->psql('postgres',
+		qq{\\set VERBOSITY verbose\nSELECT test_ws_schema_set_inherited(decode('$ckhex', 'hex'), 'lie');});
+	like($err, qr/XX001.*"pkc" is inherited/s, 'and one it does not have, the same');
+}
+
+# a temporary child is its session's: its parent reads as it did
+{
+	my $alone = $bytes->($node, 'postgres', 'ip2');
+	is( $node->safe_psql('postgres', q{CREATE TEMP TABLE tchild () INHERITS (src.ip2);
+			SELECT encode(test_ws_schema_bytes('src', 'ip2'), 'hex')}),
+		$alone, 'a temporary child no matter to its parent');
 }
 
 # an index a key on its own table uses is still the table's
@@ -638,8 +668,8 @@ my %refused_for = (
 	seqother => 'its sequence in another schema',
 	ponly => 'or is not valid', ponlyk => 'or is not valid',
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
-	ihx => 'in another schema', ihy => 'in another schema', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
-	ixa1 => 'one for the other', ixd1 => 'one for the other', ixp1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
+	ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
+	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
 	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
@@ -667,9 +697,9 @@ for my $t (
 		CREATE TABLE src.ixa1 PARTITION OF src.ixa FOR VALUES FROM (0) TO (10)} ],
 	[ 'ixd1', q{CREATE TABLE src.ixd (a integer, CONSTRAINT z UNIQUE (a) DEFERRABLE, CONSTRAINT y UNIQUE (a)) PARTITION BY RANGE (a);
 		CREATE TABLE src.ixd1 PARTITION OF src.ixd FOR VALUES FROM (0) TO (10)} ],
-	[ 'ixp1', q{CREATE TABLE src.ixp (a integer, CONSTRAINT ixp_k UNIQUE (a)) PARTITION BY RANGE (a);
-		CREATE TABLE src.ixp1 (a integer, CONSTRAINT ixp1_u UNIQUE (a)); CREATE UNIQUE INDEX ixp1_alike ON src.ixp1 (a);
-		ALTER TABLE src.ixp ATTACH PARTITION src.ixp1 FOR VALUES FROM (0) TO (10)} ],
+	[ 'ixq1', q{CREATE TABLE src.ixq (a integer) PARTITION BY RANGE (a); CREATE UNIQUE INDEX ixq_i ON src.ixq (a);
+		CREATE TABLE src.ixq1 (a integer, CONSTRAINT ixq1_u UNIQUE (a)); CREATE UNIQUE INDEX ixq1_alike ON src.ixq1 (a);
+		ALTER TABLE src.ixq ATTACH PARTITION src.ixq1 FOR VALUES FROM (0) TO (10)} ],
 	[ 'ptfn', q{CREATE TABLE src.ptfn (id integer, r integer, CONSTRAINT own FOREIGN KEY (r) REFERENCES src.ptf_p (id)); ALTER TABLE src.ptf_c ATTACH PARTITION src.ptfn FOR VALUES FROM (10) TO (20)} ],
 	[ 'ponly', q{CREATE TABLE src.ponly (a int) PARTITION BY RANGE (a); CREATE TABLE src.ponly1 PARTITION OF src.ponly FOR VALUES FROM (0) TO (1);
 		ALTER TABLE ONLY src.ponly ADD CONSTRAINT ponly_u UNIQUE (a); ALTER TABLE src.ponly DETACH PARTITION src.ponly1} ],
@@ -679,6 +709,8 @@ for my $t (
 	[ 'pam', 'CREATE TABLE src.pam (a int) PARTITION BY RANGE (a) ; ALTER TABLE src.pam SET ACCESS METHOD heap' ],
 	[ 'psp', 'CREATE TABLE src.psp (a int) PARTITION BY RANGE (a) TABLESPACE t86' ],
 	[ 'ihx', q{CREATE TABLE ptother.ihxp (a int); CREATE TABLE src.ihx () INHERITS (ptother.ihxp)} ],
+	[ 'ihf', q{CREATE FOREIGN TABLE src.ihfp (a int) SERVER pxs; CREATE TABLE src.ihf () INHERITS (src.ihfp)} ],
+	[ 'ihg', q{CREATE TABLE src.ihg (a int); CREATE FOREIGN TABLE src.ihg1 () INHERITS (src.ihg) SERVER pxs} ],
 	[ 'ihy', q{CREATE TABLE src.ihy (a int); CREATE TABLE ptother.ihy1 () INHERITS (src.ihy)} ],
 	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],
 	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
@@ -875,6 +907,27 @@ for my $t (
 }
 is($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkpart1')}), '',
 	'a key from a partitioned table is that table\'s, and not read as the partition\'s');
+# a key name so long that its numbered row is cut short to another key's
+my $longk = 'a' x 63;
+my $shortk = ('a' x 61) . '_1';
+$node->safe_psql('postgres', qq{
+	CREATE TABLE src.fkl_q (id integer PRIMARY KEY);
+	CREATE TABLE src.fkl_p (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+	CREATE TABLE src.fkl_p1 PARTITION OF src.fkl_p FOR VALUES FROM (0) TO (10);
+	CREATE TABLE src.fkl_c (a integer, b integer, CONSTRAINT "$shortk" FOREIGN KEY (a) REFERENCES src.fkl_q (id));
+	ALTER TABLE src.fkl_c ADD CONSTRAINT "$longk" FOREIGN KEY (b) REFERENCES src.fkl_p (id);
+	CREATE TABLE src.fkl_ok (a integer, b integer, CONSTRAINT "$shortk" FOREIGN KEY (a) REFERENCES src.fkl_q (id),
+		CONSTRAINT "${longk}" FOREIGN KEY (b) REFERENCES src.fkl_q (id));
+});
+($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_c')});
+like($ferr, qr/numbered rows of so long a name/, 'a key whose numbered rows could take another key\'s name refused');
+isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_ok')}), '', 'and the same names, to a table with no partitions, read');
+my $longo = 'ab' . ('x' x 61);
+$node->safe_psql('postgres', qq{
+	CREATE TABLE src.fkl_far (a integer, b integer, CONSTRAINT ab_1 FOREIGN KEY (a) REFERENCES src.fkl_q (id));
+	ALTER TABLE src.fkl_far ADD CONSTRAINT "$longo" FOREIGN KEY (b) REFERENCES src.fkl_p (id);
+});
+isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkl_far')}), '', 'a name near the limit, and a short one its cut could never reach, read');
 ($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('sharedfk', 'p')});
 like($ferr, qr/is not in a versioned schema/, 'a shared table\'s keys are no commit\'s');
 
@@ -1278,6 +1331,39 @@ my $part_utf8 = $node->safe_psql('postgres', sprintf($part_enc, 'enc'));
 is($node->safe_psql('lat', sprintf($part_enc, 'enc')), $part_utf8, 'a partitioned table the same bytes in LATIN1 as in UTF8');
 $node->safe_psql('lat', qq{SELECT test_ws_schema_create(decode('$part_utf8', 'hex'), 'dst')});
 is($node->safe_psql('lat', sprintf($part_enc, 'dst')), $part_utf8, 'and made there, read again');
+
+# a table inheriting: its parents', columns' and constraints' names in each encoding
+my $inh_sql = q{
+	SET client_encoding = UTF8;
+	CREATE TABLE enc."parenté" ("colonné" integer CONSTRAINT "nulé" NOT NULL, CONSTRAINT "chequé" CHECK ("colonné" > 0));
+	CREATE TABLE enc."enfanté" (own text) INHERITS (enc."parenté");
+};
+$node->safe_psql($_, $inh_sql) for ('postgres', 'lat');
+my $inh_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('%s', '%s'), 'hex')};
+my $inh_utf8 = $node->safe_psql('postgres', sprintf($inh_enc, 'enc', 'enfanté'));
+is($node->safe_psql('lat', sprintf($inh_enc, 'enc', 'enfanté')), $inh_utf8, 'a table inheriting the same bytes in LATIN1 as in UTF8');
+for my $table ('parenté', 'enfanté')
+{
+	my $hex = $node->safe_psql('postgres', sprintf($inh_enc, 'enc', $table));
+	$node->safe_psql('lat', qq{SET client_encoding = UTF8; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst');
+		SELECT test_ws_schema_inherit(decode('$hex', 'hex'), 'dst');
+		SELECT test_ws_schema_set_inherited(decode('$hex', 'hex'), 'dst')});
+}
+is($node->safe_psql('lat', sprintf($inh_enc, 'dst', 'enfanté')), $inh_utf8, 'and made there, read again');
+
+# a key's numbered rows, cut short in UTF8's bytes though not in this encoding's
+{
+	my ($kl, $ks) = ('é' x 31, ('é' x 30) . '_1');
+	$node->safe_psql('lat', qq{
+		SET client_encoding = UTF8;
+		CREATE TABLE enc.fkl_q (id integer PRIMARY KEY);
+		CREATE TABLE enc.fkl_p (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+		CREATE TABLE enc.fkl_c (a integer, b integer, CONSTRAINT "$ks" FOREIGN KEY (a) REFERENCES enc.fkl_q (id));
+		ALTER TABLE enc.fkl_c ADD CONSTRAINT "$kl" FOREIGN KEY (b) REFERENCES enc.fkl_p (id);
+	});
+	my ($ret, $out, $err) = $node->psql('lat', q{SELECT test_ws_fk_bytes('enc', 'fkl_c')});
+	like($err, qr/numbered rows of so long a name/, 'a key near the limit in UTF8 refused from LATIN1');
+}
 
 # a name that fits here and not in a commit, as part of another's: refused as too long
 my $over = 'é' x 40;

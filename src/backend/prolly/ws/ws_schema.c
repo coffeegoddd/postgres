@@ -40,6 +40,7 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_partitioned_table.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
@@ -154,8 +155,12 @@ inheritance_problem(const WsTableSchema *s)
 		return "a negative number of parents";
 	if (s->ninherits == 0 && (s->ninherited_cols > 0 || s->ninherited_cons > 0))
 		return "something inherited with no parents";
+	if (s->ninherits > WS_MAX_PARENTS)
+		return "more parents than a commit holds";
 	if (s->ninherits > 0 && s->partition_of != NULL)
 		return "a partition that inherits as well";
+	if (s->ninherits > 0 && s->partition != WS_PARTITION_NONE)
+		return "a partitioned table that inherits as well";
 	for (int i = 0; i < s->ninherits; i++)
 	{
 		if (s->inherits[i] == NULL || s->inherits[i][0] == '\0' || strlen(s->inherits[i]) >= NAMEDATALEN)
@@ -188,9 +193,26 @@ inheritance_problem(const WsTableSchema *s)
 			return "an inherited constraint of no name";
 		if (i > 0 && strcmp(s->inherited_cons[i - 1], name) >= 0)
 			return "inherited constraints not in order by name";
-		for (int c = 0; c < s->nconstraints && !found; c++)
-			found = s->constraints[c].kind == WS_CONSTRAINT_CHECK &&
-				strcmp(s->constraints[c].name, name) == 0;
+		/* (the table's constraints are in order by name, already checked) */
+		{
+			int			lo = 0,
+						hi = s->nconstraints - 1;
+
+			while (lo <= hi && !found)
+			{
+				int			mid = lo + (hi - lo) / 2;
+				int			cmp = strcmp(name, s->constraints[mid].name);
+
+				if (cmp == 0)
+					found = s->constraints[mid].kind == WS_CONSTRAINT_CHECK;
+				if (cmp == 0)
+					break;
+				if (cmp < 0)
+					hi = mid - 1;
+				else
+					lo = mid + 1;
+			}
+		}
 		for (int c = 0; c < s->ncols && !found; c++)
 			found = s->cols[c].not_null != NULL && strcmp(s->cols[c].not_null, name) == 0;
 		if (!found)
@@ -427,6 +449,8 @@ ws_schema_problem(const WsTableSchema *s)
 	{
 		const WsConstraint *con = &s->constraints[i];
 
+		/* (their pairs below: a record from anywhere can hold a great many) */
+		CHECK_FOR_INTERRUPTS();
 		if (con->name == NULL || con->name[0] == '\0')
 			return "a constraint with no name";
 		if (strlen(con->name) >= NAMEDATALEN)
@@ -950,6 +974,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		n = get_uvarint(&p, end);
 		if (n == 0)
 			malformed("it inherits from nothing, at length");
+		if (n > WS_MAX_PARENTS)
+			malformed("more parents than a commit holds");
 		/* (each is at least a byte, its length) */
 		if (n > (uint64) (end - p))
 			malformed("more parents than bytes");
@@ -966,6 +992,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		for (int i = 0; i < s->ninherited_cols; i++)
 			s->inherited_cols[i] = get_uvarint(&p, end);
 		n = get_uvarint(&p, end);
+		if (n > (uint64) s->ncols + (uint64) s->nconstraints)
+			malformed("more inherited constraints than the table has");
 		if (n > (uint64) (end - p))
 			malformed("more inherited constraints than bytes");
 		s->inherited_cons = px_malloc((size_t) Max(n, 1) * sizeof(char *));
@@ -2002,7 +2030,8 @@ check_inherit_statement(const WsTableSchema *s, const char *parent, const char *
 		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
 		not_the_record(s, "another table");
 	cmd = linitial_node(AlterTableCmd, stmt->cmds);
-	if (cmd->subtype != AT_AddInherit || !IsA(cmd->def, RangeVar))
+	if (cmd->subtype != AT_AddInherit || cmd->name != NULL || cmd->newowner != NULL ||
+		cmd->missing_ok || !IsA(cmd->def, RangeVar))
 		not_the_record(s, "another change");
 	of = (RangeVar *) cmd->def;
 	if (of->catalogname != NULL || of->schemaname == NULL || strcmp(of->schemaname, schema) != 0 ||
@@ -2109,6 +2138,9 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	here.inherits = palloc_array(char *, Max(s->ninherits, 1));
 	for (int i = 0; i < s->ninherits; i++)
 		here.inherits[i] = ws_name_from_utf8(s->inherits[i]);
+	here.inherited_cons = palloc_array(char *, Max(s->ninherited_cons, 1));
+	for (int i = 0; i < s->ninherited_cons; i++)
+		here.inherited_cons[i] = ws_name_from_utf8(s->inherited_cons[i]);
 	*here_out = here;
 }
 
@@ -2257,10 +2289,22 @@ static const char *const unsupported_sql =
 "  WHEN c.relispartition AND EXISTS (SELECT FROM pg_index x JOIN pg_class xc ON xc.oid = x.indexrelid "
 "               JOIN pg_index y ON y.indrelid = x.indrelid AND y.indexrelid > x.indexrelid "
 "               JOIN pg_class yc ON yc.oid = y.indexrelid "
+"               LEFT JOIN pg_inherits xp ON xp.inhrelid = x.indexrelid "
+"               LEFT JOIN pg_inherits yp ON yp.inhrelid = y.indexrelid "
 "               WHERE x.indrelid = c.oid AND xc.relam = yc.relam AND x.indisunique = y.indisunique "
+"                 AND (xp.inhparent IS NOT NULL OR yp.inhparent IS NOT NULL) "
+"                 AND NOT (yp.inhparent IS NULL AND "
+"                   EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = xp.inhparent AND k.contype IN ('p', 'u', 'x')) AND "
+"                   NOT EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = y.indexrelid AND k.contype IN ('p', 'u', 'x'))) "
+"                 AND NOT (xp.inhparent IS NULL AND "
+"                   EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = yp.inhparent AND k.contype IN ('p', 'u', 'x')) AND "
+"                   NOT EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.contype IN ('p', 'u', 'x'))) "
 "                 AND x.indnullsnotdistinct = y.indnullsnotdistinct AND x.indnatts = y.indnatts "
 "                 AND x.indnkeyatts = y.indnkeyatts AND x.indkey::text = y.indkey::text "
 "                 AND x.indcollation::text = y.indcollation::text "
+"                 AND (SELECT k.conexclop FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.contype = 'x') "
+"                   IS NOT DISTINCT FROM "
+"                     (SELECT k.conexclop FROM pg_constraint k WHERE k.conindid = y.indexrelid AND k.contype = 'x') "
 "                 AND pg_get_expr(x.indexprs, x.indrelid) IS NOT DISTINCT FROM pg_get_expr(y.indexprs, y.indrelid) "
 "                 AND pg_get_expr(x.indpred, x.indrelid) IS NOT DISTINCT FROM pg_get_expr(y.indpred, y.indrelid) "
 "                 AND (SELECT array_agg(o.opcfamily ORDER BY n.ord) FROM unnest(x.indclass::oid[]) "
@@ -2274,11 +2318,14 @@ static const char *const unsupported_sql =
 "    THEN 'it has a partition being detached, in another schema, or not a table' "
 "  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
 "  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
-"               WHERE NOT c.relispartition AND i.inhrelid = c.oid AND q.relnamespace <> c.relnamespace) "
-"    THEN 'it inherits from a table in another schema' "
+"               WHERE NOT c.relispartition AND i.inhrelid = c.oid AND "
+"                 (q.relnamespace <> c.relnamespace OR q.relkind <> 'r')) "
+"    THEN 'it inherits from a table in another schema, or from no table' "
+"  WHEN (SELECT count(*) FROM pg_inherits i WHERE NOT c.relispartition AND i.inhrelid = c.oid) > 1600 "
+"    THEN 'it inherits from more tables than a commit holds' "
 "  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhrelid "
 "               WHERE c.relkind <> 'p' AND i.inhparent = c.oid AND q.relpersistence <> 't' AND "
-"                 (q.relnamespace <> c.relnamespace OR q.relkind NOT IN ('r', 'p'))) "
+"                 (q.relnamespace <> c.relnamespace OR q.relkind <> 'r')) "
 "    THEN 'a table in another schema, or no table, inherits from it' "
 "  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
 "    THEN 'it has another access method' "
@@ -2717,6 +2764,7 @@ read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others
 	{
 		out->ninherits = parents.nrows;
 		out->inherits = px_malloc((size_t) parents.nrows * sizeof(char *));
+		memset(out->inherits, 0, (size_t) parents.nrows * sizeof(char *));
 		for (int i = 0; i < parents.nrows; i++)
 			out->inherits[i] = ws_name_to_utf8(ws_sql_value(&parents, i, 0));
 		out->inherited_cols = px_malloc((size_t) Max(cols->nrows, 1) * sizeof(uint64));
@@ -2724,6 +2772,7 @@ read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others
 			if (ws_sql_value(cols, i, 12)[0] != 't')
 				out->inherited_cols[out->ninherited_cols++] = out->cols[i].tag;
 		out->inherited_cons = px_malloc((size_t) (cols->nrows + others->nrows + 1) * sizeof(char *));
+		memset(out->inherited_cons, 0, (size_t) (cols->nrows + others->nrows + 1) * sizeof(char *));
 		for (int i = 0; i < cols->nrows; i++)
 			if (out->cols[i].not_null != NULL && ws_sql_value(cols, i, 13)[0] != 't')
 				out->inherited_cons[n++] = px_memdup(out->cols[i].not_null, strlen(out->cols[i].not_null) + 1);
@@ -3025,12 +3074,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	return true;
 }
 
+/* (both names in the server's encoding) */
 pg_noreturn static void
-not_inherited(const WsTableSchema *s, const char *what)
+not_inherited(const char *table, const char *what)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("the schema of table \"%s\" says %s is inherited, and it is not", s->name, what)));
+			 errmsg("the schema of table \"%s\" says \"%s\" is inherited, and it is not", table, what)));
 }
 
 void
@@ -3063,7 +3113,7 @@ ws_schema_set_inherited(const char *schema, const WsTableSchema *s)
 		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "no column \"%s\" in table \"%s\"", name, table);
 		if (((Form_pg_attribute) GETSTRUCT(tup))->attinhcount == 0)
-			not_inherited(s, col->name);
+			not_inherited(table, name);
 		((Form_pg_attribute) GETSTRUCT(tup))->attislocal = false;
 		CatalogTupleUpdate(catalog, &tup->t_self, tup);
 		heap_freetuple(tup);
@@ -3074,13 +3124,16 @@ ws_schema_set_inherited(const char *schema, const WsTableSchema *s)
 	for (int i = 0; i < s->ninherited_cons; i++)
 	{
 		char	   *name = ws_name_from_utf8(s->inherited_cons[i]);
-		Oid			con = get_relation_constraint_oid(relid, name, false);
-		HeapTuple	tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(con));
+		Oid			con = get_relation_constraint_oid(relid, name, true);
+		HeapTuple	tup;
 
+		if (!OidIsValid(con))
+			not_inherited(table, name);
+		tup = SearchSysCacheCopy1(CONSTROID, ObjectIdGetDatum(con));
 		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "no constraint \"%s\" on table \"%s\"", name, table);
 		if (((Form_pg_constraint) GETSTRUCT(tup))->coninhcount == 0)
-			not_inherited(s, s->inherited_cons[i]);
+			not_inherited(table, name);
 		((Form_pg_constraint) GETSTRUCT(tup))->conislocal = false;
 		CatalogTupleUpdate(catalog, &tup->t_self, tup);
 		heap_freetuple(tup);

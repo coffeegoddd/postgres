@@ -1731,6 +1731,19 @@ test_inheriting(void)
 		CHECK(problem_has(ws_schema_problem(&s), "inherits as well"));
 		s.partition_of = NULL;
 		s.partition_bound = NULL;
+		s.partition = WS_PARTITION_HASH;
+		s.npartition = 1;
+		{
+			WsIndexKey	pk = {.tag = 7,.order = 'd',.nulls = 'd'};
+
+			s.partition_keys = &pk;
+			CHECK(problem_has(ws_schema_problem(&s), "partitioned table that inherits"));
+		}
+		s.partition = WS_PARTITION_NONE;
+		s.npartition = 0;
+		s.partition_keys = NULL;
+		s.ninherits = WS_MAX_PARENTS + 1;
+		CHECK(problem_has(ws_schema_problem(&s), "more parents"));
 		s.ninherits = 0;
 		s.ninherited_cols = 1;
 		s.inherited_cols = icols;
@@ -1746,9 +1759,17 @@ test_inheriting(void)
 		static const char over[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "i" "\x01" "\x01" "p" "\x02" "\x07\x07" "\x00";
+		static const char toomany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\xc1\x0c" "\x00";
+		static const char cons[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\x01" "\x01" "p" "\x00" "\x02" "\x01" "x" "\x01" "y";
 
 		check_refused(zero, sizeof(zero) - 1, "inherits from nothing");
 		check_refused(many, sizeof(many) - 1, "more parents than bytes");
+		check_refused(toomany, sizeof(toomany) - 1, "more parents than a commit holds");
+		check_refused(cons, sizeof(cons) - 1, "more inherited constraints");
 		check_refused(over, sizeof(over) - 1, "more inherited columns");
 	}
 }
