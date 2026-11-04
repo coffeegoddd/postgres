@@ -2199,12 +2199,68 @@ test_index_settings_problems(void)
 			"\x00" "\x00" "\x00" "\x00" "x" "\x00" "\x00" "\x00";
 		static const char flags[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
-			"\x00" "\x00" "\x00" "\x00" "x" "\x04" "\x00" "\x00";
+			"\x00" "\x00" "\x00" "\x00" "x" "\x40" "\x00" "\x00";
 
 		check_refused(noset, sizeof(noset) - 1, "no index settings");
 		check_refused(many, sizeof(many) - 1, "more index settings than bytes");
 		check_refused(none, sizeof(none) - 1, "saying it has none");
 		check_refused(flags, sizeof(flags) - 1, "flags not known");
+	}
+}
+
+/* Row security: its bytes, its one statement, and only that says it. */
+static void
+test_row_security(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.row_security = true,.force_row_security = true};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x01"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00" "\x00" "\x00"
+		"x" "\x0c" "\x00" "\x00";
+	Buf			b = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.row_security && got.force_row_security);
+	ws_schema_free(&got);
+	buf_free(&b);
+	b = (Buf) BUF_INIT;
+	ws_schema_row_security(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "ALTER TABLE ONLY x.t ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY") == 0);
+	buf_free(&b);
+	s.row_security = false;
+	b = (Buf) BUF_INIT;
+	ws_schema_row_security(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "ALTER TABLE ONLY x.t FORCE ROW LEVEL SECURITY") == 0);
+	buf_free(&b);
+	s.force_row_security = false;
+	b = (Buf) BUF_INIT;
+	ws_schema_row_security(&s, "x", &b);
+	CHECK_EQ(b.len, 0);
+	ws_schema_table_settings(&s, "x", &b);
+	CHECK_EQ(b.len, 0);
+	buf_free(&b);
+	s.row_security = true;
+	b = (Buf) BUF_INIT;
+	ws_schema_table_settings(&s, "x", &b);
+	CHECK_EQ(b.len, 0);
+	ws_schema_create_table(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "SECURITY") == NULL);
+	buf_free(&b);
+	{
+		static const char unknown[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "x" "\x10" "\x00" "\x00";
+
+		check_refused(unknown, sizeof(unknown) - 1, "flags not known");
 	}
 }
 
@@ -2839,6 +2895,7 @@ static const ProllyUnitTest tests[] = {
 	{"storage_quoted", test_storage_quoted},
 	{"index_settings", test_index_settings},
 	{"index_settings_problems", test_index_settings_problems},
+	{"row_security", test_row_security},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},

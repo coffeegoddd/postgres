@@ -26,8 +26,8 @@
  * each option's name and value; indexes' settings with 'j', uvarint n, and each
  * index that has any: name, uvarint ninclude and tags, uvarint noptions, names and
  * values, uvarint nstats, columns and targets, uvarint nkeyoptions and each column,
- * uvarint noptions, names and values; and with 'x', a flags byte for the key, a
- * replica identity byte, its index's name if by index, and the clustered index's
+ * uvarint noptions, names and values; and with 'x', a flags byte for the key and
+ * row security, a replica identity byte, its index's name if by index, and the clustered index's
  * name or nothing.  Any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -789,6 +789,8 @@ ws_schema_problem(const WsTableSchema *s)
 #define WS_TABLE_SETTINGS 'x'
 #define KEY_DEFERRABLE 0x01
 #define KEY_INITDEFERRED 0x02
+#define TABLE_ROW_SECURITY 0x04
+#define TABLE_FORCE_ROW_SECURITY 0x08
 #define CON_NULLS_NOT_DISTINCT 0x01
 #define CON_DEFERRABLE 0x02
 #define CON_INITDEFERRED 0x04
@@ -1022,11 +1024,14 @@ schema_encode(const WsTableSchema *s, Buf *out)
 			}
 		}
 	}
-	if (s->key_deferrable || s->replica_identity != WS_REPLICA_DEFAULT || s->clustered != NULL)
+	if (s->key_deferrable || s->replica_identity != WS_REPLICA_DEFAULT || s->clustered != NULL ||
+		s->row_security || s->force_row_security)
 	{
 		buf_append_byte(out, WS_TABLE_SETTINGS);
 		buf_append_byte(out, (s->key_deferrable ? KEY_DEFERRABLE : 0) |
-						(s->key_initdeferred ? KEY_INITDEFERRED : 0));
+						(s->key_initdeferred ? KEY_INITDEFERRED : 0) |
+						(s->row_security ? TABLE_ROW_SECURITY : 0) |
+						(s->force_row_security ? TABLE_FORCE_ROW_SECURITY : 0));
 		buf_append_byte(out, (uint8) s->replica_identity);
 		if (s->replica_identity == WS_REPLICA_INDEX)
 			put_string(out, s->replica_index);
@@ -1490,15 +1495,18 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 
 		p++;
 		flags = get_byte(&p, end);
-		if (flags & ~(KEY_DEFERRABLE | KEY_INITDEFERRED))
+		if (flags & ~(KEY_DEFERRABLE | KEY_INITDEFERRED | TABLE_ROW_SECURITY | TABLE_FORCE_ROW_SECURITY))
 			malformed("a key's flags not known");
 		s->key_deferrable = (flags & KEY_DEFERRABLE) != 0;
 		s->key_initdeferred = (flags & KEY_INITDEFERRED) != 0;
+		s->row_security = (flags & TABLE_ROW_SECURITY) != 0;
+		s->force_row_security = (flags & TABLE_FORCE_ROW_SECURITY) != 0;
 		s->replica_identity = (char) get_byte(&p, end);
 		if (s->replica_identity == WS_REPLICA_INDEX)
 			s->replica_index = get_string(&p, end);
 		s->clustered = get_optional(&p, end);
-		if (!s->key_deferrable && s->replica_identity == WS_REPLICA_DEFAULT && s->clustered == NULL)
+		if (!s->key_deferrable && s->replica_identity == WS_REPLICA_DEFAULT && s->clustered == NULL &&
+			!s->row_security && !s->force_row_security)
 			malformed("a table's settings saying it has none");
 	}
 	if (p != end)
@@ -2851,6 +2859,29 @@ check_table_settings_statement(const WsTableSchema *s, const char *schema, const
 	}
 }
 
+/* One ALTER TABLE ONLY of this table, of just its row security. */
+static void
+check_row_security_statement(const WsTableSchema *s, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	int			want = (s->row_security ? 1 : 0) + (s->force_row_security ? 1 : 0);
+	int			at = 0;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != want)
+		not_the_record(s, "another table");
+	if (s->row_security && list_nth_node(AlterTableCmd, stmt->cmds, at++)->subtype != AT_EnableRowSecurity)
+		not_the_record(s, "another change");
+	if (s->force_row_security && list_nth_node(AlterTableCmd, stmt->cmds, at)->subtype != AT_ForceRowSecurity)
+		not_the_record(s, "another change");
+}
+
 static void
 write_index_stats(const WsIndexSettings *set, const char *schema, Buf *out)
 {
@@ -3186,6 +3217,32 @@ ws_schema_table_settings(const WsTableSchema *s, const char *schema, Buf *out)
 }
 
 void
+ws_schema_row_security(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (!s->row_security && !s->force_row_security)
+		return;
+	schema_in_server_encoding(s, &here);
+	ws_put_text(&sql, "ALTER TABLE ONLY ");
+	ws_put_identifier(&sql, schema);
+	ws_put_text(&sql, ".");
+	ws_put_identifier(&sql, here.name);
+	if (s->row_security)
+		ws_put_text(&sql, " ENABLE ROW LEVEL SECURITY");
+	if (s->force_row_security)
+		ws_put_text(&sql, s->row_security ? ", FORCE ROW LEVEL SECURITY" : " FORCE ROW LEVEL SECURITY");
+	buf_append_byte(&sql, 0);
+	check_row_security_statement(&here, schema, (char *) sql.data);
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
+void
 ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
@@ -3318,8 +3375,7 @@ static const char *const unsupported_sql =
 "  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
 "    THEN 'it has another access method' "
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
-"  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
-"       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
+"  WHEN EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has a policy' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND "
 "               k.contype NOT IN ('p', 'u', 'c', 'n', 'f', 'x')) "
 "    THEN 'it has a constraint trigger' "
@@ -3890,7 +3946,7 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	ws_sql_rows_free(&idx);
 }
 
-/* Its replica identity and clustered index. */
+/* Its row security, replica identity and clustered index. */
 static void
 read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 {
@@ -3898,11 +3954,14 @@ read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 	WsSqlRows	rows;
 
 	WsSql->run("SELECT c.relreplident::text, "
+			   "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
 			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 			   "    WHERE i.indrelid = c.oid AND i.indisreplident), "
 			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 			   "    WHERE i.indrelid = c.oid AND i.indisclustered) "
 			   "FROM pg_class c WHERE c.oid = $1::oid", 1, params, &rows);
+	out->row_security = ws_sql_value(&rows, 0, 1)[0] == 't';
+	out->force_row_security = ws_sql_value(&rows, 0, 2)[0] == 't';
 	switch (ws_sql_value(&rows, 0, 0)[0])
 	{
 		case REPLICA_IDENTITY_DEFAULT:
@@ -3914,16 +3973,16 @@ read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 			out->replica_identity = WS_REPLICA_NOTHING;
 			break;
 		case REPLICA_IDENTITY_INDEX:
-			if (ws_sql_value(&rows, 0, 1) == NULL)
+			if (ws_sql_value(&rows, 0, 3) == NULL)
 				elog(ERROR, "table \"%s\" has a replica identity by no index", table);
 			out->replica_identity = WS_REPLICA_INDEX;
-			out->replica_index = ws_name_to_utf8(ws_sql_value(&rows, 0, 1));
+			out->replica_index = ws_name_to_utf8(ws_sql_value(&rows, 0, 3));
 			break;
 		default:
 			elog(ERROR, "table \"%s\" has a replica identity of no known kind", table);
 	}
-	if (ws_sql_value(&rows, 0, 2) != NULL)
-		out->clustered = ws_name_to_utf8(ws_sql_value(&rows, 0, 2));
+	if (ws_sql_value(&rows, 0, 4) != NULL)
+		out->clustered = ws_name_to_utf8(ws_sql_value(&rows, 0, 4));
 	ws_sql_rows_free(&rows);
 }
 

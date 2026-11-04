@@ -26,6 +26,7 @@
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
 PG_FUNCTION_INFO_V1(test_ws_schema_attach);
+PG_FUNCTION_INFO_V1(test_ws_schema_row_security);
 PG_FUNCTION_INFO_V1(test_ws_schema_inherit);
 PG_FUNCTION_INFO_V1(test_ws_schema_set_inherited);
 PG_FUNCTION_INFO_V1(test_ws_schema_add_checks);
@@ -208,6 +209,38 @@ test_ws_schema_attach(PG_FUNCTION_ARGS)
 	out = cstring_to_text((char *) sql.data);
 	ws_schema_free(&s);
 	buf_free(&sql);
+	PG_RETURN_TEXT_P(out);
+}
+
+/*
+ * test_ws_schema_row_security(bytes bytea, schema text) returns text: the table of
+ * a schema's bytes given its row security, in the schema; the statement, or NULL
+ */
+Datum
+test_ws_schema_row_security(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+	Buf			sql = BUF_INIT;
+	WsSqlRows	rows;
+	text	   *out = NULL;
+	int			level = WsSql->begin();
+
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	ws_schema_row_security(&s, schema, &sql);
+	if (sql.len > 0)
+	{
+		buf_append_byte(&sql, 0);
+		WsSql->run((char *) sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		out = cstring_to_text((char *) sql.data);
+	}
+	WsSql->end(level);
+	ws_schema_free(&s);
+	buf_free(&sql);
+	if (out == NULL)
+		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(out);
 }
 

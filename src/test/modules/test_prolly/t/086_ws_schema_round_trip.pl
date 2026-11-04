@@ -358,6 +358,14 @@ $node->safe_psql('postgres', q{
 	ALTER TABLE src.io_part1 CLUSTER ON io_part1_pkey, REPLICA IDENTITY NOTHING;
 	CREATE TABLE src.io_ren (a integer, b integer, CONSTRAINT io_ren_k PRIMARY KEY (a) INCLUDE (b));
 	ALTER TABLE src.io_ren RENAME b TO z;
+	CREATE TABLE src.rs_on (a integer); ALTER TABLE src.rs_on ENABLE ROW LEVEL SECURITY;
+	CREATE TABLE src.rs_force (a integer); ALTER TABLE src.rs_force FORCE ROW LEVEL SECURITY;
+	CREATE TABLE src.rs_both (a integer); ALTER TABLE src.rs_both ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+	CREATE TABLE src.rs_part (a integer) PARTITION BY RANGE (a); ALTER TABLE src.rs_part ENABLE ROW LEVEL SECURITY;
+	CREATE TABLE src.rs_part1 PARTITION OF src.rs_part FOR VALUES FROM (0) TO (10);
+	ALTER TABLE src.rs_part1 FORCE ROW LEVEL SECURITY;
+	CREATE TABLE src.rs_inh (a integer); ALTER TABLE src.rs_inh ENABLE ROW LEVEL SECURITY;
+	CREATE TABLE src.rs_inh1 () INHERITS (src.rs_inh);
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -380,7 +388,8 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'ip1', 'ip2', 'ichild', 'ilocal', 'imulti', 'ialter', 'igrand', 'inv', 'inv1', 'ino', 'ino1', 'iren', 'iren1', 'ine_p', 'ine_k', 'ine_g',
 	'so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 'so_inh2', 'so_ren',
 	'io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4',
-	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren');
+	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
+	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -417,6 +426,7 @@ $restore_step->('test_ws_schema_attach', @tables);
 $restore_step->('test_ws_schema_add_checks', reverse @tables);
 $restore_step->('test_ws_schema_inherit', @tables);
 $restore_step->('test_ws_schema_set_inherited', @tables);
+$restore_step->('test_ws_schema_row_security', @tables);
 for my $table (@tables)
 {
 	is( $bytes->($node, 'postgres', $table, undef, 'dst'),
@@ -735,6 +745,29 @@ for my $table ('io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1'
 		"$table its deferrals and replica identity as they were");
 }
 
+# row security as it was, and on only after the rows
+my $rsec = q{SELECT string_agg(relname || ' ' || relrowsecurity || relforcerowsecurity, E'\n' ORDER BY relname)
+	FROM pg_class WHERE relnamespace = '%s'::regnamespace AND relname LIKE 'rs\_%%' AND relkind IN ('r', 'p')};
+is($node->safe_psql('postgres', sprintf($rsec, 'dst')), $node->safe_psql('postgres', sprintf($rsec, 'src')), 'row security as it was');
+{
+	my $hex = $bytes->($node, 'postgres', 'rs_both');
+	$node->safe_psql('postgres', q{
+		CREATE SCHEMA rs_dst VERSIONED;
+		CREATE ROLE regress_rs_owner;
+		GRANT CREATE, USAGE ON SCHEMA rs_dst TO regress_rs_owner;
+		GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO regress_rs_owner;
+	});
+	is( $node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'rs_dst') IS NOT NULL;
+			SELECT relrowsecurity OR relforcerowsecurity FROM pg_class WHERE oid = 'rs_dst.rs_both'::regclass}),
+		"t\nf", 'not on when the table is made');
+	$node->safe_psql('postgres', q{ALTER TABLE rs_dst.rs_both OWNER TO regress_rs_owner;
+		SET ROLE regress_rs_owner; INSERT INTO rs_dst.rs_both VALUES (1); RESET ROLE});
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_row_security(decode('$hex', 'hex'), 'rs_dst')});
+	my ($ret, $out, $err) = $node->psql('postgres', q{SET ROLE regress_rs_owner; INSERT INTO rs_dst.rs_both VALUES (2)});
+	like($err, qr/violates row-level security policy/, 'and on after: the same insert, by its owner, is refused');
+	$node->safe_psql('postgres', q{DROP SCHEMA rs_dst CASCADE; DROP OWNED BY regress_rs_owner; DROP ROLE regress_rs_owner});
+}
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -812,7 +845,6 @@ for my $t (
 	[ 'ihy', q{CREATE TABLE src.ihy (a int); CREATE TABLE ptother.ihy1 () INHERITS (src.ihy)} ],
 	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],
 	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
-	[ 'rls', 'CREATE TABLE src.rls (a int); ALTER TABLE src.rls ENABLE ROW LEVEL SECURITY' ],
 	[ 'nv', 'CREATE TABLE src.nv (a int); ALTER TABLE src.nv ADD CONSTRAINT nn NOT NULL a NOT VALID' ],
 	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
