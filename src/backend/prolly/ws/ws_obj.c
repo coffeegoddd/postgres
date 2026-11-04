@@ -40,6 +40,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/snapmgr.h"
 
 const WsObjectCodecRoutine *WsObjectCodec = &BinaryWsObjectCodec;
@@ -556,7 +557,9 @@ static const char *const refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND NOT ( "
 "        (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
-"           AND (q.relkind IN ('r', 'p', 'v', 'm') OR q.relnamespace = 'pg_catalog'::regnamespace))) "
+"           AND (q.relkind IN ('r', 'p', 'v', 'm', 'c') OR q.relnamespace = 'pg_catalog'::regnamespace))) "
+"        OR (d.refclassid = 'pg_proc'::regclass AND EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass "
+"           AND x.objid = d.refobjid AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass)) "
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k "
 "           WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
 "        OR d.refclassid = 'pg_type'::regclass "
@@ -595,6 +598,12 @@ relations_version(const char *schema)
 				"  UNION ALL SELECT 'r' || r.oid || ':' || r.xmin FROM pg_rewrite r "
 				"    JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"    WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || '.' || d.objsubid || ':' || d.description "
+				"    FROM pg_description d JOIN pg_class c ON c.oid = d.objoid JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"    WHERE d.classoid = 'pg_class'::regclass AND n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description "
+				"    FROM pg_description d JOIN pg_type t ON t.oid = d.objoid JOIN pg_namespace n ON n.oid = t.typnamespace "
+				"    WHERE d.classoid = 'pg_type'::regclass AND n.nspname = $1::name "
 				"  UNION ALL SELECT 't' || t.oid || ':' || t.xmin FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
 				"    WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'p' || t.oid || ':' || r.rolname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
@@ -618,13 +627,15 @@ relations_version(const char *schema)
  *
  * A transaction on an old snapshot reads everything else as of then, so what it would
  * read here could not go with it: raises ERRCODE_T_R_SERIALIZATION_FAILURE if the
- * schema's relations differ from it, to try again.
+ * schema's relations differ from it, to try again.  Gives what they are, as a type or
+ * a column's rename takes no lock to wait for: the caller reads again when it is done.
  */
-static void
+static char *
 push_locked_snapshot(const char *schema)
 {
 	const char *params[1] = {schema};
 	HTAB	   *locked;
+	char	   *version;
 	HASHCTL		ctl = {.keysize = sizeof(Oid),.entrysize = sizeof(Oid),.hcxt = CurrentMemoryContext};
 
 	locked = hash_create("objects locked", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
@@ -662,22 +673,22 @@ push_locked_snapshot(const char *schema)
 		PopActiveSnapshot();
 	}
 	hash_destroy(locked);
+	version = relations_version(schema);
 	if (IsolationUsesXactSnapshot())
 	{
-		char	   *now = relations_version(schema);
 		char	   *then;
 
 		PushCopiedSnapshot(GetTransactionSnapshot());
 		UpdateActiveSnapshotCommandId();
 		then = relations_version(schema);
 		PopActiveSnapshot();
-		if (strcmp(now, then) != 0)
+		if (strcmp(version, then) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("could not read schema \"%s\": it has changed since this transaction's snapshot", schema)));
-		pfree(now);
 		pfree(then);
 	}
+	return version;
 }
 
 /*
@@ -880,13 +891,20 @@ read_deps(WsObject *o, const char *oid, const char *source)
 	sql = psprintf("WITH src(classid, objid) AS (%s), "
 				   "d AS (SELECT p.refclassid, p.refobjid FROM pg_depend p JOIN src ON p.classid = src.classid "
 				   "  AND p.objid = src.objid WHERE p.deptype = 'n') "
-				   "SELECT DISTINCT q.relkind::text, q.relname::text FROM d "
+				   "SELECT DISTINCT CASE q.relkind WHEN 'c' THEN 'T' ELSE q.relkind::text END, q.relname::text FROM d "
 				   "LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
-				   "JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid ELSE t.typrelid END "
-				   "WHERE q.relkind IN ('v', 'm') AND q.relnamespace = (SELECT nsp FROM (SELECT relnamespace AS nsp FROM pg_class WHERE oid = $1::oid "
+				   "LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
+				   "JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid "
+				   "    ELSE coalesce(e.typrelid, t.typrelid) END "
+				   "WHERE q.relkind IN ('v', 'm', 'c') AND q.oid <> $1::oid "
+				   "  AND q.reltype <> $1::oid AND q.relnamespace = (SELECT nsp FROM (SELECT relnamespace AS nsp FROM pg_class WHERE oid = $1::oid "
 				   "    UNION ALL SELECT typnamespace FROM pg_type WHERE oid = $1::oid) n LIMIT 1) "
-				   "UNION SELECT CASE b.typtype WHEN 'd' THEN 'D' ELSE 'T' END, b.typname::text FROM d "
-				   "JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
+				   "UNION SELECT CASE b.typtype WHEN 'd' THEN 'D' ELSE 'T' END, b.typname::text FROM ( "
+				   "    SELECT d.refobjid AS typ FROM d WHERE d.refclassid = 'pg_type'::regclass "
+				   "    UNION SELECT x.refobjid FROM d JOIN pg_depend x ON d.refclassid = 'pg_proc'::regclass "
+				   "      AND x.classid = 'pg_proc'::regclass AND x.objid = d.refobjid AND x.deptype = 'i' "
+				   "      AND x.refclassid = 'pg_type'::regclass) n "
+				   "JOIN pg_type t ON t.oid = n.typ "
 				   "LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
 				   "LEFT JOIN pg_range r ON r.rngmultitypid = coalesce(e.oid, t.oid) "
 				   "JOIN pg_type b ON b.oid = coalesce(r.rngtypid, e.oid, t.oid) "
@@ -1041,18 +1059,32 @@ static const char *const type_refusal_sql =
 "    THEN 'it has a constraint not validated, which no statement could make' "
 "  WHEN EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_description m ON m.classoid = 'pg_constraint'::regclass AND m.objoid = k.oid "
 "      WHERE k.contypid = t.oid) THEN 'it has a comment on a constraint' "
-"  WHEN EXISTS (SELECT 1 FROM pg_seclabel l WHERE l.classoid = 'pg_type'::regclass AND l.objoid = t.oid) "
+"  WHEN EXISTS (SELECT 1 FROM pg_seclabel l WHERE (l.classoid = 'pg_type'::regclass AND l.objoid IN (t.oid, t.typarray, "
+"        (SELECT r.rngmultitypid FROM pg_range r WHERE r.rngtypid = t.oid))) "
+"      OR (l.classoid = 'pg_class'::regclass AND l.objoid = t.typrelid AND t.typrelid <> 0)) "
 "    THEN 'it has a security label' "
+"  WHEN EXISTS (SELECT 1 FROM pg_cast k WHERE (k.castsource = t.oid OR k.casttarget = t.oid) "
+"      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype = 'i')) "
+"    THEN 'it has a cast' "
+"  WHEN EXISTS (SELECT 1 FROM pg_description x WHERE x.classoid = 'pg_type'::regclass AND x.objoid IN (t.typarray, "
+"        (SELECT m.typarray FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid WHERE r.rngtypid = t.oid))) "
+"    THEN 'its array type has a comment of its own' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d JOIN pg_proc p ON p.oid = d.objid WHERE d.classid = 'pg_proc'::regclass AND d.deptype = 'i' "
+"      AND d.refclassid = 'pg_type'::regclass AND d.refobjid IN (t.oid, (SELECT r.rngmultitypid FROM pg_range r WHERE r.rngtypid = t.oid)) "
+"      AND (p.proacl IS NOT NULL OR EXISTS (SELECT 1 FROM pg_description x WHERE x.classoid = 'pg_proc'::regclass AND x.objoid = p.oid))) "
+"    THEN 'a function of it has a comment or grant of its own' "
+"  WHEN t.typtype = 'r' AND EXISTS (SELECT 1 FROM pg_proc c WHERE c.proname = t.typname AND c.pronamespace = 'pg_catalog'::regnamespace) "
+"    THEN 'it would have a function named as one in the catalogs' "
+"  WHEN EXISTS (SELECT 1 FROM aclexplode(t.typacl) e WHERE e.grantor <> t.typowner) "
+"    THEN 'it has a grant by a role that does not own it' "
 "  WHEN t.typacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(t.typacl) e WHERE e.grantee = 0) "
 "    THEN 'its USAGE has been revoked from PUBLIC' "
 "  WHEN t.typacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(t.typacl) e WHERE e.grantee = t.typowner) "
 "    THEN 'its owner''s rights have been changed' "
 "  WHEN EXISTS (SELECT 1 FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid "
 "      WHERE r.rngtypid = t.oid AND (m.typacl IS NOT NULL "
-"        OR m.typname <> left(CASE WHEN strpos(t.typname, 'range') > 0 THEN regexp_replace(t.typname, 'range', 'multirange') "
-"            ELSE t.typname || '_multirange' END, 63) "
 "        OR EXISTS (SELECT 1 FROM pg_description x WHERE x.classoid = 'pg_type'::regclass AND x.objoid = m.oid))) "
-"    THEN 'its multirange type has a name, comment or grant of its own' "
+"    THEN 'its multirange type has a comment or grant of its own' "
 "  WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE c.oid IS NOT NULL AND a.attrelid = c.oid AND a.attnum > 0 "
 "      AND NOT a.attisdropped AND a.attstattarget >= 0) THEN 'it has settings on a column' "
 "  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
@@ -1060,12 +1092,20 @@ static const char *const type_refusal_sql =
 "      WHERE d.deptype = 'n' AND i.schema IS NOT NULL AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) "
 "    THEN 'it needs something in another schema' "
 "  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
-"      WHERE d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass AND EXISTS (SELECT 1 FROM pg_type y JOIN pg_class q ON q.oid = y.typrelid "
+"      WHERE d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass AND EXISTS (SELECT 1 FROM pg_type y "
+"        LEFT JOIN pg_type e ON e.oid = y.typelem AND e.typarray = y.oid "
+"        JOIN pg_class q ON q.oid = coalesce(e.typrelid, y.typrelid) "
 "        WHERE y.oid = d.refobjid AND q.relkind <> 'c')) "
-"    THEN 'it needs a table''s row type, and a table may need it' "
+"    THEN 'it needs a table''s or a view''s row type, and a table may need it' "
+"  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
+"      WHERE d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass AND d.refobjid = t.oid) "
+"    THEN 'it needs itself, as no commit could make it' "
 "  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
 "      WHERE d.deptype = 'n' AND d.refclassid <> 'pg_type'::regclass "
 "        AND NOT (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid AND s.classid <> 'pg_constraint'::regclass) "
+"        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind = 'c')) "
+"        AND NOT (d.refclassid = 'pg_proc'::regclass AND EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass "
+"          AND x.objid = d.refobjid AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass)) "
 "        AND NOT coalesce((SELECT i.schema = 'pg_catalog' "
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
 "    THEN 'it needs an object no commit holds yet' "
@@ -1261,6 +1301,43 @@ read_type_owner_and_grants(WsObject *o, const char *oid, const char *name)
 	ws_sql_rows_free(&rows);
 }
 
+/*
+ * Refuses what the statement could not say of a type: a multirange not named as
+ * CREATE TYPE would name it, and a name too long for a commit.
+ */
+static void
+check_type_names(const char *oid, const char *name, char typtype)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	if (typtype == 'r')
+	{
+		const char *range = strstr(name, "range");
+		char	   *expected;
+
+		if (range != NULL)
+			expected = psprintf("%s%s%s", pnstrdup(name, range - name), "multi", range);
+		else
+			expected = psprintf("%s_multirange", pnstrdup(name, NAMEDATALEN - 12));
+		expected[pg_mbcliplen(expected, strlen(expected), NAMEDATALEN - 1)] = '\0';
+		WsSql->read("SELECT m.typname::text FROM pg_range r JOIN pg_type m ON m.oid = r.rngmultitypid "
+					"WHERE r.rngtypid = $1::oid", 1, params, &rows);
+		if (rows.nrows != 1 || strcmp(ws_sql_value(&rows, 0, 0), expected) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" cannot be held in a commit: its multirange type has a name of its own", name)));
+		ws_sql_rows_free(&rows);
+		pfree(expected);
+	}
+	WsSql->read("SELECT a.attname::text FROM pg_type t JOIN pg_attribute a ON a.attrelid = t.typrelid "
+				"  WHERE t.oid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+				"UNION ALL SELECT c.conname::text FROM pg_constraint c WHERE c.contypid = $1::oid", 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		pfree(ws_name_to_utf8(ws_sql_value(&rows, i, 0)));
+	ws_sql_rows_free(&rows);
+}
+
 /* Adds the types of a schema to objs, of *n and room for it. */
 static WsObject *
 read_types(const char *schema, WsObject *objs, int *n)
@@ -1282,6 +1359,7 @@ read_types(const char *schema, WsObject *objs, int *n)
 		CHECK_FOR_INTERRUPTS();
 		o->kind = typtype == 'd' ? WS_OBJ_DOMAIN : WS_OBJ_TYPE;
 		o->name = ws_name_to_utf8(name);
+		check_type_names(oid, name, typtype);
 		type_definition(typtype, oid, &text);
 		buf_append_byte(&text, 0);
 		check_type_is_portable(name, schema, typtype == 'd' ? "CREATE DOMAIN" : "CREATE TYPE", (char *) text.data);
@@ -1317,12 +1395,13 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	WsSqlRows	rels;
 	WsObject   *objs;
 	int			total;
+	char	   *version;
 
 	if (!has_usage_of_schema(schema))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for schema %s", schema)));
-	push_locked_snapshot(schema);
+	version = push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
 	refuse_types(schema, type_refusal_sql);
 	nest = path_begin(schema);
@@ -1389,13 +1468,24 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		if (!compute_order(objs, total, order))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("schema \"%s\" cannot be held in a commit: its views need each other in a cycle", schema)));
+					 errmsg("schema \"%s\" cannot be held in a commit: its objects need each other in a cycle", schema)));
 		pfree(order);
 	}
 	*n = total;
 	*out = objs;
 	ws_sql_rows_free(&rels);
 	path_end(nest);
+	PopActiveSnapshot();
+	INJECTION_POINT("ws-obj-read-end", NULL);
+
+	/* (what prints names reads them as they are now, however long this has taken) */
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetLatestSnapshot());
+	UpdateActiveSnapshotCommandId();
+	if (strcmp(version, relations_version(schema)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": it changed while it was being read", schema)));
 	PopActiveSnapshot();
 	WsSql->end(level);
 }

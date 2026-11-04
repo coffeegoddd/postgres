@@ -305,6 +305,12 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE b_uses (m z_mood, p y_pos, s v_range, ms v_multirange);
 	CREATE VIEW over_types AS SELECT m, p::a_pos2 AS p2, ARRAY[m] AS ms, NULL::w_nest IS NULL AS n, 'sad'::z_mood AS c, s, NULL::v_multirange AS mr FROM b_uses;
 	CREATE VIEW over_composite AS SELECT NULL::x_pair AS pair;
+	CREATE VIEW fields AS SELECT (NULL::x_pair).m AS m, u_collrange('a', 'b') AS r;
+	CREATE TYPE s_changed AS (keep integer, gone integer, was integer);
+	ALTER TYPE s_changed DROP ATTRIBUTE gone;
+	ALTER TYPE s_changed RENAME ATTRIBUTE was TO now_is;
+	CREATE TYPE t_opc AS RANGE (SUBTYPE = int4, SUBTYPE_OPCLASS = int4_ops);
+	CREATE TYPE r_range_range AS RANGE (SUBTYPE = int8);
 });
 my $tydump = sub {
 	my ($schema) = @_;
@@ -315,9 +321,9 @@ my $tydump = sub {
 			pg_get_expr(t.typdefaultbin, 0), format_type(t.typbasetype, t.typtypmod),
 			(SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid),
 			(SELECT string_agg(format('%s:%s:%s:%s', a.attname, format_type(a.atttypid, a.atttypmod), a.attcollation::regcollation, col_description(t.typrelid, a.attnum)), ',' ORDER BY a.attnum)
-			 FROM pg_attribute a WHERE a.attrelid = t.typrelid AND a.attnum > 0),
+			 FROM pg_attribute a WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped),
 			(SELECT string_agg(conname || ' ' || pg_get_constraintdef(oid), ',' ORDER BY conname) FROM pg_constraint WHERE contypid = t.oid),
-			(SELECT format('%s %s %s %s', format_type(rngsubtype, NULL), rngcollation::regcollation, rngsubdiff, rngcanonical) FROM pg_range WHERE rngtypid = t.oid)),
+			(SELECT format('%s %s %s %s %s %s', format_type(rngsubtype, NULL), rngcollation::regcollation, rngsubdiff, rngcanonical, rngsubopc, rngmultitypid::regtype) FROM pg_range WHERE rngtypid = t.oid)),
 		E'\n' ORDER BY t.typname)
 		FROM pg_type t WHERE t.typnamespace = '"$schema"'::regnamespace AND t.typtype IN ('e', 'd', 'r') OR
 			t.typnamespace = '"$schema"'::regnamespace AND t.typtype = 'c' AND t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c')});
@@ -332,7 +338,8 @@ my %ty_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, 
 like($ty_val{'type/x_pair'}, qr/domain\/a_pos2.*domain\/y_pos.*type\/z_mood/s, 'a composite says what it needs, an array by its element');
 like($ty_val{'view/over_types'}, qr/domain\/a_pos2.*type\/v_range.*type\/w_nest.*type\/z_mood/s, 'and a view, a multirange by its range');
 like($ty_val{'type/z_mood'}, qr/it''s @@ ok.*meh.*happy/s, 'an enum is in order, with its @ doubled');
-unlike($ty_held, qr/\bty\./, 'no name of its schema');
+unlike(join('', values %ty_val), qr/\bty\./, 'no name of its schema');
+like($ty_val{'view/fields'}, qr/type\/u_collrange.*type\/x_pair/s, 'a field and a constructor say whose they are');
 
 $node->safe_psql('postgres', q{CREATE SCHEMA ty2 AUTHORIZATION g_tyowner});
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ty', 'ty2', 'before')});
@@ -359,6 +366,43 @@ for my $change (q{ALTER TYPE ty.z_mood ADD VALUE 'later'}, q{ALTER DOMAIN ty.y_p
 }
 $node->safe_psql('postgres', q{ALTER ROLE g_tyuser2 RENAME TO g_tyuser; ALTER ROLE g_tyowner2 RENAME TO g_tyowner});
 
+# a long name's multirange is as CREATE TYPE names it, and held
+for my $long ('b' x 55, 'c' x 63)
+{
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS tyl CASCADE; CREATE SCHEMA tyl; CREATE TYPE tyl.$long AS RANGE (SUBTYPE = int4)});
+	like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyl')}), qr/^type\/\Q$long\E\t/, 'a range of a long name is held');
+}
+
+# a comment since a snapshot is one to try again, on a view or a type
+for my $change (q{COMMENT ON TYPE ty.z_mood IS 'later'}, q{COMMENT ON VIEW ty.over_composite IS 'later'})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('ty')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+
+# a type renamed while being read takes no lock: the read says so, to try again
+if ($ENV{enable_injection_points} eq 'yes' && $node->check_extension('injection_points'))
+{
+	$node->safe_psql('postgres', q{CREATE EXTENSION IF NOT EXISTS injection_points;
+		SELECT injection_points_attach('ws-obj-read-end', 'wait')});
+	my $reader2 = $node->background_psql('postgres', on_error_stop => 0);
+	$reader2->query_until(qr/reading/, "\\echo reading\nSELECT test_ws_obj_bytes('ty');\n\\echo done\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event = 'ws-obj-read-end'}) or die 'no reader';
+	$node->safe_psql('postgres', q{ALTER TYPE ty.z_mood RENAME TO z_mood2;
+		SELECT injection_points_wakeup('ws-obj-read-end');
+		SELECT injection_points_detach('ws-obj-read-end');});
+	$reader2->query_until(qr/finished/, "\\echo finished\n");
+	like($reader2->{stderr}, qr/it changed while it was being read/, 'a read overtaken by a rename is to be tried again');
+	$reader2->quit;
+	$node->safe_psql('postgres', q{ALTER TYPE ty.z_mood2 RENAME TO z_mood});
+}
+
 # a type whose owner cannot travel goes to who restores it, unlike a view
 $node->safe_psql('postgres', q{CREATE SCHEMA ty3; CREATE TYPE ty3.login_owned AS ENUM ('a'); ALTER TYPE ty3.login_owned OWNER TO x_person; CREATE SCHEMA ty4});
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ty3', 'ty4')});
@@ -375,10 +419,19 @@ my @ty_refused = (
 	[ q{CREATE TYPE r_shell}, 'no definition yet' ],
 	[ q{CREATE FUNCTION rf(int) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE DOMAIN r_fn AS int CHECK (rf(VALUE))}, 'no commit holds yet' ],
 	[ q{CREATE TABLE rt (a int); CREATE TYPE r_rowtype AS (r rt)}, 'a table' ],
+	[ q{CREATE TABLE rt2 (a int); CREATE TYPE r_rowtype2 AS (r rt2[])}, 'a table' ],
+	[ q{CREATE VIEW vv AS SELECT 1 AS a; CREATE DOMAIN r_viewdom AS vv[]}, 'a view' ],
+	[ q{CREATE DOMAIN r_self AS int; ALTER DOMAIN r_self SET DEFAULT (5::r_self)}, 'needs itself' ],
+	[ q{CREATE TYPE r_cast AS ENUM ('a'); CREATE CAST (r_cast AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TYPE lower AS RANGE (SUBTYPE = int4)}, 'named as one in the catalogs' ],
+	[ q{CREATE TYPE r_arrc AS ENUM ('a'); COMMENT ON TYPE _r_arrc IS 'x'}, 'its array type' ],
+	[ q{CREATE TYPE r_ctor AS RANGE (SUBTYPE = int4); REVOKE EXECUTE ON FUNCTION r_ctor(int4, int4) FROM PUBLIC}, 'a function of it' ],
+	[ q{CREATE TYPE r_mrc AS RANGE (SUBTYPE = int4); COMMENT ON TYPE r_mrc_multirange IS 'x'}, 'its multirange' ],
 	[ q{CREATE DOMAIN r_nv AS int; ALTER DOMAIN r_nv ADD CONSTRAINT k CHECK (VALUE > 0) NOT VALID}, 'not validated' ],
 	[ q{CREATE DOMAIN r_cc AS int CONSTRAINT k CHECK (VALUE > 0); COMMENT ON CONSTRAINT k ON DOMAIN r_cc IS 'x'}, 'a comment on a constraint' ],
 	[ q{CREATE TYPE r_public AS ENUM ('a'); REVOKE USAGE ON TYPE r_public FROM PUBLIC}, 'revoked from PUBLIC' ],
 	[ q{CREATE TYPE r_mr AS RANGE (SUBTYPE = int4, MULTIRANGE_TYPE_NAME = r_other)}, 'its multirange' ],
+	[ "CREATE TYPE " . ('a' x 60) . " AS RANGE (SUBTYPE = int4, MULTIRANGE_TYPE_NAME = " . ('a' x 60) . "_mu)", 'its multirange' ],
 	[ q{CREATE TYPE r_login AS ENUM ('a'); GRANT USAGE ON TYPE r_login TO x_person}, 'which cannot travel' ],
 	[ q{CREATE COLLATION r_c FROM "C"; CREATE DOMAIN r_coll AS text COLLATE r_c}, 'no commit holds yet' ],
 	[ q{CREATE TYPE public.elsewhere AS ENUM ('a'); CREATE DOMAIN r_other_schema AS public.elsewhere}, 'another schema' ],
