@@ -140,6 +140,8 @@ test_template(void)
 		{"(a @> a)", "(@{7} @@> @{7})"},
 		{"a(1)", "a(1)"},
 		{"(a).a", "(@{7}).a"},
+		{"'x'::geometry(point, 4326)", "'x'::geometry(point, 4326)"},
+		{"a::numeric(a, 2)", "@{7}::numeric(a, 2)"},
 		{"$$a$$", "$$a$$"},
 		{"1 /* a */", "1 /* a */"},
 		{"(a * CASE WHEN a > 0 THEN 1 ELSE a END)", "(@{7} * CASE WHEN @{7} > 0 THEN 1 ELSE @{7} END)"},
@@ -170,10 +172,17 @@ template_qualified(void *arg)
 }
 
 static void
+template_not_one(void *arg)
+{
+	(void) templated("1) FROM y WHERE (a");
+}
+
+static void
 test_template_refused(void)
 {
-	expect_error(template_unknown, NULL, ERRCODE_INTERNAL_ERROR, NULL);
-	expect_error(template_qualified, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	expect_error(template_unknown, NULL, ERRCODE_FEATURE_NOT_SUPPORTED, NULL);
+	expect_error(template_qualified, NULL, ERRCODE_FEATURE_NOT_SUPPORTED, NULL);
+	expect_error(template_not_one, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
 /*

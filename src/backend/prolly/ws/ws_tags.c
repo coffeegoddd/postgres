@@ -157,6 +157,9 @@ collect_refs(Node *node, void *arg)
 
 	if (node == NULL)
 		return false;
+	/* (a type's modifiers are its own to read: geometry(point,4326)) */
+	if (IsA(node, TypeName))
+		return false;
 	if (IsA(node, ColumnRef))
 	{
 		if (l->n == l->cap)
@@ -177,6 +180,33 @@ ref_location_cmp(const void *a, const void *b)
 	return pg_cmp_s32((*(ColumnRef *const *) a)->location, (*(ColumnRef *const *) b)->location);
 }
 
+Node *
+ws_one_expression(List *parsed)
+{
+	RawStmt    *raw;
+	SelectStmt *select;
+	ResTarget  *target;
+
+	if (list_length(parsed) != 1)
+		return NULL;
+	raw = linitial_node(RawStmt, parsed);
+	/* (a length only if a semicolon ended it) */
+	if (raw->stmt_len != 0 || !IsA(raw->stmt, SelectStmt))
+		return NULL;
+	select = (SelectStmt *) raw->stmt;
+	if (list_length(select->targetList) != 1 ||
+		select->fromClause != NIL || select->whereClause != NULL ||
+		select->groupClause != NIL || select->havingClause != NULL ||
+		select->windowClause != NIL || select->sortClause != NIL ||
+		select->limitOffset != NULL || select->limitCount != NULL ||
+		select->lockingClause != NIL || select->withClause != NULL ||
+		select->distinctClause != NIL || select->valuesLists != NIL ||
+		select->intoClause != NULL || select->op != SETOP_NONE)
+		return NULL;
+	target = linitial_node(ResTarget, select->targetList);
+	return target->name == NULL ? target->val : NULL;
+}
+
 void
 ws_tags_template(const char *expression, WsTagOfFn tag_of, void *arg, Buf *out)
 {
@@ -186,7 +216,7 @@ ws_tags_template(const char *expression, WsTagOfFn tag_of, void *arg, Buf *out)
 	RefList		refs = {0};
 	const char *at = expression;
 
-	if (list_length(parsed) != 1)
+	if (ws_one_expression(parsed) == NULL)
 		elog(ERROR, "not one expression: \"%s\"", expression);
 	(void) collect_refs(linitial_node(RawStmt, parsed)->stmt, &refs);
 	if (refs.n > 1)
@@ -202,10 +232,16 @@ ws_tags_template(const char *expression, WsTagOfFn tag_of, void *arg, Buf *out)
 		char		num[32];
 
 		if (list_length(ref->fields) != 1 || !IsA(linitial(ref->fields), String))
-			elog(ERROR, "a column reference that is not one column's name: \"%s\"", expression);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("an expression with a reference that is not one column's name cannot be read yet: \"%s\"",
+							expression)));
 		name = strVal(linitial(ref->fields));
 		if (!tag_of(arg, name, &tag))
-			elog(ERROR, "\"%s\" refers to no column of its table: \"%s\"", name, expression);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("an expression that refers to \"%s\", no column of its table, cannot be read yet: \"%s\"",
+							name, expression)));
 		quoted = quote_identifier(name);
 		len = strlen(quoted);
 		/* (as the catalogs print it, so that nothing else is replaced) */

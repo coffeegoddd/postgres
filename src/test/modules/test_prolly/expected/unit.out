@@ -184,6 +184,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_schema       | create_table_injection               | ok     | 
  ws_schema       | create_table_unchecked               | ok     | 
  ws_schema       | create_table_quoting                 | ok     | 
+ ws_schema       | create_table_renamed                 | ok     | 
  ws_schema       | create_table_stray_clause            | ok     | 
  ws_schema       | create_table_runs                    | ok     | 
  ws_tags         | escape_and_render                    | ok     | 
@@ -192,7 +193,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template                             | ok     | 
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
-(180 rows)
+(181 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

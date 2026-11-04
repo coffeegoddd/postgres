@@ -19,6 +19,8 @@
 #define PROLLY_WS_TAGS_H
 
 #include "access/tupdesc.h"
+#include "nodes/nodes.h"
+#include "nodes/pg_list.h"
 #include "prolly/engine/util.h"
 #include "utils/relcache.h"
 
@@ -46,12 +48,18 @@ extern uint64 ws_tag_derive(const char *table, const char *column, const char *t
  * The tag of a column being added to a table, none of the table's others: 0
  * if the table is not an ordinary or partitioned one in a versioned schema.
  * A table cannot move out of or into versioned schemas, so that is for life.
- * Text the name is in that has no UTF8 raises an error: no commit could hold it.
+ * A name with no UTF8 raises an error: no commit could hold it.
  */
 extern uint64 ws_tag_new_column(Relation rel, const FormData_pg_attribute *att);
 
-/* The tags of a new relation's columns (a descriptor copied holds its source's). */
+/* Gives a new relation's columns their tags (a copied descriptor holds its source's). */
 extern void ws_tags_assign(Relation rel);
+
+/*
+ * The expression of a parse of "SELECT (text)", or NULL if the text was
+ * anything more than one: another clause, an alias, a semicolon.
+ */
+extern Node *ws_one_expression(List *parsed);
 
 /*
  * An expression as the catalogs print it, as stored text appended to out:

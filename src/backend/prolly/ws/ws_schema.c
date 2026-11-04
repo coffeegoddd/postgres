@@ -20,7 +20,6 @@
 
 #include "access/htup_details.h"
 #include "access/table.h"
-#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
@@ -34,6 +33,7 @@
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
@@ -527,25 +527,14 @@ check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
 	Buf			text = BUF_INIT;
 	char	   *sql;
 	List	   *parsed;
-	SelectStmt *select;
+	Node	   *alone;
 
 	put_expression(s, c->def, &text);
 	buf_append_byte(&text, 0);
 	sql = psprintf("SELECT (%s)", (char *) text.data);
 	parsed = parse_text(s, sql);
-	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
-		not_the_record(s, "a column's expression");
-	select = (SelectStmt *) linitial_node(RawStmt, parsed)->stmt;
-	/* (one target, and no other clause: nothing of a query but the expression) */
-	if (list_length(select->targetList) != 1 ||
-		select->fromClause != NIL || select->whereClause != NULL ||
-		select->groupClause != NIL || select->havingClause != NULL ||
-		select->windowClause != NIL || select->sortClause != NIL ||
-		select->limitOffset != NULL || select->limitCount != NULL ||
-		select->lockingClause != NIL || select->withClause != NULL ||
-		select->distinctClause != NIL || select->valuesLists != NIL ||
-		select->intoClause != NULL || select->op != SETOP_NONE ||
-		!equal(linitial_node(ResTarget, select->targetList)->val, in_statement))
+	alone = ws_one_expression(parsed);
+	if (alone == NULL || !equal(alone, in_statement))
 		not_the_record(s, "a column's expression");
 	pfree(sql);
 	buf_free(&text);
@@ -711,6 +700,19 @@ from_utf8(const char *text)
 	return text ? pstrdup(pg_any_to_server(text, (int) strlen(text), PG_UTF8)) : NULL;
 }
 
+/* (a name may be longer here: the grammar would cut it short, and quietly) */
+static char *
+name_from_utf8(const char *name)
+{
+	char	   *here = from_utf8(name);
+
+	if (here != NULL && strlen(here) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("name \"%s\" is too long in this database's encoding", here)));
+	return here;
+}
+
 void
 ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
@@ -720,13 +722,13 @@ ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
-	here.name = from_utf8(s->name);
-	here.key_name = from_utf8(s->key_name);
+	here.name = name_from_utf8(s->name);
+	here.key_name = name_from_utf8(s->key_name);
 	here.cols = palloc_array(WsColumn, Max(s->ncols, 1));
 	for (int i = 0; i < s->ncols; i++)
 	{
 		here.cols[i] = s->cols[i];
-		here.cols[i].name = from_utf8(s->cols[i].name);
+		here.cols[i].name = name_from_utf8(s->cols[i].name);
 		here.cols[i].type = from_utf8(s->cols[i].type);
 		here.cols[i].def = from_utf8(s->cols[i].def);
 		here.cols[i].collation = from_utf8(s->cols[i].collation);
@@ -744,6 +746,98 @@ to_utf8(const char *text)
 	const char *u = pg_server_to_any(text, (int) strlen(text), PG_UTF8);
 
 	return px_memdup(u, strlen(u) + 1);
+}
+
+/* (a name's limit in a commit is in UTF8's bytes, on any cluster) */
+static char *
+name_to_utf8(const char *name)
+{
+	char	   *u = to_utf8(name);
+
+	if (strlen(u) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("name \"%s\" is too long for version control", name),
+				 errdetail("A commit holds names of up to %d bytes of UTF8.", NAMEDATALEN - 1)));
+	return u;
+}
+
+/*
+ * What the record cannot yet hold and a table of the catalogs has, the first
+ * of it: a refusal, not a smaller table.  (The names of a column's not-null
+ * constraint and its identity sequence are not in the list: they are made
+ * again, and a rename leaves them behind anyway.)
+ */
+static const char *const unsupported_sql =
+"SELECT CASE "
+"  WHEN c.relispartition OR c.relkind = 'p' THEN 'it is partitioned' "
+"  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) "
+"    THEN 'it has inheritance' "
+"  WHEN am.amname <> 'heap' THEN 'it has another access method' "
+"  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
+"  WHEN c.reloptions IS NOT NULL THEN 'it has storage parameters' "
+"  WHEN c.relreplident <> 'd' THEN 'it has a replica identity' "
+"  WHEN c.relrowsecurity OR c.relforcerowsecurity THEN 'it has row security' "
+"  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
+"               JOIN pg_class ic ON ic.oid = x.indexrelid "
+"               WHERE k.conrelid = c.oid AND k.contype = 'p' AND "
+"                 (k.conperiod OR k.condeferrable OR x.indnkeyatts <> x.indnatts OR "
+"                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
+"    THEN 'its primary key has more than columns' "
+"  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
+"               (NOT k.convalidated OR k.connoinherit)) "
+"    THEN 'it has a not-null constraint not valid or no inherit' "
+"  WHEN EXISTS (SELECT FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid "
+"               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND "
+"                 (a.attstorage <> t.typstorage OR a.attcompression <> '' OR "
+"                  a.attstattarget IS NOT NULL OR a.attoptions IS NOT NULL)) "
+"    THEN 'a column has storage, compression, statistics or options set' "
+"  WHEN EXISTS (SELECT FROM pg_attrdef d JOIN pg_depend p ON p.classid = 'pg_attrdef'::regclass "
+"                 AND p.objid = d.oid AND p.refclassid = 'pg_class'::regclass "
+"               JOIN pg_class q ON q.oid = p.refobjid "
+"               WHERE d.adrelid = c.oid AND q.relkind = 'S') "
+"    THEN 'a default uses a sequence' "
+"  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
+"               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
+"               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+"                 AND p.refobjid = c.oid AND p.deptype = 'i' AND a.attidentity <> '' AND "
+"                 (q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
+"                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
+"                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
+"    THEN 'an identity has sequence options set' "
+"  END "
+"FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam WHERE c.oid = $1::oid";
+
+/*
+ * The columns as this snapshot saw them have the names they have now: names
+ * are printed from the caches, not the snapshot, so an older snapshot would
+ * put another column's name in an expression.  Under the lock, it holds till
+ * the transaction ends.
+ */
+static void
+check_snapshot_current(const char *table, Oid relid, const WsSqlRows *cols)
+{
+	for (int i = 0; i < cols->nrows; i++)
+	{
+		HeapTuple	tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+										  Int16GetDatum((int16) atoi(ws_sql_value(cols, i, 0))));
+		bool		same;
+
+		if (!HeapTupleIsValid(tup))
+			same = false;
+		else
+		{
+			same = strcmp(NameStr(((Form_pg_attribute) GETSTRUCT(tup))->attname),
+						  ws_sql_value(cols, i, 1)) == 0;
+			ReleaseSysCache(tup);
+		}
+		if (!same)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("a column of table \"%s\" was renamed or dropped since this transaction's snapshot",
+							table)));
+	}
 }
 
 /* (the columns' names in the server's encoding, as an expression prints them) */
@@ -792,18 +886,30 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	}
 	relkind = ws_sql_value(&rel, 0, 1);
 	persistence = ws_sql_value(&rel, 0, 2);
-	if (relkind[0] == RELKIND_PARTITIONED_TABLE || persistence[0] == RELPERSISTENCE_TEMP)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("the schema of partitioned or temporary table \"%s\" cannot be read yet",
-						table)));
-	if (relkind[0] != RELKIND_RELATION)
+	if (relkind[0] != RELKIND_RELATION && relkind[0] != RELKIND_PARTITIONED_TABLE)
 	{
 		ws_sql_rows_free(&rel);
 		WsSql->end(level);
 		return false;
 	}
-	out->name = to_utf8(table);
+	if (persistence[0] == RELPERSISTENCE_TEMP)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the schema of temporary table \"%s\" cannot be read yet", table)));
+	LockRelationOid(atooid(ws_sql_value(&rel, 0, 0)), AccessShareLock);
+	{
+		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
+		WsSqlRows	why;
+
+		WsSql->run(unsupported_sql, 1, oid, &why);
+		if (why.nrows == 1 && ws_sql_value(&why, 0, 0) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the schema of table \"%s\" cannot be read yet: %s",
+							table, ws_sql_value(&why, 0, 0))));
+		ws_sql_rows_free(&why);
+	}
+	out->name = name_to_utf8(table);
 	out->persistence = persistence[0] == RELPERSISTENCE_UNLOGGED ?
 		WS_PERSISTENCE_UNLOGGED : WS_PERSISTENCE_PERMANENT;
 	{
@@ -830,6 +936,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
 	}
 
+	check_snapshot_current(table, atooid(ws_sql_value(&rel, 0, 0)), &cols);
 	out->ncols = cols.nrows;
 	out->cols = px_malloc((size_t) Max(cols.nrows, 1) * sizeof(WsColumn));
 	memset(out->cols, 0, (size_t) Max(cols.nrows, 1) * sizeof(WsColumn));
@@ -844,7 +951,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		const char *collation = ws_sql_value(&cols, i, 7);
 
 		rc.names[i] = ws_sql_value(&cols, i, 1);
-		c->name = to_utf8(rc.names[i]);
+		c->name = name_to_utf8(rc.names[i]);
 		c->type = to_utf8(ws_sql_value(&cols, i, 2));
 		c->not_null = ws_sql_value(&cols, i, 3)[0] == 't';
 		c->identity = identity[0];
@@ -878,13 +985,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		const char *keys = ws_sql_value(&key, 0, 4);
 
-		if (strcmp(ws_sql_value(&key, 0, 1), ws_sql_value(&key, 0, 2)) != 0 ||
-			ws_sql_value(&key, 0, 3)[0] == 't')
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("the primary key of table \"%s\" has INCLUDE columns or is deferrable, which cannot be read yet",
-							table)));
-		out->key_name = to_utf8(ws_sql_value(&key, 0, 0));
+		out->key_name = name_to_utf8(ws_sql_value(&key, 0, 0));
 		out->nkey = atoi(ws_sql_value(&key, 0, 1));
 		out->key = px_malloc((size_t) out->nkey * sizeof(uint64));
 		for (int k = 0; k < out->nkey; k++)
