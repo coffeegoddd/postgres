@@ -724,6 +724,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_ws_schema_create(bytes bytea, schema text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_ws_schema_add_checks(bytes bytea, schema text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_ws_schema_set_tags(bytes bytea, schema text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

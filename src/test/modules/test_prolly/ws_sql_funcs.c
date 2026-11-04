@@ -25,6 +25,7 @@
 
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
+PG_FUNCTION_INFO_V1(test_ws_schema_add_checks);
 PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
@@ -108,6 +109,41 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	ws_schema_free(&s);
 	buf_free(&sql);
 	PG_RETURN_TEXT_P(out);
+}
+
+/*
+ * test_ws_schema_add_checks(bytes bytea, schema text) returns text: the checks
+ * not valid of a schema's bytes added to its table in the schema, as after its
+ * rows; the statements that added them, a line each
+ */
+Datum
+test_ws_schema_add_checks(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+	WsSqlRows	rows;
+	StringInfoData out;
+	int			level = WsSql->begin();
+
+	initStringInfo(&out);
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	for (int i = 0; i < s.nconstraints; i++)
+	{
+		Buf			sql = BUF_INIT;
+
+		if (!s.constraints[i].not_valid)
+			continue;
+		ws_schema_add_check(&s, i, schema, &sql);
+		buf_append_byte(&sql, 0);
+		WsSql->run((char *) sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		appendStringInfo(&out, "%s\n", (char *) sql.data);
+		buf_free(&sql);
+	}
+	WsSql->end(level);
+	ws_schema_free(&s);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 
 /*

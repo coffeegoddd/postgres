@@ -58,6 +58,11 @@
 
 const WsSchemaCodecRoutine *WsSchemaCodec = &BinaryWsSchemaCodec;
 
+/* (a commit's bytes are the record's, whatever the parser calls these) */
+StaticAssertDecl(WS_PARTITION_RANGE == PARTITION_STRATEGY_RANGE, "partition kinds differ");
+StaticAssertDecl(WS_PARTITION_LIST == PARTITION_STRATEGY_LIST, "partition kinds differ");
+StaticAssertDecl(WS_PARTITION_HASH == PARTITION_STRATEGY_HASH, "partition kinds differ");
+
 static const char *
 own_column_name(void *arg, uint64 tag)
 {
@@ -117,11 +122,11 @@ static const char *
 index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 {
 	if ((key->tag != 0) == (key->expr != NULL))
-		return "an index's key neither a column nor an expression, or both";
+		return "a key neither a column nor an expression, or both";
 	if (key->tag != 0)
 	{
 		if (ws_schema_column(s, key->tag) == NULL)
-			return "an index with a column the table does not have";
+			return "a key with a column the table does not have";
 	}
 	else
 	{
@@ -132,7 +137,7 @@ index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 	}
 	if ((key->collation != NULL && key->collation[0] == '\0') ||
 		(key->opclass != NULL && key->opclass[0] == '\0'))
-		return "an index's key with an empty collation or opclass";
+		return "a key with an empty collation or opclass";
 	return NULL;
 }
 
@@ -361,6 +366,9 @@ ws_schema_problem(const WsTableSchema *s)
 			return "constraints not in order by name";
 		if (con->initdeferred && !con->deferrable)
 			return "a constraint initially deferred that is not deferrable";
+		if (con->kind != WS_CONSTRAINT_CHECK &&
+			(con->not_valid || con->no_inherit || con->not_enforced))
+			return "a constraint with a check's flags";
 		if (con->kind != WS_CONSTRAINT_EXCLUSION &&
 			(con->excl.name != NULL || con->excl.method != NULL || con->excl.nkeys != 0 ||
 			 con->excl.ninclude != 0 || con->excl.predicate != NULL ||
@@ -376,6 +384,9 @@ ws_schema_problem(const WsTableSchema *s)
 				return "an expression referring to a column the table does not have";
 			if (con->ncols != 0 || con->nulls_not_distinct || con->deferrable)
 				return "a check with a unique constraint's fields";
+			/* (one check, one set of bytes: not enforced says the other) */
+			if (con->not_valid && con->not_enforced)
+				return "a check both not valid and not enforced";
 		}
 		else if (con->kind == WS_CONSTRAINT_UNIQUE)
 		{
@@ -457,6 +468,9 @@ ws_schema_problem(const WsTableSchema *s)
 #define CON_NULLS_NOT_DISTINCT 0x01
 #define CON_DEFERRABLE 0x02
 #define CON_INITDEFERRED 0x04
+#define CON_NOT_VALID 0x08
+#define CON_NO_INHERIT 0x10
+#define CON_NOT_ENFORCED 0x20
 #define IDX_UNIQUE 0x01
 #define IDX_NULLS_NOT_DISTINCT 0x02
 
@@ -537,7 +551,10 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		buf_append_byte(out, (uint8) con->kind);
 		buf_append_byte(out, (con->nulls_not_distinct ? CON_NULLS_NOT_DISTINCT : 0) |
 						(con->deferrable ? CON_DEFERRABLE : 0) |
-						(con->initdeferred ? CON_INITDEFERRED : 0));
+						(con->initdeferred ? CON_INITDEFERRED : 0) |
+						(con->not_valid ? CON_NOT_VALID : 0) |
+						(con->no_inherit ? CON_NO_INHERIT : 0) |
+						(con->not_enforced ? CON_NOT_ENFORCED : 0));
 		if (con->kind == WS_CONSTRAINT_CHECK)
 			put_string(out, con->expr);
 		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
@@ -753,11 +770,15 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		con->name = get_string(&p, end);
 		con->kind = (char) get_byte(&p, end);
 		flags = get_byte(&p, end);
-		if (flags & ~(CON_NULLS_NOT_DISTINCT | CON_DEFERRABLE | CON_INITDEFERRED))
+		if (flags & ~(CON_NULLS_NOT_DISTINCT | CON_DEFERRABLE | CON_INITDEFERRED |
+					  CON_NOT_VALID | CON_NO_INHERIT | CON_NOT_ENFORCED))
 			malformed("a constraint's flags not known");
 		con->nulls_not_distinct = (flags & CON_NULLS_NOT_DISTINCT) != 0;
 		con->deferrable = (flags & CON_DEFERRABLE) != 0;
 		con->initdeferred = (flags & CON_INITDEFERRED) != 0;
+		con->not_valid = (flags & CON_NOT_VALID) != 0;
+		con->no_inherit = (flags & CON_NO_INHERIT) != 0;
+		con->not_enforced = (flags & CON_NOT_ENFORCED) != 0;
 		if (con->kind == WS_CONSTRAINT_CHECK)
 			con->expr = get_string(&p, end);
 		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
@@ -1025,6 +1046,19 @@ put_index_predicate(const WsTableSchema *s, const WsIndex *ix, Buf *out)
 	}
 }
 
+/* A check's clause, but for NOT VALID. */
+static void
+put_check(const WsTableSchema *s, const WsConstraint *con, Buf *out)
+{
+	ws_put_text(out, " CHECK (");
+	put_expression(s, con->expr, out);
+	ws_put_text(out, ")");
+	if (con->no_inherit)
+		ws_put_text(out, " NO INHERIT");
+	if (con->not_enforced)
+		ws_put_text(out, " NOT ENFORCED");
+}
+
 /* The statement, as the record has it. */
 static void
 write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
@@ -1096,14 +1130,14 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 	{
 		const WsConstraint *con = &s->constraints[i];
 
+		if (con->not_valid)
+			continue;
 		ws_put_text(out, any ? ",\n    CONSTRAINT " : "\n    CONSTRAINT ");
 		any = true;
 		ws_put_identifier(out, con->name);
 		if (con->kind == WS_CONSTRAINT_CHECK)
 		{
-			ws_put_text(out, " CHECK (");
-			put_expression(s, con->expr, out);
-			ws_put_text(out, ")");
+			put_check(s, con, out);
 			continue;
 		}
 		if (con->kind == WS_CONSTRAINT_EXCLUSION)
@@ -1439,7 +1473,6 @@ static void
 check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in_statement)
 {
 	if (in_statement->conname == NULL || strcmp(in_statement->conname, con->name) != 0 ||
-		in_statement->is_no_inherit || in_statement->skip_validation ||
 		in_statement->deferrable != con->deferrable ||
 		in_statement->initdeferred != con->initdeferred ||
 		in_statement->options != NIL ||
@@ -1454,7 +1487,10 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 	{
 		/* (the grammar says these of a check alone) */
 		if (in_statement->contype != CONSTR_CHECK || in_statement->keys != NIL ||
-			!in_statement->is_enforced || !in_statement->initially_valid)
+			in_statement->is_no_inherit != con->no_inherit ||
+			in_statement->is_enforced == con->not_enforced ||
+			in_statement->skip_validation != (con->not_valid || con->not_enforced) ||
+			in_statement->initially_valid == (con->not_valid || con->not_enforced))
 			not_the_record(s, "another constraint");
 		check_expression(s, con->expr, in_statement->raw_expr);
 	}
@@ -1465,6 +1501,7 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 		ListCell   *kc;
 
 		if (in_statement->contype != CONSTR_EXCLUSION || in_statement->raw_expr != NULL ||
+			in_statement->is_no_inherit || in_statement->skip_validation ||
 			in_statement->keys != NIL || in_statement->nulls_not_distinct ||
 			strcmp(in_statement->access_method, ix->method) != 0 ||
 			list_length(in_statement->exclusions) != ix->nkeys ||
@@ -1493,6 +1530,7 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 		ListCell   *kc;
 
 		if (in_statement->contype != CONSTR_UNIQUE || in_statement->raw_expr != NULL ||
+			in_statement->is_no_inherit || in_statement->skip_validation ||
 			in_statement->nulls_not_distinct != con->nulls_not_distinct ||
 			list_length(in_statement->keys) != con->ncols)
 			not_the_record(s, "another constraint");
@@ -1543,7 +1581,8 @@ check_partitioning(const WsTableSchema *s, const PartitionSpec *spec)
 
 /*
  * The statement as written is the one the record says, by the grammar: one
- * CREATE TABLE, of this name, these columns, key and constraints, and nothing else.
+ * CREATE TABLE, of this name, these columns, key, constraints and partitioning,
+ * and nothing else.
  * Text in a commit may have come from anywhere, and checking each piece alone
  * says nothing of what the pieces make together: a comment in one hides a
  * quote in the next.  So the whole is what is checked.
@@ -1555,7 +1594,11 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 	CreateStmt *create;
 	ListCell   *lc;
 	int			i = 0;
+	int			next = 0;
+	int			nmade = 0;
 
+	for (int c = 0; c < s->nconstraints; c++)
+		nmade += s->constraints[c].not_valid ? 0 : 1;
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateStmt))
 		not_the_record(s, "it is not one CREATE TABLE");
 	create = (CreateStmt *) linitial_node(RawStmt, parsed)->stmt;
@@ -1572,7 +1615,7 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		create->options != NIL || create->oncommit != ONCOMMIT_NOOP ||
 		create->tablespacename != NULL || create->accessMethod != NULL || create->if_not_exists)
 		not_the_record(s, "a clause the record does not have");
-	if (list_length(create->tableElts) != s->ncols + (s->nkey > 0 ? 1 : 0) + s->nconstraints)
+	if (list_length(create->tableElts) != s->ncols + (s->nkey > 0 ? 1 : 0) + nmade)
 		not_the_record(s, "another number of columns or constraints");
 	foreach(lc, create->tableElts)
 	{
@@ -1588,8 +1631,9 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		{
 			if (!IsA(element, Constraint))
 				not_the_record(s, "a clause where a constraint should be");
-			check_constraint(s, &s->constraints[i - s->ncols - (s->nkey > 0 ? 1 : 0)],
-							 (Constraint *) element);
+			while (s->constraints[next].not_valid)
+				next++;
+			check_constraint(s, &s->constraints[next++], (Constraint *) element);
 		}
 		else
 		{
@@ -1733,6 +1777,43 @@ index_in_server_encoding(const WsIndex *ix, WsIndex *here)
 	}
 }
 
+static void
+write_add_check(const WsTableSchema *s, const WsConstraint *con, const char *schema, Buf *out)
+{
+	ws_put_text(out, "ALTER TABLE ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->name);
+	ws_put_text(out, " ADD CONSTRAINT ");
+	ws_put_identifier(out, con->name);
+	put_check(s, con, out);
+	ws_put_text(out, " NOT VALID");
+}
+
+/* One ALTER TABLE, of this table, adding this check, and nothing else. */
+static void
+check_add_check_statement(const WsTableSchema *s, const WsConstraint *con, const char *schema,
+						  const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	AlterTableCmd *cmd;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || !stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
+		not_the_record(s, "another table");
+	cmd = linitial_node(AlterTableCmd, stmt->cmds);
+	if (cmd->subtype != AT_AddConstraint || cmd->name != NULL || cmd->newowner != NULL ||
+		cmd->missing_ok || !IsA(cmd->def, Constraint))
+		not_the_record(s, "another change");
+	check_constraint(s, con, (Constraint *) cmd->def);
+}
+
 /* A copy of a schema with its strings in the server's encoding. */
 static void
 schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
@@ -1811,6 +1892,25 @@ ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *o
 	buf_free(&sql);
 }
 
+void
+ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (n < 0 || n >= s->nconstraints || !s->constraints[n].not_valid)
+		elog(ERROR, "no check not valid at %d", n);
+	schema_in_server_encoding(s, &here);
+	write_add_check(&here, &here.constraints[n], schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_add_check_statement(&here, &here.constraints[n], schema, (char *) sql.data);
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
 static char *
 to_utf8(const char *text)
 {
@@ -1864,10 +1964,10 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND "
-"                 ((k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
+"                 (NOT x.indisvalid OR (k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
 "                  x.indnkeyatts <> x.indnatts OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
-"    THEN 'a key or unique constraint has more than columns' "
+"    THEN 'a key or unique constraint has more than columns, or is not valid' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_constraint k2 ON k2.conrelid = k.conrelid AND k2.oid > k.oid "
 "               JOIN pg_index x2 ON x2.indexrelid = k2.conindid "
@@ -1876,9 +1976,6 @@ static const char *const unsupported_sql =
 "                 AND x.indnullsnotdistinct = x2.indnullsnotdistinct "
 "                 AND k.condeferrable = k2.condeferrable AND k.condeferred = k2.condeferred) "
 "    THEN 'it has two constraints alike, of which CREATE TABLE makes one' "
-"  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'c' AND "
-"               (NOT k.convalidated OR k.connoinherit OR NOT k.conenforced)) "
-"    THEN 'it has a check not valid, no inherit or not enforced' "
 "  WHEN EXISTS (SELECT FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE x.indrelid = c.oid AND NOT EXISTS "
 "               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid "
@@ -2387,7 +2484,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
 				   "  con.oid::text, "
-				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid) "
+				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
+				   "  con.convalidated::text, con.connoinherit::text, con.conenforced::text "
 				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
 				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
 		WsSql->run("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
@@ -2484,6 +2582,9 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 			buf_append_byte(&stored, 0);
 			con->expr = to_utf8((char *) stored.data);
 			buf_free(&stored);
+			con->no_inherit = ws_sql_value(&others, i, 11)[0] == 't';
+			con->not_enforced = ws_sql_value(&others, i, 12)[0] != 't';
+			con->not_valid = !con->not_enforced && ws_sql_value(&others, i, 10)[0] != 't';
 		}
 		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
 		{
