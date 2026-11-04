@@ -685,7 +685,8 @@ isnt($node->safe_psql('postgres', q{SELECT reloptions FROM pg_class WHERE oid = 
 # a TOAST table's parameters on an old snapshot: its columns since changed, so what
 # they need is not what the snapshot's would
 $node->safe_psql('postgres', q{
-	CREATE TABLE src.ot1 (a int, t text STORAGE PLAIN) WITH (toast.autovacuum_enabled = false);
+	CREATE TABLE src.ot1 (a int, t text) WITH (toast.autovacuum_enabled = false);
+	ALTER TABLE src.ot1 ALTER t SET STORAGE PLAIN;
 	CREATE TABLE src.ot2 (a int, t text) WITH (toast.autovacuum_enabled = false);
 	ALTER TABLE src.ot2 DROP COLUMN t;
 	CREATE TABLE src.ot3 (a int, t text) WITH (toast.autovacuum_enabled = false);
