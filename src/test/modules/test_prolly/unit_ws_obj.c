@@ -244,6 +244,24 @@ count_table(void *arg, const char *name, const VcTable *entry)
 	return true;
 }
 
+ENGINE_TEST(test_roles)
+{
+	WsObject	v = example();
+	WsObject	p = {.kind = WS_OBJ_POLICY,.name = "y",.args = "t",
+	.definition = "CREATE POLICY y ON t AS PERMISSIVE FOR ALL TO a, \"B c\", PUBLIC USING (true)"};
+	char	  **names = NULL;
+	int			n = 0;
+
+	ws_obj_roles(&v, &names, &n);
+	CHECK_EQ(n, 3);				/* (its owner, and h twice, for the object and a column) */
+	CHECK(strcmp(names[0], "g") == 0 && strcmp(names[1], "h") == 0);
+	names = NULL;
+	n = 0;
+	ws_obj_roles(&p, &names, &n);
+	CHECK_EQ(n, 2);
+	CHECK(strcmp(names[0], "a") == 0 && strcmp(names[1], "B c") == 0);
+}
+
 ENGINE_TEST(test_positions)
 {
 	ChunkStore *cs = memstore_create();
@@ -425,6 +443,31 @@ ENGINE_TEST(test_refused_statements)
 	};
 
 	{
+		static const char *const of_table[] = {
+			"not sql",
+			"CREATE POLICY v ON other USING (true)",
+			"CREATE POLICY other ON t USING (true)",
+			"CREATE POLICY v ON s.t USING (true)",
+			"CREATE POLICY v ON t USING (true); DROP TABLE t",
+		};
+
+		for (int i = 0; i < lengthof(of_table); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_POLICY,.name = "v",.args = "t",.definition = (char *) of_table[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		{
+			WsObject	o = {.kind = WS_OBJ_TRIGGER,.name = "v",.args = "t",
+			.definition = "CREATE OR REPLACE TRIGGER v BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()"};
+			WsObject	r = {.kind = WS_OBJ_RULE,.name = "v",.args = "t",
+			.definition = "CREATE OR REPLACE RULE v AS ON INSERT TO t DO INSTEAD NOTHING"};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+			expect_error(statement_of, &r, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
+	{
 		static const char *const sequences[] = {
 			"AS bigint; DROP TABLE t",
 			"OWNED BY t.a",
@@ -497,6 +540,7 @@ static const ProllyUnitTest tests[] = {
 	{"problems", test_problems},
 	{"map", test_map},
 	{"positions", test_positions},
+	{"roles", test_roles},
 	{"restore_order", test_restore_order},
 	{"statements", test_statements},
 	{"refused_statements", test_refused_statements},

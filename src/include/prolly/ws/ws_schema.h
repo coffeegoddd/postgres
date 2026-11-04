@@ -335,7 +335,7 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * sequence's, a default using a sequence in another schema, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
- * a policy, an index's dependence on an extension, a foreign key's comment, a
+ * an index's dependence on an extension, a foreign key's comment, a
  * grant to a role that can log in or by anyone but the owner, an owner's rights
  * changed, a role with powers no commit holds, two
  * constraints alike)
