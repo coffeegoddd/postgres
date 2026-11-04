@@ -48,21 +48,15 @@ extern char *ChunkHashText(const uint8 *hash);
 extern bool ChunkStoreHas(Relation log, Relation idx, const uint8 *hash);
 
 /*
- * The chunk's bytes, palloc'd, and their length in *len; NULL if absent.
- * They are not checked against its name (a page's checksum covers the
- * read; the audit, and puts, check names).
+ * The chunk's bytes, palloc'd, and their length in *len; NULL if absent to a
+ * reader under the active snapshot: its insert not committed, or its freeing
+ * committed before that snapshot.  So what a reader found the name of while it
+ * held a reference, or anything under that, it can read, however soon that is
+ * let go of and freed.  They are not checked against its name (a page's
+ * checksum covers the read; the audit, and puts, check names).
  */
 extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
 						   uint32 *len);
-
-/*
- * The chunk's bytes as of snap, palloc'd, and their length in *len: a
- * chunk the store had then (its freeing not committed before snap, nor by
- * this transaction), whose bytes are kept until no snapshot could find it;
- * NULL if none.
- */
-extern void *ChunkStoreGetAsOf(Relation log, Relation idx, const uint8 *hash,
-							   Snapshot snap, uint32 *len);
 
 /*
  * Many chunks' bytes at once: out[i] (palloc'd) and lens[i] for hashes[i],

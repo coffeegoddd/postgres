@@ -238,13 +238,13 @@ entry_state(ChunkIndexEntry *e, Buffer buf)
 }
 
 /*
- * Whether a chunk's entry was the store's as of snapshot: its insert
- * committed before it, and its freeing not (a chunk freed since is as it
- * was then: its entry, and bytes, are taken out only once no snapshot might
- * have found it).  Changes are not asked of.
+ * Whether a chunk's entry is one a reader under snapshot may read: its insert
+ * committed, before the snapshot if !since, and its freeing not before it (a
+ * chunk freed since is as it was then: its entry, and bytes, are taken out
+ * only once no snapshot might have found it).  Changes are not asked of.
  */
 static bool
-chunk_as_of(ChunkIndexEntry *e, Buffer buf, Snapshot snap)
+chunk_readable(ChunkIndexEntry *e, Buffer buf, Snapshot snap, bool since)
 {
 	if (e->kind != CHUNK_KIND_CHUNK)
 		return false;
@@ -254,7 +254,7 @@ chunk_as_of(ChunkIndexEntry *e, Buffer buf, Snapshot snap)
 			return false;
 		if (TransactionIdIsCurrentTransactionId(e->xmin))
 			return true;
-		if (XidInMVCCSnapshot(e->xmin, snap))
+		if (since ? TransactionIdIsInProgress(e->xmin) : XidInMVCCSnapshot(e->xmin, snap))
 			return false;
 		if (!(e->flags & CHUNK_ENTRY_COMMITTED) &&
 			!hinted_commit(e, buf, e->xmin, CHUNK_ENTRY_COMMITTED, CHUNK_ENTRY_ABORTED))
@@ -2203,13 +2203,12 @@ page_bind_log(Relation idx, Oid log, uint64 stamp)
 
 /*
  * The chunks of bucket b (its first page primary, locked) as of snapshot,
- * those named hash alone if it is given, into *out (and *n, *cap); the chain
- * walked a page at a time, primary left locked
+ * into *out (and *n, *cap); the chain walked a page at a time, primary left
+ * locked
  */
 static void
 bucket_as_of(Relation idx, Buffer primary, uint32 b, const IndexCache *masks,
-			 Snapshot snap, const uint8 *hash, ChunkIndexEntry **out, int *n,
-			 int *cap)
+			 Snapshot snap, ChunkIndexEntry **out, int *n, int *cap)
 {
 	Buffer		cur = primary;
 
@@ -2224,8 +2223,7 @@ bucket_as_of(Relation idx, Buffer primary, uint32 b, const IndexCache *masks,
 			ChunkIndexEntry *e = page_entry(page, i);
 
 			if (!belongs(e, b, masks) ||
-				(hash && memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0) ||
-				!chunk_as_of(e, cur, snap))
+				!chunk_readable(e, cur, snap, false))
 				continue;
 			if (*n == *cap)
 			{
@@ -2246,23 +2244,57 @@ bucket_as_of(Relation idx, Buffer primary, uint32 b, const IndexCache *masks,
 }
 
 static bool
-page_lookup_as_of(Relation idx, const uint8 *hash, Snapshot snap,
-				  ChunkIndexEntry *out)
+lookup_snapshot(Relation idx, const uint8 *hash, Snapshot snap, bool since,
+				ChunkIndexEntry *out)
 {
 	uint32		bucket;
 	IndexCache	masks;
 	Buffer		primary = lock_bucket(idx, hash, BUFFER_LOCK_SHARE, &bucket, &masks);
-	ChunkIndexEntry *found = NULL;
-	int			n = 0,
-				cap = 0;
+	Buffer		cur = primary;
+	bool		found = false;
 
-	bucket_as_of(idx, primary, bucket, &masks, snap, hash, &found, &n, &cap);
+	while (!found)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			nentries = page_entries(page);
+
+		for (int i = 0; i < nentries && !found; i++)
+		{
+			ChunkIndexEntry *e = page_entry(page, i);
+
+			if (belongs(e, bucket, &masks) &&
+				memcmp(e->hash, hash, CHUNK_HASH_LEN) == 0 &&
+				chunk_readable(e, cur, snap, since))
+			{
+				*out = *e;
+				found = true;
+			}
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (found || !BlockNumberIsValid(next))
+			break;
+		cur = ReadBuffer(idx, next);
+		LockBuffer(cur, BUFFER_LOCK_SHARE);
+		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
 	UnlockReleaseBuffer(primary);
-	if (n > 0)
-		*out = found[0];
-	if (found)
-		pfree(found);
-	return n > 0;
+	return found;
+}
+
+static bool
+page_lookup_as_of(Relation idx, const uint8 *hash, Snapshot snap,
+				  ChunkIndexEntry *out)
+{
+	return lookup_snapshot(idx, hash, snap, false, out);
+}
+
+static bool
+page_lookup_to_read(Relation idx, const uint8 *hash, Snapshot snap,
+					ChunkIndexEntry *out)
+{
+	return lookup_snapshot(idx, hash, snap, true, out);
 }
 
 static void
@@ -2284,7 +2316,7 @@ page_visit_as_of(Relation idx, Snapshot snap,
 		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
 		if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
 			masks = *load_cache(idx);
-		bucket_as_of(idx, primary, b, &masks, snap, NULL, &chunks, &n, &cap);
+		bucket_as_of(idx, primary, b, &masks, snap, &chunks, &n, &cap);
 		UnlockReleaseBuffer(primary);
 
 		/* (called with nothing locked) */
@@ -2394,6 +2426,7 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.marked = page_marked,
 	.unmark = page_unmark,
 	.lookup_as_of = page_lookup_as_of,
+	.lookup_to_read = page_lookup_to_read,
 	.visit_as_of = page_visit_as_of,
 	.move = page_move,
 };
