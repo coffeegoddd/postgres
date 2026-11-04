@@ -4,7 +4,7 @@
  *	  The working-set model's table schemas (prolly/ws/ws_schema.h), and
  *	  "binary", their codec.
  *
- * version byte, name, persistence byte, uvarint ncols, then each column:
+ * version byte, name, uvarint ncols, then each column:
  * uvarint tag, name, type, kind byte, not null byte (0 or 1), identity byte,
  * default, collation; then the key's name, uvarint nkey and the key's tags.  A
  * string is its uvarint length and bytes, in its shortest form; a default,
@@ -50,8 +50,6 @@ ws_schema_problem(const WsTableSchema *s)
 		return "a table with no name";
 	if (strlen(s->name) >= NAMEDATALEN)
 		return "a table's name too long";
-	if (s->persistence != WS_PERSISTENCE_PERMANENT && s->persistence != WS_PERSISTENCE_UNLOGGED)
-		return "a table of no known persistence";
 	if (s->ncols < 0 || s->ncols > WS_MAX_COLS)
 		return "more columns than a table can have";
 	for (int i = 0; i < s->ncols; i++)
@@ -139,7 +137,6 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		elog(ERROR, "%s", problem);
 	buf_append_byte(out, WS_SCHEMA_VERSION);
 	put_string(out, s->name);
-	buf_append_byte(out, (uint8) s->persistence);
 	buf_append_uvarint(out, (uint64) s->ncols);
 	for (int i = 0; i < s->ncols; i++)
 	{
@@ -240,7 +237,6 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	if (get_byte(&p, end) != WS_SCHEMA_VERSION)
 		malformed("a version not known");
 	s->name = get_string(&p, end);
-	s->persistence = (char) get_byte(&p, end);
 	n = get_uvarint(&p, end);
 	if (n > WS_MAX_COLS)
 		malformed("more columns than a table can have");
@@ -388,7 +384,7 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	bool		any = false;
 
-	put_text(out, s->persistence == WS_PERSISTENCE_UNLOGGED ? "CREATE UNLOGGED TABLE " : "CREATE TABLE ");
+	put_text(out, "CREATE TABLE ");
 	put_identifier(out, schema);
 	put_text(out, ".");
 	put_identifier(out, s->name);
@@ -653,8 +649,7 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		strcmp(create->relation->schemaname, schema) != 0 ||
 		strcmp(create->relation->relname, s->name) != 0)
 		not_the_record(s, "another table's name");
-	if (create->relation->relpersistence != (s->persistence == WS_PERSISTENCE_UNLOGGED ?
-											 RELPERSISTENCE_UNLOGGED : RELPERSISTENCE_PERMANENT))
+	if (create->relation->relpersistence != RELPERSISTENCE_PERMANENT)
 		not_the_record(s, "another persistence");
 	if (create->inhRelations != NIL || create->partbound != NULL || create->partspec != NULL ||
 		create->ofTypename != NULL || create->constraints != NIL || create->nnconstraints != NIL ||
@@ -940,8 +935,6 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		ws_sql_rows_free(&why);
 	}
 	out->name = name_to_utf8(table);
-	out->persistence = persistence[0] == RELPERSISTENCE_UNLOGGED ?
-		WS_PERSISTENCE_UNLOGGED : WS_PERSISTENCE_PERMANENT;
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 

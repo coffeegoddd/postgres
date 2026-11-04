@@ -33,10 +33,6 @@
 #define WS_IDENTITY_ALWAYS 'a'
 #define WS_IDENTITY_BY_DEFAULT 'd'
 
-/* (not temporary: a temporary table is in no versioned schema) */
-#define WS_PERSISTENCE_PERMANENT 'p'
-#define WS_PERSISTENCE_UNLOGGED 'u'
-
 typedef struct WsColumn
 {
 	uint64		tag;
@@ -52,7 +48,6 @@ typedef struct WsColumn
 typedef struct WsTableSchema
 {
 	char	   *name;
-	char		persistence;	/* WS_PERSISTENCE_* */
 	int			ncols;
 	WsColumn   *cols;			/* attribute order */
 	char	   *key_name;		/* the primary key's constraint, or NULL: none */
