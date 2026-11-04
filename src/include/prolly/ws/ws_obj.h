@@ -14,7 +14,7 @@
  * written with its schema's name, being named as something in the catalogs is.
  *
  * A trigger, rule or policy is of its table, whose name is in its key, and has no owner
- * or grants of its own.  A disabled one, or one a replica fires differently, is refused.
+ * or grants of its own.
  *
  * What is made before an object is named rather than found by trying, as the order
  * of a restore must not depend on what fails.
@@ -80,6 +80,8 @@ typedef struct WsObject
 								 * all of it for a trigger, rule or policy, naming its table bare */
 	bool		after_tables;	/* a function that needs one, so made after them */
 	bool		public_revoked; /* what PUBLIC would have is revoked from it */
+	char		fires;			/* a trigger's or rule's ALTER TABLE state: 0, as made, or 'D',
+								 * 'R' or 'A' */
 	char	   *owned_table;	/* a sequence's OWNED BY, or NULL */
 	char	   *owned_column;
 	int			ndeps;
@@ -183,8 +185,15 @@ extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema,
 extern void ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out);
 
 /*
- * Makes the objects in schema that go before its tables, or after, through WsSql, in
- * restore order, each with its comments, then its owner, then its grants.  A sequence
+ * The roles an object names, as a commit holds them, for what collects ~roles: its owner,
+ * who it grants to, and who a policy is for, which only its statement says.  Appended to
+ * *names, of *n and palloc'd or NULL if none yet.
+ */
+extern void ws_obj_roles(const WsObject *o, char ***names, int *n);
+
+/*
+ * Makes the objects in schema that go before its tables, or after their rows are in, as
+ * COPY would fire a trigger, through WsSql, in restore order, each with its comments, then its owner, then its grants.  A sequence
  * is made before, and owned by its column after, which needs the table's owner its own.  objs is
  * all of a commit's, as what comes after may need what comes before.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than they
