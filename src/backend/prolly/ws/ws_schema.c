@@ -526,7 +526,10 @@ check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
 	buf_append_byte(&text, 0);
 	sql = psprintf("SELECT (%s)", (char *) text.data);
 	parsed = parse_text(s, sql);
-	/* (a length only if a semicolon ended it, the wrapper's parenthesis then a comment) */
+	/*
+	 * (a length only if a semicolon ended it: the wrapper's parenthesis, then
+	 * a comment)
+	 */
 	if (list_length(parsed) != 1 || linitial_node(RawStmt, parsed)->stmt_len != 0 ||
 		!IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
 		not_the_record(s, "a column's expression");
