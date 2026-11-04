@@ -114,8 +114,8 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 
 /*
  * test_ws_schema_add_checks(bytes bytea, schema text) returns text: the checks
- * not valid of a schema's bytes added to its table in the schema, as after its
- * rows; the statements that added them, a line each
+ * not valid of a schema's bytes added to its table in the schema, its rows and
+ * any partitions' such checks already there; the statements, a line each
  */
 Datum
 test_ws_schema_add_checks(PG_FUNCTION_ARGS)
@@ -234,7 +234,7 @@ test_ws_fk_copy(PG_FUNCTION_ARGS)
 
 	initStringInfo(&out);
 	ws_fk_read(from, table, &fks, &n);
-	for (int i = 0; i < n; i++)
+	for (int i = n - 1; i >= 0; i--)
 	{
 		Buf			k = BUF_INIT;
 		Buf			v = BUF_INIT;

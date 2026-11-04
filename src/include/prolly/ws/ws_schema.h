@@ -124,7 +124,7 @@ typedef struct WsTableSchema
 	int			npartition;
 	WsIndexKey *partition_keys; /* a column or expression, its collation and opclass */
 	char	   *partition_of;	/* the partitioned table it is one of, in its schema, or NULL */
-	char	   *partition_bound;	/* its FOR VALUES or DEFAULT, as the server prints it */
+	char	   *partition_bound;	/* its FOR VALUES or DEFAULT, of constants, as the server prints it */
 } WsTableSchema;
 
 /*
@@ -247,16 +247,20 @@ extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *sc
 /*
  * The ALTER TABLE adding the table's nth constraint, a check not valid, in the
  * named schema, appended to out, to run after the table's rows: on any earlier,
- * the rows it lets stand would be refused.  Checked as the table's statement is.
+ * the rows it lets stand would be refused.  A partition's are added before its
+ * table's, which then finds them, and is refused otherwise as one already there.
+ * Checked as the table's statement is.
  */
 extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
  * The ALTER TABLE attaching a partition to its partitioned table, in the named
- * schema, appended to out, to run once both are made, with their indexes: an
- * index of the partition's alike one of the table's becomes its partition.
- * Checked as the table's statement is.  A partition's columns' and constraints'
- * being its own as well as inherited is not held: as made this way, they are.
+ * schema, appended to out, to run once both are made, with their indexes, and
+ * after that table is attached to its own, if it is a partition too: attaching
+ * gives a partition its table's identity, and does not pass it further down.  The
+ * index of the partition's alike one of the table's becomes its partition, under
+ * the name it has.  Checked as the table's statement is, and a bound must hold
+ * nothing but constants.
  */
 extern void ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out);
 

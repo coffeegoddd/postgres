@@ -155,6 +155,9 @@ partitioning_problem(const WsTableSchema *s)
 			return "a partition of itself";
 		if (s->partition_bound[0] == '\0')
 			return "a partition with an empty bound";
+		for (int i = 0; i < s->ncols; i++)
+			if (s->cols[i].identity != WS_IDENTITY_NONE)
+				return "a partition with an identity, which attaching gives it";
 	}
 	if (s->partition == WS_PARTITION_NONE)
 		return s->npartition == 0 ? NULL : "partition keys with no partitioning";
@@ -1801,6 +1804,38 @@ write_attach(const WsTableSchema *s, const char *schema, Buf *out)
 	ws_put_text(out, s->partition_bound);
 }
 
+/*
+ * Whether a parsed bound holds nothing but constants, and so runs nothing when it
+ * is attached: the server prints no other, and a commit may have come from anywhere.
+ */
+static bool
+bound_is_constants(const PartitionBoundSpec *bound)
+{
+	ListCell   *lc;
+
+	foreach(lc, bound->listdatums)
+		if (!IsA(lfirst(lc), A_Const))
+			return false;
+	for (int side = 0; side < 2; side++)
+		foreach(lc, side == 0 ? bound->lowerdatums : bound->upperdatums)
+		{
+			Node	   *datum = lfirst(lc);
+
+			if (IsA(datum, ColumnRef))
+			{
+				List	   *fields = ((ColumnRef *) datum)->fields;
+
+				if (list_length(fields) != 1 || !IsA(linitial(fields), String) ||
+					(strcmp(strVal(linitial(fields)), "minvalue") != 0 &&
+					 strcmp(strVal(linitial(fields)), "maxvalue") != 0))
+					return false;
+			}
+			else if (!IsA(datum, A_Const))
+				return false;
+		}
+	return true;
+}
+
 /* One ALTER TABLE, of this table, attaching this partition by this bound, parsed alone. */
 static void
 check_attach_statement(const WsTableSchema *s, const char *schema, const char *sql)
@@ -1834,6 +1869,8 @@ check_attach_statement(const WsTableSchema *s, const char *schema, const char *s
 		create->options != NIL || create->tablespacename != NULL || create->accessMethod != NULL ||
 		create->oncommit != ONCOMMIT_NOOP || !equal(create->partbound, part->bound))
 		not_the_record(s, "a bound that is no bound");
+	if (!bound_is_constants(create->partbound))
+		not_the_record(s, "a bound of more than constants");
 }
 
 static void
@@ -2046,6 +2083,25 @@ static const char *const unsupported_sql =
 "               WHERE c.relispartition AND i.inhrelid = c.oid AND "
 "                 (q.relnamespace <> c.relnamespace OR i.inhdetachpending)) "
 "    THEN 'it is a partition being detached, or of a table in another schema' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_attribute pa ON pa.attrelid = i.inhparent "
+"               JOIN pg_attribute ca ON ca.attrelid = c.oid AND ca.attname = pa.attname "
+"               WHERE c.relispartition AND i.inhrelid = c.oid AND pa.attnum > 0 "
+"                 AND NOT pa.attisdropped AND NOT ca.attisdropped AND pa.attidentity <> ca.attidentity) "
+"    THEN 'its identity is not that of its partitioned table' "
+"  WHEN c.relispartition AND EXISTS (SELECT FROM pg_index x JOIN pg_class xc ON xc.oid = x.indexrelid "
+"               JOIN pg_index y ON y.indrelid = x.indrelid AND y.indexrelid > x.indexrelid "
+"               JOIN pg_class yc ON yc.oid = y.indexrelid "
+"               WHERE x.indrelid = c.oid AND xc.relam = yc.relam AND x.indisunique = y.indisunique "
+"                 AND x.indnullsnotdistinct = y.indnullsnotdistinct AND x.indnatts = y.indnatts "
+"                 AND x.indnkeyatts = y.indnkeyatts AND x.indkey::text = y.indkey::text "
+"                 AND x.indcollation::text = y.indcollation::text "
+"                 AND pg_get_expr(x.indexprs, x.indrelid) IS NOT DISTINCT FROM pg_get_expr(y.indexprs, y.indrelid) "
+"                 AND pg_get_expr(x.indpred, x.indrelid) IS NOT DISTINCT FROM pg_get_expr(y.indpred, y.indrelid) "
+"                 AND (SELECT array_agg(o.opcfamily ORDER BY n.ord) FROM unnest(x.indclass::oid[]) "
+"                      WITH ORDINALITY n(oc, ord) JOIN pg_opclass o ON o.oid = n.oc) = "
+"                     (SELECT array_agg(o.opcfamily ORDER BY n.ord) FROM unnest(y.indclass::oid[]) "
+"                      WITH ORDINALITY n(oc, ord) JOIN pg_opclass o ON o.oid = n.oc)) "
+"    THEN 'it has two indexes attaching could take one for the other' "
 "  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhrelid "
 "               WHERE c.relkind = 'p' AND i.inhparent = c.oid AND "
 "                 (q.relnamespace <> c.relnamespace OR q.relkind NOT IN ('r', 'p') OR i.inhdetachpending)) "

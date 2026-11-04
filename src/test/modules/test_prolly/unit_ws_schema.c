@@ -1605,10 +1605,42 @@ test_partition_refused(void)
 		"CONCURRENTLY",
 		"FINALIZE",
 		"x",
+		"FOR VALUES IN (now())",
+		"FOR VALUES IN (pg_read_file('/etc/hostname'))",
+		"FOR VALUES IN (1 + 1)",
+		"FOR VALUES IN ((SELECT 1))",
+		"FOR VALUES IN (1::integer)",
+		"FOR VALUES IN (x.y)",
+		"FOR VALUES FROM (now()) TO (MAXVALUE)",
+		"FOR VALUES FROM (MINVALUE) TO (now())",
+		"FOR VALUES FROM (x.minvalue) TO (MAXVALUE)",
+		"FOR VALUES FROM (other) TO (MAXVALUE)",
+	};
+	static const char *const constants[] = {
+		"DEFAULT",
+		"FOR VALUES IN (NULL, -1, 1.5, 'a', true, B'101')",
+		"FOR VALUES FROM (MINVALUE, 1) TO (MAXVALUE, 'z')",
+		"FOR VALUES WITH (modulus 2, remainder 0)",
 	};
 
 	for (int i = 0; i < lengthof(bad); i++)
 		expect_error(attach_injected, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	for (int i = 0; i < lengthof(constants); i++)
+	{
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+		WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition_of = "p",.partition_bound = (char *) constants[i]};
+		Buf			b = BUF_INIT;
+
+		ws_schema_attach(&s, "x", &b);
+		buf_free(&b);
+	}
+	{
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "n",
+		.identity = WS_IDENTITY_ALWAYS,.identity_seq = "s"}};
+		WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition_of = "p",.partition_bound = "DEFAULT"};
+
+		CHECK(problem_has(ws_schema_problem(&s), "which attaching gives it"));
+	}
 	expect_error(attach_of_no_partition, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 	{
 		static const char cut[] =

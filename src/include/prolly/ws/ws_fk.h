@@ -85,8 +85,8 @@ extern void ws_fk_read(const char *schema, const char *table, WsForeignKey **out
 /*
  * Raises ERRCODE_FEATURE_NOT_SUPPORTED if a table (its object id as text, in a
  * WsSql scope) has a key no commit can hold or the record cannot yet: to a table
- * outside its schema, not enforced, over a period, named otherwise than the
- * partitioned table's it comes from,
+ * outside its schema, not enforced, over a period, named or validated otherwise
+ * than the partitioned table's it comes from,
  * with its triggers disabled or commented on, or that more than one unique index
  * could serve.
  */
@@ -101,6 +101,8 @@ extern void ws_fk_list(ProllyCtx *ctx, const PHash *map, WsForeignKey **out, int
 /*
  * The ALTER TABLE adding a key, in the named schema, to a table and from a
  * table whose records are these, appended to out, in the server's encoding.  A
+ * table's are added last name first: adding one to a partitioned table names the
+ * partitions' rows after it with a number, which a name later in order may have.  A
  * column neither has raises ERRCODE_DATA_CORRUPTED, as does anything of the
  * statement, parsed whole, but this one key on this one table.
  */
