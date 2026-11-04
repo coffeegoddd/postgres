@@ -11,6 +11,7 @@
  *	~obj		object key -> the object's stored text (ws_tags.h)
  *	~seq		sequence name -> its position (ws_seq_encode)
  *	~viol		a merge's constraint violations
+ *	~fk			the foreign keys (ws_fk.h)
  *
  * The maps are in the data of an entry with an empty schema, and a map with
  * nothing in it has no entry, so one state is one root value however it was
@@ -44,6 +45,7 @@ typedef enum WsRootMap
 	WS_ROOT_OBJECTS,
 	WS_ROOT_SEQUENCES,
 	WS_ROOT_VIOLATIONS,
+	WS_ROOT_FOREIGN_KEYS,
 } WsRootMap;
 
 /* Each table's name (UTF8, in name order) and entry; ends early on false. */
