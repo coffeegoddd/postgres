@@ -718,7 +718,10 @@ test_create_table_injection(void)
 		{.type = "integer", .def = "1::float(0)"},
 		{.type = "text", .def = "E'\\u12'"},
 		{.type = "text", .def = "E'\\xFF'"},
-		{.type = "integer", .def = "1) UNIQUE (SELECT 1"},
+		{.type = "integer UNIQUE (SELECT 1)"},
+		{.type = "integer", .def = "UNIQUE (SELECT 1)"},
+		/* a record's text no expression, the statement's a clean default */
+		{.type = "integer --", .def = "1) FROM pg_authid WHERE (true /*\nDEFAULT (1) --*/"},
 	};
 	static const Injection good[] = {
 		{.type = "character varying(10)"},
@@ -761,6 +764,57 @@ generated_replaced(void *arg)
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "x", &b);
+}
+
+/*
+ * A clause on a column whose record has no expression: a string opened in
+ * one column's text swallows the next's line, so that the clause it opened is
+ * the next column's.  Refused for that, by the message: the record has nothing
+ * to compare it with.
+ */
+static void
+check_stray_clause(const char *def, const char *why)
+{
+	WsColumn	cols[] = {
+		{.tag = 1,.name = "a",.type = "integer --",.kind = WS_COL_STORED,.def = (char *) def},
+		{.tag = 2,.name = "b",.type = "integer --')",.kind = WS_COL_STORED},
+	};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 2,.cols = cols};
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	ErrorData  *edata = NULL;
+	Buf			b = BUF_INIT;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		ws_schema_create_table(&s, "x", &b);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	if (edata == NULL)
+		elog(ERROR, "no error, for: %s", why);
+	if (edata->sqlerrcode != ERRCODE_DATA_CORRUPTED || strstr(edata->message, why) == NULL)
+		elog(ERROR, "not refused for %s: %s", why, edata->message);
+	FreeErrorData(edata);
+}
+
+static void
+test_create_table_stray_clause(void)
+{
+	check_stray_clause("1 /*\nDEFAULT (1), b integer DEFAULT ('x --*/",
+					   "a default the column does not have");
+	check_stray_clause("1 /*\nDEFAULT (1), b integer GENERATED ALWAYS AS ('x --*/",
+					   "a column's generation");
 }
 
 /* A collation is checked as names, under whichever quoting the session has. */
@@ -890,6 +944,7 @@ static const ProllyUnitTest tests[] = {
 	{"create_table_injection", test_create_table_injection},
 	{"create_table_unchecked", test_create_table_unchecked},
 	{"create_table_quoting", test_create_table_quoting},
+	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},
 };
 

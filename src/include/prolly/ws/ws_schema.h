@@ -112,9 +112,9 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * have come from anywhere: the whole statement is parsed and compared with
  * the record, and if it is anything but one CREATE TABLE of just these
  * columns, types, clauses, expressions and key, it raises
- * ERRCODE_DATA_CORRUPTED and is not given back.  A schema with a problem raises an error.  What an
- * expression does is not checked: a default runs as it is, on later inserts,
- * with the inserter's privileges.
+ * ERRCODE_DATA_CORRUPTED and is not given back.  A schema with a problem
+ * raises an error.  What an expression does is not checked: a default runs
+ * as it is, on later inserts, with the inserter's privileges.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
 

@@ -529,7 +529,15 @@ check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
 		not_the_record(s, "a column's expression");
 	select = (SelectStmt *) linitial_node(RawStmt, parsed)->stmt;
+	/* (one target, and no other clause: nothing of a query but the expression) */
 	if (list_length(select->targetList) != 1 ||
+		select->fromClause != NIL || select->whereClause != NULL ||
+		select->groupClause != NIL || select->havingClause != NULL ||
+		select->windowClause != NIL || select->sortClause != NIL ||
+		select->limitOffset != NULL || select->limitCount != NULL ||
+		select->lockingClause != NIL || select->withClause != NULL ||
+		select->distinctClause != NIL || select->valuesLists != NIL ||
+		select->intoClause != NULL || select->op != SETOP_NONE ||
 		!equal(linitial_node(ResTarget, select->targetList)->val, in_statement))
 		not_the_record(s, "a column's expression");
 	pfree(sql);
@@ -595,6 +603,8 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 				break;
 			case CONSTR_DEFAULT:
 				deflt++;
+				if (c->kind != WS_COL_STORED || c->identity != WS_IDENTITY_NONE || c->def == NULL)
+					not_the_record(s, "a default the column does not have");
 				check_expression(s, c, con->raw_expr);
 				break;
 			case CONSTR_IDENTITY:
@@ -606,7 +616,8 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 				break;
 			case CONSTR_GENERATED:
 				generated++;
-				if (con->generated_kind != (c->kind == WS_COL_GENERATED_STORED ?
+				if (c->kind == WS_COL_STORED ||
+					con->generated_kind != (c->kind == WS_COL_GENERATED_STORED ?
 											ATTRIBUTE_GENERATED_STORED : ATTRIBUTE_GENERATED_VIRTUAL))
 					not_the_record(s, "a column's generation");
 				check_expression(s, c, con->raw_expr);
