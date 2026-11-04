@@ -156,7 +156,6 @@ patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA .
 patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch; also (2) DO_HISTORY_DATA, HistoryDataInfo
 patch src/bin/pg_dump/pg_dump_sort.c  2  DO_HISTORY_DATA's place in the data section
 patch src/bin/pg_dump/pg_dumpall.c  2  --no-history, passed to pg_dump; also (4) a role's TRAVELS
-patch src/bin/pg_dump/t/002_pg_dump.pl  4  a role is dumped with NOTRAVELS
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
 patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) notes the databases whose history store's tier has packs, and refuses a new cluster whose tiers' place is another; the history store's relations are no sign of a new cluster not empty

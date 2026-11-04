@@ -1492,6 +1492,11 @@ RenameRole(const char *oldname, const char *newname)
 															   CStringGetDatum(newname));
 	repl_null[Anum_pg_authid_rolname - 1] = false;
 
+	/* a commit means a role by name, so this is no longer the role it means */
+	repl_repl[Anum_pg_authid_roltravels - 1] = true;
+	repl_val[Anum_pg_authid_roltravels - 1] = BoolGetDatum(false);
+	repl_null[Anum_pg_authid_roltravels - 1] = false;
+
 	datum = heap_getattr(oldtuple, Anum_pg_authid_rolpassword, dsc, &isnull);
 
 	if (!isnull && get_password_type(TextDatumGetCString(datum)) == PASSWORD_TYPE_MD5)

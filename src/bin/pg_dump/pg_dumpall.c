@@ -969,9 +969,9 @@ dumpRoles(PGconn *conn)
 		else
 			appendPQExpBufferStr(buf, " NOBYPASSRLS");
 
-		if (has_travels)
-			appendPQExpBufferStr(buf, strcmp(PQgetvalue(res, i, i_roltravels), "t") == 0 ?
-								 " TRAVELS" : " NOTRAVELS");
+		/* (only if so, so that a dump of a role that is not loads into any server) */
+		if (has_travels && strcmp(PQgetvalue(res, i, i_roltravels), "t") == 0)
+			appendPQExpBufferStr(buf, " TRAVELS");
 
 		if (strcmp(PQgetvalue(res, i, i_rolconnlimit), "-1") != 0)
 			appendPQExpBuffer(buf, " CONNECTION LIMIT %s",
