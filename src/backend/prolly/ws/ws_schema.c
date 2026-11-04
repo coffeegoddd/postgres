@@ -23,7 +23,12 @@
  * parameters with 'w', uvarint n and each one's toast byte, name and value; and
  * columns' settings with 'c', uvarint n, and each column that has any: uvarint tag,
  * storage byte, compression byte, statistics target plus one or 0, uvarint n and
- * each option's name and value.  Any other ends there.
+ * each option's name and value; indexes' settings with 'j', uvarint n, and each
+ * index that has any: name, uvarint ninclude and tags, uvarint noptions, names and
+ * values, uvarint nstats, columns and targets, uvarint nkeyoptions and each column,
+ * uvarint noptions, names and values; and with 'x', a flags byte for the key, a
+ * replica identity byte, its index's name if by index, and the clustered index's
+ * name or nothing.  Any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -107,10 +112,77 @@ same_text(const char *a, const char *b)
 	return a == NULL || b == NULL ? a == b : strcmp(a, b) == 0;
 }
 
+/* An index's settings in a schema in any encoding, whose order may be another's. */
+static const WsIndexSettings *
+index_settings_of(const WsTableSchema *s, const char *index)
+{
+	for (int i = 0; i < s->nindex_settings; i++)
+		if (strcmp(s->index_settings[i].index, index) == 0)
+			return &s->index_settings[i];
+	return NULL;
+}
+
+/* The same, in a commit's order, already checked: a record may hold a great many. */
+static const WsIndexSettings *
+held_index_settings(const WsTableSchema *s, const char *index)
+{
+	int			lo = 0,
+				hi = s->nindex_settings - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		int			cmp = strcmp(index, s->index_settings[mid].index);
+
+		if (cmp == 0)
+			return &s->index_settings[mid];
+		if (cmp < 0)
+			hi = mid - 1;
+		else
+			lo = mid + 1;
+	}
+	return NULL;
+}
+
+/* The INCLUDE of a key's or unique constraint's index. */
+static bool
+same_include(const WsTableSchema *s, const char *a, const char *b)
+{
+	const WsIndexSettings *x = held_index_settings(s, a);
+	const WsIndexSettings *y = held_index_settings(s, b);
+
+	return same_tags(x ? x->include : NULL, x ? x->ninclude : 0, y ? y->include : NULL, y ? y->ninclude : 0);
+}
+
+/* Whether two exclusions' keys have the same operator class parameters. */
+static bool
+same_key_options(const WsTableSchema *s, const char *a, const char *b)
+{
+	const WsIndexSettings *x = held_index_settings(s, a);
+	const WsIndexSettings *y = held_index_settings(s, b);
+	int			nx = x ? x->nkeyoptions : 0;
+
+	if (nx != (y ? y->nkeyoptions : 0))
+		return false;
+	for (int i = 0; i < nx; i++)
+	{
+		if (x->keyoptions[i].column != y->keyoptions[i].column ||
+			x->keyoptions[i].noptions != y->keyoptions[i].noptions)
+			return false;
+		for (int k = 0; k < x->keyoptions[i].noptions; k++)
+			if (strcmp(x->keyoptions[i].options[k].name, y->keyoptions[i].options[k].name) != 0 ||
+				strcmp(x->keyoptions[i].options[k].value, y->keyoptions[i].options[k].value) != 0)
+				return false;
+	}
+	return true;
+}
+
 /* Whether CREATE TABLE would keep one index of the two (both exclusions). */
 static bool
-exclusions_alike(const WsConstraint *a, const WsConstraint *b)
+exclusions_alike(const WsTableSchema *s, const WsConstraint *a, const WsConstraint *b)
 {
+	if (!same_key_options(s, a->name, b->name))
+		return false;
 	if (a->deferrable != b->deferrable || a->initdeferred != b->initdeferred ||
 		strcmp(a->excl.method, b->excl.method) != 0 || a->excl.nkeys != b->excl.nkeys ||
 		!same_tags(a->excl.include, a->excl.ninclude, b->excl.include, b->excl.ninclude) ||
@@ -192,6 +264,166 @@ column_settings_problem(const WsColumn *c)
 		if (c->options[i].toast)
 			return "a column's option of a TOAST table";
 	return options_problem(c->options, c->noptions);
+}
+
+/* An index, by name, that the table has: what it holds, or false if none. */
+static bool
+find_index(const WsTableSchema *s, const char *name, bool *takes_include, const WsIndex **body)
+{
+	*takes_include = false;
+	*body = NULL;
+	if (s->key_name != NULL && strcmp(s->key_name, name) == 0)
+	{
+		*takes_include = true;
+		return true;
+	}
+	/* (both in order by name by now, already checked: a record may hold a great many) */
+	{
+		int			lo = 0,
+					hi = s->nconstraints - 1;
+
+		while (lo <= hi)
+		{
+			int			mid = lo + (hi - lo) / 2;
+			int			cmp = strcmp(name, s->constraints[mid].name);
+
+			if (cmp == 0)
+			{
+				/* (a check has no relation, and an index may have its name) */
+				if (s->constraints[mid].kind == WS_CONSTRAINT_CHECK)
+					break;
+				*takes_include = s->constraints[mid].kind == WS_CONSTRAINT_UNIQUE;
+				*body = s->constraints[mid].kind == WS_CONSTRAINT_EXCLUSION ? &s->constraints[mid].excl : NULL;
+				return true;
+			}
+			if (cmp < 0)
+				hi = mid - 1;
+			else
+				lo = mid + 1;
+		}
+		lo = 0;
+		hi = s->nindexes - 1;
+		while (lo <= hi)
+		{
+			int			mid = lo + (hi - lo) / 2;
+			int			cmp = strcmp(name, s->indexes[mid].name);
+
+			if (cmp == 0)
+			{
+				*body = &s->indexes[mid];
+				return true;
+			}
+			if (cmp < 0)
+				hi = mid - 1;
+			else
+				lo = mid + 1;
+		}
+	}
+	return false;
+}
+
+static const char *
+index_settings_problem(const WsTableSchema *s)
+{
+	for (int i = 0; i < s->nindex_settings; i++)
+	{
+		const WsIndexSettings *set = &s->index_settings[i];
+		bool		takes_include;
+		const WsIndex *body;
+		const char *problem;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!find_index(s, set->index, &takes_include, &body))
+			return "settings for an index the table does not have";
+		if (set->ninclude < 0 || set->noptions < 0 || set->nstats < 0 || set->nkeyoptions < 0)
+			return "a negative number of an index's settings";
+		if (set->ninclude == 0 && set->noptions == 0 && set->nstats == 0 && set->nkeyoptions == 0)
+			return "settings for an index saying it has none";
+		if (set->ninclude > 0 && !takes_include)
+			return "INCLUDE in settings for an index that holds its own, or is an exclusion's";
+		if (set->ninclude > INDEX_MAX_KEYS)
+			return "an index of too many columns";
+		for (int k = 0; k < set->ninclude; k++)
+		{
+			if (ws_schema_column(s, set->include[k]) == NULL)
+				return "an index including a column the table does not have";
+		}
+		for (int k = 0; k < set->noptions; k++)
+			if (set->options[k].toast)
+				return "an index's option of a TOAST table";
+		problem = options_problem(set->options, set->noptions);
+		if (problem != NULL)
+			return problem;
+		if (set->nstats > INDEX_MAX_KEYS || set->nkeyoptions > INDEX_MAX_KEYS)
+			return "settings for more columns than an index has";
+		for (int k = 0; k < set->nstats; k++)
+		{
+			if (set->stats[k].column < 1 || set->stats[k].column > INDEX_MAX_KEYS)
+				return "a statistics target on no column of an index";
+			if (k > 0 && set->stats[k - 1].column >= set->stats[k].column)
+				return "an index's statistics targets not in order";
+			if (set->stats[k].target < 0 || set->stats[k].target > MAX_STATISTICS_TARGET)
+				return "an index's statistics target out of range";
+			if (body == NULL || set->stats[k].column > body->nkeys ||
+				body->keys[set->stats[k].column - 1].expr == NULL)
+				return "a statistics target on a column of an index that is no expression";
+		}
+		for (int k = 0; k < set->nkeyoptions; k++)
+		{
+			const WsKeyOptions *ko = &set->keyoptions[k];
+
+			if (k > 0 && set->keyoptions[k - 1].column >= ko->column)
+				return "an index's keys' options not in order";
+			if (body == NULL || ko->column < 1 || ko->column > body->nkeys ||
+				body->keys[ko->column - 1].opclass == NULL)
+				return "options on a key with no operator class";
+			if (ko->noptions <= 0)
+				return "options on a key saying it has none";
+			for (int j = 0; j < ko->noptions; j++)
+				if (ko->options[j].toast)
+					return "an index's option of a TOAST table";
+			problem = options_problem(ko->options, ko->noptions);
+			if (problem != NULL)
+				return problem;
+		}
+	}
+	return NULL;
+}
+
+static const char *
+table_settings_problem(const WsTableSchema *s)
+{
+	bool		takes_include;
+	const WsIndex *body;
+
+	if (s->key_initdeferred && !s->key_deferrable)
+		return "a key initially deferred that is not deferrable";
+	if (s->key_deferrable && s->nkey == 0)
+		return "a key deferrable with no key";
+	if (s->replica_identity != WS_REPLICA_DEFAULT && s->replica_identity != WS_REPLICA_FULL &&
+		s->replica_identity != WS_REPLICA_NOTHING && s->replica_identity != WS_REPLICA_INDEX)
+		return "a replica identity of no known kind";
+	if ((s->replica_identity == WS_REPLICA_INDEX) != (s->replica_index != NULL))
+		return "a replica identity by index with no index, or an index with no such identity";
+	if (s->replica_index != NULL)
+	{
+		if (!find_index(s, s->replica_index, &takes_include, &body))
+			return "a replica identity by an index the table does not have";
+		if (s->key_name != NULL && strcmp(s->replica_index, s->key_name) == 0 && s->key_deferrable)
+			return "a replica identity by a deferrable index";
+		for (int i = 0; i < s->nconstraints; i++)
+			if (s->constraints[i].kind != WS_CONSTRAINT_CHECK &&
+				strcmp(s->constraints[i].name, s->replica_index) == 0 &&
+				(s->constraints[i].kind != WS_CONSTRAINT_UNIQUE || s->constraints[i].deferrable))
+				return "a replica identity by a deferrable index, or not a unique one";
+		for (int i = 0; i < s->nindexes; i++)
+			if (strcmp(s->indexes[i].name, s->replica_index) == 0 &&
+				(!s->indexes[i].unique || s->indexes[i].predicate != NULL))
+				return "a replica identity by a partial index, or not a unique one";
+	}
+	if (s->clustered != NULL && !find_index(s, s->clustered, &takes_include, &body))
+		return "clustered on an index the table does not have";
+	return NULL;
 }
 
 static const char *
@@ -501,6 +733,18 @@ ws_schema_problem(const WsTableSchema *s)
 			return "an expression referring to a column the table does not have";
 	if (s->nconstraints < 0)
 		return "a negative number of constraints";
+	/* (before the constraints' pairs, which look their settings up by this order) */
+	if (s->nindex_settings < 0)
+		return "a negative number of index settings";
+	for (int i = 0; i < s->nindex_settings; i++)
+	{
+		const char *index = s->index_settings[i].index;
+
+		if (index == NULL || index[0] == '\0')
+			return "settings for an index of no name";
+		if (i > 0 && strcmp(s->index_settings[i - 1].index, index) >= 0)
+			return "index settings not in order";
+	}
 	for (int i = 0; i < s->nconstraints; i++)
 	{
 		const WsConstraint *con = &s->constraints[i];
@@ -563,8 +807,10 @@ ws_schema_problem(const WsTableSchema *s)
 			 * (CREATE TABLE keeps one index of those it would make alike, so
 			 * no statement makes both)
 			 */
-			if (!con->nulls_not_distinct && !con->deferrable &&
-				same_tags(con->cols, con->ncols, s->key, s->nkey))
+			if (s->nkey > 0 && !con->nulls_not_distinct && con->deferrable == s->key_deferrable &&
+				con->initdeferred == s->key_initdeferred &&
+				same_tags(con->cols, con->ncols, s->key, s->nkey) &&
+				same_include(s, con->name, s->key_name))
 				return "a unique constraint alike the key";
 			for (int j = 0; j < i; j++)
 			{
@@ -574,7 +820,8 @@ ws_schema_problem(const WsTableSchema *s)
 					prior->nulls_not_distinct == con->nulls_not_distinct &&
 					prior->deferrable == con->deferrable &&
 					prior->initdeferred == con->initdeferred &&
-					same_tags(con->cols, con->ncols, prior->cols, prior->ncols))
+					same_tags(con->cols, con->ncols, prior->cols, prior->ncols) &&
+					same_include(s, con->name, prior->name))
 					return "two unique constraints alike";
 			}
 		}
@@ -591,7 +838,7 @@ ws_schema_problem(const WsTableSchema *s)
 				return problem;
 			for (int j = 0; j < i; j++)
 				if (s->constraints[j].kind == WS_CONSTRAINT_EXCLUSION &&
-					exclusions_alike(con, &s->constraints[j]))
+					exclusions_alike(s, con, &s->constraints[j]))
 					return "two exclusions alike";
 		}
 		else
@@ -621,6 +868,12 @@ ws_schema_problem(const WsTableSchema *s)
 		problem = options_problem(s->options, s->noptions);
 		if (problem != NULL)
 			return problem;
+		problem = index_settings_problem(s);
+		if (problem != NULL)
+			return problem;
+		problem = table_settings_problem(s);
+		if (problem != NULL)
+			return problem;
 	}
 	return column_names_problem(s);
 }
@@ -629,6 +882,10 @@ ws_schema_problem(const WsTableSchema *s)
 #define WS_INHERITS 'i'
 #define WS_OPTIONS 'w'
 #define WS_COLUMN_SETTINGS 'c'
+#define WS_INDEX_SETTINGS 'j'
+#define WS_TABLE_SETTINGS 'x'
+#define KEY_DEFERRABLE 0x01
+#define KEY_INITDEFERRED 0x02
 #define CON_NULLS_NOT_DISTINCT 0x01
 #define CON_DEFERRABLE 0x02
 #define CON_INITDEFERRED 0x04
@@ -675,6 +932,17 @@ put_index_body(Buf *out, const WsIndex *ix, bool exclusion)
 	for (int k = 0; k < ix->ninclude; k++)
 		buf_append_uvarint(out, ix->include[k]);
 	put_optional(out, ix->predicate);
+}
+
+static void
+put_named_options(Buf *out, const WsOption *options, int n)
+{
+	buf_append_uvarint(out, (uint64) n);
+	for (int i = 0; i < n; i++)
+	{
+		put_string(out, options[i].name);
+		put_string(out, options[i].value);
+	}
 }
 
 static bool
@@ -824,6 +1092,43 @@ schema_encode(const WsTableSchema *s, Buf *out)
 			}
 		}
 	}
+	if (s->nindex_settings > 0)
+	{
+		buf_append_byte(out, WS_INDEX_SETTINGS);
+		buf_append_uvarint(out, (uint64) s->nindex_settings);
+		for (int i = 0; i < s->nindex_settings; i++)
+		{
+			const WsIndexSettings *set = &s->index_settings[i];
+
+			put_string(out, set->index);
+			buf_append_uvarint(out, (uint64) set->ninclude);
+			for (int k = 0; k < set->ninclude; k++)
+				buf_append_uvarint(out, set->include[k]);
+			put_named_options(out, set->options, set->noptions);
+			buf_append_uvarint(out, (uint64) set->nstats);
+			for (int k = 0; k < set->nstats; k++)
+			{
+				buf_append_uvarint(out, (uint64) set->stats[k].column);
+				buf_append_uvarint(out, (uint64) set->stats[k].target);
+			}
+			buf_append_uvarint(out, (uint64) set->nkeyoptions);
+			for (int k = 0; k < set->nkeyoptions; k++)
+			{
+				buf_append_uvarint(out, (uint64) set->keyoptions[k].column);
+				put_named_options(out, set->keyoptions[k].options, set->keyoptions[k].noptions);
+			}
+		}
+	}
+	if (s->key_deferrable || s->replica_identity != WS_REPLICA_DEFAULT || s->clustered != NULL)
+	{
+		buf_append_byte(out, WS_TABLE_SETTINGS);
+		buf_append_byte(out, (s->key_deferrable ? KEY_DEFERRABLE : 0) |
+						(s->key_initdeferred ? KEY_INITDEFERRED : 0));
+		buf_append_byte(out, (uint8) s->replica_identity);
+		if (s->replica_identity == WS_REPLICA_INDEX)
+			put_string(out, s->replica_index);
+		put_optional(out, s->clustered);
+	}
 }
 
 pg_noreturn static void
@@ -926,6 +1231,72 @@ get_index_body(const uint8 **p, const uint8 *end, WsIndex *ix, bool exclusion)
 	for (int k = 0; k < ix->ninclude; k++)
 		ix->include[k] = get_uvarint(p, end);
 	ix->predicate = get_optional(p, end);
+}
+
+static void
+get_named_options(const uint8 **p, const uint8 *end, WsOption **options, int *n)
+{
+	uint64		count = get_uvarint(p, end);
+
+	if (count > WS_MAX_OPTIONS)
+		malformed("more options than a table has");
+	/* (each is at least two bytes: two lengths) */
+	if (count > (uint64) (end - *p) / 2)
+		malformed("more options than bytes");
+	*options = px_malloc((size_t) Max(count, 1) * sizeof(WsOption));
+	memset(*options, 0, (size_t) Max(count, 1) * sizeof(WsOption));
+	*n = (int) count;
+	for (int i = 0; i < *n; i++)
+	{
+		(*options)[i].name = get_string(p, end);
+		(*options)[i].value = get_string(p, end);
+	}
+}
+
+static void
+get_index_settings(const uint8 **p, const uint8 *end, WsIndexSettings *set)
+{
+	uint64		n;
+
+	set->index = get_string(p, end);
+	n = get_uvarint(p, end);
+	if (n > INDEX_MAX_KEYS)
+		malformed("an index of too many columns");
+	set->include = px_malloc((size_t) Max(n, 1) * sizeof(uint64));
+	set->ninclude = (int) n;
+	for (int k = 0; k < set->ninclude; k++)
+		set->include[k] = get_uvarint(p, end);
+	get_named_options(p, end, &set->options, &set->noptions);
+	n = get_uvarint(p, end);
+	if (n > INDEX_MAX_KEYS)
+		malformed("settings for more columns than an index has");
+	set->stats = px_malloc((size_t) Max(n, 1) * sizeof(WsIndexStat));
+	set->nstats = (int) n;
+	for (int k = 0; k < set->nstats; k++)
+	{
+		uint64		column = get_uvarint(p, end);
+		uint64		target = get_uvarint(p, end);
+
+		if (column > INDEX_MAX_KEYS || target > MAX_STATISTICS_TARGET)
+			malformed("an index's statistics target out of range");
+		set->stats[k].column = (int) column;
+		set->stats[k].target = (int) target;
+	}
+	n = get_uvarint(p, end);
+	if (n > INDEX_MAX_KEYS)
+		malformed("settings for more columns than an index has");
+	set->keyoptions = px_malloc((size_t) Max(n, 1) * sizeof(WsKeyOptions));
+	memset(set->keyoptions, 0, (size_t) Max(n, 1) * sizeof(WsKeyOptions));
+	set->nkeyoptions = (int) n;
+	for (int k = 0; k < set->nkeyoptions; k++)
+	{
+		uint64		column = get_uvarint(p, end);
+
+		if (column > INDEX_MAX_KEYS)
+			malformed("an index's keys' options out of range");
+		set->keyoptions[k].column = (int) column;
+		get_named_options(p, end, &set->keyoptions[k].options, &set->keyoptions[k].noptions);
+	}
 }
 
 static void
@@ -1048,7 +1419,7 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		get_index_body(&p, end, ix, false);
 	}
 	if (p != end && *p != WS_PARTITION_OF && *p != WS_INHERITS && *p != WS_OPTIONS &&
-		*p != WS_COLUMN_SETTINGS)
+		*p != WS_COLUMN_SETTINGS && *p != WS_INDEX_SETTINGS && *p != WS_TABLE_SETTINGS)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -1193,6 +1564,46 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 				malformed("settings for a column saying it has none");
 		}
 	}
+	if (p != end && *p == WS_INDEX_SETTINGS)
+	{
+		p++;
+		n = get_uvarint(&p, end);
+		if (n == 0)
+			malformed("it has no index settings, at length");
+		/* (each is at least five bytes: its name and four counts) */
+		if (n > (uint64) (end - p) / 5)
+			malformed("more index settings than bytes");
+		s->index_settings = px_malloc((size_t) Min(n, 16) * sizeof(WsIndexSettings));
+		memset(s->index_settings, 0, (size_t) Min(n, 16) * sizeof(WsIndexSettings));
+		for (uint64 i = 0; i < n; i++)
+		{
+			/* (grown as they are read: each is far bigger here than there) */
+			if (i >= 16 && (i & (i - 1)) == 0)
+			{
+				s->index_settings = px_realloc(s->index_settings, (size_t) Min(i * 2, n) * sizeof(WsIndexSettings));
+				memset(s->index_settings + i, 0, (size_t) (Min(i * 2, n) - i) * sizeof(WsIndexSettings));
+			}
+			s->nindex_settings = (int) i + 1;
+			get_index_settings(&p, end, &s->index_settings[i]);
+		}
+	}
+	if (p != end && *p == WS_TABLE_SETTINGS)
+	{
+		uint8		flags;
+
+		p++;
+		flags = get_byte(&p, end);
+		if (flags & ~(KEY_DEFERRABLE | KEY_INITDEFERRED))
+			malformed("a key's flags not known");
+		s->key_deferrable = (flags & KEY_DEFERRABLE) != 0;
+		s->key_initdeferred = (flags & KEY_INITDEFERRED) != 0;
+		s->replica_identity = (char) get_byte(&p, end);
+		if (s->replica_identity == WS_REPLICA_INDEX)
+			s->replica_index = get_string(&p, end);
+		s->clustered = get_optional(&p, end);
+		if (!s->key_deferrable && s->replica_identity == WS_REPLICA_DEFAULT && s->clustered == NULL)
+			malformed("a table's settings saying it has none");
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_schema_problem(s);
@@ -1237,6 +1648,21 @@ options_free(WsOption *options, int n)
 void
 ws_schema_free(WsTableSchema *s)
 {
+	for (int i = 0; i < s->nindex_settings; i++)
+	{
+		WsIndexSettings *set = &s->index_settings[i];
+
+		px_free(set->index);
+		px_free(set->include);
+		options_free(set->options, set->noptions);
+		px_free(set->stats);
+		for (int k = 0; k < set->nkeyoptions; k++)
+			options_free(set->keyoptions[k].options, set->keyoptions[k].noptions);
+		px_free(set->keyoptions);
+	}
+	px_free(s->index_settings);
+	px_free(s->replica_index);
+	px_free(s->clustered);
 	options_free(s->options, s->noptions);
 	for (int i = 0; i < s->ncols; i++)
 		options_free(s->cols[i].options, s->cols[i].noptions);
@@ -1355,9 +1781,21 @@ ws_put_identifier(Buf *out, const char *name)
 		pfree((char *) quoted);
 }
 
+static void put_options(const WsOption *options, int n, Buf *out);
+
+/* The options on an index's kth key (from 0), or none. */
+static const WsKeyOptions *
+key_options_of(const WsIndexSettings *set, int k)
+{
+	for (int i = 0; set != NULL && i < set->nkeyoptions; i++)
+		if (set->keyoptions[i].column == k + 1)
+			return &set->keyoptions[i];
+	return NULL;
+}
+
 /* An index's keys and INCLUDE, in the order both statements have them. */
 static void
-put_index_columns(const WsTableSchema *s, const WsIndex *ix, Buf *out)
+put_index_columns(const WsTableSchema *s, const WsIndex *ix, const WsIndexSettings *set, Buf *out)
 {
 	ws_put_text(out, " (");
 	for (int k = 0; k < ix->nkeys; k++)
@@ -1381,8 +1819,15 @@ put_index_columns(const WsTableSchema *s, const WsIndex *ix, Buf *out)
 		}
 		if (key->opclass != NULL)
 		{
+			const WsKeyOptions *ko = key_options_of(set, k);
+
 			ws_put_text(out, " ");
 			ws_put_text(out, key->opclass);
+			if (ko != NULL)
+			{
+				ws_put_text(out, " ");
+				put_options(ko->options, ko->noptions, out);
+			}
 		}
 		if (key->order != WS_INDEX_ORDER_DEFAULT)
 			ws_put_text(out, " DESC");
@@ -1489,6 +1934,30 @@ put_check(const WsTableSchema *s, const WsConstraint *con, Buf *out)
 		ws_put_text(out, " NOT ENFORCED");
 }
 
+/* A constraint's index's INCLUDE and WITH. */
+static void
+put_constraint_settings(const WsTableSchema *s, const WsIndexSettings *set, Buf *out)
+{
+	if (set == NULL)
+		return;
+	if (set->ninclude > 0)
+	{
+		ws_put_text(out, " INCLUDE (");
+		for (int k = 0; k < set->ninclude; k++)
+		{
+			if (k > 0)
+				ws_put_text(out, ", ");
+			ws_put_identifier(out, ws_schema_column(s, set->include[k])->name);
+		}
+		ws_put_text(out, ")");
+	}
+	if (set->noptions > 0)
+	{
+		ws_put_text(out, " WITH ");
+		put_options(set->options, set->noptions, out);
+	}
+}
+
 /* The statement, as the record has it. */
 static void
 write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
@@ -1562,6 +2031,9 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 			ws_put_identifier(out, ws_schema_column(s, s->key[i])->name);
 		}
 		ws_put_text(out, ")");
+		put_constraint_settings(s, index_settings_of(s, s->key_name), out);
+		if (s->key_deferrable)
+			ws_put_text(out, s->key_initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
 	}
 	for (int i = 0; i < s->nconstraints; i++)
 	{
@@ -1581,7 +2053,8 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 		{
 			ws_put_text(out, " EXCLUDE USING ");
 			ws_put_identifier(out, con->excl.method);
-			put_index_columns(s, &con->excl, out);
+			put_index_columns(s, &con->excl, index_settings_of(s, con->name), out);
+			put_constraint_settings(s, index_settings_of(s, con->name), out);
 			put_index_predicate(s, &con->excl, out);
 		}
 		else
@@ -1594,6 +2067,7 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 				ws_put_identifier(out, ws_schema_column(s, con->cols[k])->name);
 			}
 			ws_put_text(out, ")");
+			put_constraint_settings(s, index_settings_of(s, con->name), out);
 		}
 		if (con->deferrable)
 			ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
@@ -1784,11 +2258,30 @@ operator_text(List *names)
 	return psprintf("%s.%s", canonical_names(list_copy_head(names, list_length(names) - 1)), op);
 }
 
+static bool same_options(const WsOption *options, int n, List *parsed);
+
+/* An INCLUDE and a WITH as parsed are the settings', of a constraint's index. */
+static bool
+same_constraint_settings(const WsTableSchema *s, const WsIndexSettings *set, List *including, List *options)
+{
+	int			k = 0;
+	ListCell   *lc;
+
+	if (list_length(including) != (set ? set->ninclude : 0) ||
+		!same_options(set ? set->options : NULL, set ? set->noptions : 0, options))
+		return false;
+	foreach(lc, including)
+		if (strcmp(strVal(lfirst(lc)), ws_schema_column(s, set->include[k++])->name) != 0)
+			return false;
+	return true;
+}
+
 /* An index's key as parsed is the record's; false if not. */
 static bool
-same_index_key(const WsTableSchema *s, const WsIndexKey *key, const IndexElem *elem)
+same_index_key(const WsTableSchema *s, const WsIndexKey *key, const WsKeyOptions *ko, const IndexElem *elem)
 {
-	if (elem->indexcolname != NULL || elem->opclassopts != NIL ||
+	if (elem->indexcolname != NULL ||
+		!same_options(ko ? ko->options : NULL, ko ? ko->noptions : 0, elem->opclassopts) ||
 		!same_names(key->collation, elem->collation) ||
 		!same_names(key->opclass, elem->opclass) ||
 		elem->ordering != (key->order == WS_INDEX_ORDER_DESC ? SORTBY_DESC : SORTBY_DEFAULT) ||
@@ -1922,14 +2415,24 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 	if (in_statement->conname == NULL || strcmp(in_statement->conname, con->name) != 0 ||
 		in_statement->deferrable != con->deferrable ||
 		in_statement->initdeferred != con->initdeferred ||
-		in_statement->options != NIL ||
 		in_statement->indexspace != NULL || in_statement->indexname != NULL ||
 		in_statement->without_overlaps || in_statement->pktable != NULL)
 		not_the_record(s, "another constraint");
 	if (con->kind != WS_CONSTRAINT_EXCLUSION &&
-		(in_statement->including != NIL || in_statement->exclusions != NIL ||
-		 in_statement->where_clause != NULL))
+		(in_statement->exclusions != NIL || in_statement->where_clause != NULL))
 		not_the_record(s, "another constraint");
+	if (con->kind == WS_CONSTRAINT_CHECK && (in_statement->including != NIL || in_statement->options != NIL))
+		not_the_record(s, "another constraint");
+	if (con->kind == WS_CONSTRAINT_UNIQUE &&
+		!same_constraint_settings(s, index_settings_of(s, con->name), in_statement->including, in_statement->options))
+		not_the_record(s, "another constraint");
+	if (con->kind == WS_CONSTRAINT_EXCLUSION)
+	{
+		const WsIndexSettings *set = index_settings_of(s, con->name);
+
+		if (!same_options(set ? set->options : NULL, set ? set->noptions : 0, in_statement->options))
+			not_the_record(s, "another constraint");
+	}
 	if (con->kind == WS_CONSTRAINT_CHECK)
 	{
 		/* (the grammar says these of a check alone) */
@@ -1960,7 +2463,8 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 			List	   *pair = lfirst_node(List, kc);
 			const WsIndexKey *key = &ix->keys[k++];
 
-			if (!same_index_key(s, key, linitial_node(IndexElem, pair)) ||
+			if (!same_index_key(s, key, key_options_of(index_settings_of(s, con->name), k - 1),
+								linitial_node(IndexElem, pair)) ||
 				strcmp(operator_text(lsecond_node(List, pair)), key->op) != 0)
 				not_the_record(s, "another constraint");
 		}
@@ -2092,9 +2596,10 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 
 			if (!IsA(element, Constraint) || key->contype != CONSTR_PRIMARY ||
 				key->conname == NULL || strcmp(key->conname, s->key_name) != 0 ||
-				list_length(key->keys) != s->nkey || key->including != NIL ||
-				key->options != NIL || key->indexspace != NULL || key->deferrable ||
-				key->initdeferred || key->without_overlaps)
+				list_length(key->keys) != s->nkey ||
+				!same_constraint_settings(s, index_settings_of(s, s->key_name), key->including, key->options) ||
+				key->indexspace != NULL || key->deferrable != s->key_deferrable ||
+				key->initdeferred != s->key_initdeferred || key->without_overlaps)
 				not_the_record(s, "another key");
 			foreach(kc, key->keys)
 				if (strcmp(strVal(lfirst(kc)), ws_schema_column(s, s->key[k++])->name) != 0)
@@ -2153,9 +2658,10 @@ write_create_index(const WsTableSchema *s, const WsIndex *ix, const char *schema
 	ws_put_identifier(out, s->name);
 	ws_put_text(out, " USING ");
 	ws_put_identifier(out, ix->method);
-	put_index_columns(s, ix, out);
+	put_index_columns(s, ix, index_settings_of(s, ix->name), out);
 	if (ix->nulls_not_distinct)
 		ws_put_text(out, " NULLS NOT DISTINCT");
+	put_constraint_settings(s, index_settings_of(s, ix->name), out);
 	put_index_predicate(s, ix, out);
 }
 
@@ -2167,6 +2673,7 @@ static void
 check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *schema, const char *sql)
 {
 	List	   *parsed = parse_text(s, sql);
+	const WsIndexSettings *set = index_settings_of(s, ix->name);
 	IndexStmt  *stmt;
 	int			k = 0;
 	ListCell   *lc;
@@ -2179,7 +2686,8 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 		strcmp(stmt->relation->schemaname, schema) != 0 ||
 		strcmp(stmt->relation->relname, s->name) != 0 || !stmt->relation->inh ||
 		strcmp(stmt->accessMethod, ix->method) != 0 ||
-		stmt->tableSpace != NULL || stmt->options != NIL || stmt->excludeOpNames != NIL ||
+		stmt->tableSpace != NULL || stmt->excludeOpNames != NIL ||
+		!same_options(set ? set->options : NULL, set ? set->noptions : 0, stmt->options) ||
 		stmt->idxcomment != NULL || stmt->unique != ix->unique ||
 		stmt->nulls_not_distinct != ix->nulls_not_distinct || stmt->primary ||
 		stmt->isconstraint || stmt->iswithoutoverlaps || stmt->deferrable ||
@@ -2190,8 +2698,10 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 		not_the_record(s, "another index");
 	foreach(lc, stmt->indexParams)
 	{
-		if (!same_index_key(s, &ix->keys[k++], lfirst_node(IndexElem, lc)))
+		if (!same_index_key(s, &ix->keys[k], key_options_of(index_settings_of(s, ix->name), k),
+							lfirst_node(IndexElem, lc)))
 			not_the_record(s, "another index");
+		k++;
 	}
 	k = 0;
 	foreach(lc, stmt->indexIncludingParams)
@@ -2377,6 +2887,119 @@ check_column_settings_statement(const WsTableSchema *s, const char *schema, cons
 		not_the_record(s, "too many changes");
 }
 
+static void
+write_table_settings(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	ws_put_text(out, "ALTER TABLE ONLY ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->name);
+	if (s->replica_identity != WS_REPLICA_DEFAULT)
+	{
+		ws_put_text(out, " REPLICA IDENTITY ");
+		if (s->replica_identity == WS_REPLICA_FULL)
+			ws_put_text(out, "FULL");
+		else if (s->replica_identity == WS_REPLICA_NOTHING)
+			ws_put_text(out, "NOTHING");
+		else
+		{
+			ws_put_text(out, "USING INDEX ");
+			ws_put_identifier(out, s->replica_index);
+		}
+	}
+	if (s->clustered != NULL)
+	{
+		ws_put_text(out, s->replica_identity != WS_REPLICA_DEFAULT ? ", CLUSTER ON " : " CLUSTER ON ");
+		ws_put_identifier(out, s->clustered);
+	}
+}
+
+/* One ALTER TABLE ONLY of this table, of just its replica identity and clustered index. */
+static void
+check_table_settings_statement(const WsTableSchema *s, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	int			want = (s->replica_identity != WS_REPLICA_DEFAULT ? 1 : 0) + (s->clustered != NULL ? 1 : 0);
+	int			at = 0;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != want)
+		not_the_record(s, "another table");
+	if (s->replica_identity != WS_REPLICA_DEFAULT)
+	{
+		AlterTableCmd *cmd = list_nth_node(AlterTableCmd, stmt->cmds, at++);
+		ReplicaIdentityStmt *ri;
+
+		if (cmd->subtype != AT_ReplicaIdentity || !IsA(cmd->def, ReplicaIdentityStmt))
+			not_the_record(s, "another change");
+		ri = (ReplicaIdentityStmt *) cmd->def;
+		if (ri->identity_type != (s->replica_identity == WS_REPLICA_FULL ? REPLICA_IDENTITY_FULL :
+								  s->replica_identity == WS_REPLICA_NOTHING ? REPLICA_IDENTITY_NOTHING :
+								  REPLICA_IDENTITY_INDEX) ||
+			(ri->name != NULL) != (s->replica_index != NULL) ||
+			(ri->name != NULL && strcmp(ri->name, s->replica_index) != 0))
+			not_the_record(s, "another replica identity");
+	}
+	if (s->clustered != NULL)
+	{
+		AlterTableCmd *cmd = list_nth_node(AlterTableCmd, stmt->cmds, at);
+
+		if (cmd->subtype != AT_ClusterOn || cmd->name == NULL || strcmp(cmd->name, s->clustered) != 0)
+			not_the_record(s, "another clustered index");
+	}
+}
+
+static void
+write_index_stats(const WsIndexSettings *set, const char *schema, Buf *out)
+{
+	ws_put_text(out, "ALTER INDEX ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, set->index);
+	for (int k = 0; k < set->nstats; k++)
+	{
+		char		text[48];
+
+		snprintf(text, sizeof(text), "%s ALTER COLUMN %d SET STATISTICS %d", k > 0 ? "," : "",
+				 set->stats[k].column, set->stats[k].target);
+		ws_put_text(out, text);
+	}
+}
+
+/* One ALTER INDEX, of this index, of just these targets. */
+static void
+check_index_stats_statement(const WsTableSchema *s, const WsIndexSettings *set, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	int			k = 0;
+	ListCell   *lc;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER INDEX");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, set->index) != 0 ||
+		stmt->objtype != OBJECT_INDEX || stmt->missing_ok || list_length(stmt->cmds) != set->nstats)
+		not_the_record(s, "another index");
+	foreach(lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+		if (cmd->subtype != AT_SetStatistics || cmd->name != NULL || cmd->num != set->stats[k].column ||
+			cmd->def == NULL || !IsA(cmd->def, Integer) || intVal(cmd->def) != set->stats[k].target)
+			not_the_record(s, "another statistics target");
+		k++;
+	}
+}
+
 /* One ALTER TABLE, of this table, inheriting from this parent, and nothing else. */
 static void
 check_inherit_statement(const WsTableSchema *s, const char *parent, const char *schema, const char *sql)
@@ -2473,6 +3096,29 @@ options_in_server_encoding(const WsOption *options, int n)
 	return here;
 }
 
+static WsIndexSettings *
+index_settings_in_server_encoding(const WsTableSchema *s)
+{
+	WsIndexSettings *here = palloc_array(WsIndexSettings, Max(s->nindex_settings, 1));
+
+	for (int i = 0; i < s->nindex_settings; i++)
+	{
+		const WsIndexSettings *set = &s->index_settings[i];
+
+		here[i] = *set;
+		here[i].index = ws_name_from_utf8(set->index);
+		here[i].options = options_in_server_encoding(set->options, set->noptions);
+		here[i].keyoptions = palloc_array(WsKeyOptions, Max(set->nkeyoptions, 1));
+		for (int k = 0; k < set->nkeyoptions; k++)
+		{
+			here[i].keyoptions[k] = set->keyoptions[k];
+			here[i].keyoptions[k].options = options_in_server_encoding(set->keyoptions[k].options,
+																	   set->keyoptions[k].noptions);
+		}
+	}
+	return here;
+}
+
 /* A copy of a schema with its strings in the server's encoding. */
 static void
 schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
@@ -2516,6 +3162,9 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	here.partition_of = ws_name_from_utf8(s->partition_of);
 	here.partition_bound = from_utf8(s->partition_bound);
 	here.options = options_in_server_encoding(s->options, s->noptions);
+	here.index_settings = index_settings_in_server_encoding(s);
+	here.replica_index = ws_name_from_utf8(s->replica_index);
+	here.clustered = ws_name_from_utf8(s->clustered);
 	here.inherits = palloc_array(char *, Max(s->ninherits, 1));
 	for (int i = 0; i < s->ninherits; i++)
 		here.inherits[i] = ws_name_from_utf8(s->inherits[i]);
@@ -2525,21 +3174,43 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	*here_out = here;
 }
 
+/*
+ * A statement's copy of the schema, and what parsing it takes, in a context of its
+ * own: each is as big as the record, and a table has a statement per index.
+ */
+static MemoryContext
+statement_begin(void)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "ws statement", ALLOCSET_DEFAULT_SIZES);
+
+	MemoryContextSwitchTo(cxt);
+	return cxt;
+}
+
+static void
+statement_end(MemoryContext cxt, Buf *sql, Buf *out)
+{
+	MemoryContextSwitchTo(MemoryContextGetParent(cxt));
+	buf_append(out, sql->data, sql->len - 1);
+	MemoryContextDelete(cxt);
+}
+
 void
 ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_create_table(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -2548,17 +3219,18 @@ ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *o
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (n < 0 || n >= s->nindexes)
 		elog(ERROR, "no index %d", n);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_create_index(&here, &here.indexes[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_index_statement(&here, &here.indexes[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -2567,17 +3239,18 @@ ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (n < 0 || n >= s->nconstraints || !s->constraints[n].not_valid)
 		elog(ERROR, "no check not valid at %d", n);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_add_check(&here, &here.constraints[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_add_check_statement(&here, &here.constraints[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -2586,17 +3259,18 @@ ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (s->partition_of == NULL)
 		elog(ERROR, "table \"%s\" is no partition", s->name);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_attach(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_attach_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -2605,6 +3279,7 @@ ws_schema_column_settings(const WsTableSchema *s, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 	bool		any = false;
 
 	if (problem != NULL)
@@ -2613,12 +3288,56 @@ ws_schema_column_settings(const WsTableSchema *s, const char *schema, Buf *out)
 		any |= s->cols[i].has_stattarget || s->cols[i].noptions > 0;
 	if (!any)
 		return;
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_column_settings(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_column_settings_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_table_settings(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (s->replica_identity == WS_REPLICA_DEFAULT && s->clustered == NULL)
+		return;
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	write_table_settings(&here, schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_table_settings_statement(&here, schema, (char *) sql.data);
+	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out)
+{
+	const char *problem;
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+
+	/* (one of these per index: most have nothing to say, so ask that first) */
+	if (n < 0 || n >= s->nindex_settings)
+		elog(ERROR, "no index settings %d", n);
+	if (s->index_settings[n].nstats == 0)
+		return;
+	problem = ws_schema_problem(s);
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	write_index_stats(&here.index_settings[n], schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_index_stats_statement(&here, &here.index_settings[n], schema, (char *) sql.data);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -2627,11 +3346,13 @@ ws_schema_inherit(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (n < 0 || n >= s->ninherits)
 		elog(ERROR, "no parent %d", n);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	ws_put_text(&sql, "ALTER TABLE ");
 	ws_put_identifier(&sql, schema);
@@ -2643,8 +3364,7 @@ ws_schema_inherit(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	ws_put_identifier(&sql, here.inherits[n]);
 	buf_append_byte(&sql, 0);
 	check_inherit_statement(&here, here.inherits[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 static char *
@@ -2733,7 +3453,8 @@ static const char *const unsupported_sql =
 "  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
 "    THEN 'it has another access method' "
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
-"  WHEN c.relreplident <> 'd' THEN 'it has a replica identity' "
+"  WHEN c.relreplident = 'i' AND NOT EXISTS (SELECT FROM pg_index x WHERE x.indrelid = c.oid AND x.indisreplident) "
+"    THEN 'its replica identity is by an index it no longer has' "
 "  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
 "       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND "
@@ -2742,15 +3463,13 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND "
-"                 (NOT x.indisvalid OR (k.contype = 'p' AND k.condeferrable) OR k.conperiod OR x.indisclustered OR "
-"                  x.indnkeyatts <> x.indnatts OR "
-"                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
-"    THEN 'a key or unique constraint has more than columns, or is not valid' "
+"                 (NOT x.indisvalid OR k.conperiod OR ic.reltablespace <> 0)) "
+"    THEN 'a key or unique constraint is over a period, has a tablespace, or is not valid' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_constraint k2 ON k2.conrelid = k.conrelid AND k2.oid > k.oid "
 "               JOIN pg_index x2 ON x2.indexrelid = k2.conindid "
 "               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND k2.contype IN ('p', 'u') "
-"                 AND x.indkey::text = x2.indkey::text "
+"                 AND x.indkey::text = x2.indkey::text AND x.indnkeyatts = x2.indnkeyatts "
 "                 AND x.indnullsnotdistinct = x2.indnullsnotdistinct "
 "                 AND k.condeferrable = k2.condeferrable AND k.condeferred = k2.condeferred) "
 "    THEN 'it has two constraints alike, of which CREATE TABLE makes one' "
@@ -2758,11 +3477,8 @@ static const char *const unsupported_sql =
 "               WHERE x.indrelid = c.oid AND NOT EXISTS "
 "               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid "
 "                  AND k.contype NOT IN ('x', 'f')) AND "
-"                 (NOT x.indisvalid OR NOT x.indisready OR x.indisclustered OR "
-"                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0 OR "
-"                  EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = x.indexrelid AND "
-"                          (a.attstattarget IS NOT NULL OR a.attoptions IS NOT NULL)))) "
-"    THEN 'an index has options, or is not valid' "
+"                 (NOT x.indisvalid OR NOT x.indisready OR ic.reltablespace <> 0)) "
+"    THEN 'an index has a tablespace, or is not valid' "
 "  WHEN EXISTS (SELECT FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
 "               AND p.objid IN (SELECT o FROM own) AND p.deptype = 'x') "
 "    THEN 'it depends on an extension' "
@@ -2925,15 +3641,6 @@ index_gone(const char *table)
 			 errmsg("an index of table \"%s\" was dropped since this transaction's snapshot", table)));
 }
 
-/* (and so, what the snapshot's rows passed as having no options) */
-pg_noreturn static void
-index_changed(const char *table)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-			 errmsg("an index of table \"%s\" was given options since this transaction's snapshot", table)));
-}
-
 /* Each part of a name a commit holds as text, within a commit's limit for a name. */
 static void
 names_fit(List *names)
@@ -2949,11 +3656,6 @@ static void
 read_index_key(const char *table, const char *index_oid, int k, const IndexElem *elem,
 			   ReadCols *rc, WsIndexKey *key)
 {
-	if (elem->opclassopts != NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("the schema of table \"%s\" cannot be read yet: an index has options",
-						table)));
 	if (elem->name != NULL)
 		key->tag = index_col_tag(table, rc, elem->name);
 	else
@@ -3011,8 +3713,6 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 	con = linitial_node(Constraint, elts);
 	if (con->contype != CONSTR_EXCLUSION)
 		elog(ERROR, "an exclusion of table \"%s\" printed as something else", table);
-	if (con->options != NIL || con->indexspace != NULL)
-		index_changed(table);
 	ix->method = ws_name_to_utf8(con->access_method);
 	ix->nkeys = list_length(con->exclusions);
 	ix->keys = px_malloc((size_t) Max(ix->nkeys, 1) * sizeof(WsIndexKey));
@@ -3056,8 +3756,6 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, IndexStmt))
 		elog(ERROR, "an index of table \"%s\" printed as something else", table);
 	stmt = (IndexStmt *) linitial_node(RawStmt, parsed)->stmt;
-	if (stmt->options != NIL || stmt->tableSpace != NULL)
-		index_changed(table);
 	ix->name = ws_name_to_utf8(ws_sql_value(idxs, row, 0));
 	ix->method = ws_name_to_utf8(stmt->accessMethod);
 	ix->unique = stmt->unique;
@@ -3258,6 +3956,154 @@ name_cmp(const void *a, const void *b)
 	return strcmp(*(char *const *) a, *(char *const *) b);
 }
 
+static int
+index_settings_cmp(const void *a, const void *b)
+{
+	return strcmp(((const WsIndexSettings *) a)->index, ((const WsIndexSettings *) b)->index);
+}
+
+/* An array of name=value, in rows: the first column's, from row at, n of them. */
+static WsOption *
+read_option_rows(const WsSqlRows *rows, int column, int at, int n)
+{
+	WsOption   *options = px_malloc((size_t) Max(n, 1) * sizeof(WsOption));
+
+	memset(options, 0, (size_t) Max(n, 1) * sizeof(WsOption));
+	for (int i = 0; i < n; i++)
+		read_option(ws_sql_value(rows, at + i, column), false, &options[i]);
+	if (n > 1)
+		qsort(options, n, sizeof(WsOption), option_cmp);
+	return options;
+}
+
+/*
+ * Each index's settings, of any kind: a key's or unique constraint's INCLUDE, all
+ * of their options, and their columns'.  A constraint's index has the constraint's
+ * name, so the name is the one the record has it by.
+ */
+static void
+read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	idx;
+	int			n = 0;
+
+	WsSql->run("SELECT ic.relname::text, ic.oid::text, "
+			   "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
+			   "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
+			   "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
+			   "  array_to_string((i.indkey::int2[])[i.indnkeyatts:i.indnatts - 1], ' ') "
+			   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			   "WHERE i.indrelid = $1::oid", 1, params, &idx);
+	out->index_settings = px_malloc((size_t) Max(idx.nrows, 1) * sizeof(WsIndexSettings));
+	memset(out->index_settings, 0, (size_t) Max(idx.nrows, 1) * sizeof(WsIndexSettings));
+	for (int r = 0; r < idx.nrows; r++)
+	{
+		WsIndexSettings *set = &out->index_settings[n];
+		const char *iparams[1] = {ws_sql_value(&idx, r, 1)};
+		WsSqlRows	opts;
+		WsSqlRows	atts;
+		WsSqlRows	keyopts;
+
+		set->ninclude = atoi(ws_sql_value(&idx, r, 2));
+		if (set->ninclude > 0)
+		{
+			set->include = px_malloc((size_t) set->ninclude * sizeof(uint64));
+			read_col_tags(table, cols, out, ws_sql_value(&idx, r, 3), set->ninclude, set->include);
+		}
+		WsSql->run("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
+		if (opts.nrows > 0)
+		{
+			set->options = read_option_rows(&opts, 0, 0, opts.nrows);
+			set->noptions = opts.nrows;
+		}
+		ws_sql_rows_free(&opts);
+		WsSql->run("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
+				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
+				   "ORDER BY a.attnum", 1, iparams, &atts);
+		if (atts.nrows > 0)
+		{
+			set->stats = px_malloc((size_t) atts.nrows * sizeof(WsIndexStat));
+			set->nstats = atts.nrows;
+			for (int k = 0; k < atts.nrows; k++)
+			{
+				set->stats[k].column = atoi(ws_sql_value(&atts, k, 0));
+				set->stats[k].target = atoi(ws_sql_value(&atts, k, 1));
+			}
+		}
+		ws_sql_rows_free(&atts);
+		WsSql->run("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
+				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
+		if (keyopts.nrows > 0)
+		{
+			set->keyoptions = px_malloc((size_t) keyopts.nrows * sizeof(WsKeyOptions));
+			memset(set->keyoptions, 0, (size_t) keyopts.nrows * sizeof(WsKeyOptions));
+			for (int at = 0; at < keyopts.nrows;)
+			{
+				int			same = 1;
+
+				while (at + same < keyopts.nrows &&
+					   strcmp(ws_sql_value(&keyopts, at, 0), ws_sql_value(&keyopts, at + same, 0)) == 0)
+					same++;
+				set->keyoptions[set->nkeyoptions].column = atoi(ws_sql_value(&keyopts, at, 0));
+				set->keyoptions[set->nkeyoptions].options = read_option_rows(&keyopts, 1, at, same);
+				set->keyoptions[set->nkeyoptions].noptions = same;
+				set->nkeyoptions++;
+				at += same;
+			}
+		}
+		ws_sql_rows_free(&keyopts);
+		if (set->ninclude > 0 || set->noptions > 0 || set->nstats > 0 || set->nkeyoptions > 0)
+		{
+			set->index = ws_name_to_utf8(ws_sql_value(&idx, r, 0));
+			n++;
+		}
+		else
+			memset(set, 0, sizeof(*set));
+	}
+	out->nindex_settings = n;
+	if (n > 1)
+		qsort(out->index_settings, n, sizeof(WsIndexSettings), index_settings_cmp);
+	ws_sql_rows_free(&idx);
+}
+
+/* Its replica identity and clustered index. */
+static void
+read_table_settings(const char *table, const char *oid, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT c.relreplident::text, "
+			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			   "    WHERE i.indrelid = c.oid AND i.indisreplident), "
+			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			   "    WHERE i.indrelid = c.oid AND i.indisclustered) "
+			   "FROM pg_class c WHERE c.oid = $1::oid", 1, params, &rows);
+	switch (ws_sql_value(&rows, 0, 0)[0])
+	{
+		case REPLICA_IDENTITY_DEFAULT:
+			break;
+		case REPLICA_IDENTITY_FULL:
+			out->replica_identity = WS_REPLICA_FULL;
+			break;
+		case REPLICA_IDENTITY_NOTHING:
+			out->replica_identity = WS_REPLICA_NOTHING;
+			break;
+		case REPLICA_IDENTITY_INDEX:
+			if (ws_sql_value(&rows, 0, 1) == NULL)
+				elog(ERROR, "table \"%s\" has a replica identity by no index", table);
+			out->replica_identity = WS_REPLICA_INDEX;
+			out->replica_index = ws_name_to_utf8(ws_sql_value(&rows, 0, 1));
+			break;
+		default:
+			elog(ERROR, "table \"%s\" has a replica identity of no known kind", table);
+	}
+	if (ws_sql_value(&rows, 0, 2) != NULL)
+		out->clustered = ws_name_to_utf8(ws_sql_value(&rows, 0, 2));
+	ws_sql_rows_free(&rows);
+}
+
 /* The tables a table inherits from, and what it has only by doing so. */
 static void
 read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others, WsTableSchema *out)
@@ -3433,7 +4279,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   1, oid, &idxs);
 		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
 				   "  con.condeferrable::text, "
-				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' ') "
+				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
+				   "  con.condeferred::text "
 				   "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
 				   "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
 	}
@@ -3508,6 +4355,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		out->nkey = atoi(ws_sql_value(&key, 0, 1));
 		out->key = px_malloc((size_t) out->nkey * sizeof(uint64));
 		read_col_tags(table, &cols, out, keys, out->nkey, out->key);
+		out->key_deferrable = ws_sql_value(&key, 0, 3)[0] == 't';
+		out->key_initdeferred = ws_sql_value(&key, 0, 5)[0] == 't';
 	}
 	out->nconstraints = others.nrows;
 	out->constraints = px_malloc((size_t) Max(others.nrows, 1) * sizeof(WsConstraint));
@@ -3554,15 +4403,6 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	/* (by name in UTF8's order: what a commit holds, whatever this database sorts by) */
 	if (out->nconstraints > 1)
 		qsort(out->constraints, out->nconstraints, sizeof(WsConstraint), constraint_cmp);
-	for (int i = 0; i < out->nconstraints; i++)
-		for (int j = 0; j < i; j++)
-			if (out->constraints[i].kind == WS_CONSTRAINT_EXCLUSION &&
-				out->constraints[j].kind == WS_CONSTRAINT_EXCLUSION &&
-				exclusions_alike(&out->constraints[i], &out->constraints[j]))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("the schema of table \"%s\" cannot be read yet: it has two constraints alike, of which CREATE TABLE makes one",
-								table)));
 	out->nindexes = idxs.nrows;
 	out->indexes = px_malloc((size_t) Max(idxs.nrows, 1) * sizeof(WsIndex));
 	memset(out->indexes, 0, (size_t) Max(idxs.nrows, 1) * sizeof(WsIndex));
@@ -3573,6 +4413,18 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
 	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
+	read_index_settings(table, ws_sql_value(&rel, 0, 0), &cols, out);
+	read_table_settings(table, ws_sql_value(&rel, 0, 0), out);
+	/* (their keys' parameters, in the settings, tell them apart) */
+	for (int i = 0; i < out->nconstraints; i++)
+		for (int j = 0; j < i; j++)
+			if (out->constraints[i].kind == WS_CONSTRAINT_EXCLUSION &&
+				out->constraints[j].kind == WS_CONSTRAINT_EXCLUSION &&
+				exclusions_alike(out, &out->constraints[i], &out->constraints[j]))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the schema of table \"%s\" cannot be read yet: it has two constraints alike, of which CREATE TABLE makes one",
+								table)));
 	if (ws_sql_value(&rel, 0, 4)[0] != 't')
 		read_inheritance(ws_sql_value(&rel, 0, 0), &cols, &others, out);
 	if (ws_sql_value(&rel, 0, 4)[0] == 't')

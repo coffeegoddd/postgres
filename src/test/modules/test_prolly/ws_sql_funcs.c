@@ -117,6 +117,22 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 		ws_sql_rows_free(&rows);
 		buf_free(&ix);
 	}
+	for (int i = 0; i <= s.nindex_settings; i++)
+	{
+		Buf			set = BUF_INIT;
+
+		if (i < s.nindex_settings)
+			ws_schema_index_stats(&s, i, schema, &set);
+		else
+			ws_schema_table_settings(&s, schema, &set);
+		if (set.len > 0)
+		{
+			buf_append_byte(&set, 0);
+			WsSql->run((char *) set.data, 0, NULL, &rows);
+			ws_sql_rows_free(&rows);
+		}
+		buf_free(&set);
+	}
 	ws_schema_set_tags(schema, &s);
 	CommandCounterIncrement();
 	WsSql->end(level);
