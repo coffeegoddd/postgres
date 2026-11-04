@@ -583,6 +583,18 @@ my $nnchk = $node->safe_psql('postgres', q{
 $node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$nnchk', 'hex'), 'dst')});
 is($bytes->($node, 'postgres', 'nnchk', undef, 'dst'), $nnchk, 'a check named as a not-null constraint would be');
 
+# the other side: a sequence on a column that is no identity, for a table elsewhere
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA seqo VERSIONED;
+	CREATE TABLE seqo.seqside (a int);
+	CREATE TABLE src.seqside (a int NOT NULL);
+	ALTER TABLE src.seqside ALTER a ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME seqo.seqside_s);
+});
+{
+	my ($ret, $out, $err) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('seqo', 'seqside')});
+	like($err, qr/cannot be read yet.*owns the identity sequence of another table/, 'a column owning another table\'s sequence refused');
+}
+
 # a column retyped since the reader's snapshot, the type it had gone: not its text
 $node->safe_psql('postgres', q{
 	CREATE TYPE src.gone AS ENUM ('a');
