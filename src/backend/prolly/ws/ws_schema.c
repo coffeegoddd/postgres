@@ -28,7 +28,8 @@
  * values, uvarint nstats, columns and targets, uvarint nkeyoptions and each column,
  * uvarint noptions, names and values; and with 'x', a flags byte for the key and
  * row security, a replica identity byte, its index's name if by index, and the clustered index's
- * name or nothing.  Any other ends there.
+ * name or nothing; and comments with 'm', uvarint n, and each one's kind byte, tag
+ * or name as its kind has, and text.  Any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -423,6 +424,76 @@ table_settings_problem(const WsTableSchema *s)
 	}
 	if (s->clustered != NULL && !find_index(s, s->clustered, &takes_include, &body))
 		return "clustered on an index the table does not have";
+	return NULL;
+}
+
+static const char *
+comments_problem(const WsTableSchema *s)
+{
+	if (s->ncomments < 0)
+		return "a negative number of comments";
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		const WsComment *m = &s->comments[i];
+		bool		takes_include;
+		const WsIndex *body;
+
+		CHECK_FOR_INTERRUPTS();
+		if (m->text == NULL || m->text[0] == '\0')
+			return "a comment with no text";
+		switch (m->kind)
+		{
+			case WS_COMMENT_TABLE:
+				if (m->tag != 0 || m->name != NULL)
+					return "a table's comment on something else";
+				break;
+			case WS_COMMENT_COLUMN:
+			case WS_COMMENT_SEQUENCE:
+				{
+					const WsColumn *col = ws_schema_column(s, m->tag);
+
+					if (m->name != NULL || col == NULL)
+						return "a comment on a column the table does not have";
+					if (m->kind == WS_COMMENT_SEQUENCE && col->identity_seq == NULL)
+						return "a comment on a sequence the table does not have";
+					break;
+				}
+			case WS_COMMENT_INDEX:
+				if (m->tag != 0 || m->name == NULL || !find_index(s, m->name, &takes_include, &body))
+					return "a comment on an index the table does not have";
+				break;
+			case WS_COMMENT_CONSTRAINT:
+				{
+					bool		found = false;
+
+					if (m->tag != 0 || m->name == NULL)
+						return "a comment on a constraint the table does not have";
+					found = s->key_name != NULL && strcmp(s->key_name, m->name) == 0;
+					for (int k = 0; k < s->nconstraints && !found; k++)
+						found = strcmp(s->constraints[k].name, m->name) == 0;
+					for (int k = 0; k < s->ncols && !found; k++)
+						found = s->cols[k].not_null != NULL && strcmp(s->cols[k].not_null, m->name) == 0;
+					if (!found)
+						return "a comment on a constraint the table does not have";
+					break;
+				}
+			default:
+				return "a comment on no known kind of thing";
+		}
+		/* (one order, so one set of bytes) */
+		if (i > 0)
+		{
+			const WsComment *prior = &s->comments[i - 1];
+			int			cmp = (unsigned char) prior->kind - (unsigned char) m->kind;
+
+			if (cmp == 0 && prior->tag != m->tag)
+				cmp = prior->tag < m->tag ? -1 : 1;
+			if (cmp == 0 && m->name != NULL)
+				cmp = strcmp(prior->name, m->name);
+			if (cmp >= 0)
+				return "comments not in order";
+		}
+	}
 	return NULL;
 }
 
@@ -874,6 +945,9 @@ ws_schema_problem(const WsTableSchema *s)
 		problem = table_settings_problem(s);
 		if (problem != NULL)
 			return problem;
+		problem = comments_problem(s);
+		if (problem != NULL)
+			return problem;
 	}
 	return column_names_problem(s);
 }
@@ -884,6 +958,7 @@ ws_schema_problem(const WsTableSchema *s)
 #define WS_COLUMN_SETTINGS 'c'
 #define WS_INDEX_SETTINGS 'j'
 #define WS_TABLE_SETTINGS 'x'
+#define WS_COMMENTS 'm'
 #define KEY_DEFERRABLE 0x01
 #define KEY_INITDEFERRED 0x02
 #define TABLE_ROW_SECURITY 0x04
@@ -1133,6 +1208,22 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		if (s->replica_identity == WS_REPLICA_INDEX)
 			put_string(out, s->replica_index);
 		put_optional(out, s->clustered);
+	}
+	if (s->ncomments > 0)
+	{
+		buf_append_byte(out, WS_COMMENTS);
+		buf_append_uvarint(out, (uint64) s->ncomments);
+		for (int i = 0; i < s->ncomments; i++)
+		{
+			const WsComment *m = &s->comments[i];
+
+			buf_append_byte(out, (uint8) m->kind);
+			if (m->kind == WS_COMMENT_COLUMN || m->kind == WS_COMMENT_SEQUENCE)
+				buf_append_uvarint(out, m->tag);
+			else if (m->kind != WS_COMMENT_TABLE)
+				put_string(out, m->name);
+			put_string(out, m->text);
+		}
 	}
 }
 
@@ -1424,7 +1515,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		get_index_body(&p, end, ix, false);
 	}
 	if (p != end && *p != WS_PARTITION_OF && *p != WS_INHERITS && *p != WS_OPTIONS &&
-		*p != WS_COLUMN_SETTINGS && *p != WS_INDEX_SETTINGS && *p != WS_TABLE_SETTINGS)
+		*p != WS_COLUMN_SETTINGS && *p != WS_INDEX_SETTINGS && *p != WS_TABLE_SETTINGS &&
+		*p != WS_COMMENTS)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -1612,6 +1704,37 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			!s->row_security && !s->force_row_security)
 			malformed("a table's settings saying it has none");
 	}
+	if (p != end && *p == WS_COMMENTS)
+	{
+		p++;
+		n = get_uvarint(&p, end);
+		if (n == 0)
+			malformed("it has no comments, at length");
+		/* (each is at least two bytes: its kind and its text's length) */
+		if (n > (uint64) (end - p) / 2)
+			malformed("more comments than bytes");
+		s->comments = px_malloc((size_t) Min(n, 16) * sizeof(WsComment));
+		memset(s->comments, 0, (size_t) Min(n, 16) * sizeof(WsComment));
+		for (uint64 i = 0; i < n; i++)
+		{
+			WsComment  *m;
+
+			/* (grown as they are read: each is bigger here than there) */
+			if (i >= 16 && (i & (i - 1)) == 0)
+			{
+				s->comments = px_realloc(s->comments, (size_t) Min(i * 2, n) * sizeof(WsComment));
+				memset(s->comments + i, 0, (size_t) (Min(i * 2, n) - i) * sizeof(WsComment));
+			}
+			s->ncomments = (int) i + 1;
+			m = &s->comments[i];
+			m->kind = (char) get_byte(&p, end);
+			if (m->kind == WS_COMMENT_COLUMN || m->kind == WS_COMMENT_SEQUENCE)
+				m->tag = get_uvarint(&p, end);
+			else if (m->kind != WS_COMMENT_TABLE)
+				m->name = get_string(&p, end);
+			m->text = get_string(&p, end);
+		}
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_schema_problem(s);
@@ -1668,6 +1791,12 @@ ws_schema_free(WsTableSchema *s)
 			options_free(set->keyoptions[k].options, set->keyoptions[k].noptions);
 		px_free(set->keyoptions);
 	}
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		px_free(s->comments[i].name);
+		px_free(s->comments[i].text);
+	}
+	px_free(s->comments);
 	px_free(s->index_settings);
 	px_free(s->replica_index);
 	px_free(s->clustered);
@@ -2963,6 +3092,91 @@ check_table_settings_statement(const WsTableSchema *s, const char *schema, const
 	}
 }
 
+static void
+write_comment(const WsTableSchema *s, const WsComment *m, const char *schema, Buf *out)
+{
+	const WsColumn *col = m->tag != 0 ? ws_schema_column(s, m->tag) : NULL;
+
+	switch (m->kind)
+	{
+		case WS_COMMENT_TABLE:
+			ws_put_text(out, "COMMENT ON TABLE ");
+			break;
+		case WS_COMMENT_COLUMN:
+			ws_put_text(out, "COMMENT ON COLUMN ");
+			break;
+		case WS_COMMENT_SEQUENCE:
+			ws_put_text(out, "COMMENT ON SEQUENCE ");
+			break;
+		case WS_COMMENT_INDEX:
+			ws_put_text(out, "COMMENT ON INDEX ");
+			break;
+		default:
+			ws_put_text(out, "COMMENT ON CONSTRAINT ");
+			ws_put_identifier(out, m->name);
+			ws_put_text(out, " ON ");
+			break;
+	}
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	if (m->kind == WS_COMMENT_SEQUENCE)
+		ws_put_identifier(out, col->identity_seq);
+	else if (m->kind == WS_COMMENT_INDEX)
+		ws_put_identifier(out, m->name);
+	else
+		ws_put_identifier(out, s->name);
+	if (m->kind == WS_COMMENT_COLUMN)
+	{
+		ws_put_text(out, ".");
+		ws_put_identifier(out, col->name);
+	}
+	ws_put_text(out, " IS ");
+	ws_put_text(out, quote_literal_cstr(m->text));
+}
+
+/* One COMMENT, on just this, saying just this. */
+static void
+check_comment_statement(const WsTableSchema *s, const WsComment *m, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	const WsColumn *col = m->tag != 0 ? ws_schema_column(s, m->tag) : NULL;
+	CommentStmt *stmt;
+	List	   *want = list_make1(makeString((char *) schema));
+	ObjectType	type;
+
+	switch (m->kind)
+	{
+		case WS_COMMENT_TABLE:
+			type = OBJECT_TABLE;
+			want = lappend(want, makeString(s->name));
+			break;
+		case WS_COMMENT_COLUMN:
+			type = OBJECT_COLUMN;
+			want = lappend(want, makeString(s->name));
+			want = lappend(want, makeString(col->name));
+			break;
+		case WS_COMMENT_SEQUENCE:
+			type = OBJECT_SEQUENCE;
+			want = lappend(want, makeString(col->identity_seq));
+			break;
+		case WS_COMMENT_INDEX:
+			type = OBJECT_INDEX;
+			want = lappend(want, makeString(m->name));
+			break;
+		default:
+			type = OBJECT_TABCONSTRAINT;
+			want = lappend(want, makeString(s->name));
+			want = lappend(want, makeString(m->name));
+			break;
+	}
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CommentStmt))
+		not_the_record(s, "it is not one COMMENT");
+	stmt = (CommentStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->objtype != type || !equal(stmt->object, want) || stmt->comment == NULL ||
+		strcmp(stmt->comment, m->text) != 0)
+		not_the_record(s, "another comment");
+}
+
 /* One ALTER TABLE ONLY of this table, of just its row security. */
 static void
 check_row_security_statement(const WsTableSchema *s, const char *schema, const char *sql)
@@ -3196,6 +3410,13 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	here.index_settings = index_settings_in_server_encoding(s);
 	here.replica_index = ws_name_from_utf8(s->replica_index);
 	here.clustered = ws_name_from_utf8(s->clustered);
+	here.comments = palloc_array(WsComment, Max(s->ncomments, 1));
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		here.comments[i] = s->comments[i];
+		here.comments[i].name = ws_name_from_utf8(s->comments[i].name);
+		here.comments[i].text = from_utf8(s->comments[i].text);
+	}
 	here.inherits = palloc_array(char *, Max(s->ninherits, 1));
 	for (int i = 0; i < s->ninherits; i++)
 		here.inherits[i] = ws_name_from_utf8(s->inherits[i]);
@@ -3344,6 +3565,26 @@ ws_schema_table_settings(const WsTableSchema *s, const char *schema, Buf *out)
 	write_table_settings(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_table_settings_statement(&here, schema, (char *) sql.data);
+	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (n < 0 || n >= s->ncomments)
+		elog(ERROR, "no comment %d", n);
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	write_comment(&here, &here.comments[n], schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_comment_statement(&here, &here.comments[n], schema, (char *) sql.data);
 	statement_end(cxt, &sql, out);
 }
 
@@ -3539,11 +3780,9 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
 "               AND p.objid IN (SELECT o FROM own) AND p.deptype = 'x') "
 "    THEN 'it depends on an extension' "
-"  WHEN EXISTS (SELECT FROM pg_description d WHERE "
-"               (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT o FROM own)) OR "
-"               (d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
-"                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid))) "
-"    THEN 'it has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
+"                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'f')) "
+"    THEN 'a foreign key has a comment' "
 "  WHEN EXISTS (SELECT FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass "
 "               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
 "  WHEN (c.relacl IS NOT NULL AND c.relacl <> acldefault('r', c.relowner)) OR "
@@ -4124,6 +4363,70 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	ws_sql_rows_free(&idx);
 }
 
+static int
+comment_cmp(const void *a, const void *b)
+{
+	const WsComment *x = a;
+	const WsComment *y = b;
+
+	if (x->kind != y->kind)
+		return (unsigned char) x->kind < (unsigned char) y->kind ? -1 : 1;
+	if (x->tag != y->tag)
+		return x->tag < y->tag ? -1 : 1;
+	return x->name != NULL && y->name != NULL ? strcmp(x->name, y->name) : 0;
+}
+
+/* The comments on what the record holds; on any other, refused above. */
+static void
+read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT 't', NULL::text, d.description FROM pg_description d "
+			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid = 0 "
+			   "UNION ALL SELECT 'c', d.objsubid::text, d.description FROM pg_description d "
+			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid > 0 "
+			   "UNION ALL SELECT 'i', q.relname::text, d.description FROM pg_description d "
+			   "  JOIN pg_index x ON x.indexrelid = d.objoid JOIN pg_class q ON q.oid = x.indexrelid "
+			   "  WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = $1::oid "
+			   "UNION ALL SELECT 's', p.refobjsubid::text, d.description FROM pg_description d "
+			   "  JOIN pg_depend p ON p.objid = d.objoid AND p.classid = 'pg_class'::regclass "
+			   "    AND p.refclassid = 'pg_class'::regclass AND p.deptype = 'i' "
+			   "  JOIN pg_class q ON q.oid = p.objid AND q.relkind = 'S' "
+			   "  WHERE d.classoid = 'pg_class'::regclass AND p.refobjid = $1::oid "
+			   "UNION ALL SELECT 'k', k.conname::text, d.description FROM pg_description d "
+			   "  JOIN pg_constraint k ON k.oid = d.objoid "
+			   "  WHERE d.classoid = 'pg_constraint'::regclass AND k.conrelid = $1::oid", 1, params, &rows);
+	if (rows.nrows > 0)
+	{
+		out->comments = px_malloc((size_t) rows.nrows * sizeof(WsComment));
+		memset(out->comments, 0, (size_t) rows.nrows * sizeof(WsComment));
+		out->ncomments = rows.nrows;
+		for (int i = 0; i < rows.nrows; i++)
+		{
+			WsComment  *m = &out->comments[i];
+			const char *target = ws_sql_value(&rows, i, 1);
+
+			m->kind = ws_sql_value(&rows, i, 0)[0];
+			m->text = to_utf8(ws_sql_value(&rows, i, 2));
+			if (m->kind == WS_COMMENT_COLUMN || m->kind == WS_COMMENT_SEQUENCE)
+			{
+				for (int k = 0; k < cols->nrows && m->tag == 0; k++)
+					if (strcmp(ws_sql_value(cols, k, 0), target) == 0)
+						m->tag = out->cols[k].tag;
+				if (m->tag == 0)
+					elog(ERROR, "a comment on a column the table does not have");
+			}
+			else if (m->kind != WS_COMMENT_TABLE)
+				m->name = ws_name_to_utf8(target);
+		}
+		if (out->ncomments > 1)
+			qsort(out->comments, out->ncomments, sizeof(WsComment), comment_cmp);
+	}
+	ws_sql_rows_free(&rows);
+}
+
 /* Its row security, replica identity and clustered index. */
 static void
 read_table_settings(const char *table, const char *oid, WsTableSchema *out)
@@ -4475,6 +4778,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_index_settings(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_table_settings(table, ws_sql_value(&rel, 0, 0), out);
+	read_comments(ws_sql_value(&rel, 0, 0), &cols, out);
 	/* (their keys' parameters, in the settings, tell them apart) */
 	for (int i = 0; i < out->nconstraints; i++)
 		for (int j = 0; j < i; j++)
