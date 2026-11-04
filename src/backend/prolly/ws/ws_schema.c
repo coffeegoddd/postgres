@@ -778,11 +778,13 @@ static const char *const unsupported_sql =
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
 "  WHEN c.reloptions IS NOT NULL THEN 'it has storage parameters' "
 "  WHEN c.relreplident <> 'd' THEN 'it has a replica identity' "
-"  WHEN c.relrowsecurity OR c.relforcerowsecurity THEN 'it has row security' "
+"  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
+"       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE k.conrelid = c.oid AND k.contype = 'p' AND "
-"                 (k.conperiod OR k.condeferrable OR x.indnkeyatts <> x.indnatts OR "
+"                 (k.conperiod OR k.condeferrable OR x.indisclustered OR "
+"                  x.indnkeyatts <> x.indnatts OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
 "    THEN 'its primary key has more than columns' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
@@ -799,10 +801,16 @@ static const char *const unsupported_sql =
 "               WHERE d.adrelid = c.oid AND q.relkind = 'S') "
 "    THEN 'a default uses a sequence' "
 "  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
+"               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+"                 AND p.refobjid = c.oid AND p.deptype = 'a') "
+"    THEN 'it owns a sequence' "
+"  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
+"               JOIN pg_class qc ON qc.oid = q.seqrelid "
 "               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
 "               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
 "                 AND p.refobjid = c.oid AND p.deptype = 'i' AND a.attidentity <> '' AND "
-"                 (q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
+"                 (q.seqtypid <> a.atttypid OR qc.relpersistence <> c.relpersistence OR "
+"                  q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
@@ -875,9 +883,32 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 			   *persistence;
 
 	memset(out, 0, sizeof(*out));
-	WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text "
-			   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-			   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
+
+	/*
+	 * The name's table, locked: while waiting for the lock the name may have
+	 * come to mean another table, or none, so it is looked up again after.
+	 */
+	for (Oid locked = InvalidOid;;)
+	{
+		Oid			now;
+
+		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text "
+				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
+		now = rel.nrows == 0 ? InvalidOid : atooid(ws_sql_value(&rel, 0, 0));
+		if (now == locked)
+			break;
+		if (OidIsValid(locked))
+			UnlockRelationOid(locked, AccessShareLock);
+		locked = now;
+		if (OidIsValid(locked))
+		{
+			ws_sql_rows_free(&rel);
+			LockRelationOid(locked, AccessShareLock);
+		}
+		else
+			break;
+	}
 	if (rel.nrows == 0)
 	{
 		ws_sql_rows_free(&rel);
@@ -896,7 +927,6 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the schema of temporary table \"%s\" cannot be read yet", table)));
-	LockRelationOid(atooid(ws_sql_value(&rel, 0, 0)), AccessShareLock);
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 		WsSqlRows	why;

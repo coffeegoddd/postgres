@@ -119,8 +119,9 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * dropped since the transaction's snapshot raises
  * ERRCODE_T_R_SERIALIZATION_FAILURE.  Other objects' names (a type's, a
  * function's in a default) are printed as they are now, so a reader on an old
- * snapshot must hold those still itself.  What it gives is the caller's to
- * ws_schema_free.
+ * snapshot must hold those still itself.  A sequence a default names only by
+ * text has no dependency to see, so the record holds that default as it is.
+ * What it gives is the caller's to ws_schema_free.
  */
 extern bool ws_schema_read(const char *schema, const char *table, WsTableSchema *out);
 
