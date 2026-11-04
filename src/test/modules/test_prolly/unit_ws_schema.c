@@ -1504,6 +1504,161 @@ test_partition_injection(void)
 	}
 }
 
+/* A partition: the record, its bytes and its statement. */
+static void
+test_partition(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition = WS_PARTITION_RANGE,
+		.npartition = 1,.partition_keys = &key,.partition_of = "Odd Parent",
+	.partition_bound = "FOR VALUES FROM (1) TO (2)"};
+	static const char want[] =
+		"\x01" "\x01" "c" "\x01"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00" "\x00" "\x00"
+		"r" "\x01" "\x07" "\x00" "\x00"
+		"o" "\x0a" "Odd Parent" "\x1a" "FOR VALUES FROM (1) TO (2)";
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(strcmp(got.partition_of, "Odd Parent") == 0 && got.partition == WS_PARTITION_RANGE);
+	CHECK(strcmp(got.partition_bound, "FOR VALUES FROM (1) TO (2)") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+
+	/* (a partition that is not partitioned itself: the section alone) */
+	s.partition = WS_PARTITION_NONE;
+	s.npartition = 0;
+	s.partition_keys = NULL;
+	s.partition_bound = "DEFAULT";
+	b = (Buf) BUF_INIT;
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.partition == WS_PARTITION_NONE && strcmp(got.partition_bound, "DEFAULT") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+
+	ws_schema_attach(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data, "ALTER TABLE x.\"Odd Parent\" ATTACH PARTITION x.c DEFAULT") == 0);
+	buf_free(&sql);
+	sql = (Buf) BUF_INIT;
+	/* (the table's own statement says nothing of it) */
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strstr((char *) sql.data, "PARTITION") == NULL);
+	buf_free(&sql);
+
+	s.partition_of = NULL;
+	CHECK(problem_has(ws_schema_problem(&s), "no table or no bound"));
+	s.partition_of = "p";
+	s.partition_bound = NULL;
+	CHECK(problem_has(ws_schema_problem(&s), "no table or no bound"));
+	s.partition_bound = "";
+	CHECK(problem_has(ws_schema_problem(&s), "empty bound"));
+	s.partition_bound = "DEFAULT";
+	s.partition_of = "";
+	CHECK(problem_has(ws_schema_problem(&s), "no name"));
+	s.partition_of = "c";
+	CHECK(problem_has(ws_schema_problem(&s), "of itself"));
+}
+
+static void
+attach_injected(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition_of = "p",.partition_bound = (char *) arg};
+	Buf			b = BUF_INIT;
+
+	ws_schema_attach(&s, "x", &b);
+}
+
+static void
+attach_of_no_partition(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_attach(&s, "x", &b);
+}
+
+static void
+test_partition_refused(void)
+{
+	static const char *const bad[] = {
+		"DEFAULT; DROP TABLE x.c",
+		"DEFAULT; SELECT 1",
+		"FOR VALUES IN (1), ADD CHECK (false)",
+		"FOR VALUES IN (1) TABLESPACE x",
+		"FOR VALUES IN (1) USING heap",
+		"FOR VALUES IN (1) WITH (fillfactor = 10)",
+		"FOR VALUES IN (1) PARTITION BY HASH (a)",
+		"(a int) DEFAULT",
+		"DEFAULT CONCURRENTLY",
+		"CONCURRENTLY",
+		"FINALIZE",
+		"x",
+		"FOR VALUES IN (now())",
+		"FOR VALUES IN (pg_read_file('/etc/hostname'))",
+		"FOR VALUES IN (1 + 1)",
+		"FOR VALUES IN ((SELECT 1))",
+		"FOR VALUES IN (1::integer)",
+		"FOR VALUES IN (x.y)",
+		"FOR VALUES FROM (now()) TO (MAXVALUE)",
+		"FOR VALUES FROM (MINVALUE) TO (now())",
+		"FOR VALUES FROM (x.minvalue) TO (MAXVALUE)",
+		"FOR VALUES FROM (other) TO (MAXVALUE)",
+	};
+	static const char *const constants[] = {
+		"DEFAULT",
+		"FOR VALUES IN (NULL, -1, 1.5, 'a', true, B'101')",
+		"FOR VALUES FROM (MINVALUE, 1) TO (MAXVALUE, 'z')",
+		"FOR VALUES WITH (modulus 2, remainder 0)",
+	};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(attach_injected, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	for (int i = 0; i < lengthof(constants); i++)
+	{
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+		WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition_of = "p",.partition_bound = (char *) constants[i]};
+		Buf			b = BUF_INIT;
+
+		ws_schema_attach(&s, "x", &b);
+		buf_free(&b);
+	}
+	{
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "n",
+		.identity = WS_IDENTITY_ALWAYS,.identity_seq = "s"}};
+		WsTableSchema s = {.name = "c",.ncols = 1,.cols = cols,.partition_of = "p",.partition_bound = "DEFAULT"};
+
+		CHECK(problem_has(ws_schema_problem(&s), "which attaching gives it"));
+	}
+	expect_error(attach_of_no_partition, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+	{
+		static const char cut[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "o" "\x01" "p";
+		static const char over[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "o" "\x01" "p" "\x01" "x" "o";
+		static const char swapped[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "o" "\x01" "p" "\x01" "x" "h" "\x01" "\x07" "\x00" "\x00";
+
+		check_refused(cut, sizeof(cut) - 1, "ends early");
+		check_refused(over, sizeof(over) - 1, "left over");
+		check_refused(swapped, sizeof(swapped) - 1, "left over");
+	}
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -2126,6 +2281,8 @@ static const ProllyUnitTest tests[] = {
 	{"partitioned", test_partitioned},
 	{"partitioning_problems", test_partitioning_problems},
 	{"partition_injection", test_partition_injection},
+	{"partition", test_partition},
+	{"partition_refused", test_partition_refused},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},

@@ -17,7 +17,8 @@
  * form; a default, collation, not-null constraint's or key's name none is empty,
  * which none is if it is there.  A partitioned table goes on: its kind byte,
  * uvarint nkeys and each key (uvarint tag, 0 for an expression's, expression if
- * so, collation, opclass); any other ends there.
+ * so, collation, opclass); and a partition with 'o', its table's name and bound;
+ * any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -144,6 +145,20 @@ index_key_problem(const WsTableSchema *s, const WsIndexKey *key)
 static const char *
 partitioning_problem(const WsTableSchema *s)
 {
+	if ((s->partition_of != NULL) != (s->partition_bound != NULL))
+		return "a partition with no table or no bound";
+	if (s->partition_of != NULL)
+	{
+		if (s->partition_of[0] == '\0' || strlen(s->partition_of) >= NAMEDATALEN)
+			return "a partition of a table of no name, or too long a one";
+		if (strcmp(s->partition_of, s->name) == 0)
+			return "a partition of itself";
+		if (s->partition_bound[0] == '\0')
+			return "a partition with an empty bound";
+		for (int i = 0; i < s->ncols; i++)
+			if (s->cols[i].identity != WS_IDENTITY_NONE)
+				return "a partition with an identity, which attaching gives it";
+	}
 	if (s->partition == WS_PARTITION_NONE)
 		return s->npartition == 0 ? NULL : "partition keys with no partitioning";
 	if (s->partition != WS_PARTITION_RANGE && s->partition != WS_PARTITION_LIST &&
@@ -465,6 +480,7 @@ ws_schema_problem(const WsTableSchema *s)
 	return column_names_problem(s);
 }
 
+#define WS_PARTITION_OF 'o'
 #define CON_NULLS_NOT_DISTINCT 0x01
 #define CON_DEFERRABLE 0x02
 #define CON_INITDEFERRED 0x04
@@ -594,6 +610,12 @@ schema_encode(const WsTableSchema *s, Buf *out)
 			put_optional(out, key->collation);
 			put_optional(out, key->opclass);
 		}
+	}
+	if (s->partition_of != NULL)
+	{
+		buf_append_byte(out, WS_PARTITION_OF);
+		put_string(out, s->partition_of);
+		put_string(out, s->partition_bound);
 	}
 }
 
@@ -818,7 +840,7 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		ix->nulls_not_distinct = (flags & IDX_NULLS_NOT_DISTINCT) != 0;
 		get_index_body(&p, end, ix, false);
 	}
-	if (p != end)
+	if (p != end && *p != WS_PARTITION_OF)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -841,6 +863,12 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			key->order = WS_INDEX_ORDER_DEFAULT;
 			key->nulls = WS_INDEX_NULLS_DEFAULT;
 		}
+	}
+	if (p != end && *p == WS_PARTITION_OF)
+	{
+		p++;
+		s->partition_of = get_string(&p, end);
+		s->partition_bound = get_string(&p, end);
 	}
 	if (p != end)
 		malformed("it has bytes left over");
@@ -906,6 +934,8 @@ ws_schema_free(WsTableSchema *s)
 		px_free(s->partition_keys[k].opclass);
 	}
 	px_free(s->partition_keys);
+	px_free(s->partition_of);
+	px_free(s->partition_bound);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -1760,6 +1790,90 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 }
 
 static void
+write_attach(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	ws_put_text(out, "ALTER TABLE ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->partition_of);
+	ws_put_text(out, " ATTACH PARTITION ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, s->name);
+	ws_put_text(out, " ");
+	ws_put_text(out, s->partition_bound);
+}
+
+/*
+ * Whether a parsed bound holds nothing but constants, and so runs nothing when it
+ * is attached: the server prints no other, and a commit may have come from anywhere.
+ */
+static bool
+bound_is_constants(const PartitionBoundSpec *bound)
+{
+	ListCell   *lc;
+
+	foreach(lc, bound->listdatums)
+		if (!IsA(lfirst(lc), A_Const))
+			return false;
+	for (int side = 0; side < 2; side++)
+		foreach(lc, side == 0 ? bound->lowerdatums : bound->upperdatums)
+		{
+			Node	   *datum = lfirst(lc);
+
+			if (IsA(datum, ColumnRef))
+			{
+				List	   *fields = ((ColumnRef *) datum)->fields;
+
+				if (list_length(fields) != 1 || !IsA(linitial(fields), String) ||
+					(strcmp(strVal(linitial(fields)), "minvalue") != 0 &&
+					 strcmp(strVal(linitial(fields)), "maxvalue") != 0))
+					return false;
+			}
+			else if (!IsA(datum, A_Const))
+				return false;
+		}
+	return true;
+}
+
+/* One ALTER TABLE, of this table, attaching this partition by this bound, parsed alone. */
+static void
+check_attach_statement(const WsTableSchema *s, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	List	   *alone = parse_text(s, psprintf("CREATE TABLE t PARTITION OF p %s", s->partition_bound));
+	AlterTableStmt *stmt;
+	AlterTableCmd *cmd;
+	PartitionCmd *part;
+	CreateStmt *create;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->partition_of) != 0 || !stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
+		not_the_record(s, "another table");
+	cmd = linitial_node(AlterTableCmd, stmt->cmds);
+	if (cmd->subtype != AT_AttachPartition || !IsA(cmd->def, PartitionCmd))
+		not_the_record(s, "another change");
+	part = (PartitionCmd *) cmd->def;
+	if (part->concurrent || part->name->catalogname != NULL || part->name->schemaname == NULL ||
+		strcmp(part->name->schemaname, schema) != 0 || strcmp(part->name->relname, s->name) != 0)
+		not_the_record(s, "another partition");
+	if (list_length(alone) != 1 || !IsA(linitial_node(RawStmt, alone)->stmt, CreateStmt))
+		not_the_record(s, "a bound that is no bound");
+	create = (CreateStmt *) linitial_node(RawStmt, alone)->stmt;
+	if (create->partbound == NULL || create->partspec != NULL || create->tableElts != NIL ||
+		create->options != NIL || create->tablespacename != NULL || create->accessMethod != NULL ||
+		create->oncommit != ONCOMMIT_NOOP || !equal(create->partbound, part->bound))
+		not_the_record(s, "a bound that is no bound");
+	if (!bound_is_constants(create->partbound))
+		not_the_record(s, "a bound of more than constants");
+}
+
+static void
 index_in_server_encoding(const WsIndex *ix, WsIndex *here)
 {
 	*here = *ix;
@@ -1853,6 +1967,8 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 		here.partition_keys[k].collation = from_utf8(s->partition_keys[k].collation);
 		here.partition_keys[k].opclass = from_utf8(s->partition_keys[k].opclass);
 	}
+	here.partition_of = ws_name_from_utf8(s->partition_of);
+	here.partition_bound = from_utf8(s->partition_bound);
 	*here_out = here;
 }
 
@@ -1911,6 +2027,25 @@ ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	buf_free(&sql);
 }
 
+void
+ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (s->partition_of == NULL)
+		elog(ERROR, "table \"%s\" is no partition", s->name);
+	schema_in_server_encoding(s, &here);
+	write_attach(&here, schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_attach_statement(&here, schema, (char *) sql.data);
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
 static char *
 to_utf8(const char *text)
 {
@@ -1944,11 +2079,48 @@ static const char *const unsupported_sql =
 "    AND p.refclassid = 'pg_class'::regclass AND p.refobjid = $1::oid AND p.deptype = 'i' "
 "    AND p.refobjsubid > 0) "
 "SELECT CASE "
-"  WHEN c.relispartition THEN 'it is a partition' "
-"  WHEN c.relkind = 'p' AND EXISTS (SELECT FROM pg_inherits i WHERE i.inhparent = c.oid) "
-"    THEN 'it has partitions' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+"               WHERE c.relispartition AND i.inhrelid = c.oid AND "
+"                 (q.relnamespace <> c.relnamespace OR i.inhdetachpending)) "
+"    THEN 'it is a partition being detached, or of a table in another schema' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_attribute pa ON pa.attrelid = i.inhparent "
+"               JOIN pg_attribute ca ON ca.attrelid = c.oid AND ca.attname = pa.attname "
+"               WHERE c.relispartition AND i.inhrelid = c.oid AND pa.attnum > 0 "
+"                 AND NOT pa.attisdropped AND NOT ca.attisdropped AND pa.attidentity <> ca.attidentity) "
+"    THEN 'its identity is not that of its partitioned table' "
+"  WHEN c.relispartition AND EXISTS (SELECT FROM pg_index x JOIN pg_class xc ON xc.oid = x.indexrelid "
+"               JOIN pg_index y ON y.indrelid = x.indrelid AND y.indexrelid > x.indexrelid "
+"               JOIN pg_class yc ON yc.oid = y.indexrelid "
+"               LEFT JOIN pg_inherits xp ON xp.inhrelid = x.indexrelid "
+"               LEFT JOIN pg_inherits yp ON yp.inhrelid = y.indexrelid "
+"               WHERE x.indrelid = c.oid AND xc.relam = yc.relam AND x.indisunique = y.indisunique "
+"                 AND (xp.inhparent IS NOT NULL OR yp.inhparent IS NOT NULL) "
+"                 AND NOT (yp.inhparent IS NULL AND "
+"                   EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = xp.inhparent AND k.contype IN ('p', 'u', 'x')) AND "
+"                   NOT EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = y.indexrelid AND k.contype IN ('p', 'u', 'x'))) "
+"                 AND NOT (xp.inhparent IS NULL AND "
+"                   EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = yp.inhparent AND k.contype IN ('p', 'u', 'x')) AND "
+"                   NOT EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.contype IN ('p', 'u', 'x'))) "
+"                 AND x.indnullsnotdistinct = y.indnullsnotdistinct AND x.indnatts = y.indnatts "
+"                 AND x.indnkeyatts = y.indnkeyatts AND x.indkey::text = y.indkey::text "
+"                 AND x.indcollation::text = y.indcollation::text "
+"                 AND (SELECT k.conexclop FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.contype = 'x') "
+"                   IS NOT DISTINCT FROM "
+"                     (SELECT k.conexclop FROM pg_constraint k WHERE k.conindid = y.indexrelid AND k.contype = 'x') "
+"                 AND pg_get_expr(x.indexprs, x.indrelid) IS NOT DISTINCT FROM pg_get_expr(y.indexprs, y.indrelid) "
+"                 AND pg_get_expr(x.indpred, x.indrelid) IS NOT DISTINCT FROM pg_get_expr(y.indpred, y.indrelid) "
+"                 AND (SELECT array_agg(o.opcfamily ORDER BY n.ord) FROM unnest(x.indclass::oid[]) "
+"                      WITH ORDINALITY n(oc, ord) JOIN pg_opclass o ON o.oid = n.oc) = "
+"                     (SELECT array_agg(o.opcfamily ORDER BY n.ord) FROM unnest(y.indclass::oid[]) "
+"                      WITH ORDINALITY n(oc, ord) JOIN pg_opclass o ON o.oid = n.oc)) "
+"    THEN 'it has two indexes attaching could take one for the other' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhrelid "
+"               WHERE c.relkind = 'p' AND i.inhparent = c.oid AND "
+"                 (q.relnamespace <> c.relnamespace OR q.relkind NOT IN ('r', 'p') OR i.inhdetachpending)) "
+"    THEN 'it has a partition being detached, in another schema, or not a table' "
 "  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
-"  WHEN EXISTS (SELECT FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) "
+"  WHEN EXISTS (SELECT FROM pg_inherits i WHERE (i.inhrelid = c.oid AND NOT c.relispartition) "
+"               OR (i.inhparent = c.oid AND c.relkind <> 'p')) "
 "    THEN 'it has inheritance' "
 "  WHEN am.amname <> 'heap' OR (c.relkind = 'p' AND c.relam <> 0) "
 "    THEN 'it has another access method' "
@@ -2026,7 +2198,7 @@ static const char *const unsupported_sql =
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
-"  WHEN EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attidentity <> '' "
+"  WHEN NOT c.relispartition AND EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attidentity <> '' "
 "               AND NOT a.attisdropped AND NOT EXISTS (SELECT FROM pg_depend p "
 "                 JOIN pg_class q ON q.oid = p.objid WHERE p.classid = 'pg_class'::regclass "
 "                 AND p.refclassid = 'pg_class'::regclass AND p.refobjid = c.oid "
@@ -2403,7 +2575,10 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		Oid			now;
 
-		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text "
+		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text, "
+				   "  c.relispartition::text, pg_get_expr(c.relpartbound, c.oid), "
+				   "  (SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+				   "    WHERE c.relispartition AND i.inhrelid = c.oid) "
 				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
 		now = rel.nrows == 0 ? InvalidOid : atooid(ws_sql_value(&rel, 0, 0));
@@ -2526,7 +2701,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				elog(ERROR, "column \"%s\" of table \"%s\" is not null by no constraint", rc.names[i], table);
 			c->not_null = ws_name_to_utf8(ws_sql_value(&cols, i, 9));
 		}
-		c->identity = identity[0];
+		/* (a partition's is its table's, which attaching gives it) */
+		c->identity = ws_sql_value(&rel, 0, 4)[0] == 't' ? WS_IDENTITY_NONE : identity[0];
 		if (c->identity != WS_IDENTITY_NONE)
 		{
 			if (ws_sql_value(&cols, i, 10) == NULL)
@@ -2628,6 +2804,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
+	if (ws_sql_value(&rel, 0, 4)[0] == 't')
+	{
+		if (ws_sql_value(&rel, 0, 5) == NULL || ws_sql_value(&rel, 0, 6) == NULL)
+			elog(ERROR, "partition \"%s\" has no bound, or no table", table);
+		out->partition_of = ws_name_to_utf8(ws_sql_value(&rel, 0, 6));
+		out->partition_bound = to_utf8(ws_sql_value(&rel, 0, 5));
+	}
 	pfree(rc.names);
 	pfree(rc.tags);
 	ws_sql_rows_free(&rel);

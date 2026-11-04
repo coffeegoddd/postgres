@@ -123,6 +123,8 @@ typedef struct WsTableSchema
 	char		partition;		/* WS_PARTITION_*: how its partitions divide its rows */
 	int			npartition;
 	WsIndexKey *partition_keys; /* a column or expression, its collation and opclass */
+	char	   *partition_of;	/* the partitioned table it is one of, in its schema, or NULL */
+	char	   *partition_bound;	/* its FOR VALUES or DEFAULT, of constants, as the server prints it */
 } WsTableSchema;
 
 /*
@@ -144,7 +146,8 @@ typedef struct WsTableSchema
  * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique;
  * a known way to partition with keys, one if by list, no more than a partition
  * key can have otherwise, none if not partitioned, each key as an index's with no
- * order or operator.  NULL if it is so, or what is wrong.
+ * order or operator; a partition with its bound, and of another table.  NULL if
+ * it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -188,13 +191,16 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * refuses the table here too): false if the schema
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
- * What the record cannot yet hold and would lose (inheritance, partitions and a
- * partitioned table with any, storage settings, a key's options, a sequence's, a
- * default using one,
+ * What the record cannot yet hold and would lose (inheritance, a partition or
+ * partitioned table across schemas, storage settings, a key's options, a
+ * sequence's, a default using one, a partition detached, of another identity
+ * than its table's or with two indexes attaching could take for one another
+ * (a parent's constraint takes only a constraint's index: that one is not),
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
- * ERRCODE_NAME_TOO_LONG.  The table's owner is not held, and is whoever makes
+ * ERRCODE_NAME_TOO_LONG.  A partition's identity is its table's, and not held
+ * in its own record.  The table's owner is not held, and is whoever makes
  * it.  Triggers, rules and the like are objects of their own, not their table's.
  *
  * It locks the table till the transaction ends, and a column renamed, retyped or
@@ -243,9 +249,22 @@ extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *sc
 /*
  * The ALTER TABLE adding the table's nth constraint, a check not valid, in the
  * named schema, appended to out, to run after the table's rows: on any earlier,
- * the rows it lets stand would be refused.  Checked as the table's statement is.
+ * the rows it lets stand would be refused.  A partition's are added before its
+ * table's, which then finds them, and is refused otherwise as one already there.
+ * Checked as the table's statement is.
  */
 extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE attaching a partition to its partitioned table, in the named
+ * schema, appended to out, to run once both are made, with their indexes, and
+ * after that table is attached to its own, if it is a partition too: attaching
+ * gives a partition its table's identity, and does not pass it further down.  The
+ * index of the partition's alike one of the table's becomes its partition, under
+ * the name it has.  Checked as the table's statement is, and a bound must hold
+ * nothing but constants.
+ */
+extern void ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out);
 
 /*
  * A name as a commit holds it, raising ERRCODE_NAME_TOO_LONG past a commit's

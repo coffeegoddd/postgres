@@ -74,7 +74,8 @@ extern PGDLLIMPORT const WsFkCodecRoutine *WsFkCodec;
 extern void ws_fk_free(WsForeignKey *fk);
 
 /*
- * A table's foreign keys, from the catalogs, through WsSql, by name in UTF8's
+ * A table's foreign keys, but those it has as its partitioned table's, which
+ * adding that table's makes again, from the catalogs, through WsSql, by name in UTF8's
  * order, in *out, palloc'd, each the caller's to ws_fk_free.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED as ws_fk_refuse does, and if the table is in no
  * versioned schema.
@@ -84,7 +85,9 @@ extern void ws_fk_read(const char *schema, const char *table, WsForeignKey **out
 /*
  * Raises ERRCODE_FEATURE_NOT_SUPPORTED if a table (its object id as text, in a
  * WsSql scope) has a key no commit can hold or the record cannot yet: to a table
- * outside its schema, not enforced, over a period, from a partitioned table's,
+ * outside its schema, not enforced, over a period, named or validated otherwise
+ * than the partitioned table's it comes from, so long a name that the numbered
+ * rows it has for a partitioned table could take another key's,
  * with its triggers disabled or commented on, or that more than one unique index
  * could serve.
  */
@@ -99,6 +102,11 @@ extern void ws_fk_list(ProllyCtx *ctx, const PHash *map, WsForeignKey **out, int
 /*
  * The ALTER TABLE adding a key, in the named schema, to a table and from a
  * table whose records are these, appended to out, in the server's encoding.  A
+ * table's are added last name first: a key to a partitioned table has a row for
+ * each of its partitions on the key's own table, named after it with a number,
+ * which a name later in order may have, and a table's before its partitions'.
+ * (Measured in UTF8's bytes, as a commit is: a key with such rows and a name near
+ * the limit, and another of that name cut short and numbered, are refused.)  A
  * column neither has raises ERRCODE_DATA_CORRUPTED, as does anything of the
  * statement, parsed whole, but this one key on this one table.
  */

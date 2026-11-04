@@ -25,6 +25,7 @@
 
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
+PG_FUNCTION_INFO_V1(test_ws_schema_attach);
 PG_FUNCTION_INFO_V1(test_ws_schema_add_checks);
 PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
@@ -113,8 +114,8 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 
 /*
  * test_ws_schema_add_checks(bytes bytea, schema text) returns text: the checks
- * not valid of a schema's bytes added to its table in the schema, as after its
- * rows; the statements that added them, a line each
+ * not valid of a schema's bytes added to its table in the schema, its rows and
+ * any partitions' such checks already there; the statements, a line each
  */
 Datum
 test_ws_schema_add_checks(PG_FUNCTION_ARGS)
@@ -144,6 +145,40 @@ test_ws_schema_add_checks(PG_FUNCTION_ARGS)
 	WsSql->end(level);
 	ws_schema_free(&s);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_schema_attach(bytes bytea, schema text) returns text: a partition of
+ * a schema's bytes attached to its table in the schema; the statement, or NULL
+ * if it is none
+ */
+Datum
+test_ws_schema_attach(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+	WsSqlRows	rows;
+	Buf			sql = BUF_INIT;
+	int			level;
+	text	   *out;
+
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	if (s.partition_of == NULL)
+	{
+		ws_schema_free(&s);
+		PG_RETURN_NULL();
+	}
+	level = WsSql->begin();
+	ws_schema_attach(&s, schema, &sql);
+	buf_append_byte(&sql, 0);
+	WsSql->run((char *) sql.data, 0, NULL, &rows);
+	ws_sql_rows_free(&rows);
+	WsSql->end(level);
+	out = cstring_to_text((char *) sql.data);
+	ws_schema_free(&s);
+	buf_free(&sql);
+	PG_RETURN_TEXT_P(out);
 }
 
 /*
@@ -199,7 +234,7 @@ test_ws_fk_copy(PG_FUNCTION_ARGS)
 
 	initStringInfo(&out);
 	ws_fk_read(from, table, &fks, &n);
-	for (int i = 0; i < n; i++)
+	for (int i = n - 1; i >= 0; i--)
 	{
 		Buf			k = BUF_INIT;
 		Buf			v = BUF_INIT;

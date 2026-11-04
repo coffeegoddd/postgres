@@ -288,13 +288,27 @@ static const char *const refusal_sql =
 "  WHEN p.relnamespace <> c.relnamespace "
 "    THEN 'is to a table outside its schema, which no commit can hold' "
 "  WHEN NOT k.conenforced OR k.conperiod THEN 'cannot be read yet: not enforced, or over a period' "
-"  WHEN k.conparentid <> 0 THEN 'cannot be read yet: it comes from its partitioned table''s' "
+"  WHEN k.conparentid <> 0 AND EXISTS (SELECT FROM pg_constraint u WHERE u.oid = k.conparentid "
+"                                       AND u.conrelid <> k.conrelid AND u.conname <> k.conname) "
+"    THEN 'cannot be read yet: it is named otherwise than its partitioned table''s' "
+"  WHEN k.conparentid <> 0 AND EXISTS (SELECT FROM pg_constraint u WHERE u.oid = k.conparentid "
+"                                       AND u.conrelid <> k.conrelid AND u.convalidated <> k.convalidated) "
+"    THEN 'cannot be read yet: it is validated otherwise than its partitioned table''s' "
 "  WHEN EXISTS (SELECT FROM pg_trigger t WHERE t.tgconstraint = k.oid AND t.tgenabled <> 'O') "
 "    THEN 'cannot be read yet: its triggers are disabled' "
 "  WHEN EXISTS (SELECT FROM pg_trigger t JOIN pg_description d ON d.objoid = t.oid "
 "               AND d.classoid = 'pg_trigger'::regclass WHERE t.tgconstraint = k.oid) "
 "    THEN 'cannot be read yet: its triggers have comments' "
-"  WHEN (SELECT count(*) FROM pg_index x WHERE x.indrelid = k.confrelid AND x.indisunique "
+"  WHEN k.conparentid = 0 AND p.relkind = 'p' AND EXISTS (SELECT FROM pg_constraint o "
+"               WHERE o.conrelid = k.conrelid AND o.contype = 'f' AND o.conparentid = 0 AND o.oid <> k.oid "
+"                 AND o.conname::text ~ '_[0-9]+$' "
+"                 AND starts_with(k.conname::text, regexp_replace(o.conname::text, '_[0-9]+$', '')) "
+"                 AND k.conname <> o.conname "
+"                 AND octet_length(convert_to(o.conname::text, 'UTF8')) >= 60 "
+"                 AND octet_length(convert_to(k.conname::text, 'UTF8')) + octet_length(o.conname::text) "
+"                     - octet_length(regexp_replace(o.conname::text, '_[0-9]+$', '')) >= 64) "
+"    THEN 'cannot be read yet: the numbered rows of so long a name could take another key''s' "
+"  WHEN k.conparentid = 0 AND (SELECT count(*) FROM pg_index x WHERE x.indrelid = k.confrelid AND x.indisunique "
 "        AND x.indisvalid AND x.indimmediate AND x.indpred IS NULL AND x.indexprs IS NULL "
 "        AND x.indnkeyatts = cardinality(k.confkey) AND "
 "          (SELECT array_agg(a ORDER BY a) FROM unnest((x.indkey::int2[])[0:x.indnkeyatts - 1]) a) = "
@@ -350,7 +364,7 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 			   "FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
 			   "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
 			   "JOIN pg_class p ON p.oid = k.confrelid "
-			   "WHERE ns.nspname = $1 AND c.relname = $2 AND k.contype = 'f'",
+			   "WHERE ns.nspname = $1 AND c.relname = $2 AND k.contype = 'f' AND k.conparentid = 0",
 			   2, params, &rows);
 	*n = rows.nrows;
 	*out = palloc0_array(WsForeignKey, Max(rows.nrows, 1));
