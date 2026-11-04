@@ -20,6 +20,7 @@ OBJS = \
 	unit_engine_vc.o \
 	unit_engine_window.o \
 	unit_ws_fk.o \
+	unit_ws_role.o \
 	unit_ws_root.o \
 	unit_ws_row.o \
 	unit_ws_schema.o \
