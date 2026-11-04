@@ -45,21 +45,6 @@ typedef struct WsColumn
 	char	   *collation;		/* qualified and quoted, or NULL: the type's */
 } WsColumn;
 
-#define WS_CONSTRAINT_CHECK 'c'
-#define WS_CONSTRAINT_UNIQUE 'u'
-
-typedef struct WsConstraint
-{
-	char	   *name;
-	char		kind;			/* WS_CONSTRAINT_* */
-	char	   *expr;			/* a check's expression, as stored */
-	int			ncols;
-	uint64	   *cols;			/* a unique constraint's tags */
-	bool		nulls_not_distinct;
-	bool		deferrable;
-	bool		initdeferred;
-} WsConstraint;
-
 #define WS_INDEX_ORDER_DEFAULT 'd'
 #define WS_INDEX_ORDER_DESC 'D'
 /* (the default's the other: first if descending, else last) */
@@ -76,9 +61,14 @@ typedef struct WsIndexKey
 	char	   *opclass;		/* quoted, qualified if not visible, or NULL: the default */
 	char		order;			/* WS_INDEX_ORDER_* */
 	char		nulls;			/* WS_INDEX_NULLS_* */
+	char	   *op;				/* an exclusion's operator, qualified if not visible, or NULL */
 } WsIndexKey;
 
-/* An index no constraint has: a statement of its own, after the table's. */
+/*
+ * An index no constraint has: a statement of its own, after the table's.  An
+ * exclusion constraint's too, with no name but the constraint's, and each key
+ * with its operator.
+ */
 typedef struct WsIndex
 {
 	char	   *name;
@@ -91,6 +81,23 @@ typedef struct WsIndex
 	uint64	   *include;		/* INCLUDE's tags */
 	char	   *predicate;		/* as stored, or NULL: not partial */
 } WsIndex;
+
+#define WS_CONSTRAINT_CHECK 'c'
+#define WS_CONSTRAINT_UNIQUE 'u'
+#define WS_CONSTRAINT_EXCLUSION 'x'
+
+typedef struct WsConstraint
+{
+	char	   *name;
+	char		kind;			/* WS_CONSTRAINT_* */
+	char	   *expr;			/* a check's expression, as stored */
+	int			ncols;
+	uint64	   *cols;			/* a unique constraint's tags */
+	bool		nulls_not_distinct;
+	bool		deferrable;
+	bool		initdeferred;
+	WsIndex		excl;			/* an exclusion's index */
+} WsConstraint;
 
 typedef struct WsTableSchema
 {
@@ -114,11 +121,13 @@ typedef struct WsTableSchema
  * formed, a key named if it has columns, its columns its own, stored, not
  * null and distinct; other constraints in order by name, none named as another
  * or as the key, a check with its expression and nothing else, a unique one
- * with its columns, its own, stored and distinct, initially deferred only if
- * deferrable; indexes in order by name, none named as a unique constraint or the key,
- * with a method and keys, each a column of its own or an expression, not both,
- * INCLUDE's columns its own, an order of nulls only if it is not the default,
- * and NULLS NOT DISTINCT only if unique.  NULL if it is so, or what is wrong.
+ * with its columns, its own, stored and distinct, an exclusion with an unnamed
+ * index and each key an operator, none alike another, initially deferred only
+ * if deferrable; indexes in order by name, none named as a constraint with an
+ * index or the key, with a method and keys, each a column of its own or an
+ * expression, not both, and no operator, INCLUDE's columns its own, an order of
+ * nulls only if it is not the default, and NULLS NOT DISTINCT only if unique.
+ * NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -164,8 +173,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance and partitions,
  * storage settings, a key's options, a sequence's, a default using one,
- * exclusion constraints, an index's options or its dependence on an
- * extension, comments, grants)
+ * an index's options or its dependence on an extension, comments, grants, two
+ * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
  * sequence's are not held, and are made again, and neither is the table's owner,

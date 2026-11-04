@@ -1089,7 +1089,7 @@ test_index_problems(void)
 		{"no method", {.name = "x"}, OK_KEY},
 		{"too long", {.name = "1234567890123456789012345678901234567890123456789012345678901234",
 		.method = "btree"}, OK_KEY},
-		{"named as a unique constraint", {.name = "c",.method = "btree"}, OK_KEY},
+		{"named as a constraint with an index", {.name = "c",.method = "btree"}, OK_KEY},
 		{"does not have", {.name = "x",.method = "btree",.predicate = "(@{9} > 0)"}, OK_KEY},
 		{"malformed", {.name = "x",.method = "btree",.predicate = "@"}, OK_KEY},
 		{"no known order", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'a',.nulls = 'd'}},
@@ -1281,6 +1281,247 @@ test_index_injection(void)
 	}
 }
 
+/* An exclusion constraint: the record, its bytes and its statement. */
+static void
+test_exclusions(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "int4range",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	keys[] = {
+		{.tag = 7,.order = 'd',.nulls = 'd',.op = "&&"},
+		{.expr = "(@{8} + 1)",.collation = "\"C\"",.opclass = "o.c",.order = 'D',.nulls = 'l',.op = "o.==="},
+	};
+	uint64		include[] = {8};
+	WsConstraint con = {.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,.deferrable = true,.initdeferred = true,
+		.excl = {.method = "gist",.nkeys = 2,.keys = keys,.ninclude = 1,.include = include,
+	.predicate = "(@{8} > 0)"}};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 1,.constraints = &con};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x02"
+		"\x07" "\x01" "a" "\x09" "int4range" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x08" "\x01" "b" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"			/* no key */
+		"\x01"					/* constraints */
+		"\x01" "x" "x" "\x06" "\x04" "gist" "\x02"
+		"\x07" "\x00" "\x00" "d" "d" "\x02" "&&"
+		"\x00" "\x0a" "(@{8} + 1)" "\x03" "\"C\"" "\x03" "o.c" "D" "l" "\x05" "o.==="
+		"\x01" "\x08" "\x0a" "(@{8} > 0)"
+		"\x00";					/* indexes */
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.constraints[0].kind == WS_CONSTRAINT_EXCLUSION);
+	CHECK(strcmp(got.constraints[0].excl.keys[1].op, "o.===") == 0);
+	CHECK(strcmp(got.constraints[0].excl.predicate, "(@{8} > 0)") == 0);
+	CHECK(got.constraints[0].excl.include[0] == 8 && got.constraints[0].initdeferred);
+	ws_schema_free(&got);
+
+	ws_schema_create_table(&s, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data,
+				 "CREATE TABLE x.t (\n"
+				 "    a int4range,\n"
+				 "    b integer,\n"
+				 "    CONSTRAINT x EXCLUDE USING gist (a WITH OPERATOR(&&), ((b + 1)) COLLATE \"C\" o.c DESC NULLS LAST WITH OPERATOR(o.===))"
+				 " INCLUDE (b) WHERE ((b > 0)) DEFERRABLE INITIALLY DEFERRED\n"
+				 ")") == 0);
+	buf_free(&sql);
+	buf_free(&b);
+}
+
+static const char *
+exclusion_problem(const WsIndexKey *key, const char *method, const char *predicate,
+				  const WsConstraint *extra)
+{
+	static WsColumn cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint cons[2] = {{.name = "a",.kind = WS_CONSTRAINT_EXCLUSION,
+			.excl = {.method = (char *) method,.nkeys = 1,.keys = (WsIndexKey *) key,
+	.predicate = (char *) predicate}}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = extra ? 2 : 1,.constraints = cons};
+
+	if (extra)
+		cons[1] = *extra;
+	return ws_schema_problem(&s);
+}
+
+static void
+test_exclusion_problems(void)
+{
+	WsIndexKey	ok = {.tag = 7,.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	noop = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsIndexKey	emptyop = {.tag = 7,.order = 'd',.nulls = 'd',.op = ""};
+	WsIndexKey	nocol = {.tag = 9,.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	badexpr = {.expr = "@{9}",.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	both = {.tag = 7,.expr = "1",.order = 'd',.nulls = 'd',.op = "="};
+	WsConstraint alike = {.name = "b",.kind = WS_CONSTRAINT_EXCLUSION,
+	.excl = {.method = "gist",.nkeys = 1,.keys = &ok}};
+	WsConstraint other = alike;
+
+	CHECK(exclusion_problem(&ok, "gist", NULL, NULL) == NULL);
+	CHECK(strstr(exclusion_problem(&noop, "gist", NULL, NULL), "no operator") != NULL);
+	CHECK(strstr(exclusion_problem(&emptyop, "gist", NULL, NULL), "no operator") != NULL);
+	CHECK(strstr(exclusion_problem(&nocol, "gist", NULL, NULL), "does not have") != NULL);
+	CHECK(strstr(exclusion_problem(&badexpr, "gist", NULL, NULL), "does not have") != NULL);
+	CHECK(strstr(exclusion_problem(&both, "gist", NULL, NULL), "or both") != NULL);
+	CHECK(strstr(exclusion_problem(&ok, NULL, NULL, NULL), "no method") != NULL);
+	CHECK(strstr(exclusion_problem(&ok, "gist", "@", NULL), "malformed") != NULL);
+	CHECK(strstr(exclusion_problem(&ok, "gist", NULL, &alike), "alike") != NULL);
+	/* (each difference is another index) */
+	other.deferrable = true;
+	CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	other = alike;
+	other.excl.method = "btree";
+	CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	other = alike;
+	other.excl.predicate = "true";
+	CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	{
+		WsIndexKey	op2 = {.tag = 7,.order = 'd',.nulls = 'd',.op = "<>"};
+
+		other = alike;
+		other.excl.keys = &op2;
+		CHECK(exclusion_problem(&ok, "gist", NULL, &other) == NULL);
+	}
+	{
+		/* an exclusion's fields elsewhere, and elsewhere's on an exclusion */
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+		uint64		a[] = {7};
+		WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true",.excl = {.method = "gist"}};
+		WsIndexKey	idxkey = {.tag = 7,.order = 'd',.nulls = 'd'};
+		WsIndex		ix = {.name = "c",.method = "btree",.nkeys = 1,.keys = &idxkey};
+		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+
+		CHECK(strstr(ws_schema_problem(&s), "an exclusion's fields") != NULL);
+		con = (WsConstraint) {.name = "c",.kind = WS_CONSTRAINT_EXCLUSION,.ncols = 1,.cols = a,
+		.excl = {.method = "gist",.nkeys = 1,.keys = &ok}};
+		CHECK(strstr(ws_schema_problem(&s), "another constraint's fields") != NULL);
+		con.ncols = 0;
+		con.cols = NULL;
+		con.excl.unique = true;
+		CHECK(strstr(ws_schema_problem(&s), "or unique") != NULL);
+		con.excl.unique = false;
+		con.excl.name = "c";
+		CHECK(strstr(ws_schema_problem(&s), "or unique") != NULL);
+		con.excl.name = NULL;
+		CHECK(ws_schema_problem(&s) == NULL);
+		/* (an index of the exclusion's name, and an operator on a plain index) */
+		s.nindexes = 1;
+		s.indexes = &ix;
+		CHECK(strstr(ws_schema_problem(&s), "named as a constraint") != NULL);
+		ix.name = "i";
+		CHECK(ws_schema_problem(&s) == NULL);
+		idxkey.op = "=";
+		CHECK(strstr(ws_schema_problem(&s), "with an operator") != NULL);
+	}
+}
+
+typedef struct ExclusionAttack
+{
+	const char *op;
+	const char *expr;
+	const char *predicate;
+	const char *opclass;
+} ExclusionAttack;
+
+static void
+exclusion_injected(void *arg)
+{
+	const ExclusionAttack *in = arg;
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	key = {.tag = in->expr ? 0 : 7,.expr = (char *) in->expr,.opclass = (char *) in->opclass,
+		.order = 'd',.nulls = 'd',.op = (char *) (in->op ? in->op : "=")};
+	WsConstraint con = {.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,
+		.excl = {.method = "gist",.nkeys = 1,.keys = &key,
+	.predicate = (char *) in->predicate}};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* A comment in one key's expression and a newline in the next's, as for an index. */
+static void
+exclusion_spanned(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	keys[] = {
+		{.expr = "1) --",.order = 'd',.nulls = 'd',.op = "="},
+		{.expr = (char *) arg,.order = 'd',.nulls = 'd',.op = "="},
+	};
+	WsConstraint con = {.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,
+	.excl = {.method = "gist",.nkeys = 2,.keys = keys}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
+/* Text differing where the grammar does not: CREATE TABLE would keep one. */
+static void
+exclusions_parse_alike(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsIndexKey	key1 = {.expr = "@{7}",.order = 'd',.nulls = 'd',.op = "="};
+	WsIndexKey	key2 = {.expr = " @{7}",.order = 'd',.nulls = 'd',.op = "="};
+	WsConstraint cons[] = {
+		{.name = "x",.kind = WS_CONSTRAINT_EXCLUSION,.excl = {.method = "gist",.nkeys = 1,.keys = &key1}},
+		{.name = "y",.kind = WS_CONSTRAINT_EXCLUSION,.excl = {.method = "gist",.nkeys = 1,.keys = &key2}},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 2,.constraints = cons};
+	Buf			b = BUF_INIT;
+
+	CHECK(ws_schema_problem(&s) == NULL);
+	ws_schema_create_table(&s, "x", &b);
+}
+
+static void
+test_exclusion_injection(void)
+{
+	static const ExclusionAttack bad[] = {
+		{.op = "= ) WHERE (true) --"},
+		{.op = "=) WHERE (true"},
+		{.op = "=), b WITH OPERATOR(="},
+		{.op = "= /* */"},
+		{.op = "=/*"},
+		{.op = " ="},
+		{.op = "= "},
+		{.op = "pg_catalog . ="},
+		{.op = "\"pg_catalog\".="},
+		{.op = "PG_CATALOG.="},
+		{.op = "12345678901234567890123456789012345678901234567890123456789012345678.="},
+		{.op = "x"},
+		{.expr = "1) WITH OPERATOR(=), (2"},
+		{.expr = "1)) INCLUDE (a) --"},
+		{.predicate = "true) DEFERRABLE --"},
+		{.predicate = "true) DEFERRABLE INITIALLY DEFERRED --"},
+		{.opclass = "o.c WITH OPERATOR(=), a"},
+	};
+	static const char *const spanning[] = {
+		"2 /*\n, ((2)) WITH OPERATOR(=)) INCLUDE (a) -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) WITH (fillfactor = 10) -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) USING INDEX TABLESPACE x -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) WHERE (true) -- */",
+		"2 /*\n, ((2)) WITH OPERATOR(=)) DEFERRABLE -- */",
+	};
+
+	for (int i = 0; i < lengthof(bad); i++)
+		expect_error(exclusion_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(exclusions_parse_alike, NULL, ERRCODE_DATA_CORRUPTED, NULL);
+
+	for (int i = 0; i < lengthof(spanning); i++)
+		expect_error(exclusion_spanned, (void *) spanning[i], ERRCODE_DATA_CORRUPTED, NULL);
+}
+
 /* An expression's references take the names the record has now. */
 static void
 test_create_table_renamed(void)
@@ -1429,6 +1670,9 @@ static const ProllyUnitTest tests[] = {
 	{"indexes", test_indexes},
 	{"index_problems", test_index_problems},
 	{"index_injection", test_index_injection},
+	{"exclusions", test_exclusions},
+	{"exclusion_problems", test_exclusion_problems},
+	{"exclusion_injection", test_exclusion_injection},
 	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},

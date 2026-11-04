@@ -113,6 +113,30 @@ $node->safe_psql('postgres', q{
 	CREATE TYPE public."integer" AS ENUM ('z');
 	CREATE TABLE src.names (a other.cdom, b other.cdom COLLATE "POSIX", c text[] COLLATE "C",
 		d text COLLATE other."My Coll", e public."integer", f integer, g other.cdom COLLATE "default");
+	CREATE OPERATOR other.=== (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4eq,
+		COMMUTATOR = OPERATOR(other.===));
+	CREATE OPERATOR CLASS other."My Ops" FOR TYPE integer USING btree AS
+		OPERATOR 3 other.===, FUNCTION 1 btint4cmp(integer, integer);
+	CREATE TABLE src.excl (r int4range, a integer, b text, "Odd" int4range,
+		CONSTRAINT excl_plain EXCLUDE USING gist (r WITH &&),
+		CONSTRAINT "Odd Excl" EXCLUDE USING gist ("Odd" WITH &&, r WITH -|-),
+		CONSTRAINT excl_inc EXCLUDE USING gist (r WITH &&) INCLUDE (a, b),
+		CONSTRAINT excl_part EXCLUDE USING gist (r WITH &&) WHERE (a > 0 AND b <> '@a'),
+		CONSTRAINT excl_later EXCLUDE USING gist ("Odd" WITH &&) DEFERRABLE INITIALLY DEFERRED,
+		CONSTRAINT excl_soon EXCLUDE USING gist ("Odd" WITH &&) DEFERRABLE,
+		CONSTRAINT excl_expr EXCLUDE USING gist (int4range(a, a + 1) WITH &&, (r) WITH &&),
+		CONSTRAINT excl_btree EXCLUDE (a WITH =),
+		CONSTRAINT excl_hash EXCLUDE USING hash (a WITH =),
+		CONSTRAINT excl_keys EXCLUDE USING btree (b COLLATE "POSIX" text_pattern_ops DESC NULLS LAST WITH =,
+			a WITH =),
+		CONSTRAINT excl_other EXCLUDE USING btree (a other."My Ops" WITH OPERATOR(other.===)));
+	CREATE TABLE src.excl_ren (a int4range, b integer,
+		CONSTRAINT excl_ren_x EXCLUDE USING gist (a WITH &&, int4range(b, b + 1) WITH &&) INCLUDE (b)
+			WHERE (b > 0));
+	ALTER TABLE src.excl_ren RENAME a TO y;
+	ALTER TABLE src.excl_ren RENAME b TO z;
+	CREATE TABLE src.excl_key (id integer PRIMARY KEY, a integer UNIQUE, CONSTRAINT excl_key_x EXCLUDE (a WITH =));
+	CREATE INDEX excl_key_i ON src.excl_key (a);
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -123,7 +147,8 @@ $node->safe_psql('postgres', q{
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
 	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key',
-	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_defp', 'fk_defc', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats');
+	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_defp', 'fk_defc', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats',
+	'excl', 'excl_ren', 'excl_key');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -202,10 +227,36 @@ $node->safe_psql('postgres', q{
 });
 my $tsdir = PostgreSQL::Test::Utils::tempdir();
 $node->safe_psql('postgres', "CREATE TABLESPACE t86 LOCATION '$tsdir'");
+
+# an exclusion made again is the one it was, and holds
+for my $table ('excl', 'excl_ren', 'excl_key')
+{
+	my $defs = q{SELECT string_agg(conname || ': ' || pg_get_constraintdef(oid), E'\n' ORDER BY conname)
+		FROM pg_constraint WHERE contype = 'x' AND conrelid = '%s.%s'::regclass};
+	my $want = $node->safe_psql('postgres', sprintf($defs, 'src', $table));
+	isnt($want, '', "$table has exclusions");
+	is($node->safe_psql('postgres', sprintf($defs, 'dst', $table)), $want, "$table its exclusions made again");
+}
+$node->safe_psql('postgres', q{INSERT INTO dst.excl (r, a, b) VALUES ('[1,5)', 1, 'x')});
+my ($eret, $eout, $eerr) = $node->psql('postgres', q{INSERT INTO dst.excl (r, a, b) VALUES ('[2,3)', 2, 'y')});
+like($eerr, qr/conflicting key value violates exclusion constraint/, 'an exclusion made again holds');
+$node->safe_psql('postgres', q{DELETE FROM dst.excl});
+is( $node->safe_psql('postgres',
+		q{SELECT count(*) FILTER (WHERE condeferrable), count(*) FILTER (WHERE condeferred)
+		  FROM pg_constraint WHERE conrelid = 'dst.excl'::regclass AND contype = 'x'}),
+	"2|1", 'deferrable and deferred as they were');
+is( $node->safe_psql('postgres',
+		q!SELECT position('b + 1'::bytea in test_ws_schema_bytes('src', 'excl_ren')) = 0 AND
+		         position('z + 1'::bytea in test_ws_schema_bytes('src', 'excl_ren')) = 0!),
+	't', 'an exclusion stored by tag');
+
 $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
-	excl => 'an exclusion', cnv => 'a check not valid',
+	cnv => 'a check not valid', ctrg => 'a constraint trigger',
+	xdup => 'two constraints alike', xfill => 'an index has options', xspc => 'an index has options',
+	xclu => 'an index has options', xstat => 'an index has options', xcmt => 'a comment',
+	xicmt => 'a comment', xext => 'depends on an extension',
 	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
@@ -237,7 +288,16 @@ for my $t (
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
-	[ 'excl', 'CREATE TABLE src.excl (r int4range, EXCLUDE USING gist (r WITH &&))' ],
+	[ 'ctrg', q{CREATE TABLE src.ctrg (a int); CREATE FUNCTION src.ctrg_f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+		CREATE CONSTRAINT TRIGGER ctrg_t AFTER INSERT ON src.ctrg FOR EACH ROW EXECUTE FUNCTION src.ctrg_f()} ],
+	[ 'xdup', 'CREATE TABLE src.xdup (r int4range, CONSTRAINT x1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xdup ADD CONSTRAINT x2 EXCLUDE USING gist (r WITH &&)' ],
+	[ 'xfill', 'CREATE TABLE src.xfill (r int4range, EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50))' ],
+	[ 'xspc', 'CREATE TABLE src.xspc (r int4range, EXCLUDE USING gist (r WITH &&) USING INDEX TABLESPACE t86)' ],
+	[ 'xclu', 'CREATE TABLE src.xclu (r int4range, CONSTRAINT xclu_x EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xclu CLUSTER ON xclu_x' ],
+	[ 'xstat', 'CREATE TABLE src.xstat (a int, CONSTRAINT xstat_x EXCLUDE ((a + 1) WITH =)); ALTER INDEX src.xstat_x ALTER COLUMN 1 SET STATISTICS 5' ],
+	[ 'xcmt', q{CREATE TABLE src.xcmt (r int4range, CONSTRAINT xcmt_x EXCLUDE USING gist (r WITH &&)); COMMENT ON CONSTRAINT xcmt_x ON src.xcmt IS 'x'} ],
+	[ 'xicmt', q{CREATE TABLE src.xicmt (r int4range, CONSTRAINT xicmt_x EXCLUDE USING gist (r WITH &&)); COMMENT ON INDEX src.xicmt_x IS 'x'} ],
+	[ 'xext', 'CREATE TABLE src.xext (r int4range, CONSTRAINT xext_x EXCLUDE USING gist (r WITH &&)); ALTER INDEX src.xext_x DEPENDS ON EXTENSION test_prolly' ],
 	[ 'cnv', 'CREATE TABLE src.cnv (a int); ALTER TABLE src.cnv ADD CONSTRAINT c CHECK (a > 0) NOT VALID' ],
 	[ 'cni', 'CREATE TABLE src.cni (a int, CONSTRAINT c CHECK (a > 0) NO INHERIT)' ],
 	[ 'cne', 'CREATE TABLE src.cne (a int, CONSTRAINT c CHECK (a > 0) NOT ENFORCED)' ],
@@ -411,6 +471,24 @@ for my $t (
 like($ferr, qr/comes from its partitioned table/, 'a key from a partitioned table refused');
 ($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('sharedfk', 'p')});
 like($ferr, qr/is not in a versioned schema/, 'a shared table\'s keys are no commit\'s');
+
+# an exclusion dropped since the reader's snapshot, its row there but not its text
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.dropx (r int4range, a int, CONSTRAINT dropx_x EXCLUDE USING gist (r WITH &&),
+		CONSTRAINT dropx_e EXCLUDE ((a + 1) WITH =));
+});
+for my $con ('dropx_x', 'dropx_e')
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', "ALTER TABLE src.dropx DROP CONSTRAINT $con");
+	$old->query(q{SELECT test_ws_schema_bytes('src', 'dropx')});
+	like($old->{stderr}, qr/was dropped since this transaction's snapshot/,
+		"$con dropped since a snapshot refused, not a crash");
+	$old->query('ROLLBACK');
+	$old->quit;
+}
 
 # a key's one unique index is not refused, by what it takes to be one
 $node->safe_psql('postgres', q{

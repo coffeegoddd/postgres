@@ -8,10 +8,12 @@
  * uvarint tag, name, type, kind byte, not null byte (0 or 1), identity byte,
  * default, collation; then the key's name, uvarint nkey and the key's tags;
  * then uvarint nconstraints and each constraint: name, kind byte, flags byte,
- * and a check's expression or a unique constraint's uvarint ncols and tags;
- * then uvarint nindexes and each index: name, method, flags byte, uvarint nkeys
- * and each key (uvarint tag, 0 for an expression's, expression if so, collation,
- * opclass, order byte, nulls byte), uvarint ninclude and tags, predicate.  A
+ * and a check's expression, a unique constraint's uvarint ncols and tags, or an
+ * exclusion's method and index body; then uvarint nindexes and each index: name,
+ * method, flags byte and index body.  An index body is uvarint nkeys and each key
+ * (uvarint tag, 0 for an expression's, expression if so, collation, opclass,
+ * order byte, nulls byte, and an exclusion's operator), uvarint ninclude and
+ * tags, predicate.  A
  * string is its uvarint length and bytes, in its shortest form; a default,
  * collation or key's name none is empty, which none is if it is there.
  *
@@ -75,23 +77,41 @@ refers_to_own_columns(const WsTableSchema *s, const char *stored)
 static bool
 same_tags(const uint64 *a, int na, const uint64 *b, int nb)
 {
-	return na == nb && memcmp(a, b, (size_t) na * sizeof(uint64)) == 0;
+	return na == nb && (na == 0 || memcmp(a, b, (size_t) na * sizeof(uint64)) == 0);
 }
 
-static const char *
-index_problem(const WsTableSchema *s, const WsIndex *ix)
+static bool
+same_text(const char *a, const char *b)
 {
-	if (ix->name == NULL || ix->name[0] == '\0')
-		return "an index with no name";
-	if (strlen(ix->name) >= NAMEDATALEN)
-		return "an index's name too long";
-	if (s->key_name != NULL && strcmp(ix->name, s->key_name) == 0)
-		return "an index named as the key is";
-	/* (a unique constraint's index has its name; a check has no relation) */
-	for (int c = 0; c < s->nconstraints; c++)
-		if (s->constraints[c].kind == WS_CONSTRAINT_UNIQUE &&
-			strcmp(ix->name, s->constraints[c].name) == 0)
-			return "an index named as a unique constraint is";
+	return a == NULL || b == NULL ? a == b : strcmp(a, b) == 0;
+}
+
+/* Whether CREATE TABLE would keep one index of the two (both exclusions). */
+static bool
+exclusions_alike(const WsConstraint *a, const WsConstraint *b)
+{
+	if (a->deferrable != b->deferrable || a->initdeferred != b->initdeferred ||
+		strcmp(a->excl.method, b->excl.method) != 0 || a->excl.nkeys != b->excl.nkeys ||
+		!same_tags(a->excl.include, a->excl.ninclude, b->excl.include, b->excl.ninclude) ||
+		!same_text(a->excl.predicate, b->excl.predicate))
+		return false;
+	for (int k = 0; k < a->excl.nkeys; k++)
+	{
+		const WsIndexKey *x = &a->excl.keys[k];
+		const WsIndexKey *y = &b->excl.keys[k];
+
+		if (x->tag != y->tag || x->order != y->order || x->nulls != y->nulls ||
+			!same_text(x->expr, y->expr) || !same_text(x->collation, y->collation) ||
+			!same_text(x->opclass, y->opclass) || !same_text(x->op, y->op))
+			return false;
+	}
+	return true;
+}
+
+/* What an index and an exclusion's index have to be alike. */
+static const char *
+index_body_problem(const WsTableSchema *s, const WsIndex *ix, bool exclusion)
+{
 	if (ix->method == NULL || ix->method[0] == '\0' || strlen(ix->method) >= NAMEDATALEN)
 		return "an index with no method";
 	if (ix->nulls_not_distinct && !ix->unique)
@@ -104,6 +124,10 @@ index_problem(const WsTableSchema *s, const WsIndex *ix)
 	{
 		const WsIndexKey *key = &ix->keys[k];
 
+		if ((key->op != NULL) != exclusion)
+			return exclusion ? "an exclusion's key with no operator" : "an index's key with an operator";
+		if (exclusion && key->op[0] == '\0')
+			return "an exclusion's key with no operator";
 		if ((key->tag != 0) == (key->expr != NULL))
 			return "an index's key neither a column nor an expression, or both";
 		if (key->tag != 0)
@@ -144,6 +168,23 @@ index_problem(const WsTableSchema *s, const WsIndex *ix)
 			return "an expression referring to a column the table does not have";
 	}
 	return NULL;
+}
+
+static const char *
+index_problem(const WsTableSchema *s, const WsIndex *ix)
+{
+	if (ix->name == NULL || ix->name[0] == '\0')
+		return "an index with no name";
+	if (strlen(ix->name) >= NAMEDATALEN)
+		return "an index's name too long";
+	if (s->key_name != NULL && strcmp(ix->name, s->key_name) == 0)
+		return "an index named as the key is";
+	/* (a constraint's index has its name; a check has no relation) */
+	for (int c = 0; c < s->nconstraints; c++)
+		if (s->constraints[c].kind != WS_CONSTRAINT_CHECK &&
+			strcmp(ix->name, s->constraints[c].name) == 0)
+			return "an index named as a constraint with an index is";
+	return index_body_problem(s, ix, false);
 }
 
 const char *
@@ -236,6 +277,10 @@ ws_schema_problem(const WsTableSchema *s)
 			return "constraints not in order by name";
 		if (con->initdeferred && !con->deferrable)
 			return "a constraint initially deferred that is not deferrable";
+		if (con->kind != WS_CONSTRAINT_EXCLUSION &&
+			(con->excl.name != NULL || con->excl.method != NULL || con->excl.nkeys != 0 ||
+			 con->excl.ninclude != 0 || con->excl.predicate != NULL))
+			return "a constraint with an exclusion's fields";
 		if (con->kind == WS_CONSTRAINT_CHECK)
 		{
 			if (con->expr == NULL || con->expr[0] == '\0')
@@ -285,6 +330,22 @@ ws_schema_problem(const WsTableSchema *s)
 					return "two unique constraints alike";
 			}
 		}
+		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
+		{
+			const char *problem;
+
+			if (con->expr != NULL || con->ncols != 0 || con->nulls_not_distinct)
+				return "an exclusion with another constraint's fields";
+			if (con->excl.name != NULL || con->excl.unique || con->excl.nulls_not_distinct)
+				return "an exclusion's index with a name, or unique";
+			problem = index_body_problem(s, &con->excl, true);
+			if (problem != NULL)
+				return problem;
+			for (int j = 0; j < i; j++)
+				if (s->constraints[j].kind == WS_CONSTRAINT_EXCLUSION &&
+					exclusions_alike(con, &s->constraints[j]))
+					return "two exclusions alike";
+		}
 		else
 			return "a constraint of no known kind";
 	}
@@ -321,6 +382,30 @@ static void
 put_optional(Buf *out, const char *s)
 {
 	put_string(out, s ? s : "");
+}
+
+static void
+put_index_body(Buf *out, const WsIndex *ix, bool exclusion)
+{
+	buf_append_uvarint(out, (uint64) ix->nkeys);
+	for (int k = 0; k < ix->nkeys; k++)
+	{
+		const WsIndexKey *key = &ix->keys[k];
+
+		buf_append_uvarint(out, key->tag);
+		if (key->tag == 0)
+			put_string(out, key->expr);
+		put_optional(out, key->collation);
+		put_optional(out, key->opclass);
+		buf_append_byte(out, (uint8) key->order);
+		buf_append_byte(out, (uint8) key->nulls);
+		if (exclusion)
+			put_string(out, key->op);
+	}
+	buf_append_uvarint(out, (uint64) ix->ninclude);
+	for (int k = 0; k < ix->ninclude; k++)
+		buf_append_uvarint(out, ix->include[k]);
+	put_optional(out, ix->predicate);
 }
 
 static void
@@ -362,6 +447,11 @@ schema_encode(const WsTableSchema *s, Buf *out)
 						(con->initdeferred ? CON_INITDEFERRED : 0));
 		if (con->kind == WS_CONSTRAINT_CHECK)
 			put_string(out, con->expr);
+		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
+		{
+			put_string(out, con->excl.method);
+			put_index_body(out, &con->excl, true);
+		}
 		else
 		{
 			buf_append_uvarint(out, (uint64) con->ncols);
@@ -378,23 +468,7 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		put_string(out, ix->method);
 		buf_append_byte(out, (ix->unique ? IDX_UNIQUE : 0) |
 						(ix->nulls_not_distinct ? IDX_NULLS_NOT_DISTINCT : 0));
-		buf_append_uvarint(out, (uint64) ix->nkeys);
-		for (int k = 0; k < ix->nkeys; k++)
-		{
-			const WsIndexKey *key = &ix->keys[k];
-
-			buf_append_uvarint(out, key->tag);
-			if (key->tag == 0)
-				put_string(out, key->expr);
-			put_optional(out, key->collation);
-			put_optional(out, key->opclass);
-			buf_append_byte(out, (uint8) key->order);
-			buf_append_byte(out, (uint8) key->nulls);
-		}
-		buf_append_uvarint(out, (uint64) ix->ninclude);
-		for (int k = 0; k < ix->ninclude; k++)
-			buf_append_uvarint(out, ix->include[k]);
-		put_optional(out, ix->predicate);
+		put_index_body(out, ix, false);
 	}
 }
 
@@ -467,6 +541,40 @@ get_optional(const uint8 **p, const uint8 *end)
 }
 
 static void
+get_index_body(const uint8 **p, const uint8 *end, WsIndex *ix, bool exclusion)
+{
+	uint64		n = get_uvarint(p, end);
+
+	if (n > INDEX_MAX_KEYS)
+		malformed("an index of too many keys");
+	ix->nkeys = (int) n;
+	ix->keys = px_malloc((size_t) Max(n, 1) * sizeof(WsIndexKey));
+	memset(ix->keys, 0, (size_t) Max(n, 1) * sizeof(WsIndexKey));
+	for (int k = 0; k < ix->nkeys; k++)
+	{
+		WsIndexKey *key = &ix->keys[k];
+
+		key->tag = get_uvarint(p, end);
+		if (key->tag == 0)
+			key->expr = get_string(p, end);
+		key->collation = get_optional(p, end);
+		key->opclass = get_optional(p, end);
+		key->order = (char) get_byte(p, end);
+		key->nulls = (char) get_byte(p, end);
+		if (exclusion)
+			key->op = get_string(p, end);
+	}
+	n = get_uvarint(p, end);
+	if (n > INDEX_MAX_KEYS)
+		malformed("an index of too many columns");
+	ix->ninclude = (int) n;
+	ix->include = px_malloc((size_t) Max(n, 1) * sizeof(uint64));
+	for (int k = 0; k < ix->ninclude; k++)
+		ix->include[k] = get_uvarint(p, end);
+	ix->predicate = get_optional(p, end);
+}
+
+static void
 schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 {
 	const uint8 *p = bytes,
@@ -531,6 +639,11 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		con->initdeferred = (flags & CON_INITDEFERRED) != 0;
 		if (con->kind == WS_CONSTRAINT_CHECK)
 			con->expr = get_string(&p, end);
+		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
+		{
+			con->excl.method = get_string(&p, end);
+			get_index_body(&p, end, &con->excl, true);
+		}
 		else
 		{
 			n = get_uvarint(&p, end);
@@ -561,32 +674,7 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			malformed("an index's flags not known");
 		ix->unique = (flags & IDX_UNIQUE) != 0;
 		ix->nulls_not_distinct = (flags & IDX_NULLS_NOT_DISTINCT) != 0;
-		n = get_uvarint(&p, end);
-		if (n > INDEX_MAX_KEYS)
-			malformed("an index of too many keys");
-		ix->nkeys = (int) n;
-		ix->keys = px_malloc((size_t) Max(n, 1) * sizeof(WsIndexKey));
-		memset(ix->keys, 0, (size_t) Max(n, 1) * sizeof(WsIndexKey));
-		for (int k = 0; k < ix->nkeys; k++)
-		{
-			WsIndexKey *key = &ix->keys[k];
-
-			key->tag = get_uvarint(&p, end);
-			if (key->tag == 0)
-				key->expr = get_string(&p, end);
-			key->collation = get_optional(&p, end);
-			key->opclass = get_optional(&p, end);
-			key->order = (char) get_byte(&p, end);
-			key->nulls = (char) get_byte(&p, end);
-		}
-		n = get_uvarint(&p, end);
-		if (n > INDEX_MAX_KEYS)
-			malformed("an index of too many columns");
-		ix->ninclude = (int) n;
-		ix->include = px_malloc((size_t) Max(n, 1) * sizeof(uint64));
-		for (int k = 0; k < ix->ninclude; k++)
-			ix->include[k] = get_uvarint(&p, end);
-		ix->predicate = get_optional(&p, end);
+		get_index_body(&p, end, ix, false);
 	}
 	if (p != end)
 		malformed("it has bytes left over");
@@ -600,6 +688,23 @@ const WsSchemaCodecRoutine BinaryWsSchemaCodec = {
 	.encode = schema_encode,
 	.decode = schema_decode,
 };
+
+static void
+index_free(WsIndex *ix)
+{
+	px_free(ix->name);
+	px_free(ix->method);
+	for (int k = 0; k < ix->nkeys; k++)
+	{
+		px_free(ix->keys[k].expr);
+		px_free(ix->keys[k].collation);
+		px_free(ix->keys[k].opclass);
+		px_free(ix->keys[k].op);
+	}
+	px_free(ix->keys);
+	px_free(ix->include);
+	px_free(ix->predicate);
+}
 
 void
 ws_schema_free(WsTableSchema *s)
@@ -620,24 +725,11 @@ ws_schema_free(WsTableSchema *s)
 		px_free(s->constraints[i].name);
 		px_free(s->constraints[i].expr);
 		px_free(s->constraints[i].cols);
+		index_free(&s->constraints[i].excl);
 	}
 	px_free(s->constraints);
 	for (int i = 0; i < s->nindexes; i++)
-	{
-		WsIndex    *ix = &s->indexes[i];
-
-		px_free(ix->name);
-		px_free(ix->method);
-		for (int k = 0; k < ix->nkeys; k++)
-		{
-			px_free(ix->keys[k].expr);
-			px_free(ix->keys[k].collation);
-			px_free(ix->keys[k].opclass);
-		}
-		px_free(ix->keys);
-		px_free(ix->include);
-		px_free(ix->predicate);
-	}
+		index_free(&s->indexes[i]);
 	px_free(s->indexes);
 	memset(s, 0, sizeof(*s));
 }
@@ -714,6 +806,71 @@ ws_put_identifier(Buf *out, const char *name)
 		pfree((char *) quoted);
 }
 
+/* An index's keys and INCLUDE, in the order both statements have them. */
+static void
+put_index_columns(const WsTableSchema *s, const WsIndex *ix, Buf *out)
+{
+	ws_put_text(out, " (");
+	for (int k = 0; k < ix->nkeys; k++)
+	{
+		const WsIndexKey *key = &ix->keys[k];
+
+		if (k > 0)
+			ws_put_text(out, ", ");
+		if (key->tag != 0)
+			ws_put_identifier(out, ws_schema_column(s, key->tag)->name);
+		else
+		{
+			ws_put_text(out, "(");
+			put_expression(s, key->expr, out);
+			ws_put_text(out, ")");
+		}
+		if (key->collation != NULL)
+		{
+			ws_put_text(out, " COLLATE ");
+			ws_put_text(out, key->collation);
+		}
+		if (key->opclass != NULL)
+		{
+			ws_put_text(out, " ");
+			ws_put_text(out, key->opclass);
+		}
+		if (key->order != WS_INDEX_ORDER_DEFAULT)
+			ws_put_text(out, " DESC");
+		if (key->nulls != WS_INDEX_NULLS_DEFAULT)
+			ws_put_text(out, key->nulls == WS_INDEX_NULLS_FIRST ? " NULLS FIRST" : " NULLS LAST");
+		if (key->op != NULL)
+		{
+			ws_put_text(out, " WITH OPERATOR(");
+			ws_put_text(out, key->op);
+			ws_put_text(out, ")");
+		}
+	}
+	ws_put_text(out, ")");
+	if (ix->ninclude > 0)
+	{
+		ws_put_text(out, " INCLUDE (");
+		for (int k = 0; k < ix->ninclude; k++)
+		{
+			if (k > 0)
+				ws_put_text(out, ", ");
+			ws_put_identifier(out, ws_schema_column(s, ix->include[k])->name);
+		}
+		ws_put_text(out, ")");
+	}
+}
+
+static void
+put_index_predicate(const WsTableSchema *s, const WsIndex *ix, Buf *out)
+{
+	if (ix->predicate != NULL)
+	{
+		ws_put_text(out, " WHERE (");
+		put_expression(s, ix->predicate, out);
+		ws_put_text(out, ")");
+	}
+}
+
 /* The statement, as the record has it. */
 static void
 write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
@@ -786,14 +943,24 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 			ws_put_text(out, ")");
 			continue;
 		}
-		ws_put_text(out, con->nulls_not_distinct ? " UNIQUE NULLS NOT DISTINCT (" : " UNIQUE (");
-		for (int k = 0; k < con->ncols; k++)
+		if (con->kind == WS_CONSTRAINT_EXCLUSION)
 		{
-			if (k > 0)
-				ws_put_text(out, ", ");
-			ws_put_identifier(out, ws_schema_column(s, con->cols[k])->name);
+			ws_put_text(out, " EXCLUDE USING ");
+			ws_put_identifier(out, con->excl.method);
+			put_index_columns(s, &con->excl, out);
+			put_index_predicate(s, &con->excl, out);
 		}
-		ws_put_text(out, ")");
+		else
+		{
+			ws_put_text(out, con->nulls_not_distinct ? " UNIQUE NULLS NOT DISTINCT (" : " UNIQUE (");
+			for (int k = 0; k < con->ncols; k++)
+			{
+				if (k > 0)
+					ws_put_text(out, ", ");
+				ws_put_identifier(out, ws_schema_column(s, con->cols[k])->name);
+			}
+			ws_put_text(out, ")");
+		}
 		if (con->deferrable)
 			ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
 	}
@@ -897,6 +1064,26 @@ check_expression(const WsTableSchema *s, const char *stored, Node *in_statement)
 	buf_free(&text);
 }
 
+/* Names as they print with no setting asking for more quotes. */
+static char *
+canonical_names(List *names)
+{
+	char	   *canonical;
+	bool		quote_all = quote_all_identifiers;
+
+	quote_all_identifiers = false;
+	PG_TRY();
+	{
+		canonical = NameListToQuotedString(names);
+	}
+	PG_FINALLY();
+	{
+		quote_all_identifiers = quote_all;
+	}
+	PG_END_TRY();
+	return canonical;
+}
+
 /*
  * Whether a collation's or opclass's text names these names, in its one form:
  * as they print with no setting asking for more quotes, so no spaces, nor a
@@ -907,25 +1094,45 @@ same_names(const char *text, List *names)
 {
 	ErrorSaveContext escontext = {T_ErrorSaveContext};
 	List	   *want;
-	char	   *canonical;
-	bool		quote_all = quote_all_identifiers;
 
 	if (text == NULL)
 		return names == NIL;
 	want = stringToQualifiedNameList(text, (Node *) &escontext);
 	if (want == NIL || !equal(want, names))
 		return false;
-	quote_all_identifiers = false;
-	PG_TRY();
-	{
-		canonical = NameListToQuotedString(want);
-	}
-	PG_FINALLY();
-	{
-		quote_all_identifiers = quote_all;
-	}
-	PG_END_TRY();
-	return strcmp(canonical, text) == 0;
+	return strcmp(canonical_names(want), text) == 0;
+}
+
+/* An exclusion's operator in its one form: its schema's name quoted, if it has one, itself bare. */
+static char *
+operator_text(List *names)
+{
+	char	   *op = strVal(llast(names));
+
+	if (list_length(names) == 1)
+		return pstrdup(op);
+	return psprintf("%s.%s", canonical_names(list_copy_head(names, list_length(names) - 1)), op);
+}
+
+/* An index's key as parsed is the record's; false if not. */
+static bool
+same_index_key(const WsTableSchema *s, const WsIndexKey *key, const IndexElem *elem)
+{
+	if (elem->indexcolname != NULL || elem->opclassopts != NIL ||
+		!same_names(key->collation, elem->collation) ||
+		!same_names(key->opclass, elem->opclass) ||
+		elem->ordering != (key->order == WS_INDEX_ORDER_DESC ? SORTBY_DESC : SORTBY_DEFAULT) ||
+		elem->nulls_ordering != (key->nulls == WS_INDEX_NULLS_FIRST ? SORTBY_NULLS_FIRST :
+								 key->nulls == WS_INDEX_NULLS_LAST ? SORTBY_NULLS_LAST :
+								 SORTBY_NULLS_DEFAULT))
+		return false;
+	if (key->tag != 0)
+		return elem->name != NULL && elem->expr == NULL &&
+			strcmp(elem->name, ws_schema_column(s, key->tag)->name) == 0;
+	if (elem->name != NULL || elem->expr == NULL)
+		return false;
+	check_expression(s, key->expr, elem->expr);
+	return true;
 }
 
 /* Whether a type name would create a sequence too: CREATE TABLE's serial types. */
@@ -1021,10 +1228,13 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 		in_statement->is_no_inherit || in_statement->skip_validation ||
 		in_statement->deferrable != con->deferrable ||
 		in_statement->initdeferred != con->initdeferred ||
-		in_statement->including != NIL || in_statement->options != NIL ||
+		in_statement->options != NIL ||
 		in_statement->indexspace != NULL || in_statement->indexname != NULL ||
-		in_statement->without_overlaps || in_statement->pktable != NULL ||
-		in_statement->exclusions != NIL || in_statement->where_clause != NULL)
+		in_statement->without_overlaps || in_statement->pktable != NULL)
+		not_the_record(s, "another constraint");
+	if (con->kind != WS_CONSTRAINT_EXCLUSION &&
+		(in_statement->including != NIL || in_statement->exclusions != NIL ||
+		 in_statement->where_clause != NULL))
 		not_the_record(s, "another constraint");
 	if (con->kind == WS_CONSTRAINT_CHECK)
 	{
@@ -1033,6 +1243,35 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 			!in_statement->is_enforced || !in_statement->initially_valid)
 			not_the_record(s, "another constraint");
 		check_expression(s, con->expr, in_statement->raw_expr);
+	}
+	else if (con->kind == WS_CONSTRAINT_EXCLUSION)
+	{
+		const WsIndex *ix = &con->excl;
+		int			k = 0;
+		ListCell   *kc;
+
+		if (in_statement->contype != CONSTR_EXCLUSION || in_statement->raw_expr != NULL ||
+			in_statement->keys != NIL || in_statement->nulls_not_distinct ||
+			strcmp(in_statement->access_method, ix->method) != 0 ||
+			list_length(in_statement->exclusions) != ix->nkeys ||
+			list_length(in_statement->including) != ix->ninclude ||
+			(in_statement->where_clause != NULL) != (ix->predicate != NULL))
+			not_the_record(s, "another constraint");
+		foreach(kc, in_statement->exclusions)
+		{
+			List	   *pair = lfirst_node(List, kc);
+			const WsIndexKey *key = &ix->keys[k++];
+
+			if (!same_index_key(s, key, linitial_node(IndexElem, pair)) ||
+				strcmp(operator_text(lsecond_node(List, pair)), key->op) != 0)
+				not_the_record(s, "another constraint");
+		}
+		k = 0;
+		foreach(kc, in_statement->including)
+			if (strcmp(strVal(lfirst(kc)), ws_schema_column(s, ix->include[k++])->name) != 0)
+				not_the_record(s, "another constraint");
+		if (ix->predicate != NULL)
+			check_expression(s, ix->predicate, in_statement->where_clause);
 	}
 	else
 	{
@@ -1116,6 +1355,24 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		}
 		i++;
 	}
+
+	/*
+	 * CREATE TABLE keeps one index of those that parse alike, which two
+	 * exclusions may though the record's text for them differs.
+	 */
+	for (int x = s->ncols + (s->nkey > 0 ? 1 : 0); x < list_length(create->tableElts); x++)
+		for (int y = x + 1; y < list_length(create->tableElts); y++)
+		{
+			Constraint *a = list_nth_node(Constraint, create->tableElts, x);
+			Constraint *b = list_nth_node(Constraint, create->tableElts, y);
+
+			if (a->contype == CONSTR_EXCLUSION && b->contype == CONSTR_EXCLUSION &&
+				strcmp(a->access_method, b->access_method) == 0 &&
+				a->deferrable == b->deferrable && a->initdeferred == b->initdeferred &&
+				equal(a->exclusions, b->exclusions) && equal(a->including, b->including) &&
+				equal(a->where_clause, b->where_clause))
+				not_the_record(s, "two exclusions alike");
+		}
 }
 
 /* (strings of a schema, a new copy, each from UTF8 into the server's encoding) */
@@ -1149,56 +1406,10 @@ write_create_index(const WsTableSchema *s, const WsIndex *ix, const char *schema
 	ws_put_identifier(out, s->name);
 	ws_put_text(out, " USING ");
 	ws_put_identifier(out, ix->method);
-	ws_put_text(out, " (");
-	for (int k = 0; k < ix->nkeys; k++)
-	{
-		const WsIndexKey *key = &ix->keys[k];
-
-		if (k > 0)
-			ws_put_text(out, ", ");
-		if (key->tag != 0)
-			ws_put_identifier(out, ws_schema_column(s, key->tag)->name);
-		else
-		{
-			ws_put_text(out, "(");
-			put_expression(s, key->expr, out);
-			ws_put_text(out, ")");
-		}
-		if (key->collation != NULL)
-		{
-			ws_put_text(out, " COLLATE ");
-			ws_put_text(out, key->collation);
-		}
-		if (key->opclass != NULL)
-		{
-			ws_put_text(out, " ");
-			ws_put_text(out, key->opclass);
-		}
-		if (key->order != WS_INDEX_ORDER_DEFAULT)
-			ws_put_text(out, " DESC");
-		if (key->nulls != WS_INDEX_NULLS_DEFAULT)
-			ws_put_text(out, key->nulls == WS_INDEX_NULLS_FIRST ? " NULLS FIRST" : " NULLS LAST");
-	}
-	ws_put_text(out, ")");
-	if (ix->ninclude > 0)
-	{
-		ws_put_text(out, " INCLUDE (");
-		for (int k = 0; k < ix->ninclude; k++)
-		{
-			if (k > 0)
-				ws_put_text(out, ", ");
-			ws_put_identifier(out, ws_schema_column(s, ix->include[k])->name);
-		}
-		ws_put_text(out, ")");
-	}
+	put_index_columns(s, ix, out);
 	if (ix->nulls_not_distinct)
 		ws_put_text(out, " NULLS NOT DISTINCT");
-	if (ix->predicate != NULL)
-	{
-		ws_put_text(out, " WHERE (");
-		put_expression(s, ix->predicate, out);
-		ws_put_text(out, ")");
-	}
+	put_index_predicate(s, ix, out);
 }
 
 /*
@@ -1232,29 +1443,8 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 		not_the_record(s, "another index");
 	foreach(lc, stmt->indexParams)
 	{
-		IndexElem  *elem = lfirst_node(IndexElem, lc);
-		const WsIndexKey *key = &ix->keys[k++];
-
-		if (elem->indexcolname != NULL || elem->opclassopts != NIL ||
-			!same_names(key->collation, elem->collation) ||
-			!same_names(key->opclass, elem->opclass) ||
-			elem->ordering != (key->order == WS_INDEX_ORDER_DESC ? SORTBY_DESC : SORTBY_DEFAULT) ||
-			elem->nulls_ordering != (key->nulls == WS_INDEX_NULLS_FIRST ? SORTBY_NULLS_FIRST :
-									 key->nulls == WS_INDEX_NULLS_LAST ? SORTBY_NULLS_LAST :
-									 SORTBY_NULLS_DEFAULT))
+		if (!same_index_key(s, &ix->keys[k++], lfirst_node(IndexElem, lc)))
 			not_the_record(s, "another index");
-		if (key->tag != 0)
-		{
-			if (elem->name == NULL || elem->expr != NULL ||
-				strcmp(elem->name, ws_schema_column(s, key->tag)->name) != 0)
-				not_the_record(s, "another index");
-		}
-		else
-		{
-			if (elem->name != NULL || elem->expr == NULL)
-				not_the_record(s, "another index");
-			check_expression(s, key->expr, elem->expr);
-		}
 	}
 	k = 0;
 	foreach(lc, stmt->indexIncludingParams)
@@ -1269,6 +1459,24 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 	}
 	if (ix->predicate != NULL)
 		check_expression(s, ix->predicate, stmt->whereClause);
+}
+
+static void
+index_in_server_encoding(const WsIndex *ix, WsIndex *here)
+{
+	*here = *ix;
+	here->name = ws_name_from_utf8(ix->name);
+	here->method = ws_name_from_utf8(ix->method);
+	here->predicate = from_utf8(ix->predicate);
+	here->keys = palloc_array(WsIndexKey, Max(ix->nkeys, 1));
+	for (int k = 0; k < ix->nkeys; k++)
+	{
+		here->keys[k] = ix->keys[k];
+		here->keys[k].expr = from_utf8(ix->keys[k].expr);
+		here->keys[k].collation = from_utf8(ix->keys[k].collation);
+		here->keys[k].opclass = from_utf8(ix->keys[k].opclass);
+		here->keys[k].op = from_utf8(ix->keys[k].op);
+	}
 }
 
 /* A copy of a schema with its strings in the server's encoding. */
@@ -1294,25 +1502,12 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 		here.constraints[i] = s->constraints[i];
 		here.constraints[i].name = ws_name_from_utf8(s->constraints[i].name);
 		here.constraints[i].expr = from_utf8(s->constraints[i].expr);
+		if (s->constraints[i].kind == WS_CONSTRAINT_EXCLUSION)
+			index_in_server_encoding(&s->constraints[i].excl, &here.constraints[i].excl);
 	}
 	here.indexes = palloc_array(WsIndex, Max(s->nindexes, 1));
 	for (int i = 0; i < s->nindexes; i++)
-	{
-		const WsIndex *ix = &s->indexes[i];
-
-		here.indexes[i] = *ix;
-		here.indexes[i].name = ws_name_from_utf8(ix->name);
-		here.indexes[i].method = ws_name_from_utf8(ix->method);
-		here.indexes[i].predicate = from_utf8(ix->predicate);
-		here.indexes[i].keys = palloc_array(WsIndexKey, Max(ix->nkeys, 1));
-		for (int k = 0; k < ix->nkeys; k++)
-		{
-			here.indexes[i].keys[k] = ix->keys[k];
-			here.indexes[i].keys[k].expr = from_utf8(ix->keys[k].expr);
-			here.indexes[i].keys[k].collation = from_utf8(ix->keys[k].collation);
-			here.indexes[i].keys[k].opclass = from_utf8(ix->keys[k].opclass);
-		}
-	}
+		index_in_server_encoding(&s->indexes[i], &here.indexes[i]);
 	*here_out = here;
 }
 
@@ -1399,8 +1594,8 @@ static const char *const unsupported_sql =
 "  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
 "       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND "
-"               k.contype NOT IN ('p', 'u', 'c', 'n', 'f')) "
-"    THEN 'it has an exclusion or a constraint trigger' "
+"               k.contype NOT IN ('p', 'u', 'c', 'n', 'f', 'x')) "
+"    THEN 'it has a constraint trigger' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
 "               JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND "
@@ -1421,7 +1616,8 @@ static const char *const unsupported_sql =
 "    THEN 'it has a check not valid, no inherit or not enforced' "
 "  WHEN EXISTS (SELECT FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE x.indrelid = c.oid AND NOT EXISTS "
-"               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid) AND "
+"               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid "
+"                  AND k.contype <> 'x') AND "
 "                 (NOT x.indisvalid OR NOT x.indisready OR x.indisclustered OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0 OR "
 "                  EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = x.indexrelid AND "
@@ -1581,6 +1777,87 @@ index_gone(const char *table)
 			 errmsg("an index of table \"%s\" was dropped since this transaction's snapshot", table)));
 }
 
+/* A key as printed; its expression, if it is one, as printed alone. */
+static void
+read_index_key(const char *table, const char *index_oid, int k, const IndexElem *elem,
+			   ReadCols *rc, WsIndexKey *key)
+{
+	if (elem->opclassopts != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the schema of table \"%s\" cannot be read yet: an index has options",
+						table)));
+	if (elem->name != NULL)
+		key->tag = index_col_tag(table, rc, elem->name);
+	else
+	{
+		char		colno[16];
+		const char *params[2] = {index_oid, colno};
+		WsSqlRows	one;
+
+		snprintf(colno, sizeof(colno), "%d", k + 1);
+		WsSql->run("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
+		if (ws_sql_value(&one, 0, 0) == NULL)
+			index_gone(table);
+		key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
+		ws_sql_rows_free(&one);
+	}
+	key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
+	key->opclass = elem->opclass ? to_utf8(NameListToQuotedString(elem->opclass)) : NULL;
+	key->order = elem->ordering == SORTBY_DESC ? WS_INDEX_ORDER_DESC : WS_INDEX_ORDER_DEFAULT;
+	key->nulls = elem->nulls_ordering == SORTBY_NULLS_FIRST ? WS_INDEX_NULLS_FIRST :
+		elem->nulls_ordering == SORTBY_NULLS_LAST ? WS_INDEX_NULLS_LAST : WS_INDEX_NULLS_DEFAULT;
+}
+
+/*
+ * An exclusion, from the clause the server prints for it, as an index is below.
+ * The constraint's row is the snapshot's, and its index's text the caches', which
+ * the server cannot print with that index gone; under the lock, it stays.
+ */
+static void
+read_exclusion(const char *table, const char *con_oid, const char *index_oid, const char *predicate,
+			   ReadCols *rc, WsIndex *ix)
+{
+	const char *params[1] = {con_oid};
+	WsSqlRows	printed;
+	List	   *parsed;
+	Constraint *con;
+	int			k = 0;
+	ListCell   *lc;
+
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(atooid(index_oid))))
+		index_gone(table);
+	WsSql->run("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
+	if (ws_sql_value(&printed, 0, 0) == NULL)
+		index_gone(table);
+	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", ws_sql_value(&printed, 0, 0)),
+						RAW_PARSE_DEFAULT);
+	ws_sql_rows_free(&printed);
+	con = linitial_node(Constraint, castNode(CreateStmt, linitial_node(RawStmt, parsed)->stmt)->tableElts);
+	if (con->contype != CONSTR_EXCLUSION)
+		elog(ERROR, "an exclusion of table \"%s\" printed as something else", table);
+	if (con->options != NIL || con->indexspace != NULL)
+		elog(ERROR, "an exclusion of table \"%s\" with options that were to be refused", table);
+	ix->method = ws_name_to_utf8(con->access_method);
+	ix->nkeys = list_length(con->exclusions);
+	ix->keys = px_malloc((size_t) Max(ix->nkeys, 1) * sizeof(WsIndexKey));
+	memset(ix->keys, 0, (size_t) Max(ix->nkeys, 1) * sizeof(WsIndexKey));
+	foreach(lc, con->exclusions)
+	{
+		List	   *pair = lfirst_node(List, lc);
+
+		read_index_key(table, index_oid, k, linitial_node(IndexElem, pair), rc, &ix->keys[k]);
+		ix->keys[k].op = to_utf8(operator_text(lsecond_node(List, pair)));
+		k++;
+	}
+	ix->ninclude = list_length(con->including);
+	ix->include = px_malloc((size_t) Max(ix->ninclude, 1) * sizeof(uint64));
+	k = 0;
+	foreach(lc, con->including)
+		ix->include[k++] = index_col_tag(table, rc, strVal(lfirst(lc)));
+	ix->predicate = predicate ? stored_expression(predicate, rc) : NULL;
+}
+
 /*
  * An index, from the statement the server prints for it: which collations,
  * opclasses and orders are other than the default is its decision, so the
@@ -1614,34 +1891,7 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 	memset(ix->keys, 0, (size_t) Max(ix->nkeys, 1) * sizeof(WsIndexKey));
 	foreach(lc, stmt->indexParams)
 	{
-		IndexElem  *elem = lfirst_node(IndexElem, lc);
-		WsIndexKey *key = &ix->keys[k];
-
-		if (elem->opclassopts != NIL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("the schema of table \"%s\" cannot be read yet: an index has options",
-							table)));
-		if (elem->name != NULL)
-			key->tag = index_col_tag(table, rc, elem->name);
-		else
-		{
-			char		colno[16];
-			const char *params[2] = {ws_sql_value(idxs, row, 1), colno};
-			WsSqlRows	one;
-
-			snprintf(colno, sizeof(colno), "%d", k + 1);
-			WsSql->run("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
-			if (ws_sql_value(&one, 0, 0) == NULL)
-				index_gone(table);
-			key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
-			ws_sql_rows_free(&one);
-		}
-		key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
-		key->opclass = elem->opclass ? to_utf8(NameListToQuotedString(elem->opclass)) : NULL;
-		key->order = elem->ordering == SORTBY_DESC ? WS_INDEX_ORDER_DESC : WS_INDEX_ORDER_DEFAULT;
-		key->nulls = elem->nulls_ordering == SORTBY_NULLS_FIRST ? WS_INDEX_NULLS_FIRST :
-			elem->nulls_ordering == SORTBY_NULLS_LAST ? WS_INDEX_NULLS_LAST : WS_INDEX_NULLS_DEFAULT;
+		read_index_key(table, ws_sql_value(idxs, row, 1), k, lfirst_node(IndexElem, lc), rc, &ix->keys[k]);
 		k++;
 	}
 	ix->ninclude = list_length(stmt->indexIncludingParams);
@@ -1760,9 +2010,11 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "ORDER BY a.attnum", 1, oid, &cols);
 		WsSql->run("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
-				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text "
+				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
+				   "  con.oid::text, "
+				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid) "
 				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
-				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u')", 1, oid, &others);
+				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
 		WsSql->run("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
 				   "  pg_get_expr(i.indpred, i.indrelid) "
 				   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
@@ -1843,6 +2095,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 			con->expr = to_utf8((char *) stored.data);
 			buf_free(&stored);
 		}
+		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
+		{
+			read_exclusion(table, ws_sql_value(&others, i, 7), ws_sql_value(&others, i, 8),
+						   ws_sql_value(&others, i, 9), &rc, &con->excl);
+			con->deferrable = ws_sql_value(&others, i, 5)[0] == 't';
+			con->initdeferred = ws_sql_value(&others, i, 6)[0] == 't';
+		}
 		else
 		{
 			const char *keys = ws_sql_value(&others, i, 3);
@@ -1860,6 +2119,15 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	/* (by name in UTF8's order: what a commit holds, whatever this database sorts by) */
 	if (out->nconstraints > 1)
 		qsort(out->constraints, out->nconstraints, sizeof(WsConstraint), constraint_cmp);
+	for (int i = 0; i < out->nconstraints; i++)
+		for (int j = 0; j < i; j++)
+			if (out->constraints[i].kind == WS_CONSTRAINT_EXCLUSION &&
+				out->constraints[j].kind == WS_CONSTRAINT_EXCLUSION &&
+				exclusions_alike(&out->constraints[i], &out->constraints[j]))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the schema of table \"%s\" cannot be read yet: it has two constraints alike, of which CREATE TABLE makes one",
+								table)));
 	out->nindexes = idxs.nrows;
 	out->indexes = px_malloc((size_t) Max(idxs.nrows, 1) * sizeof(WsIndex));
 	memset(out->indexes, 0, (size_t) Max(idxs.nrows, 1) * sizeof(WsIndex));
