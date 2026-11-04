@@ -244,6 +244,28 @@ $node->safe_psql('postgres', q{
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'idlike') IS NOT NULL}),
 	't', 'an identity from LIKE INCLUDING ALL reads');
 
+# a security label is refused, and one cleared is nothing lost
+$node->safe_psql('postgres', q{
+	LOAD 'dummy_seclabel';
+	CREATE TABLE src.lab (a int GENERATED ALWAYS AS IDENTITY, b int);
+	CREATE TABLE src.labc (a int);
+	SECURITY LABEL ON TABLE src.lab IS 'classified';
+	SECURITY LABEL ON COLUMN src.labc.a IS 'classified';
+	CREATE TABLE src.labs (a int GENERATED ALWAYS AS IDENTITY);
+	SECURITY LABEL ON SEQUENCE src.labs_a_seq IS 'classified';
+});
+for my $table ('lab', 'labc', 'labs')
+{
+	my ($lret, $lout, $lerr) = $node->psql('postgres', qq{SELECT test_ws_schema_bytes('src', '$table')});
+	like($lerr, qr/it has a security label/, "a label on $table refused");
+}
+$node->safe_psql('postgres', q{
+	LOAD 'dummy_seclabel';
+	SECURITY LABEL ON TABLE src.lab IS NULL;
+});
+is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'lab') IS NOT NULL}),
+	't', 'a label cleared reads');
+
 # grants taken back again, and constraints differing in what CREATE TABLE tells
 # apart, are nothing the record loses
 $node->safe_psql('postgres', q{

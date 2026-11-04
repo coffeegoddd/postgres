@@ -970,8 +970,8 @@ check_injection(void *arg)
 }
 
 /*
- * A comment opened in one check's text and closed in the next: each alone
- * could parse, and the statement holds one check where the record has two.
+ * A comment opened in one check's text and closed in the next: the statement
+ * holds one check where the record has two.
  */
 static void
 check_spanning(void *arg)
@@ -996,6 +996,7 @@ test_constraint_injection(void)
 		"true) NOT ENFORCED --",
 		"true), CONSTRAINT d CHECK (false",
 		"true), UNIQUE (a",
+		"true) ENFORCED --",
 	};
 
 	for (int i = 0; i < lengthof(bad); i++)

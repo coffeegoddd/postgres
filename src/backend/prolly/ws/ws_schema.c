@@ -1050,7 +1050,7 @@ static const char *const unsupported_sql =
 "               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
 "  WHEN (c.relacl IS NOT NULL AND c.relacl <> acldefault('r', c.relowner)) OR "
 "       EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid "
-"               AND a.attacl IS NOT NULL AND cardinality(a.attacl) > 0) OR "
+"               AND a.attacl IS NOT NULL) OR "
 "       EXISTS (SELECT FROM pg_class q WHERE q.oid IN (SELECT o FROM own) AND q.relkind = 'S' "
 "               AND q.relacl IS NOT NULL AND q.relacl <> acldefault('s', q.relowner)) "
 "    THEN 'it has grants' "

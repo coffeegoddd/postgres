@@ -46,7 +46,7 @@ REGRESS_OPTS = --temp-config=$(srcdir)/chunk_store.conf
 ISOLATION_OPTS = --temp-config=$(srcdir)/chunk_store_isolation.conf
 TAP_TESTS = 1
 
-EXTRA_INSTALL = contrib/amcheck contrib/pageinspect contrib/pg_buffercache contrib/pg_prewarm contrib/pg_visibility \
+EXTRA_INSTALL = src/test/modules/dummy_seclabel contrib/amcheck contrib/pageinspect contrib/pg_buffercache contrib/pg_prewarm contrib/pg_visibility \
 	contrib/pg_walinspect contrib/test_decoding \
 	src/test/modules/injection_points
 
