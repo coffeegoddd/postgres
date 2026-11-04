@@ -970,7 +970,7 @@ if ($ENV{enable_injection_points} eq 'yes' && $node->check_extension('injection_
 		SELECT injection_points_detach('ws-schema-read-between');
 	});
 	my $read = $reader->query_until(qr/done/, q{});
-	like($read, qr/\Q$before\E/, 'a read as of its one snapshot, not what committed since it began');
+	like($read, qr/^\Q$before\E$/m, 'a read as of its one snapshot, not what committed since it began');
 	is($reader->{stderr}, '', '(and no error)');
 	$reader->quit;
 	$node->safe_psql('postgres', q{COMMENT ON CONSTRAINT mid_k ON src.mid IS NULL; REVOKE SELECT ON src.mid FROM rg_login});
@@ -1006,14 +1006,48 @@ $node->safe_psql('postgres', q{
 	my $hex = $bytes->($node, 'postgres', 'g_dp');
 	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp GRANT SELECT ON TABLES TO rg_read});
 	my ($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
-	like($err, qr/default privileges would add to what is made/, 'a destination whose default privileges would add to it refused');
+	like($err, qr/default privileges would change what is made/, 'a destination whose default privileges would add to it refused');
 	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp REVOKE SELECT ON TABLES FROM rg_read;
 		ALTER DEFAULT PRIVILEGES IN SCHEMA dp GRANT USAGE ON SEQUENCES TO rg_read});
 	($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
-	like($err, qr/default privileges would add to what is made/, 'and on sequences');
-	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp REVOKE USAGE ON SEQUENCES FROM rg_read});
+	like($err, qr/default privileges would change what is made/, 'and on sequences');
+	# (on sequences, but a table with no identity has none)
+	$node->safe_psql('postgres', q{CREATE TABLE src.g_dpn (a integer)});
+	my $plain = $bytes->($node, 'postgres', 'g_dpn');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$plain', 'hex'), 'dp')});
+	is($bytes->($node, 'postgres', 'g_dpn', undef, 'dp'), $plain, 'sequences\' defaults no matter to a table of none');
+	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp REVOKE USAGE ON SEQUENCES FROM rg_read;
+		ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO rg_read});
+	($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
+	like($err, qr/default privileges would change what is made/, 'and from defaults for every schema');
+	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM rg_read;
+		CREATE ROLE "Mixed Role" NOLOGIN; CREATE ROLE mixed NOLOGIN;
+		GRANT CREATE, USAGE ON SCHEMA dp TO "Mixed Role", mixed;
+		ALTER DEFAULT PRIVILEGES FOR ROLE "Mixed Role" IN SCHEMA dp GRANT SELECT ON TABLES TO rg_read});
+	($ret, $out, $err) = $node->psql('postgres', qq{SET ROLE "Mixed Role"; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
+	like($err, qr/default privileges would change what is made/, 'the role making it, whatever its name, as its own');
+	($ret, $out, $err) = $node->psql('postgres', qq{SET ROLE mixed; SELECT test_ws_schema_create(decode('$plain', 'hex'), 'dp')});
+	unlike($err, qr/default privileges/, 'and not another role\'s');
+	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES FOR ROLE "Mixed Role" IN SCHEMA dp REVOKE SELECT ON TABLES FROM rg_read;
+		DROP TABLE IF EXISTS dp.g_dpn;
+		REVOKE ALL ON SCHEMA dp FROM "Mixed Role", mixed; DROP ROLE "Mixed Role", mixed});
 	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
 	is($bytes->($node, 'postgres', 'g_dp', undef, 'dp'), $hex, 'with none, the same bytes');
+
+	# (a name like a predefined one's is not one)
+	$node->safe_psql('postgres', q{CREATE ROLE pgfoo NOLOGIN; CREATE TABLE src.g_pgfoo (a integer);
+		ALTER TABLE src.g_pgfoo OWNER TO pgfoo});
+	my $pgfoo = $bytes->($node, 'postgres', 'g_pgfoo');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$pgfoo', 'hex'), 'gl_dst');
+		SELECT test_ws_schema_grants(decode('$pgfoo', 'hex'), 'gl_dst')});
+	is($bytes->($node, 'postgres', 'g_pgfoo', undef, 'gl_dst'), $pgfoo, 'a role named as a predefined one nearly is held');
+
+	$node->safe_psql('postgres', q{CREATE ROLE rg_pow_later NOLOGIN; CREATE TABLE src.g_powl (a integer); ALTER TABLE src.g_powl OWNER TO rg_pow_later});
+	my $powl = $bytes->($node, 'postgres', 'g_powl');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$powl', 'hex'), 'gl_dst'); ALTER ROLE rg_pow_later BYPASSRLS});
+	($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_grants(decode('$powl', 'hex'), 'gl_dst')});
+	like($err, qr/a role that can log in, or with powers/, 'an owner with powers here refused');
+	$node->safe_psql('postgres', q{ALTER ROLE rg_pow_later NOBYPASSRLS});
 
 	for my $t ([ 'g_later', 'rg_later' ], [ 'g_glater', 'rg_glater' ])
 	{
@@ -1028,6 +1062,19 @@ $node->safe_psql('postgres', q{
 	($ret, $out, $err) = $node->psql('postgres', qq{SET ROLE rg_read; SELECT test_ws_schema_grants(decode('$self', 'hex'), 'gl_dst')});
 	like($err, qr/has a grant to role "rg_read", who would own it/, 'a grant to who restores a table it would own refused');
 }
+
+# a role's name in the bytes of a database since gone: not this encoding, and refused
+$node->safe_psql('postgres', q{CREATE ROLE rg_bytes NOLOGIN; CREATE DATABASE lat0 ENCODING LATIN1 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
+$node->safe_psql('postgres', q{CREATE TABLE src.g_bytes (a integer); GRANT SELECT ON src.g_bytes TO rg_bytes});
+$node->safe_psql('lat0', q{SET client_encoding = UTF8; ALTER ROLE rg_bytes RENAME TO "ré2"});
+$node->safe_psql('postgres', q{DROP DATABASE lat0});
+{
+	my ($ret, $out, $err) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('src', 'g_bytes')});
+	like($err, qr/names a role not in ASCII/, 'a role\'s name in another encoding\'s bytes, its database gone, refused');
+}
+$node->safe_psql('postgres', q{DROP TABLE src.g_bytes; CREATE DATABASE lat0 ENCODING LATIN1 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
+$node->safe_psql('lat0', q{SET client_encoding = UTF8; DROP ROLE "ré2"});
+$node->safe_psql('postgres', q{DROP DATABASE lat0});
 
 # an owner that can log in is not held: whoever makes it owns it
 $node->safe_psql('postgres', q{CREATE ROLE rg_person LOGIN; GRANT CREATE, USAGE ON SCHEMA src TO rg_person;
@@ -1073,7 +1120,7 @@ $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
 	ctrg => 'a constraint trigger',
-	fkcom => 'a foreign key has a comment', cmty => 'row type has a comment', cmto => 'TOAST table has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace', 
+	fkcom => 'a foreign key has a comment', cmty => 'row type has a comment', cmar => 'row type has a comment', cmto => 'TOAST table has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace',
 	repgone => 'no longer has', repgonek => 'no longer has', uoptd => 'two constraints alike', kuoptd => 'two constraints alike',
 	xoptd => 'two constraints alike', ixo1 => 'one for the other',
 	xext => 'depends on an extension', fksopt => 'has a tablespace',
@@ -1083,8 +1130,8 @@ my %refused_for = (
 	toastd => 'no longer needs one', toastp => 'no longer needs one', ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
 	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uover => 'over a period', uspc => 'has a tablespace',
-	iext => 'depends on an extension', 
-	ispc => 'has a tablespace', 
+	iext => 'depends on an extension',
+	ispc => 'has a tablespace',
 	gl => 'can log in', gsu => 'powers no commit holds', gby => 'other than its owner', gown => 'other rights', gsuo => 'its owner has powers',
 	gcown => 'other rights', gcl => 'can log in', gsl => 'can log in', gbyc => 'other than its owner', gsown => 'other rights',
 	gsys => 'a system column', gtoast => 'TOAST table has a grant', gpg => 'powers no commit holds', gpgo => 'its owner has powers',
@@ -1141,6 +1188,7 @@ for my $t (
 	[ 'kuoptd', 'CREATE TABLE src.kuoptd (a int PRIMARY KEY); ALTER TABLE src.kuoptd ADD CONSTRAINT kuoptd_2 UNIQUE (a) WITH (fillfactor = 50)' ],
 	[ 'xoptd', 'CREATE TABLE src.xoptd (r int4range, CONSTRAINT xoptd_1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xoptd ADD CONSTRAINT xoptd_2 EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50)' ],
 	[ 'ixo1', q{CREATE TABLE src.ixo (a integer) PARTITION BY RANGE (a); CREATE INDEX ixo_1 ON src.ixo (a); CREATE INDEX ixo_2 ON src.ixo (a) WITH (fillfactor = 50); CREATE TABLE src.ixo1 PARTITION OF src.ixo FOR VALUES FROM (0) TO (10)} ],
+	[ 'cmar', q{CREATE TABLE src.cmar (a int); COMMENT ON TYPE src._cmar IS 'x'} ],
 	[ 'cmty', q{CREATE TABLE src.cmty (a int); COMMENT ON TYPE src.cmty IS 'x'} ],
 	[ 'cmto', q{CREATE TABLE src.cmto (a text);
 		SELECT format('COMMENT ON INDEX pg_toast.%I IS ''x''', i.relname) FROM pg_class t JOIN pg_index x ON x.indrelid = t.reltoastrelid JOIN pg_class i ON i.oid = x.indexrelid WHERE t.oid = 'src.cmto'::regclass \gexec} ],
@@ -1793,6 +1841,18 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE ROLE "propriété" 
 	like($err, qr/names a role not in ASCII/, 'and in LATIN1');
 }
 
+# and a record naming one, made there
+{
+	$node->safe_psql('postgres', q{CREATE ROLE rg_enc_read NOLOGIN; CREATE TABLE enc.g_rec (a integer); GRANT SELECT ON enc.g_rec TO rg_enc_read});
+	my $hex = $node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('enc', 'g_rec'), 'hex')});
+	my $from = unpack('H*', 'rg_enc_read');
+	my $to = unpack('H*', "rg_enc_r\xc3\xa9d");
+	$hex =~ s/$from/$to/ or die 'no role in the bytes';
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst')});
+	my ($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_grants(decode('$hex', 'hex'), 'dst')});
+	like($err, qr/names a role not in ASCII/, 'a record naming a role not in ASCII refused too');
+}
+
 # roles' names in each encoding
 my $gr_sql = q{
 	SET client_encoding = UTF8;
@@ -1801,7 +1861,7 @@ my $gr_sql = q{
 	GRANT SELECT ON enc."droité" TO rg_enc_read;
 	GRANT SELECT ("colonné") ON enc."droité" TO rg_enc_read;
 };
-$node->safe_psql('postgres', q{CREATE ROLE rg_enc_owner NOLOGIN; CREATE ROLE rg_enc_read NOLOGIN});
+$node->safe_psql('postgres', q{CREATE ROLE rg_enc_owner NOLOGIN});
 $node->safe_psql($_, $gr_sql) for ('postgres', 'lat');
 my $gr_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('%s', 'droité'), 'hex')};
 my $gr_utf8 = $node->safe_psql('postgres', sprintf($gr_enc, 'enc'));

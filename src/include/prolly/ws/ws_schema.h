@@ -367,6 +367,9 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.
  *
+ * Default privileges in the named schema for the current role that would change what
+ * this makes, which the record does not say, raise ERRCODE_FEATURE_NOT_SUPPORTED.
+ *
  * A column's STORAGE plain is in this statement, before any rows.  A row made
  * before that was set, too long to fit without TOAST, is refused when made again,
  * as it is by restoring from pg_dump.
@@ -431,13 +434,6 @@ extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *sch
  * after the rows.  Checked as the table's statement is.
  */
 extern void ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out);
-
-/*
- * Raises ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would give what is made
- * in the named schema, by the current role, grants a record does not say.  To call
- * before making anything there.
- */
-extern void ws_schema_check_destination(const char *schema);
 
 /*
  * The ALTER TABLE ONLY giving a table its owner, in the named schema, appended to
