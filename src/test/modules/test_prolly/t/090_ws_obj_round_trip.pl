@@ -753,6 +753,8 @@ $node->safe_psql('postgres', q{
 	CREATE TRIGGER on_view INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION trf();
 	CREATE TRIGGER on_parted BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
 	CREATE TRIGGER off_for_now BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf();
+	CREATE TRIGGER off_parted BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
+	ALTER TABLE p DISABLE TRIGGER off_parted;
 	CREATE TRIGGER replica_only BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf();
 	CREATE TRIGGER always_on BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trf();
 	CREATE TRIGGER " ON tr.t x" BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION trf();
@@ -810,9 +812,12 @@ is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_trigger g WHERE g.tgr
 is( $node->safe_psql('postgres', q{SELECT string_agg(tgname || ' ' || tgenabled::text, ', ' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'tr2.t'::regclass AND tgname IN ('off_for_now', 'replica_only', 'always_on')}),
 	'always_on A, off_for_now D, replica_only R', 'a trigger fires as it did');
 is($node->safe_psql('postgres', q{SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'off_rule' AND ev_class = 'tr2.t'::regclass}), 'D', 'and a rule');
+is($node->safe_psql('postgres', q{SELECT tgenabled FROM pg_trigger WHERE tgrelid = 'tr2.p1'::regclass AND tgname = 'off_parted'}), 'D', 'and a partition\'s clone goes with its table\'s');
 
 my @tr_refused = (
 	[ q{CREATE TABLE pg_stats (a int); CREATE RULE r AS ON DELETE TO tr5.pg_stats DO INSTEAD NOTHING}, 'named as one in the catalogs' ],
+	[ q{CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; CREATE CONSTRAINT TRIGGER g AFTER INSERT ON t FROM v FOR EACH ROW EXECUTE FUNCTION f()}, 'from what is no table' ],
+	[ q{CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (9); CREATE TRIGGER g BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION f(); COMMENT ON TRIGGER g ON p1 IS 'x'}, 'a comment of its own' ],
 	[ q{CREATE TABLE pg_class (a int); CREATE POLICY y ON tr5.pg_class USING (true)}, 'named as one in the catalogs' ],
 	[ q{CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (9); CREATE TRIGGER g BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION f(); ALTER TABLE p1 DISABLE TRIGGER g}, 'fires otherwise than its table' ],
 	[ q{CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE FOREIGN DATA WRAPPER fdw_tr; CREATE SERVER srv_tr FOREIGN DATA WRAPPER fdw_tr; CREATE FOREIGN TABLE ft (a int) SERVER srv_tr; CREATE TRIGGER g BEFORE INSERT ON ft FOR EACH ROW EXECUTE FUNCTION f()}, 'what no commit holds' ],
@@ -832,6 +837,13 @@ for my $case (@tr_refused)
 	isnt($rc6, 0, "refused: $sql");
 	like($err6, qr/\Q$why\E/, "for why: $sql");
 }
+
+# a policy's role whose name another encoding on this cluster may read otherwise
+$node->safe_psql('postgres', q{CREATE DATABASE trlatin TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+$node->safe_psql('postgres', q{CREATE ROLE "g_é" NOLOGIN; CREATE SCHEMA tr9; CREATE TABLE tr9.t (a int); CREATE POLICY y ON tr9.t TO "g_é" USING (true)});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('tr9')});
+like($err, qr/names a role not in ASCII/, 'a policy\'s role not in ASCII, in a cluster of mixed encodings, is refused');
+$node->safe_psql('postgres', q{DROP SCHEMA tr9 CASCADE; DROP ROLE "g_é"; DROP DATABASE trlatin});
 
 # since a snapshot, one to try again
 for my $change (q{COMMENT ON POLICY mine ON tr.t IS 'later'}, q{COMMENT ON TRIGGER before_ins ON tr.t IS 'later'}, q{COMMENT ON RULE noop ON tr.audit IS 'later'},

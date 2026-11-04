@@ -1190,6 +1190,7 @@ for my $t (
 	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
 	[ 'seqelse', q{CREATE SEQUENCE other.seq_else; CREATE TABLE src.seqelse (a bigint DEFAULT nextval('other.seq_else'))} ],
 	[ 'seqid', q{CREATE TABLE src.seqid_p (id integer GENERATED ALWAYS AS IDENTITY); CREATE TABLE src.seqid (a bigint DEFAULT currval('src.seqid_p_id_seq'))} ],
+	[ 'intoff', q{CREATE TABLE src.intoff (a integer UNIQUE DEFERRABLE); ALTER TABLE src.intoff DISABLE TRIGGER ALL} ],
 	[ 'seqidc', q{CREATE TABLE src.seqidc (a bigint CHECK (a < currval('src.seqid_p_id_seq')))} ],
 	[ 'seqidi', q{CREATE TABLE src.seqidi (a oid); CREATE INDEX ON src.seqidi (a) WHERE a <> 'src.seqid_p_id_seq'::regclass::oid} ],
 	[ 'tabref', q{CREATE TABLE src.tabref (a oid DEFAULT 'src.seqid_p'::regclass)} ],
@@ -1246,7 +1247,7 @@ for my $t (
 	my ($ret, $out, $err) = $node->psql('postgres',
 		qq{SELECT test_ws_schema_bytes('src', '$name')});
 	my %uses_other = (seqid => 1, seqidc => 1, seqidi => 1, tabref => 1);
-	my $why = $uses_other{$name} ? 'which no order could make first' : $name eq 'seqgr' ? 'a column of its identity sequence' : $refused_for{$name} // '';
+	my $why = $uses_other{$name} ? 'which no order could make first' : $name eq 'intoff' ? 'a trigger of its own has been disabled' : $name eq 'seqgr' ? 'a column of its identity sequence' : $refused_for{$name} // '';
 	like($err, qr/cannot be read yet.*\Q$why\E/, "$name refused");
 }
 my ($tret, $tout, $terr) = $node->psql('postgres',
