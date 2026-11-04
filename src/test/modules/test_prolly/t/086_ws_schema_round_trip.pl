@@ -682,12 +682,32 @@ for my $table ('so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 
 }
 isnt($node->safe_psql('postgres', q{SELECT reloptions FROM pg_class WHERE oid = 'src.so_tab'::regclass}), '', '(it has some)');
 
+# a TOAST table's parameters on an old snapshot: its columns since changed, so what
+# they need is not what the snapshot's would
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.ot1 (a int, t text STORAGE PLAIN) WITH (toast.autovacuum_enabled = false);
+	CREATE TABLE src.ot2 (a int, t text) WITH (toast.autovacuum_enabled = false);
+	ALTER TABLE src.ot2 DROP COLUMN t;
+	CREATE TABLE src.ot3 (a int, t text) WITH (toast.autovacuum_enabled = false);
+});
+for my $t ([ 'ot1', 'ALTER TABLE src.ot1 ALTER t SET STORAGE EXTENDED' ], [ 'ot2', 'ALTER TABLE src.ot2 ADD u text' ],
+	[ 'ot3', 'ALTER TABLE src.ot3 ALTER t SET STORAGE PLAIN' ])
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $t->[1]);
+	$old->query(qq{SELECT test_ws_schema_bytes('src', '$t->[0]')});
+	like($old->{stderr}, qr/added or its storage changed since this transaction's snapshot/,
+		"$t->[0] changed since a snapshot refused as such");
+	$old->query('ROLLBACK');
+	$old->quit;
+}
+
 # parameters in another order than the record's, however they came to be: the same bytes
 $node->safe_psql('postgres', q{
 	CREATE TABLE src.so_un (a integer) WITH (parallel_workers = 2, fillfactor = 50, autovacuum_enabled = false);
 	ALTER TABLE src.so_un SET (toast_tuple_target = 200), ALTER a SET (n_distinct_inherited = 7, n_distinct = 5);
-	CREATE TABLE src.so_un2 (a integer) WITH (autovacuum_enabled = false, fillfactor = 50, parallel_workers = 2, toast_tuple_target = 200);
-	ALTER TABLE src.so_un2 ALTER a SET (n_distinct = 5, n_distinct_inherited = 7);
 	CREATE SCHEMA so_dst VERSIONED;
 });
 {
@@ -1417,6 +1437,14 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 		qq{SET client_encoding = UTF8; SELECT test_ws_schema_set_inherited(decode('$inh_utf8', 'hex'), 'lié');});
 	like($err, qr/table "enfanté" says "colonné" is inherited/, 'a lie told in the server\'s encoding');
 }
+{
+	# (the name in the server's encoding, in what is refused)
+	$node->safe_psql('lat', q{SET client_encoding = UTF8;
+		CREATE TABLE enc."toasté" (a int, t text) WITH (toast.autovacuum_enabled = false); ALTER TABLE enc."toasté" DROP COLUMN t});
+	my ($ret, $out, $err) = $node->psql('lat', q{SET client_encoding = UTF8; SELECT test_ws_schema_bytes('enc', 'toasté')});
+	like($err, qr/table "toasté" cannot be read yet/, 'a TOAST table\'s refusal in the server\'s encoding');
+}
+
 # settings around names in each encoding (parameters themselves are ASCII: the server refuses any other)
 my $so_sql = q{
 	SET client_encoding = UTF8;

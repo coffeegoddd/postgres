@@ -229,7 +229,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * What the record cannot yet hold and would lose (inheritance or a partition or
  * partitioned table across schemas, a tablespace or another access method, a
  * replica identity, a TOAST table's parameters where no TOAST table is needed any
- * more, a key's options, a sequence's, a default using one, a partition detached, of another identity
+ * more, a key's options, a sequence's, a default using one, a partition
+ * detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
  * an index's options or its dependence on an extension, comments, grants, two
@@ -271,14 +272,14 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * not given back.  A schema with a problem raises an error.  What an
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.
+  *
+ * A column's STORAGE plain is in this statement, before any rows.  A row made
+ * before that was set, too long to fit without TOAST, is refused when made again,
+ * as it is by restoring from pg_dump.
  */
 extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out);
 
 /*
- * (A column's STORAGE plain is in the table's own statement, before any rows.  A
- * row made before that was set, too long to fit without TOAST, is refused when made
- * again, as it is by restoring from pg_dump.)
- *
  * The ALTER TABLE ONLY giving the table's columns their statistics targets and
  * storage parameters, which CREATE TABLE has no clause for, in the named schema,
  * appended to out, to run right after the table's own statement; nothing, if none

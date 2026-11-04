@@ -1926,6 +1926,7 @@ test_storage_problems(void)
 	CHECK(problem_has(one_column_problem(COL(), twice, 2), "not in order"));
 	CHECK(problem_has(one_column_problem(COL(), toastfirst, 2), "not in order"));
 	CHECK(one_column_problem(COL(.storage = 'x',.compression = 'l',.has_stattarget = true,.stattarget = 10000), &toasted, 1) == NULL);
+	CHECK(problem_has(one_column_problem(COL(), &toasted, WS_MAX_OPTIONS + 1), "no table has"));
 #undef COL
 	{
 		static const char zero[] =
@@ -1963,6 +1964,9 @@ test_storage_problems(void)
 		static const char toomany[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "w" "\x81\x02";
+		static const char colmany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "\x00" "\x00" "\x00" "\x81\x02";
 		static const char wrongorder[] =
 			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
 			"\x00" "\x00" "\x00" "\x00" "c" "\x01" "\x07" "e" "\x00" "\x00" "\x00" "w" "\x01" "\x00" "\x01" "x" "\x01" "y";
@@ -1982,6 +1986,7 @@ test_storage_problems(void)
 		check_refused(dup, sizeof(dup) - 1, "not in attribute order");
 		check_refused(coloptions, sizeof(coloptions) - 1, "more options than bytes");
 		check_refused(toomany, sizeof(toomany) - 1, "more options than a table has");
+		check_refused(colmany, sizeof(colmany) - 1, "more options than a table has");
 		check_refused(wrongorder, sizeof(wrongorder) - 1, "left over");
 	}
 }

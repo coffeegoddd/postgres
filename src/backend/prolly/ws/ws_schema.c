@@ -3166,7 +3166,7 @@ read_option(const char *held, bool toast, WsOption *o)
 
 /* The table's storage parameters, its TOAST table's, and its columns'. */
 static void
-read_options(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
@@ -3177,19 +3177,40 @@ read_options(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 	/*
 	 * A TOAST table outlives the need for one, and its parameters with it, where
 	 * CREATE TABLE would make none and lose them: what decides is what it would.
+	 * That looks at the table as it is now, so the columns must be as this
+	 * snapshot saw them, under the lock, for its answer to be about them.
 	 */
 	for (int i = 0; i < rows.nrows; i++)
 		if (ws_sql_value(&rows, i, 1)[0] == 't')
 		{
 			Relation	r = relation_open(atooid(oid), NoLock);
-			bool		needs = table_relation_needs_toast_table(r);
+			TupleDesc	desc = RelationGetDescr(r);
+			int			live = 0;
+			bool		same = true;
+			bool		needs;
 
+			for (int a = 0; a < desc->natts; a++)
+				live += TupleDescAttr(desc, a)->attisdropped ? 0 : 1;
+			same = live == cols->nrows;
+			for (int k = 0; k < cols->nrows && same; k++)
+			{
+				int			attnum = atoi(ws_sql_value(cols, k, 0));
+
+				same = attnum <= desc->natts &&
+					TupleDescAttr(desc, attnum - 1)->attstorage == ws_sql_value(cols, k, 17)[0];
+			}
+			needs = table_relation_needs_toast_table(r);
 			relation_close(r, NoLock);
+			if (!same)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("a column of table \"%s\" was added or its storage changed since this transaction's snapshot",
+								table)));
 			if (!needs)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("the schema of table \"%s\" cannot be read yet: its TOAST table has parameters, and it no longer needs one",
-								out->name)));
+								table)));
 			break;
 		}
 	if (rows.nrows > 0)
@@ -3384,7 +3405,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
 				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
 				   "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
-				   "  a.attcompression::text, a.attstattarget::text "
+				   "  a.attcompression::text, a.attstattarget::text, a.attstorage::text "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
@@ -3549,7 +3570,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
-	read_options(ws_sql_value(&rel, 0, 0), &cols, out);
+	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	if (ws_sql_value(&rel, 0, 4)[0] != 't')
 		read_inheritance(ws_sql_value(&rel, 0, 0), &cols, &others, out);
 	if (ws_sql_value(&rel, 0, 4)[0] == 't')
