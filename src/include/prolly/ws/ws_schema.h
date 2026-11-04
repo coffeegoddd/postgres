@@ -96,6 +96,9 @@ typedef struct WsConstraint
 	bool		nulls_not_distinct;
 	bool		deferrable;
 	bool		initdeferred;
+	bool		not_valid;		/* a check's: a statement of its own, after the rows */
+	bool		no_inherit;		/* a check's */
+	bool		not_enforced;	/* a check's; which says it is not valid, too */
 	WsIndex		excl;			/* an exclusion's index */
 } WsConstraint;
 
@@ -121,7 +124,8 @@ typedef struct WsTableSchema
  * formed, a key named if it has columns, its columns its own, stored, not
  * null and distinct; other constraints in order by name, none named as another
  * or as the key, a check with its expression and nothing else, a unique one
- * with its columns, its own, stored and distinct, an exclusion with an unnamed
+ * with its columns, its own, stored and distinct, a check alone with its
+ * flags, not valid or not enforced and not both, an exclusion with an unnamed
  * index and each key an operator, none alike another, initially deferred only
  * if deferrable; indexes in order by name, none named as a constraint with an
  * index or the key, with a method and keys, each a column of its own or an
@@ -208,7 +212,8 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * (prolly/ws/ws_sql.h) makes the text the same whoever asks.  A commit may
  * have come from anywhere: the whole statement is parsed and compared with the
  * record, and if it is anything but one CREATE TABLE of just these columns,
- * types, clauses, expressions and key, it raises ERRCODE_DATA_CORRUPTED and is
+ * types, clauses, expressions and key, and each constraint but a check not valid
+ * (ws_schema_add_check), it raises ERRCODE_DATA_CORRUPTED and is
  * not given back.  A schema with a problem raises an error.  What an
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.
@@ -222,6 +227,13 @@ extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, B
  * ERRCODE_DATA_CORRUPTED and is not given back.
  */
 extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The ALTER TABLE adding the table's nth constraint, a check not valid, in the
+ * named schema, appended to out, to run after the table's rows: on any earlier,
+ * the rows it lets stand would be refused.  Checked as the table's statement is.
+ */
+extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
  * A name as a commit holds it, raising ERRCODE_NAME_TOO_LONG past a commit's
