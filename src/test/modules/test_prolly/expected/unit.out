@@ -193,7 +193,8 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template                             | ok     | 
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
-(181 rows)
+ ws_tags         | tupdesc                              | ok     | 
+(182 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

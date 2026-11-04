@@ -14,6 +14,8 @@
 #include "postgres.h"
 
 #include "engine_test_util.h"
+#include "access/tupdesc.h"
+#include "catalog/pg_type_d.h"
 #include "prolly/ws/ws_tags.h"
 #include "test_prolly.h"
 
@@ -185,14 +187,43 @@ test_template_refused(void)
 	expect_error(template_not_one, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
-/* The tag a new column gets: this value on any cluster, its input's first 60 bits. */
+/*
+ * The tag a new column gets: this value on every cluster, or two branches'
+ * clones would disagree; different for anything else it is derived from, and
+ * no parts run together.
+ */
 static void
 test_derive(void)
 {
-	CHECK_EQ(ws_tag_derive("t", "a", "integer", 0), UINT64CONST(759085911278661888));
-	CHECK(ws_tag_derive("t", "a", "integer", 0) != ws_tag_derive("t", "a", "integer", 1));
-	CHECK(ws_tag_derive("t", "a", "integer", 0) != ws_tag_derive("t", "b", "integer", 0));
-	CHECK(ws_tag_derive("t", "a", "integer", 0) < (UINT64CONST(1) << 60));
+	uint64		tag = ws_tag_derive("t", "a", "pg_catalog.int4(-1)", 0);
+
+	CHECK_EQ(tag, UINT64CONST(254872713275789205));
+	CHECK(tag < (UINT64CONST(1) << 60));
+	CHECK(tag != ws_tag_derive("t", "a", "pg_catalog.int4(-1)", 1));
+	CHECK(tag != ws_tag_derive("t", "b", "pg_catalog.int4(-1)", 0));
+	CHECK(tag != ws_tag_derive("u", "a", "pg_catalog.int4(-1)", 0));
+	CHECK(tag != ws_tag_derive("t", "a", "pg_catalog.int8(-1)", 0));
+	CHECK(ws_tag_derive("ab", "c", "t", 0) != ws_tag_derive("a", "bc", "t", 0));
+}
+
+/* A descriptor's entry starts with no tag, and a tag makes two different. */
+static void
+test_tupdesc(void)
+{
+	TupleDesc	a = CreateTemplateTupleDesc(2);
+	TupleDesc	b;
+
+	TupleDescInitEntry(a, 1, "x", INT4OID, -1, 0);
+	TupleDescInitBuiltinEntry(a, 2, "y", INT4OID, -1, 0);
+	TupleDescFinalize(a);
+	CHECK_EQ(TupleDescAttr(a, 0)->attcoltag, 0);
+	CHECK_EQ(TupleDescAttr(a, 1)->attcoltag, 0);
+	b = CreateTupleDescCopy(a);
+	CHECK(equalTupleDescs(a, b));
+	TupleDescAttr(b, 0)->attcoltag = 7;
+	CHECK(!equalTupleDescs(a, b));
+	FreeTupleDesc(a);
+	FreeTupleDesc(b);
 }
 
 static const ProllyUnitTest tests[] = {
@@ -202,6 +233,7 @@ static const ProllyUnitTest tests[] = {
 	{"template", test_template},
 	{"template_refused", test_template_refused},
 	{"derive", test_derive},
+	{"tupdesc", test_tupdesc},
 };
 
 const ProllyUnitSuite unit_ws_tags_suite = {"ws_tags", tests, lengthof(tests)};

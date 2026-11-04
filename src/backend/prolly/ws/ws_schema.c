@@ -4,7 +4,7 @@
  *	  The working-set model's table schemas (prolly/ws/ws_schema.h), and
  *	  "binary", their codec.
  *
- * version byte, name, persistence byte, uvarint ncols, then each column:
+ * version byte, name, uvarint ncols, then each column:
  * uvarint tag, name, type, kind byte, not null byte (0 or 1), identity byte,
  * default, collation; then the key's name, uvarint nkey and the key's tags.  A
  * string is its uvarint length and bytes, in its shortest form; a default,
@@ -19,6 +19,9 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/relation.h"
+#include "access/table.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
@@ -28,12 +31,15 @@
 #include "nodes/parsenodes.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/regproc.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
@@ -47,8 +53,6 @@ ws_schema_problem(const WsTableSchema *s)
 		return "a table with no name";
 	if (strlen(s->name) >= NAMEDATALEN)
 		return "a table's name too long";
-	if (s->persistence != WS_PERSISTENCE_PERMANENT && s->persistence != WS_PERSISTENCE_UNLOGGED)
-		return "a table of no known persistence";
 	if (s->ncols < 0 || s->ncols > WS_MAX_COLS)
 		return "more columns than a table can have";
 	for (int i = 0; i < s->ncols; i++)
@@ -57,6 +61,8 @@ ws_schema_problem(const WsTableSchema *s)
 
 		if (c->name == NULL || c->name[0] == '\0')
 			return "a column with no name";
+		if (c->tag == 0)
+			return "a column with no tag";
 		if (strlen(c->name) >= NAMEDATALEN)
 			return "a column's name too long";
 		if (c->type == NULL || c->type[0] == '\0')
@@ -136,7 +142,6 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		elog(ERROR, "%s", problem);
 	buf_append_byte(out, WS_SCHEMA_VERSION);
 	put_string(out, s->name);
-	buf_append_byte(out, (uint8) s->persistence);
 	buf_append_uvarint(out, (uint64) s->ncols);
 	for (int i = 0; i < s->ncols; i++)
 	{
@@ -237,7 +242,6 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	if (get_byte(&p, end) != WS_SCHEMA_VERSION)
 		malformed("a version not known");
 	s->name = get_string(&p, end);
-	s->persistence = (char) get_byte(&p, end);
 	n = get_uvarint(&p, end);
 	if (n > WS_MAX_COLS)
 		malformed("more columns than a table can have");
@@ -385,7 +389,7 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	bool		any = false;
 
-	put_text(out, s->persistence == WS_PERSISTENCE_UNLOGGED ? "CREATE UNLOGGED TABLE " : "CREATE TABLE ");
+	put_text(out, "CREATE TABLE ");
 	put_identifier(out, schema);
 	put_text(out, ".");
 	put_identifier(out, s->name);
@@ -650,8 +654,7 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		strcmp(create->relation->schemaname, schema) != 0 ||
 		strcmp(create->relation->relname, s->name) != 0)
 		not_the_record(s, "another table's name");
-	if (create->relation->relpersistence != (s->persistence == WS_PERSISTENCE_UNLOGGED ?
-											 RELPERSISTENCE_UNLOGGED : RELPERSISTENCE_PERMANENT))
+	if (create->relation->relpersistence != RELPERSISTENCE_PERMANENT)
 		not_the_record(s, "another persistence");
 	if (create->inhRelations != NIL || create->partbound != NULL || create->partspec != NULL ||
 		create->ofTypename != NULL || create->constraints != NIL || create->nnconstraints != NIL ||
@@ -737,13 +740,6 @@ ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 	buf_free(&sql);
 }
 
-uint64
-ws_schema_derived_tag(void *arg, const char *table, const char *column, const char *type,
-					  int attnum, int attempt)
-{
-	return ws_tag_derive(table, column, type, attempt);
-}
-
 static char *
 to_utf8(const char *text)
 {
@@ -810,12 +806,10 @@ static const char *const unsupported_sql =
 "                 AND p.refobjid = c.oid AND p.deptype = 'a') "
 "    THEN 'it owns a sequence' "
 "  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
-"               JOIN pg_class qc ON qc.oid = q.seqrelid "
 "               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
 "               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
 "                 AND p.refobjid = c.oid AND p.deptype = 'i' AND a.attidentity <> '' AND "
-"                 (qc.relpersistence <> c.relpersistence OR "
-"                  q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
+"                 (q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
@@ -877,8 +871,7 @@ read_tag_of(void *arg, const char *name, uint64 *tag)
 }
 
 bool
-ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void *arg,
-			   WsTableSchema *out)
+ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 {
 	const char *params[2] = {schema, table};
 	int			level = WsSql->begin();
@@ -899,7 +892,7 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 	{
 		Oid			now;
 
-		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text "
+		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text "
 				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 				   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
 		now = rel.nrows == 0 ? InvalidOid : atooid(ws_sql_value(&rel, 0, 0));
@@ -934,6 +927,10 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the schema of temporary table \"%s\" cannot be read yet", table)));
+	if (atoi(ws_sql_value(&rel, 0, 3)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" is not in a versioned schema", table)));
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 		WsSqlRows	why;
@@ -947,8 +944,6 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 		ws_sql_rows_free(&why);
 	}
 	out->name = name_to_utf8(table);
-	out->persistence = persistence[0] == RELPERSISTENCE_UNLOGGED ?
-		WS_PERSISTENCE_UNLOGGED : WS_PERSISTENCE_PERMANENT;
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 
@@ -957,7 +952,8 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 				   "  a.attidentity::text, a.attgenerated::text, "
 				   "  pg_get_expr(d.adbin, d.adrelid), "
 				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
-				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END "
+				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
+				   "  a.attcoltag::text "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
@@ -985,8 +981,6 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 		const char *identity = ws_sql_value(&cols, i, 4);
 		const char *generated = ws_sql_value(&cols, i, 5);
 		const char *collation = ws_sql_value(&cols, i, 7);
-		bool		again;
-		int			attempt = 0;
 
 		rc.names[i] = ws_sql_value(&cols, i, 1);
 		c->name = name_to_utf8(rc.names[i]);
@@ -996,15 +990,7 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 		c->kind = generated[0] == ATTRIBUTE_GENERATED_STORED ? WS_COL_GENERATED_STORED :
 			generated[0] == ATTRIBUTE_GENERATED_VIRTUAL ? WS_COL_GENERATED_VIRTUAL : WS_COL_STORED;
 		c->collation = collation ? to_utf8(collation) : NULL;
-		/* (a tag another column of the table has: the next one) */
-		do
-		{
-			c->tag = tag_fn(arg, out->name, c->name, c->type, atoi(ws_sql_value(&cols, i, 0)),
-							attempt++);
-			again = false;
-			for (int j = 0; j < i; j++)
-				again |= out->cols[j].tag == c->tag;
-		} while (again);
+		c->tag = (uint64) strtoi64(ws_sql_value(&cols, i, 8), NULL, 10);
 		rc.tags[i] = c->tag;
 	}
 	/* (once every column has its tag: an expression may refer to any) */
@@ -1054,4 +1040,48 @@ ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void
 	ws_sql_rows_free(&key);
 	WsSql->end(level);
 	return true;
+}
+
+void
+ws_schema_set_tags(const char *schema, const WsTableSchema *s)
+{
+	const char *problem = ws_schema_problem(s);
+	char	   *table;
+	Oid			nsp = get_namespace_oid(schema, false);
+	Oid			relid;
+	Relation	rel;
+	Relation	attrs;
+	int			live = 0;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (NamespaceBranch(nsp) == 0)
+		elog(ERROR, "schema \"%s\" is not versioned, and its columns have no tags", schema);
+	table = name_from_utf8(s->name);
+	relid = get_relname_relid(table, nsp);
+	if (!OidIsValid(relid))
+		elog(ERROR, "no table \"%s\" in schema \"%s\"", table, schema);
+	rel = relation_open(relid, AccessExclusiveLock);
+	for (int i = 0; i < RelationGetNumberOfAttributes(rel); i++)
+		if (!TupleDescAttr(RelationGetDescr(rel), i)->attisdropped)
+			live++;
+	/* (every column the record's, or the table could hold a tag twice) */
+	if (live != s->ncols)
+		elog(ERROR, "table \"%s\" has %d columns, its record %d", table, live, s->ncols);
+	relation_close(rel, NoLock);
+	attrs = table_open(AttributeRelationId, RowExclusiveLock);
+	for (int i = 0; i < s->ncols; i++)
+	{
+		char	   *name = name_from_utf8(s->cols[i].name);
+		HeapTuple	tup = SearchSysCacheCopyAttName(relid, name);
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "no column \"%s\" in table \"%s\"", name, table);
+		((Form_pg_attribute) GETSTRUCT(tup))->attcoltag = (int64) s->cols[i].tag;
+		CatalogTupleUpdate(attrs, &tup->t_self, tup);
+		heap_freetuple(tup);
+		pfree(name);
+	}
+	table_close(attrs, RowExclusiveLock);
+	pfree(table);
 }

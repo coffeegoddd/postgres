@@ -33,10 +33,6 @@
 #define WS_IDENTITY_ALWAYS 'a'
 #define WS_IDENTITY_BY_DEFAULT 'd'
 
-/* (not temporary: a temporary table is in no versioned schema) */
-#define WS_PERSISTENCE_PERMANENT 'p'
-#define WS_PERSISTENCE_UNLOGGED 'u'
-
 typedef struct WsColumn
 {
 	uint64		tag;
@@ -52,7 +48,6 @@ typedef struct WsColumn
 typedef struct WsTableSchema
 {
 	char	   *name;
-	char		persistence;	/* WS_PERSISTENCE_* */
 	int			ncols;
 	WsColumn   *cols;			/* attribute order */
 	char	   *key_name;		/* the primary key's constraint, or NULL: none */
@@ -106,21 +101,11 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
- * A column's tag, by the caller's table of them; attempt as ws_tag_derive's.
- * table, column and type are UTF8.
- */
-typedef uint64 (*WsSchemaTagFn) (void *arg, const char *table, const char *column,
-								 const char *type, int attnum, int attempt);
-
-/* (the tag a new column gets, for callers that keep none) */
-extern uint64 ws_schema_derived_tag(void *arg, const char *table, const char *column,
-									const char *type, int attnum, int attempt);
-
-/*
- * The schema of a table, from the catalogs, through WsSql: false if the
- * schema has no ordinary table of that name.  What the record cannot yet hold
- * and would lose (inheritance and partitions, storage settings, a key's
- * options, a sequence's, a default using one) raises
+ * The schema of a table, from the catalogs, through WsSql: false if the schema
+ * has no ordinary table of that name.  Each column's tag is its catalog row's,
+ * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
+ * What the record cannot yet hold and would lose (inheritance and partitions,
+ * storage settings, a key's options, a sequence's, a default using one) raises
  * ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
  * sequence's are not held, and are made again.
@@ -133,8 +118,14 @@ extern uint64 ws_schema_derived_tag(void *arg, const char *table, const char *co
  * text has no dependency to see, so the record holds that default as it is.
  * What it gives is the caller's to ws_schema_free.
  */
-extern bool ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag, void *arg,
-						   WsTableSchema *out);
+extern bool ws_schema_read(const char *schema, const char *table, WsTableSchema *out);
+
+/*
+ * Gives the columns of a table just made from a record the tags the record
+ * says, in place of those they were given as new.  The caller makes them
+ * visible, with CommandCounterIncrement.
+ */
+extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
 
 /*
  * The CREATE TABLE statement for the table, in the named schema, appended to

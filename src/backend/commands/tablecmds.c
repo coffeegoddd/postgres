@@ -89,6 +89,7 @@
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_log.h"
+#include "prolly/ws/ws_tags.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
@@ -3923,6 +3924,7 @@ renameatt_internal(Oid myrelid,
 	 */
 	targetrelation = relation_open(myrelid, AccessExclusiveLock);
 	renameatt_check(myrelid, RelationGetForm(targetrelation), recursing);
+	ws_tags_check_name(targetrelation, newattname);
 
 	/*
 	 * if the 'recurse' flag is set then we are supposed to rename this
@@ -4349,6 +4351,7 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 	 * specially.
 	 */
 	targetrelation = relation_open(myrelid, is_index ? ShareUpdateExclusiveLock : AccessExclusiveLock);
+	ws_tags_check_name(targetrelation, newrelname);
 	namespaceId = RelationGetNamespace(targetrelation);
 
 	/*
@@ -7479,6 +7482,8 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	CheckAttributeType(NameStr(attribute->attname), attribute->atttypid, attribute->attcollation,
 					   list_make1_oid(rel->rd_rel->reltype),
 					   (attribute->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? CHKATYPE_IS_VIRTUAL : 0));
+
+	attribute->attcoltag = (int64) ws_tag_new_column(rel, attribute);
 
 	InsertPgAttributeTuples(attrdesc, tupdesc, myrelid, NULL, NULL);
 

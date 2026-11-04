@@ -2,7 +2,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A table's schema read from the catalogs, encoded, and made again in another
-# schema from its bytes alone is the table it was, by pg_dump.  The record's
+# schema from its bytes alone is the table it was, by pg_dump, and the same
+# bytes.  A column's tag is its own through what happens to it.  The record's
 # bytes are the same whatever the database's encoding and the session's
 # settings; text the encoding cannot hold is refused, not changed.
 use strict;
@@ -15,10 +16,20 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('ws_round_trip');
 $node->init(extra => ['--encoding=UTF8', '--locale=C']);
 $node->start;
+
+# (every connection on a branch of its own database)
+my $prepare = sub {
+	my ($db) = @_;
+	local $ENV{PGOPTIONS} = '';
+	$node->safe_psql($db, 'CREATE EXTENSION test_prolly');
+	return $node->safe_psql($db, 'SELECT pg_branch_id_allocate()');
+};
+my $branch = $prepare->('postgres');
+$ENV{PGOPTIONS} = "-c catalog_branch=$branch";
+
 $node->safe_psql('postgres', q{
-	CREATE EXTENSION test_prolly;
-	CREATE SCHEMA src;
-	CREATE SCHEMA dst;
+	CREATE SCHEMA src VERSIONED;
+	CREATE SCHEMA dst VERSIONED;
 	CREATE TYPE src.mood AS ENUM ('a', 'b');
 	CREATE DOMAIN src.posint AS integer CHECK (VALUE > 0);
 	CREATE TABLE src.plain (a integer, b text);
@@ -37,7 +48,8 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src."Odd Table" ("Odd Name" integer, "select" integer DEFAULT 1,
 		"a""b" integer GENERATED ALWAYS AS ("Odd Name" + "select") STORED,
 		CONSTRAINT "Odd Key" PRIMARY KEY ("Odd Name"));
-	CREATE UNLOGGED TABLE src.unlogged (a integer);
+	CREATE TABLE src.renamed (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
+	ALTER TABLE src.renamed RENAME a TO z;
 	CREATE SCHEMA other;
 	CREATE COLLATION other."My Coll" FROM "C";
 	CREATE DOMAIN other.cdom AS text COLLATE "C";
@@ -53,15 +65,16 @@ $node->safe_psql('postgres', q{
 });
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
-	'colls', 'Odd Table', 'unlogged', 'dropped', 'settings', 'names', 'ats');
+	'colls', 'Odd Table', 'renamed', 'dropped', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
 my $bytes = sub {
-	my ($n, $db, $table, $prefix) = @_;
+	my ($n, $db, $table, $prefix, $schema) = @_;
 	(my $lit = $table) =~ s/'/''/g;
+	$schema //= 'src';
 	return $n->safe_psql($db,
-		($prefix // '') . qq{SELECT encode(test_ws_schema_bytes('src', '$lit'), 'hex')});
+		($prefix // '') . qq{SELECT encode(test_ws_schema_bytes('$schema', '$lit'), 'hex')});
 };
 
 # made again from the bytes alone
@@ -71,6 +84,7 @@ for my $table (@tables)
 	isnt($hex, '', "$table read");
 	$node->safe_psql('postgres',
 		qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst')});
+	is($bytes->($node, 'postgres', $table, undef, 'dst'), $hex, "$table the same bytes, made again");
 }
 
 # by pg_dump, the same table, but for its schema's name (the types a table
@@ -133,7 +147,6 @@ for my $t (
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
 	[ 'toastp', 'CREATE TABLE src.toastp (a text) WITH (toast.autovacuum_enabled = false)' ],
-	[ 'seqp', 'CREATE UNLOGGED TABLE src.seqp (a int GENERATED ALWAYS AS IDENTITY); ALTER SEQUENCE src.seqp_a_seq SET LOGGED' ],
 	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
 	[ 'clus', 'CREATE TABLE src.clus (a int PRIMARY KEY); ALTER TABLE src.clus CLUSTER ON clus_pkey' ],
 	[ 'pol', 'CREATE TABLE src.pol (a int); CREATE POLICY p ON src.pol USING (true)' ],
@@ -210,7 +223,7 @@ my $while_waiting = sub {
 for my $t (
 	[ 'gone', 'DROP TABLE src.gone' ],
 	[ 'moved', 'ALTER TABLE src.moved RENAME TO moved2' ],
-	[ 'other_sch', 'ALTER TABLE src.other_sch SET SCHEMA other' ])
+	[ 'other_sch', 'ALTER TABLE src.other_sch SET SCHEMA dst' ])
 {
 	like($while_waiting->($t->[0], $t->[1]), qr/^t\n/, "$t->[0] while waiting: no such table");
 }
@@ -220,20 +233,153 @@ like(
 		q{position('zzzcolumn'::bytea in test_ws_schema_bytes('src', 'again')) > 0}),
 	qr/^t\n/,
 	'dropped and made again while waiting: the table now of that name');
-like(
-	$while_waiting->(
-		'unl', 'ALTER TABLE src.unl SET UNLOGGED',
-		q{position('\x03756e6c75'::bytea in test_ws_schema_bytes('src', 'unl')) > 0}),
-	qr/^t\n/,
-	'made unlogged while waiting: as it is now');
-
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'nosuch') IS NULL}),
 	't', 'no such table');
+
+# a tag is the column's, whatever happens to it
+my $tag = sub {
+	my ($table, $column) = @_;
+	return $node->safe_psql('postgres',
+		qq{SELECT attcoltag FROM pg_attribute WHERE attrelid = '$table'::regclass AND attname = '$column'});
+};
+$node->safe_psql('postgres',
+	q{CREATE TABLE src.life (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED)});
+my $life = $tag->('src.life', 'a');
+isnt($life, '0', 'a column of a versioned table has a tag');
+isnt($tag->('src.life', 'b'), $life, 'each its own');
+$node->safe_psql('postgres', q{ALTER TABLE src.life RENAME a TO r});
+is($tag->('src.life', 'r'), $life, 'kept by a rename');
+$node->safe_psql('postgres', q{ALTER TABLE src.life RENAME TO life2});
+is($tag->('src.life2', 'r'), $life, 'and by the table renamed');
+$node->safe_psql('postgres', q{ALTER TABLE src.life2 ADD COLUMN x integer});
+my $x = $tag->('src.life2', 'x');
+isnt($x, '0', 'a column added has one');
+$node->safe_psql('postgres', q{ALTER TABLE src.life2 ALTER x TYPE text});
+is($tag->('src.life2', 'x'), $x, 'kept by a new type, the table rewritten');
+$node->safe_psql('postgres', q{VACUUM FULL src.life2});
+is($tag->('src.life2', 'r'), $life, 'and by VACUUM FULL');
+
+# the expression follows: made from the bytes, under the column's new name
+my $renamed = $bytes->($node, 'postgres', 'life2');
+$node->safe_psql('postgres', q{CREATE SCHEMA dst2 VERSIONED});
+like(
+	$node->safe_psql('postgres',
+		qq{SELECT test_ws_schema_create(decode('$renamed', 'hex'), 'dst2')}),
+	qr/\(r \* 2\)/,
+	'the expression by the column, under its new name');
+
+# a table made like another, and an index of it, are not it
+$node->safe_psql('postgres', q{CREATE TABLE src.like_it (LIKE src.life2); CREATE INDEX ON src.life2 (r)});
+isnt($tag->('src.like_it', 'r'), $life, 'a table made like another has its own tags');
+is( $node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = attrelid
+		  WHERE relnamespace = 'src'::regnamespace AND relkind NOT IN ('r', 'p') AND attcoltag <> 0}),
+	'0',
+	'only tables have tags, not their indexes or types');
+is( $node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'src.life2'::regclass
+		  AND attnum < 0 AND attcoltag <> 0}),
+	'0',
+	'nor their system columns');
+
+# a tag another column of the table has: the next one
+$node->safe_psql('postgres', q{CREATE TABLE src.clash (c integer)});
+my $would = $tag->('src.clash', 'c');
+$node->safe_psql('postgres', qq{
+	ALTER TABLE src.clash DROP COLUMN c;
+	ALTER TABLE src.clash ADD COLUMN holder integer;
+	SET allow_system_table_mods = on;
+	UPDATE pg_attribute SET attcoltag = $would
+	WHERE attrelid = 'src.clash'::regclass AND attname = 'holder';
+});
+$node->safe_psql('postgres', q{ALTER TABLE src.clash ADD COLUMN c integer});
+isnt($tag->('src.clash', 'c'), $would, 'a tag the table has is passed over');
+isnt($tag->('src.clash', 'c'), '0', '(for the next)');
+
+# two branches adding the same column agree; of another type they do not
+my $other = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$node->safe_psql('postgres', q{CREATE TABLE src.same (a integer, b text, c integer)});
+$node->safe_psql('postgres', qq{
+	SET catalog_branch = $other;
+	CREATE SCHEMA src VERSIONED;
+	CREATE TABLE src.same (a integer);
+	ALTER TABLE src.same ADD COLUMN b text;
+	ALTER TABLE src.same ADD COLUMN c bigint;
+});
+my $tag_on = sub {
+	my ($on, $table, $column) = @_;
+	return $node->safe_psql('postgres', qq{
+		SET catalog_branch = $on;
+		SELECT attcoltag FROM pg_attribute WHERE attrelid = '$table'::regclass AND attname = '$column'});
+};
+is($tag_on->($other, 'src.same', 'a'), $tag->('src.same', 'a'), 'two branches agree on a column');
+is($tag_on->($other, 'src.same', 'b'), $tag->('src.same', 'b'), 'made or added');
+isnt($tag_on->($other, 'src.same', 'c'), $tag->('src.same', 'c'), 'of another type, they do not');
+
+# a column dropped and made again is the column it was
+$node->safe_psql('postgres', q{ALTER TABLE src.same DROP COLUMN b; ALTER TABLE src.same ADD COLUMN b text});
+is($tag_on->($other, 'src.same', 'b'), $tag->('src.same', 'b'), 'dropped and made again, the same tag');
+
+# a branch copied keeps a renamed column's tag
+my $small = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+my $copy = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$node->safe_psql('postgres', qq{
+	SET catalog_branch = $small;
+	CREATE SCHEMA c VERSIONED;
+	CREATE TABLE c.t (a integer);
+	ALTER TABLE c.t RENAME a TO b;
+});
+my $before_copy = $tag_on->($small, 'c.t', 'b');
+{
+	local $ENV{PGOPTIONS} = '';
+	$node->safe_psql('postgres', "SELECT pg_branch_catalog_copy($small, $copy)");
+}
+is($tag_on->($copy, 'c.t', 'b'), $before_copy, 'a branch copied keeps a renamed column\'s tag');
+
+# nothing outside a versioned schema has a tag, and so no record
+$node->safe_psql('postgres', q{CREATE SCHEMA plainsch; CREATE TABLE plainsch.t (a integer)});
+is($tag->('plainsch.t', 'a'), '0', 'a shared table has no tags');
+my ($sret, $sout, $serr) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('plainsch', 't')});
+like($serr, qr/is not in a versioned schema/, 'and is refused');
+$node->safe_psql('postgres', q{CREATE TABLE plainsch.empty ()});
+($sret, $sout, $serr) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('plainsch', 'empty')});
+like($serr, qr/is not in a versioned schema/, 'with no columns too');
+my $hex_plain = $bytes->($node, 'postgres', 'plain');
+($sret, $sout, $serr) = $node->psql('postgres',
+	qq{SELECT test_ws_schema_create(decode('$hex_plain', 'hex'), 'plainsch')});
+like($serr, qr/is not versioned, and its columns have no tags/, 'and takes no tags');
+
+# a column added to a table made again passes over the tag its record gave
+# another column
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.re (a integer);
+	ALTER TABLE src.re RENAME a TO r;
+	CREATE SCHEMA dst3 VERSIONED;
+});
+my $re = $bytes->($node, 'postgres', 're');
+# (in one transaction, whose relcache keeps a table it made: rebuilt, not dropped)
+$node->safe_psql('postgres', qq{
+	BEGIN;
+	SELECT test_ws_schema_create(decode('$re', 'hex'), 'dst3');
+	ALTER TABLE dst3.re ADD COLUMN a integer;
+	COMMIT;
+});
+is($tag->('dst3.re', 'r'), $tag->('src.re', 'r'), 'a table made again has the record\'s tag');
+isnt($tag->('dst3.re', 'a'), $tag->('dst3.re', 'r'), 'and a column added in that session another');
+
+# a table with a column its record lacks would hold a tag twice
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA dst4 VERSIONED;
+	CREATE TABLE dst4.re (r integer, extra integer);
+});
+($sret, $sout, $serr) = $node->psql('postgres',
+	qq{SELECT test_ws_schema_set_tags(decode('$re', 'hex'), 'dst4')});
+like($serr, qr/has 2 columns, its record 1/, 'tags are not given to a table its record does not describe');
 
 # another encoding: the same bytes, UTF8; and what it cannot hold refused
 $node->safe_psql('postgres', q{
 	CREATE DATABASE lat ENCODING LATIN1 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C';
-	CREATE SCHEMA enc;
+	CREATE SCHEMA enc VERSIONED;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
@@ -241,13 +387,13 @@ $node->safe_psql('postgres', q{
 });
 my $enc_sql = q{
 	SET client_encoding = UTF8;
-	CREATE EXTENSION test_prolly;
-	CREATE SCHEMA enc;
+	CREATE SCHEMA enc VERSIONED;
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"));
-	CREATE SCHEMA dst;
+	CREATE SCHEMA dst VERSIONED;
 };
+is($prepare->('lat'), $branch, '(the same branch number in that database)');
 $node->safe_psql('lat', $enc_sql);
 my $enc = sub {
 	my ($db) = @_;
@@ -286,10 +432,42 @@ my $wide_hex = $node->safe_psql('postgres',
 	qq{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('enc', '$wide'), 'hex')});
 $node->safe_psql('postgres',
 	q{CREATE DATABASE tw ENCODING EUC_TW TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
-$node->safe_psql('tw', 'CREATE EXTENSION test_prolly; CREATE SCHEMA dst');
+is($prepare->('tw'), $branch, '(and in that one)');
+$node->safe_psql('tw', 'CREATE SCHEMA dst VERSIONED');
 ($ret, $out, $err) = $node->psql('tw',
 	qq{SELECT test_ws_schema_create(decode('$wide_hex', 'hex'), 'dst')});
 like($err, qr/too long in this database's encoding/, 'a name too long here refused, not cut');
+
+# a name with no UTF8 cannot come into a versioned schema by a rename, where a
+# table's next rewrite could not derive its tags
+$node->safe_psql('postgres',
+	q{CREATE DATABASE sqlascii ENCODING SQL_ASCII TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
+is($prepare->('sqlascii'), $branch, '(and in the SQL_ASCII one)');
+$node->safe_psql('sqlascii', q{
+	CREATE SCHEMA v VERSIONED;
+	CREATE TABLE v.t (a integer);
+});
+($ret, $out, $err) = $node->psql('sqlascii', qq{CREATE TABLE v."x\xe9" (a integer)});
+like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a new table of such a name refused');
+($ret, $out, $err) = $node->psql('sqlascii', qq{ALTER TABLE v.t RENAME a TO "c\xe9"});
+like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a column renamed so refused');
+($ret, $out, $err) = $node->psql('sqlascii', qq{ALTER TABLE v.t RENAME TO "t\xe9"});
+like($err, qr/invalid byte sequence for encoding "UTF8"/, 'a table renamed so refused');
+$node->safe_psql('sqlascii', q{CREATE SCHEMA sh; CREATE TABLE sh.t (a integer)});
+$node->safe_psql('sqlascii', qq{ALTER TABLE sh.t RENAME a TO "c\xe9"; VACUUM FULL sh.t});
+pass('a shared table is as it ever was');
+
+# a rewrite derives no tags, so a type renamed to such a name does not stop it
+$node->safe_psql('sqlascii', qq{
+	CREATE DOMAIN v.d AS integer;
+	CREATE TABLE v.t1 (a v.d);
+	ALTER DOMAIN v.d RENAME TO "d\xe9";
+	VACUUM FULL v.t1;
+});
+pass('a table of a type renamed so can be rewritten');
+isnt($node->safe_psql('sqlascii',
+		q{SELECT attcoltag FROM pg_attribute WHERE attrelid = 'v.t1'::regclass AND attname = 'a'}),
+	'0', 'and keeps its tags');
 
 $node->stop;
 done_testing();

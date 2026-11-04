@@ -11,29 +11,134 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
+#include "common/cryptohash.h"
 #include "common/int.h"
-#include "common/md5.h"
+#include "common/sha2.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "parser/parser.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_tags.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
 
 uint64
 ws_tag_derive(const char *table, const char *column, const char *type, int attempt)
 {
-	char	   *text = psprintf("%s/%s/%s/%d", table, column, type, attempt);
-	char		hex[MD5_DIGEST_LENGTH * 2 + 1];
-	const char *errstr = NULL;
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	uint8		digest[PG_SHA256_DIGEST_LENGTH];
+	char		num[16];
+	const char *parts[] = {table, column, type, num};
 	uint64		tag = 0;
 
-	if (!pg_md5_hash(text, strlen(text), hex, &errstr))
-		elog(ERROR, "could not derive a column's tag: %s", errstr);
-	pfree(text);
-	/* (its first 60 bits) */
-	for (int i = 0; i < 15; i++)
-		tag = tag << 4 | (uint64) (hex[i] <= '9' ? hex[i] - '0' : hex[i] - 'a' + 10);
-	return tag;
+	snprintf(num, sizeof(num), "%d", attempt);
+	if (ctx == NULL || pg_cryptohash_init(ctx) < 0)
+		elog(ERROR, "could not derive a column's tag: %s", pg_cryptohash_error(ctx));
+	/* (each with its terminator: no name holds one, so no two run together) */
+	for (int i = 0; i < lengthof(parts); i++)
+		if (pg_cryptohash_update(ctx, (const uint8 *) parts[i], strlen(parts[i]) + 1) < 0)
+			elog(ERROR, "could not derive a column's tag: %s", pg_cryptohash_error(ctx));
+	if (pg_cryptohash_final(ctx, digest, sizeof(digest)) < 0)
+		elog(ERROR, "could not derive a column's tag: %s", pg_cryptohash_error(ctx));
+	pg_cryptohash_free(ctx);
+	/* (60 bits, as the catalog column holds a tag signed) */
+	for (int i = 0; i < 8; i++)
+		tag = tag << 8 | digest[i];
+	return tag >> 4;
+}
+
+/*
+ * A type as a tag is derived from it: its names and its modifier, not its
+ * printed form, which follows the session's search path and quoting.
+ */
+static char *
+type_identity(Oid typid, int32 typmod)
+{
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	Form_pg_type form;
+	char	   *nsp;
+	char	   *text;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", typid);
+	form = (Form_pg_type) GETSTRUCT(tup);
+	nsp = get_namespace_name(form->typnamespace);
+	if (nsp == NULL)
+		elog(ERROR, "cache lookup failed for namespace %u", form->typnamespace);
+	text = psprintf("%s.%s(%d)", nsp, NameStr(form->typname), typmod);
+	ReleaseSysCache(tup);
+	return text;
+}
+
+/* Whether a relation's columns have tags. */
+static bool
+has_tags(Relation rel)
+{
+	char		relkind = rel->rd_rel->relkind;
+
+	return !IsBootstrapProcessingMode() &&
+		(relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE) &&
+		NamespaceBranch(RelationGetNamespace(rel)) != 0;
+}
+
+void
+ws_tags_check_name(Relation rel, const char *name)
+{
+	if (has_tags(rel))
+		(void) pg_server_to_any(name, strlen(name), PG_UTF8);
+}
+
+uint64
+ws_tag_new_column(Relation rel, const FormData_pg_attribute *att)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	char	   *table;
+	char	   *column;
+	char	   *type;
+
+	if (att->attisdropped || !has_tags(rel))
+		return 0;
+	table = pg_server_to_any(RelationGetRelationName(rel),
+							 strlen(RelationGetRelationName(rel)), PG_UTF8);
+	column = pg_server_to_any(NameStr(att->attname), strlen(NameStr(att->attname)), PG_UTF8);
+	type = type_identity(att->atttypid, att->atttypmod);
+	type = pg_server_to_any(type, strlen(type), PG_UTF8);
+	for (int attempt = 0;; attempt++)
+	{
+		uint64		tag = ws_tag_derive(table, column, type, attempt);
+		bool		taken = tag == 0;
+
+		for (int i = 0; i < desc->natts && !taken; i++)
+		{
+			Form_pg_attribute other = TupleDescAttr(desc, i);
+
+			taken = !other->attisdropped && (uint64) other->attcoltag == tag;
+		}
+		if (!taken)
+			return tag;
+	}
+}
+
+void
+ws_tags_assign(Relation rel, bool assign)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	for (int i = 0; i < desc->natts; i++)
+		TupleDescAttr(desc, i)->attcoltag = 0;
+	for (int i = 0; assign && i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		att->attcoltag = (int64) ws_tag_new_column(rel, att);
+	}
 }
 
 static void

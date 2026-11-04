@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "fmgr.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
@@ -21,11 +22,11 @@
 
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
 PG_FUNCTION_INFO_V1(test_ws_schema_create);
+PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 
 /*
  * test_ws_schema_bytes(schema text, table text) returns bytea: the table's
- * schema, read from the catalogs and encoded, its new columns' tags derived;
- * NULL if there is no such table
+ * schema, read from the catalogs and encoded; NULL if there is no such table
  */
 Datum
 test_ws_schema_bytes(PG_FUNCTION_ARGS)
@@ -36,7 +37,7 @@ test_ws_schema_bytes(PG_FUNCTION_ARGS)
 	Buf			b = BUF_INIT;
 	bytea	   *out;
 
-	if (!ws_schema_read(schema, table, ws_schema_derived_tag, NULL, &s))
+	if (!ws_schema_read(schema, table, &s))
 		PG_RETURN_NULL();
 	WsSchemaCodec->encode(&s, &b);
 	out = palloc(VARHDRSZ + b.len);
@@ -48,8 +49,26 @@ test_ws_schema_bytes(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_ws_schema_set_tags(bytes bytea, schema text) returns void: a schema's
+ * bytes' tags given to its table in the schema
+ */
+Datum
+test_ws_schema_set_tags(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	ws_schema_set_tags(schema, &s);
+	ws_schema_free(&s);
+	PG_RETURN_VOID();
+}
+
+/*
  * test_ws_schema_create(bytes bytea, schema text) returns text: the table of
- * a schema's bytes made in the schema; the statement that made it
+ * a schema's bytes made in the schema, its columns with the tags the bytes
+ * say; the statement that made it
  */
 Datum
 test_ws_schema_create(PG_FUNCTION_ARGS)
@@ -67,6 +86,8 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	buf_append_byte(&sql, 0);
 	WsSql->run((char *) sql.data, 0, NULL, &rows);
 	ws_sql_rows_free(&rows);
+	ws_schema_set_tags(schema, &s);
+	CommandCounterIncrement();
 	WsSql->end(level);
 	out = cstring_to_text((char *) sql.data);
 	ws_schema_free(&s);

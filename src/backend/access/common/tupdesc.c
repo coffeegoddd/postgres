@@ -735,6 +735,8 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 			return false;
 		if (attr1->attcollation != attr2->attcollation)
 			return false;
+		if (attr1->attcoltag != attr2->attcoltag)
+			return false;
 		/* variable-length fields are not even present... */
 	}
 
@@ -970,6 +972,7 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attstorage = typeForm->typstorage;
 	att->attcompression = InvalidCompressionMethod;
 	att->attcollation = typeForm->typcollation;
+	att->attcoltag = 0;
 
 	populate_compact_attribute(desc, attributeNumber - 1);
 
@@ -1019,6 +1022,7 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 	att->attisdropped = false;
 	att->attislocal = true;
 	att->attinhcount = 0;
+	att->attcoltag = 0;
 	/* variable-length fields are not present in tupledescs */
 
 	att->atttypid = oidtypeid;

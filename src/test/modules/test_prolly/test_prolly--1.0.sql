@@ -715,12 +715,15 @@ CREATE FUNCTION test_vc_bench_merge(branch text, other text,
 	OUT status text, OUT us float8, OUT gets int8, OUT puts int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
--- A table's schema read from the catalogs and encoded (its new columns' tags
--- derived), NULL if there is no such table; and the table of those bytes made
--- in a schema, the statement that made it.
+-- A table's schema read from the catalogs and encoded, NULL if there is no
+-- such table; and the table of those bytes made in a schema, with their tags,
+-- the statement that made it.
 CREATE FUNCTION test_ws_schema_bytes(schema text, tab text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_ws_schema_create(bytes bytea, schema text)
 RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+CREATE FUNCTION test_ws_schema_set_tags(bytes bytea, schema text)
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

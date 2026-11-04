@@ -28,7 +28,7 @@ static WsColumn example_cols[] = {
 	.collation = "pg_catalog.\"C\""},
 	{.tag = 5,.name = "g",.type = "bigint",.kind = WS_COL_GENERATED_STORED,.def = "(@{7} * 2)"},
 	{.tag = 9,.name = "w",.type = "bigint",.kind = WS_COL_GENERATED_VIRTUAL,.def = "(@{7} + 1)"},
-	{.tag = 0,.name = "e",.type = "integer",.kind = WS_COL_STORED,.def = "0"},
+	{.tag = 11,.name = "e",.type = "integer",.kind = WS_COL_STORED,.def = "0"},
 };
 
 static uint64 example_key[] = {7};
@@ -36,8 +36,7 @@ static uint64 example_key[] = {7};
 static WsTableSchema
 example(void)
 {
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,
-		.ncols = lengthof(example_cols),.cols = example_cols,.key_name = "t_pkey",
+	WsTableSchema s = {.name = "t",.ncols = lengthof(example_cols),.cols = example_cols,.key_name = "t_pkey",
 	.nkey = lengthof(example_key),.key = example_key};
 
 	return s;
@@ -55,13 +54,13 @@ test_bytes(void)
 {
 	static const char want[] =
 		"\x01"					/* version */
-		"\x01" "t" "p"			/* name, persistence */
+		"\x01" "t"				/* name */
 		"\x01"					/* columns */
 		"\x07" "\x02" "id" "\x06" "bigint" "s" "\x01" "a" "\x00" "\x00"
 		"\x02" "pk" "\x01\x07";	/* key: its name, its columns */
 	WsColumn	cols[] = {{.tag = 7,.name = "id",.type = "bigint",.kind = WS_COL_STORED,
 		.not_null = true,.identity = WS_IDENTITY_ALWAYS}};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,
+	WsTableSchema s = {.name = "t",.ncols = 1,
 	.cols = cols,.key_name = "pk",.nkey = 1,.key = example_key};
 	Buf			b = BUF_INIT;
 
@@ -70,10 +69,10 @@ test_bytes(void)
 	CHECK(memcmp(b.data, want, b.len) == 0);
 	buf_free(&b);
 
-	/* each kind of column, a default and a collation, a tag of two bytes, unlogged */
+	/* each kind of column, a default and a collation, a tag of two bytes */
 	{
 		static const char want2[] =
-			"\x01" "\x01" "t" "u" "\x03"
+			"\x01" "\x01" "t" "\x03"
 			"\x07" "\x01" "k" "\x01" "i" "s" "\x01" "d" "\x00" "\x00"
 			"\xac\x02" "\x01" "v" "\x01" "t" "s" "\x00" "\x00" "\x03" "\'x\'" "\x03" "\"C\""
 			"\x05" "\x01" "g" "\x01" "i" "g" "\x00" "\x00" "\x01" "1" "\x00"
@@ -84,7 +83,7 @@ test_bytes(void)
 			{.tag = 300,.name = "v",.type = "t",.kind = WS_COL_STORED,.def = "'x'",.collation = "\"C\""},
 			{.tag = 5,.name = "g",.type = "i",.kind = WS_COL_GENERATED_STORED,.def = "1"},
 		};
-		WsTableSchema s2 = {.name = "t",.persistence = WS_PERSISTENCE_UNLOGGED,.ncols = 3,
+		WsTableSchema s2 = {.name = "t",.ncols = 3,
 		.cols = c2,.key_name = "pk",.nkey = 1,.key = example_key};
 
 		WsSchemaCodec->encode(&s2, &b);
@@ -104,7 +103,7 @@ test_round_trip(void)
 
 	WsSchemaCodec->encode(&s, &a);
 	WsSchemaCodec->decode(a.data, a.len, &got);
-	CHECK(strcmp(got.name, "t") == 0 && got.persistence == WS_PERSISTENCE_PERMANENT);
+	CHECK(strcmp(got.name, "t") == 0);
 	CHECK_EQ(got.ncols, s.ncols);
 	for (int i = 0; i < s.ncols; i++)
 	{
@@ -127,18 +126,18 @@ test_round_trip(void)
 	buf_free(&b);
 }
 
-/* A table with no columns and no key is one; so is an unlogged one. */
+/* A table with no columns and no key is one. */
 static void
 test_smallest(void)
 {
-	WsTableSchema s = {.name = "empty",.persistence = WS_PERSISTENCE_UNLOGGED};
+	WsTableSchema s = {.name = "empty"};
 	WsTableSchema got;
 	WsRowShape	shape;
 	Buf			b = BUF_INIT;
 
 	WsSchemaCodec->encode(&s, &b);
 	WsSchemaCodec->decode(b.data, b.len, &got);
-	CHECK(got.ncols == 0 && got.nkey == 0 && got.persistence == WS_PERSISTENCE_UNLOGGED);
+	CHECK(got.ncols == 0 && got.nkey == 0);
 	ws_schema_row_shape(&got, &shape);
 	CHECK_EQ(shape.nstored, 0);
 	ws_row_shape_free(&shape);
@@ -152,7 +151,7 @@ test_find(void)
 	WsTableSchema s = example();
 
 	CHECK(ws_schema_column(&s, 300) == &s.cols[1]);
-	CHECK(ws_schema_column(&s, 0) == &s.cols[4]);
+	CHECK(ws_schema_column(&s, 11) == &s.cols[4]);
 	CHECK(ws_schema_column(&s, 1) == NULL);
 	CHECK(ws_schema_column_named(&s, "g") == &s.cols[2]);
 	CHECK(ws_schema_column_named(&s, "nope") == NULL);
@@ -170,13 +169,13 @@ test_row_shape(void)
 
 	ws_schema_row_shape(&s, &shape);
 	CHECK(shape.nkey == 1 && shape.nstored == 4);
-	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
+	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 11);
 	CHECK_EQ(ws_row_shape_at(&shape, 9), -1);
 	ws_row_shape_free(&shape);
 
 	/* a key on later attributes, out of their order: the key first, in its order */
 	{
-		uint64		key[] = {0, 300};
+		uint64		key[] = {11, 300};
 		WsColumn	cols[lengthof(example_cols)];
 
 		memcpy(cols, example_cols, sizeof(cols));
@@ -188,7 +187,7 @@ test_row_shape(void)
 		CHECK(ws_schema_problem(&s) == NULL);
 		ws_schema_row_shape(&s, &shape);
 		CHECK(shape.nkey == 2 && shape.nstored == 4);
-		CHECK(shape.tags[0] == 0 && shape.tags[1] == 300 && shape.tags[2] == 7 && shape.tags[3] == 5);
+		CHECK(shape.tags[0] == 11 && shape.tags[1] == 300 && shape.tags[2] == 7 && shape.tags[3] == 5);
 		ws_row_shape_free(&shape);
 	}
 
@@ -198,7 +197,7 @@ test_row_shape(void)
 	s.key_name = NULL;
 	ws_schema_row_shape(&s, &shape);
 	CHECK(shape.nkey == 0 && shape.nstored == 4);
-	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 0);
+	CHECK(shape.tags[0] == 7 && shape.tags[1] == 300 && shape.tags[2] == 5 && shape.tags[3] == 11);
 	ws_row_shape_free(&shape);
 }
 
@@ -228,14 +227,13 @@ static void
 test_wide_and_odd(void)
 {
 	WsColumn   *cols = palloc0_array(WsColumn, WS_MAX_COLS);
-	WsTableSchema s = {.name = "tab\there \"q\" \xc3\xa9",.persistence = WS_PERSISTENCE_PERMANENT,
-	.ncols = WS_MAX_COLS,.cols = cols};
+	WsTableSchema s = {.name = "tab\there \"q\" \xc3\xa9",.ncols = WS_MAX_COLS,.cols = cols};
 	WsTableSchema got;
 	Buf			b = BUF_INIT;
 
 	for (int i = 0; i < WS_MAX_COLS; i++)
 	{
-		cols[i].tag = (uint64) i * 1000;
+		cols[i].tag = (uint64) (i + 1) * 1000;
 		cols[i].name = psprintf("c\n%d", i);
 		cols[i].type = "a type";
 		cols[i].kind = WS_COL_STORED;
@@ -256,15 +254,15 @@ typedef struct Invalid
 } Invalid;
 
 static void
-no_name(WsTableSchema *s)
+col_no_tag(WsTableSchema *s)
 {
-	s->name = "";
+	s->cols[0].tag = 0;
 }
 
 static void
-persistence(WsTableSchema *s)
+no_name(WsTableSchema *s)
 {
-	s->persistence = 't';
+	s->name = "";
 }
 
 static void
@@ -418,6 +416,7 @@ key_too_many(WsTableSchema *s)
 }
 
 static const Invalid invalid[] = {
+	{"a column with no tag", col_no_tag},
 	{"a table's name too long", name_long},
 	{"a column's name too long", col_name_long},
 	{"an identity column that may be null", identity_nullable},
@@ -427,7 +426,6 @@ static const Invalid invalid[] = {
 	{"an expression with malformed column references", lone_at},
 	{"an expression with malformed column references", tag_leading_zero},
 	{"a table with no name", no_name},
-	{"a table of no known persistence", persistence},
 	{"a column with no name", col_no_name},
 	{"a column with no type", col_no_type},
 	{"a column of no known kind", col_kind},
@@ -532,19 +530,18 @@ test_malformed(void)
 		size_t		len;
 		const char *why;
 	}			bad[] = {
-		{"\x02" "\x01" "t" "p" "\x00" "\x00" "\x00", 7, "a version not known"},
-		{"\x01" "\x02" "t\0" "p" "\x00" "\x00" "\x00", 8, "a NUL"},
+		{"\x02" "\x01" "t" "\x00" "\x00" "\x00", 6, "a version not known"},
+		{"\x01" "\x02" "t\0" "\x00" "\x00" "\x00", 7, "a NUL"},
 		{"\x01" "\x09" "t", 3, "runs past its end"},
-		{"\x01" "\x01" "t" "p" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 18, "neither"},
-		{"\x01" "\x01" "t" "p" "\xc1\x0c" "\x00", 7, "more columns than a table can have"},
-		{"\x01" "\x01" "t" "x" "\x00" "\x00" "\x00", 7, "no known persistence"},
-		{"\x01" "\x01" "t" "p" "\x00" "\x02" "k" "\x01" "\x07", 9, "a key of more columns"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 17, "neither"},
+		{"\x01" "\x01" "t" "\xc1\x0c" "\x00", 6, "more columns than a table can have"},
+		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07", 8, "a key of more columns"},
 		/* a number not in its shortest form: one schema, other bytes */
-		{"\x01" "\x81\x00" "t" "p" "\x00" "\x00" "\x00", 8, "shortest form"},
-		{"\x01" "\x01" "t" "p" "\x80\x00" "\x00" "\x00", 8, "shortest form"},
-		{"\x01" "\x01" "t" "p" "\x00" "\x00" "\x80\x80\x00", 9, "shortest form"},
+		{"\x01" "\x81\x00" "t" "\x00" "\x00" "\x00", 7, "shortest form"},
+		{"\x01" "\x01" "t" "\x80\x00" "\x00" "\x00", 7, "shortest form"},
+		{"\x01" "\x01" "t" "\x00" "\x00" "\x80\x80\x00", 8, "shortest form"},
 		/* a tag of bits past the 64th, dropped on reading */
-		{"\x01" "\x01" "t" "p" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 26, "shortest form"},
+		{"\x01" "\x01" "t" "\x01" "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f" "\x01" "c" "\x01" "b" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 25, "shortest form"},
 	};
 
 	WsSchemaCodec->encode(&s, &b);
@@ -564,7 +561,7 @@ test_malformed(void)
 		check_refused(bad[i].p, bad[i].len, bad[i].why);
 
 	/* a name not UTF8, whatever the database's encoding */
-	check_refused("\x01" "\x01" "\xff" "p" "\x00" "\x00" "\x00", 7, "not UTF8");
+	check_refused("\x01" "\x01" "\xff" "\x00" "\x00" "\x00", 6, "not UTF8");
 }
 
 /* The statement, to the byte: names quoted, each clause, references by name. */
@@ -599,14 +596,14 @@ test_create_table_names(void)
 		{.tag = 2,.name = "select",.type = "integer",.kind = WS_COL_STORED,.def = "(@{1} @@ 2)"},
 	};
 	uint64		key[] = {1};
-	WsTableSchema s = {.name = "Odd Table",.persistence = WS_PERSISTENCE_UNLOGGED,.ncols = 2,
+	WsTableSchema s = {.name = "Odd Table",.ncols = 2,
 	.cols = cols,.key_name = "Odd Key",.nkey = 1,.key = key};
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "Odd Schema", &b);
 	buf_append_byte(&b, 0);
 	if (strcmp((char *) b.data,
-			   "CREATE UNLOGGED TABLE \"Odd Schema\".\"Odd Table\" (\n"
+			   "CREATE TABLE \"Odd Schema\".\"Odd Table\" (\n"
 			   "    \"Odd Name\" integer NOT NULL,\n"
 			   "    \"select\" integer DEFAULT ((\"Odd Name\" @ 2)),\n"
 			   "    CONSTRAINT \"Odd Key\" PRIMARY KEY (\"Odd Name\")\n"
@@ -626,7 +623,7 @@ test_create_table_names(void)
 static void
 test_create_table_empty(void)
 {
-	WsTableSchema s = {.name = "e",.persistence = WS_PERSISTENCE_PERMANENT};
+	WsTableSchema s = {.name = "e"};
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "x", &b);
@@ -640,7 +637,7 @@ create_dangling(void *arg)
 {
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer",.kind = WS_COL_STORED,
 	.def = "(@{9} + 1)"}};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "x", &b);
@@ -666,7 +663,7 @@ create_injected(void *arg)
 	Injection  *in = arg;
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = (char *) in->type,.kind = WS_COL_STORED,
 	.collation = (char *) in->collation,.def = (char *) in->def,.not_null = in->not_null}};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "x", &b);
@@ -744,7 +741,7 @@ create_unchecked(void *arg)
 {
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
 	uint64		key[] = {9};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,
+	WsTableSchema s = {.name = "t",.ncols = 1,
 	.cols = cols,.key_name = "k",.nkey = 1,.key = key};
 	Buf			b = BUF_INIT;
 
@@ -757,7 +754,7 @@ generated_replaced(void *arg)
 {
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "integer --",.not_null = true,
 	.kind = WS_COL_GENERATED_STORED,.def = "1\nNOT NULL NOT NULL --"}};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "x", &b);
@@ -776,7 +773,7 @@ check_stray_clause(const char *def, const char *why)
 		{.tag = 1,.name = "a",.type = "integer --",.kind = WS_COL_STORED,.def = (char *) def},
 		{.tag = 2,.name = "b",.type = "integer --')",.kind = WS_COL_STORED},
 	};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 2,.cols = cols};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols};
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	ErrorData  *edata = NULL;
@@ -822,7 +819,7 @@ test_create_table_renamed(void)
 		{.tag = 7,.name = "now_named",.type = "integer",.kind = WS_COL_STORED},
 		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_GENERATED_STORED,.def = "(@{7} * 2)"},
 	};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 2,.cols = cols};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols};
 	Buf			b = BUF_INIT;
 
 	ws_schema_create_table(&s, "x", &b);
@@ -838,7 +835,7 @@ test_create_table_quoting(void)
 	int			level = NewGUCNestLevel();
 	WsColumn	cols[] = {{.tag = 1,.name = "a",.type = "text",.kind = WS_COL_STORED,
 	.collation = "pg_catalog.\"C\""}};
-	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 1,.cols = cols};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
 	Buf			b = BUF_INIT;
 
 	(void) set_config_option("quote_all_identifiers", "on", PGC_USERSET, PGC_S_SESSION,
@@ -891,7 +888,7 @@ create_and_read(void *arg)
 		{.tag = 5,.name = "n",.type = "integer",.kind = WS_COL_STORED,.not_null = true},
 	};
 	uint64		key[] = {5, 1};
-	WsTableSchema s = {.name = "made",.persistence = WS_PERSISTENCE_UNLOGGED,.ncols = lengthof(cols),
+	WsTableSchema s = {.name = "made",.ncols = lengthof(cols),
 	.cols = cols,.key_name = "made_pk",.nkey = 2,.key = key};
 	Buf			b = BUF_INIT;
 	int			level = WsSql->begin();
@@ -906,8 +903,6 @@ create_and_read(void *arg)
 	ws_sql_rows_free(&rows);
 	buf_free(&b);
 
-	CHECK(strcmp(one("SELECT relpersistence FROM pg_class WHERE oid = 'ws_made.made'::regclass"),
-				 "u") == 0);
 	got = one("SELECT string_agg(attname || '|' || format_type(atttypid, atttypmod) || '|' || "
 			  "attnotnull || '|' || attidentity::text || '|' || attgenerated::text || '|' || "
 			  "coalesce((SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef "
