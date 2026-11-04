@@ -1361,6 +1361,17 @@
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>attcoltag</structfield> <type>int8</type>
+      </para>
+      <para>
+       The column's identity in version control: given when the column is
+       made in a table of a versioned schema, and kept through renames and
+       changes of type.  Zero for any other column.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>attstattarget</structfield> <type>int2</type>
       </para>
       <para>

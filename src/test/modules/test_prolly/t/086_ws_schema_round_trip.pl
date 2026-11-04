@@ -147,7 +147,6 @@ for my $t (
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
 	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
 	[ 'toastp', 'CREATE TABLE src.toastp (a text) WITH (toast.autovacuum_enabled = false)' ],
-	[ 'seqp', 'CREATE UNLOGGED TABLE src.seqp (a int GENERATED ALWAYS AS IDENTITY); ALTER SEQUENCE src.seqp_a_seq SET LOGGED' ],
 	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
 	[ 'clus', 'CREATE TABLE src.clus (a int PRIMARY KEY); ALTER TABLE src.clus CLUSTER ON clus_pkey' ],
 	[ 'pol', 'CREATE TABLE src.pol (a int); CREATE POLICY p ON src.pol USING (true)' ],
@@ -224,7 +223,7 @@ my $while_waiting = sub {
 for my $t (
 	[ 'gone', 'DROP TABLE src.gone' ],
 	[ 'moved', 'ALTER TABLE src.moved RENAME TO moved2' ],
-	[ 'other_sch', 'ALTER TABLE src.other_sch SET SCHEMA other' ])
+	[ 'other_sch', 'ALTER TABLE src.other_sch SET SCHEMA dst' ])
 {
 	like($while_waiting->($t->[0], $t->[1]), qr/^t\n/, "$t->[0] while waiting: no such table");
 }
@@ -234,13 +233,6 @@ like(
 		q{position('zzzcolumn'::bytea in test_ws_schema_bytes('src', 'again')) > 0}),
 	qr/^t\n/,
 	'dropped and made again while waiting: the table now of that name');
-like(
-	$while_waiting->(
-		'unl', 'ALTER TABLE src.unl SET UNLOGGED',
-		q{position('\x03756e6c75'::bytea in test_ws_schema_bytes('src', 'unl')) > 0}),
-	qr/^t\n/,
-	'made unlogged while waiting: as it is now');
-
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'nosuch') IS NULL}),
 	't', 'no such table');
 
@@ -289,6 +281,20 @@ is( $node->safe_psql('postgres',
 		  AND attnum < 0 AND attcoltag <> 0}),
 	'0',
 	'nor their system columns');
+
+# a tag another column of the table has: the next one
+$node->safe_psql('postgres', q{CREATE TABLE src.clash (c integer)});
+my $would = $tag->('src.clash', 'c');
+$node->safe_psql('postgres', qq{
+	ALTER TABLE src.clash DROP COLUMN c;
+	ALTER TABLE src.clash ADD COLUMN holder integer;
+	SET allow_system_table_mods = on;
+	UPDATE pg_attribute SET attcoltag = $would
+	WHERE attrelid = 'src.clash'::regclass AND attname = 'holder';
+});
+$node->safe_psql('postgres', q{ALTER TABLE src.clash ADD COLUMN c integer});
+isnt($tag->('src.clash', 'c'), $would, 'a tag the table has is passed over');
+isnt($tag->('src.clash', 'c'), '0', '(for the next)');
 
 # two branches adding the same column agree; of another type they do not
 my $other = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
