@@ -144,7 +144,7 @@ is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_clas
 	'g_owner', 'and one that can travel owns it after a restore');
 
 # restoring a materialized view runs nothing
-$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE MATERIALIZED VIEW m_lock AS SELECT pg_advisory_lock(42) AS x WITH NO DATA});
+$node->safe_psql('postgres', q{SET ROLE g_owner; SET search_path = "S rc"; CREATE MATERIALIZED VIEW m_lock AS SELECT pg_try_advisory_lock(42) AS x WITH NO DATA});
 $fresh->('D6');
 is( $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D6'); SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()}),
 	"\n0", 'a materialized view is restored without running what it would fill itself with');
