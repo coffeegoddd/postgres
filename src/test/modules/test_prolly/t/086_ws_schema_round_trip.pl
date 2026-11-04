@@ -278,6 +278,32 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.fku_p1 PARTITION OF src.fku_p FOR VALUES FROM (0) TO (10);
 	CREATE UNIQUE INDEX fku_p1_also ON src.fku_p1 (b, a);
 	CREATE TABLE src.fku_c (a integer, b integer, FOREIGN KEY (a, b) REFERENCES src.fku_p (a, b));
+	CREATE TABLE src.ip1 (a integer NOT NULL, b text DEFAULT 'x', g integer GENERATED ALWAYS AS (a * 2) STORED,
+		CONSTRAINT ip1_c CHECK (a > 0));
+	CREATE TABLE src.ip2 (b text, z integer, CONSTRAINT ip2_nn NOT NULL z);
+	CREATE TABLE src.ichild () INHERITS (src.ip1);
+	CREATE TABLE src.ilocal (a integer NOT NULL, own text, CONSTRAINT ip1_c CHECK (a > 0), CONSTRAINT ilocal_c CHECK (own <> '')) INHERITS (src.ip1);
+	CREATE TABLE src.imulti (extra integer) INHERITS (src.ip2, src.ip1);
+	CREATE TABLE src.ialter (own text, z integer CONSTRAINT ialter_nn NOT NULL, b text DEFAULT 'y', a integer NOT NULL,
+		g integer GENERATED ALWAYS AS (a * 3) STORED, CONSTRAINT ip1_c CHECK (a > 0));
+	ALTER TABLE src.ialter INHERIT src.ip1;
+	ALTER TABLE src.ialter INHERIT src.ip2;
+	CREATE TABLE src.igrand () INHERITS (src.ichild);
+	ALTER TABLE src.ichild ALTER b SET DEFAULT 'own default';
+	CREATE TABLE src.inv (a integer);
+	CREATE TABLE src.inv1 () INHERITS (src.inv);
+	ALTER TABLE src.inv ADD CONSTRAINT inv_c CHECK (a > 0) NOT VALID;
+	ALTER TABLE src.inv1 VALIDATE CONSTRAINT inv_c;
+	CREATE TABLE src.ino (a integer, CONSTRAINT ino_c CHECK (a > 0) NO INHERIT);
+	CREATE TABLE src.ino1 () INHERITS (src.ino);
+	CREATE TABLE src.iren (a integer NOT NULL);
+	CREATE TABLE src.iren1 () INHERITS (src.iren);
+	ALTER TABLE src.iren RENAME a TO z;
+	CREATE TABLE src.ine_p (a integer, CONSTRAINT ine_c CHECK (a > 0) NOT ENFORCED);
+	CREATE TABLE src.ine_k (a integer);
+	ALTER TABLE src.ine_k ADD CONSTRAINT ine_c CHECK (a > 0) NOT VALID;
+	ALTER TABLE src.ine_k INHERIT src.ine_p;
+	CREATE TABLE src.ine_g () INHERITS (src.ine_k);
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -296,7 +322,8 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'ptf_p', 'ptf_p1', 'ptf_c', 'ptf_c1',
 	'idt', 'idm', 'idl', 'pnv', 'pnv1', 'pnv2', 'ptbd', 'ptbd1', 'ptbn', 'ptbn1', 'ptby', 'ptby1', 'ptbs', 'ptbs1', 'ptbt', 'ptbt1',
 	'fkn_q', 'fkn_p', 'fkn_p1', 'fkn_c', 'fks', 'fksm', 'fksl', 'fknv', 'fknv1',
-	'ixp', 'ixp1', 'ixn', 'ixn1', 'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c');
+	'ixp', 'ixp1', 'ixn', 'ixn1', 'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c',
+	'ip1', 'ip2', 'ichild', 'ilocal', 'imulti', 'ialter', 'igrand', 'inv', 'inv1', 'ino', 'ino1', 'iren', 'iren1', 'ine_p', 'ine_k', 'ine_g');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -318,18 +345,21 @@ for my $table (@tables)
 }
 
 # partitions attached, once every table and its indexes are made, each table
-# before its own partitions (as this list has them); then checks not valid,
-# each partition's before its table's; the same bytes
-for my $table (@tables)
-{
-	my $hex = $bytes->($node, 'postgres', $table);
-	$node->safe_psql('postgres', qq{SELECT test_ws_schema_attach(decode('$hex', 'hex'), 'dst')});
-}
-for my $table (reverse @tables)
-{
-	my $hex = $bytes->($node, 'postgres', $table);
-	$node->safe_psql('postgres', qq{SELECT test_ws_schema_add_checks(decode('$hex', 'hex'), 'dst')});
-}
+# before its own partitions (as this list has them); then checks not valid, each
+# partition's before its table's; then inheriting, which needs those there; then
+# what is only inherited marked so; the same bytes
+my $restore_step = sub {
+	my ($function, @of) = @_;
+	for my $table (@of)
+	{
+		my $hex = $bytes->($node, 'postgres', $table);
+		$node->safe_psql('postgres', qq{SELECT $function(decode('$hex', 'hex'), 'dst')});
+	}
+};
+$restore_step->('test_ws_schema_attach', @tables);
+$restore_step->('test_ws_schema_add_checks', reverse @tables);
+$restore_step->('test_ws_schema_inherit', @tables);
+$restore_step->('test_ws_schema_set_inherited', @tables);
 for my $table (@tables)
 {
 	is( $bytes->($node, 'postgres', $table, undef, 'dst'),
@@ -391,7 +421,6 @@ is( $bytes->(
 
 # what the record would lose is refused, not lost
 $node->safe_psql('postgres', q{
-	CREATE TABLE src.parent (a int);
 	CREATE TYPE src.rowtype AS (a int);
 	CREATE ACCESS METHOD otheram TYPE TABLE HANDLER heap_tableam_handler;
 });
@@ -538,6 +567,86 @@ my $nvchecks = q{SELECT string_agg(c.relname || '.' || k.conname || ' ' || k.con
 is($node->safe_psql('postgres', sprintf($nvchecks, 'dst')), $node->safe_psql('postgres', sprintf($nvchecks, 'src')),
 	'checks not valid across a partitioned table as they were');
 
+# inheritance as it was: what is whose, in what order, and what dropping does
+my $inh = q{SELECT string_agg(c.relname || '.' || a.attname || ' ' || a.attnum || ' ' || a.attislocal || a.attinhcount, E'\n' ORDER BY c.relname, a.attnum)
+	FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+	WHERE c.relnamespace = '%s'::regnamespace AND c.relname ~ '^i(p|child|local|multi|alter|grand|nv|no|ren)' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped};
+is($node->safe_psql('postgres', sprintf($inh, 'dst')), $node->safe_psql('postgres', sprintf($inh, 'src')), 'inherited columns as they were');
+my $inhcon = q{SELECT string_agg(c.relname || '.' || k.conname || ' ' || k.contype::text || k.conislocal || k.coninhcount || k.convalidated, E'\n' ORDER BY c.relname, k.conname)
+	FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+	WHERE c.relnamespace = '%s'::regnamespace AND c.relname ~ '^i(p|child|local|multi|alter|grand|nv|no|ren)' AND c.relkind = 'r'};
+is($node->safe_psql('postgres', sprintf($inhcon, 'dst')), $node->safe_psql('postgres', sprintf($inhcon, 'src')), 'inherited constraints as they were');
+my $inhpar = q{SELECT string_agg(c.relname || ' ' || i.inhseqno || ' ' || q.relname, E'\n' ORDER BY c.relname, i.inhseqno)
+	FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class q ON q.oid = i.inhparent
+	WHERE c.relnamespace = '%s'::regnamespace AND c.relname ~ '^i(p|child|local|multi|alter|grand|nv|no|ren)'};
+is($node->safe_psql('postgres', sprintf($inhpar, 'dst')), $node->safe_psql('postgres', sprintf($inhpar, 'src')), 'parents in their order');
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA dropsrc VERSIONED;
+	CREATE TABLE dropsrc.p (a int, b int, CONSTRAINT pc CHECK (a > 0));
+	CREATE TABLE dropsrc.c (b int) INHERITS (dropsrc.p);
+	CREATE SCHEMA dropdst VERSIONED;
+});
+my $chex;
+for my $t ('p', 'c')
+{
+	my $hex = $bytes->($node, 'postgres', $t, undef, 'dropsrc');
+	$chex = $hex;
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dropdst');
+		SELECT test_ws_schema_inherit(decode('$hex', 'hex'), 'dropdst');
+		SELECT test_ws_schema_set_inherited(decode('$hex', 'hex'), 'dropdst')});
+}
+for my $sch ('dropsrc', 'dropdst')
+{
+	$node->safe_psql('postgres', qq{ALTER TABLE $sch.p DROP COLUMN a CASCADE; ALTER TABLE $sch.p DROP COLUMN b});
+}
+is( $node->safe_psql('postgres', q{SELECT string_agg(attname, ' ' ORDER BY attname) FROM pg_attribute WHERE attrelid = 'dropdst.c'::regclass AND attnum > 0 AND NOT attisdropped}),
+	'b', 'dropped from its parent: what was only inherited goes, what was its own stays');
+$node->safe_psql('postgres', q{
+	CREATE TABLE dropsrc.ckp (a int, CONSTRAINT pkc CHECK (a > 0));
+	CREATE TABLE dropsrc.ckc (a int) INHERITS (dropsrc.ckp);
+	CREATE SCHEMA lie VERSIONED;
+	CREATE TABLE lie.c (a int, b int);
+	CREATE TABLE lie.ckc (a int, CONSTRAINT pkc CHECK (a > 0));
+});
+my $ckhex = $bytes->($node, 'postgres', 'ckc', undef, 'dropsrc');
+for my $t ([ $chex, 'a column', qr/"a" is inherited, and it is not/ ], [ $ckhex, 'a constraint', qr/"pkc" is inherited, and it is not/ ])
+{
+	my ($ret, $out, $err) = $node->psql('postgres',
+		qq{\\set VERBOSITY verbose\nSELECT test_ws_schema_set_inherited(decode('$t->[0]', 'hex'), 'lie');});
+	like($err, $t->[2], "a record saying $t->[1] is inherited that is not, refused");
+	like($err, qr/XX001/, '(as the record\'s fault)');
+}
+$node->safe_psql('postgres', q{ALTER TABLE lie.ckc DROP CONSTRAINT pkc});
+{
+	my ($ret, $out, $err) = $node->psql('postgres',
+		qq{\\set VERBOSITY verbose\nSELECT test_ws_schema_set_inherited(decode('$ckhex', 'hex'), 'lie');});
+	like($err, qr/XX001.*"pkc" is inherited/s, 'and one it does not have, the same');
+}
+
+# more parents than a commit holds
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA manyp VERSIONED;
+	CREATE TABLE manyp.c ();
+	DO $$ BEGIN
+		FOR i IN 1..1601 LOOP
+			EXECUTE format('CREATE TABLE manyp.p%s ()', i);
+			EXECUTE format('ALTER TABLE manyp.c INHERIT manyp.p%s', i);
+		END LOOP;
+	END $$;
+});
+{
+	my ($ret, $out, $err) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('manyp', 'c')});
+	like($err, qr/cannot be read yet: it inherits from more tables than a commit holds/, 'a table of too many parents refused');
+}
+
+# a temporary child is its session's: its parent reads as it did
+{
+	my $alone = $bytes->($node, 'postgres', 'ip2');
+	is( $node->safe_psql('postgres', q{CREATE TEMP TABLE tchild () INHERITS (src.ip2);
+			SELECT encode(test_ws_schema_bytes('src', 'ip2'), 'hex')}),
+		$alone, 'a temporary child no matter to its parent');
+}
+
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),
 	'1', 'an index its own table\'s foreign key uses is made again');
@@ -574,7 +683,7 @@ my %refused_for = (
 	seqother => 'its sequence in another schema',
 	ponly => 'or is not valid', ponlyk => 'or is not valid',
 	pxs => 'in another schema', pxc => 'in another schema', pxf => 'not a table', pxd => 'being detached', pxd1 => 'being detached',
-	ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
+	ihx => 'in another schema', ihy => 'in another schema', ihf => 'or from no table', ihg => 'or no table, inherits', ptfn => 'named otherwise', ptfv => 'validated otherwise', idbl => 'its identity is not',
 	ixa1 => 'one for the other', ixd1 => 'one for the other', ixq1 => 'one for the other', pam => 'another access method', psp => 'a tablespace',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
@@ -614,8 +723,10 @@ for my $t (
 	[ 'pwhole', q{CREATE TABLE src.pwhole (a int) PARTITION BY RANGE ((pwhole IS NOT NULL))} ],
 	[ 'pam', 'CREATE TABLE src.pam (a int) PARTITION BY RANGE (a) ; ALTER TABLE src.pam SET ACCESS METHOD heap' ],
 	[ 'psp', 'CREATE TABLE src.psp (a int) PARTITION BY RANGE (a) TABLESPACE t86' ],
-	[ 'child', 'CREATE TABLE src.child () INHERITS (src.parent)' ],
-	[ 'parent', 'SELECT 1' ],
+	[ 'ihx', q{CREATE TABLE ptother.ihxp (a int); CREATE TABLE src.ihx () INHERITS (ptother.ihxp)} ],
+	[ 'ihf', q{CREATE FOREIGN TABLE src.ihfp (a int) SERVER pxs; CREATE TABLE src.ihf () INHERITS (src.ihfp)} ],
+	[ 'ihg', q{CREATE TABLE src.ihg (a int); CREATE FOREIGN TABLE src.ihg1 () INHERITS (src.ihg) SERVER pxs} ],
+	[ 'ihy', q{CREATE TABLE src.ihy (a int); CREATE TABLE ptother.ihy1 () INHERITS (src.ihy)} ],
 	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],
 	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
 	[ 'fill', 'CREATE TABLE src.fill (a int) WITH (fillfactor = 50)' ],
@@ -1235,6 +1346,32 @@ my $part_utf8 = $node->safe_psql('postgres', sprintf($part_enc, 'enc'));
 is($node->safe_psql('lat', sprintf($part_enc, 'enc')), $part_utf8, 'a partitioned table the same bytes in LATIN1 as in UTF8');
 $node->safe_psql('lat', qq{SELECT test_ws_schema_create(decode('$part_utf8', 'hex'), 'dst')});
 is($node->safe_psql('lat', sprintf($part_enc, 'dst')), $part_utf8, 'and made there, read again');
+
+# a table inheriting: its parents', columns' and constraints' names in each encoding
+my $inh_sql = q{
+	SET client_encoding = UTF8;
+	CREATE TABLE enc."parenté" ("colonné" integer CONSTRAINT "nulé" NOT NULL, CONSTRAINT "chequé" CHECK ("colonné" > 0));
+	CREATE TABLE enc."enfanté" (own text) INHERITS (enc."parenté");
+};
+$node->safe_psql($_, $inh_sql) for ('postgres', 'lat');
+my $inh_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('%s', '%s'), 'hex')};
+my $inh_utf8 = $node->safe_psql('postgres', sprintf($inh_enc, 'enc', 'enfanté'));
+is($node->safe_psql('lat', sprintf($inh_enc, 'enc', 'enfanté')), $inh_utf8, 'a table inheriting the same bytes in LATIN1 as in UTF8');
+for my $table ('parenté', 'enfanté')
+{
+	my $hex = $node->safe_psql('postgres', sprintf($inh_enc, 'enc', $table));
+	$node->safe_psql('lat', qq{SET client_encoding = UTF8; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst');
+		SELECT test_ws_schema_inherit(decode('$hex', 'hex'), 'dst');
+		SELECT test_ws_schema_set_inherited(decode('$hex', 'hex'), 'dst')});
+}
+is($node->safe_psql('lat', sprintf($inh_enc, 'dst', 'enfanté')), $inh_utf8, 'and made there, read again');
+$node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSIONED;
+	CREATE TABLE lié."enfanté" ("colonné" integer CONSTRAINT "nulé" NOT NULL, own text, CONSTRAINT "chequé" CHECK ("colonné" > 0))});
+{
+	my ($ret, $out, $err) = $node->psql('lat',
+		qq{SET client_encoding = UTF8; SELECT test_ws_schema_set_inherited(decode('$inh_utf8', 'hex'), 'lié');});
+	like($err, qr/table "enfanté" says "colonné" is inherited/, 'a lie told in the server\'s encoding');
+}
 
 # a key's numbered rows, cut short in UTF8's bytes though not in this encoding's
 {

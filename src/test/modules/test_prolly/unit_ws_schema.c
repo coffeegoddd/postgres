@@ -1659,6 +1659,157 @@ test_partition_refused(void)
 	}
 }
 
+/* A table inheriting: the record, its bytes and its statements. */
+static void
+test_inheriting(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn"},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+	};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+	char	   *parents[] = {"Odd Parent", "q"};
+	uint64		icols[] = {7, 8};
+	char	   *icons[] = {"c", "nn"};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 1,.constraints = &con,
+		.ninherits = 2,.inherits = parents,.ninherited_cols = 2,.inherited_cols = icols,
+	.ninherited_cons = 2,.inherited_cons = icons};
+	static const char want[] =
+		"\x01" "\x01" "t" "\x02"
+		"\x07" "\x01" "a" "\x07" "integer" "s" "\x02" "nn" "\x00" "\x00" "\x00"
+		"\x08" "\x01" "b" "\x07" "integer" "s" "\x00" "\x00" "\x00" "\x00"
+		"\x00" "\x00"
+		"\x01" "\x01" "c" "c" "\x00" "\x04" "true"
+		"\x00"
+		"i" "\x02" "\x0a" "Odd Parent" "\x01" "q" "\x02" "\x07\x08" "\x02" "\x01" "c" "\x02" "nn";
+	Buf			b = BUF_INIT;
+	Buf			sql = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	CHECK_EQ(b.len, sizeof(want) - 1);
+	CHECK(memcmp(b.data, want, b.len) == 0);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK(got.ninherits == 2 && strcmp(got.inherits[1], "q") == 0);
+	CHECK(got.ninherited_cols == 2 && got.inherited_cols[1] == 8);
+	CHECK(got.ninherited_cons == 2 && strcmp(got.inherited_cons[1], "nn") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+	ws_schema_inherit(&s, 0, "x", &sql);
+	buf_append_byte(&sql, 0);
+	CHECK(strcmp((char *) sql.data, "ALTER TABLE x.t INHERIT x.\"Odd Parent\"") == 0);
+	buf_free(&sql);
+
+	{
+		uint64		reversed[] = {8, 7};
+		uint64		none[] = {9};
+		char	   *backwards[] = {"nn", "c"};
+		char	   *absent[] = {"zz"};
+		char	   *twice[] = {"q", "q"};
+		char	   *self[] = {"t"};
+
+		s.inherited_cols = reversed;
+		CHECK(problem_has(ws_schema_problem(&s), "attribute order"));
+		s.ninherited_cols = 1;
+		s.inherited_cols = none;
+		CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+		s.ninherited_cols = 0;
+		s.inherited_cons = backwards;
+		CHECK(problem_has(ws_schema_problem(&s), "order by name"));
+		s.ninherited_cons = 1;
+		s.inherited_cons = absent;
+		CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+		{
+			/* (a name it has, on a constraint that cannot be inherited) */
+			uint64		key[] = {7};
+			WsConstraint uq = {.name = "zz",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = key};
+			WsConstraint *check = s.constraints;
+
+			s.constraints = &uq;
+			CHECK(problem_has(ws_schema_problem(&s), "does not have"));
+			s.constraints = check;
+		}
+		s.ninherited_cons = 0;
+		s.inherits = twice;
+		CHECK(problem_has(ws_schema_problem(&s), "a parent twice"));
+		s.ninherits = 1;
+		s.inherits = self;
+		CHECK(problem_has(ws_schema_problem(&s), "from itself"));
+		s.inherits = parents;
+		s.partition_of = "p";
+		s.partition_bound = "DEFAULT";
+		CHECK(problem_has(ws_schema_problem(&s), "inherits as well"));
+		s.partition_of = NULL;
+		s.partition_bound = NULL;
+		s.partition = WS_PARTITION_HASH;
+		s.npartition = 1;
+		{
+			WsIndexKey	pk = {.tag = 7,.order = 'd',.nulls = 'd'};
+
+			s.partition_keys = &pk;
+			CHECK(problem_has(ws_schema_problem(&s), "partitioned table that inherits"));
+		}
+		s.partition = WS_PARTITION_NONE;
+		s.npartition = 0;
+		s.partition_keys = NULL;
+		s.ninherits = WS_MAX_PARENTS + 1;
+		CHECK(problem_has(ws_schema_problem(&s), "more parents"));
+		s.ninherits = 0;
+		s.ninherited_cols = 1;
+		s.inherited_cols = icols;
+		CHECK(problem_has(ws_schema_problem(&s), "no parents"));
+	}
+	{
+		static const char zero[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\x00" "\x00" "\x00";
+		static const char many[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\x7f" "\x00";
+		static const char over[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\x01" "\x01" "p" "\x02" "\x07\x07" "\x00";
+		static const char toomany[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\xc1\x0c" "\x00";
+		static const char cons[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "i" "\x01" "\x01" "p" "\x00" "\x02" "\x01" "x" "\x01" "y";
+
+		check_refused(zero, sizeof(zero) - 1, "inherits from nothing");
+		check_refused(many, sizeof(many) - 1, "more parents than bytes");
+		check_refused(toomany, sizeof(toomany) - 1, "more parents than a commit holds");
+		check_refused(cons, sizeof(cons) - 1, "more inherited constraints");
+		check_refused(over, sizeof(over) - 1, "more inherited columns");
+	}
+}
+
+/* What the statement could say beyond the parent, by the parent's own name: quoted. */
+static void
+inherit_of_no_parent(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_inherit(&s, 0, "x", &b);
+}
+
+static void
+test_inherit_quoted(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	char	   *parents[] = {"p, ADD CHECK (false); --"};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.ninherits = 1,.inherits = parents};
+	Buf			b = BUF_INIT;
+
+	ws_schema_inherit(&s, 0, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "ALTER TABLE x.t INHERIT x.\"p, ADD CHECK (false); --\"") == 0);
+	buf_free(&b);
+	expect_error(inherit_of_no_parent, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -2283,6 +2434,8 @@ static const ProllyUnitTest tests[] = {
 	{"partition_injection", test_partition_injection},
 	{"partition", test_partition},
 	{"partition_refused", test_partition_refused},
+	{"inheriting", test_inheriting},
+	{"inherit_quoted", test_inherit_quoted},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},
