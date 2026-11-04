@@ -22,6 +22,7 @@ test_prolly_sources = files(
   'unit_engine_vc.c',
   'unit_engine_window.c',
   'vc_sql.c',
+  'ws_sql_funcs.c',
   'unit_bufmgr.c',
   'unit_harness.c',
   'unit_registry.c',
@@ -206,6 +207,7 @@ tests += {
       't/083_vc_history_restarts.pl',
       't/084_vc_pointer_reads.pl',
       't/085_vc_deep_bench.pl',
+      't/086_ws_schema_round_trip.pl',
       't/087_branch_copy_minimal_wal.pl',
     ],
     'env': {

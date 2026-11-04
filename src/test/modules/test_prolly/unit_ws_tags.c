@@ -94,10 +94,114 @@ test_render_malformed(void)
 	CHECK(ws_tags_well_formed("") && ws_tags_well_formed("a @@ @{0} @{7}b"));
 }
 
+static bool
+tag_of(void *arg, const char *name, uint64 *tag)
+{
+	if (strcmp(name, "a") == 0)
+		*tag = 7;
+	else if (strcmp(name, "Odd Name") == 0)
+		*tag = 8;
+	else if (strcmp(name, "select") == 0)
+		*tag = 9;
+	else
+		return false;
+	return true;
+}
+
+static char *
+templated(const char *expression)
+{
+	Buf			b = BUF_INIT;
+
+	ws_tags_template(expression, tag_of, NULL, &b);
+	buf_append_byte(&b, 0);
+	return (char *) b.data;
+}
+
+/*
+ * References are found by the grammar: a column's name in a string, a
+ * comment, a function's name or a field's is none, and an @ of any of them
+ * is an @.
+ */
+static void
+test_template(void)
+{
+	static const struct
+	{
+		const char *expression;
+		const char *stored;
+	}			cases[] = {
+		{"(a + 1)", "(@{7} + 1)"},
+		{"(a + a)", "(@{7} + @{7})"},
+		{"(\"Odd Name\" || a)", "(@{8} || @{7})"},
+		{"\"select\"", "@{9}"},
+		{"'a'::text", "'a'::text"},
+		{"(a || 'a @{7} a')", "(@{7} || 'a @@{7} a')"},
+		{"(a @> a)", "(@{7} @@> @{7})"},
+		{"a(1)", "a(1)"},
+		{"(a).a", "(@{7}).a"},
+		{"'x'::geometry(point, 4326)", "'x'::geometry(point, 4326)"},
+		{"a::numeric(a, 2)", "@{7}::numeric(a, 2)"},
+		{"$$a$$", "$$a$$"},
+		{"1 /* a */", "1 /* a */"},
+		{"(a * CASE WHEN a > 0 THEN 1 ELSE a END)", "(@{7} * CASE WHEN @{7} > 0 THEN 1 ELSE @{7} END)"},
+		{"'caf\xc3\xa9'::text || a", "'caf\xc3\xa9'::text || @{7}"},
+	};
+
+	for (size_t i = 0; i < lengthof(cases); i++)
+	{
+		char	   *got = templated(cases[i].expression);
+
+		if (strcmp(got, cases[i].stored) != 0)
+			elog(ERROR, "\"%s\" stored as \"%s\", not \"%s\"", cases[i].expression, got,
+				 cases[i].stored);
+		CHECK(ws_tags_well_formed(got));
+	}
+}
+
+static void
+template_unknown(void *arg)
+{
+	(void) templated("(nosuch + 1)");
+}
+
+static void
+template_qualified(void *arg)
+{
+	(void) templated("(t.a + 1)");
+}
+
+static void
+template_not_one(void *arg)
+{
+	(void) templated("1) FROM y WHERE (a");
+}
+
+static void
+test_template_refused(void)
+{
+	expect_error(template_unknown, NULL, ERRCODE_FEATURE_NOT_SUPPORTED, NULL);
+	expect_error(template_qualified, NULL, ERRCODE_FEATURE_NOT_SUPPORTED, NULL);
+	expect_error(template_not_one, NULL, ERRCODE_INTERNAL_ERROR, NULL);
+}
+
+/* The tag a new column gets: this value on any cluster, its input's first 60 bits. */
+static void
+test_derive(void)
+{
+	CHECK_EQ(ws_tag_derive("t", "a", "integer", 0), UINT64CONST(759085911278661888));
+	CHECK(ws_tag_derive("t", "a", "integer", 0) != ws_tag_derive("t", "a", "integer", 1));
+	CHECK(ws_tag_derive("t", "a", "integer", 0) != ws_tag_derive("t", "b", "integer", 0));
+	CHECK(ws_tag_derive("t", "a", "integer", 0) < (UINT64CONST(1) << 60));
+}
+
 static const ProllyUnitTest tests[] = {
 	{"escape_and_render", test_escape_and_render},
 	{"render_missing", test_render_missing},
 	{"render_malformed", test_render_malformed},
+	{"template", test_template},
+	{"template_refused", test_template_refused},
+	{"derive", test_derive},
 };
 
 const ProllyUnitSuite unit_ws_tags_suite = {"ws_tags", tests, lengthof(tests)};

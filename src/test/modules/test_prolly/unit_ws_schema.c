@@ -15,7 +15,6 @@
 
 #include "access/xact.h"
 #include "engine_test_util.h"
-#include "mb/pg_wchar.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "test_prolly.h"
@@ -241,8 +240,6 @@ test_wide_and_odd(void)
 		cols[i].type = "a type";
 		cols[i].kind = WS_COL_STORED;
 	}
-	if (GetDatabaseEncoding() != PG_UTF8)
-		s.name = "tab\there \"q\"";
 	WsSchemaCodec->encode(&s, &b);
 	WsSchemaCodec->decode(b.data, b.len, &got);
 	CHECK_EQ(got.ncols, WS_MAX_COLS);
@@ -566,9 +563,8 @@ test_malformed(void)
 	for (size_t i = 0; i < lengthof(bad); i++)
 		check_refused(bad[i].p, bad[i].len, bad[i].why);
 
-	/* a name not in the database's encoding */
-	if (GetDatabaseEncoding() == PG_UTF8)
-		check_refused("\x01" "\x01" "\xff" "p" "\x00" "\x00" "\x00", 7, "encoding");
+	/* a name not UTF8, whatever the database's encoding */
+	check_refused("\x01" "\x01" "\xff" "p" "\x00" "\x00" "\x00", 7, "not UTF8");
 }
 
 /* The statement, to the byte: names quoted, each clause, references by name. */
@@ -818,6 +814,23 @@ test_create_table_stray_clause(void)
 					   "a column's generation");
 }
 
+/* An expression's references take the names the record has now. */
+static void
+test_create_table_renamed(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "now_named",.type = "integer",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_GENERATED_STORED,.def = "(@{7} * 2)"},
+	};
+	WsTableSchema s = {.name = "t",.persistence = WS_PERSISTENCE_PERMANENT,.ncols = 2,.cols = cols};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "(now_named * 2)") != NULL);
+	buf_free(&b);
+}
+
 /* A collation is checked as names, under whichever quoting the session has. */
 static void
 test_create_table_quoting(void)
@@ -945,6 +958,7 @@ static const ProllyUnitTest tests[] = {
 	{"create_table_injection", test_create_table_injection},
 	{"create_table_unchecked", test_create_table_unchecked},
 	{"create_table_quoting", test_create_table_quoting},
+	{"create_table_renamed", test_create_table_renamed},
 	{"create_table_stray_clause", test_create_table_stray_clause},
 	{"create_table_runs", test_create_table_runs},
 };

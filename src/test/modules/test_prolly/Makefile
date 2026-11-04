@@ -24,6 +24,7 @@ OBJS = \
 	unit_ws_sql.o \
 	unit_ws_tags.o \
 	vc_sql.o \
+	ws_sql_funcs.o \
 	unit_bufmgr.o \
 	unit_harness.o \
 	unit_registry.o \

@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
@@ -28,9 +29,12 @@
 #include "parser/parse_type.h"
 #include "parser/parser.h"
 #include "prolly/ws/ws_schema.h"
+#include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/regproc.h"
+#include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
 
@@ -196,8 +200,8 @@ get_bytes(const uint8 **p, const uint8 *end, uint64 n)
 		malformed("a string too long to be one");
 	if (memchr(*p, '\0', (size_t) n) != NULL)
 		malformed("a string with a NUL in it");
-	if (!pg_verifymbstr((const char *) *p, (int) n, true))
-		malformed("a string not in the database's encoding");
+	if (!pg_verify_mbstr(PG_UTF8, (const char *) *p, (int) n, true))
+		malformed("a string not UTF8");
 	s = px_malloc((size_t) n + 1);
 	memcpy(s, *p, (size_t) n);
 	s[n] = '\0';
@@ -520,31 +524,14 @@ check_expression(const WsTableSchema *s, const WsColumn *c, Node *in_statement)
 	Buf			text = BUF_INIT;
 	char	   *sql;
 	List	   *parsed;
-	SelectStmt *select;
+	Node	   *alone;
 
 	put_expression(s, c->def, &text);
 	buf_append_byte(&text, 0);
 	sql = psprintf("SELECT (%s)", (char *) text.data);
 	parsed = parse_text(s, sql);
-	/*
-	 * (a length only if a semicolon ended it: the wrapper's parenthesis, then
-	 * a comment)
-	 */
-	if (list_length(parsed) != 1 || linitial_node(RawStmt, parsed)->stmt_len != 0 ||
-		!IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
-		not_the_record(s, "a column's expression");
-	select = (SelectStmt *) linitial_node(RawStmt, parsed)->stmt;
-	/* (one target, and no other clause: nothing of a query but the expression) */
-	if (list_length(select->targetList) != 1 ||
-		linitial_node(ResTarget, select->targetList)->name != NULL ||
-		select->fromClause != NIL || select->whereClause != NULL ||
-		select->groupClause != NIL || select->havingClause != NULL ||
-		select->windowClause != NIL || select->sortClause != NIL ||
-		select->limitOffset != NULL || select->limitCount != NULL ||
-		select->lockingClause != NIL || select->withClause != NULL ||
-		select->distinctClause != NIL || select->valuesLists != NIL ||
-		select->intoClause != NULL || select->op != SETOP_NONE ||
-		!equal(linitial_node(ResTarget, select->targetList)->val, in_statement))
+	alone = ws_one_expression(parsed);
+	if (alone == NULL || !equal(alone, in_statement))
 		not_the_record(s, "a column's expression");
 	pfree(sql);
 	buf_free(&text);
@@ -703,17 +690,368 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 	}
 }
 
+/* (strings of a schema, a new copy, each from UTF8 into the server's encoding) */
+static char *
+from_utf8(const char *text)
+{
+	return text ? pstrdup(pg_any_to_server(text, (int) strlen(text), PG_UTF8)) : NULL;
+}
+
+/* (a name may be longer here: the grammar would cut it short, and quietly) */
+static char *
+name_from_utf8(const char *name)
+{
+	char	   *here = from_utf8(name);
+
+	if (here != NULL && strlen(here) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("name \"%s\" is too long in this database's encoding", here)));
+	return here;
+}
+
 void
 ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
+	WsTableSchema here = *s;
 	Buf			sql = BUF_INIT;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
-	write_create_table(s, schema, &sql);
+	here.name = name_from_utf8(s->name);
+	here.key_name = name_from_utf8(s->key_name);
+	here.cols = palloc_array(WsColumn, Max(s->ncols, 1));
+	for (int i = 0; i < s->ncols; i++)
+	{
+		here.cols[i] = s->cols[i];
+		here.cols[i].name = name_from_utf8(s->cols[i].name);
+		here.cols[i].type = from_utf8(s->cols[i].type);
+		here.cols[i].def = from_utf8(s->cols[i].def);
+		here.cols[i].collation = from_utf8(s->cols[i].collation);
+	}
+	write_create_table(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
-	check_statement(s, schema, (char *) sql.data);
+	check_statement(&here, schema, (char *) sql.data);
 	buf_append(out, sql.data, sql.len - 1);
 	buf_free(&sql);
+}
+
+uint64
+ws_schema_derived_tag(void *arg, const char *table, const char *column, const char *type,
+					  int attnum, int attempt)
+{
+	return ws_tag_derive(table, column, type, attempt);
+}
+
+static char *
+to_utf8(const char *text)
+{
+	const char *u = pg_server_to_any(text, (int) strlen(text), PG_UTF8);
+
+	return px_memdup(u, strlen(u) + 1);
+}
+
+/* (a name's limit in a commit is in UTF8's bytes, on any cluster) */
+static char *
+name_to_utf8(const char *name)
+{
+	char	   *u = to_utf8(name);
+
+	if (strlen(u) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("name \"%s\" is too long for version control", name),
+				 errdetail("A commit holds names of up to %d bytes of UTF8.", NAMEDATALEN - 1)));
+	return u;
+}
+
+/*
+ * What the record cannot yet hold and a table of the catalogs has, the first
+ * of it: a refusal, not a smaller table.  (The names of a column's not-null
+ * constraint and its identity sequence are not in the list: they are made
+ * again, and a rename leaves them behind anyway.)
+ */
+static const char *const unsupported_sql =
+"SELECT CASE "
+"  WHEN c.relispartition OR c.relkind = 'p' THEN 'it is partitioned' "
+"  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
+"  WHEN EXISTS (SELECT FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) "
+"    THEN 'it has inheritance' "
+"  WHEN am.amname <> 'heap' THEN 'it has another access method' "
+"  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
+"  WHEN c.reloptions IS NOT NULL OR tc.reloptions IS NOT NULL "
+"    THEN 'it has storage parameters' "
+"  WHEN c.relreplident <> 'd' THEN 'it has a replica identity' "
+"  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
+"       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
+"  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
+"               JOIN pg_class ic ON ic.oid = x.indexrelid "
+"               WHERE k.conrelid = c.oid AND k.contype = 'p' AND "
+"                 (k.conperiod OR k.condeferrable OR x.indisclustered OR "
+"                  x.indnkeyatts <> x.indnatts OR "
+"                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
+"    THEN 'its primary key has more than columns' "
+"  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
+"               (NOT k.convalidated OR k.connoinherit)) "
+"    THEN 'it has a not-null constraint not valid or no inherit' "
+"  WHEN EXISTS (SELECT FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid "
+"               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped AND "
+"                 (a.attstorage <> t.typstorage OR a.attcompression <> '' OR "
+"                  a.attstattarget IS NOT NULL OR a.attoptions IS NOT NULL)) "
+"    THEN 'a column has storage, compression, statistics or options set' "
+"  WHEN EXISTS (SELECT FROM pg_attrdef d JOIN pg_depend p ON p.classid = 'pg_attrdef'::regclass "
+"                 AND p.objid = d.oid AND p.refclassid = 'pg_class'::regclass "
+"               JOIN pg_class q ON q.oid = p.refobjid "
+"               WHERE d.adrelid = c.oid AND q.relkind = 'S') "
+"    THEN 'a default uses a sequence' "
+"  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
+"               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+"                 AND p.refobjid = c.oid AND p.deptype = 'a') "
+"    THEN 'it owns a sequence' "
+"  WHEN EXISTS (SELECT FROM pg_depend p JOIN pg_sequence q ON q.seqrelid = p.objid "
+"               JOIN pg_class qc ON qc.oid = q.seqrelid "
+"               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
+"               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+"                 AND p.refobjid = c.oid AND p.deptype = 'i' AND a.attidentity <> '' AND "
+"                 (qc.relpersistence <> c.relpersistence OR "
+"                  q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
+"                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
+"                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
+"    THEN 'an identity has sequence options set' "
+"  END "
+"FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam "
+"LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid WHERE c.oid = $1::oid";
+
+/*
+ * The columns as this snapshot saw them have the names they have now: names
+ * are printed from the caches, not the snapshot, so an older snapshot would
+ * put another column's name in an expression.  Under the lock, it holds till
+ * the transaction ends.
+ */
+static void
+check_snapshot_current(const char *table, Oid relid, const WsSqlRows *cols)
+{
+	for (int i = 0; i < cols->nrows; i++)
+	{
+		HeapTuple	tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+										  Int16GetDatum((int16) atoi(ws_sql_value(cols, i, 0))));
+		bool		same;
+
+		if (!HeapTupleIsValid(tup))
+			same = false;
+		else
+		{
+			same = strcmp(NameStr(((Form_pg_attribute) GETSTRUCT(tup))->attname),
+						  ws_sql_value(cols, i, 1)) == 0;
+			ReleaseSysCache(tup);
+		}
+		if (!same)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("a column of table \"%s\" was renamed or dropped since this transaction's snapshot",
+							table)));
+	}
+}
+
+/* (the columns' names in the server's encoding, as an expression prints them) */
+typedef struct ReadCols
+{
+	int			n;
+	const char **names;
+	uint64	   *tags;
+} ReadCols;
+
+static bool
+read_tag_of(void *arg, const char *name, uint64 *tag)
+{
+	ReadCols   *c = arg;
+
+	for (int i = 0; i < c->n; i++)
+		if (strcmp(c->names[i], name) == 0)
+		{
+			*tag = c->tags[i];
+			return true;
+		}
+	return false;
+}
+
+bool
+ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void *arg,
+			   WsTableSchema *out)
+{
+	const char *params[2] = {schema, table};
+	int			level = WsSql->begin();
+	WsSqlRows	rel,
+				cols,
+				key;
+	ReadCols	rc = {0};
+	const char *relkind,
+			   *persistence;
+
+	memset(out, 0, sizeof(*out));
+
+	/*
+	 * The name's table, locked: while waiting for the lock the name may have
+	 * come to mean another table, or none, so it is looked up again after.
+	 */
+	for (Oid locked = InvalidOid;;)
+	{
+		Oid			now;
+
+		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text "
+				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
+		now = rel.nrows == 0 ? InvalidOid : atooid(ws_sql_value(&rel, 0, 0));
+		if (now == locked)
+			break;
+		if (OidIsValid(locked))
+			UnlockRelationOid(locked, AccessShareLock);
+		locked = now;
+		if (OidIsValid(locked))
+		{
+			ws_sql_rows_free(&rel);
+			LockRelationOid(locked, AccessShareLock);
+		}
+		else
+			break;
+	}
+	if (rel.nrows == 0)
+	{
+		ws_sql_rows_free(&rel);
+		WsSql->end(level);
+		return false;
+	}
+	relkind = ws_sql_value(&rel, 0, 1);
+	persistence = ws_sql_value(&rel, 0, 2);
+	if (relkind[0] != RELKIND_RELATION && relkind[0] != RELKIND_PARTITIONED_TABLE)
+	{
+		ws_sql_rows_free(&rel);
+		WsSql->end(level);
+		return false;
+	}
+	if (persistence[0] == RELPERSISTENCE_TEMP)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the schema of temporary table \"%s\" cannot be read yet", table)));
+	{
+		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
+		WsSqlRows	why;
+
+		WsSql->run(unsupported_sql, 1, oid, &why);
+		if (why.nrows == 1 && ws_sql_value(&why, 0, 0) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the schema of table \"%s\" cannot be read yet: %s",
+							table, ws_sql_value(&why, 0, 0))));
+		ws_sql_rows_free(&why);
+	}
+	out->name = name_to_utf8(table);
+	out->persistence = persistence[0] == RELPERSISTENCE_UNLOGGED ?
+		WS_PERSISTENCE_UNLOGGED : WS_PERSISTENCE_PERMANENT;
+	{
+		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
+
+		WsSql->run("SELECT a.attnum::text, a.attname::text, "
+				   "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
+				   "  a.attidentity::text, a.attgenerated::text, "
+				   "  pg_get_expr(d.adbin, d.adrelid), "
+				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
+				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END "
+				   "FROM pg_attribute a "
+				   "JOIN pg_type t ON t.oid = a.atttypid "
+				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+				   "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
+				   "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
+				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+				   "ORDER BY a.attnum", 1, oid, &cols);
+		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
+				   "  con.condeferrable::text, "
+				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' ') "
+				   "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
+				   "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
+	}
+
+	check_snapshot_current(table, atooid(ws_sql_value(&rel, 0, 0)), &cols);
+	out->ncols = cols.nrows;
+	out->cols = px_malloc((size_t) Max(cols.nrows, 1) * sizeof(WsColumn));
+	memset(out->cols, 0, (size_t) Max(cols.nrows, 1) * sizeof(WsColumn));
+	rc.n = cols.nrows;
+	rc.names = palloc_array(const char *, Max(cols.nrows, 1));
+	rc.tags = palloc_array(uint64, Max(cols.nrows, 1));
+	for (int i = 0; i < cols.nrows; i++)
+	{
+		WsColumn   *c = &out->cols[i];
+		const char *identity = ws_sql_value(&cols, i, 4);
+		const char *generated = ws_sql_value(&cols, i, 5);
+		const char *collation = ws_sql_value(&cols, i, 7);
+		bool		again;
+		int			attempt = 0;
+
+		rc.names[i] = ws_sql_value(&cols, i, 1);
+		c->name = name_to_utf8(rc.names[i]);
+		c->type = to_utf8(ws_sql_value(&cols, i, 2));
+		c->not_null = ws_sql_value(&cols, i, 3)[0] == 't';
+		c->identity = identity[0];
+		c->kind = generated[0] == ATTRIBUTE_GENERATED_STORED ? WS_COL_GENERATED_STORED :
+			generated[0] == ATTRIBUTE_GENERATED_VIRTUAL ? WS_COL_GENERATED_VIRTUAL : WS_COL_STORED;
+		c->collation = collation ? to_utf8(collation) : NULL;
+		/* (a tag another column of the table has: the next one) */
+		do
+		{
+			c->tag = tag_fn(arg, out->name, c->name, c->type, atoi(ws_sql_value(&cols, i, 0)),
+							attempt++);
+			again = false;
+			for (int j = 0; j < i; j++)
+				again |= out->cols[j].tag == c->tag;
+		} while (again);
+		rc.tags[i] = c->tag;
+	}
+	/* (once every column has its tag: an expression may refer to any) */
+	for (int i = 0; i < cols.nrows; i++)
+	{
+		const char *expr = ws_sql_value(&cols, i, 6);
+
+		if (expr != NULL)
+		{
+			Buf			stored = BUF_INIT;
+
+			ws_tags_template(expr, read_tag_of, &rc, &stored);
+			buf_append_byte(&stored, 0);
+			out->cols[i].def = to_utf8((char *) stored.data);
+			buf_free(&stored);
+		}
+	}
+	if (key.nrows > 0)
+	{
+		const char *keys = ws_sql_value(&key, 0, 4);
+
+		out->key_name = name_to_utf8(ws_sql_value(&key, 0, 0));
+		out->nkey = atoi(ws_sql_value(&key, 0, 1));
+		out->key = px_malloc((size_t) out->nkey * sizeof(uint64));
+		for (int k = 0; k < out->nkey; k++)
+		{
+			char	   *end;
+			long		attnum = strtol(keys, &end, 10);
+			bool		found = false;
+
+			keys = end;
+			for (int i = 0; i < cols.nrows && !found; i++)
+				if (atol(ws_sql_value(&cols, i, 0)) == attnum)
+				{
+					out->key[k] = out->cols[i].tag;
+					found = true;
+				}
+			if (!found)
+				elog(ERROR, "a primary key of table \"%s\" on column %ld, which it does not have",
+					 table, attnum);
+		}
+	}
+	pfree(rc.names);
+	pfree(rc.tags);
+	ws_sql_rows_free(&rel);
+	ws_sql_rows_free(&cols);
+	ws_sql_rows_free(&key);
+	WsSql->end(level);
+	return true;
 }
