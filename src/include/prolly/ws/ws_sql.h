@@ -71,6 +71,13 @@ typedef struct WsSqlRoutine
 	void		(*run) (const char *sql, int nparams, const char *const *params,
 						WsSqlRows *rows);
 	/*
+	 * A statement run as run does, reading only, under the active snapshot, which
+	 * the caller has pushed: each read of one sees what the others saw, whatever
+	 * commits between them.
+	 */
+	void		(*read) (const char *sql, int nparams, const char *const *params,
+						 WsSqlRows *rows);
+	/*
 	 * A statement run; if it fails, false, with what it changed undone and
 	 * its failure in *failure.  A failure is the statement's own: its data, a
 	 * constraint, its syntax or what it names, a limit it passed, or an error

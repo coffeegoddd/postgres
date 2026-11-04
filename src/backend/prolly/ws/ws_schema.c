@@ -28,7 +28,8 @@
  * values, uvarint nstats, columns and targets, uvarint nkeyoptions and each column,
  * uvarint noptions, names and values; and with 'x', a flags byte for the key and
  * row security, a replica identity byte, its index's name if by index, and the clustered index's
- * name or nothing.  Any other ends there.
+ * name or nothing; and comments with 'm', uvarint n, and each one's kind byte, tag
+ * or name as its kind has, and text.  Any other ends there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -65,10 +66,12 @@
 #include "prolly/ws/ws_tags.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
@@ -423,6 +426,91 @@ table_settings_problem(const WsTableSchema *s)
 	}
 	if (s->clustered != NULL && !find_index(s, s->clustered, &takes_include, &body))
 		return "clustered on an index the table does not have";
+	return NULL;
+}
+
+static const char *
+comments_problem(const WsTableSchema *s)
+{
+	if (s->ncomments < 0)
+		return "a negative number of comments";
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		const WsComment *m = &s->comments[i];
+		bool		takes_include;
+		const WsIndex *body;
+
+		CHECK_FOR_INTERRUPTS();
+		if (m->text == NULL || m->text[0] == '\0')
+			return "a comment with no text";
+		switch (m->kind)
+		{
+			case WS_COMMENT_TABLE:
+				if (m->tag != 0 || m->name != NULL)
+					return "a table's comment on something else";
+				break;
+			case WS_COMMENT_COLUMN:
+			case WS_COMMENT_SEQUENCE:
+				{
+					const WsColumn *col = ws_schema_column(s, m->tag);
+
+					if (m->name != NULL || col == NULL)
+						return "a comment on a column the table does not have";
+					if (m->kind == WS_COMMENT_SEQUENCE && col->identity_seq == NULL)
+						return "a comment on a sequence the table does not have";
+					break;
+				}
+			case WS_COMMENT_INDEX:
+				if (m->tag != 0 || m->name == NULL || !find_index(s, m->name, &takes_include, &body))
+					return "a comment on an index the table does not have";
+				break;
+			case WS_COMMENT_CONSTRAINT:
+				{
+					bool		found = false;
+
+					if (m->tag != 0 || m->name == NULL)
+						return "a comment on a constraint the table does not have";
+					found = s->key_name != NULL && strcmp(s->key_name, m->name) == 0;
+					/* (in order by name, already checked: a record may hold a great many) */
+					{
+						int			lo = 0,
+									hi = s->nconstraints - 1;
+
+						while (lo <= hi && !found)
+						{
+							int			mid = lo + (hi - lo) / 2;
+							int			cmp = strcmp(m->name, s->constraints[mid].name);
+
+							found = cmp == 0;
+							if (cmp < 0)
+								hi = mid - 1;
+							else
+								lo = mid + 1;
+						}
+					}
+					for (int k = 0; k < s->ncols && !found; k++)
+						found = s->cols[k].not_null != NULL && strcmp(s->cols[k].not_null, m->name) == 0;
+					if (!found)
+						return "a comment on a constraint the table does not have";
+					break;
+				}
+			default:
+				return "a comment on no known kind of thing";
+		}
+		/* (one order, so one set of bytes) */
+		if (i > 0)
+		{
+			const WsComment *prior = &s->comments[i - 1];
+			int			cmp = (unsigned char) prior->kind - (unsigned char) m->kind;
+
+			if (cmp == 0 && prior->tag != m->tag)
+				cmp = prior->tag < m->tag ? -1 : 1;
+			if (cmp == 0 && m->name != NULL)
+				cmp = strcmp(prior->name, m->name);
+			if (cmp >= 0)
+				return "comments not in order";
+		}
+	}
 	return NULL;
 }
 
@@ -874,6 +962,9 @@ ws_schema_problem(const WsTableSchema *s)
 		problem = table_settings_problem(s);
 		if (problem != NULL)
 			return problem;
+		problem = comments_problem(s);
+		if (problem != NULL)
+			return problem;
 	}
 	return column_names_problem(s);
 }
@@ -884,6 +975,7 @@ ws_schema_problem(const WsTableSchema *s)
 #define WS_COLUMN_SETTINGS 'c'
 #define WS_INDEX_SETTINGS 'j'
 #define WS_TABLE_SETTINGS 'x'
+#define WS_COMMENTS 'm'
 #define KEY_DEFERRABLE 0x01
 #define KEY_INITDEFERRED 0x02
 #define TABLE_ROW_SECURITY 0x04
@@ -1133,6 +1225,22 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		if (s->replica_identity == WS_REPLICA_INDEX)
 			put_string(out, s->replica_index);
 		put_optional(out, s->clustered);
+	}
+	if (s->ncomments > 0)
+	{
+		buf_append_byte(out, WS_COMMENTS);
+		buf_append_uvarint(out, (uint64) s->ncomments);
+		for (int i = 0; i < s->ncomments; i++)
+		{
+			const WsComment *m = &s->comments[i];
+
+			buf_append_byte(out, (uint8) m->kind);
+			if (m->kind == WS_COMMENT_COLUMN || m->kind == WS_COMMENT_SEQUENCE)
+				buf_append_uvarint(out, m->tag);
+			else if (m->kind != WS_COMMENT_TABLE)
+				put_string(out, m->name);
+			put_string(out, m->text);
+		}
 	}
 }
 
@@ -1424,7 +1532,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		get_index_body(&p, end, ix, false);
 	}
 	if (p != end && *p != WS_PARTITION_OF && *p != WS_INHERITS && *p != WS_OPTIONS &&
-		*p != WS_COLUMN_SETTINGS && *p != WS_INDEX_SETTINGS && *p != WS_TABLE_SETTINGS)
+		*p != WS_COLUMN_SETTINGS && *p != WS_INDEX_SETTINGS && *p != WS_TABLE_SETTINGS &&
+		*p != WS_COMMENTS)
 	{
 		s->partition = (char) get_byte(&p, end);
 		if (s->partition == WS_PARTITION_NONE)
@@ -1612,6 +1721,37 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 			!s->row_security && !s->force_row_security)
 			malformed("a table's settings saying it has none");
 	}
+	if (p != end && *p == WS_COMMENTS)
+	{
+		p++;
+		n = get_uvarint(&p, end);
+		if (n == 0)
+			malformed("it has no comments, at length");
+		/* (each is at least two bytes: its kind and its text's length) */
+		if (n > (uint64) (end - p) / 2)
+			malformed("more comments than bytes");
+		s->comments = px_malloc((size_t) Min(n, 16) * sizeof(WsComment));
+		memset(s->comments, 0, (size_t) Min(n, 16) * sizeof(WsComment));
+		for (uint64 i = 0; i < n; i++)
+		{
+			WsComment  *m;
+
+			/* (grown as they are read: each is bigger here than there) */
+			if (i >= 16 && (i & (i - 1)) == 0)
+			{
+				s->comments = px_realloc(s->comments, (size_t) Min(i * 2, n) * sizeof(WsComment));
+				memset(s->comments + i, 0, (size_t) (Min(i * 2, n) - i) * sizeof(WsComment));
+			}
+			s->ncomments = (int) i + 1;
+			m = &s->comments[i];
+			m->kind = (char) get_byte(&p, end);
+			if (m->kind == WS_COMMENT_COLUMN || m->kind == WS_COMMENT_SEQUENCE)
+				m->tag = get_uvarint(&p, end);
+			else if (m->kind != WS_COMMENT_TABLE)
+				m->name = get_string(&p, end);
+			m->text = get_string(&p, end);
+		}
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_schema_problem(s);
@@ -1668,6 +1808,12 @@ ws_schema_free(WsTableSchema *s)
 			options_free(set->keyoptions[k].options, set->keyoptions[k].noptions);
 		px_free(set->keyoptions);
 	}
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		px_free(s->comments[i].name);
+		px_free(s->comments[i].text);
+	}
+	px_free(s->comments);
 	px_free(s->index_settings);
 	px_free(s->replica_index);
 	px_free(s->clustered);
@@ -2963,6 +3109,91 @@ check_table_settings_statement(const WsTableSchema *s, const char *schema, const
 	}
 }
 
+static void
+write_comment(const WsTableSchema *s, const WsComment *m, const char *schema, Buf *out)
+{
+	const WsColumn *col = m->tag != 0 ? ws_schema_column(s, m->tag) : NULL;
+
+	switch (m->kind)
+	{
+		case WS_COMMENT_TABLE:
+			ws_put_text(out, "COMMENT ON TABLE ");
+			break;
+		case WS_COMMENT_COLUMN:
+			ws_put_text(out, "COMMENT ON COLUMN ");
+			break;
+		case WS_COMMENT_SEQUENCE:
+			ws_put_text(out, "COMMENT ON SEQUENCE ");
+			break;
+		case WS_COMMENT_INDEX:
+			ws_put_text(out, "COMMENT ON INDEX ");
+			break;
+		default:
+			ws_put_text(out, "COMMENT ON CONSTRAINT ");
+			ws_put_identifier(out, m->name);
+			ws_put_text(out, " ON ");
+			break;
+	}
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	if (m->kind == WS_COMMENT_SEQUENCE)
+		ws_put_identifier(out, col->identity_seq);
+	else if (m->kind == WS_COMMENT_INDEX)
+		ws_put_identifier(out, m->name);
+	else
+		ws_put_identifier(out, s->name);
+	if (m->kind == WS_COMMENT_COLUMN)
+	{
+		ws_put_text(out, ".");
+		ws_put_identifier(out, col->name);
+	}
+	ws_put_text(out, " IS ");
+	ws_put_text(out, quote_literal_cstr(m->text));
+}
+
+/* One COMMENT, on just this, saying just this. */
+static void
+check_comment_statement(const WsTableSchema *s, const WsComment *m, const char *schema, const char *sql)
+{
+	List	   *parsed = parse_text(s, sql);
+	const WsColumn *col = m->tag != 0 ? ws_schema_column(s, m->tag) : NULL;
+	CommentStmt *stmt;
+	List	   *want = list_make1(makeString((char *) schema));
+	ObjectType	type;
+
+	switch (m->kind)
+	{
+		case WS_COMMENT_TABLE:
+			type = OBJECT_TABLE;
+			want = lappend(want, makeString(s->name));
+			break;
+		case WS_COMMENT_COLUMN:
+			type = OBJECT_COLUMN;
+			want = lappend(want, makeString(s->name));
+			want = lappend(want, makeString(col->name));
+			break;
+		case WS_COMMENT_SEQUENCE:
+			type = OBJECT_SEQUENCE;
+			want = lappend(want, makeString(col->identity_seq));
+			break;
+		case WS_COMMENT_INDEX:
+			type = OBJECT_INDEX;
+			want = lappend(want, makeString(m->name));
+			break;
+		default:
+			type = OBJECT_TABCONSTRAINT;
+			want = lappend(want, makeString(s->name));
+			want = lappend(want, makeString(m->name));
+			break;
+	}
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CommentStmt))
+		not_the_record(s, "it is not one COMMENT");
+	stmt = (CommentStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->objtype != type || !equal(stmt->object, want) || stmt->comment == NULL ||
+		strcmp(stmt->comment, m->text) != 0)
+		not_the_record(s, "another comment");
+}
+
 /* One ALTER TABLE ONLY of this table, of just its row security. */
 static void
 check_row_security_statement(const WsTableSchema *s, const char *schema, const char *sql)
@@ -3196,6 +3427,13 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	here.index_settings = index_settings_in_server_encoding(s);
 	here.replica_index = ws_name_from_utf8(s->replica_index);
 	here.clustered = ws_name_from_utf8(s->clustered);
+	here.comments = palloc_array(WsComment, Max(s->ncomments, 1));
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		here.comments[i] = s->comments[i];
+		here.comments[i].name = ws_name_from_utf8(s->comments[i].name);
+		here.comments[i].text = from_utf8(s->comments[i].text);
+	}
 	here.inherits = palloc_array(char *, Max(s->ninherits, 1));
 	for (int i = 0; i < s->ninherits; i++)
 		here.inherits[i] = ws_name_from_utf8(s->inherits[i]);
@@ -3344,6 +3582,26 @@ ws_schema_table_settings(const WsTableSchema *s, const char *schema, Buf *out)
 	write_table_settings(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_table_settings_statement(&here, schema, (char *) sql.data);
+	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	if (n < 0 || n >= s->ncomments)
+		elog(ERROR, "no comment %d", n);
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	write_comment(&here, &here.comments[n], schema, &sql);
+	buf_append_byte(&sql, 0);
+	check_comment_statement(&here, &here.comments[n], schema, (char *) sql.data);
 	statement_end(cxt, &sql, out);
 }
 
@@ -3539,11 +3797,15 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
 "               AND p.objid IN (SELECT o FROM own) AND p.deptype = 'x') "
 "    THEN 'it depends on an extension' "
-"  WHEN EXISTS (SELECT FROM pg_description d WHERE "
-"               (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT o FROM own)) OR "
-"               (d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
-"                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid))) "
-"    THEN 'it has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
+"                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'f')) "
+"    THEN 'a foreign key has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_type'::regclass AND "
+"               (d.objoid = c.reltype OR d.objoid = (SELECT t.typarray FROM pg_type t WHERE t.oid = c.reltype))) "
+"    THEN 'its row type has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d JOIN pg_index x ON x.indexrelid = d.objoid "
+"               WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = c.reltoastrelid) "
+"    THEN 'its TOAST table has a comment' "
 "  WHEN EXISTS (SELECT FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass "
 "               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
 "  WHEN (c.relacl IS NOT NULL AND c.relacl <> acldefault('r', c.relowner)) OR "
@@ -3722,7 +3984,7 @@ read_index_key(const char *table, const char *index_oid, int k, const IndexElem 
 		WsSqlRows	one;
 
 		snprintf(colno, sizeof(colno), "%d", k + 1);
-		WsSql->run("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
+		WsSql->read("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
 		if (ws_sql_value(&one, 0, 0) == NULL)
 			index_gone(table);
 		key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
@@ -3756,7 +4018,7 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(atooid(index_oid))))
 		index_gone(table);
-	WsSql->run("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
+	WsSql->read("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
 	if (ws_sql_value(&printed, 0, 0) == NULL)
 		index_gone(table);
 	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", ws_sql_value(&printed, 0, 0)),
@@ -3862,7 +4124,7 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 			exprs = (List *) stringToNode(TextDatumGetCString(datum));
 	}
 	ReleaseSysCache(tup);
-	WsSql->run("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
+	WsSql->read("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
 	if (ws_sql_value(&printed, 0, 0) == NULL)
 		elog(ERROR, "partitioned table \"%s\" printed no partitioning", table);
 	parsed = raw_parser(psprintf("CREATE TABLE t () PARTITION BY %s", ws_sql_value(&printed, 0, 0)),
@@ -3926,9 +4188,9 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
-			   "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
-			   "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
+	WsSql->read("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
+			    "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
+			    "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
 	/*
 	 * A TOAST table outlives the need for one, and its parameters with it, where
 	 * CREATE TABLE would make none and lose them: what decides is what it would.
@@ -3980,8 +4242,8 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 			qsort(out->options, out->noptions, sizeof(WsOption), option_cmp);
 	}
 	ws_sql_rows_free(&rows);
-	WsSql->run("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
-			   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
+	WsSql->read("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
+			    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
 	for (int r = 0; r < rows.nrows;)
 	{
 		int			same = 1;
@@ -4045,13 +4307,13 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	WsSqlRows	idx;
 	int			n = 0;
 
-	WsSql->run("SELECT ic.relname::text, ic.oid::text, "
-			   "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
-			   "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
-			   "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
-			   "  array_to_string((i.indkey::int2[])[i.indnkeyatts:i.indnatts - 1], ' ') "
-			   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-			   "WHERE i.indrelid = $1::oid", 1, params, &idx);
+	WsSql->read("SELECT ic.relname::text, ic.oid::text, "
+			    "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
+			    "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
+			    "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
+			    "  array_to_string((i.indkey::int2[])[i.indnkeyatts:i.indnatts - 1], ' ') "
+			    "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			    "WHERE i.indrelid = $1::oid", 1, params, &idx);
 	out->index_settings = px_malloc((size_t) Max(idx.nrows, 1) * sizeof(WsIndexSettings));
 	memset(out->index_settings, 0, (size_t) Max(idx.nrows, 1) * sizeof(WsIndexSettings));
 	for (int r = 0; r < idx.nrows; r++)
@@ -4068,16 +4330,16 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 			set->include = px_malloc((size_t) set->ninclude * sizeof(uint64));
 			read_col_tags(table, cols, out, ws_sql_value(&idx, r, 3), set->ninclude, set->include);
 		}
-		WsSql->run("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
+		WsSql->read("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
 		if (opts.nrows > 0)
 		{
 			set->options = read_option_rows(&opts, 0, 0, opts.nrows);
 			set->noptions = opts.nrows;
 		}
 		ws_sql_rows_free(&opts);
-		WsSql->run("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
-				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
-				   "ORDER BY a.attnum", 1, iparams, &atts);
+		WsSql->read("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
+				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
+				    "ORDER BY a.attnum", 1, iparams, &atts);
 		if (atts.nrows > 0)
 		{
 			set->stats = px_malloc((size_t) atts.nrows * sizeof(WsIndexStat));
@@ -4089,8 +4351,8 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 			}
 		}
 		ws_sql_rows_free(&atts);
-		WsSql->run("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
-				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
+		WsSql->read("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
+				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
 		if (keyopts.nrows > 0)
 		{
 			set->keyoptions = px_malloc((size_t) keyopts.nrows * sizeof(WsKeyOptions));
@@ -4124,6 +4386,74 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	ws_sql_rows_free(&idx);
 }
 
+static int
+comment_cmp(const void *a, const void *b)
+{
+	const WsComment *x = a;
+	const WsComment *y = b;
+
+	if (x->kind != y->kind)
+		return (unsigned char) x->kind < (unsigned char) y->kind ? -1 : 1;
+	if (x->tag != y->tag)
+		return x->tag < y->tag ? -1 : 1;
+	return x->name != NULL && y->name != NULL ? strcmp(x->name, y->name) : 0;
+}
+
+/*
+ * The comments on what the record holds: those on a foreign key, a row type or a
+ * TOAST table are refused above, and those on triggers and the like go with those
+ * objects, which are not the table's.
+ */
+static void
+read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT 't', NULL::text, d.description FROM pg_description d "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid = 0 "
+			    "UNION ALL SELECT 'c', d.objsubid::text, d.description FROM pg_description d "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid > 0 "
+			    "UNION ALL SELECT 'i', q.relname::text, d.description FROM pg_description d "
+			    "  JOIN pg_index x ON x.indexrelid = d.objoid JOIN pg_class q ON q.oid = x.indexrelid "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = $1::oid "
+			    "UNION ALL SELECT 's', p.refobjsubid::text, d.description FROM pg_description d "
+			    "  JOIN pg_depend p ON p.objid = d.objoid AND p.classid = 'pg_class'::regclass "
+			    "    AND p.refclassid = 'pg_class'::regclass AND p.deptype = 'i' "
+			    "  JOIN pg_class q ON q.oid = p.objid AND q.relkind = 'S' "
+			    "  WHERE d.classoid = 'pg_class'::regclass AND p.refobjid = $1::oid "
+			    "UNION ALL SELECT 'k', k.conname::text, d.description FROM pg_description d "
+			    "  JOIN pg_constraint k ON k.oid = d.objoid "
+			    "  WHERE d.classoid = 'pg_constraint'::regclass AND k.conrelid = $1::oid", 1, params, &rows);
+	if (rows.nrows > 0)
+	{
+		out->comments = px_malloc((size_t) rows.nrows * sizeof(WsComment));
+		memset(out->comments, 0, (size_t) rows.nrows * sizeof(WsComment));
+		out->ncomments = rows.nrows;
+		for (int i = 0; i < rows.nrows; i++)
+		{
+			WsComment  *m = &out->comments[i];
+			const char *target = ws_sql_value(&rows, i, 1);
+
+			m->kind = ws_sql_value(&rows, i, 0)[0];
+			m->text = to_utf8(ws_sql_value(&rows, i, 2));
+			if (m->kind == WS_COMMENT_COLUMN || m->kind == WS_COMMENT_SEQUENCE)
+			{
+				for (int k = 0; k < cols->nrows && m->tag == 0; k++)
+					if (strcmp(ws_sql_value(cols, k, 0), target) == 0)
+						m->tag = out->cols[k].tag;
+				if (m->tag == 0)
+					elog(ERROR, "a comment on a column the table does not have");
+			}
+			else if (m->kind != WS_COMMENT_TABLE)
+				m->name = ws_name_to_utf8(target);
+		}
+		if (out->ncomments > 1)
+			qsort(out->comments, out->ncomments, sizeof(WsComment), comment_cmp);
+	}
+	ws_sql_rows_free(&rows);
+}
+
 /* Its row security, replica identity and clustered index. */
 static void
 read_table_settings(const char *table, const char *oid, WsTableSchema *out)
@@ -4131,13 +4461,13 @@ read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT c.relreplident::text, "
-			   "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
-			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-			   "    WHERE i.indrelid = c.oid AND i.indisreplident), "
-			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-			   "    WHERE i.indrelid = c.oid AND i.indisclustered) "
-			   "FROM pg_class c WHERE c.oid = $1::oid", 1, params, &rows);
+	WsSql->read("SELECT c.relreplident::text, "
+			    "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
+			    "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			    "    WHERE i.indrelid = c.oid AND i.indisreplident), "
+			    "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+			    "    WHERE i.indrelid = c.oid AND i.indisclustered) "
+			    "FROM pg_class c WHERE c.oid = $1::oid", 1, params, &rows);
 	out->row_security = ws_sql_value(&rows, 0, 1)[0] == 't';
 	out->force_row_security = ws_sql_value(&rows, 0, 2)[0] == 't';
 	switch (ws_sql_value(&rows, 0, 0)[0])
@@ -4172,8 +4502,8 @@ read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others
 	WsSqlRows	parents;
 	int			n = 0;
 
-	WsSql->run("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
-			   "WHERE i.inhrelid = $1::oid ORDER BY i.inhseqno", 1, params, &parents);
+	WsSql->read("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+			    "WHERE i.inhrelid = $1::oid ORDER BY i.inhseqno", 1, params, &parents);
 	if (parents.nrows > 0)
 	{
 		out->ninherits = parents.nrows;
@@ -4278,11 +4608,19 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("table \"%s\" is not in a versioned schema", table)));
+
+	/*
+	 * All the rest under one snapshot, taken now the lock is held, as that lock
+	 * keeps out only some of what can change a table's record: another
+	 * transaction's comment, or an index renamed, between one read and the next.
+	 */
+	PushCopiedSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 		WsSqlRows	why;
 
-		WsSql->run(unsupported_sql, 1, oid, &why);
+		WsSql->read(unsupported_sql, 1, oid, &why);
 		if (why.nrows == 1 && ws_sql_value(&why, 0, 0) != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -4295,54 +4633,54 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 
-		WsSql->run("SELECT a.attnum::text, a.attname::text, "
-				   "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
-				   "  a.attidentity::text, a.attgenerated::text, "
-				   "  pg_get_expr(d.adbin, d.adrelid), "
-				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
-				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
-				   "  a.attcoltag::text, "
-				   "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
-				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
-				   "  (SELECT q.relname::text FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
-				   "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
-				   "      AND p.refobjid = a.attrelid AND p.refobjsubid = a.attnum "
-				   "      AND p.deptype = 'i' AND q.relkind = 'S'), "
-				   "  a.atttypid::text, a.attislocal::text, "
-				   "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
-				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
-				   "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
-				   "  a.attcompression::text, a.attstattarget::text, a.attstorage::text, "
-				   "  a.atttypmod::text "
-				   "FROM pg_attribute a "
-				   "JOIN pg_type t ON t.oid = a.atttypid "
-				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
-				   "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
-				   "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
-				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
-				   "ORDER BY a.attnum", 1, oid, &cols);
-		WsSql->run("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
-				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
-				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
-				   "  con.oid::text, "
-				   "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
-				   "  con.convalidated::text, con.connoinherit::text, con.conenforced::text, "
-				   "  con.conislocal::text "
-				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
-				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
-		WsSql->run("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
-				   "  pg_get_expr(i.indpred, i.indrelid) "
-				   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
-				   "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
-				   "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
-				   "    AND k.contype <> 'f')",
-				   1, oid, &idxs);
-		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
-				   "  con.condeferrable::text, "
-				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
-				   "  con.condeferred::text "
-				   "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
-				   "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
+		WsSql->read("SELECT a.attnum::text, a.attname::text, "
+				    "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
+				    "  a.attidentity::text, a.attgenerated::text, "
+				    "  pg_get_expr(d.adbin, d.adrelid), "
+				    "  CASE WHEN a.attcollation <> t.typcollation THEN "
+				    "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
+				    "  a.attcoltag::text, "
+				    "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
+				    "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
+				    "  (SELECT q.relname::text FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
+				    "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+				    "      AND p.refobjid = a.attrelid AND p.refobjsubid = a.attnum "
+				    "      AND p.deptype = 'i' AND q.relkind = 'S'), "
+				    "  a.atttypid::text, a.attislocal::text, "
+				    "  (SELECT k.conislocal::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
+				    "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
+				    "  CASE WHEN a.attstorage <> t.typstorage THEN a.attstorage::text END, "
+				    "  a.attcompression::text, a.attstattarget::text, a.attstorage::text, "
+				    "  a.atttypmod::text "
+				    "FROM pg_attribute a "
+				    "JOIN pg_type t ON t.oid = a.atttypid "
+				    "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+				    "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
+				    "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
+				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+				    "ORDER BY a.attnum", 1, oid, &cols);
+		WsSql->read("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
+				    "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
+				    "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
+				    "  con.oid::text, "
+				    "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
+				    "  con.convalidated::text, con.connoinherit::text, con.conenforced::text, "
+				    "  con.conislocal::text "
+				    "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
+				    "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
+		WsSql->read("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
+				    "  pg_get_expr(i.indpred, i.indrelid) "
+				    "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+				    "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
+				    "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
+				    "    AND k.contype <> 'f')",
+				    1, oid, &idxs);
+		WsSql->read("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
+				    "  con.condeferrable::text, "
+				    "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
+				    "  con.condeferred::text "
+				    "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
+				    "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
 	}
 
 	check_snapshot_current(table, atooid(ws_sql_value(&rel, 0, 0)), &cols);
@@ -4472,9 +4810,11 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
+	INJECTION_POINT("ws-schema-read-between", NULL);
 	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_index_settings(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_table_settings(table, ws_sql_value(&rel, 0, 0), out);
+	read_comments(ws_sql_value(&rel, 0, 0), &cols, out);
 	/* (their keys' parameters, in the settings, tell them apart) */
 	for (int i = 0; i < out->nconstraints; i++)
 		for (int j = 0; j < i; j++)
@@ -4501,6 +4841,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&key);
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
+	PopActiveSnapshot();
 	WsSql->end(level);
 	return true;
 }

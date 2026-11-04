@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "mb/pg_wchar.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
@@ -24,6 +25,7 @@
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
+#include "utils/snapmgr.h"
 
 #define FK_DEFERRABLE 0x01
 #define FK_INITDEFERRED 0x02
@@ -324,7 +326,7 @@ ws_fk_refuse(const char *oid, const char *table)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run(refusal_sql, 1, params, &rows);
+	WsSql->read(refusal_sql, 1, params, &rows);
 	for (int i = 0; i < rows.nrows; i++)
 		if (ws_sql_value(&rows, i, 1) != NULL)
 			ereport(ERROR,
@@ -342,9 +344,13 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 	WsSqlRows	rows;
 	WsSqlRows	rel;
 
-	WsSql->run("SELECT c.oid::text, ns.nspbranch::text FROM pg_class c "
-			   "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
-			   "WHERE ns.nspname = $1 AND c.relname = $2", 2, params, &rel);
+	/* (seeing what this transaction has done so far, as a statement would) */
+	CommandCounterIncrement();
+	PushCopiedSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
+	WsSql->read("SELECT c.oid::text, ns.nspbranch::text FROM pg_class c "
+			    "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
+			    "WHERE ns.nspname = $1 AND c.relname = $2", 2, params, &rel);
 	if (rel.nrows == 1)
 	{
 		if (atoi(ws_sql_value(&rel, 0, 1)) == 0)
@@ -355,17 +361,17 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 	}
 	ws_sql_rows_free(&rel);
 
-	WsSql->run("SELECT k.conname::text, p.relname::text, k.confmatchtype::text, "
-			   "  k.confupdtype::text, k.confdeltype::text, k.condeferrable::text, "
-			   "  k.condeferred::text, k.convalidated::text, "
-			   TAGS_OF("k.conkey", "k.conrelid") ", "
-			   TAGS_OF("k.confkey", "k.confrelid") ", "
-			   TAGS_OF("k.confdelsetcols", "k.conrelid") " "
-			   "FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
-			   "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
-			   "JOIN pg_class p ON p.oid = k.confrelid "
-			   "WHERE ns.nspname = $1 AND c.relname = $2 AND k.contype = 'f' AND k.conparentid = 0",
-			   2, params, &rows);
+	WsSql->read("SELECT k.conname::text, p.relname::text, k.confmatchtype::text, "
+			    "  k.confupdtype::text, k.confdeltype::text, k.condeferrable::text, "
+			    "  k.condeferred::text, k.convalidated::text, "
+			    TAGS_OF("k.conkey", "k.conrelid") ", "
+			    TAGS_OF("k.confkey", "k.confrelid") ", "
+			    TAGS_OF("k.confdelsetcols", "k.conrelid") " "
+			    "FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
+			    "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
+			    "JOIN pg_class p ON p.oid = k.confrelid "
+			    "WHERE ns.nspname = $1 AND c.relname = $2 AND k.contype = 'f' AND k.conparentid = 0",
+			    2, params, &rows);
 	*n = rows.nrows;
 	*out = palloc0_array(WsForeignKey, Max(rows.nrows, 1));
 	for (int i = 0; i < rows.nrows; i++)
@@ -391,6 +397,7 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 	if (*n > 1)
 		qsort(*out, *n, sizeof(WsForeignKey), fk_cmp);
 	ws_sql_rows_free(&rows);
+	PopActiveSnapshot();
 	WsSql->end(level);
 }
 

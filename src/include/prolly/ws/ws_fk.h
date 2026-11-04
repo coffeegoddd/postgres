@@ -84,7 +84,7 @@ extern void ws_fk_read(const char *schema, const char *table, WsForeignKey **out
 
 /*
  * Raises ERRCODE_FEATURE_NOT_SUPPORTED if a table (its object id as text, in a
- * WsSql scope) has a key no commit can hold or the record cannot yet: to a table
+ * WsSql scope, a snapshot pushed as WsSql's read needs) has a key no commit can hold or the record cannot yet: to a table
  * outside its schema, not enforced, over a period, named or validated otherwise
  * than the partitioned table's it comes from, so long a name that the numbered
  * rows it has for a partitioned table could take another key's,

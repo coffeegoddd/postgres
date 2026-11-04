@@ -2437,6 +2437,159 @@ test_row_security(void)
 	}
 }
 
+/* Comments: bytes, and each one's statement. */
+static void
+test_comments(void)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED,.not_null = "nn",
+		.identity = WS_IDENTITY_ALWAYS,.identity_seq = "sq"},
+	};
+	WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+	WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 1,.keys = &key};
+	WsComment	comments[] = {
+		{.kind = 'c',.tag = 7,.text = "on it's column"},
+		{.kind = 'i',.name = "i",.text = "index"},
+		{.kind = 'k',.name = "nn",.text = "not null"},
+		{.kind = 's',.tag = 7,.text = "sequence"},
+		{.kind = 't',.text = "table"},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 1,.indexes = &ix,
+	.ncomments = 5,.comments = comments};
+	static const char *const want[] = {
+		"COMMENT ON COLUMN x.t.a IS 'on it''s column'",
+		"COMMENT ON INDEX x.i IS 'index'",
+		"COMMENT ON CONSTRAINT nn ON x.t IS 'not null'",
+		"COMMENT ON SEQUENCE x.sq IS 'sequence'",
+		"COMMENT ON TABLE x.t IS 'table'",
+	};
+	Buf			b = BUF_INIT;
+	WsTableSchema got;
+
+	WsSchemaCodec->encode(&s, &b);
+	WsSchemaCodec->decode(b.data, b.len, &got);
+	CHECK_EQ(got.ncomments, 5);
+	CHECK(got.comments[0].tag == 7 && strcmp(got.comments[1].name, "i") == 0);
+	CHECK(strcmp(got.comments[4].text, "table") == 0);
+	ws_schema_free(&got);
+	buf_free(&b);
+	for (int i = 0; i < 5; i++)
+	{
+		b = (Buf) BUF_INIT;
+		ws_schema_comment(&s, i, "x", &b);
+		buf_append_byte(&b, 0);
+		CHECK(strcmp((char *) b.data, want[i]) == 0);
+		buf_free(&b);
+	}
+#define HAS(why, ...) \
+	do { \
+		WsComment	one[] = {__VA_ARGS__}; \
+		s.comments = one; \
+		s.ncomments = lengthof(one); \
+		CHECK(problem_has(ws_schema_problem(&s), why)); \
+	} while (0)
+	HAS("no text", {.kind = 't'});
+	HAS("no text", {.kind = 't',.text = ""});
+	HAS("something else", {.kind = 't',.tag = 7,.text = "x"});
+	HAS("does not have", {.kind = 'c',.tag = 9,.text = "x"});
+	HAS("does not have", {.kind = 'i',.name = "nothing",.text = "x"});
+	HAS("does not have", {.kind = 'i',.text = "x"});
+	HAS("does not have", {.kind = 'k',.name = "nothing",.text = "x"});
+	HAS("no known kind", {.kind = 'z',.text = "x"});
+	HAS("not in order", {.kind = 't',.text = "x"}, {.kind = 'c',.tag = 7,.text = "x"});
+	HAS("not in order", {.kind = 't',.text = "x"}, {.kind = 't',.text = "y"});
+	HAS("not in order", {.kind = 'c',.tag = 7,.text = "x"}, {.kind = 'c',.tag = 7,.text = "y"});
+	ix.name = "j";
+	{
+		WsIndex		two[] = {ix, ix};
+
+		two[0].name = "i";
+		s.nindexes = 2;
+		s.indexes = two;
+		HAS("not in order", {.kind = 'i',.name = "j",.text = "x"}, {.kind = 'i',.name = "i",.text = "x"});
+		HAS("not in order", {.kind = 'i',.name = "i",.text = "x"}, {.kind = 'i',.name = "i",.text = "y"});
+		s.nindexes = 1;
+		s.indexes = &ix;
+	}
+	ix.name = "i";
+#undef HAS
+	cols[0].identity = WS_IDENTITY_NONE;
+	cols[0].identity_seq = NULL;
+	{
+		WsComment	one = {.kind = 's',.tag = 7,.text = "x"};
+
+		s.comments = &one;
+		s.ncomments = 1;
+		CHECK(problem_has(ws_schema_problem(&s), "a sequence the table does not have"));
+	}
+	{
+		static const char zero[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "m" "\x00";
+		static const char many[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "m" "\x7f" "t" "\x00";
+		static const char cut[] =
+			"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00"
+			"\x00" "\x00" "\x00" "\x00" "m" "\x01" "t" "\x05" "ab";
+
+		check_refused(zero, sizeof(zero) - 1, "no comments");
+		check_refused(many, sizeof(many) - 1, "more comments than bytes");
+		check_refused(cut, sizeof(cut) - 1, "runs past");
+	}
+}
+
+/* What a comment's text holds stays in it. */
+static void
+test_comment_quoted(void)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a'; DROP",.type = "integer",.kind = WS_COL_STORED}};
+	WsComment	m = {.kind = 't',.text = "x'; DROP TABLE x.t; --\\'"};
+	WsComment	onto = {.kind = 'c',.tag = 7,.text = "y"};
+	WsTableSchema s = {.name = "t; DROP",.ncols = 1,.cols = cols,.ncomments = 1,.comments = &m};
+	Buf			b = BUF_INIT;
+
+	ws_schema_comment(&s, 0, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "COMMENT ON TABLE x.\"t; DROP\" IS E'x''; DROP TABLE x.t; --") != NULL);
+	buf_free(&b);
+	s.comments = &onto;
+	b = (Buf) BUF_INIT;
+	ws_schema_comment(&s, 0, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "COMMENT ON COLUMN x.\"t; DROP\".\"a'; DROP\" IS 'y'") == 0);
+	buf_free(&b);
+	{
+		/* more than the decoder first makes room for */
+		WsComment	many[40];
+		char		names[40][8];
+		WsConstraint cons[40];
+		WsTableSchema t = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 40,.constraints = cons,
+		.ncomments = 40,.comments = many};
+		WsTableSchema got;
+
+		memset(cons, 0, sizeof(cons));
+		memset(many, 0, sizeof(many));
+		for (int i = 0; i < 40; i++)
+		{
+			snprintf(names[i], sizeof(names[i]), "c%02d", i);
+			cons[i].name = names[i];
+			cons[i].kind = WS_CONSTRAINT_CHECK;
+			cons[i].expr = "true";
+			many[i].kind = 'k';
+			many[i].name = names[i];
+			many[i].text = "x";
+		}
+		b = (Buf) BUF_INIT;
+		WsSchemaCodec->encode(&t, &b);
+		WsSchemaCodec->decode(b.data, b.len, &got);
+		CHECK_EQ(got.ncomments, 40);
+		CHECK(strcmp(got.comments[39].name, "c39") == 0);
+		ws_schema_free(&got);
+		buf_free(&b);
+	}
+}
+
 /* A column's not-null constraint's and sequence's names: what they must be. */
 static void
 test_column_names(void)
@@ -3070,6 +3223,8 @@ static const ProllyUnitTest tests[] = {
 	{"index_settings_problems", test_index_settings_problems},
 	{"exclusion_key_options", test_exclusion_key_options},
 	{"row_security", test_row_security},
+	{"comments", test_comments},
+	{"comment_quoted", test_comment_quoted},
 	{"column_names", test_column_names},
 	{"not_null_name_injection", test_not_null_name_injection},
 	{"many_constraints", test_many_constraints},

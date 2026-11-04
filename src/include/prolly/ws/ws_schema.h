@@ -155,6 +155,20 @@ typedef struct WsIndexSettings
 	WsKeyOptions *keyoptions;	/* by column */
 } WsIndexSettings;
 
+#define WS_COMMENT_CONSTRAINT 'k'	/* by name: its key, a check, unique, exclusion or not-null */
+#define WS_COMMENT_INDEX 'i'	/* by name, of any kind */
+#define WS_COMMENT_COLUMN 'c'	/* by tag */
+#define WS_COMMENT_SEQUENCE 's' /* an identity's, by its column's tag */
+#define WS_COMMENT_TABLE 't'	/* the table's own */
+
+typedef struct WsComment
+{
+	char		kind;			/* WS_COMMENT_* */
+	uint64		tag;			/* a column's or sequence's */
+	char	   *name;			/* a constraint's or index's */
+	char	   *text;
+} WsComment;
+
 #define WS_REPLICA_DEFAULT '\0'
 #define WS_REPLICA_FULL 'f'
 #define WS_REPLICA_NOTHING 'n'
@@ -202,6 +216,8 @@ typedef struct WsTableSchema
 	char	   *clustered;		/* the index CLUSTER uses, or NULL */
 	bool		row_security;	/* ENABLE ROW LEVEL SECURITY */
 	bool		force_row_security; /* FORCE ROW LEVEL SECURITY */
+	int			ncomments;
+	WsComment  *comments;		/* by kind's byte, then tag or name in UTF8's order */
 } WsTableSchema;
 
 /*
@@ -233,8 +249,8 @@ typedef struct WsTableSchema
  * INCLUDE only on a key or unique constraint, its statistics targets only on
  * expressions, its columns' parameters only on a key with an operator class; a
  * replica identity known, by index only if it names one that is unique, not partial
- * and not deferrable; and a clustered index one it has.  NULL if it is so, or what
- * is wrong.
+ * and not deferrable; a clustered index one it has; and comments in order, each
+ * on what it has and not empty.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -284,7 +300,7 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * a default using one, a partition detached, of another identity
  * than its table's or with two indexes attaching could take for one another
  * (a parent's constraint takes only a constraint's index: that one is not),
- * a policy, an index's dependence on an extension, comments, grants, two
+ * a policy, an index's dependence on an extension, a foreign key's comment, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A partition's identity is its table's, and not held
@@ -381,6 +397,13 @@ extern void ws_schema_table_settings(const WsTableSchema *s, const char *schema,
  * if it has none.  Checked as the table's statement is.
  */
 extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * The COMMENT giving the nth of a table's comments, in the named schema, appended
+ * to out, to run after everything it may be on is made: a check not valid is made
+ * after the rows.  Checked as the table's statement is.
+ */
+extern void ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
  * The ALTER TABLE ONLY enabling and forcing a table's row security, in the named
