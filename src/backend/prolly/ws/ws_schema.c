@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
@@ -28,6 +29,7 @@
 #include "parser/parse_type.h"
 #include "parser/parser.h"
 #include "prolly/ws/ws_schema.h"
+#include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
 #include "utils/builtins.h"
 #include "utils/regproc.h"
@@ -196,8 +198,8 @@ get_bytes(const uint8 **p, const uint8 *end, uint64 n)
 		malformed("a string too long to be one");
 	if (memchr(*p, '\0', (size_t) n) != NULL)
 		malformed("a string with a NUL in it");
-	if (!pg_verifymbstr((const char *) *p, (int) n, true))
-		malformed("a string not in the database's encoding");
+	if (!pg_verify_mbstr(PG_UTF8, (const char *) *p, (int) n, true))
+		malformed("a string not UTF8");
 	s = px_malloc((size_t) n + 1);
 	memcpy(s, *p, (size_t) n);
 	s[n] = '\0';
@@ -686,17 +688,224 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 	}
 }
 
+/* (strings of a schema, a new copy, each from UTF8 into the server's encoding) */
+static char *
+from_utf8(const char *text)
+{
+	return text ? pstrdup(pg_any_to_server(text, (int) strlen(text), PG_UTF8)) : NULL;
+}
+
 void
 ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
+	WsTableSchema here = *s;
 	Buf			sql = BUF_INIT;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
-	write_create_table(s, schema, &sql);
+	here.name = from_utf8(s->name);
+	here.key_name = from_utf8(s->key_name);
+	here.cols = palloc_array(WsColumn, Max(s->ncols, 1));
+	for (int i = 0; i < s->ncols; i++)
+	{
+		here.cols[i] = s->cols[i];
+		here.cols[i].name = from_utf8(s->cols[i].name);
+		here.cols[i].type = from_utf8(s->cols[i].type);
+		here.cols[i].def = from_utf8(s->cols[i].def);
+		here.cols[i].collation = from_utf8(s->cols[i].collation);
+	}
+	write_create_table(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
-	check_statement(s, schema, (char *) sql.data);
+	check_statement(&here, schema, (char *) sql.data);
 	buf_append(out, sql.data, sql.len - 1);
 	buf_free(&sql);
+}
+
+uint64
+ws_schema_derived_tag(void *arg, const char *table, const char *column, const char *type,
+					  int attnum, int attempt)
+{
+	return ws_tag_derive(table, column, type, attempt);
+}
+
+static char *
+to_utf8(const char *text)
+{
+	const char *u = pg_server_to_any(text, (int) strlen(text), PG_UTF8);
+
+	return px_memdup(u, strlen(u) + 1);
+}
+
+/* (the columns' names in the server's encoding, as an expression prints them) */
+typedef struct ReadCols
+{
+	int			n;
+	const char **names;
+	uint64	   *tags;
+} ReadCols;
+
+static bool
+read_tag_of(void *arg, const char *name, uint64 *tag)
+{
+	ReadCols   *c = arg;
+
+	for (int i = 0; i < c->n; i++)
+		if (strcmp(c->names[i], name) == 0)
+		{
+			*tag = c->tags[i];
+			return true;
+		}
+	return false;
+}
+
+bool
+ws_schema_read(const char *schema, const char *table, WsSchemaTagFn tag_fn, void *arg,
+			   WsTableSchema *out)
+{
+	const char *params[2] = {schema, table};
+	int			level = WsSql->begin();
+	WsSqlRows	rel,
+				cols,
+				key;
+	ReadCols	rc = {0};
+	const char *relkind,
+			   *persistence;
+
+	memset(out, 0, sizeof(*out));
+	WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text "
+			   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1 AND c.relname = $2", 2, params, &rel);
+	if (rel.nrows == 0)
+	{
+		ws_sql_rows_free(&rel);
+		WsSql->end(level);
+		return false;
+	}
+	relkind = ws_sql_value(&rel, 0, 1);
+	persistence = ws_sql_value(&rel, 0, 2);
+	if (relkind[0] == RELKIND_PARTITIONED_TABLE || persistence[0] == RELPERSISTENCE_TEMP)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the schema of partitioned or temporary table \"%s\" cannot be read yet",
+						table)));
+	if (relkind[0] != RELKIND_RELATION)
+	{
+		ws_sql_rows_free(&rel);
+		WsSql->end(level);
+		return false;
+	}
+	out->name = to_utf8(table);
+	out->persistence = persistence[0] == RELPERSISTENCE_UNLOGGED ?
+		WS_PERSISTENCE_UNLOGGED : WS_PERSISTENCE_PERMANENT;
+	{
+		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
+
+		WsSql->run("SELECT a.attnum::text, a.attname::text, "
+				   "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
+				   "  a.attidentity::text, a.attgenerated::text, "
+				   "  pg_get_expr(d.adbin, d.adrelid), "
+				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
+				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END "
+				   "FROM pg_attribute a "
+				   "JOIN pg_type t ON t.oid = a.atttypid "
+				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+				   "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
+				   "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
+				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
+				   "ORDER BY a.attnum", 1, oid, &cols);
+		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
+				   "  con.condeferrable::text, "
+				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' ') "
+				   "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
+				   "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
+	}
+
+	out->ncols = cols.nrows;
+	out->cols = px_malloc((size_t) Max(cols.nrows, 1) * sizeof(WsColumn));
+	memset(out->cols, 0, (size_t) Max(cols.nrows, 1) * sizeof(WsColumn));
+	rc.n = cols.nrows;
+	rc.names = palloc_array(const char *, Max(cols.nrows, 1));
+	rc.tags = palloc_array(uint64, Max(cols.nrows, 1));
+	for (int i = 0; i < cols.nrows; i++)
+	{
+		WsColumn   *c = &out->cols[i];
+		const char *identity = ws_sql_value(&cols, i, 4);
+		const char *generated = ws_sql_value(&cols, i, 5);
+		const char *collation = ws_sql_value(&cols, i, 7);
+		bool		again;
+		int			attempt = 0;
+
+		rc.names[i] = ws_sql_value(&cols, i, 1);
+		c->name = to_utf8(rc.names[i]);
+		c->type = to_utf8(ws_sql_value(&cols, i, 2));
+		c->not_null = ws_sql_value(&cols, i, 3)[0] == 't';
+		c->identity = identity[0];
+		c->kind = generated[0] == ATTRIBUTE_GENERATED_STORED ? WS_COL_GENERATED_STORED :
+			generated[0] == ATTRIBUTE_GENERATED_VIRTUAL ? WS_COL_GENERATED_VIRTUAL : WS_COL_STORED;
+		c->collation = collation ? to_utf8(collation) : NULL;
+		/* (a tag another column of the table has: the next one) */
+		do
+		{
+			c->tag = tag_fn(arg, out->name, c->name, c->type, atoi(ws_sql_value(&cols, i, 0)),
+							attempt++);
+			again = false;
+			for (int j = 0; j < i; j++)
+				again |= out->cols[j].tag == c->tag;
+		} while (again);
+		rc.tags[i] = c->tag;
+	}
+	/* (once every column has its tag: an expression may refer to any) */
+	for (int i = 0; i < cols.nrows; i++)
+	{
+		const char *expr = ws_sql_value(&cols, i, 6);
+
+		if (expr != NULL)
+		{
+			Buf			stored = BUF_INIT;
+
+			ws_tags_template(expr, read_tag_of, &rc, &stored);
+			buf_append_byte(&stored, 0);
+			out->cols[i].def = to_utf8((char *) stored.data);
+			buf_free(&stored);
+		}
+	}
+	if (key.nrows > 0)
+	{
+		const char *keys = ws_sql_value(&key, 0, 4);
+
+		if (strcmp(ws_sql_value(&key, 0, 1), ws_sql_value(&key, 0, 2)) != 0 ||
+			ws_sql_value(&key, 0, 3)[0] == 't')
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the primary key of table \"%s\" has INCLUDE columns or is deferrable, which cannot be read yet",
+							table)));
+		out->key_name = to_utf8(ws_sql_value(&key, 0, 0));
+		out->nkey = atoi(ws_sql_value(&key, 0, 1));
+		out->key = px_malloc((size_t) out->nkey * sizeof(uint64));
+		for (int k = 0; k < out->nkey; k++)
+		{
+			char	   *end;
+			long		attnum = strtol(keys, &end, 10);
+			bool		found = false;
+
+			keys = end;
+			for (int i = 0; i < cols.nrows && !found; i++)
+				if (atol(ws_sql_value(&cols, i, 0)) == attnum)
+				{
+					out->key[k] = out->cols[i].tag;
+					found = true;
+				}
+			if (!found)
+				elog(ERROR, "a primary key of table \"%s\" on column %ld, which it does not have",
+					 table, attnum);
+		}
+	}
+	pfree(rc.names);
+	pfree(rc.tags);
+	ws_sql_rows_free(&rel);
+	ws_sql_rows_free(&cols);
+	ws_sql_rows_free(&key);
+	WsSql->end(level);
+	return true;
 }

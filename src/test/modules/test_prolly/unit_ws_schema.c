@@ -15,7 +15,6 @@
 
 #include "access/xact.h"
 #include "engine_test_util.h"
-#include "mb/pg_wchar.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "test_prolly.h"
@@ -241,8 +240,6 @@ test_wide_and_odd(void)
 		cols[i].type = "a type";
 		cols[i].kind = WS_COL_STORED;
 	}
-	if (GetDatabaseEncoding() != PG_UTF8)
-		s.name = "tab\there \"q\"";
 	WsSchemaCodec->encode(&s, &b);
 	WsSchemaCodec->decode(b.data, b.len, &got);
 	CHECK_EQ(got.ncols, WS_MAX_COLS);
@@ -566,9 +563,8 @@ test_malformed(void)
 	for (size_t i = 0; i < lengthof(bad); i++)
 		check_refused(bad[i].p, bad[i].len, bad[i].why);
 
-	/* a name not in the database's encoding */
-	if (GetDatabaseEncoding() == PG_UTF8)
-		check_refused("\x01" "\x01" "\xff" "p" "\x00" "\x00" "\x00", 7, "encoding");
+	/* a name not UTF8, whatever the database's encoding */
+	check_refused("\x01" "\x01" "\xff" "p" "\x00" "\x00" "\x00", 7, "not UTF8");
 }
 
 /* The statement, to the byte: names quoted, each clause, references by name. */
