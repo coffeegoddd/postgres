@@ -481,6 +481,19 @@ extern void ws_schema_set_inherited(const char *schema, const WsTableSchema *s);
 extern char *ws_name_to_utf8(const char *name);
 extern char *ws_name_from_utf8(const char *name);
 
+/* Text as a commit holds it, and as this database holds it: refusing what it cannot. */
+extern char *ws_text_to_utf8(const char *text);
+extern char *ws_text_from_utf8(const char *text);
+
+/* A privilege's keyword, from its aclitem letter. */
+extern const char *ws_privilege_word(char letter);
+
+/*
+ * Raises ERRCODE_FEATURE_NOT_SUPPORTED if default privileges for the role about to
+ * make a relation in schema would make it other than it is held.
+ */
+extern void ws_schema_check_relation_defaults(const char *schema);
+
 /* Text of a statement being written; an identifier as quote_identifier quotes it. */
 extern void ws_put_text(Buf *out, const char *text);
 extern void ws_put_identifier(Buf *out, const char *name);

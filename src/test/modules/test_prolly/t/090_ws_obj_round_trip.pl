@@ -1,0 +1,158 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# A schema's views and materialized views round-trip: generated, restored into
+# another schema, and the same by the catalogs, naming nothing of where they came from.
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+my $node = PostgreSQL::Test::Cluster->new('ws_obj');
+$node->init(extra => ['--encoding=UTF8', '--locale=C']);
+$node->start;
+$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
+
+# (a schema's objects by the catalogs, with its name out of them)
+my $dump = sub {
+	my ($schema) = @_;
+	my $out = $node->safe_psql('postgres', qq{SELECT string_agg(
+		format('%s %s %s owner=%s acl=%s opts=%s comment=%s def=%s cols=%s',
+			c.relkind, c.relname, c.relispopulated, pg_get_userbyid(c.relowner), (SELECT array_agg(x::text ORDER BY x::text) FROM unnest(c.relacl) x), c.reloptions,
+			obj_description(c.oid, 'pg_class'),
+			replace(pg_get_viewdef(c.oid), '$schema.', ''),
+			(SELECT string_agg(format('%s:%s:%s:%s', a.attname, format_type(a.atttypid, a.atttypmod), a.attacl,
+				col_description(c.oid, a.attnum)), ',' ORDER BY a.attnum)
+			 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0)),
+		E'\\n' ORDER BY c.relname)
+		FROM pg_class c WHERE c.relnamespace = '"$schema"'::regnamespace AND c.relkind IN ('v', 'm')});
+	$out =~ s/"?\Q$schema\E"?\.//g;
+	return $out;
+};
+my $fresh = sub {
+	my ($to) = @_;
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS "$to" CASCADE; CREATE SCHEMA "$to";
+		CREATE TABLE "$to".t (a int PRIMARY KEY, b text, "Odd c" int);
+		CREATE TABLE "$to".pg_class_like (x int);});
+};
+
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_owner NOLOGIN;
+	CREATE ROLE g_read NOLOGIN;
+	CREATE ROLE x_person LOGIN;
+	CREATE SCHEMA "S rc";
+	SET search_path = "S rc";
+	CREATE TABLE t (a int PRIMARY KEY, b text, "Odd c" int);
+	CREATE TABLE pg_class_like (x int);
+	CREATE VIEW z_base AS SELECT a, b, "Odd c" FROM t WHERE a > 0;
+	CREATE VIEW y_mid WITH (security_barrier = true) AS SELECT a, b FROM z_base;
+	CREATE VIEW a_top WITH (security_invoker = true) AS SELECT y.a, y.b, 'it''s @ here'::text AS note FROM y_mid y;
+	CREATE VIEW checked AS SELECT a FROM t WHERE a > 5 WITH LOCAL CHECK OPTION;
+	CREATE VIEW grouped AS SELECT a, count(*) AS n FROM t GROUP BY a;
+	CREATE MATERIALIZED VIEW m_base AS SELECT a FROM t WITH NO DATA;
+	CREATE MATERIALIZED VIEW m_filled WITH (fillfactor = 50) AS SELECT a, b FROM t;
+	CREATE VIEW on_m AS SELECT a FROM m_base;
+	CREATE VIEW shadow AS SELECT x FROM pg_class_like, pg_catalog.pg_class LIMIT 0;
+	COMMENT ON VIEW a_top IS 'the ''top''';
+	COMMENT ON COLUMN a_top.note IS 'a note';
+	COMMENT ON MATERIALIZED VIEW m_base IS 'on the base';
+	ALTER VIEW a_top OWNER TO g_owner;
+	ALTER MATERIALIZED VIEW m_base OWNER TO g_owner;
+	GRANT SELECT ON a_top TO g_read;
+	GRANT SELECT ON a_top TO PUBLIC;
+	GRANT SELECT (a) ON z_base TO g_read WITH GRANT OPTION;
+	GRANT SELECT ON m_base TO g_read;
+});
+
+my $held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('S rc')});
+my %keys = map { (split /\t/)[0] => 1 } split /\n/, $held;
+ok($keys{$_}, "$_ is held")
+  for qw(view/a_top view/y_mid view/z_base view/checked view/grouped view/on_m matview/m_base matview/m_filled);
+my ($top) = grep { /^view\/a_top\t/ } split /\n/, $held;
+my $value = pack('H*', (split /\t/, $top)[1]);
+unlike($value, qr/S rc/, 'a definition does not name its schema');
+like($value, qr/it''s @@ here/, 'an @ of the text is doubled');
+like($value, qr/view\/y_mid/, 'it says what it needs');
+
+$fresh->('Dest ination');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'Dest ination')});
+is( $dump->('Dest ination'),
+	$dump->('S rc') =~ s/(m m_filled )t/$1f/r,
+	'the same by the catalogs, with a materialized view empty');
+is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_rewrite r
+	JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass
+	JOIN pg_class q ON q.oid = d.refobjid JOIN pg_class c ON c.oid = r.ev_class
+	WHERE c.relnamespace = '"Dest ination"'::regnamespace AND q.relnamespace = '"S rc"'::regnamespace}),
+	'0', 'and nothing of the source is used');
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('Dest ination')}), $held, 'and the same bytes there');
+
+# (restoring a matview runs nothing, and what is needed elsewhere is refused)
+$node->safe_psql('postgres', q{
+	SET search_path = "S rc";
+	CREATE FUNCTION public.ws_explode() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RAISE 'ran it'; END $$;
+	CREATE MATERIALIZED VIEW m_runs AS SELECT public.ws_explode() AS x WITH NO DATA;
+});
+my ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('S rc')});
+like($err, qr/m_runs.*needs something in another schema/, 'what it needs elsewhere is refused');
+$node->safe_psql('postgres', q{DROP MATERIALIZED VIEW "S rc".m_runs; DROP FUNCTION public.ws_explode()});
+
+# what a commit cannot hold is refused by name, nothing left out in silence
+my @refused = (
+	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int)', 'DROP TABLE public.o CASCADE' ],
+	[ q{CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE VIEW r_func AS SELECT f()}, 'no commit holds yet', undef, 'DROP FUNCTION "S rc".f() CASCADE' ],
+	[ q{CREATE TYPE e AS ENUM ('a'); CREATE VIEW r_type AS SELECT 'a'::e AS x}, 'no commit holds yet', undef, 'DROP TYPE "S rc".e CASCADE' ],
+	[ q{CREATE SEQUENCE q; CREATE VIEW r_seq AS SELECT nextval('q'::regclass)}, 'no commit holds yet', undef, 'DROP SEQUENCE "S rc".q CASCADE' ],
+	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
+	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
+	[ q{CREATE VIEW r_rule AS SELECT a FROM t; CREATE RULE r AS ON DELETE TO r_rule DO INSTEAD NOTHING}, 'a rule', undef, 'DROP VIEW "S rc".r_rule' ],
+	[ q{CREATE TABLE pg_class (x int); CREATE VIEW r_shadow AS SELECT x FROM "S rc".pg_class}, 'named as a catalog is', undef, 'DROP TABLE "S rc".pg_class CASCADE' ],
+	[ q{CREATE VIEW r_login AS SELECT a FROM t; GRANT SELECT ON r_login TO x_person}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_login' ],
+	[ q{CREATE VIEW r_pg AS SELECT a FROM t; GRANT SELECT ON r_pg TO pg_monitor}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_pg' ],
+);
+for my $case (@refused)
+{
+	my ($sql, $why, $before, $undo) = @$case;
+	$node->safe_psql('postgres', $before) if $before;
+	$node->safe_psql('postgres', qq{SET search_path = "S rc"; $sql});
+	my ($rc2, $out2, $err2) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('S rc')});
+	isnt($rc2, 0, "refused: $sql");
+	like($err2, qr/\Q$why\E/, "for why: $sql");
+	$node->safe_psql('postgres', $undo);
+}
+
+# a login owner is not held: whoever restores owns it
+$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW by_person AS SELECT a FROM t; ALTER VIEW by_person OWNER TO x_person});
+$fresh->('D2');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D2')});
+is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = '"D2".by_person'::regclass}),
+	$node->safe_psql('postgres', 'SELECT current_user'),
+	'a login role is not an owner in a commit');
+$node->safe_psql('postgres', 'DROP VIEW "S rc".by_person');
+
+# default privileges would add grants a commit does not hold
+$fresh->('D3');
+$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA "D3" GRANT SELECT ON TABLES TO g_read});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D3')});
+like($err, qr/default privileges would change what is made/, 'default privileges refuse a restore');
+
+# a view's text means what it meant, whatever the schema shadows
+$fresh->('D4');
+$node->safe_psql('postgres', q{CREATE FUNCTION "D4".now() RETURNS int LANGUAGE sql AS 'SELECT 1'});
+$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW uses_now AS SELECT now() AS n});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D4')});
+is( $node->safe_psql('postgres', q{SELECT format_type(atttypid, NULL) FROM pg_attribute WHERE attrelid = '"D4".uses_now'::regclass AND attname = 'n'}),
+	'timestamp with time zone',
+	'a schema cannot shadow the catalogs');
+
+# one snapshot: what a read saw of one view is what it saw of the next
+my $s = $node->background_psql('postgres');
+$s->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$s->query_safe('SELECT count(*) FROM pg_class');
+$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW later AS SELECT 1 AS x});
+my $old = $s->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
+$s->query_safe('COMMIT');
+unlike($old, qr/view\/later/, 'a read is of its snapshot');
+$s->quit;
+
+$node->stop;
+done_testing();

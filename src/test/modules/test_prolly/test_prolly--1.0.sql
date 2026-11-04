@@ -759,6 +759,14 @@ CREATE FUNCTION test_ws_role_restore(bytes text, known text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_ws_obj_bytes(schema text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_ws_obj_copy(from_schema text, to_schema text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_ws_fk_bytes(schema text, tab text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

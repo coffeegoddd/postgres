@@ -3354,9 +3354,8 @@ check_comment_statement(const WsTableSchema *s, const WsComment *m, const char *
 		not_the_record(s, "another comment");
 }
 
-/* A privilege's keyword, from its letter. */
-static const char *
-privilege_word(char letter)
+const char *
+ws_privilege_word(char letter)
 {
 	switch (letter)
 	{
@@ -3390,7 +3389,7 @@ write_grant(const WsTableSchema *s, const WsGrant *g, const char *schema, Buf *o
 	{
 		if (l > g->privileges)
 			ws_put_text(out, ", ");
-		ws_put_text(out, privilege_word(*l));
+		ws_put_text(out, ws_privilege_word(*l));
 		if (g->target == WS_GRANT_COLUMN)
 		{
 			ws_put_text(out, " (");
@@ -3444,7 +3443,7 @@ check_grant_statement(const WsTableSchema *s, const WsGrant *g, const char *sche
 	{
 		AccessPriv *priv = lfirst_node(AccessPriv, lc);
 
-		if (pg_strcasecmp(priv->priv_name, privilege_word(*l)) != 0)
+		if (pg_strcasecmp(priv->priv_name, ws_privilege_word(*l)) != 0)
 			not_the_record(s, "another grant");
 		l++;
 		if (g->target == WS_GRANT_COLUMN)
@@ -3756,6 +3755,22 @@ statement_end(MemoryContext cxt, Buf *sql, Buf *out)
 	MemoryContextDelete(cxt);
 }
 
+void
+ws_schema_check_relation_defaults(const char *schema)
+{
+	Oid			nsp = get_namespace_oid(schema, true);
+	Oid			role = GetUserId();
+
+	if (SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(InvalidOid),
+							  CharGetDatum(DEFACLOBJ_RELATION)) ||
+		(OidIsValid(nsp) &&
+		 SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(nsp),
+							   CharGetDatum(DEFACLOBJ_RELATION))))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("default privileges would change what is made in schema \"%s\"", schema)));
+}
+
 /*
  * Whether default privileges would make what is made here other than the record
  * says, by the role about to make it.  What applies to a table always does, and to
@@ -3768,18 +3783,16 @@ check_destination(const WsTableSchema *s, const char *schema)
 	Oid			nsp = get_namespace_oid(schema, true);
 	Oid			role = GetUserId();
 	bool		sequences = false;
-	bool		changes;
 
+	ws_schema_check_relation_defaults(schema);
 	for (int i = 0; i < s->ncols; i++)
 		sequences |= s->cols[i].identity != WS_IDENTITY_NONE;
-#define DEFAULTS_FOR(n, type) \
-	SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(n), CharGetDatum(type))
-	changes = DEFAULTS_FOR(InvalidOid, DEFACLOBJ_RELATION) ||
-		(OidIsValid(nsp) && DEFAULTS_FOR(nsp, DEFACLOBJ_RELATION)) ||
-		(sequences && (DEFAULTS_FOR(InvalidOid, DEFACLOBJ_SEQUENCE) ||
-					   (OidIsValid(nsp) && DEFAULTS_FOR(nsp, DEFACLOBJ_SEQUENCE))));
-#undef DEFAULTS_FOR
-	if (changes)
+	if (sequences &&
+		(SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(InvalidOid),
+							   CharGetDatum(DEFACLOBJ_SEQUENCE)) ||
+		 (OidIsValid(nsp) &&
+		  SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(nsp),
+								CharGetDatum(DEFACLOBJ_SEQUENCE)))))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("default privileges would change what is made in schema \"%s\"", schema)));
@@ -4086,6 +4099,18 @@ to_utf8(const char *text)
 	const char *u = pg_server_to_any(text, (int) strlen(text), PG_UTF8);
 
 	return px_memdup(u, strlen(u) + 1);
+}
+
+char *
+ws_text_to_utf8(const char *text)
+{
+	return to_utf8(text);
+}
+
+char *
+ws_text_from_utf8(const char *text)
+{
+	return from_utf8(text);
 }
 
 /* (a name's limit in a commit is in UTF8's bytes, on any cluster) */

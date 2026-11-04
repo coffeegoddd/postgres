@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	ws_fk.o \
+	ws_obj.o \
 	ws_role.o \
 	ws_root.o \
 	ws_row.o \

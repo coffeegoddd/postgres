@@ -16,6 +16,7 @@ test_prolly_sources = files(
   'unit_engine_remote.c',
   'unit_engine_rewrite.c',
   'unit_ws_fk.c',
+  'unit_ws_obj.c',
   'unit_ws_role.c',
   'unit_ws_root.c',
   'unit_ws_row.c',
@@ -215,6 +216,7 @@ tests += {
       't/087_branch_copy_minimal_wal.pl',
       't/088_vc_read_while_freed.pl',
       't/089_ws_role_round_trip.pl',
+      't/090_ws_obj_round_trip.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

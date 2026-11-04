@@ -152,6 +152,13 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_fk           | map                                  | ok     | 
  ws_fk           | statement                            | ok     | 
  ws_fk           | statement_quoting                    | ok     | 
+ ws_obj          | bytes                                | ok     | 
+ ws_obj          | malformed                            | ok     | 
+ ws_obj          | problems                             | ok     | 
+ ws_obj          | map                                  | ok     | 
+ ws_obj          | restore_order                        | ok     | 
+ ws_obj          | statements                           | ok     | 
+ ws_obj          | refused_statements                   | ok     | 
  ws_role         | bytes                                | ok     | 
  ws_role         | malformed                            | ok     | 
  ws_role         | problems                             | ok     | 
@@ -245,7 +252,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
  ws_tags         | tupdesc                              | ok     | 
-(233 rows)
+(240 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
