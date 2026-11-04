@@ -362,6 +362,7 @@ my %refused_for = (
 	xdup => 'two constraints alike', xfill => 'an index has options', xspc => 'an index has options',
 	xclu => 'an index has options', xstat => 'an index has options', xcmt => 'a comment',
 	xicmt => 'a comment', xext => 'depends on an extension', fksopt => 'an index has options',
+	seqother => 'its sequence in another schema',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
 	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
@@ -395,6 +396,7 @@ for my $t (
 	[ 'ctrg', q{CREATE TABLE src.ctrg (a int); CREATE FUNCTION src.ctrg_f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
 		CREATE CONSTRAINT TRIGGER ctrg_t AFTER INSERT ON src.ctrg FOR EACH ROW EXECUTE FUNCTION src.ctrg_f()} ],
 	[ 'fksopt', 'CREATE TABLE src.fksopt (a int, b int); CREATE UNIQUE INDEX fksopt_i ON src.fksopt (a) WITH (fillfactor = 50); ALTER TABLE src.fksopt ADD FOREIGN KEY (b) REFERENCES src.fksopt (a)' ],
+	[ 'seqother', 'CREATE TABLE other.seqother (a int); CREATE TABLE src.seqother (a int NOT NULL); ALTER TABLE src.seqother ALTER a ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME other.seqother_s)' ],
 	[ 'xdup', 'CREATE TABLE src.xdup (r int4range, CONSTRAINT x1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xdup ADD CONSTRAINT x2 EXCLUDE USING gist (r WITH &&)' ],
 	[ 'xfill', 'CREATE TABLE src.xfill (r int4range, EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50))' ],
 	[ 'xspc', 'CREATE TABLE src.xspc (r int4range, EXCLUDE USING gist (r WITH &&) USING INDEX TABLESPACE t86)' ],
@@ -469,7 +471,7 @@ $node->safe_psql('postgres', q{
 	ALTER TABLE src.ren2 RENAME x TO b;
 });
 $sess->query(q{SELECT test_ws_schema_bytes('src', 'ren2')});
-like($sess->{stderr}, qr/was renamed or dropped since this transaction's snapshot/,
+like($sess->{stderr}, qr/was renamed, retyped or dropped since this transaction's snapshot/,
 	'columns swapped since a snapshot refused');
 $sess->query('ROLLBACK');
 $sess->quit;
@@ -580,6 +582,23 @@ my $nnchk = $node->safe_psql('postgres', q{
 	SELECT encode(test_ws_schema_bytes('src', 'nnchk'), 'hex')});
 $node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$nnchk', 'hex'), 'dst')});
 is($bytes->($node, 'postgres', 'nnchk', undef, 'dst'), $nnchk, 'a check named as a not-null constraint would be');
+
+# a column retyped since the reader's snapshot, the type it had gone: not its text
+$node->safe_psql('postgres', q{
+	CREATE TYPE src.gone AS ENUM ('a');
+	CREATE TABLE src.retype (a src.gone);
+});
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', q{ALTER TABLE src.retype ALTER a TYPE text; DROP TYPE src.gone});
+	$old->query(q{SELECT test_ws_schema_bytes('src', 'retype')});
+	like($old->{stderr}, qr/renamed, retyped or dropped since this transaction's snapshot/,
+		'a column retyped since a snapshot refused as such');
+	$old->query('ROLLBACK');
+	$old->quit;
+}
 
 # options given since the reader's snapshot: not what the snapshot saw refused
 $node->safe_psql('postgres', q{
@@ -877,6 +896,7 @@ $node->safe_psql('postgres', q{
 		OPERATOR 3 "sché".===, FUNCTION 1 bttextcmp(text, text);
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
+		i integer CONSTRAINT "nné" GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME enc."séq"),
 		CONSTRAINT "écheck" CHECK ("colonné" > 0 AND b <> 'é'), CONSTRAINT zu UNIQUE (b),
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"),
 		CONSTRAINT "exclusioné" EXCLUDE USING btree (b COLLATE "C" "sché"."classé" WITH OPERATOR("sché".===),
@@ -892,6 +912,7 @@ my $enc_sql = q{
 		OPERATOR 3 "sché".===, FUNCTION 1 bttextcmp(text, text);
 	CREATE TABLE enc."tablé" ("colonné" integer, b text DEFAULT 'é' COLLATE "C",
 		g integer GENERATED ALWAYS AS ("colonné" + 1) STORED,
+		i integer CONSTRAINT "nné" GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME enc."séq"),
 		CONSTRAINT "écheck" CHECK ("colonné" > 0 AND b <> 'é'), CONSTRAINT zu UNIQUE (b),
 		CONSTRAINT "clé" PRIMARY KEY ("colonné"),
 		CONSTRAINT "exclusioné" EXCLUDE USING btree (b COLLATE "C" "sché"."classé" WITH OPERATOR("sché".===),
@@ -904,6 +925,11 @@ my $enc = sub {
 	my ($db) = @_;
 	return $node->safe_psql($db,
 		q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('enc', 'tablé'), 'hex')});
+};
+my $enc_dst = sub {
+	my ($db) = @_;
+	return $node->safe_psql($db,
+		q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('dst', 'tablé'), 'hex')});
 };
 my $in_utf8 = $enc->('postgres');
 is($enc->('lat'), $in_utf8, 'a schema is the same bytes in LATIN1 as in UTF8');
@@ -925,6 +951,7 @@ is( $node->safe_psql(
 		q{SET client_encoding = UTF8; SELECT pg_get_constraintdef(oid) LIKE '%"sché".===%é%' FROM pg_constraint WHERE conname = 'exclusioné' AND connamespace = 'dst'::regnamespace}),
 	't',
 	'and an exclusion with it, in its names and its text');
+is($enc_dst->('lat'), $in_utf8, 'and the same bytes, read there again');
 
 # a name that fits here and not in a commit, as part of another's: refused as too long
 my $over = 'é' x 40;
