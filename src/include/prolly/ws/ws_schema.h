@@ -439,7 +439,9 @@ extern void ws_schema_comment(const WsTableSchema *s, int n, const char *schema,
  * The ALTER TABLE ONLY giving a table its owner, in the named schema, appended to
  * out; nothing, if the record holds none.  The GRANT giving the nth of its grants.
  * To run once everything is made, the owner first, the roles they name there
- * already.  Checked as the table's statement is.
+ * already.  Checked as the table's statement is, and a role that can log in here,
+ * has powers no commit holds, is predefined or has a name not in ASCII in a cluster of
+ * mixed encodings raises an error, as does a grant to who would own the table.
  */
 extern void ws_schema_owner(const WsTableSchema *s, const char *schema, Buf *out);
 extern void ws_schema_grant(const WsTableSchema *s, int n, const char *schema, Buf *out);

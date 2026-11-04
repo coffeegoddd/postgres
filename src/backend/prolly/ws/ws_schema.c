@@ -55,6 +55,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_default_acl.h"
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_type.h"
 #include "commands/vacuum.h"
@@ -3760,33 +3761,30 @@ statement_end(MemoryContext cxt, Buf *sql, Buf *out)
 /*
  * Whether default privileges would make what is made here other than the record
  * says, by the role about to make it.  What applies to a table always does, and to
- * sequences if it has an identity.
+ * sequences if it has an identity.  Looked up as making it will look them up, so
+ * the two agree whatever snapshot this transaction holds.
  */
 static void
 check_destination(const WsTableSchema *s, const char *schema)
 {
-	char		role[16];
-	const char *params[3];
+	Oid			nsp = get_namespace_oid(schema, true);
+	Oid			role = GetUserId();
 	bool		sequences = false;
-	int			level = WsSql->begin();
-	WsSqlRows	rows;
+	bool		changes;
 
 	for (int i = 0; i < s->ncols; i++)
 		sequences |= s->cols[i].identity != WS_IDENTITY_NONE;
-	snprintf(role, sizeof(role), "%u", GetUserId());
-	params[0] = schema;
-	params[1] = role;
-	params[2] = sequences ? "S" : "r";
-	WsSql->run("SELECT FROM pg_default_acl d WHERE d.defaclrole = $2::oid "
-			   "AND d.defaclobjtype::text IN ('r', $3) AND (d.defaclnamespace = 0 "
-			   "  OR d.defaclnamespace = (SELECT n.oid FROM pg_namespace n WHERE n.nspname = $1))",
-			   3, params, &rows);
-	if (rows.nrows > 0)
+#define DEFAULTS_FOR(n, type) \
+	SearchSysCacheExists3(DEFACLROLENSPOBJ, ObjectIdGetDatum(role), ObjectIdGetDatum(n), CharGetDatum(type))
+	changes = DEFAULTS_FOR(InvalidOid, DEFACLOBJ_RELATION) ||
+		(OidIsValid(nsp) && DEFAULTS_FOR(nsp, DEFACLOBJ_RELATION)) ||
+		(sequences && (DEFAULTS_FOR(InvalidOid, DEFACLOBJ_SEQUENCE) ||
+					   (OidIsValid(nsp) && DEFAULTS_FOR(nsp, DEFACLOBJ_SEQUENCE))));
+#undef DEFAULTS_FOR
+	if (changes)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("default privileges would change what is made in schema \"%s\"", schema)));
-	ws_sql_rows_free(&rows);
-	WsSql->end(level);
 }
 
 void

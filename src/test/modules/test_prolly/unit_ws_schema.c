@@ -2710,6 +2710,16 @@ grant_public_named(void *arg)
 }
 
 static void
+owner_predefined(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.owner = "pg_monitor"};
+	Buf			b = BUF_INIT;
+
+	ws_schema_owner(&s, "x", &b);
+}
+
+static void
 test_grant_names(void)
 {
 	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
@@ -2728,6 +2738,7 @@ test_grant_names(void)
 	buf_free(&b);
 	expect_error(grant_public_named, "public", ERRCODE_DATA_CORRUPTED, NULL);
 	expect_error(grant_public_named, "pg_monitor", ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(owner_predefined, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 	{
 		/* more than the decoder first makes room for */
 		WsGrant		many[40];

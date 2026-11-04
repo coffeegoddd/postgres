@@ -75,7 +75,8 @@ extern void ws_fk_free(WsForeignKey *fk);
 
 /*
  * A table's foreign keys, but those it has as its partitioned table's, which
- * adding that table's makes again, from the catalogs, through WsSql, by name in UTF8's
+ * adding that table's makes again, from the catalogs, through WsSql, by name in
+ * UTF8's
  * order, in *out, palloc'd, each the caller's to ws_fk_free.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED as ws_fk_refuse does, and if the table is in no
  * versioned schema.

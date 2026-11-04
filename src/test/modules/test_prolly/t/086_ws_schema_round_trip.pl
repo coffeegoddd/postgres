@@ -1034,6 +1034,19 @@ $node->safe_psql('postgres', q{
 	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
 	is($bytes->($node, 'postgres', 'g_dp', undef, 'dp'), $hex, 'with none, the same bytes');
 
+	# (as making it will see them, whatever this transaction's snapshot saw)
+	{
+		my $old = $node->background_psql('postgres', on_error_stop => 0);
+		$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+		$old->query_safe('SELECT count(*) FROM pg_class');
+		$node->safe_psql('postgres', q{CREATE SCHEMA dprr VERSIONED; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO rg_read});
+		$old->query(qq{SELECT test_ws_schema_create(decode('$plain', 'hex'), 'gl_dst')});
+		like($old->{stderr}, qr/default privileges would change what is made/, 'defaults since this transaction\'s snapshot refused too');
+		$old->query('ROLLBACK');
+		$old->quit;
+		$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM rg_read});
+	}
+
 	# (a name like a predefined one's is not one)
 	$node->safe_psql('postgres', q{CREATE ROLE pgfoo NOLOGIN; CREATE TABLE src.g_pgfoo (a integer);
 		ALTER TABLE src.g_pgfoo OWNER TO pgfoo});
