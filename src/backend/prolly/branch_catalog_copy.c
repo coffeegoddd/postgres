@@ -2081,6 +2081,8 @@ make_storage(CopyState *cs)
 		dstsmgr = RelationCreateStorageWith(dst->rd_locator,
 											dst->rd_rel->relpersistence, true,
 											RelationGetSmgr(src)->smgr_which);
+		/* (new in this transaction: at wal_level minimal, it skips WAL till commit) */
+		RelationAssumeNewRelfilelocator(dst);
 		if (src->rd_rel->relkind == RELKIND_SEQUENCE)
 		{
 			/* (its page as the buffers have it, not as the file does) */
