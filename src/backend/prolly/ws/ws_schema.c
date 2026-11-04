@@ -771,7 +771,8 @@ static const char *const unsupported_sql =
 "    THEN 'it has inheritance' "
 "  WHEN am.amname <> 'heap' THEN 'it has another access method' "
 "  WHEN c.reltablespace <> 0 THEN 'it has a tablespace' "
-"  WHEN c.reloptions IS NOT NULL THEN 'it has storage parameters' "
+"  WHEN c.reloptions IS NOT NULL OR tc.reloptions IS NOT NULL "
+"    THEN 'it has storage parameters' "
 "  WHEN c.relreplident <> 'd' THEN 'it has a replica identity' "
 "  WHEN c.relrowsecurity OR c.relforcerowsecurity OR "
 "       EXISTS (SELECT FROM pg_policy o WHERE o.polrelid = c.oid) THEN 'it has row security' "
@@ -804,13 +805,14 @@ static const char *const unsupported_sql =
 "               JOIN pg_attribute a ON a.attrelid = p.refobjid AND a.attnum = p.refobjsubid "
 "               WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
 "                 AND p.refobjid = c.oid AND p.deptype = 'i' AND a.attidentity <> '' AND "
-"                 (q.seqtypid <> a.atttypid OR qc.relpersistence <> c.relpersistence OR "
+"                 (qc.relpersistence <> c.relpersistence OR "
 "                  q.seqstart <> 1 OR q.seqincrement <> 1 OR q.seqmin <> 1 OR q.seqcache <> 1 "
 "                  OR q.seqcycle OR q.seqmax <> CASE a.atttypid WHEN 'int2'::regtype THEN 32767 "
 "                    WHEN 'int4'::regtype THEN 2147483647 ELSE 9223372036854775807 END)) "
 "    THEN 'an identity has sequence options set' "
 "  END "
-"FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam WHERE c.oid = $1::oid";
+"FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam "
+"LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid WHERE c.oid = $1::oid";
 
 /*
  * The columns as this snapshot saw them have the names they have now: names
