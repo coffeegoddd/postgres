@@ -57,6 +57,25 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.cons_key (id integer PRIMARY KEY, a integer CHECK (a <> id));
 	CREATE TABLE src.cons_ren (a integer, CHECK (a > 0), UNIQUE (a));
 	ALTER TABLE src.cons_ren RENAME a TO z;
+	CREATE TABLE src.idxs (a integer, b text, c text, d integer[], r int4range,
+		"Odd Col" integer);
+	CREATE INDEX idxs_plain ON src.idxs (a);
+	CREATE INDEX "Odd Idx" ON src.idxs (a, "Odd Col" DESC NULLS LAST);
+	CREATE INDEX idxs_order ON src.idxs (a DESC, b NULLS FIRST);
+	CREATE INDEX idxs_coll ON src.idxs (b COLLATE "POSIX");
+	CREATE INDEX idxs_ops ON src.idxs (b text_pattern_ops);
+	CREATE INDEX idxs_expr ON src.idxs (lower(b), (a + 1), (b || '@' || c));
+	CREATE INDEX idxs_part ON src.idxs (a) WHERE a > 0 AND b <> '@a';
+	CREATE UNIQUE INDEX idxs_uniq ON src.idxs (a, b);
+	CREATE UNIQUE INDEX idxs_nnd ON src.idxs (b, a) INCLUDE (c, "Odd Col") NULLS NOT DISTINCT;
+	CREATE INDEX idxs_gin ON src.idxs USING gin (d);
+	CREATE INDEX idxs_gist ON src.idxs USING gist (r);
+	CREATE INDEX idxs_hash ON src.idxs USING hash (c);
+	CREATE TABLE src.idx_ren (a integer, b integer);
+	CREATE INDEX idx_ren_i ON src.idx_ren ((a + b)) WHERE a > 0;
+	ALTER TABLE src.idx_ren RENAME a TO z;
+	CREATE TABLE src.idx_key (id integer PRIMARY KEY, a integer UNIQUE);
+	CREATE UNIQUE INDEX idx_key_also ON src.idx_key (id);
 	CREATE TABLE src.renamed (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
 	ALTER TABLE src.renamed RENAME a TO z;
 	CREATE SCHEMA other;
@@ -74,7 +93,7 @@ $node->safe_psql('postgres', q{
 });
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
-	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'settings', 'names', 'ats');
+	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -135,13 +154,15 @@ $node->safe_psql('postgres', q{
 });
 my $tsdir = PostgreSQL::Test::Utils::tempdir();
 $node->safe_psql('postgres', "CREATE TABLESPACE t86 LOCATION '$tsdir'");
+$node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
 	fk => 'a foreign key', excl => 'an exclusion', cnv => 'a check not valid',
 	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
-	idx => 'an index no constraint has', cmt => 'a comment', ccmt => 'a comment',
+	ifill => 'an index has options', ispc => 'an index has options', iclu => 'an index has options',
+	istat => 'an index has options', cmt => 'a comment', ccmt => 'a comment',
 	kcmt => 'a comment', kicmt => 'a comment', seqcmt => 'a comment',
 	grt => 'grants', cgrt => 'grants', seqgrt => 'grants',
 	dup => 'two constraints alike', dupk => 'two constraints alike');
@@ -175,7 +196,10 @@ for my $t (
 	[ 'uinc', 'CREATE TABLE src.uinc (a int, b int, UNIQUE (a) INCLUDE (b))' ],
 	[ 'uopt', 'CREATE TABLE src.uopt (a int, UNIQUE (a) WITH (fillfactor = 50))' ],
 	[ 'uclu', 'CREATE TABLE src.uclu (a int, CONSTRAINT u UNIQUE (a)); ALTER TABLE src.uclu CLUSTER ON u' ],
-	[ 'idx', 'CREATE TABLE src.idx (a int); CREATE INDEX ON src.idx (a)' ],
+	[ 'ifill', 'CREATE TABLE src.ifill (a int); CREATE INDEX ON src.ifill (a) WITH (fillfactor = 50)' ],
+	[ 'ispc', 'CREATE TABLE src.ispc (a int); CREATE INDEX ON src.ispc (a) TABLESPACE t86' ],
+	[ 'iclu', 'CREATE TABLE src.iclu (a int); CREATE INDEX iclu_i ON src.iclu (a); ALTER TABLE src.iclu CLUSTER ON iclu_i' ],
+	[ 'istat', 'CREATE TABLE src.istat (a int); CREATE INDEX istat_i ON src.istat ((a + 1)); ALTER INDEX src.istat_i ALTER COLUMN 1 SET STATISTICS 5' ],
 	[ 'cmt', q{CREATE TABLE src.cmt (a int); COMMENT ON TABLE src.cmt IS 'x'} ],
 	[ 'ccmt', q{CREATE TABLE src.ccmt (a int); COMMENT ON COLUMN src.ccmt.a IS 'x'} ],
 	[ 'kcmt', q{CREATE TABLE src.kcmt (a int, CONSTRAINT c CHECK (a > 0)); COMMENT ON CONSTRAINT c ON src.kcmt IS 'x'} ],
@@ -284,6 +308,17 @@ is( $node->safe_psql('postgres',
 		qq{SELECT test_ws_schema_create(decode('$alike', 'hex'), 'dst') IS NOT NULL;
 		   SELECT count(*) FROM pg_constraint WHERE conrelid = 'dst.alike'::regclass AND contype = 'u'}),
 	"t\n4", 'constraints CREATE TABLE tells apart all made');
+
+# an index's references by tag, and the expression under a new name
+like(
+	$node->safe_psql('postgres',
+		qq{SELECT test_ws_schema_create(decode('@{[ $bytes->($node, 'postgres', 'idx_ren') ]}', 'hex'), 'dst2_idx')}),
+	qr/CREATE TABLE/, 'a table of a renamed column\'s index made');
+is( $node->safe_psql('postgres',
+		q{SELECT pg_get_indexdef('dst2_idx.idx_ren_i'::regclass) LIKE '%(z + b)%WHERE (z > 0)%'}),
+	't', 'and the index follows the new name');
+my $tagged_idx = q!SELECT position('a + b'::bytea in test_ws_schema_bytes('src', 'idx_ren')) = 0!;
+is($node->safe_psql('postgres', $tagged_idx), 't', 'an index stored by tag');
 
 # a check's references are by tag: no column's name in its bytes
 $node->safe_psql('postgres', q{CREATE TABLE src.tagged (longcolumnname int, CHECK (longcolumnname > 0))});
@@ -515,6 +550,9 @@ my $order = q{
 	CREATE SCHEMA ord VERSIONED;
 	CREATE TABLE ord.t (a integer, CONSTRAINT "€1" CHECK (a > 1), CONSTRAINT "é1" CHECK (a > 2),
 		CONSTRAINT "z1" CHECK (a > 3));
+	CREATE INDEX "€i" ON ord.t (a);
+	CREATE INDEX "éi" ON ord.t (a);
+	CREATE INDEX "zi" ON ord.t (a);
 };
 $node->safe_psql('postgres',
 	q{CREATE DATABASE lat9 ENCODING LATIN9 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
