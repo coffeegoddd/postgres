@@ -86,6 +86,22 @@ ENGINE_TEST(test_tables)
 	CHECK(memcmp(after.b, empty_rv.b, PHASH_LEN) == 0);
 }
 
+typedef struct Seen
+{
+	int			n;
+	char		names[4][NAMEDATALEN];
+	int			stop_after;
+} Seen;
+
+static bool
+see_table(void *arg, const char *name, const VcTable *entry)
+{
+	Seen	   *seen = arg;
+
+	strlcpy(seen->names[seen->n++], name, NAMEDATALEN);
+	return seen->n != seen->stop_after;
+}
+
 /* No table's name is taken for a map, however it is spelled. */
 ENGINE_TEST(test_names_apart)
 {
@@ -108,10 +124,15 @@ ENGINE_TEST(test_names_apart)
 		WsTableSchema named = record_named(odd[i]);
 		PHash		with;
 
+		Seen		seen = {0};
+
 		WsRoot->put_table(&ctx, &rv, &named, &rows, &with);
 		CHECK(WsRoot->get_table(&ctx, &with, odd[i], &got, &got_rows));
 		CHECK(strcmp(got.name, odd[i]) == 0);
 		ws_schema_free(&got);
+		WsRoot->tables(&ctx, &with, see_table, &seen);
+		CHECK_EQ(seen.n, 1);
+		CHECK(strcmp(seen.names[0], odd[i]) == 0);
 	}
 	WsRoot->put_table(&ctx, &rv, &s, &rows, &rv);
 	WsRoot->put_map(&ctx, &rv, WS_ROOT_OBJECTS, &objs, &rv);
@@ -120,22 +141,6 @@ ENGINE_TEST(test_names_apart)
 	ws_schema_free(&got);
 	CHECK(WsRoot->get_map(&ctx, &rv, WS_ROOT_OBJECTS, &map));
 	CHECK(memcmp(map.b, objs.b, PHASH_LEN) == 0);
-}
-
-typedef struct Seen
-{
-	int			n;
-	char		names[4][NAMEDATALEN];
-	int			stop_after;
-} Seen;
-
-static bool
-see_table(void *arg, const char *name, const VcTable *entry)
-{
-	Seen	   *seen = arg;
-
-	strlcpy(seen->names[seen->n++], name, NAMEDATALEN);
-	return seen->n != seen->stop_after;
 }
 
 /* Tables in name order, and only tables. */
@@ -311,6 +316,20 @@ ENGINE_TEST(test_refused)
 		CHECK_EQ(vc_table_create(&ctx, &empty_rv, key, "", 0, &d.rv), VC_OK);
 		check_refused(read_tables, &d, ERRCODE_DATA_CORRUPTED, "names no table");
 	}
+	{
+		/* (a name with a NUL in it, which no name function could spell) */
+		VcTable		t;
+		PHash		with;
+		uint8		val[2 * PHASH_LEN];
+		ProllyEdit	e = {(const uint8 *) "t/a\0b", 5, val, sizeof(val), false};
+
+		CHECK_EQ(vc_table_create(&ctx, &empty_rv, "t/x", "", 0, &with), VC_OK);
+		CHECK(vc_table_get(&ctx, &with, "t/x", &t));
+		memcpy(val, t.schema.b, PHASH_LEN);
+		memcpy(val + PHASH_LEN, t.data.b, PHASH_LEN);
+		CHECK_EQ(prolly_apply(&ctx, &empty_rv, &e, 1, &d.rv), PROLLY_OK);
+		check_refused(read_tables, &d, ERRCODE_DATA_CORRUPTED, "names no table");
+	}
 
 	/* a table's entry holding another table's record */
 	WsSchemaCodec->encode(&other, &bytes);
@@ -367,6 +386,15 @@ decode_text(void *arg)
 	ws_seq_decode((const uint8 *) text, strlen(text), &v, &c);
 }
 
+static void
+decode_nul(void *arg)
+{
+	int64		v;
+	bool		c;
+
+	ws_seq_decode((const uint8 *) "1\0t", 3, &v, &c);
+}
+
 /* A sequence's position has one set of bytes. */
 static void
 test_seq(void)
@@ -404,6 +432,7 @@ test_seq(void)
 	}
 	for (int i = 0; i < lengthof(bad); i++)
 		expect_error(decode_text, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(decode_nul, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 }
 
 static const ProllyUnitTest tests[] = {

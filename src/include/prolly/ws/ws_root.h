@@ -51,6 +51,8 @@ typedef bool (*WsRootTableFn) (void *arg, const char *name, const VcTable *entry
 
 typedef struct WsRootRoutine
 {
+	const char *name;
+
 	/*
 	 * Sets a table's entry, by the name in its record: new, or in place of
 	 * what it was.  Raises an error if the record has a problem.

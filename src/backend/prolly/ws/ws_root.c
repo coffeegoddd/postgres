@@ -192,6 +192,7 @@ root_put_map(ProllyCtx *ctx, const PHash *rv, WsRootMap which, const PHash *map,
 }
 
 const WsRootRoutine MapWsRoot = {
+	.name = "map",
 	.put_table = root_put_table,
 	.get_table = root_get_table,
 	.drop_table = root_drop_table,
