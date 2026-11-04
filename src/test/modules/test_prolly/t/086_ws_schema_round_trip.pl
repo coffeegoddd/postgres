@@ -2052,7 +2052,7 @@ my $make_names = sub {
 		CREATE DOMAIN $s.pos AS integer CHECK (VALUE > 0);
 		CREATE COLLATION $s.coll FROM "C";
 		CREATE FUNCTION $s.f() RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
-		CREATE OPERATOR $s.=== (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4eq);
+		CREATE OPERATOR $s.=== (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4eq, COMMUTATOR = OPERATOR($s.===));
 	});
 };
 $make_names->('nm1');
@@ -2131,7 +2131,7 @@ $make_names->('nm6');
 $node->safe_psql('postgres', q{
 	CREATE OPERATOR CLASS nm5.ops FOR TYPE integer USING btree AS OPERATOR 3 nm5.===, FUNCTION 1 btint4cmp(integer, integer);
 	CREATE OPERATOR CLASS nm6.ops FOR TYPE integer USING btree AS OPERATOR 3 nm6.===, FUNCTION 1 btint4cmp(integer, integer);
-	CREATE TABLE nm5.parted (a integer, t text) PARTITION BY RANGE (nm5.f(), t COLLATE nm5.coll, a nm5.ops);
+	CREATE TABLE nm5.parted (a integer, t text) PARTITION BY RANGE ((nm5.f() + a), t COLLATE nm5.coll, a nm5.ops);
 	CREATE TABLE nm5.excl (a integer, c text COLLATE "C", EXCLUDE USING btree (a nm5.ops WITH OPERATOR(nm5.===)));
 });
 for my $table ('parted', 'excl')

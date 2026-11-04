@@ -179,6 +179,12 @@ ENGINE_TEST(test_problems)
 	CHECK(ws_obj_problem(&o) != NULL);
 	o.owner = NULL;
 	CHECK(ws_obj_problem(&o) != NULL);
+	/* (a type reads nothing with its owner's rights, so may have none held) */
+	o.kind = WS_OBJ_TYPE;
+	o.ncomments = 0;
+	o.ngrants = 0;
+	o.ndeps = 0;
+	CHECK(ws_obj_problem(&o) == NULL);
 	{
 		WsObjectComment empty[] = {{.text = ""}};
 		WsObjectGrant to_owner[] = {{.grantee = "g",.privileges = "r"}};
@@ -289,6 +295,10 @@ ENGINE_TEST(test_statements)
 	WsObject	at = {.kind = WS_OBJ_VIEW,.name = "at",
 		.definition = "AS SELECT 'a@@b'::text AS c",.owner = "g"};
 	Buf			b = BUF_INIT;
+	WsObject	e = {.kind = WS_OBJ_TYPE,.name = "e",.definition = "AS ENUM ('a')"};
+	WsObject	c = {.kind = WS_OBJ_TYPE,.name = "c",.definition = "AS (a integer)"};
+	WsObject	r = {.kind = WS_OBJ_TYPE,.name = "r",.definition = "AS RANGE (SUBTYPE = integer)"};
+	WsObject	d = {.kind = WS_OBJ_DOMAIN,.name = "d",.definition = "AS integer CONSTRAINT k CHECK ((VALUE > 0))"};
 	static const char want[] = "CREATE VIEW s.at AS SELECT 'a@b'::text AS c";
 	static const char want_m_made[] = "CREATE MATERIALIZED VIEW s.m AS SELECT 1 AS c WITH NO DATA";
 	static const char want_comment[] = "COMMENT ON COLUMN s.v.c IS 'on c'";
@@ -297,6 +307,18 @@ ENGINE_TEST(test_statements)
 	static const char want_owner[] = "ALTER VIEW s.v OWNER TO g";
 	static const char want_m[] = "ALTER MATERIALIZED VIEW s.m OWNER TO g";
 
+	ws_obj_create_statement(&e, "s", &b);
+	CHECK(b.len == strlen("CREATE TYPE s.e AS ENUM ('a')"));
+	b.len = 0;
+	ws_obj_create_statement(&c, "s", &b);
+	CHECK(b.len == strlen("CREATE TYPE s.c AS (a integer)"));
+	b.len = 0;
+	ws_obj_create_statement(&r, "s", &b);
+	CHECK(b.len == strlen("CREATE TYPE s.r AS RANGE (SUBTYPE = integer)"));
+	b.len = 0;
+	ws_obj_create_statement(&d, "s", &b);
+	CHECK(b.len == strlen("CREATE DOMAIN s.d AS integer CONSTRAINT k CHECK ((VALUE > 0))"));
+	b.len = 0;
 	ws_obj_create_statement(&m, "s", &b);
 	CHECK(b.len == strlen(want_m_made) && memcmp(b.data, want_m_made, b.len) == 0);
 	b.len = 0;
@@ -349,6 +371,31 @@ ENGINE_TEST(test_refused_statements)
 		"(x) AS SELECT 1 WITH NO DATA",
 	};
 
+	{
+		static const char *const types[] = {
+			"AS ENUM ('a'); DROP TABLE t",
+			"AS (a int); DROP TABLE t",
+			"(INPUT = i, OUTPUT = o)",
+			"",
+		};
+		static const char *const domains[] = {
+			"AS int; DROP TABLE t",
+			"",
+		};
+
+		for (int i = 0; i < lengthof(types); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_TYPE,.name = "v",.definition = (char *) types[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(domains); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_DOMAIN,.name = "v",.definition = (char *) domains[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
 	for (int i = 0; i < lengthof(views); i++)
 	{
 		WsObject	o = {.kind = WS_OBJ_VIEW,.name = "v",.definition = (char *) views[i],.owner = "g"};

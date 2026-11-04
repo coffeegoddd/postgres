@@ -100,7 +100,6 @@ $node->safe_psql('postgres', q{DROP MATERIALIZED VIEW "S rc".m_runs; DROP FUNCTI
 my @refused = (
 	[ q{CREATE VIEW r_other AS SELECT * FROM public.o}, 'another schema', 'CREATE TABLE public.o (a int); GRANT SELECT ON public.o TO g_owner', 'DROP TABLE public.o CASCADE' ],
 	[ q{CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE VIEW r_func AS SELECT f()}, 'no commit holds yet', undef, 'DROP FUNCTION "S rc".f() CASCADE' ],
-	[ q{CREATE TYPE e AS ENUM ('a'); CREATE VIEW r_type AS SELECT 'a'::e AS x}, 'no commit holds yet', undef, 'DROP TYPE "S rc".e CASCADE' ],
 	[ q{CREATE SEQUENCE q; CREATE VIEW r_seq AS SELECT nextval('q'::regclass)}, 'no commit holds yet', undef, 'DROP SEQUENCE "S rc".q CASCADE' ],
 	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
 	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
@@ -281,6 +280,226 @@ my $line = (grep { /^view\/now_a\t/ } split /\n/, $reader->{stdout})[0];
 like(pack('H*', (split /\t/, $line)[1]), qr/a_rc AS was/, 'and read as it left things');
 like(pack('H*', (split /\t/, $line)[1]), qr/with the rename/, 'all of them, not a new definition with an old comment');
 $_->quit for ($renamer, $reader, $s);
+
+# types: made before tables, which may use them, and needed by views
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_tyowner NOLOGIN;
+	CREATE ROLE g_tyuser NOLOGIN;
+	CREATE SCHEMA ty AUTHORIZATION g_tyowner;
+	SET ROLE g_tyowner;
+	SET search_path = ty;
+	CREATE TYPE z_mood AS ENUM ('sad', 'it''s @ ok', 'happy');
+	ALTER TYPE z_mood ADD VALUE 'meh' BEFORE 'happy';
+	CREATE DOMAIN y_pos AS integer DEFAULT 1 CONSTRAINT y_pos_ok CHECK (VALUE > 0) CONSTRAINT y_pos_nn NOT NULL;
+	CREATE DOMAIN a_pos2 AS y_pos CONSTRAINT small CHECK (VALUE < 100);
+	CREATE DOMAIN d_coll AS text COLLATE "C";
+	CREATE TYPE x_pair AS (m z_mood, p a_pos2, t text COLLATE "C", "Odd" numeric(5, 2), arr y_pos[]);
+	CREATE TYPE w_nest AS (inner_pair x_pair);
+	CREATE TYPE v_range AS RANGE (SUBTYPE = float8, SUBTYPE_DIFF = float8mi);
+	CREATE TYPE u_collrange AS RANGE (SUBTYPE = text, COLLATION = "C");
+	COMMENT ON TYPE z_mood IS 'how it''s going';
+	COMMENT ON COLUMN x_pair.m IS 'a mood';
+	COMMENT ON DOMAIN y_pos IS 'positive';
+	GRANT USAGE ON TYPE z_mood TO g_tyuser;
+	GRANT USAGE ON DOMAIN y_pos TO g_tyuser WITH GRANT OPTION;
+	CREATE TABLE b_uses (m z_mood, p y_pos, s v_range, ms v_multirange);
+	CREATE VIEW over_types AS SELECT m, p::a_pos2 AS p2, ARRAY[m] AS ms, NULL::w_nest IS NULL AS n, 'sad'::z_mood AS c, s, NULL::v_multirange AS mr FROM b_uses;
+	CREATE VIEW over_composite AS SELECT NULL::x_pair AS pair;
+	CREATE VIEW fields AS SELECT (NULL::x_pair).m AS m, u_collrange('a', 'b') AS r;
+	CREATE TYPE s_changed AS (keep integer, gone integer, was integer);
+	ALTER TYPE s_changed DROP ATTRIBUTE gone;
+	ALTER TYPE s_changed RENAME ATTRIBUTE was TO now_is;
+	CREATE TYPE t_opc AS RANGE (SUBTYPE = text, SUBTYPE_OPCLASS = text_pattern_ops);
+	CREATE DOMAIN q_field AS x_pair CHECK ((VALUE).t IS NOT NULL);
+	CREATE TYPE u_ints AS RANGE (SUBTYPE = int4);
+	CREATE DOMAIN p_ctor AS integer CHECK (VALUE <@ u_ints(0, 100));
+	CREATE VIEW b_via_array AS SELECT 1 AS a;
+	CREATE VIEW a_via_array AS SELECT NULL::b_via_array[] AS arr;
+	CREATE TYPE r_range_range AS RANGE (SUBTYPE = int8);
+});
+my $tydump = sub {
+	my ($schema) = @_;
+	my $out = $node->safe_psql('postgres', qq{SELECT string_agg(
+		format('%s %s owner=%s acl=%s comment=%s collation=%s default=%s base=%s enum=%s attrs=%s checks=%s range=%s',
+			t.typtype, t.typname, pg_get_userbyid(t.typowner),
+			(SELECT array_agg(x::text ORDER BY x::text) FROM unnest(t.typacl) x), obj_description(t.oid, 'pg_type'), t.typcollation::regcollation,
+			pg_get_expr(t.typdefaultbin, 0), format_type(t.typbasetype, t.typtypmod),
+			(SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid),
+			(SELECT string_agg(format('%s:%s:%s:%s', a.attname, format_type(a.atttypid, a.atttypmod), a.attcollation::regcollation, col_description(t.typrelid, a.attnum)), ',' ORDER BY a.attnum)
+			 FROM pg_attribute a WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped),
+			(SELECT string_agg(conname || ' ' || pg_get_constraintdef(oid), ',' ORDER BY conname) FROM pg_constraint WHERE contypid = t.oid),
+			(SELECT format('%s %s %s %s %s %s', format_type(rngsubtype, NULL), rngcollation::regcollation, rngsubdiff, rngcanonical, rngsubopc, rngmultitypid::regtype) FROM pg_range WHERE rngtypid = t.oid)),
+		E'\n' ORDER BY t.typname)
+		FROM pg_type t WHERE t.typnamespace = '"$schema"'::regnamespace AND t.typtype IN ('e', 'd', 'r') OR
+			t.typnamespace = '"$schema"'::regnamespace AND t.typtype = 'c' AND t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c')});
+	$out =~ s/"?\Q$schema\E"?\.//g;
+	return $out;
+};
+my $ty_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ty')});
+my %ty_keys = map { (split /\t/)[0] => 1 } split /\n/, $ty_held;
+ok($ty_keys{$_}, "$_ is held") for qw(type/z_mood domain/y_pos domain/a_pos2 domain/d_coll type/x_pair type/w_nest type/v_range type/u_collrange view/over_types);
+ok(!grep({ /multirange|_z_mood|^table|^type\/b_uses/ } keys %ty_keys), 'nor what comes of them: arrays, multiranges, row types');
+my %ty_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $ty_held;
+like($ty_val{'type/x_pair'}, qr/domain\/a_pos2.*domain\/y_pos.*type\/z_mood/s, 'a composite says what it needs, an array by its element');
+like($ty_val{'view/over_types'}, qr/domain\/a_pos2.*type\/v_range.*type\/w_nest.*type\/z_mood/s, 'and a view, a multirange by its range');
+like($ty_val{'type/z_mood'}, qr/it''s @@ ok.*meh.*happy/s, 'an enum is in order, with its @ doubled');
+unlike(join('', values %ty_val), qr/\bty\./, 'no name of its schema');
+like($ty_val{'domain/q_field'}, qr/type\/x_pair/, 'a domain of a composite needs it');
+like($ty_val{'domain/p_ctor'}, qr/type\/u_ints/, 'a domain using a constructor needs its range');
+like($ty_val{'view/a_via_array'}, qr/view\/b_via_array/, 'a view of an array of a view needs that view');
+like($ty_val{'type/t_opc'}, qr/SUBTYPE_OPCLASS = text_pattern_ops/, 'an opclass not the default is said');
+like($ty_val{'view/fields'}, qr/type\/u_collrange.*type\/x_pair/s, 'a field and a constructor say whose they are');
+
+$node->safe_psql('postgres', q{CREATE SCHEMA ty2 AUTHORIZATION g_tyowner});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ty', 'ty2', 'before')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_class WHERE relnamespace = 'ty2'::regnamespace AND relkind = 'v'}), '0', 'views wait for tables');
+$node->safe_psql('postgres', q{SET ROLE g_tyowner; SET search_path = ty2; CREATE TABLE b_uses (m z_mood, p y_pos, s v_range, ms v_multirange)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ty', 'ty2', 'after')});
+is($tydump->('ty2'), $tydump->('ty'), 'the same by the catalogs');
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ty2')}), $ty_held, 'and the same bytes');
+is( $node->safe_psql('postgres', q{SET search_path = ty2; INSERT INTO b_uses (m) VALUES ('meh'); SELECT p, m > 'sad', m < 'happy' FROM b_uses}),
+	'1|t|t', 'a default and an order as they were');
+
+# under an old snapshot, a type's change or its roles' is one to try again
+for my $change (q{ALTER TYPE ty.z_mood ADD VALUE 'later'}, q{ALTER DOMAIN ty.y_pos DROP CONSTRAINT y_pos_nn},
+	q{ALTER ROLE g_tyuser RENAME TO g_tyuser2}, q{ALTER ROLE g_tyowner RENAME TO g_tyowner2})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('ty')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+$node->safe_psql('postgres', q{ALTER ROLE g_tyuser2 RENAME TO g_tyuser; ALTER ROLE g_tyowner2 RENAME TO g_tyowner});
+
+# default privileges on functions, which a range's constructors take, are no refusal
+$node->safe_psql('postgres', q{CREATE SCHEMA tyd; ALTER DEFAULT PRIVILEGES IN SCHEMA tyd GRANT EXECUTE ON FUNCTIONS TO g_tyuser; CREATE TYPE tyd.r AS RANGE (SUBTYPE = int4)});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyd')}), qr/^type\/r\t/, 'a range under default privileges on functions is held');
+$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA tyd REVOKE EXECUTE ON FUNCTIONS FROM g_tyuser; DROP SCHEMA tyd CASCADE});
+
+# a type's owner changed takes its range's functions with it
+$node->safe_psql('postgres', q{CREATE SCHEMA tyo; CREATE TYPE tyo.r AS RANGE (SUBTYPE = int4); ALTER TYPE tyo.r OWNER TO g_tyowner});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyo')}), qr/^type\/r\t/, 'a range given another owner is held');
+
+# a name too long for a commit, though not for this database
+$node->safe_psql('postgres', q{CREATE DATABASE tylatin TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+$node->safe_psql('tylatin', q{CREATE EXTENSION test_prolly; CREATE SCHEMA s; CREATE TYPE s.c AS ("} . ("\xe9" x 40) . q{" integer)});
+($rc, $out, $err) = $node->psql('tylatin', q{SELECT test_ws_obj_bytes('s')});
+like($err, qr/too long|longer than/, 'an attribute too long in UTF8 is refused');
+
+# a schema's functions do not take the catalogs' place in reading its objects, nor run
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA tyc;
+	CREATE TABLE tyc.ran (a integer);
+	CREATE FUNCTION tyc.quote_ident(name) RETURNS text LANGUAGE sql AS $$ INSERT INTO tyc.ran VALUES (1) RETURNING 'captured' $$;
+	CREATE FUNCTION tyc.quote_literal(name) RETURNS text LANGUAGE sql AS $$ INSERT INTO tyc.ran VALUES (2) RETURNING 'captured' $$;
+	CREATE TYPE tyc.e AS ENUM ('a');
+	CREATE TYPE tyc.c AS (x integer, y tyc.e);
+	CREATE ROLE g_tyc NOLOGIN;
+	ALTER SCHEMA tyc OWNER TO g_tyc;
+	ALTER TABLE tyc.ran OWNER TO g_tyc;
+	CREATE VIEW tyc.v AS SELECT a FROM tyc.ran;
+	ALTER VIEW tyc.v OWNER TO g_tyc;
+});
+my $tyc = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyc')});
+my %tyc_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $tyc;
+like($tyc_val{'type/c'}, qr/AS \(x integer, y e\)/, 'a type is not captured by a function of its schema');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM tyc.ran'), '0', 'and runs none of them');
+
+# a long name's multirange is as CREATE TYPE names it, and held
+for my $long ('b' x 55, 'c' x 63)
+{
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS tyl CASCADE; CREATE SCHEMA tyl; CREATE TYPE tyl.$long AS RANGE (SUBTYPE = int4)});
+	like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tyl')}), qr/^type\/\Q$long\E\t/, 'a range of a long name is held');
+}
+
+# a comment since a snapshot is one to try again, on a view or a type
+for my $change (q{COMMENT ON TYPE ty.z_mood IS 'later'}, q{COMMENT ON VIEW ty.over_composite IS 'later'})
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $change);
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('ty')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
+	$old->quit;
+}
+
+# a type renamed while being read takes no lock: the read says so, to try again
+if ($ENV{enable_injection_points} eq 'yes' && $node->check_extension('injection_points'))
+{
+	$node->safe_psql('postgres', q{CREATE EXTENSION IF NOT EXISTS injection_points;
+		SELECT injection_points_attach('ws-obj-read-end', 'wait')});
+	my $reader2 = $node->background_psql('postgres', on_error_stop => 0);
+	$reader2->query_until(qr/reading/, "\\echo reading\nSELECT test_ws_obj_bytes('ty');\n\\echo done\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event = 'ws-obj-read-end'}) or die 'no reader';
+	$node->safe_psql('postgres', q{ALTER TYPE ty.z_mood RENAME TO z_mood2;
+		SELECT injection_points_wakeup('ws-obj-read-end');
+		SELECT injection_points_detach('ws-obj-read-end');});
+	$reader2->query_until(qr/finished/, "\\echo finished\n");
+	like($reader2->{stderr}, qr/it changed while it was being read/, 'a read overtaken by a rename is to be tried again');
+	$reader2->quit;
+	$node->safe_psql('postgres', q{ALTER TYPE ty.z_mood2 RENAME TO z_mood});
+}
+
+# a type whose owner cannot travel goes to who restores it, unlike a view
+$node->safe_psql('postgres', q{CREATE SCHEMA ty3; CREATE TYPE ty3.login_owned AS ENUM ('a'); ALTER TYPE ty3.login_owned OWNER TO x_person; CREATE SCHEMA ty4});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ty3', 'ty4')});
+is( $node->safe_psql('postgres', q{SELECT pg_get_userbyid(typowner) = current_user FROM pg_type WHERE oid = 'ty4.login_owned'::regtype}),
+	't', 'a type of a login role goes to who restores it');
+
+# default privileges on types refuse
+$node->safe_psql('postgres', q{CREATE SCHEMA ty5; ALTER DEFAULT PRIVILEGES IN SCHEMA ty5 GRANT USAGE ON TYPES TO g_tyuser});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('ty3', 'ty5')});
+like($err, qr/default privileges would change what is made/, 'default privileges on types refuse a restore');
+
+# what a commit cannot hold of a type, by name
+my @ty_refused = (
+	[ q{CREATE TYPE r_shell}, 'no definition yet' ],
+	[ q{CREATE FUNCTION rf(int) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE DOMAIN r_fn AS int CHECK (rf(VALUE))}, 'no commit holds yet' ],
+	[ q{CREATE TABLE rt (a int); CREATE TYPE r_rowtype AS (r rt)}, 'a table' ],
+	[ q{CREATE TABLE rt2 (a int); CREATE TYPE r_rowtype2 AS (r rt2[])}, 'a table' ],
+	[ q{CREATE VIEW vv AS SELECT 1 AS a; CREATE DOMAIN r_viewdom AS vv[]}, 'a view' ],
+	[ q{CREATE DOMAIN r_self AS int; ALTER DOMAIN r_self SET DEFAULT (5::r_self)}, 'needs itself' ],
+	[ q{CREATE TYPE r_cast AS ENUM ('a'); CREATE CAST (r_cast AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TYPE r_cast2 AS ENUM ('a'); CREATE CAST (r_cast2[] AS text) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TYPE r_cast3 AS RANGE (SUBTYPE = int4); CREATE CAST (r_cast3_multirange AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE TABLE r_cast4 (a int); CREATE CAST (r_cast4 AS integer) WITH INOUT}, 'a cast' ],
+	[ q{CREATE DOMAIN r_self2 AS int; ALTER DOMAIN r_self2 ADD CONSTRAINT k CHECK ('{}'::r_self2[] IS NOT NULL)}, 'needs itself' ],
+	[ q{CREATE TYPE range AS RANGE (SUBTYPE = int4)}, 'named as one in the catalogs' ],
+	[ q{CREATE TYPE r_ren AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_ren(int4, int4) RENAME TO r_ren2}, 'has been changed' ],
+	[ q{CREATE TYPE r_own AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_own(int4, int4) OWNER TO g_tyowner}, 'has been changed' ],
+	[ q{CREATE TYPE r_vol AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_vol(int4, int4) VOLATILE}, 'has been changed' ],
+	[ q{CREATE TYPE r_set AS RANGE (SUBTYPE = int4); ALTER FUNCTION r_set(int4, int4) SET work_mem = '1MB'}, 'has been changed' ],
+	[ q{CREATE TYPE r_cm AS RANGE (SUBTYPE = int4); COMMENT ON FUNCTION r_cm(int4, int4) IS 'x'}, 'its own' ],
+	[ q{CREATE ROLE g_mid2 NOLOGIN; CREATE TYPE r_pub AS ENUM ('a'); REVOKE USAGE ON TYPE r_pub FROM PUBLIC; GRANT USAGE ON TYPE r_pub TO g_mid2 WITH GRANT OPTION; SET ROLE g_mid2; GRANT USAGE ON TYPE r_pub TO PUBLIC; RESET ROLE}, 'a grant by a role that does not own it' ],
+	[ q{CREATE TYPE lower AS RANGE (SUBTYPE = int4)}, 'named as one in the catalogs' ],
+	[ q{CREATE TYPE r_arrc AS ENUM ('a'); COMMENT ON TYPE _r_arrc IS 'x'}, 'its array type' ],
+	[ q{CREATE TYPE r_ctor AS RANGE (SUBTYPE = int4); REVOKE EXECUTE ON FUNCTION r_ctor(int4, int4) FROM PUBLIC}, 'a function of it' ],
+	[ q{CREATE TYPE r_mrc AS RANGE (SUBTYPE = int4); COMMENT ON TYPE r_mrc_multirange IS 'x'}, 'its multirange' ],
+	[ q{CREATE DOMAIN r_nv AS int; ALTER DOMAIN r_nv ADD CONSTRAINT k CHECK (VALUE > 0) NOT VALID}, 'not validated' ],
+	[ q{CREATE DOMAIN r_cc AS int CONSTRAINT k CHECK (VALUE > 0); COMMENT ON CONSTRAINT k ON DOMAIN r_cc IS 'x'}, 'a comment on a constraint' ],
+	[ q{CREATE TYPE r_public AS ENUM ('a'); REVOKE USAGE ON TYPE r_public FROM PUBLIC}, 'revoked from PUBLIC' ],
+	[ q{CREATE TYPE r_mr AS RANGE (SUBTYPE = int4, MULTIRANGE_TYPE_NAME = r_other)}, 'its multirange' ],
+	[ "CREATE TYPE " . ('a' x 60) . " AS RANGE (SUBTYPE = int4, MULTIRANGE_TYPE_NAME = " . ('a' x 60) . "_mu)", 'its multirange' ],
+	[ q{CREATE TYPE r_login AS ENUM ('a'); GRANT USAGE ON TYPE r_login TO x_person}, 'which cannot travel' ],
+	[ q{CREATE COLLATION r_c FROM "C"; CREATE DOMAIN r_coll AS text COLLATE r_c}, 'no commit holds yet' ],
+	[ q{CREATE TYPE public.elsewhere AS ENUM ('a'); CREATE DOMAIN r_other_schema AS public.elsewhere}, 'another schema' ],
+	[ q{CREATE TYPE "text" AS ENUM ('a'); CREATE TYPE r_shadow AS (t ty6."text")}, "say a schema's name" ],
+);
+for my $i (0 .. $#ty_refused)
+{
+	my ($sql, $why) = @{ $ty_refused[$i] };
+	my $sch = 'ty6';
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS $sch CASCADE; DROP ROLE IF EXISTS g_mid2; DROP TYPE IF EXISTS public.elsewhere CASCADE; CREATE SCHEMA $sch; GRANT USAGE ON SCHEMA $sch TO PUBLIC; SET search_path = $sch, public; $sql});
+	my ($rc2, $out2, $err2) = $node->psql('postgres', qq{SELECT test_ws_obj_bytes('$sch')});
+	isnt($rc2, 0, "refused: $sql");
+	like($err2, qr/\Q$why\E/, "for why: $sql");
+}
 
 $node->stop;
 done_testing();

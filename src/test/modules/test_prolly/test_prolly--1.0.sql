@@ -767,7 +767,7 @@ CREATE FUNCTION test_ws_obj_bytes(schema text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_ws_obj_copy(from_schema text, to_schema text)
+CREATE FUNCTION test_ws_obj_copy(from_schema text, to_schema text, which text DEFAULT 'both')
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
