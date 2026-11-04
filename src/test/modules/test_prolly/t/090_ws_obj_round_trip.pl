@@ -597,6 +597,8 @@ my @fn_refused = (
 	[ q{CREATE FUNCTION now() RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'named as one in the catalogs' ],
 	[ q{CREATE FUNCTION r_self(a int) RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE OR REPLACE FUNCTION r_self(a int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT r_self(a); END}, 'needs itself' ],
 	[ q{CREATE FUNCTION r_cost() RETURNS int LANGUAGE sql COST 1234567 AS 'SELECT 1'}, 'more digits' ],
+	[ q{CREATE FUNCTION r_rows() RETURNS SETOF int LANGUAGE sql ROWS 1234567 AS 'SELECT 1'}, 'more digits' ],
+	[ q{CREATE FUNCTION r_inf() RETURNS int LANGUAGE sql COST 1e39 AS 'SELECT 1'}, 'more than a definition can say' ],
 	[ q{CREATE TYPE h AS (r regclass); CREATE FUNCTION r_h(a h DEFAULT '(pg_class)') RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'may hold names' ],
 	[ q{CREATE TABLE z (a int); CREATE FUNCTION r_p(int) RETURNS int LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT count(*)::int FROM z; END; CREATE TABLE zp (a int) PARTITION BY LIST (r_p(a))}, 'a table needs it, and it needs a table' ],
 	[ q{CREATE AGGREGATE r_agg(int) (SFUNC = int4pl, STYPE = int)}, 'an aggregate' ],
@@ -616,16 +618,24 @@ for my $case (@fn_refused)
 	like($err4, qr/\Q$why\E/, "for why: $sql");
 }
 
+# an argument of a type holding names is no constant; a comment no client can show stops nothing
+$node->safe_psql('postgres', q{DROP SCHEMA IF EXISTS fn9 CASCADE; CREATE SCHEMA fn9; CREATE TYPE fn9.holds AS (r regclass, n int);
+	CREATE FUNCTION fn9.f(h fn9.holds, i int DEFAULT 1) RETURNS int LANGUAGE sql AS 'SELECT 1';
+	CREATE FUNCTION fn9.g(h fn9.holds) RETURNS int LANGUAGE sql RETURN (h).n;
+	COMMENT ON FUNCTION fn9.g(fn9.holds) IS U&'\\65E5\\672C'});
+isnt($node->safe_psql('postgres', q{SET client_encoding = 'LATIN1'; SELECT length(test_ws_obj_bytes('fn9'))}), '0', 'a type holding names as an argument, under a client that cannot show a comment, is held');
+
 # what restoring its grants takes, or a function meant to be closed is left open
 $node->safe_psql('postgres', q{CREATE SCHEMA fn7 AUTHORIZATION g_fnowner; CREATE ROLE g_rs_noinherit NOLOGIN CREATEROLE; GRANT g_fnowner TO g_rs_noinherit WITH INHERIT FALSE, SET TRUE;
 	GRANT CREATE, USAGE ON SCHEMA fn7 TO g_rs_noinherit; CREATE SCHEMA fn8 AUTHORIZATION g_fnowner;
 	CREATE FUNCTION fn8.closed() RETURNS integer LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION fn8.closed() OWNER TO g_fnowner; REVOKE ALL ON FUNCTION fn8.closed() FROM PUBLIC;
 	GRANT USAGE ON SCHEMA fn8 TO g_rs_noinherit});
 ($rc, $out, $err) = $node->psql('postgres', q{SET ROLE g_rs_noinherit; SELECT test_ws_obj_copy('fn8', 'fn7')});
-like($err, qr/cannot restore the grants of "closed": this role does not have the privileges of its owner/, 'with no INHERIT on its owner, a restore of what is revoked refuses, and leaves nothing open');
+like($err, qr/cannot restore the grants of "closed": this role does not have the privileges of its owner/, 'with no INHERIT on its owner, a restore of what is revoked refuses');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_proc WHERE pronamespace = 'fn7'::regnamespace}), '0', 'and leaves nothing open');
 
 # a function renamed while being read is one to try again, by key or by need
-for my $change (q{COMMENT ON FUNCTION fn.granted() IS 'later'}, q{ALTER ROLE g_fnuser RENAME TO g_fnuser2}, q{ALTER ROLE g_fnuser2 RENAME TO g_fnuser},
+for my $change (q{ALTER FUNCTION fn.granted() OWNER TO g_tyowner}, q{ALTER FUNCTION fn.granted() OWNER TO g_fnowner}, q{COMMENT ON FUNCTION fn.granted() IS 'later'}, q{ALTER ROLE g_fnuser RENAME TO g_fnuser2}, q{ALTER ROLE g_fnuser2 RENAME TO g_fnuser},
 	q{ALTER FUNCTION fn.granted() RENAME TO granted2}, q{DROP FUNCTION fn.granted2()})
 {
 	my $old = $node->background_psql('postgres', on_error_stop => 0);
