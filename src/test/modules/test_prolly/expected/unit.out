@@ -146,6 +146,13 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_rewrite  | mode_is_the_repository               | ok     | 
  engine_rewrite  | no_remotes                           | ok     | 
  engine_rewrite  | low_marks                            | ok     | 
+ ws_root         | tables                               | ok     | 
+ ws_root         | names_apart                          | ok     | 
+ ws_root         | listing                              | ok     | 
+ ws_root         | maps                                 | ok     | 
+ ws_root         | refused                              | ok     | 
+ ws_root         | read_only                            | ok     | 
+ ws_root         | seq                                  | ok     | 
  ws_row          | bytes                                | ok     | 
  ws_row          | round_trip                           | ok     | 
  ws_row          | schema_changes                       | ok     | 
@@ -197,7 +204,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
  ws_tags         | tupdesc                              | ok     | 
-(185 rows)
+(192 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

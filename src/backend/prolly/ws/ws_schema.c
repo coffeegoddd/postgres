@@ -48,6 +48,32 @@
 
 const WsSchemaCodecRoutine *WsSchemaCodec = &BinaryWsSchemaCodec;
 
+static const char *
+own_column_name(void *arg, uint64 tag)
+{
+	const WsColumn *c = ws_schema_column(arg, tag);
+
+	return c ? c->name : NULL;
+}
+
+/* (well formed already) */
+static bool
+refers_to_own_columns(const WsTableSchema *s, const char *stored)
+{
+	Buf			rendered = BUF_INIT;
+	uint64		missing = 0;
+	bool		ok = ws_tags_render(stored, own_column_name, (void *) s, &rendered, &missing);
+
+	buf_free(&rendered);
+	return ok;
+}
+
+static bool
+same_tags(const uint64 *a, int na, const uint64 *b, int nb)
+{
+	return na == nb && memcmp(a, b, (size_t) na * sizeof(uint64)) == 0;
+}
+
 const char *
 ws_schema_problem(const WsTableSchema *s)
 {
@@ -117,6 +143,10 @@ ws_schema_problem(const WsTableSchema *s)
 			if (s->key[j] == s->key[i])
 				return "a key with a column twice";
 	}
+	/* (now that every column is known, whichever order they refer to each other) */
+	for (int i = 0; i < s->ncols; i++)
+		if (s->cols[i].def != NULL && !refers_to_own_columns(s, s->cols[i].def))
+			return "an expression referring to a column the table does not have";
 	if (s->nconstraints < 0)
 		return "a negative number of constraints";
 	for (int i = 0; i < s->nconstraints; i++)
@@ -140,6 +170,8 @@ ws_schema_problem(const WsTableSchema *s)
 				return "a check with no expression";
 			if (!ws_tags_well_formed(con->expr))
 				return "an expression with malformed column references";
+			if (!refers_to_own_columns(s, con->expr))
+				return "an expression referring to a column the table does not have";
 			if (con->ncols != 0 || con->nulls_not_distinct || con->deferrable)
 				return "a check with a unique constraint's fields";
 		}
@@ -160,6 +192,25 @@ ws_schema_problem(const WsTableSchema *s)
 				for (int j = 0; j < k; j++)
 					if (con->cols[j] == con->cols[k])
 						return "a unique constraint with a column twice";
+			}
+
+			/*
+			 * (CREATE TABLE keeps one index of those it would make alike, so
+			 * no statement makes both)
+			 */
+			if (!con->nulls_not_distinct && !con->deferrable &&
+				same_tags(con->cols, con->ncols, s->key, s->nkey))
+				return "a unique constraint alike the key";
+			for (int j = 0; j < i; j++)
+			{
+				const WsConstraint *prior = &s->constraints[j];
+
+				if (prior->kind == WS_CONSTRAINT_UNIQUE &&
+					prior->nulls_not_distinct == con->nulls_not_distinct &&
+					prior->deferrable == con->deferrable &&
+					prior->initdeferred == con->initdeferred &&
+					same_tags(con->cols, con->ncols, prior->cols, prior->ncols))
+					return "two unique constraints alike";
 			}
 		}
 		else
@@ -347,8 +398,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	for (int i = 0; i < s->nkey; i++)
 		s->key[i] = get_uvarint(&p, end);
 	n = get_uvarint(&p, end);
-	/* (each is more than a byte: no more of them than bytes left) */
-	if (n > (uint64) (end - p))
+	/* (each is at least four bytes: its name, kind, flags and what follows) */
+	if (n > (uint64) (end - p) / 4)
 		malformed("more constraints than bytes");
 	s->nconstraints = (int) n;
 	s->constraints = px_malloc((size_t) Max(n, 1) * sizeof(WsConstraint));
@@ -371,8 +422,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 		else
 		{
 			n = get_uvarint(&p, end);
-			if (n > (uint64) (end - p))
-				malformed("more of a constraint's columns than bytes");
+			if (n > (uint64) s->ncols)
+				malformed("a unique constraint of more columns than the table has");
 			con->ncols = (int) n;
 			con->cols = px_malloc((size_t) Max(n, 1) * sizeof(uint64));
 			for (int k = 0; k < con->ncols; k++)
@@ -457,14 +508,6 @@ ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape)
 	}
 	ws_row_shape_init(shape, tags, n, s->nkey);
 	px_free(tags);
-}
-
-static const char *
-own_column_name(void *arg, uint64 tag)
-{
-	const WsColumn *c = ws_schema_column(arg, tag);
-
-	return c ? c->name : NULL;
 }
 
 /* A stored expression rendered with the table's own columns' names. */
@@ -656,8 +699,8 @@ parse_type(const WsTableSchema *s, const char *type)
 }
 
 /*
- * A column's expression as written, parsed alone, is the expression the
- * statement holds: what a comment elsewhere in the statement could otherwise
+ * An expression as written, parsed alone, is the expression the statement
+ * holds: what a comment elsewhere in the statement could otherwise
  * put in its place, while the record reads as something else.
  */
 static void
@@ -674,7 +717,7 @@ check_expression(const WsTableSchema *s, const char *stored, Node *in_statement)
 	parsed = parse_text(s, sql);
 	alone = ws_one_expression(parsed);
 	if (alone == NULL || !equal(alone, in_statement))
-		not_the_record(s, "a column's expression");
+		not_the_record(s, "an expression");
 	pfree(sql);
 	buf_free(&text);
 }
@@ -807,7 +850,7 @@ check_constraint(const WsTableSchema *s, const WsConstraint *con, Constraint *in
 
 /*
  * The statement as written is the one the record says, by the grammar: one
- * CREATE TABLE, of this name, these columns and this key, and nothing else.
+ * CREATE TABLE, of this name, these columns, key and constraints, and nothing else.
  * Text in a commit may have come from anywhere, and checking each piece alone
  * says nothing of what the pieces make together: a comment in one hides a
  * quote in the next.  So the whole is what is checked.
@@ -836,7 +879,7 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		create->tablespacename != NULL || create->accessMethod != NULL || create->if_not_exists)
 		not_the_record(s, "a clause the record does not have");
 	if (list_length(create->tableElts) != s->ncols + (s->nkey > 0 ? 1 : 0) + s->nconstraints)
-		not_the_record(s, "another number of columns");
+		not_the_record(s, "another number of columns or constraints");
 	foreach(lc, create->tableElts)
 	{
 		Node	   *element = lfirst(lc);
@@ -957,6 +1000,11 @@ name_to_utf8(const char *name)
  * again, and a rename leaves them behind anyway.)
  */
 static const char *const unsupported_sql =
+"WITH own(o) AS (SELECT $1::oid "
+"  UNION ALL SELECT x.indexrelid FROM pg_index x WHERE x.indrelid = $1::oid "
+"  UNION ALL SELECT p.objid FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
+"    AND p.refclassid = 'pg_class'::regclass AND p.refobjid = $1::oid AND p.deptype = 'i' "
+"    AND p.refobjsubid > 0) "
 "SELECT CASE "
 "  WHEN c.relispartition OR c.relkind = 'p' THEN 'it is partitioned' "
 "  WHEN c.reloftype <> 0 THEN 'it is a typed table' "
@@ -979,6 +1027,14 @@ static const char *const unsupported_sql =
 "                  x.indnkeyatts <> x.indnatts OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0)) "
 "    THEN 'a key or unique constraint has more than columns' "
+"  WHEN EXISTS (SELECT FROM pg_constraint k JOIN pg_index x ON x.indexrelid = k.conindid "
+"               JOIN pg_constraint k2 ON k2.conrelid = k.conrelid AND k2.oid > k.oid "
+"               JOIN pg_index x2 ON x2.indexrelid = k2.conindid "
+"               WHERE k.conrelid = c.oid AND k.contype IN ('p', 'u') AND k2.contype IN ('p', 'u') "
+"                 AND x.indkey::text = x2.indkey::text "
+"                 AND x.indnullsnotdistinct = x2.indnullsnotdistinct "
+"                 AND k.condeferrable = k2.condeferrable AND k.condeferred = k2.condeferred) "
+"    THEN 'it has two constraints alike, of which CREATE TABLE makes one' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'c' AND "
 "               (NOT k.convalidated OR k.connoinherit OR NOT k.conenforced)) "
 "    THEN 'it has a check not valid, no inherit or not enforced' "
@@ -986,12 +1042,18 @@ static const char *const unsupported_sql =
 "               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid)) "
 "    THEN 'it has an index no constraint has' "
 "  WHEN EXISTS (SELECT FROM pg_description d WHERE "
-"               (d.classoid = 'pg_class'::regclass AND d.objoid = c.oid) OR "
+"               (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT o FROM own)) OR "
 "               (d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
 "                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid))) "
 "    THEN 'it has a comment' "
-"  WHEN c.relacl IS NOT NULL OR EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid "
-"               AND a.attacl IS NOT NULL) THEN 'it has grants' "
+"  WHEN EXISTS (SELECT FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass "
+"               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
+"  WHEN (c.relacl IS NOT NULL AND c.relacl <> acldefault('r', c.relowner)) OR "
+"       EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid "
+"               AND a.attacl IS NOT NULL AND cardinality(a.attacl) > 0) OR "
+"       EXISTS (SELECT FROM pg_class q WHERE q.oid IN (SELECT o FROM own) AND q.relkind = 'S' "
+"               AND q.relacl IS NOT NULL AND q.relacl <> acldefault('s', q.relowner)) "
+"    THEN 'it has grants' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
 "               (NOT k.convalidated OR k.connoinherit)) "
 "    THEN 'it has a not-null constraint not valid or no inherit' "

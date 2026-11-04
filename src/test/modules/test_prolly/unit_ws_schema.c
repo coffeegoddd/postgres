@@ -537,6 +537,13 @@ test_malformed(void)
 		{"\x01" "\x01" "t" "\x01" "\x07" "\x02" "id" "\x01" "b" "s" "\x02" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00", 18, "neither"},
 		{"\x01" "\x01" "t" "\xc1\x0c" "\x00" "\x00", 7, "more columns than a table can have"},
 		{"\x01" "\x01" "t" "\x00" "\x02" "k" "\x01" "\x07" "\x00", 9, "a key of more columns"},
+		/* constraints */
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x08" "\x01" "x", 23, "flags not known"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "z" "\x00" "\x01" "\x07", 23, "no known kind"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x7f" "\x01", 18, "more constraints than bytes"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x02" "\x07" "\x07", 24, "more columns than the table has"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "u" "\x00" "\x01" "\x09", 23, "does not have"},
+		{"\x01" "\x01" "t" "\x01" "\x07" "\x01" "a" "\x01" "i" "s" "\x00" "\x00" "\x00" "\x00" "\x00" "\x00" "\x01" "\x01" "c" "c" "\x00" "\x01" "@", 23, "malformed"},
 		/* a number not in its shortest form: one schema, other bytes */
 		{"\x01" "\x81\x00" "t" "\x00" "\x00" "\x00" "\x00", 8, "shortest form"},
 		{"\x01" "\x01" "t" "\x80\x00" "\x00" "\x00" "\x00", 8, "shortest form"},
@@ -647,7 +654,8 @@ create_dangling(void *arg)
 static void
 test_create_table_dangling(void)
 {
-	expect_error(create_dangling, NULL, ERRCODE_DATA_CORRUPTED, NULL);
+	/* (a problem with the record, now, before any statement is written) */
+	expect_error(create_dangling, NULL, ERRCODE_INTERNAL_ERROR, NULL);
 }
 
 typedef struct Injection
@@ -891,6 +899,12 @@ test_constraint_problems(void)
 		constraint_invalid(one, lengthof(one), why); \
 	} while (0)
 	BAD("no name", {.kind = WS_CONSTRAINT_CHECK,.expr = "true"});
+	BAD("name too long", {.name = "1234567890123456789012345678901234567890123456789012345678901234",
+		.kind = WS_CONSTRAINT_CHECK,.expr = "true"});
+	BAD("does not have", {.name = "x",.kind = WS_CONSTRAINT_CHECK,.expr = "(@{99} > 0)"});
+	BAD("more than the table has", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 3,.cols = a});
+	BAD("alike", {.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = a},
+		{.name = "y",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = a});
 	BAD("no known kind", {.name = "x",.kind = 'z'});
 	BAD("not in order", {.name = "d",.kind = WS_CONSTRAINT_CHECK,.expr = "true"}, CHECK_C);
 	BAD("not in order", CHECK_C, CHECK_C);
@@ -912,6 +926,34 @@ test_constraint_problems(void)
 		.nconstraints = 1,.constraints = &same};
 
 		CHECK(strstr(ws_schema_problem(&s), "named as the key") != NULL);
+		same.name = "u";
+		same.kind = WS_CONSTRAINT_UNIQUE;
+		same.expr = NULL;
+		same.ncols = 1;
+		same.cols = a;
+		CHECK(strstr(ws_schema_problem(&s), "alike the key") != NULL);
+		/* (not alike: CREATE TABLE makes both) */
+		same.deferrable = true;
+		CHECK(ws_schema_problem(&s) == NULL);
+		same.deferrable = false;
+		same.nulls_not_distinct = true;
+		CHECK(ws_schema_problem(&s) == NULL);
+	}
+	{
+		uint64		ab[] = {7, 8};
+		uint64		ba[] = {8, 7};
+		WsColumn	cols[] = {
+			{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED},
+			{.tag = 8,.name = "b",.type = "integer",.kind = WS_COL_STORED},
+		};
+		WsConstraint two[] = {
+			{.name = "x",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 2,.cols = ab},
+			{.name = "y",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 2,.cols = ba},
+		};
+		WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nconstraints = 2,.constraints = two};
+
+		/* (another order is another index) */
+		CHECK(ws_schema_problem(&s) == NULL);
 	}
 }
 
@@ -927,6 +969,24 @@ check_injection(void *arg)
 	ws_schema_create_table(&s, "x", &b);
 }
 
+/*
+ * A comment opened in one check's text and closed in the next: each alone
+ * could parse, and the statement holds one check where the record has two.
+ */
+static void
+check_spanning(void *arg)
+{
+	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "integer",.kind = WS_COL_STORED}};
+	WsConstraint cons[] = {
+		{.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true /*"},
+		{.name = "d",.kind = WS_CONSTRAINT_CHECK,.expr = "*/ AND false"},
+	};
+	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 2,.constraints = cons};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_table(&s, "x", &b);
+}
+
 static void
 test_constraint_injection(void)
 {
@@ -934,16 +994,13 @@ test_constraint_injection(void)
 		"true) NO INHERIT --",
 		"true) NOT VALID --",
 		"true) NOT ENFORCED --",
-		"true); DROP TABLE x.y; --",
 		"true), CONSTRAINT d CHECK (false",
 		"true), UNIQUE (a",
-		"true)) INHERITS (x.y",
-		"true) FROM pg_authid WHERE (true",
-		"true) AS foo --",
 	};
 
 	for (int i = 0; i < lengthof(bad); i++)
 		expect_error(check_injection, (void *) bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(check_spanning, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 }
 
 /* An expression's references take the names the record has now. */

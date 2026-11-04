@@ -133,6 +133,18 @@ $node->safe_psql('postgres', q{
 	CREATE TYPE src.rowtype AS (a int);
 	CREATE ACCESS METHOD otheram TYPE TABLE HANDLER heap_tableam_handler;
 });
+my $tsdir = PostgreSQL::Test::Utils::tempdir();
+$node->safe_psql('postgres', "CREATE TABLESPACE t86 LOCATION '$tsdir'");
+# (what each is refused for, where another clause could refuse it first)
+my %refused_for = (
+	fk => 'a foreign key', excl => 'an exclusion', cnv => 'a check not valid',
+	cni => 'a check not valid', cne => 'a check not valid',
+	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
+	uover => 'more than columns', uspc => 'more than columns',
+	idx => 'an index no constraint has', cmt => 'a comment', ccmt => 'a comment',
+	kcmt => 'a comment', kicmt => 'a comment', seqcmt => 'a comment',
+	grt => 'grants', cgrt => 'grants', seqgrt => 'grants',
+	dup => 'two constraints alike', dupk => 'two constraints alike');
 for my $t (
 	[ 'inc', 'CREATE TABLE src.inc (a int, b int, PRIMARY KEY (a) INCLUDE (b))' ],
 	[ 'defr', 'CREATE TABLE src.defr (a int PRIMARY KEY DEFERRABLE)' ],
@@ -169,6 +181,13 @@ for my $t (
 	[ 'kcmt', q{CREATE TABLE src.kcmt (a int, CONSTRAINT c CHECK (a > 0)); COMMENT ON CONSTRAINT c ON src.kcmt IS 'x'} ],
 	[ 'grt', 'CREATE TABLE src.grt (a int); GRANT SELECT ON src.grt TO PUBLIC' ],
 	[ 'cgrt', 'CREATE TABLE src.cgrt (a int); GRANT SELECT (a) ON src.cgrt TO PUBLIC' ],
+	[ 'dup', 'CREATE TABLE src.dup (a int, CONSTRAINT dup1 UNIQUE (a)); ALTER TABLE src.dup ADD CONSTRAINT dup2 UNIQUE (a)' ],
+	[ 'dupk', 'CREATE TABLE src.dupk (a int PRIMARY KEY); ALTER TABLE src.dupk ADD CONSTRAINT dupk_u UNIQUE (a)' ],
+	[ 'kicmt', q{CREATE TABLE src.kicmt (a int PRIMARY KEY); COMMENT ON INDEX src.kicmt_pkey IS 'x'} ],
+	[ 'seqcmt', q{CREATE TABLE src.seqcmt (a int GENERATED ALWAYS AS IDENTITY); COMMENT ON SEQUENCE src.seqcmt_a_seq IS 'x'} ],
+	[ 'seqgrt', 'CREATE TABLE src.seqgrt (a int GENERATED ALWAYS AS IDENTITY); GRANT SELECT ON src.seqgrt_a_seq TO PUBLIC' ],
+	[ 'uover', 'CREATE TABLE src.uover (a int4range, r int4range, UNIQUE (a, r WITHOUT OVERLAPS))' ],
+	[ 'uspc', "CREATE TABLE src.uspc (a int, UNIQUE (a) USING INDEX TABLESPACE t86)" ],
 	[ 'toastp', 'CREATE TABLE src.toastp (a text) WITH (toast.autovacuum_enabled = false)' ],
 	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
 	[ 'clus', 'CREATE TABLE src.clus (a int PRIMARY KEY); ALTER TABLE src.clus CLUSTER ON clus_pkey' ],
@@ -180,7 +199,8 @@ for my $t (
 	$node->safe_psql('postgres', $t->[1]);
 	my ($ret, $out, $err) = $node->psql('postgres',
 		qq{SELECT test_ws_schema_bytes('src', '$name')});
-	like($err, qr/cannot be read yet/, "$name refused");
+	my $why = $refused_for{$name} // '';
+	like($err, qr/cannot be read yet.*\Q$why\E/, "$name refused");
 }
 my ($tret, $tout, $terr) = $node->psql('postgres',
 	q{CREATE TEMP TABLE tt (a int); SELECT test_ws_schema_bytes(nspname::text, 'tt')
@@ -223,6 +243,32 @@ $node->safe_psql('postgres', q{
 });
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'idlike') IS NOT NULL}),
 	't', 'an identity from LIKE INCLUDING ALL reads');
+
+# grants taken back again, and constraints differing in what CREATE TABLE tells
+# apart, are nothing the record loses
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.regrant (a int GENERATED ALWAYS AS IDENTITY, b int);
+	GRANT SELECT ON src.regrant TO PUBLIC;
+	REVOKE SELECT ON src.regrant FROM PUBLIC;
+	GRANT SELECT (b) ON src.regrant TO PUBLIC;
+	REVOKE SELECT (b) ON src.regrant FROM PUBLIC;
+	CREATE TABLE src.alike (a int, b int, CONSTRAINT a1 UNIQUE (a, b), CONSTRAINT a2 UNIQUE (b, a),
+		CONSTRAINT a3 UNIQUE NULLS NOT DISTINCT (a, b), CONSTRAINT a4 UNIQUE (a, b) DEFERRABLE);
+});
+is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'regrant') IS NOT NULL}),
+	't', 'grants taken back again read');
+my $alike = $bytes->($node, 'postgres', 'alike');
+is( $node->safe_psql('postgres',
+		qq{SELECT test_ws_schema_create(decode('$alike', 'hex'), 'dst') IS NOT NULL;
+		   SELECT count(*) FROM pg_constraint WHERE conrelid = 'dst.alike'::regclass AND contype = 'u'}),
+	"t\n4", 'constraints CREATE TABLE tells apart all made');
+
+# a check's references are by tag: no column's name in its bytes
+$node->safe_psql('postgres', q{CREATE TABLE src.tagged (longcolumnname int, CHECK (longcolumnname > 0))});
+is( $node->safe_psql('postgres',
+		q!SELECT position('(longcolumnname'::bytea in test_ws_schema_bytes('src', 'tagged')) = 0
+		     AND position('(@{'::bytea in test_ws_schema_bytes('src', 'tagged')) > 0!),
+	't', 'a check stored by tag');
 
 # a reader waiting for its lock while the table goes: what is there afterwards
 my $while_waiting = sub {
@@ -440,6 +486,22 @@ my ($ret, $out, $err) = $node->psql('lat',
 	qq{SELECT test_ws_schema_create(decode('$euro', 'hex'), 'dst')});
 isnt($ret, 0, 'a name LATIN1 cannot hold is refused');
 like($err, qr/has no equivalent in encoding/, '(as not convertible, not changed)');
+
+# constraints in UTF8's order, in an encoding whose bytes sort them otherwise
+my $order = q{
+	SET client_encoding = UTF8;
+	CREATE SCHEMA ord VERSIONED;
+	CREATE TABLE ord.t (a integer, CONSTRAINT "€1" CHECK (a > 1), CONSTRAINT "é1" CHECK (a > 2),
+		CONSTRAINT "z1" CHECK (a > 3));
+};
+$node->safe_psql('postgres',
+	q{CREATE DATABASE lat9 ENCODING LATIN9 TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C'});
+is($prepare->('lat9'), $branch, '(and in the LATIN9 one)');
+$node->safe_psql('lat9', $order);
+$node->safe_psql('postgres', $order);
+my $ord_sql = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('ord', 't'), 'hex')};
+is($node->safe_psql('lat9', $ord_sql), $node->safe_psql('postgres', $ord_sql),
+	'constraints in one order, whichever order the database sorts them in');
 
 # a name is limited in a commit by UTF8's bytes, whichever encoding could hold more
 my $long = 'é' x 40;
