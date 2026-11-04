@@ -59,7 +59,7 @@ ws_tag_derive(const char *table, const char *column, const char *type, int attem
  * printed form, which follows the session's search path and quoting.
  */
 static char *
-type_identity(Oid typid, int32 typmod)
+type_identity(Oid typid, int32 typmod, Oid own_namespace)
 {
 	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	Form_pg_type form;
@@ -72,7 +72,10 @@ type_identity(Oid typid, int32 typmod)
 	nsp = get_namespace_name(form->typnamespace);
 	if (nsp == NULL)
 		elog(ERROR, "cache lookup failed for namespace %u", form->typnamespace);
-	text = psprintf("%s.%s(%d)", nsp, NameStr(form->typname), typmod);
+	/* (a commit does not name the schema it is of, nor may what it derives) */
+	text = form->typnamespace == own_namespace ?
+		psprintf(".%s(%d)", NameStr(form->typname), typmod) :
+		psprintf("%s.%s(%d)", nsp, NameStr(form->typname), typmod);
 	ReleaseSysCache(tup);
 	return text;
 }
@@ -108,7 +111,7 @@ ws_tag_new_column(Relation rel, const FormData_pg_attribute *att)
 	table = pg_server_to_any(RelationGetRelationName(rel),
 							 strlen(RelationGetRelationName(rel)), PG_UTF8);
 	column = pg_server_to_any(NameStr(att->attname), strlen(NameStr(att->attname)), PG_UTF8);
-	type = type_identity(att->atttypid, att->atttypmod);
+	type = type_identity(att->atttypid, att->atttypmod, RelationGetNamespace(rel));
 	type = pg_server_to_any(type, strlen(type), PG_UTF8);
 	for (int attempt = 0;; attempt++)
 	{

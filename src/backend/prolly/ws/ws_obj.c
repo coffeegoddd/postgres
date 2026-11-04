@@ -38,6 +38,7 @@
 #include "prolly/ws/ws_tags.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
@@ -491,29 +492,6 @@ compute_order(const WsObject *objs, int n, int *order)
 
 /* ---------------------------------------------------------- the catalogs */
 
-/*
- * The search path a definition is written and run under.  The catalogs come first
- * and temporary objects last, so that nothing of the schema's can be taken for
- * theirs or the other way about: a name the schema shadows is written qualified.
- */
-static int
-path_begin(const char *schema)
-{
-	int			nest = NewGUCNestLevel();
-	char	   *path = psprintf("pg_catalog, %s, pg_temp", quote_identifier(schema));
-
-	(void) set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
-	pfree(path);
-	return nest;
-}
-
-static void
-path_end(int nest)
-{
-	AtEOXact_GUC(true, nest);
-}
-
 /* What no commit can hold of an object in the schema, the first of it. */
 static const char *const refusal_sql =
 "SELECT c.relname::text, CASE "
@@ -700,36 +678,74 @@ push_locked_snapshot(const char *schema)
 typedef struct NamesSchema
 {
 	const char *why;
+	const char *only;			/* this schema's name, or NULL: any but the catalogs' */
 } NamesSchema;
 
 static bool
-qualified(List *names)
+qualifier_counts(const char *qualifier, const char *only)
+{
+	return only != NULL ? strcmp(qualifier, only) == 0 : strcmp(qualifier, "pg_catalog") != 0;
+}
+
+static bool
+qualified(List *names, const char *only)
 {
 	return list_length(names) >= 2 && IsA(linitial(names), String) &&
-		strcmp(strVal(linitial(names)), "pg_catalog") != 0;
+		qualifier_counts(strVal(linitial(names)), only);
 }
 
 /* (a reg* constant is a name in a string, which only the type it is cast to says) */
 static bool
-string_is_qualified(const char *s)
+string_is_qualified(const char *s, const char *only)
 {
-	const char *p = s;
+	const char *start = s;
 	bool		quoted = false;
-	const char *start;
 
-	while (*p == ' ')
-		p++;
-	start = p;
-	for (; *p; p++)
+	for (const char *p = s; *p; p++)
 	{
 		if (*p == '"')
 			quoted = !quoted;
-		else if (!quoted && *p == '(')
-			return false;
+		else if (!quoted && strchr(" (),", *p) != NULL)
+			start = p + 1;
 		else if (!quoted && *p == '.')
-			return !((size_t) (p - start) == strlen("pg_catalog") &&
-					 strncmp(start, "pg_catalog", p - start) == 0);
+		{
+			char	   *qualifier = pnstrdup(start, p - start);
+			bool		counts;
+
+			if (qualifier[0] == '"' && p - start >= 2)
+			{
+				/* (as quote_identifier wrote it: an inner quote doubled) */
+				char	   *undoubled = palloc(p - start);
+				int			u = 0;
+
+				for (const char *q = start + 1; q < p - 1; q++)
+				{
+					undoubled[u++] = *q;
+					if (q[0] == '"' && q[1] == '"')
+						q++;
+				}
+				undoubled[u] = '\0';
+				qualifier = undoubled;
+			}
+			counts = qualifier_counts(qualifier, only);
+			pfree(qualifier);
+			if (counts)
+				return true;
+			start = p + 1;
+		}
 	}
+	return false;
+}
+
+bool
+ws_is_reg_type(const char *type)
+{
+	static const char *const names[] = {"regclass", "regcollation", "regconfig", "regdatabase", "regdictionary",
+		"regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype"};
+
+	for (int i = 0; i < lengthof(names); i++)
+		if (strcmp(type, names[i]) == 0)
+			return true;
 	return false;
 }
 
@@ -745,38 +761,44 @@ names_schema_walker(Node *node, void *arg)
 	{
 		case T_RangeVar:
 			named = ((RangeVar *) node)->schemaname != NULL &&
-				strcmp(((RangeVar *) node)->schemaname, "pg_catalog") != 0;
+				qualifier_counts(((RangeVar *) node)->schemaname, n->only);
 			break;
 		case T_TypeName:
-			named = qualified(((TypeName *) node)->names);
+			named = qualified(((TypeName *) node)->names, n->only);
 			break;
 		case T_FuncCall:
-			named = qualified(((FuncCall *) node)->funcname);
+			named = qualified(((FuncCall *) node)->funcname, n->only);
 			break;
 		case T_A_Expr:
-			named = qualified(((A_Expr *) node)->name);
+			named = qualified(((A_Expr *) node)->name, n->only);
 			break;
 		case T_CollateClause:
-			named = qualified(((CollateClause *) node)->collname);
+			named = qualified(((CollateClause *) node)->collname, n->only);
 			break;
 		case T_SortBy:
-			named = qualified(((SortBy *) node)->useOp);
+			named = qualified(((SortBy *) node)->useOp, n->only);
 			break;
 		case T_TypeCast:
 			{
 				TypeCast   *c = (TypeCast *) node;
 				const char *type = strVal(llast(c->typeName->names));
 
-				if (strncmp(type, "reg", 3) == 0 && c->typeName->arrayBounds != NIL)
+				if (ws_is_reg_type(type) && c->typeName->arrayBounds != NIL)
 				{
 					/* (no dependency is held for a name in one, nor is it one name) */
 					n->why = "it has an array of reg* names, which say nothing of what they need";
 					return true;
 				}
-				if (strncmp(type, "reg", 3) == 0 && IsA(c->arg, A_Const) &&
-					IsA(&((A_Const *) c->arg)->val, String) &&
-					string_is_qualified(strVal(&((A_Const *) c->arg)->val)))
-					named = true;
+				if (ws_is_reg_type(type) && IsA(c->arg, A_Const) &&
+					IsA(&((A_Const *) c->arg)->val, String))
+				{
+					const char *value = strVal(&((A_Const *) c->arg)->val);
+
+					named = string_is_qualified(value, n->only) ||
+						(strcmp(type, "regnamespace") == 0 &&
+						 (n->only != NULL ? (strcmp(value, n->only) == 0 || strcmp(value, quote_identifier(n->only)) == 0) :
+						  strcmp(value, "pg_catalog") != 0));
+				}
 				break;
 			}
 		case T_RangeSubselect:
@@ -787,7 +809,7 @@ names_schema_walker(Node *node, void *arg)
 				 * (VALUES with column names prints as a subquery that prints
 				 * otherwise once it is one: two sets of bytes for one view)
 				 */
-				if (r->alias != NULL && strcmp(r->alias->aliasname, "*VALUES*") == 0)
+				if (n->only == NULL && r->alias != NULL && strcmp(r->alias->aliasname, "*VALUES*") == 0)
 				{
 					n->why = "it is a VALUES list with column names, which does not print as itself";
 					return true;
@@ -805,12 +827,21 @@ names_schema_walker(Node *node, void *arg)
 	return raw_expression_tree_walker(node, names_schema_walker, arg);
 }
 
+bool
+ws_expression_names_schema(const char *expression, const char *schema)
+{
+	List	   *parsed = raw_parser(psprintf("SELECT (%s)", expression), RAW_PARSE_DEFAULT);
+	NamesSchema n = {NULL, schema};
+
+	return list_length(parsed) == 1 && names_schema_walker(linitial_node(RawStmt, parsed)->stmt, &n);
+}
+
 /* Refuses a printed query that would not mean the same in another schema. */
 static void
 check_query_is_portable(const char *name, const char *schema, const char *query)
 {
 	List	   *parsed = raw_parser(query, RAW_PARSE_DEFAULT);
-	NamesSchema n = {NULL};
+	NamesSchema n = {NULL, NULL};
 
 	if (list_length(parsed) != 1)
 		elog(ERROR, "a view's definition is not one query");
@@ -931,6 +962,27 @@ read_deps(WsObject *o, const char *oid, const char *source)
 	}
 	if (o->ndeps > 1)
 		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
+	ws_sql_rows_free(&rows);
+}
+
+/*
+ * Refuses an object whose text may have a constant of a type holding names (of the
+ * types a query gives): such a constant is one string no grammar sees into, so it
+ * could name the schema there.
+ */
+static void
+check_constants_hold_no_names(const char *name, const char *schema, const char *oid, const char *types)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->read(types, 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_type_holds_names(atooid(ws_sql_value(&rows, i, 0))))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: a constant of it may hold names no grammar reads",
+							name, schema)));
 	ws_sql_rows_free(&rows);
 }
 
@@ -1148,7 +1200,7 @@ check_type_is_portable(const char *name, const char *schema, const char *head, c
 	char	   *sql = psprintf("%s x %s", head, tail);
 	List	   *parsed = raw_parser(sql, RAW_PARSE_DEFAULT);
 	Node	   *node = linitial_node(RawStmt, parsed)->stmt;
-	NamesSchema n = {NULL};
+	NamesSchema n = {NULL, NULL};
 	bool		named = false;
 	ListCell   *lc;
 
@@ -1179,7 +1231,7 @@ check_type_is_portable(const char *name, const char *schema, const char *head, c
 
 			if (IsA(arg, TypeName))
 				named = named || names_schema_walker(arg, &n);
-			else if (IsA(arg, List) && qualified((List *) arg))
+			else if (IsA(arg, List) && qualified((List *) arg, n.only))
 			{
 				n.why = "it must say a schema's name, having something named as the catalogs' is, or from a schema renamed under it";
 				named = true;
@@ -1193,9 +1245,34 @@ check_type_is_portable(const char *name, const char *schema, const char *head, c
 	pfree(sql);
 }
 
+/*
+ * What a printing function gives, which is nothing for what was dropped since this
+ * read's snapshot: to try again, as what a read overtaken ends with anyway.
+ */
+static char *
+printed_or_retry(const char *schema, char *printed)
+{
+	if (printed == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": it changed while it was being read", schema)));
+	return printed;
+}
+
+/*
+ * A type as the statement says it, printed under the schema's path, as nothing else
+ * here runs: what is in the schema is not named.
+ */
+static char *
+print_type(const char *schema, Oid typid, int32 typmod)
+{
+	return printed_or_retry(schema, ws_schema_print(schema, format_type, 2, ObjectIdGetDatum(typid),
+													Int32GetDatum(typmod), 0));
+}
+
 /* The statement after its name of a type of each kind, into text. */
 static void
-type_definition(char typtype, const char *oid, Buf *text)
+type_definition(const char *schema, char typtype, const char *oid, Buf *text)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
@@ -1210,18 +1287,31 @@ type_definition(char typtype, const char *oid, Buf *text)
 			ws_put_text(text, ")");
 			break;
 		case 'c':
-			WsSql->read("SELECT coalesce(string_agg(quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod) || "
-						"  CASE WHEN a.attcollation <> u.typcollation "
-						"    THEN ' COLLATE ' || quote_ident(k.collname) ELSE '' END, ', ' ORDER BY a.attnum), '') "
+			WsSql->read("SELECT quote_ident(a.attname), a.atttypid::text, a.atttypmod::text, "
+						"  CASE WHEN a.attcollation <> u.typcollation THEN quote_ident(k.collname) END "
 						"FROM pg_type t JOIN pg_attribute a ON a.attrelid = t.typrelid "
 						"JOIN pg_type u ON u.oid = a.atttypid LEFT JOIN pg_collation k ON k.oid = a.attcollation "
-						"WHERE t.oid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped", 1, params, &rows);
+						"WHERE t.oid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+						1, params, &rows);
 			ws_put_text(text, "AS (");
-			ws_put_text(text, ws_sql_value(&rows, 0, 0));
+			for (int i = 0; i < rows.nrows; i++)
+			{
+				if (i > 0)
+					ws_put_text(text, ", ");
+				ws_put_text(text, ws_sql_value(&rows, i, 0));
+				ws_put_text(text, " ");
+				ws_put_text(text, print_type(schema, atooid(ws_sql_value(&rows, i, 1)),
+											 atoi(ws_sql_value(&rows, i, 2))));
+				if (ws_sql_value(&rows, i, 3) != NULL)
+				{
+					ws_put_text(text, " COLLATE ");
+					ws_put_text(text, ws_sql_value(&rows, i, 3));
+				}
+			}
 			ws_put_text(text, ")");
 			break;
 		case 'r':
-			WsSql->read("SELECT 'AS RANGE (SUBTYPE = ' || format_type(r.rngsubtype, NULL) || "
+			WsSql->read("SELECT r.rngsubtype::text, "
 						"  CASE WHEN o.opcdefault THEN '' ELSE ', SUBTYPE_OPCLASS = ' || quote_ident(o.opcname) END || "
 						"  CASE WHEN r.rngcollation <> s.typcollation "
 						"    THEN ', COLLATION = ' || quote_ident(k.collname) ELSE '' END || "
@@ -1229,20 +1319,48 @@ type_definition(char typtype, const char *oid, Buf *text)
 						"  CASE WHEN r.rngsubdiff <> 0 THEN ', SUBTYPE_DIFF = ' || r.rngsubdiff::regproc ELSE '' END || ')' "
 						"FROM pg_range r JOIN pg_type s ON s.oid = r.rngsubtype JOIN pg_opclass o ON o.oid = r.rngsubopc "
 						"LEFT JOIN pg_collation k ON k.oid = r.rngcollation WHERE r.rngtypid = $1::oid", 1, params, &rows);
-			ws_put_text(text, ws_sql_value(&rows, 0, 0));
+			ws_put_text(text, "AS RANGE (SUBTYPE = ");
+			ws_put_text(text, print_type(schema, atooid(ws_sql_value(&rows, 0, 0)), -1));
+			ws_put_text(text, ws_sql_value(&rows, 0, 1));
 			break;
 		case 'd':
-			WsSql->read("SELECT 'AS ' || format_type(t.typbasetype, t.typtypmod) || "
-						"  CASE WHEN t.typcollation <> b.typcollation "
-						"    THEN ' COLLATE ' || quote_ident(k.collname) ELSE '' END || "
-						"  coalesce(' DEFAULT ' || pg_get_expr(t.typdefaultbin, 0), '') || "
-						"  coalesce((SELECT string_agg(' CONSTRAINT ' || quote_ident(c.conname) || ' ' || "
-						"      pg_get_constraintdef(c.oid), '' ORDER BY c.conname) "
-						"    FROM pg_constraint c WHERE c.contypid = t.oid), '') "
-						"FROM pg_type t JOIN pg_type b ON b.oid = t.typbasetype "
-						"LEFT JOIN pg_collation k ON k.oid = t.typcollation WHERE t.oid = $1::oid", 1, params, &rows);
-			ws_put_text(text, ws_sql_value(&rows, 0, 0));
-			break;
+			{
+				WsSqlRows	cons;
+
+				WsSql->read("SELECT t.typbasetype::text, t.typtypmod::text, "
+							"  CASE WHEN t.typcollation <> b.typcollation THEN quote_ident(k.collname) END, "
+							"  t.typdefaultbin::text "
+							"FROM pg_type t JOIN pg_type b ON b.oid = t.typbasetype "
+							"LEFT JOIN pg_collation k ON k.oid = t.typcollation WHERE t.oid = $1::oid", 1, params, &rows);
+				ws_put_text(text, "AS ");
+				ws_put_text(text, print_type(schema, atooid(ws_sql_value(&rows, 0, 0)),
+											 atoi(ws_sql_value(&rows, 0, 1))));
+				if (ws_sql_value(&rows, 0, 2) != NULL)
+				{
+					ws_put_text(text, " COLLATE ");
+					ws_put_text(text, ws_sql_value(&rows, 0, 2));
+				}
+				if (ws_sql_value(&rows, 0, 3) != NULL)
+				{
+					ws_put_text(text, " DEFAULT ");
+					ws_put_text(text, printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2,
+																			   CStringGetTextDatum(ws_sql_value(&rows, 0, 3)),
+																			   ObjectIdGetDatum(InvalidOid), 0)));
+				}
+				WsSql->read("SELECT quote_ident(conname), oid::text FROM pg_constraint WHERE contypid = $1::oid "
+							"ORDER BY conname", 1, params, &cons);
+				for (int i = 0; i < cons.nrows; i++)
+				{
+					ws_put_text(text, " CONSTRAINT ");
+					ws_put_text(text, ws_sql_value(&cons, i, 0));
+					ws_put_text(text, " ");
+					INJECTION_POINT("ws-obj-print-constraint", NULL);
+					ws_put_text(text, printed_or_retry(schema, ws_schema_print(schema, pg_get_constraintdef, 1,
+																			   ObjectIdGetDatum(atooid(ws_sql_value(&cons, i, 1))), 0, 0)));
+				}
+				ws_sql_rows_free(&cons);
+				break;
+			}
 		default:
 			elog(ERROR, "a type of no kind held: %c", typtype);
 	}
@@ -1374,7 +1492,7 @@ read_types(const char *schema, WsObject *objs, int *n)
 		o->kind = typtype == 'd' ? WS_OBJ_DOMAIN : WS_OBJ_TYPE;
 		o->name = ws_name_to_utf8(name);
 		check_type_names(oid, name, typtype);
-		type_definition(typtype, oid, &text);
+		type_definition(schema, typtype, oid, &text);
 		buf_append_byte(&text, 0);
 		check_type_is_portable(name, schema, typtype == 'd' ? "CREATE DOMAIN" : "CREATE TYPE", (char *) text.data);
 		ws_tags_escape(ws_text_to_utf8((char *) text.data), &stored);
@@ -1382,6 +1500,12 @@ read_types(const char *schema, WsObject *objs, int *n)
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
 		buf_free(&text);
+		if (typtype == 'd')
+			check_constants_hold_no_names(name, schema, oid,
+										  "SELECT typbasetype::text FROM pg_type WHERE oid = $1::oid "
+										  "  AND (typdefaultbin IS NOT NULL OR EXISTS (SELECT 1 FROM pg_constraint WHERE contypid = $1::oid AND contype = 'c')) "
+										  "UNION SELECT d.refobjid::text FROM pg_constraint c JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass "
+										  "  AND d.objid = c.oid WHERE c.contypid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
 		read_deps(o, oid, TYPE_SOURCE_OF("$1::oid"));
 		read_type_comments(o, oid);
 		read_type_owner_and_grants(o, oid, name);
@@ -1390,38 +1514,23 @@ read_types(const char *schema, WsObject *objs, int *n)
 	return objs;
 }
 
-/* (without it, what is in the schema could only be printed with its schema's name) */
-static bool
-has_usage_of_schema(const char *schema)
-{
-	Oid			nsp = get_namespace_oid(schema, true);
-
-	return !OidIsValid(nsp) ||
-		object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) == ACLCHECK_OK;
-}
-
 void
 ws_obj_read(const char *schema, WsObject **out, int *n)
 {
 	int			level = WsSql->begin();
-	int			nest;
 	const char *params[1] = {schema};
 	WsSqlRows	rels;
 	WsObject   *objs;
 	int			total;
 	char	   *version;
 
-	if (!has_usage_of_schema(schema))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied for schema %s", schema)));
+	ws_schema_check_usage(schema);
 	version = push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
 	refuse_types(schema, type_refusal_sql);
 	refuse_types(schema, cast_refusal_sql);
-	nest = path_begin(schema);
 
-	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, pg_get_viewdef(c.oid, false), "
+	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, NULL::text, "
 				"  (SELECT string_agg(quote_ident(split_part(o, '=', 1)) || ' = ' || "
 				"      quote_literal(substr(o, strpos(o, '=') + 1)), ', ' ORDER BY o) FROM unnest(c.reloptions) o) "
 				"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -1433,7 +1542,9 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		const char *oid = ws_sql_value(&rels, i, 0);
 		bool		matview = ws_sql_value(&rels, i, 1)[0] == 'm';
 		const char *name = ws_sql_value(&rels, i, 2);
-		const char *viewdef = ws_sql_value(&rels, i, 3);
+		char	   *viewdef = printed_or_retry(schema, ws_schema_print(schema, pg_get_viewdef_ext, 2,
+																	   ObjectIdGetDatum(atooid(oid)),
+																	   BoolGetDatum(false), 0));
 		const char *options = ws_sql_value(&rels, i, 4);
 		Buf			text = BUF_INIT;
 		Buf			stored = BUF_INIT;
@@ -1468,6 +1579,9 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
 		buf_free(&text);
+		check_constants_hold_no_names(name, schema, oid,
+									  "SELECT d.refobjid::text FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass "
+									  "AND d.objid = r.oid WHERE r.ev_class = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
 		read_deps(o, oid, "SELECT 'pg_rewrite'::regclass::oid, oid FROM pg_rewrite WHERE ev_class = $1::oid");
 		read_comments(o, oid);
 		read_owner_and_grants(o, oid, name);
@@ -1489,7 +1603,6 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	*n = total;
 	*out = objs;
 	ws_sql_rows_free(&rels);
-	path_end(nest);
 	PopActiveSnapshot();
 	INJECTION_POINT("ws-obj-read-end", NULL);
 
@@ -1922,7 +2035,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 			ws_schema_check_defaults(schema, before_tables ? DEFACLOBJ_TYPE : DEFACLOBJ_RELATION);
 	level = WsSql->begin();
 	check_nothing_captures(schema);
-	nest = path_begin(schema);
+	nest = ws_schema_path_begin(schema);
 	for (int i = 0; i < n; i++)
 	{
 		Buf			sql = BUF_INIT;
@@ -1932,7 +2045,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		ws_obj_create_statement(&objs[order[i]], schema, &sql);
 		run_statement(&sql);
 	}
-	path_end(nest);
+	ws_schema_path_end(nest);
 	for (int i = 0; i < n; i++)
 	{
 		const WsObject *o = &objs[order[i]];

@@ -49,6 +49,8 @@
 #include "catalog/indexing.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -60,17 +62,22 @@
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_fk.h"
+#include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_tags.h"
 #include "storage/lmgr.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
@@ -2077,6 +2084,113 @@ put_expression(const WsTableSchema *s, const char *stored, Buf *out)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("an expression of table \"%s\" refers to column tag " UINT64_FORMAT ", which it does not have",
 						s->name, missing)));
+}
+
+/*
+ * The catalogs come first and temporary objects last, so that nothing of the schema's
+ * can be taken for theirs or the other way about: what the schema shadows is printed
+ * qualified, which a record refuses.
+ */
+int
+ws_schema_path_begin(const char *schema)
+{
+	int			nest;
+	char	   *path;
+
+	/* (a path takes this as whoever is asking's own, however it is quoted) */
+	if (strcmp(schema, "$user") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a schema named \"$user\" cannot be held in a commit")));
+	nest = NewGUCNestLevel();
+	path = psprintf("pg_catalog, %s, pg_temp", quote_identifier(schema));
+
+	(void) set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	pfree(path);
+	return nest;
+}
+
+void
+ws_schema_path_end(int nest)
+{
+	AtEOXact_GUC(true, nest);
+}
+
+char *
+ws_schema_print(const char *schema, PGFunction fn, int nargs, Datum a, Datum b, Datum c)
+{
+	LOCAL_FCINFO(fcinfo, 3);
+	int			nest;
+	Datum		printed;
+	char	   *result = NULL;
+
+	InitFunctionCallInfoData(*fcinfo, NULL, nargs, InvalidOid, NULL, NULL);
+	fcinfo->args[0].value = a;
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = b;
+	fcinfo->args[1].isnull = false;
+	fcinfo->args[2].value = c;
+	fcinfo->args[2].isnull = false;
+	nest = ws_schema_path_begin(schema);
+	printed = fn(fcinfo);
+	if (!fcinfo->isnull)
+		result = TextDatumGetCString(printed);
+	ws_schema_path_end(nest);
+	return result;
+}
+
+void
+ws_schema_check_usage(const char *schema)
+{
+	Oid			nsp = get_namespace_oid(schema, true);
+
+	if (OidIsValid(nsp) && object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for schema %s", schema)));
+}
+
+/* A collation's name as a record says it: bare, if its schema's and what that means. */
+static char *
+collation_as_held(const char *schema, Oid collation)
+{
+	HeapTuple	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(collation));
+	Form_pg_collation form;
+	char	   *nsp;
+	char	   *result;
+	bool		bare;
+	int			nest;
+
+	/* (read under an old snapshot, it may be gone by now, as an index may) */
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": a collation has been dropped since this transaction's snapshot",
+						schema)));
+	form = (Form_pg_collation) GETSTRUCT(tup);
+	nsp = get_namespace_name(form->collnamespace);
+	nest = ws_schema_path_begin(schema);
+	bare = form->collnamespace == get_namespace_oid(schema, false) && CollationIsVisible(collation);
+	ws_schema_path_end(nest);
+	result = bare ? pstrdup(quote_identifier(NameStr(form->collname))) :
+		psprintf("%s.%s", quote_identifier(nsp), quote_identifier(NameStr(form->collname)));
+	ReleaseSysCache(tup);
+	return result;
+}
+
+/* (a cell of a read as printed, of an expression as the catalog holds it) */
+static void
+print_expr_cell(WsSqlRows *rows, int r, int c, const char *schema, Oid relid)
+{
+	char	  **cell = &rows->values[r * rows->ncols + c];
+	char	   *printed;
+
+	if (*cell == NULL)
+		return;
+	printed = ws_schema_print(schema, pg_get_expr, 2, CStringGetTextDatum(*cell), ObjectIdGetDatum(relid), 0);
+	pfree(*cell);
+	*cell = printed;
 }
 
 void
@@ -4334,6 +4448,8 @@ check_snapshot_current(const char *table, Oid relid, const WsSqlRows *cols)
 /* (the columns' names in the server's encoding, as an expression prints them) */
 typedef struct ReadCols
 {
+	const char *schema;
+	const char *table;
 	int			n;
 	const char **names;
 	uint64	   *tags;
@@ -4387,12 +4503,203 @@ index_col_tag(const char *table, ReadCols *rc, const char *name)
 	return tag;
 }
 
+pg_noreturn static void
+says_its_schema(const char *schema, const char *table)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("table \"%s\" in schema \"%s\" cannot be held in a commit: it must say its schema's name",
+					table, schema),
+			 errdetail("What it uses in its schema has a name the catalogs also have, or a constant of it holds names, which a record could not hold without saying the schema.")));
+}
+
+/* (a commit does not name the schema it is of, so it can be restored into any) */
+static void
+check_says_no_schema(const ReadCols *rc, const char *expression)
+{
+	if (ws_expression_names_schema(expression, rc->schema))
+		says_its_schema(rc->schema, rc->table);
+}
+
+/* Whether a name as the catalogs print it is qualified by a schema's name. */
+static bool
+name_says_schema(const char *name, const char *schema)
+{
+	const char *q = quote_identifier(schema);
+	size_t		n = strlen(q);
+
+	return name != NULL && (strncmp(name, q, n) == 0 && name[n] == '.');
+}
+
+static void
+check_key_says_no_schema(const WsIndexKey *key, const char *in_commit, const char *schema,
+						 const char *table)
+{
+	if (name_says_schema(key->collation, in_commit) || name_says_schema(key->opclass, in_commit) ||
+		name_says_schema(key->op, in_commit))
+		says_its_schema(schema, table);
+}
+
+/*
+ * Whether a type bare is what CREATE TABLE takes for something else: said of the
+ * schema's own type, it must be said by naming the schema.
+ */
+static bool
+type_means_something_else(const char *type)
+{
+	static const char *const names[] = {"serial", "bigserial", "smallserial", "serial2", "serial4", "serial8"};
+	size_t		n = strcspn(type, "[");
+
+	for (int i = 0; i < lengthof(names); i++)
+		if (strlen(names[i]) == n && strncmp(type, names[i], n) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * Whether a value of a type holds a name, however deep: a reg* type itself, an array
+ * of one, a domain over one, or a composite with such a field, not looked into by
+ * anything that reads an expression.  A scalar reg* constant is another matter,
+ * which the grammar sees: the caller says which it means by which it asks of.
+ */
+static bool
+is_reg_type_oid(Oid typid)
+{
+	switch (typid)
+	{
+		case REGCLASSOID:
+		case REGCOLLATIONOID:
+		case REGCONFIGOID:
+		case REGDATABASEOID:
+		case REGDICTIONARYOID:
+		case REGNAMESPACEOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGROLEOID:
+		case REGTYPEOID:
+			return true;
+	}
+	return false;
+}
+
+static bool
+holds_names(Oid typid, int depth)
+{
+	Oid			element;
+	Oid			relid;
+
+	check_stack_depth();
+	if (is_reg_type_oid(typid))
+		return true;
+	if (depth > 64)
+		return true;
+	if (get_typtype(typid) == TYPTYPE_DOMAIN)
+		return holds_names(getBaseType(typid), depth + 1);
+	element = get_element_type(typid);
+	if (OidIsValid(element))
+		return holds_names(element, depth + 1);
+	relid = get_typ_typrelid(typid);
+	if (OidIsValid(relid))
+		for (AttrNumber a = 1;; a++)
+		{
+			HeapTuple	tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(a));
+			bool		found;
+
+			if (!HeapTupleIsValid(tup))
+				break;
+			found = !((Form_pg_attribute) GETSTRUCT(tup))->attisdropped &&
+				holds_names(((Form_pg_attribute) GETSTRUCT(tup))->atttypid, depth + 1);
+			ReleaseSysCache(tup);
+			if (found)
+				return true;
+		}
+	return false;
+}
+
+bool
+ws_type_holds_names(Oid typid)
+{
+	/* (a scalar reg* constant the grammar does see into) */
+	return !is_reg_type_oid(typid) && holds_names(typid, 0);
+}
+
+/*
+ * Refuses what a table's expressions need of its schema with a name the catalogs also
+ * have: printed bare, in a schema without it, it would quietly mean theirs instead.
+ */
+static void
+check_catalog_named_needs(const char *schema, const char *table, const char *oid)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+	bool		found;
+
+	WsSql->read("WITH src(classid, objid) AS ( "
+				"  SELECT 'pg_attrdef'::regclass::oid, oid FROM pg_attrdef WHERE adrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_constraint'::regclass::oid, oid FROM pg_constraint WHERE conrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_class'::regclass::oid, indexrelid FROM pg_index WHERE indrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_class'::regclass::oid, $1::oid), "
+				"own AS (SELECT relnamespace FROM pg_class WHERE oid = $1::oid) "
+				"SELECT 1 FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
+				"JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
+				"WHERE p.pronamespace = (SELECT relnamespace FROM own) AND EXISTS (SELECT 1 FROM pg_proc c "
+				"  WHERE c.proname = p.proname AND c.pronamespace = 'pg_catalog'::regnamespace) "
+				"UNION ALL SELECT 1 FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
+				"JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid "
+				"WHERE o.oprnamespace = (SELECT relnamespace FROM own) AND EXISTS (SELECT 1 FROM pg_operator c "
+				"  WHERE c.oprname = o.oprname AND c.oprnamespace = 'pg_catalog'::regnamespace) "
+				"LIMIT 1",
+				1, params, &rows);
+	found = rows.nrows > 0;
+	ws_sql_rows_free(&rows);
+	if (found)
+		says_its_schema(schema, table);
+
+	/* (a column's type is no constant: only what its expressions name, not its row) */
+	WsSql->read("WITH src(classid, objid) AS ( "
+				"  SELECT 'pg_attrdef'::regclass::oid, oid FROM pg_attrdef WHERE adrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_constraint'::regclass::oid, oid FROM pg_constraint WHERE conrelid = $1::oid "
+				"  UNION ALL SELECT 'pg_class'::regclass::oid, indexrelid FROM pg_index WHERE indrelid = $1::oid) "
+				"SELECT DISTINCT d.refobjid::text FROM src JOIN pg_depend d ON d.classid = src.classid AND d.objid = src.objid "
+				"WHERE d.refclassid = 'pg_type'::regclass "
+				"UNION SELECT a.atttypid::text FROM pg_attrdef ad JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+				"WHERE ad.adrelid = $1::oid", 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_type_holds_names(atooid(ws_sql_value(&rows, i, 0))))
+			says_its_schema(schema, table);
+	ws_sql_rows_free(&rows);
+}
+
+/* The record's names that are not in an expression, which what read those has checked. */
+static void
+check_record_says_no_schema(const WsTableSchema *s, const char *in_commit, const char *schema,
+							const char *table)
+{
+	for (int i = 0; i < s->ncols; i++)
+		if (name_says_schema(s->cols[i].type, in_commit) || name_says_schema(s->cols[i].collation, in_commit) ||
+			type_means_something_else(s->cols[i].type))
+			says_its_schema(schema, table);
+	for (int i = 0; i < s->nconstraints; i++)
+		for (int k = 0; k < s->constraints[i].excl.nkeys; k++)
+			check_key_says_no_schema(&s->constraints[i].excl.keys[k], in_commit, schema, table);
+	for (int i = 0; i < s->nindexes; i++)
+		for (int k = 0; k < s->indexes[i].nkeys; k++)
+			check_key_says_no_schema(&s->indexes[i].keys[k], in_commit, schema, table);
+	for (int k = 0; k < s->npartition; k++)
+	{
+		check_key_says_no_schema(&s->partition_keys[k], in_commit, schema, table);
+	}
+}
+
 static char *
 stored_expression(const char *expression, ReadCols *rc)
 {
 	Buf			stored = BUF_INIT;
 	char	   *utf8;
 
+	check_says_no_schema(rc, expression);
 	ws_tags_template(expression, read_tag_of, rc, &stored);
 	buf_append_byte(&stored, 0);
 	utf8 = to_utf8((char *) stored.data);
@@ -4428,16 +4735,14 @@ read_index_key(const char *table, const char *index_oid, int k, const IndexElem 
 		key->tag = index_col_tag(table, rc, elem->name);
 	else
 	{
-		char		colno[16];
-		const char *params[2] = {index_oid, colno};
-		WsSqlRows	one;
+		char	   *printed;
 
-		snprintf(colno, sizeof(colno), "%d", k + 1);
-		WsSql->read("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
-		if (ws_sql_value(&one, 0, 0) == NULL)
+		printed = ws_schema_print(rc->schema, pg_get_indexdef_ext, 3, ObjectIdGetDatum(atooid(index_oid)),
+								  Int32GetDatum(k + 1), BoolGetDatum(false));
+		if (printed == NULL)
 			index_gone(table);
-		key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
-		ws_sql_rows_free(&one);
+		key->expr = stored_expression(printed, rc);
+		pfree(printed);
 	}
 	names_fit(elem->collation);
 	names_fit(elem->opclass);
@@ -4457,8 +4762,7 @@ static void
 read_exclusion(const char *table, const char *con_oid, const char *index_oid, const char *predicate,
 			   ReadCols *rc, WsIndex *ix)
 {
-	const char *params[1] = {con_oid};
-	WsSqlRows	printed;
+	char	   *printed;
 	List	   *parsed;
 	List	   *elts;
 	Constraint *con;
@@ -4467,12 +4771,11 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(atooid(index_oid))))
 		index_gone(table);
-	WsSql->read("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
-	if (ws_sql_value(&printed, 0, 0) == NULL)
+	printed = ws_schema_print(rc->schema, pg_get_constraintdef, 1, ObjectIdGetDatum(atooid(con_oid)), 0, 0);
+	if (printed == NULL)
 		index_gone(table);
-	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", ws_sql_value(&printed, 0, 0)),
-						RAW_PARSE_DEFAULT);
-	ws_sql_rows_free(&printed);
+	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", printed), RAW_PARSE_DEFAULT);
+	pfree(printed);
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateStmt))
 		elog(ERROR, "an exclusion of table \"%s\" printed as something else", table);
 	elts = ((CreateStmt *) linitial_node(RawStmt, parsed)->stmt)->tableElts;
@@ -4552,8 +4855,7 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 static void
 read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchema *out)
 {
-	const char *params[1] = {oid};
-	WsSqlRows	printed;
+	char	   *printed;
 	List	   *parsed;
 	PartitionSpec *spec;
 	HeapTuple	tup = SearchSysCache1(PARTRELID, ObjectIdGetDatum(atooid(oid)));
@@ -4573,12 +4875,11 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 			exprs = (List *) stringToNode(TextDatumGetCString(datum));
 	}
 	ReleaseSysCache(tup);
-	WsSql->read("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
-	if (ws_sql_value(&printed, 0, 0) == NULL)
+	printed = ws_schema_print(rc->schema, pg_get_partkeydef, 1, ObjectIdGetDatum(atooid(oid)), 0, 0);
+	if (printed == NULL)
 		elog(ERROR, "partitioned table \"%s\" printed no partitioning", table);
-	parsed = raw_parser(psprintf("CREATE TABLE t () PARTITION BY %s", ws_sql_value(&printed, 0, 0)),
-						RAW_PARSE_DEFAULT);
-	ws_sql_rows_free(&printed);
+	parsed = raw_parser(psprintf("CREATE TABLE t () PARTITION BY %s", printed), RAW_PARSE_DEFAULT);
+	pfree(printed);
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateStmt))
 		elog(ERROR, "partitioned table \"%s\" printed as something else", table);
 	spec = ((CreateStmt *) linitial_node(RawStmt, parsed)->stmt)->partspec;
@@ -4593,10 +4894,26 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 		PartitionElem *elem = lfirst_node(PartitionElem, lc);
 		WsIndexKey *key = &out->partition_keys[k++];
 
+		Oid			key_type;
+
 		if (elem->name != NULL)
+		{
 			key->tag = index_col_tag(table, rc, elem->name);
+			key_type = get_atttype(atooid(oid), get_attnum(atooid(oid), elem->name));
+		}
 		else
-			key->expr = stored_expression(deparse_expression(list_nth(exprs, nexpr++), context, false, false), rc);
+		{
+			int			nest = ws_schema_path_begin(rc->schema);
+			Node	   *keyexpr = list_nth(exprs, nexpr++);
+			char	   *expression = deparse_expression(keyexpr, context, false, false);
+
+			ws_schema_path_end(nest);
+			key->expr = stored_expression(expression, rc);
+			key_type = exprType(keyexpr);
+		}
+		/* (its partitions' bounds would hold names, in values no grammar reads) */
+		if (holds_names(key_type, 0))
+			says_its_schema(rc->schema, table);
 		names_fit(elem->collation);
 		names_fit(elem->opclass);
 		key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
@@ -5095,11 +5412,12 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				key,
 				others,
 				idxs;
-	ReadCols	rc = {0};
+	ReadCols	rc = {.schema = schema,.table = table};
 	const char *relkind,
 			   *persistence;
 
 	memset(out, 0, sizeof(*out));
+	ws_schema_check_usage(schema);
 
 	/*
 	 * The name's table, locked: while waiting for the lock the name may have
@@ -5110,7 +5428,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		Oid			now;
 
 		WsSql->run("SELECT c.oid::text, c.relkind::text, c.relpersistence::text, n.nspbranch::text, "
-				   "  c.relispartition::text, pg_get_expr(c.relpartbound, c.oid), "
+				   "  c.relispartition::text, c.relpartbound::text, "
 				   "  (SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
 				   "    WHERE c.relispartition AND i.inhrelid = c.oid) "
 				   "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -5177,11 +5495,10 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 
 		WsSql->read("SELECT a.attnum::text, a.attname::text, "
-				    "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
+				    "  a.atttypid::text || ' ' || a.atttypmod::text, a.attnotnull::text, "
 				    "  a.attidentity::text, a.attgenerated::text, "
-				    "  pg_get_expr(d.adbin, d.adrelid), "
-				    "  CASE WHEN a.attcollation <> t.typcollation THEN "
-				    "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
+				    "  d.adbin::text, "
+				    "  CASE WHEN a.attcollation <> t.typcollation THEN a.attcollation::text END, "
 				    "  a.attcoltag::text, "
 				    "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
 				    "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
@@ -5198,21 +5515,18 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				    "FROM pg_attribute a "
 				    "JOIN pg_type t ON t.oid = a.atttypid "
 				    "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
-				    "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
-				    "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
 				    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
 				    "ORDER BY a.attnum", 1, oid, &cols);
-		WsSql->read("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
+		WsSql->read("SELECT con.conname::text, con.contype::text, con.conbin::text, "
 				    "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				    "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
 				    "  con.oid::text, "
-				    "  i.indexrelid::text, pg_get_expr(i.indpred, i.indrelid), "
+				    "  i.indexrelid::text, i.indpred::text, "
 				    "  con.convalidated::text, con.connoinherit::text, con.conenforced::text, "
 				    "  con.conislocal::text "
 				    "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
 				    "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
-		WsSql->read("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
-				    "  pg_get_expr(i.indpred, i.indrelid) "
+		WsSql->read("SELECT ic.relname::text, i.indexrelid::text, i.indexrelid::text, i.indpred::text "
 				    "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 				    "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
 				    "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
@@ -5224,6 +5538,51 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				    "  con.condeferred::text "
 				    "FROM pg_constraint con JOIN pg_index i ON i.indexrelid = con.conindid "
 				    "WHERE con.conrelid = $1::oid AND con.contype = 'p'", 1, oid, &key);
+	}
+
+	/*
+	 * What is printed is printed by itself, with the schema on the search path so
+	 * that what is in it is not named.  A statement above parsed with it there could
+	 * take a function of the schema's for the catalogs'.
+	 */
+	{
+		Oid			relid = atooid(ws_sql_value(&rel, 0, 0));
+
+		check_catalog_named_needs(schema, table, ws_sql_value(&rel, 0, 0));
+		print_expr_cell(&rel, 0, 5, schema, relid);
+		for (int i = 0; i < cols.nrows; i++)
+		{
+			char	  **type = &cols.values[i * cols.ncols + 2];
+			Oid			typid = atooid(*type);
+			int32		typmod = atoi(strchr(*type, ' ') + 1);
+			char	   *printed = ws_schema_print(schema, format_type, 2, ObjectIdGetDatum(typid),
+												  Int32GetDatum(typmod), 0);
+
+			pfree(*type);
+			*type = printed;
+			print_expr_cell(&cols, i, 6, schema, relid);
+			if (cols.values[i * cols.ncols + 7] != NULL)
+			{
+				char	   *name = collation_as_held(schema, atooid(cols.values[i * cols.ncols + 7]));
+
+				pfree(cols.values[i * cols.ncols + 7]);
+				cols.values[i * cols.ncols + 7] = name;
+			}
+		}
+		for (int i = 0; i < others.nrows; i++)
+		{
+			print_expr_cell(&others, i, 2, schema, relid);
+			print_expr_cell(&others, i, 9, schema, relid);
+		}
+		for (int i = 0; i < idxs.nrows; i++)
+		{
+			char	  **def = &idxs.values[i * idxs.ncols + 2];
+			char	   *printed = ws_schema_print(schema, pg_get_indexdef, 1, ObjectIdGetDatum(atooid(*def)), 0, 0);
+
+			pfree(*def);
+			*def = printed;
+			print_expr_cell(&idxs, i, 3, schema, relid);
+		}
 	}
 
 	check_snapshot_current(table, atooid(ws_sql_value(&rel, 0, 0)), &cols);
@@ -5282,6 +5641,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		{
 			Buf			stored = BUF_INIT;
 
+			check_says_no_schema(&rc, expr);
 			ws_tags_template(expr, read_tag_of, &rc, &stored);
 			buf_append_byte(&stored, 0);
 			out->cols[i].def = to_utf8((char *) stored.data);
@@ -5312,6 +5672,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		{
 			Buf			stored = BUF_INIT;
 
+			check_says_no_schema(&rc, ws_sql_value(&others, i, 2));
 			ws_tags_template(ws_sql_value(&others, i, 2), read_tag_of, &rc, &stored);
 			buf_append_byte(&stored, 0);
 			con->expr = to_utf8((char *) stored.data);
@@ -5386,6 +5747,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
 	PopActiveSnapshot();
+	check_record_says_no_schema(out, ws_text_to_utf8(schema), schema, table);
 	WsSql->end(level);
 	return true;
 }
