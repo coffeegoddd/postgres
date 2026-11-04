@@ -131,7 +131,14 @@ for my $t (
 	[ 'opt', 'CREATE TABLE src.opt (a int); ALTER TABLE src.opt ALTER a SET (n_distinct = 5)' ],
 	[ 'ser', 'CREATE TABLE src.ser (a serial)' ],
 	[ 'seqo', 'CREATE TABLE src.seqo (a int GENERATED ALWAYS AS IDENTITY (START 5))' ],
-	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ])
+	[ 'seqm', 'CREATE TABLE src.seqm (a smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 7))' ],
+	[ 'seqt', 'CREATE TABLE src.seqt (a int GENERATED ALWAYS AS IDENTITY); ALTER SEQUENCE src.seqt_a_seq AS bigint MAXVALUE 2147483647' ],
+	[ 'seqp', 'CREATE UNLOGGED TABLE src.seqp (a int GENERATED ALWAYS AS IDENTITY); ALTER SEQUENCE src.seqp_a_seq SET LOGGED' ],
+	[ 'owner', 'CREATE TABLE src.owner (a int); CREATE SEQUENCE src.owned OWNED BY src.owner.a' ],
+	[ 'clus', 'CREATE TABLE src.clus (a int PRIMARY KEY); ALTER TABLE src.clus CLUSTER ON clus_pkey' ],
+	[ 'pol', 'CREATE TABLE src.pol (a int); CREATE POLICY p ON src.pol USING (true)' ],
+	[ 'over', 'CREATE TABLE src.over (a int4range, r int4range, PRIMARY KEY (a, r WITHOUT OVERLAPS))' ],
+	[ 'toid', 'CREATE TABLE src.toid (a oid GENERATED ALWAYS AS (tableoid) STORED)' ])
 {
 	my $name = $t->[2] // $t->[0];
 	$node->safe_psql('postgres', $t->[1]);
@@ -172,6 +179,34 @@ like($sess->{stderr}, qr/was renamed or dropped since this transaction's snapsho
 	'columns swapped since a snapshot refused');
 $sess->query('ROLLBACK');
 $sess->quit;
+
+# a reader waiting for its lock while the table goes: what is there afterwards
+my $while_waiting = sub {
+	my ($table, $ddl) = @_;
+	$node->safe_psql('postgres', qq{CREATE TABLE src.$table (a integer)});
+	my $holder = $node->background_psql('postgres');
+	$holder->query_safe('BEGIN');
+	$holder->query_safe($ddl);
+	my $reader = $node->background_psql('postgres');
+	$reader->query_until(qr/waiting/,
+		qq{\\echo waiting\nSELECT test_ws_schema_bytes('src', '$table') IS NULL AS nothing;\n});
+	$node->poll_query_until('postgres',
+		q{SELECT EXISTS (SELECT FROM pg_locks WHERE NOT granted)}) or die 'no wait';
+	$holder->query_safe('COMMIT');
+	$holder->quit;
+	my $result = $reader->query_safe('SELECT 1');
+	$reader->quit;
+	return $result;
+};
+for my $t (
+	[ 'gone', 'DROP TABLE src.gone' ],
+	[ 'moved', 'ALTER TABLE src.moved RENAME TO moved2' ],
+	[ 'other_sch', 'ALTER TABLE src.other_sch SET SCHEMA other' ])
+{
+	like($while_waiting->($t->[0], $t->[1]), qr/^t\n/, "$t->[0] while waiting: no such table");
+}
+like($while_waiting->('again', 'DROP TABLE src.again; CREATE TABLE src.again (z text)'),
+	qr/^f\n/, 'dropped and made again while waiting: the table now of that name');
 
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'nosuch') IS NULL}),
 	't', 'no such table');
