@@ -104,8 +104,13 @@ extern void ws_role_list(ProllyCtx *ctx, const PHash *map, WsRole **out, int *n)
  * allowed to write, as the role committing.  Marking one not yet marked takes a
  * superuser, as ALTER ROLE ... TRAVELS does, since a mark lets a commit say who is a
  * member of it: ERRCODE_INSUFFICIENT_PRIVILEGE otherwise.  A role already marked
- * needs nothing.  The mark goes with the role.  A mark says only that some versioned
- * database of this cluster holds it, and those that hold one name share it.
+ * needs nothing.  A mark goes with the role, and is cleared by renaming it, as a
+ * commit means that role by name.  A mark says only that some versioned database of
+ * this cluster holds it, and those that hold one name share it.
+ *
+ * Who has ADMIN on a marked role can make anyone a member of it, who then has what
+ * later commits grant it; so can a role with CREATEROLE that pulled a commit making
+ * it, as it then has ADMIN.  That is what ADMIN is, and what a remote is trusted with.
  */
 extern void ws_role_mark(const WsRole *roles, int n);
 
@@ -146,7 +151,8 @@ extern void ws_role_revoke_statement(const char *member, const char *of, const c
  * what another role granted takes what the server asks of that, so a role with
  * CREATEROLE and ADMIN may be refused what a superuser granted; taking the ADMIN
  * option from a role that has used it here raises
- * ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST.  previous is in order.
+ * ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST, as does removing two memberships that each
+ * granted what the other holds.  previous is in order.
  */
 extern void ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int nprevious);
 

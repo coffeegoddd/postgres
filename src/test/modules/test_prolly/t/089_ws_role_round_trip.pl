@@ -258,14 +258,13 @@ my $globals_file = $src->basedir . '/globals.sql';
 $src->command_ok([ 'pg_dumpall', '--globals-only', '--port' => $src->port, '--host' => $src->host, '--file' => $globals_file ], 'pg_dumpall of globals');
 my $globals = PostgreSQL::Test::Utils::slurp_file($globals_file);
 like($globals, qr/ALTER ROLE g_dumped WITH [^\n]* TRAVELS;/, 'a mark is dumped');
-like($globals, qr/ALTER ROLE g_undumped WITH [^\n]* NOTRAVELS;/, 'and its absence');
+unlike($globals, qr/ALTER ROLE g_undumped WITH [^\n]*TRAVELS/, 'and only a mark, so a dump of other roles loads into any server');
 my $third = PostgreSQL::Test::Cluster->new('ws_role_third');
 $third->init(extra => ['--encoding=UTF8', '--locale=C']);
 $third->start;
-$third->safe_psql('postgres', 'CREATE ROLE g_undumped NOLOGIN TRAVELS');
 $third->psql('postgres', join("\n", grep { /^(CREATE|ALTER) ROLE g_(un)?dumped/ } split /\n/, $globals), on_error_stop => 0);
 is( $third->safe_psql('postgres', q{SELECT string_agg(rolname || ' ' || roltravels, ', ' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('g_dumped', 'g_undumped')}),
-	'g_dumped true, g_undumped false', 'and a restore leaves both as they were, over a role there too');
+	'g_dumped true, g_undumped false', 'and a restore leaves both as they were');
 $third->stop;
 $dst->safe_psql('postgres', 'CREATE ROLE g_marked_by_sql NOLOGIN; ALTER ROLE g_marked_by_sql TRAVELS');
 is($dst->safe_psql('postgres', q{SELECT roltravels FROM pg_authid WHERE rolname = 'g_marked_by_sql'}), 't', 'ALTER ROLE marks');
@@ -284,15 +283,19 @@ my $forged_login = sprintf("%s:0000\n", unpack('H*', 'x_person'));
 ($rc, $out, $err) = $src->psql('postgres', "SELECT test_ws_role_mark('$forged_login')");
 like($err, qr/role "x_person" cannot travel with a commit: it can log in/, 'a login role cannot be marked');
 
-# what has nothing to do takes no lock: an open change of owner does not block it
+# what has nothing to do takes no lock: an open grant of the role does not block it
 $src->safe_psql('postgres', 'CREATE ROLE g_race_mark NOLOGIN TRAVELS');
 my $to_mark = $bytes->($src, 'g_race_mark');
 my $m1 = $src->background_psql('postgres');
 $m1->query_safe('BEGIN');
-$m1->query_safe(q{CREATE TABLE owned (); ALTER TABLE owned OWNER TO g_race_mark});
+$m1->query_safe('GRANT g_race_mark TO x_nobody');
 is($src->psql('postgres', "SET lock_timeout = '5s'; SELECT test_ws_role_mark('$to_mark')"), 0, 'marking one already marked waits for no one');
 $m1->query_safe('ROLLBACK');
 $m1->quit;
+
+# a rename clears a mark: a commit means a role by name
+$src->safe_psql('postgres', 'CREATE ROLE g_named NOLOGIN TRAVELS; ALTER ROLE g_named RENAME TO g_renamed');
+is($src->safe_psql('postgres', q{SELECT roltravels FROM pg_authid WHERE rolname = 'g_renamed'}), 'f', 'a renamed role is no longer marked');
 
 # two markings of one unmarked role: the second waits, then has nothing to do
 $src->safe_psql('postgres', 'CREATE ROLE g_race_mark2 NOLOGIN');
@@ -408,6 +411,29 @@ is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_auth_members m JOIN pg_
 	'and leaves alone a person who took the name, and their membership');
 $dst->safe_psql('postgres', q{DROP ROLE g_x1; DROP ROLE g_x2});
 is($restore->($dst, $bytes->($src, 'g_top'), $x_both), 0, 'and roles dropped here are nothing to it');
+
+# a grantor that has ADMIN only through another role cannot grant as itself
+$src->safe_psql('postgres', q{CREATE ROLE g_v1 NOLOGIN; CREATE ROLE g_v2 NOLOGIN; GRANT g_v2 TO g_v1 WITH ADMIN FALSE, INHERIT TRUE, SET TRUE});
+my $v_before = $bytes->($src, 'g_v1');
+is($restore->($dst, $v_before), 0, 'a membership arrives');
+my $su2 = $dst->safe_psql('postgres', 'SELECT current_user');
+$dst->safe_psql('postgres', qq{CREATE ROLE g_v3 NOLOGIN; CREATE ROLE g_v4 NOLOGIN; GRANT g_v2 TO g_v3 WITH ADMIN TRUE; GRANT g_v2 TO g_v4 WITH ADMIN TRUE;
+	GRANT g_v4 TO g_v3; REVOKE g_v2 FROM g_v1 GRANTED BY "$su2"; SET ROLE g_v3; GRANT g_v2 TO g_v1 WITH ADMIN FALSE, INHERIT FALSE, SET TRUE; RESET ROLE;
+	GRANT g_v2 TO g_v3 WITH ADMIN FALSE});
+$src->safe_psql('postgres', q{GRANT g_v2 TO g_v1 WITH ADMIN FALSE, INHERIT TRUE, SET FALSE});
+my $v_after = $bytes->($src, 'g_v1');
+is($restore->($dst, $v_after, $v_before), 0, 'the row is replaced, not changed as it');
+is( $dst->safe_psql('postgres', q{SELECT count(*), bool_or(m.set_option) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member
+	JOIN pg_roles p ON p.oid = m.roleid WHERE r.rolname = 'g_v1' AND p.rolname = 'g_v2'}), '1|f', 'and says what the commit does');
+
+# a membership a role partly granted itself goes whole
+$src->safe_psql('postgres', q{CREATE ROLE g_u1 NOLOGIN; CREATE ROLE g_u2 NOLOGIN; GRANT g_u2 TO g_u1 WITH ADMIN TRUE, INHERIT TRUE, SET TRUE});
+my $u_before = $bytes->($src, 'g_u1');
+is($restore->($dst, $u_before), 0, 'a membership arrives');
+$dst->safe_psql('postgres', q{GRANT g_u2 TO g_u1 WITH INHERIT FALSE GRANTED BY g_u1});
+$src->safe_psql('postgres', q{REVOKE g_u2 FROM g_u1});
+is($restore->($dst, $bytes->($src, 'g_u1', 'g_u2'), $u_before), 0, 'with a row it granted itself');
+is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'g_u1'}), '0', 'all of it goes');
 
 # a grantor no one can act as: the row is replaced
 $src->safe_psql('postgres', q{CREATE ROLE g_y1 NOLOGIN; CREATE ROLE g_y2 NOLOGIN; CREATE ROLE g_y3 NOLOGIN;

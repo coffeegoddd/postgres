@@ -1076,7 +1076,8 @@ dependent_of(Oid member_oid, Oid of_oid)
 	{
 		Form_pg_auth_members m = (Form_pg_auth_members) GETSTRUCT(tup);
 
-		if (m->grantor == member_oid)
+		/* (a row it granted itself goes with the rest of this membership) */
+		if (m->grantor == member_oid && m->member != member_oid)
 		{
 			found = m->member;
 			break;
@@ -1101,7 +1102,10 @@ check_no_dependents(const char *member, Oid member_oid, const char *of, Oid of_o
 				 errhint("Revoke that grant here before the commit arrives.")));
 }
 
-/* Revokes what is here of a membership, whoever granted it, but for one row's grantor. */
+/*
+ * Revokes what is here of a membership, whoever granted it, but for one row's
+ * grantor: what it granted itself first, as that depends on the rest.
+ */
 static void
 revoke_membership(const char *member, const char *of, Oid keep)
 {
@@ -1110,15 +1114,16 @@ revoke_membership(const char *member, const char *of, Oid keep)
 	Oid			of_oid = get_role_oid(of, false);
 	int			n = memberships_here(member_oid, of_oid, &rows, NULL);
 
-	for (int i = 0; i < n; i++)
-	{
-		Buf			sql = BUF_INIT;
+	for (int self = 1; self >= 0; self--)
+		for (int i = 0; i < n; i++)
+		{
+			Buf			sql = BUF_INIT;
 
-		if (rows[i].grantor == keep)
-			continue;
-		ws_role_revoke_statement(member, of, GetUserNameFromId(rows[i].grantor, false), &sql);
-		run_role_statement(&sql);
-	}
+			if (rows[i].grantor == keep || (rows[i].grantor == member_oid) != (self == 1))
+				continue;
+			ws_role_revoke_statement(member, of, GetUserNameFromId(rows[i].grantor, false), &sql);
+			run_role_statement(&sql);
+		}
 	pfree(rows);
 }
 
@@ -1132,7 +1137,8 @@ row_to_keep(const HereRow *rows, int n, Oid member, Oid of)
 {
 	for (int i = 0; i < n; i++)
 		if (rows[i].grantor != member &&
-			(superuser_arg(rows[i].grantor) || is_admin_of_role(rows[i].grantor, of)))
+			(rows[i].grantor == BOOTSTRAP_SUPERUSERID ||
+			 select_best_admin(rows[i].grantor, of) == rows[i].grantor))
 			return i;
 	return -1;
 }
