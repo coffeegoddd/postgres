@@ -2229,5 +2229,13 @@ like($err_q, qr/a schema named "\$user" cannot be held in a commit/, 'a schema n
 $node->safe_psql('postgres', q{CREATE TABLE nm2.other_schema (a other.cdom)});
 like(pack('H*', $bytes->($node, 'postgres', 'other_schema', undef, 'nm2')), qr/other\.cdom/, 'another schema is named');
 
+# a column on its schema's own collation says it bare, and restores on the other's
+$node->safe_psql('postgres', q{CREATE COLLATION src.own_coll FROM "C"; CREATE TABLE src.ocoll (a text COLLATE src.own_coll)});
+is($node->safe_psql('postgres', q{SELECT position('own_coll'::bytea in test_ws_schema_bytes('src', 'ocoll')) > 0}), 't', 'a table holds its schema\'s collation, bare');
+is($node->safe_psql('postgres', q{SELECT position('src.'::bytea in test_ws_schema_bytes('src', 'ocoll'))}), '0', 'not naming its schema');
+$node->safe_psql('postgres', q{CREATE COLLATION dst.own_coll FROM "C"; SELECT test_ws_schema_create(test_ws_schema_bytes('src', 'ocoll'), 'dst')});
+is( $node->safe_psql('postgres', q{SELECT o.collnamespace::regnamespace FROM pg_attribute a JOIN pg_collation o ON o.oid = a.attcollation WHERE a.attrelid = 'dst.ocoll'::regclass AND a.attname = 'a'}),
+	'dst', 'and restores on the collation of the schema it arrives in');
+
 $node->stop;
 done_testing();

@@ -503,6 +503,30 @@ ENGINE_TEST(test_refused_statements)
 		}
 	}
 	{
+		static const char *const collations[] = {"(LOCALE = 'C'); DROP TABLE t", "FROM \"C\"; DROP TABLE t", "AS ENUM ('a')"};
+		static const char *const casts[] = {"CREATE CAST (a AS b) WITH INOUT; DROP TABLE t", "DROP CAST (a AS b)", "not sql"};
+		static const char *const conversions[] = {"FOR 'a' TO 'b' FROM f; DROP TABLE t", "not sql"};
+
+		for (int i = 0; i < lengthof(collations); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_COLLATION,.name = "v",.definition = (char *) collations[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(casts); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_CAST,.name = "a",.args = "b",.definition = (char *) casts[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(conversions); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_CONVERSION,.name = "v",.definition = (char *) conversions[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+	}
+	{
 		static const char *const sequences[] = {
 			"AS bigint; DROP TABLE t",
 			"OWNED BY t.a",

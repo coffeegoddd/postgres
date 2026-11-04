@@ -60,6 +60,9 @@ const WsObjectCodecRoutine *WsObjectCodec = &BinaryWsObjectCodec;
 #define OBJ_FLAGS (OBJ_AFTER_TABLES | OBJ_PUBLIC_REVOKED | OBJ_FIRES_DISABLED | OBJ_FIRES_REPLICA | OBJ_FIRES_ALWAYS)
 
 static const char *const kind_words[] = {
+	[WS_OBJ_CAST] = "cast",
+	[WS_OBJ_COLLATION] = "collation",
+	[WS_OBJ_CONVERSION] = "conversion",
 	[WS_OBJ_DEFAULT] = "default",
 	[WS_OBJ_DOMAIN] = "domain",
 	[WS_OBJ_FUNCTION] = "function",
@@ -75,6 +78,9 @@ static const char *const kind_words[] = {
 };
 
 static const char *const kind_sql[] = {
+	[WS_OBJ_CAST] = "CAST",
+	[WS_OBJ_COLLATION] = "COLLATION",
+	[WS_OBJ_CONVERSION] = "CONVERSION",
 	[WS_OBJ_DEFAULT] = "DEFAULT",
 	[WS_OBJ_DOMAIN] = "DOMAIN",
 	[WS_OBJ_FUNCTION] = "FUNCTION",
@@ -106,13 +112,21 @@ is_of_table(WsObjectKind kind)
 static bool
 has_args(WsObjectKind kind)
 {
-	return is_function(kind) || is_of_table(kind);
+	return is_function(kind) || is_of_table(kind) || kind == WS_OBJ_CAST;
+}
+
+/* Whether its definition is its whole statement, not what follows its name. */
+static bool
+is_whole_statement(WsObjectKind kind)
+{
+	return is_of_table(kind) || kind == WS_OBJ_CAST;
 }
 
 bool
 ws_obj_before_tables(const WsObject *o)
 {
 	return o->kind == WS_OBJ_DOMAIN || o->kind == WS_OBJ_TYPE || o->kind == WS_OBJ_SEQUENCE ||
+		o->kind == WS_OBJ_COLLATION || o->kind == WS_OBJ_CONVERSION || o->kind == WS_OBJ_CAST ||
 		(is_function(o->kind) && !o->after_tables);
 }
 
@@ -141,6 +155,13 @@ static bool
 bad_name(const char *name)
 {
 	return name == NULL || name[0] == '\0' || strlen(name) >= NAMEDATALEN;
+}
+
+/* An object's name or args in this encoding: a cast's are types as printed. */
+static char *
+name_here(const WsObject *o, const char *name)
+{
+	return o->kind == WS_OBJ_CAST ? ws_text_from_utf8(name) : ws_name_from_utf8(name);
 }
 
 /* (order: none first, then by name) */
@@ -177,7 +198,8 @@ ws_obj_problem(const WsObject *o)
 
 	if (o->kind < 0 || o->kind >= lengthof(kind_words))
 		return "an object of no kind";
-	if (bad_name(o->name))
+	/* (a cast's are types as printed, which may be longer than any name) */
+	if (o->kind == WS_OBJ_CAST ? (o->name == NULL || o->name[0] == '\0') : bad_name(o->name))
 		return "an object of no name, or one too long";
 	if (o->definition == NULL || !ws_tags_well_formed(o->definition))
 		return "a definition that is not stored text";
@@ -187,6 +209,8 @@ ws_obj_problem(const WsObject *o)
 		return "a function with no input types, or something else with them";
 	if (is_of_table(o->kind) && (o->owner != NULL || o->ngrants > 0 || bad_name(o->args)))
 		return "something of a table with no table, or with an owner or grants of its own";
+	if (o->kind == WS_OBJ_CAST && (o->owner != NULL || o->ngrants > 0 || o->args == NULL || o->args[0] == '\0'))
+		return "a cast with no target, or with an owner or grants of its own";
 	if ((o->after_tables || o->public_revoked) && !is_function(o->kind))
 		return "a setting its kind cannot have";
 	if (o->fires != 0 && ((o->fires != 'D' && o->fires != 'R' && o->fires != 'A') ||
@@ -641,7 +665,7 @@ static const char *const refusal_sql =
 "      WHERE r.ev_class = c.oid AND r.rulename = '_RETURN' AND d.deptype = 'n' AND NOT ( "
 "        (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "           AND (q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S') OR q.relnamespace = 'pg_catalog'::regnamespace))) "
-"        OR d.refclassid = 'pg_proc'::regclass "
+"        OR d.refclassid IN ('pg_proc'::regclass, 'pg_collation'::regclass) "
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k "
 "           WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
 "        OR d.refclassid = 'pg_type'::regclass "
@@ -703,6 +727,20 @@ relations_version(const char *schema)
 				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description "
 				"    FROM pg_description d JOIN pg_proc p ON p.oid = d.objoid JOIN pg_namespace n ON n.oid = p.pronamespace "
 				"    WHERE d.classoid = 'pg_proc'::regclass AND n.nspname = $1::name "
+				"  UNION ALL SELECT 'C' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_collation o JOIN pg_namespace n ON n.oid = o.collnamespace "
+				"    JOIN pg_roles r ON r.oid = o.collowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'V' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_conversion o JOIN pg_namespace n ON n.oid = o.connamespace "
+				"    JOIN pg_roles r ON r.oid = o.conowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'K' || k.oid || ':' || k.xmin FROM pg_cast k WHERE EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
+				"      WHERE t.oid IN (k.castsource, k.casttarget) AND n.nspname = $1::name) "
+				"    OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.oid = k.castfunc AND n.nspname = $1::name) "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_collation o ON d.classoid = 'pg_collation'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.collnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_conversion o ON d.classoid = 'pg_conversion'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.connamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_cast k ON d.classoid = 'pg_cast'::regclass AND k.oid = d.objoid JOIN pg_type t ON t.oid IN (k.castsource, k.casttarget) "
+				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'x' || i.indexrelid || ':' || i.xmin FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'w' || w.oid || ':' || w.xmin FROM pg_attrdef w JOIN pg_class c ON c.oid = w.adrelid "
@@ -1112,6 +1150,8 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 				   "WHERE q.relkind IN ('v', 'm', 'c', 'S') AND q.oid <> $1::oid "
 				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass) "
 				   "  AND q.reltype <> $1::oid AND q.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'L', l.collname::text FROM d JOIN pg_collation l ON d.refclassid = 'pg_collation'::regclass "
+				   "  AND l.oid = d.refobjid WHERE l.collnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'F', p.oid::text FROM d JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
 				   "WHERE p.oid <> $1::oid AND p.pronamespace <> 'pg_catalog'::regnamespace "
 				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass AND x.objid = p.oid "
@@ -1140,7 +1180,7 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 		if (k == 'F')
 			function_key(schema, atooid(ws_sql_value(&rows, i, 1)), &key);
 		else
-			ws_obj_key(k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN :
+			ws_obj_key(k == 'L' ? WS_OBJ_COLLATION : k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN :
 					   k == 'S' ? WS_OBJ_SEQUENCE : WS_OBJ_TYPE,
 					   ws_name_to_utf8(ws_sql_value(&rows, i, 1)), NULL, &key);
 		buf_append_byte(&key, 0);
@@ -1364,18 +1404,30 @@ static const char *const type_refusal_sql =
 "        AND NOT (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid AND s.classid <> 'pg_constraint'::regclass) "
 "        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind IN ('c', 'S') "
 "          AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass))) "
-"        AND d.refclassid <> 'pg_proc'::regclass "
+"        AND d.refclassid NOT IN ('pg_proc'::regclass, 'pg_collation'::regclass) "
 "        AND NOT coalesce((SELECT i.schema = 'pg_catalog' "
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
 "    THEN 'it needs an object no commit holds yet' "
 "  END " TYPES_OF_SCHEMA "ORDER BY 1";
 
-/* A cast on anything in a schema, of what comes of a type too; not a range's own. */
+/* The casts of a schema: of a type or function in it; not a range's own. */
+#define CASTS_OF_SCHEMA \
+	"FROM pg_cast k, pg_namespace n WHERE n.nspname = $1::name AND NOT EXISTS (SELECT 1 FROM pg_depend d " \
+	"    WHERE d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype = 'i') " \
+	"  AND (EXISTS (SELECT 1 FROM pg_type t WHERE t.oid IN (k.castsource, k.casttarget) AND t.typnamespace = n.oid) " \
+	"    OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.oid = k.castfunc AND p.pronamespace = n.oid)) "
+
 static const char *const cast_refusal_sql =
-"SELECT t.typname::text, 'it has a cast' FROM pg_cast k "
-"JOIN pg_type t ON t.oid IN (k.castsource, k.casttarget) JOIN pg_namespace n ON n.oid = t.typnamespace "
-"WHERE n.nspname = $1::name AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_cast'::regclass "
-"  AND d.objid = k.oid AND d.deptype = 'i') ORDER BY 1";
+"SELECT format('(%s AS %s)', k.castsource::regtype, k.casttarget::regtype), CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i "
+"      WHERE d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype = 'n' AND i.schema IS NOT NULL "
+"        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' "
+"  WHEN EXISTS (SELECT 1 FROM pg_type t LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
+"      JOIN pg_class q ON q.oid = coalesce(e.typrelid, t.typrelid) WHERE t.oid IN (k.castsource, k.casttarget) AND q.relkind <> 'c') "
+"    THEN 'it is of a table''s or a view''s row type, and a table may need it' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension' "
+"  END " CASTS_OF_SCHEMA;
 
 static void
 refuse_types(const char *schema, const char *sql)
@@ -1851,6 +1903,190 @@ ws_seq_restore(const WsSeqPosition *positions, int n, const char *schema)
 	WsSql->end(level);
 }
 
+/* ------------------------------------- collations, conversions and casts */
+
+static void check_of_table_is_portable(const char *name, const char *schema, const char *statement);
+
+static const char *const collation_refusal_sql =
+"SELECT o.collname::text, CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_collation'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension' "
+"  WHEN EXISTS (SELECT 1 FROM pg_collation c WHERE c.collname = o.collname AND c.collnamespace = 'pg_catalog'::regnamespace) "
+"    THEN 'it is named as one in the catalogs, which its bare name would mean' "
+"  END FROM pg_collation o JOIN pg_namespace n ON n.oid = o.collnamespace WHERE n.nspname = $1::name ORDER BY 1";
+
+static const char *const conversion_refusal_sql =
+"SELECT o.conname::text, CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_conversion'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
+"    THEN 'it belongs to an extension' "
+"  WHEN o.condefault THEN 'it is a default conversion, which no commit holds yet' "
+"  WHEN p.pronamespace <> 'pg_catalog'::regnamespace THEN 'its function is not one in the catalogs' "
+"  END FROM pg_conversion o JOIN pg_namespace n ON n.oid = o.connamespace JOIN pg_proc p ON p.oid = o.conproc "
+"WHERE n.nspname = $1::name ORDER BY 1";
+
+/* Its owner, if it can travel, and its comments. */
+static void
+read_owner_and_comments(WsObject *o, const char *oid, const char *name, const char *owner_sql, const char *catalog)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+	char	   *comments = psprintf("SELECT description FROM pg_description WHERE classoid = '%s'::regclass AND objoid = $1::oid", catalog);
+
+	if (owner_sql != NULL)
+	{
+		WsSql->read(owner_sql, 1, params, &rows);
+		if (rows.nrows == 1 && !IsReservedName(ws_sql_value(&rows, 0, 0)))
+			o->owner = role_in_commit(name, ws_sql_value(&rows, 0, 0));
+		ws_sql_rows_free(&rows);
+	}
+	WsSql->read(comments, 1, params, &rows);
+	o->comments = zeroed(rows.nrows, sizeof(WsObjectComment));
+	o->ncomments = rows.nrows;
+	for (int c = 0; c < rows.nrows; c++)
+		o->comments[c].text = ws_text_to_utf8(ws_sql_value(&rows, c, 0));
+	ws_sql_rows_free(&rows);
+	pfree(comments);
+}
+
+static void
+set_definition(WsObject *o, const char *text)
+{
+	Buf			stored = BUF_INIT;
+
+	ws_tags_escape(ws_text_to_utf8(text), &stored);
+	buf_append_byte(&stored, 0);
+	o->definition = px_memdup(stored.data, stored.len);
+	buf_free(&stored);
+	if (o->deps == NULL)
+		o->deps = zeroed(0, sizeof(char *));
+}
+
+/* Adds the collations of a schema to objs, of *n and room for it. */
+static WsObject *
+read_collations(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT o.oid::text, o.collname::text, o.collprovider::text, o.collisdeterministic::text, "
+				"  o.collcollate, o.collctype, o.colllocale, o.collicurules "
+				"FROM pg_collation o JOIN pg_namespace n ON n.oid = o.collnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+		char		provider = ws_sql_value(&rows, i, 2)[0];
+		StringInfoData s;
+
+		/* (no version: that is the library's here, as a restore will find its own) */
+		initStringInfo(&s);
+		appendStringInfo(&s, "(PROVIDER = %s", provider == 'i' ? "icu" : provider == 'b' ? "builtin" : "libc");
+		if (provider == 'c')
+			appendStringInfo(&s, ", LC_COLLATE = %s, LC_CTYPE = %s", quote_literal_cstr(ws_sql_value(&rows, i, 4)),
+							 quote_literal_cstr(ws_sql_value(&rows, i, 5)));
+		else
+			appendStringInfo(&s, ", LOCALE = %s", quote_literal_cstr(ws_sql_value(&rows, i, 6)));
+		if (ws_sql_value(&rows, i, 3)[0] != 't')
+			appendStringInfoString(&s, ", DETERMINISTIC = false");
+		if (ws_sql_value(&rows, i, 7) != NULL)
+			appendStringInfo(&s, ", RULES = %s", quote_literal_cstr(ws_sql_value(&rows, i, 7)));
+		appendStringInfoChar(&s, ')');
+		o->kind = WS_OBJ_COLLATION;
+		o->name = ws_name_to_utf8(name);
+		set_definition(o, s.data);
+		read_owner_and_comments(o, oid, name,
+								"SELECT r.rolname::text FROM pg_collation o JOIN pg_roles r ON r.oid = o.collowner WHERE o.oid = $1::oid "
+								"AND NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)",
+								"pg_collation");
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
+/* Adds the conversions of a schema to objs, of *n and room for it. */
+static WsObject *
+read_conversions(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT o.oid::text, o.conname::text, pg_encoding_to_char(o.conforencoding)::text, "
+				"  pg_encoding_to_char(o.contoencoding)::text, quote_ident(p.proname) "
+				"FROM pg_conversion o JOIN pg_namespace n ON n.oid = o.connamespace JOIN pg_proc p ON p.oid = o.conproc "
+				"WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+
+		o->kind = WS_OBJ_CONVERSION;
+		o->name = ws_name_to_utf8(name);
+		set_definition(o, psprintf("FOR %s TO %s FROM %s", quote_literal_cstr(ws_sql_value(&rows, i, 2)),
+								   quote_literal_cstr(ws_sql_value(&rows, i, 3)), ws_sql_value(&rows, i, 4)));
+		read_owner_and_comments(o, oid, name,
+								"SELECT r.rolname::text FROM pg_conversion o JOIN pg_roles r ON r.oid = o.conowner WHERE o.oid = $1::oid "
+								"AND NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)",
+								"pg_conversion");
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
+/* Adds the casts of a schema to objs, of *n and room for it. */
+static WsObject *
+read_casts(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT k.oid::text, k.castsource::text, k.casttarget::text, k.castfunc::text, k.castcontext::text, k.castmethod::text "
+				CASTS_OF_SCHEMA, 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		char	   *source = print_type(schema, atooid(ws_sql_value(&rows, i, 1)), -1);
+		char	   *target = print_type(schema, atooid(ws_sql_value(&rows, i, 2)), -1);
+		char		method = ws_sql_value(&rows, i, 5)[0];
+		char		context = ws_sql_value(&rows, i, 4)[0];
+		StringInfoData s;
+		char	   *name;
+
+		initStringInfo(&s);
+		appendStringInfo(&s, "CREATE CAST (%s AS %s) ", source, target);
+		if (method == 'f')
+		{
+			Oid			fn = atooid(ws_sql_value(&rows, i, 3));
+
+			appendStringInfo(&s, "WITH FUNCTION %s(%s)", quote_identifier(get_func_name(fn)), function_args(schema, fn, NULL));
+		}
+		else
+			appendStringInfoString(&s, method == 'i' ? "WITH INOUT" : "WITHOUT FUNCTION");
+		if (context == 'a')
+			appendStringInfoString(&s, " AS ASSIGNMENT");
+		else if (context == 'i')
+			appendStringInfoString(&s, " AS IMPLICIT");
+		name = psprintf("%s", source);
+		check_of_table_is_portable(name, schema, s.data);
+		o->kind = WS_OBJ_CAST;
+		o->name = ws_text_to_utf8(source);
+		o->args = ws_text_to_utf8(target);
+		set_definition(o, s.data);
+		px_free(o->deps);
+		o->deps = NULL;
+		read_deps(o, schema, oid, "SELECT 'pg_cast'::regclass::oid, $1::oid");
+		read_owner_and_comments(o, oid, name, NULL, "pg_cast");
+		pfree(name);
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
 /* ------------------------------------- triggers, rules and policies */
 
 /* What such a one needs that no commit can hold, of its row in a catalog and its source. */
@@ -1862,7 +2098,7 @@ ws_seq_restore(const WsSeqPosition *positions, int n, const char *schema)
 "      WHERE d.classid = '" catalog "'::regclass AND d.objid = " oid " AND d.deptype = 'n' AND i.schema IS NOT NULL " \
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' " \
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '" catalog "'::regclass AND d.objid = " oid " AND d.deptype = 'n' " \
-"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass) " \
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_collation'::regclass) " \
 "        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid " \
 "          AND q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S'))) " \
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k WHERE k.oid = d.refobjid AND k.conrelid <> 0)) " \
@@ -1971,6 +2207,12 @@ check_of_table_is_portable(const char *name, const char *schema, const char *sql
 	else if (IsA(node, CreatePolicyStmt))
 		named = names_schema_walker(((CreatePolicyStmt *) node)->qual, &n) ||
 			names_schema_walker(((CreatePolicyStmt *) node)->with_check, &n);
+	else if (IsA(node, CreateCastStmt))
+	{
+		CreateCastStmt *k = (CreateCastStmt *) node;
+
+		named = names_schema_walker((Node *) k->sourcetype, &n) || names_schema_walker((Node *) k->targettype, &n);
+	}
 	else if (IsA(node, IndexStmt))
 	{
 		IndexStmt  *ix = (IndexStmt *) node;
@@ -2201,7 +2443,7 @@ static const char *const function_refusal_sql =
 "      WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' AND i.schema IS NOT NULL "
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' "
-"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass) "
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass, 'pg_collation'::regclass) "
 "        OR (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid) "
 "        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "          AND q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S'))) "
@@ -2456,6 +2698,8 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_types(schema, trigger_clone_refusal_sql);
 	refuse_types(schema, rule_refusal_sql);
 	refuse_types(schema, policy_refusal_sql);
+	refuse_types(schema, collation_refusal_sql);
+	refuse_types(schema, conversion_refusal_sql);
 	refuse_types(schema, index_refusal_sql);
 	refuse_types(schema, default_refusal_sql);
 
@@ -2519,6 +2763,9 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	objs = read_types(schema, objs, &total);
 	objs = read_functions(schema, objs, &total);
 	objs = read_sequences(schema, objs, &total);
+	objs = read_collations(schema, objs, &total);
+	objs = read_conversions(schema, objs, &total);
+	objs = read_casts(schema, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_TRIGGER, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_RULE, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_POLICY, objs, &total);
@@ -2769,9 +3016,9 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
-	here = ws_name_from_utf8(o->name);
+	here = name_here(o, o->name);
 	definition = ws_text_from_utf8(o->definition);
-	if (!is_of_table(o->kind))
+	if (!is_whole_statement(o->kind))
 	{
 		ws_put_text(&sql, "CREATE ");
 		ws_put_text(&sql, kind_sql[o->kind]);
@@ -2818,7 +3065,7 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 		case WS_OBJ_INDEX:
 		case WS_OBJ_DEFAULT:
 			{
-				char	   *table = ws_name_from_utf8(o->args);
+				char	   *table = name_here(o, o->args);
 				RangeVar   *on = NULL;
 				const char *made = NULL;
 
@@ -2860,6 +3107,20 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 				pfree(table);
 				break;
 			}
+		case WS_OBJ_CAST:
+			if (node == NULL || !IsA(node, CreateCastStmt))
+				not_the_object(o, "it is not one CREATE CAST");
+			break;
+		case WS_OBJ_COLLATION:
+			if (node == NULL || !IsA(node, DefineStmt) || ((DefineStmt *) node)->kind != OBJECT_COLLATION ||
+				((DefineStmt *) node)->if_not_exists || !names_it(((DefineStmt *) node)->defnames, schema, here))
+				not_the_object(o, "it is not one CREATE COLLATION of it");
+			break;
+		case WS_OBJ_CONVERSION:
+			if (node == NULL || !IsA(node, CreateConversionStmt) || ((CreateConversionStmt *) node)->def ||
+				!names_it(((CreateConversionStmt *) node)->conversion_name, schema, here))
+				not_the_object(o, "it is not one CREATE CONVERSION of it");
+			break;
 		case WS_OBJ_SEQUENCE:
 			{
 				CreateSeqStmt *q = (CreateSeqStmt *) node;
@@ -2934,7 +3195,7 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 static void
 put_object(const WsObject *o, const char *schema, Buf *sql)
 {
-	char	   *here = ws_name_from_utf8(o->name);
+	char	   *here = name_here(o, o->name);
 
 	ws_put_identifier(sql, schema);
 	ws_put_text(sql, ".");
@@ -2961,9 +3222,26 @@ ws_obj_comment_statement(const WsObject *o, int k, const char *schema, Buf *out)
 		elog(ERROR, "no comment %d", k);
 	c = &o->comments[k];
 	ws_put_text(out, "COMMENT ON ");
+	if (o->kind == WS_OBJ_CAST)
+	{
+		char	   *source = ws_text_from_utf8(o->name);
+		char	   *target = ws_text_from_utf8(o->args);
+
+		ws_put_text(out, "CAST (");
+		ws_put_text(out, source);
+		ws_put_text(out, " AS ");
+		ws_put_text(out, target);
+		ws_put_text(out, ") IS ");
+		text = ws_text_from_utf8(c->text);
+		ws_put_text(out, quote_literal_cstr(text));
+		pfree(text);
+		pfree(source);
+		pfree(target);
+		return;
+	}
 	if (o->kind == WS_OBJ_INDEX)
 	{
-		char	   *here = ws_name_from_utf8(o->name);
+		char	   *here = name_here(o, o->name);
 
 		ws_put_text(out, "INDEX ");
 		ws_put_identifier(out, schema);
@@ -2978,8 +3256,8 @@ ws_obj_comment_statement(const WsObject *o, int k, const char *schema, Buf *out)
 	}
 	if (is_of_table(o->kind))
 	{
-		char	   *here = ws_name_from_utf8(o->name);
-		char	   *table = ws_name_from_utf8(o->args);
+		char	   *here = name_here(o, o->name);
+		char	   *table = name_here(o, o->args);
 
 		ws_put_text(out, kind_sql[o->kind]);
 		ws_put_text(out, " ");
@@ -3052,8 +3330,8 @@ fires_statement(const WsObject *o, const char *schema, Buf *out)
 
 	if (o->fires == 0)
 		return;
-	here = ws_name_from_utf8(o->name);
-	table = ws_name_from_utf8(o->args);
+	here = name_here(o, o->name);
+	table = name_here(o, o->args);
 	ws_put_text(out, "ALTER TABLE ");
 	ws_put_identifier(out, schema);
 	ws_put_text(out, ".");
@@ -3239,7 +3517,8 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		return;
 	}
 	for (int i = 0; i < n; i++)
-		if (ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind))
+		if (ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind) &&
+			objs[i].kind != WS_OBJ_CAST && objs[i].kind != WS_OBJ_COLLATION && objs[i].kind != WS_OBJ_CONVERSION)
 			ws_schema_check_defaults(schema, is_function(objs[i].kind) ? DEFACLOBJ_FUNCTION :
 									 is_relation(objs[i].kind) ? DEFACLOBJ_RELATION :
 									 objs[i].kind == WS_OBJ_SEQUENCE ? DEFACLOBJ_SEQUENCE : DEFACLOBJ_TYPE);
