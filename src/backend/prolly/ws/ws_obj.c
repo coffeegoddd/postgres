@@ -769,45 +769,54 @@ qualified(List *names, const char *only)
 		qualifier_counts(strVal(linitial(names)), only);
 }
 
-/* (a reg* constant is a name in a string, which only the type it is cast to says) */
+/*
+ * Whether a name in a string has a qualifier that counts, as the input function of a
+ * reg* type will read it at run time: an unquoted part folded to lower case, with
+ * spaces around its dot.
+ */
 static bool
 string_is_qualified(const char *s, const char *only)
 {
-	const char *start = s;
-	bool		quoted = false;
+	const char *p = s;
 
-	for (const char *p = s; *p; p++)
+	while (*p)
 	{
+		StringInfoData part;
+
+		initStringInfo(&part);
 		if (*p == '"')
-			quoted = !quoted;
-		else if (!quoted && strchr(" (),", *p) != NULL)
-			start = p + 1;
-		else if (!quoted && *p == '.')
 		{
-			char	   *qualifier = pnstrdup(start, p - start);
-			bool		counts;
-
-			if (qualifier[0] == '"' && p - start >= 2)
+			for (p++; *p; p++)
 			{
-				/* (as quote_identifier wrote it: an inner quote doubled) */
-				char	   *undoubled = palloc(p - start);
-				int			u = 0;
-
-				for (const char *q = start + 1; q < p - 1; q++)
+				if (*p == '"' && p[1] != '"')
 				{
-					undoubled[u++] = *q;
-					if (q[0] == '"' && q[1] == '"')
-						q++;
+					p++;
+					break;
 				}
-				undoubled[u] = '\0';
-				qualifier = undoubled;
+				if (*p == '"')
+					p++;
+				appendStringInfoChar(&part, *p);
 			}
-			counts = qualifier_counts(qualifier, only);
-			pfree(qualifier);
-			if (counts)
-				return true;
-			start = p + 1;
 		}
+		else if (strchr(" (),.", *p) == NULL)
+		{
+			for (; *p && strchr(" (),.\"", *p) == NULL; p++)
+				appendStringInfoChar(&part, pg_tolower((unsigned char) *p));
+		}
+		else
+		{
+			pfree(part.data);
+			p++;
+			continue;
+		}
+		while (*p == ' ')
+			p++;
+		if (*p == '.' && qualifier_counts(part.data, only))
+		{
+			pfree(part.data);
+			return true;
+		}
+		pfree(part.data);
 	}
 	return false;
 }
@@ -842,26 +851,8 @@ names_schema_walker(Node *node, void *arg)
 			named = qualified(((TypeName *) node)->names, n->only);
 			break;
 		case T_FuncCall:
-			{
-				FuncCall   *call = (FuncCall *) node;
-				const char *fn = strVal(llast(call->funcname));
-
-				named = qualified(call->funcname, n->only);
-
-				/* (these take a name as text too, with no dependency to say so) */
-				if (!named && call->args != NIL &&
-					(strcmp(fn, "nextval") == 0 || strcmp(fn, "currval") == 0 || strcmp(fn, "setval") == 0))
-				{
-					Node	   *first = linitial(call->args);
-
-					/* (printed with casts around it, as text and then to regclass) */
-					while (IsA(first, TypeCast))
-						first = ((TypeCast *) first)->arg;
-					if (IsA(first, A_Const) && IsA(&((A_Const *) first)->val, String))
-						named = string_is_qualified(strVal(&((A_Const *) first)->val), n->only);
-				}
-				break;
-			}
+			named = qualified(((FuncCall *) node)->funcname, n->only);
+			break;
 		case T_A_Expr:
 			named = qualified(((A_Expr *) node)->name, n->only);
 			break;
@@ -875,6 +866,7 @@ names_schema_walker(Node *node, void *arg)
 			{
 				TypeCast   *c = (TypeCast *) node;
 				const char *type = strVal(llast(c->typeName->names));
+				Node	   *inner = c->arg;
 
 				if (ws_is_reg_type(type) && c->typeName->arrayBounds != NIL)
 				{
@@ -882,10 +874,13 @@ names_schema_walker(Node *node, void *arg)
 					n->why = "it has an array of reg* names, which say nothing of what they need";
 					return true;
 				}
-				if (ws_is_reg_type(type) && IsA(c->arg, A_Const) &&
-					IsA(&((A_Const *) c->arg)->val, String))
+				/* (printed with casts around it: as text, and then to regclass) */
+				while (IsA(inner, TypeCast))
+					inner = ((TypeCast *) inner)->arg;
+				if (ws_is_reg_type(type) && IsA(inner, A_Const) &&
+					IsA(&((A_Const *) inner)->val, String))
 				{
-					const char *value = strVal(&((A_Const *) c->arg)->val);
+					const char *value = strVal(&((A_Const *) inner)->val);
 
 					named = string_is_qualified(value, n->only) ||
 						(strcmp(type, "regnamespace") == 0 &&
@@ -1055,7 +1050,9 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 				   "LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
 				   "JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid "
 				   "    ELSE coalesce(e.typrelid, t.typrelid) END "
+				   /* (an identity's is made with its table, so is no object to need) */
 				   "WHERE q.relkind IN ('v', 'm', 'c', 'S') AND q.oid <> $1::oid "
+				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass) "
 				   "  AND q.reltype <> $1::oid AND q.relnamespace = (SELECT nsp FROM (SELECT relnamespace AS nsp FROM pg_class WHERE oid = $1::oid "
 				   "    UNION ALL SELECT typnamespace FROM pg_type WHERE oid = $1::oid "
 				   "    UNION ALL SELECT pronamespace FROM pg_proc WHERE oid = $1::oid) n LIMIT 1) "
@@ -1309,7 +1306,8 @@ static const char *const type_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM (" TYPE_SOURCE_OF("t.oid") ") s(classid, objid) JOIN pg_depend d ON d.classid = s.classid AND d.objid = s.objid "
 "      WHERE d.deptype = 'n' AND d.refclassid <> 'pg_type'::regclass "
 "        AND NOT (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid AND s.classid <> 'pg_constraint'::regclass) "
-"        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind IN ('c', 'S'))) "
+"        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind IN ('c', 'S') "
+"          AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass))) "
 "        AND d.refclassid <> 'pg_proc'::regclass "
 "        AND NOT coalesce((SELECT i.schema = 'pg_catalog' "
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
@@ -1983,7 +1981,8 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		WsSql->read("SELECT 1 FROM pg_depend d LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
 					"LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
 					"JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid ELSE coalesce(e.typrelid, t.typrelid) END "
-					"WHERE d.classid = 'pg_proc'::regclass AND d.objid = $1::oid AND d.deptype = 'n' AND q.relkind NOT IN ('c', 'S') LIMIT 1",
+					"WHERE d.classid = 'pg_proc'::regclass AND d.objid = $1::oid AND d.deptype = 'n' AND (q.relkind NOT IN ('c', 'S') "
+					"  OR EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass)) LIMIT 1",
 					1, self_params, &rows);
 		o->after_tables = rows.nrows > 0;
 		ws_sql_rows_free(&rows);

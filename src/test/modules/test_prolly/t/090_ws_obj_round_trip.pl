@@ -669,6 +669,8 @@ $node->safe_psql('postgres', q{
 	INSERT INTO idt DEFAULT VALUES;
 	CREATE FUNCTION nexts() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('plain'::regclass); END;
 	CREATE VIEW nv AS SELECT nextval('plain'::regclass) AS n;
+	CREATE VIEW over_ident AS SELECT nextval('idt_i_seq'::regclass) AS n;
+	CREATE FUNCTION next_ident() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT nextval('idt_i_seq'::regclass); END;
 	COMMENT ON SEQUENCE odd IS 'it''s odd';
 	GRANT USAGE, SELECT ON SEQUENCE plain TO g_squser;
 	SELECT setval('plain', 41);
@@ -677,6 +679,7 @@ $node->safe_psql('postgres', q{
 my $sq_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sq')});
 my %sq_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $sq_held;
 ok(!$sq_val{'sequence/idt_i_seq'}, 'an identity sequence is its table\'s, not an object');
+unlike($sq_val{'view/over_ident'}, qr/sequence\//, 'nor a need, being there with its table');
 ok($sq_val{$_}, "$_ is held") for ('sequence/plain', 'sequence/odd', 'sequence/Odd name', 'sequence/ser_id_seq', 'sequence/ser_big_seq');
 like($sq_val{'sequence/odd'}, qr/AS smallint INCREMENT BY -2 MINVALUE -100 MAXVALUE 50 START WITH 40 CACHE 3 CYCLE/, 'all of a sequence is said');
 like($sq_val{'sequence/ser_id_seq'}, qr/ser.*id/s, 'and what column owns it');
@@ -692,6 +695,7 @@ $node->safe_psql('postgres', q{SET ROLE g_sqowner; CREATE TABLE sq2.ser (id inte
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sq', 'sq2', 'after')});
 is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sq2')}), $sq_held, 'the same bytes restored');
 is( $node->safe_psql('postgres', q{SELECT pg_get_serial_sequence('sq2.ser', 'id')}), 'sq2.ser_id_seq', 'owned by its column');
+is( $node->safe_psql('postgres', q{SELECT count(*) FROM pg_proc WHERE oid = 'sq2.next_ident()'::regprocedure}), '1', 'a function needing an identity sequence is made after its table');
 my $positions = $node->safe_psql('postgres', q{SELECT test_ws_seq_copy('sq', 'sq2')});
 like($positions, qr/^plain 41 1$/m, 'where a sequence is, is read');
 like($positions, qr/^odd 30 0$/m, 'and whether it has been called');
@@ -718,6 +722,8 @@ is($node->safe_psql('postgres', q{SELECT nextval('sq2.odd')}), '30', 'so the nex
 my @sq_refused = (
 	[ q{CREATE UNLOGGED SEQUENCE r_u}, 'not logged' ],
 	[ q{CREATE SEQUENCE r_g; GRANT USAGE ON SEQUENCE r_g TO x_person}, 'which cannot travel' ],
+	[ q{CREATE VIEW r_txt AS SELECT nextval('sq5.x'::text) AS n}, "say a schema's name" ],
+	[ q{CREATE TABLE t (i integer GENERATED ALWAYS AS IDENTITY); CREATE DOMAIN r_dm AS bigint DEFAULT nextval('t_i_seq'::regclass)}, 'no commit holds yet' ],
 	[ q{CREATE SEQUENCE r_c; GRANT SELECT (last_value) ON TABLE r_c TO g_squser}, 'a grant on a column' ],
 	[ q{CREATE SEQUENCE r_r; REVOKE UPDATE ON SEQUENCE r_r FROM CURRENT_USER}, 'rights have been changed' ],
 	[ q{CREATE FOREIGN DATA WRAPPER fdw_sq; CREATE SERVER srv_sq FOREIGN DATA WRAPPER fdw_sq; CREATE FOREIGN TABLE ft (a int) SERVER srv_sq; CREATE SEQUENCE r_f OWNED BY ft.a}, 'what no commit holds' ],
