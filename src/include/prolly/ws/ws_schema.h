@@ -22,6 +22,8 @@
 #ifndef PROLLY_WS_SCHEMA_H
 #define PROLLY_WS_SCHEMA_H
 
+#include "fmgr.h"
+
 #include "prolly/engine/util.h"
 #include "prolly/ws/ws_row.h"
 
@@ -315,10 +317,12 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
  * A record does not name the schema it is of: it says mood, not src.mood, as a commit
- * can be restored under any name.  So it is read, and its statements are run, under
- * ws_schema_path_begin with the schema they are in; what it uses in another schema it
- * says by that schema's name.  A table using something of its schema that would have
- * to be told from the catalogs' by naming it raises ERRCODE_FEATURE_NOT_SUPPORTED.
+ * can be restored under any name.  So what it holds is printed, and its statements are
+ * run, under ws_schema_path_begin with the schema they are in; what it uses in another
+ * schema it says by that schema's name.  A table using something of its schema that
+ * would have to be told from the catalogs' by naming it, or that a name the catalogs
+ * also have would mean elsewhere, raises ERRCODE_FEATURE_NOT_SUPPORTED, and a role
+ * with no USAGE on the schema ERRCODE_INSUFFICIENT_PRIVILEGE.
  *
  * The schema of a table, from the catalogs, through WsSql (its foreign keys,
  * which no one record holds, from ws_fk_read, though one no commit can hold
@@ -493,6 +497,17 @@ extern char *ws_name_from_utf8(const char *name);
  */
 extern int	ws_schema_path_begin(const char *schema);
 extern void ws_schema_path_end(int nest);
+
+/*
+ * What a printing function of nargs arguments gives under that path, or NULL, called
+ * directly.  No statement parsed under that path could be trusted to mean the
+ * catalogs: a function of the schema's beats a polymorphic one of theirs, and would
+ * run.  So only printing is done under it, never a read of the catalogs.
+ */
+extern char *ws_schema_print(const char *schema, PGFunction fn, int nargs, Datum a, Datum b, Datum c);
+
+/* Raises ERRCODE_INSUFFICIENT_PRIVILEGE without USAGE on the schema. */
+extern void ws_schema_check_usage(const char *schema);
 
 /* Text as a commit holds it, and as this database holds it: refusing what it cannot. */
 extern char *ws_text_to_utf8(const char *text);

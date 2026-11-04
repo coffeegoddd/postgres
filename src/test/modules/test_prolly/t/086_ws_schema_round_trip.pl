@@ -2058,11 +2058,11 @@ my $make_names = sub {
 $make_names->('nm1');
 $make_names->('nm2');
 $node->safe_psql('postgres', q{
-	CREATE TABLE nm1.uses (a integer, m nm1.mood, p nm1.pos, ms nm1.mood[], c text COLLATE nm1.coll,
+	CREATE TABLE nm1.uses (a integer, m nm1.mood, p nm1.pos, ms nm1.mood[], c text COLLATE nm1.coll, t text,
 		d integer DEFAULT nm1.f(), g integer GENERATED ALWAYS AS (nm1.f() + a) STORED,
 		CONSTRAINT ck CHECK (nm1.f() > 0 AND m <> 'a'::nm1.mood));
 	CREATE INDEX uses_ex ON nm1.uses ((a OPERATOR(nm1.===) nm1.f()));
-	CREATE INDEX uses_co ON nm1.uses (c COLLATE nm1.coll);
+	CREATE INDEX uses_co ON nm1.uses (t COLLATE nm1.coll);
 });
 my $nm_hex = $bytes->($node, 'postgres', 'uses', undef, 'nm1');
 unlike(pack('H*', $nm_hex), qr/nm1/, 'a record does not name its schema');
@@ -2082,7 +2082,13 @@ for my $case (
 	[ q{CREATE TYPE nm3."text" AS ENUM ('a'); CREATE TABLE nm3.r1 (a nm3."text")}, 'r1', 'a column of a type named as a catalog type is' ],
 	[ q{CREATE FUNCTION nm3.now() RETURNS timestamptz LANGUAGE sql STABLE AS 'SELECT pg_catalog.now()'; CREATE TABLE nm3.r2 (a timestamptz DEFAULT nm3.now())}, 'r2', 'a default of a function named as a catalog function is' ],
 	[ q{CREATE TABLE nm3.r3 (a oid DEFAULT 'nm3.pg_class'::regclass); }, 'r3', 'a default of a reg* constant naming its schema' ],
-	[ q{CREATE COLLATION nm3."C" FROM "POSIX"; CREATE TABLE nm3.r4 (a text COLLATE nm3."C")}, 'r4', 'a collation named as a catalog collation is' ])
+	[ q{CREATE COLLATION nm3."C" FROM "POSIX"; CREATE TABLE nm3.r4 (a text COLLATE nm3."C")}, 'r4', 'a collation named as a catalog collation is' ],
+	[ q{CREATE TABLE nm3.r5 (a text); CREATE INDEX ON nm3.r5 (a COLLATE nm3."C")}, 'r5', 'an index key of such a collation' ],
+	[ q{CREATE FUNCTION nm3.round(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1'; CREATE TABLE nm3.r6 (a integer, CHECK (nm3.round(a) = 42))}, 'r6', 'a check of a function a catalog function would be taken for' ],
+	[ q{CREATE TABLE nm3.r7 (a regnamespace DEFAULT 'nm3'::regnamespace)}, 'r7', 'a default naming the schema by regnamespace' ],
+	[ q{CREATE TABLE nm3.r8 (a oid[] DEFAULT '{nm3.pg_class}'::regclass[]::oid[])}, 'r8', 'a default of an array of reg* names' ],
+	[ q{CREATE FUNCTION nm3.g(nm3."text") RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE TABLE nm3.r9 (a regprocedure DEFAULT 'nm3.g(nm3.text)'::regprocedure)}, 'r9', 'a default of a function by reg* with its schema in its arguments' ],
+	[ q{CREATE TYPE nm3.serial AS ENUM ('a'); CREATE TABLE nm3.r10 (a nm3.serial)}, 'r10', 'a type CREATE TABLE would take for a serial' ])
 {
 	my ($sql, $table, $what) = @$case;
 	$node->safe_psql('postgres', 'CREATE TABLE IF NOT EXISTS nm3.pg_class (x integer)') if $table eq 'r3';
@@ -2090,6 +2096,34 @@ for my $case (
 	my ($rc, $out, $err) = $node->psql('postgres', "SELECT test_ws_schema_bytes('nm3', '$table')");
 	like($err, qr/table "$table" in schema "nm3" cannot be held in a commit: it must say its schema's name/, "$what is refused");
 }
+
+# a function of the schema's is not taken for the catalogs' in reading it, nor run
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA nm4 VERSIONED;
+	CREATE TABLE nm4.ran (a integer);
+	CREATE FUNCTION nm4.unnest(text[]) RETURNS SETOF text LANGUAGE sql AS $$ INSERT INTO nm4.ran VALUES (1) RETURNING 'fillfactor=10' $$;
+	CREATE FUNCTION nm4.quote_ident(name) RETURNS text LANGUAGE sql AS $$ INSERT INTO nm4.ran VALUES (2) RETURNING 'captured' $$;
+	CREATE FUNCTION nm4.array_to_string(int2[], text) RETURNS text LANGUAGE sql AS $$ INSERT INTO nm4.ran VALUES (3) RETURNING '1' $$;
+	CREATE TABLE nm4.t (a integer, b integer, c text COLLATE "C", UNIQUE (b)) WITH (fillfactor = 50);
+});
+my $captured = pack('H*', $bytes->($node, 'postgres', 't', undef, 'nm4'));
+like($captured, qr/fillfactor.*50/s, 'a read is not captured by a function of the schema');
+unlike($captured, qr/captured/, 'nor a name');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM nm4.ran'), '0', 'and runs none of them');
+
+# one DDL, one tag, in any schema
+$node->safe_psql('postgres', q{CREATE TABLE nm2.tagged (m nm2.mood); CREATE TABLE nm1_new.tagged (m nm1_new.mood)});
+is( $node->safe_psql('postgres', q{SELECT count(DISTINCT attcoltag) FROM pg_attribute WHERE attname = 'm' AND attrelid IN ('nm2.tagged'::regclass, 'nm1_new.tagged'::regclass)}),
+	'1', 'a column of a type of its own schema has one tag whatever that is named');
+
+# with no USAGE on it, a schema says so
+$node->safe_psql('postgres', q{CREATE ROLE rg_nousage NOLOGIN});
+my ($rc_u, $out_u, $err_u) = $node->psql('postgres', q{SET ROLE rg_nousage; SELECT test_ws_schema_bytes('nm2', 'uses')});
+like($err_u, qr/permission denied for schema nm2/, 'a role with no USAGE on the schema is told that');
+
+# nor is a type of a like name a name
+$node->safe_psql('postgres', q{CREATE TYPE nm2.region AS ENUM ('nm2.west'); CREATE TABLE nm2.regional (a nm2.region DEFAULT 'nm2.west'::nm2.region)});
+isnt($bytes->($node, 'postgres', 'regional', undef, 'nm2'), '', 'a label like a qualified name of a type like a reg* is held');
 
 # what is in another schema is said by its name, as ever
 $node->safe_psql('postgres', q{CREATE TABLE nm2.other_schema (a other.cdom)});

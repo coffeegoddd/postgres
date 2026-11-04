@@ -37,6 +37,7 @@
 #include "prolly/ws/ws_tags.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/snapmgr.h"
@@ -658,19 +659,15 @@ qualified(List *names, const char *only)
 static bool
 string_is_qualified(const char *s, const char *only)
 {
-	const char *p = s;
+	const char *start = s;
 	bool		quoted = false;
-	const char *start;
 
-	while (*p == ' ')
-		p++;
-	start = p;
-	for (; *p; p++)
+	for (const char *p = s; *p; p++)
 	{
 		if (*p == '"')
 			quoted = !quoted;
-		else if (!quoted && *p == '(')
-			return false;
+		else if (!quoted && strchr(" (),", *p) != NULL)
+			start = p + 1;
 		else if (!quoted && *p == '.')
 		{
 			char	   *qualifier = pnstrdup(start, p - start);
@@ -680,9 +677,24 @@ string_is_qualified(const char *s, const char *only)
 				qualifier = pnstrdup(start + 1, p - start - 2);
 			counts = qualifier_counts(qualifier, only);
 			pfree(qualifier);
-			return counts;
+			if (counts)
+				return true;
+			start = p + 1;
 		}
 	}
+	return false;
+}
+
+/* Whether a type's name is one of those whose values are names. */
+static bool
+is_reg_type(const char *type)
+{
+	static const char *const names[] = {"regclass", "regcollation", "regconfig", "regdatabase", "regdictionary",
+		"regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype"};
+
+	for (int i = 0; i < lengthof(names); i++)
+		if (strcmp(type, names[i]) == 0)
+			return true;
 	return false;
 }
 
@@ -720,16 +732,21 @@ names_schema_walker(Node *node, void *arg)
 				TypeCast   *c = (TypeCast *) node;
 				const char *type = strVal(llast(c->typeName->names));
 
-				if (n->only == NULL && strncmp(type, "reg", 3) == 0 && c->typeName->arrayBounds != NIL)
+				if (is_reg_type(type) && c->typeName->arrayBounds != NIL)
 				{
 					/* (no dependency is held for a name in one, nor is it one name) */
 					n->why = "it has an array of reg* names, which say nothing of what they need";
 					return true;
 				}
-				if (strncmp(type, "reg", 3) == 0 && IsA(c->arg, A_Const) &&
-					IsA(&((A_Const *) c->arg)->val, String) &&
-					string_is_qualified(strVal(&((A_Const *) c->arg)->val), n->only))
-					named = true;
+				if (is_reg_type(type) && IsA(c->arg, A_Const) &&
+					IsA(&((A_Const *) c->arg)->val, String))
+				{
+					const char *value = strVal(&((A_Const *) c->arg)->val);
+
+					named = string_is_qualified(value, n->only) ||
+						(strcmp(type, "regnamespace") == 0 && n->only != NULL &&
+						 (strcmp(value, n->only) == 0 || strcmp(value, quote_identifier(n->only)) == 0));
+				}
 				break;
 			}
 		case T_RangeSubselect:
@@ -972,34 +989,19 @@ object_cmp(const void *a, const void *b)
 	return c != 0 ? c : strcmp(x->name, y->name);
 }
 
-/* (without it, what is in the schema could only be printed with its schema's name) */
-static bool
-has_usage_of_schema(const char *schema)
-{
-	Oid			nsp = get_namespace_oid(schema, true);
-
-	return !OidIsValid(nsp) ||
-		object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) == ACLCHECK_OK;
-}
-
 void
 ws_obj_read(const char *schema, WsObject **out, int *n)
 {
 	int			level = WsSql->begin();
-	int			nest;
 	const char *params[1] = {schema};
 	WsSqlRows	rels;
 	WsObject   *objs;
 
-	if (!has_usage_of_schema(schema))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied for schema %s", schema)));
+	ws_schema_check_usage(schema);
 	push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
-	nest = ws_schema_path_begin(schema);
 
-	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, pg_get_viewdef(c.oid, false), "
+	WsSql->read("SELECT c.oid::text, c.relkind::text, c.relname::text, NULL::text, "
 				"  (SELECT string_agg(quote_ident(split_part(o, '=', 1)) || ' = ' || "
 				"      quote_literal(substr(o, strpos(o, '=') + 1)), ', ' ORDER BY o) FROM unnest(c.reloptions) o) "
 				"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -1011,7 +1013,8 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		const char *oid = ws_sql_value(&rels, i, 0);
 		bool		matview = ws_sql_value(&rels, i, 1)[0] == 'm';
 		const char *name = ws_sql_value(&rels, i, 2);
-		const char *viewdef = ws_sql_value(&rels, i, 3);
+		char	   *viewdef = ws_schema_print(schema, pg_get_viewdef_ext, 2, ObjectIdGetDatum(atooid(oid)),
+											  BoolGetDatum(false), 0);
 		const char *options = ws_sql_value(&rels, i, 4);
 		Buf			text = BUF_INIT;
 		Buf			stored = BUF_INIT;
@@ -1065,7 +1068,6 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	*n = rels.nrows;
 	*out = objs;
 	ws_sql_rows_free(&rels);
-	ws_schema_path_end(nest);
 	PopActiveSnapshot();
 	WsSql->end(level);
 }
