@@ -277,19 +277,48 @@ find_index(const WsTableSchema *s, const char *name, bool *takes_include, const 
 		*takes_include = true;
 		return true;
 	}
-	for (int i = 0; i < s->nconstraints; i++)
-		if (s->constraints[i].kind != WS_CONSTRAINT_CHECK && strcmp(s->constraints[i].name, name) == 0)
+	/* (both in order by name by now, already checked: a record may hold a great many) */
+	{
+		int			lo = 0,
+					hi = s->nconstraints - 1;
+
+		while (lo <= hi)
 		{
-			*takes_include = s->constraints[i].kind == WS_CONSTRAINT_UNIQUE;
-			*body = s->constraints[i].kind == WS_CONSTRAINT_EXCLUSION ? &s->constraints[i].excl : NULL;
-			return true;
+			int			mid = lo + (hi - lo) / 2;
+			int			cmp = strcmp(name, s->constraints[mid].name);
+
+			if (cmp == 0)
+			{
+				/* (a check has no relation, and an index may have its name) */
+				if (s->constraints[mid].kind == WS_CONSTRAINT_CHECK)
+					break;
+				*takes_include = s->constraints[mid].kind == WS_CONSTRAINT_UNIQUE;
+				*body = s->constraints[mid].kind == WS_CONSTRAINT_EXCLUSION ? &s->constraints[mid].excl : NULL;
+				return true;
+			}
+			if (cmp < 0)
+				hi = mid - 1;
+			else
+				lo = mid + 1;
 		}
-	for (int i = 0; i < s->nindexes; i++)
-		if (strcmp(s->indexes[i].name, name) == 0)
+		lo = 0;
+		hi = s->nindexes - 1;
+		while (lo <= hi)
 		{
-			*body = &s->indexes[i];
-			return true;
+			int			mid = lo + (hi - lo) / 2;
+			int			cmp = strcmp(name, s->indexes[mid].name);
+
+			if (cmp == 0)
+			{
+				*body = &s->indexes[mid];
+				return true;
+			}
+			if (cmp < 0)
+				hi = mid - 1;
+			else
+				lo = mid + 1;
 		}
+	}
 	return false;
 }
 
@@ -383,7 +412,8 @@ table_settings_problem(const WsTableSchema *s)
 		if (s->key_name != NULL && strcmp(s->replica_index, s->key_name) == 0 && s->key_deferrable)
 			return "a replica identity by a deferrable index";
 		for (int i = 0; i < s->nconstraints; i++)
-			if (strcmp(s->constraints[i].name, s->replica_index) == 0 &&
+			if (s->constraints[i].kind != WS_CONSTRAINT_CHECK &&
+				strcmp(s->constraints[i].name, s->replica_index) == 0 &&
 				(s->constraints[i].kind != WS_CONSTRAINT_UNIQUE || s->constraints[i].deferrable))
 				return "a replica identity by a deferrable index, or not a unique one";
 		for (int i = 0; i < s->nindexes; i++)
@@ -3144,21 +3174,43 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 	*here_out = here;
 }
 
+/*
+ * A statement's copy of the schema, and what parsing it takes, in a context of its
+ * own: each is as big as the record, and a table has a statement per index.
+ */
+static MemoryContext
+statement_begin(void)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "ws statement", ALLOCSET_DEFAULT_SIZES);
+
+	MemoryContextSwitchTo(cxt);
+	return cxt;
+}
+
+static void
+statement_end(MemoryContext cxt, Buf *sql, Buf *out)
+{
+	MemoryContextSwitchTo(MemoryContextGetParent(cxt));
+	buf_append(out, sql->data, sql->len - 1);
+	MemoryContextDelete(cxt);
+}
+
 void
 ws_schema_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_create_table(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -3167,17 +3219,18 @@ ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *o
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (n < 0 || n >= s->nindexes)
 		elog(ERROR, "no index %d", n);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_create_index(&here, &here.indexes[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_index_statement(&here, &here.indexes[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -3186,17 +3239,18 @@ ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (n < 0 || n >= s->nconstraints || !s->constraints[n].not_valid)
 		elog(ERROR, "no check not valid at %d", n);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_add_check(&here, &here.constraints[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_add_check_statement(&here, &here.constraints[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -3205,17 +3259,18 @@ ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (s->partition_of == NULL)
 		elog(ERROR, "table \"%s\" is no partition", s->name);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_attach(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_attach_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -3224,6 +3279,7 @@ ws_schema_column_settings(const WsTableSchema *s, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 	bool		any = false;
 
 	if (problem != NULL)
@@ -3232,12 +3288,12 @@ ws_schema_column_settings(const WsTableSchema *s, const char *schema, Buf *out)
 		any |= s->cols[i].has_stattarget || s->cols[i].noptions > 0;
 	if (!any)
 		return;
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_column_settings(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_column_settings_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -3246,38 +3302,42 @@ ws_schema_table_settings(const WsTableSchema *s, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (s->replica_identity == WS_REPLICA_DEFAULT && s->clustered == NULL)
 		return;
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_table_settings(&here, schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_table_settings_statement(&here, schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
 ws_schema_index_stats(const WsTableSchema *s, int n, const char *schema, Buf *out)
 {
-	const char *problem = ws_schema_problem(s);
+	const char *problem;
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
-	if (problem != NULL)
-		elog(ERROR, "%s", problem);
+	/* (one of these per index: most have nothing to say, so ask that first) */
 	if (n < 0 || n >= s->nindex_settings)
 		elog(ERROR, "no index settings %d", n);
 	if (s->index_settings[n].nstats == 0)
 		return;
+	problem = ws_schema_problem(s);
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	write_index_stats(&here.index_settings[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_index_stats_statement(&here, &here.index_settings[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 void
@@ -3286,11 +3346,13 @@ ws_schema_inherit(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
 	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
 	if (n < 0 || n >= s->ninherits)
 		elog(ERROR, "no parent %d", n);
+	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
 	ws_put_text(&sql, "ALTER TABLE ");
 	ws_put_identifier(&sql, schema);
@@ -3302,8 +3364,7 @@ ws_schema_inherit(const WsTableSchema *s, int n, const char *schema, Buf *out)
 	ws_put_identifier(&sql, here.inherits[n]);
 	buf_append_byte(&sql, 0);
 	check_inherit_statement(&here, here.inherits[n], schema, (char *) sql.data);
-	buf_append(out, sql.data, sql.len - 1);
-	buf_free(&sql);
+	statement_end(cxt, &sql, out);
 }
 
 static char *

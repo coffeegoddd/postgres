@@ -223,13 +223,16 @@ typedef struct WsTableSchema
  * key can have otherwise, none if not partitioned, each key as an index's with no
  * order or operator; a partition with its bound, of another table and with no
  * identity; a table inheriting from no more than WS_MAX_PARENTS others, distinct
- * and not itself, neither a partition nor partitioned, what it has only by doing so its own columns in attribute order and
+ * and not itself, neither a partition nor partitioned, what it has only by doing
+ * so its own columns in attribute order and
  * its own checks' and not-null constraints' names in order; storage parameters
  * named, valued and in order, a column's storage, compression and statistics
  * target known ones; an index's settings each for an index it has, in order, its
  * INCLUDE only on a key or unique constraint, its statistics targets only on
- * expressions, its columns' parameters only on a key with an operator class; a replica identity known, naming an index only by index,
- * and a clustered index one it has.  NULL if it is so, or what is wrong.
+ * expressions, its columns' parameters only on a key with an operator class; a
+ * replica identity known, by index only if it names one that is unique, not partial
+ * and not deferrable; and a clustered index one it has.  NULL if it is so, or what
+ * is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 

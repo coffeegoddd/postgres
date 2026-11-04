@@ -357,6 +357,23 @@ $node->safe_psql('postgres', q{
 	ALTER INDEX src.io_part1_pkey SET (fillfactor = 80);
 	ALTER TABLE src.io_part1 CLUSTER ON io_part1_pkey, REPLICA IDENTITY NOTHING;
 	CREATE TABLE src.io_ren (a integer, b integer, CONSTRAINT io_ren_k PRIMARY KEY (a) INCLUDE (b));
+	CREATE TABLE src.io_repck (a integer NOT NULL);
+	CREATE UNIQUE INDEX io_repck_i ON src.io_repck (a);
+	ALTER TABLE src.io_repck ADD CONSTRAINT io_repck_i CHECK (a > 0);
+	ALTER TABLE src.io_repck REPLICA IDENTITY USING INDEX io_repck_i;
+	CREATE OPERATOR CLASS other.ts_sig FOR TYPE tsvector USING gist AS
+		OPERATOR 1 = ,
+		FUNCTION 1 gtsvector_consistent(internal, tsvector, smallint, oid, internal),
+		FUNCTION 2 gtsvector_union(internal, internal),
+		FUNCTION 3 gtsvector_compress(internal),
+		FUNCTION 4 gtsvector_decompress(internal),
+		FUNCTION 5 gtsvector_penalty(internal, internal, internal),
+		FUNCTION 6 gtsvector_picksplit(internal, internal),
+		FUNCTION 7 gtsvector_same(gtsvector, gtsvector, internal),
+		FUNCTION 10 gtsvector_options(internal),
+		STORAGE gtsvector;
+	CREATE TABLE src.io_xk (t tsvector, CONSTRAINT io_xk_1 EXCLUDE USING gist (t other.ts_sig (siglen = 10) WITH =),
+		CONSTRAINT io_xk_2 EXCLUDE USING gist (t other.ts_sig (siglen = 20) WITH =));
 	CREATE TABLE src.io_inc (a integer, b integer, CONSTRAINT io_inc_ab UNIQUE (a, b), CONSTRAINT io_inc_a UNIQUE (a) INCLUDE (b),
 		CONSTRAINT io_inc_ba UNIQUE (b) INCLUDE (a, a), CONSTRAINT io_inc_k UNIQUE (a) INCLUDE (a));
 	CREATE TABLE src.io_ppart (a integer, b integer) PARTITION BY RANGE (a);
@@ -396,7 +413,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'so_tab', 'so_cols', 'so_part', 'so_part1', 'so_inh', 'so_inh1', 'so_inh2', 'so_ren',
 	'io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4',
 	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
-	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1');
+	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -744,7 +761,7 @@ my $ixset = q{SELECT string_agg(ic.relname || ' ' || pg_get_indexdef(i.indexreli
 my $ixkey = q{SELECT string_agg(conname || ' ' || condeferrable || condeferred, ',' ORDER BY conname) || ' ' || (SELECT relreplident::text FROM pg_class WHERE oid = '%1$s.%2$s'::regclass)
 	FROM pg_constraint WHERE conrelid = '%1$s.%2$s'::regclass AND contype IN ('p', 'u', 'x')};
 for my $table ('io_key', 'io_def', 'io_lat', 'io_uq', 'io_ix', 'io_x', 'io_rep1', 'io_rep2', 'io_rep3', 'io_rep4', 'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
-	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1')
+	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk')
 {
 	(my $want = $node->safe_psql('postgres', sprintf($ixset, 'src', $table))) =~ s/\bsrc\./dst./g;
 	is($node->safe_psql('postgres', sprintf($ixset, 'dst', $table)), $want, "$table its indexes' settings as they were");
@@ -1108,6 +1125,24 @@ $node->safe_psql('postgres', q{
 		'a column retyped since a snapshot refused as such');
 	$old->query('ROLLBACK');
 	$old->quit;
+}
+
+# an index's settings changed since the reader's snapshot: as the snapshot saw them
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.ioold (a int);
+	CREATE INDEX ioold_i ON src.ioold (a);
+});
+{
+	my $before = $bytes->($node, 'postgres', 'ioold');
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', q{ALTER INDEX src.ioold_i SET (fillfactor = 50); ALTER TABLE src.ioold CLUSTER ON ioold_i});
+	is($old->query_safe(q{SELECT encode(test_ws_schema_bytes('src', 'ioold'), 'hex')}), $before,
+		'settings since a snapshot not in what it reads');
+	$old->query('ROLLBACK');
+	$old->quit;
+	isnt($bytes->($node, 'postgres', 'ioold'), $before, '(though they are in what is read now)');
 }
 
 # an exclusion dropped since the reader's snapshot, its row there but not its text
