@@ -39,8 +39,9 @@ typedef struct WsColumn
 	char	   *name;
 	char	   *type;
 	char		kind;			/* WS_COL_* */
-	bool		not_null;
+	char	   *not_null;		/* its not-null constraint's name, or NULL: it may be null */
 	char		identity;		/* WS_IDENTITY_* */
+	char	   *identity_seq;	/* an identity's sequence's name, in the table's schema */
 	char	   *def;			/* default or generation expression, or NULL */
 	char	   *collation;		/* qualified and quoted, or NULL: the type's */
 } WsColumn;
@@ -117,7 +118,9 @@ typedef struct WsTableSchema
  * What a schema must be, in order to be written and when it is read: named,
  * in names Postgres would not shorten, its columns' tags and names distinct,
  * a generated column with its expression and no identity, an identity not
- * null, no empty expression or collation, an expression's references well
+ * null and with its sequence, no name another's of its kind (a not-null
+ * constraint's among the table's constraints, a sequence's among its relations),
+ * no empty expression or collation, an expression's references well
  * formed, a key named if it has columns, its columns its own, stored, not
  * null and distinct; other constraints in order by name, none named as another
  * or as the key, a check with its expression and nothing else, a unique one
@@ -176,9 +179,7 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
- * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
- * sequence's are not held, and are made again, and neither is the table's owner,
- * which is whoever makes it.  Triggers, rules and the like are objects of their
+ * ERRCODE_NAME_TOO_LONG.  The table's owner is not held, and is whoever makes it.  Triggers, rules and the like are objects of their
  * own, not their table's.
  *
  * It locks the table till the transaction ends, and a column renamed or
@@ -208,7 +209,7 @@ extern void ws_schema_set_tags(const char *schema, const WsTableSchema *s);
  * (prolly/ws/ws_sql.h) makes the text the same whoever asks.  A commit may
  * have come from anywhere: the whole statement is parsed and compared with the
  * record, and if it is anything but one CREATE TABLE of just these columns,
- * types, clauses, expressions and key, it raises ERRCODE_DATA_CORRUPTED and is
+ * types, names, clauses, expressions and key, it raises ERRCODE_DATA_CORRUPTED and is
  * not given back.  A schema with a problem raises an error.  What an
  * expression does is not checked: a default runs as it is, on later inserts,
  * with the inserter's privileges.

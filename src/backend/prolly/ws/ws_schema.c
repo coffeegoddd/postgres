@@ -5,17 +5,17 @@
  *	  "binary", their codec.
  *
  * version byte, name, uvarint ncols, then each column:
- * uvarint tag, name, type, kind byte, not null byte (0 or 1), identity byte,
- * default, collation; then the key's name, uvarint nkey and the key's tags;
+ * uvarint tag, name, type, kind byte, not-null constraint's name, identity byte
+ * and if it has one its sequence's name, default, collation; then the key's name, uvarint nkey and the key's tags;
  * then uvarint nconstraints and each constraint: name, kind byte, flags byte,
  * and a check's expression, a unique constraint's uvarint ncols and tags, or an
  * exclusion's method and index body; then uvarint nindexes and each index: name,
  * method, flags byte and index body.  An index body is uvarint nkeys and each key
  * (uvarint tag, 0 for an expression's, expression if so, collation, opclass,
  * order byte, nulls byte, and an exclusion's operator), uvarint ninclude and
- * tags, predicate.  A
- * string is its uvarint length and bytes, in its shortest form; a default,
- * collation or key's name none is empty, which none is if it is there.
+ * tags, predicate.  A string is its uvarint length and bytes, in its shortest
+ * form; a default, collation, not-null constraint's or key's name none is empty,
+ * which none is if it is there.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -170,6 +170,38 @@ index_body_problem(const WsTableSchema *s, const WsIndex *ix, bool exclusion)
 	return NULL;
 }
 
+/*
+ * A name a column's not-null constraint or sequence has, taken by another of
+ * its kind: they could not stand together.  (All else already well formed.)
+ */
+static const char *
+column_names_problem(const WsTableSchema *s)
+{
+	for (int i = 0; i < s->ncols; i++)
+	{
+		const char *not_null = s->cols[i].not_null;
+		const char *seq = s->cols[i].identity_seq;
+
+		if (not_null != NULL && s->key_name != NULL && strcmp(not_null, s->key_name) == 0)
+			return "a not-null constraint named as the key is";
+		if (seq != NULL && (strcmp(seq, s->name) == 0 ||
+							(s->key_name != NULL && strcmp(seq, s->key_name) == 0)))
+			return "a sequence named as the table or its key is";
+		for (int c = 0; c < s->nconstraints; c++)
+		{
+			if (not_null != NULL && strcmp(not_null, s->constraints[c].name) == 0)
+				return "a not-null constraint named as another constraint is";
+			if (seq != NULL && s->constraints[c].kind != WS_CONSTRAINT_CHECK &&
+				strcmp(seq, s->constraints[c].name) == 0)
+				return "a sequence named as a constraint with an index is";
+		}
+		for (int x = 0; x < s->nindexes && seq != NULL; x++)
+			if (strcmp(seq, s->indexes[x].name) == 0)
+				return "a sequence named as an index is";
+	}
+	return NULL;
+}
+
 static const char *
 index_problem(const WsTableSchema *s, const WsIndex *ix)
 {
@@ -214,6 +246,8 @@ ws_schema_problem(const WsTableSchema *s)
 		if (c->identity != WS_IDENTITY_NONE && c->identity != WS_IDENTITY_ALWAYS &&
 			c->identity != WS_IDENTITY_BY_DEFAULT)
 			return "a column of no known identity";
+		if (c->not_null != NULL && (c->not_null[0] == '\0' || strlen(c->not_null) >= NAMEDATALEN))
+			return "a not-null constraint with no name, or too long a one";
 		if (c->kind != WS_COL_STORED && (c->def == NULL || c->def[0] == '\0'))
 			return "a generated column with no expression";
 		if (c->kind != WS_COL_STORED && c->identity != WS_IDENTITY_NONE)
@@ -222,6 +256,11 @@ ws_schema_problem(const WsTableSchema *s)
 			return "an identity column with a default";
 		if (c->identity != WS_IDENTITY_NONE && !c->not_null)
 			return "an identity column that may be null";
+		if ((c->identity != WS_IDENTITY_NONE) != (c->identity_seq != NULL))
+			return "an identity with no sequence, or a sequence with no identity";
+		if (c->identity_seq != NULL &&
+			(c->identity_seq[0] == '\0' || strlen(c->identity_seq) >= NAMEDATALEN))
+			return "an identity's sequence with no name, or too long a one";
 		if (c->def != NULL && c->def[0] == '\0')
 			return "an empty default";
 		if (c->collation != NULL && c->collation[0] == '\0')
@@ -234,6 +273,12 @@ ws_schema_problem(const WsTableSchema *s)
 				return "two columns with one tag";
 			if (strcmp(s->cols[j].name, c->name) == 0)
 				return "two columns with one name";
+			if (c->not_null != NULL && s->cols[j].not_null != NULL &&
+				strcmp(s->cols[j].not_null, c->not_null) == 0)
+				return "two not-null constraints with one name";
+			if (c->identity_seq != NULL && s->cols[j].identity_seq != NULL &&
+				strcmp(s->cols[j].identity_seq, c->identity_seq) == 0)
+				return "two sequences with one name";
 		}
 	}
 	if (s->nkey < 0 || s->nkey > s->ncols)
@@ -279,7 +324,8 @@ ws_schema_problem(const WsTableSchema *s)
 			return "a constraint initially deferred that is not deferrable";
 		if (con->kind != WS_CONSTRAINT_EXCLUSION &&
 			(con->excl.name != NULL || con->excl.method != NULL || con->excl.nkeys != 0 ||
-			 con->excl.ninclude != 0 || con->excl.predicate != NULL))
+			 con->excl.ninclude != 0 || con->excl.predicate != NULL ||
+			 con->excl.unique || con->excl.nulls_not_distinct))
 			return "a constraint with an exclusion's fields";
 		if (con->kind == WS_CONSTRAINT_CHECK)
 		{
@@ -360,7 +406,7 @@ ws_schema_problem(const WsTableSchema *s)
 		if (i > 0 && strcmp(s->indexes[i - 1].name, s->indexes[i].name) >= 0)
 			return "indexes not in order by name";
 	}
-	return NULL;
+	return column_names_problem(s);
 }
 
 #define CON_NULLS_NOT_DISTINCT 0x01
@@ -426,8 +472,10 @@ schema_encode(const WsTableSchema *s, Buf *out)
 		put_string(out, c->name);
 		put_string(out, c->type);
 		buf_append_byte(out, (uint8) c->kind);
-		buf_append_byte(out, c->not_null ? 1 : 0);
+		put_optional(out, c->not_null);
 		buf_append_byte(out, (uint8) c->identity);
+		if (c->identity != WS_IDENTITY_NONE)
+			put_string(out, c->identity_seq);
 		put_optional(out, c->def);
 		put_optional(out, c->collation);
 	}
@@ -580,6 +628,8 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	const uint8 *p = bytes,
 			   *end = bytes + len;
 	uint64		n;
+	uint64		nconstraints;
+	uint64		capacity;
 	const char *problem;
 
 	memset(s, 0, sizeof(*s));
@@ -595,17 +645,15 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	for (int i = 0; i < s->ncols; i++)
 	{
 		WsColumn   *c = &s->cols[i];
-		uint8		not_null;
 
 		c->tag = get_uvarint(&p, end);
 		c->name = get_string(&p, end);
 		c->type = get_string(&p, end);
 		c->kind = (char) get_byte(&p, end);
-		not_null = get_byte(&p, end);
-		if (not_null > 1)
-			malformed("a column's not null is neither");
-		c->not_null = not_null == 1;
+		c->not_null = get_optional(&p, end);
 		c->identity = (char) get_byte(&p, end);
+		if (c->identity != WS_IDENTITY_NONE)
+			c->identity_seq = get_string(&p, end);
 		c->def = get_optional(&p, end);
 		c->collation = get_optional(&p, end);
 	}
@@ -621,13 +669,26 @@ schema_decode(const uint8 *bytes, size_t len, WsTableSchema *s)
 	/* (each is at least four bytes: its name, kind, flags and what follows) */
 	if (n > (uint64) (end - p) / 4)
 		malformed("more constraints than bytes");
-	s->nconstraints = (int) n;
-	s->constraints = px_malloc((size_t) Max(n, 1) * sizeof(WsConstraint));
-	memset(s->constraints, 0, (size_t) Max(n, 1) * sizeof(WsConstraint));
-	for (int i = 0; i < s->nconstraints; i++)
+	nconstraints = n;
+	/* (grown as they are read: each is far bigger here than its four bytes there) */
+	capacity = Max(Min(nconstraints, 16), 1);
+	s->constraints = px_malloc((size_t) capacity * sizeof(WsConstraint));
+	memset(s->constraints, 0, (size_t) capacity * sizeof(WsConstraint));
+	for (uint64 i = 0; i < nconstraints; i++)
 	{
-		WsConstraint *con = &s->constraints[i];
+		WsConstraint *con;
 		uint8		flags;
+
+		if (i == capacity)
+		{
+			uint64		grown = Min(capacity * 2, nconstraints);
+
+			s->constraints = px_realloc(s->constraints, (size_t) grown * sizeof(WsConstraint));
+			memset(s->constraints + capacity, 0, (size_t) (grown - capacity) * sizeof(WsConstraint));
+			capacity = grown;
+		}
+		s->nconstraints = (int) i + 1;
+		con = &s->constraints[i];
 
 		con->name = get_string(&p, end);
 		con->kind = (char) get_byte(&p, end);
@@ -716,6 +777,8 @@ ws_schema_free(WsTableSchema *s)
 		px_free(s->cols[i].type);
 		px_free(s->cols[i].def);
 		px_free(s->cols[i].collation);
+		px_free(s->cols[i].not_null);
+		px_free(s->cols[i].identity_seq);
 	}
 	px_free(s->cols);
 	px_free(s->key_name);
@@ -902,18 +965,27 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 			put_expression(s, c->def, out);
 			ws_put_text(out, c->kind == WS_COL_GENERATED_STORED ? ") STORED" : ") VIRTUAL");
 		}
-		else if (c->identity == WS_IDENTITY_ALWAYS)
-			ws_put_text(out, " GENERATED ALWAYS AS IDENTITY");
-		else if (c->identity == WS_IDENTITY_BY_DEFAULT)
-			ws_put_text(out, " GENERATED BY DEFAULT AS IDENTITY");
+		else if (c->identity != WS_IDENTITY_NONE)
+		{
+			ws_put_text(out, c->identity == WS_IDENTITY_ALWAYS ? " GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME " :
+						" GENERATED BY DEFAULT AS IDENTITY (SEQUENCE NAME ");
+			ws_put_identifier(out, schema);
+			ws_put_text(out, ".");
+			ws_put_identifier(out, c->identity_seq);
+			ws_put_text(out, ")");
+		}
 		else if (c->def != NULL)
 		{
 			ws_put_text(out, " DEFAULT (");
 			put_expression(s, c->def, out);
 			ws_put_text(out, ")");
 		}
-		if (c->not_null)
+		if (c->not_null != NULL)
+		{
+			ws_put_text(out, " CONSTRAINT ");
+			ws_put_identifier(out, c->not_null);
 			ws_put_text(out, " NOT NULL");
+		}
 	}
 	if (s->nkey > 0)
 	{
@@ -1103,7 +1175,7 @@ same_names(const char *text, List *names)
 	return strcmp(canonical_names(want), text) == 0;
 }
 
-/* An exclusion's operator in its one form: its schema's name quoted, if it has one, itself bare. */
+/* An exclusion's operator in its one form: its schema's name quoted, itself bare. */
 static char *
 operator_text(List *names)
 {
@@ -1150,9 +1222,26 @@ is_serial(const TypeName *t)
 		strcmp(n, "bigserial") == 0 || strcmp(n, "serial8") == 0;
 }
 
+/* Whether an identity's options are its sequence's name, in this schema, alone. */
+static bool
+is_sequence_named(List *options, const char *schema, const char *seq)
+{
+	DefElem    *only;
+	List	   *names;
+
+	if (list_length(options) != 1)
+		return false;
+	only = linitial_node(DefElem, options);
+	if (strcmp(only->defname, "sequence_name") != 0 || !IsA(only->arg, List))
+		return false;
+	names = (List *) only->arg;
+	return list_length(names) == 2 && strcmp(strVal(linitial(names)), schema) == 0 &&
+		strcmp(strVal(lsecond(names)), seq) == 0;
+}
+
 /* A column as parsed is the record's: its name, type, collation and clauses. */
 static void
-check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
+check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def, const char *schema)
 {
 	TypeName   *type = parse_type(s, c->type);
 	int			not_null = 0,
@@ -1180,12 +1269,15 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 	{
 		Constraint *con = lfirst_node(Constraint, lc);
 
-		if (con->conname != NULL || con->is_no_inherit || con->deferrable || con->initdeferred)
+		if ((con->conname != NULL) != (con->contype == CONSTR_NOTNULL) ||
+			con->is_no_inherit || con->deferrable || con->initdeferred)
 			not_the_record(s, "a column's clause");
 		switch (con->contype)
 		{
 			case CONSTR_NOTNULL:
 				not_null++;
+				if (c->not_null == NULL || strcmp(con->conname, c->not_null) != 0)
+					not_the_record(s, "a column's not-null constraint");
 				break;
 			case CONSTR_DEFAULT:
 				deflt++;
@@ -1195,7 +1287,7 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 				break;
 			case CONSTR_IDENTITY:
 				identity++;
-				if (con->options != NIL ||
+				if (c->identity == WS_IDENTITY_NONE || !is_sequence_named(con->options, schema, c->identity_seq) ||
 					con->generated_when != (c->identity == WS_IDENTITY_ALWAYS ?
 											ATTRIBUTE_IDENTITY_ALWAYS : ATTRIBUTE_IDENTITY_BY_DEFAULT))
 					not_the_record(s, "a column's identity");
@@ -1328,7 +1420,7 @@ check_statement(const WsTableSchema *s, const char *schema, const char *sql)
 		{
 			if (!IsA(element, ColumnDef))
 				not_the_record(s, "a clause where a column should be");
-			check_column(s, &s->cols[i], (ColumnDef *) element);
+			check_column(s, &s->cols[i], (ColumnDef *) element, schema);
 		}
 		else if (i >= s->ncols + (s->nkey > 0 ? 1 : 0))
 		{
@@ -1495,6 +1587,8 @@ schema_in_server_encoding(const WsTableSchema *s, WsTableSchema *here_out)
 		here.cols[i].type = from_utf8(s->cols[i].type);
 		here.cols[i].def = from_utf8(s->cols[i].def);
 		here.cols[i].collation = from_utf8(s->cols[i].collation);
+		here.cols[i].not_null = ws_name_from_utf8(s->cols[i].not_null);
+		here.cols[i].identity_seq = ws_name_from_utf8(s->cols[i].identity_seq);
 	}
 	here.constraints = palloc_array(WsConstraint, Max(s->nconstraints, 1));
 	for (int i = 0; i < s->nconstraints; i++)
@@ -1571,9 +1665,7 @@ ws_name_to_utf8(const char *name)
 
 /*
  * What the record cannot yet hold and a table of the catalogs has, the first
- * of it: a refusal, not a smaller table.  (The names of a column's not-null
- * constraint and its identity sequence are not in the list: they are made
- * again, and a rename leaves them behind anyway.)
+ * of it: a refusal, not a smaller table.
  */
 static const char *const unsupported_sql =
 "WITH own(o) AS (SELECT $1::oid "
@@ -1617,7 +1709,7 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid "
 "               WHERE x.indrelid = c.oid AND NOT EXISTS "
 "               (SELECT FROM pg_constraint k WHERE k.conindid = x.indexrelid AND k.conrelid = c.oid "
-"                  AND k.contype <> 'x') AND "
+"                  AND k.contype NOT IN ('x', 'f')) AND "
 "                 (NOT x.indisvalid OR NOT x.indisready OR x.indisclustered OR "
 "                  ic.reloptions IS NOT NULL OR ic.reltablespace <> 0 OR "
 "                  EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = x.indexrelid AND "
@@ -1777,6 +1869,25 @@ index_gone(const char *table)
 			 errmsg("an index of table \"%s\" was dropped since this transaction's snapshot", table)));
 }
 
+/* (and so, what the snapshot's rows passed as having no options) */
+pg_noreturn static void
+index_changed(const char *table)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("an index of table \"%s\" was given options since this transaction's snapshot", table)));
+}
+
+/* Each part of a name a commit holds as text, within a commit's limit for a name. */
+static void
+names_fit(List *names)
+{
+	ListCell   *lc;
+
+	foreach(lc, names)
+		px_free(ws_name_to_utf8(strVal(lfirst(lc))));
+}
+
 /* A key as printed; its expression, if it is one, as printed alone. */
 static void
 read_index_key(const char *table, const char *index_oid, int k, const IndexElem *elem,
@@ -1802,6 +1913,8 @@ read_index_key(const char *table, const char *index_oid, int k, const IndexElem 
 		key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
 		ws_sql_rows_free(&one);
 	}
+	names_fit(elem->collation);
+	names_fit(elem->opclass);
 	key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
 	key->opclass = elem->opclass ? to_utf8(NameListToQuotedString(elem->opclass)) : NULL;
 	key->order = elem->ordering == SORTBY_DESC ? WS_INDEX_ORDER_DESC : WS_INDEX_ORDER_DEFAULT;
@@ -1821,6 +1934,7 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 	const char *params[1] = {con_oid};
 	WsSqlRows	printed;
 	List	   *parsed;
+	List	   *elts;
 	Constraint *con;
 	int			k = 0;
 	ListCell   *lc;
@@ -1833,11 +1947,16 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", ws_sql_value(&printed, 0, 0)),
 						RAW_PARSE_DEFAULT);
 	ws_sql_rows_free(&printed);
-	con = linitial_node(Constraint, castNode(CreateStmt, linitial_node(RawStmt, parsed)->stmt)->tableElts);
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateStmt))
+		elog(ERROR, "an exclusion of table \"%s\" printed as something else", table);
+	elts = ((CreateStmt *) linitial_node(RawStmt, parsed)->stmt)->tableElts;
+	if (list_length(elts) != 1 || !IsA(linitial(elts), Constraint))
+		elog(ERROR, "an exclusion of table \"%s\" printed as something else", table);
+	con = linitial_node(Constraint, elts);
 	if (con->contype != CONSTR_EXCLUSION)
 		elog(ERROR, "an exclusion of table \"%s\" printed as something else", table);
 	if (con->options != NIL || con->indexspace != NULL)
-		elog(ERROR, "an exclusion of table \"%s\" with options that were to be refused", table);
+		index_changed(table);
 	ix->method = ws_name_to_utf8(con->access_method);
 	ix->nkeys = list_length(con->exclusions);
 	ix->keys = px_malloc((size_t) Max(ix->nkeys, 1) * sizeof(WsIndexKey));
@@ -1847,6 +1966,7 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 		List	   *pair = lfirst_node(List, lc);
 
 		read_index_key(table, index_oid, k, linitial_node(IndexElem, pair), rc, &ix->keys[k]);
+		names_fit(lsecond_node(List, pair));
 		ix->keys[k].op = to_utf8(operator_text(lsecond_node(List, pair)));
 		k++;
 	}
@@ -1881,7 +2001,7 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 		elog(ERROR, "an index of table \"%s\" printed as something else", table);
 	stmt = (IndexStmt *) linitial_node(RawStmt, parsed)->stmt;
 	if (stmt->options != NIL || stmt->tableSpace != NULL)
-		elog(ERROR, "an index of table \"%s\" with options that were to be refused", table);
+		index_changed(table);
 	ix->name = ws_name_to_utf8(ws_sql_value(idxs, row, 0));
 	ix->method = ws_name_to_utf8(stmt->accessMethod);
 	ix->unique = stmt->unique;
@@ -2000,7 +2120,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  pg_get_expr(d.adbin, d.adrelid), "
 				   "  CASE WHEN a.attcollation <> t.typcollation THEN "
 				   "    quote_ident(cn.nspname) || '.' || quote_ident(co.collname) END, "
-				   "  a.attcoltag::text "
+				   "  a.attcoltag::text, "
+				   "  (SELECT k.conname::text FROM pg_constraint k WHERE k.conrelid = a.attrelid "
+				   "    AND k.contype = 'n' AND k.conkey[1] = a.attnum), "
+				   "  (SELECT q.relname::text FROM pg_depend p JOIN pg_class q ON q.oid = p.objid "
+				   "    WHERE p.classid = 'pg_class'::regclass AND p.refclassid = 'pg_class'::regclass "
+				   "      AND p.refobjid = a.attrelid AND p.refobjsubid = a.attnum "
+				   "      AND p.deptype = 'i' AND q.relkind = 'S') "
 				   "FROM pg_attribute a "
 				   "JOIN pg_type t ON t.oid = a.atttypid "
 				   "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
@@ -2019,7 +2145,8 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  pg_get_expr(i.indpred, i.indrelid) "
 				   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 				   "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
-				   "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid)",
+				   "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
+				   "    AND k.contype <> 'f')",
 				   1, oid, &idxs);
 		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
 				   "  con.condeferrable::text, "
@@ -2044,11 +2171,25 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 
 		rc.names[i] = ws_sql_value(&cols, i, 1);
 		c->name = ws_name_to_utf8(rc.names[i]);
+		names_fit(typeStringToTypeName(ws_sql_value(&cols, i, 2), NULL)->names);
 		c->type = to_utf8(ws_sql_value(&cols, i, 2));
-		c->not_null = ws_sql_value(&cols, i, 3)[0] == 't';
+		if (ws_sql_value(&cols, i, 3)[0] == 't')
+		{
+			if (ws_sql_value(&cols, i, 9) == NULL)
+				elog(ERROR, "column \"%s\" of table \"%s\" is not null by no constraint", rc.names[i], table);
+			c->not_null = ws_name_to_utf8(ws_sql_value(&cols, i, 9));
+		}
 		c->identity = identity[0];
+		if (c->identity != WS_IDENTITY_NONE)
+		{
+			if (ws_sql_value(&cols, i, 10) == NULL)
+				elog(ERROR, "identity column \"%s\" of table \"%s\" has no sequence", rc.names[i], table);
+			c->identity_seq = ws_name_to_utf8(ws_sql_value(&cols, i, 10));
+		}
 		c->kind = generated[0] == ATTRIBUTE_GENERATED_STORED ? WS_COL_GENERATED_STORED :
 			generated[0] == ATTRIBUTE_GENERATED_VIRTUAL ? WS_COL_GENERATED_VIRTUAL : WS_COL_STORED;
+		if (collation != NULL)
+			names_fit(stringToQualifiedNameList(collation, NULL));
 		c->collation = collation ? to_utf8(collation) : NULL;
 		c->tag = (uint64) strtoi64(ws_sql_value(&cols, i, 8), NULL, 10);
 		rc.tags[i] = c->tag;
