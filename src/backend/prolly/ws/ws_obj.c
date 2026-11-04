@@ -19,11 +19,15 @@
 
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "common/int.h"
+#include "lib/binaryheap.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "parser/parser.h"
 #include "prolly/ws/ws_obj.h"
+#include "storage/lmgr.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_schema.h"
@@ -32,6 +36,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/snapmgr.h"
 
 const WsObjectCodecRoutine *WsObjectCodec = &BinaryWsObjectCodec;
@@ -122,7 +127,8 @@ ws_obj_problem(const WsObject *o)
 
 		if (c->column != NULL && bad_name(c->column))
 			return "a comment on a column of no name";
-		if (c->text == NULL)
+		/* (no comment is empty: making one removes it) */
+		if (c->text == NULL || c->text[0] == '\0')
 			return "a comment of no text";
 		if (i > 0 && opt_cmp(o->comments[i - 1].column, c->column) >= 0)
 			return "comments not in order";
@@ -137,6 +143,8 @@ ws_obj_problem(const WsObject *o)
 			return "a grant to a role no commit holds";
 		if (privileges_problem(g->privileges))
 			return "a grant of privileges not known, or not in order";
+		if (g->grantee != NULL && o->owner != NULL && strcmp(g->grantee, o->owner) == 0)
+			return "a grant to its owner";
 		if (i > 0)
 		{
 			const WsObjectGrant *p = &o->grants[i - 1];
@@ -148,6 +156,11 @@ ws_obj_problem(const WsObject *o)
 				c = (int) p->grant_option - (int) g->grant_option;
 			if (c >= 0)
 				return "grants not in order";
+			/* (the one privilege with and without its option is not what a catalog holds) */
+			if (opt_cmp(p->column, g->column) == 0 && opt_cmp(p->grantee, g->grantee) == 0)
+				for (const char *l = g->privileges; *l; l++)
+					if (strchr(p->privileges, *l) != NULL)
+						return "a privilege granted twice";
 		}
 	}
 	return NULL;
@@ -362,6 +375,100 @@ ws_obj_free(WsObject *o)
 	memset(o, 0, sizeof(*o));
 }
 
+/* ------------------------------------------------------------------ order */
+
+static int
+find_object(const WsObject *objs, int n, const char *key)
+{
+	int			lo = 0,
+				hi = n - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		Buf			k = BUF_INIT;
+		int			c;
+
+		ws_obj_key(objs[mid].kind, objs[mid].name, &k);
+		buf_append_byte(&k, 0);
+		c = strcmp(key, (char *) k.data);
+		buf_free(&k);
+		if (c == 0)
+			return mid;
+		if (c < 0)
+			hi = mid - 1;
+		else
+			lo = mid + 1;
+	}
+	return -1;
+}
+
+static int
+order_cmp(Datum a, Datum b, void *arg)
+{
+	return pg_cmp_s32(DatumGetInt32(b), DatumGetInt32(a));
+}
+
+/* False if they need each other in a cycle.  An unheld need raises an error. */
+static bool
+compute_order(const WsObject *objs, int n, int *order)
+{
+	int		   *remaining = palloc0_array(int, Max(n, 1));
+	int		  **needed_by = palloc0_array(int *, Max(n, 1));
+	int		   *nneeded_by = palloc0_array(int, Max(n, 1));
+	binaryheap *ready = binaryheap_allocate(Max(n, 1), order_cmp, NULL);
+	int			done = 0;
+
+	/* (edges from each object's own needs, so bounded by the bytes it took to say so) */
+	for (int i = 0; i < n; i++)
+		for (int d = 0; d < objs[i].ndeps; d++)
+		{
+			int			of = find_object(objs, n, objs[i].deps[d]);
+
+			if (of < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("object \"%s\" needs \"%s\", which a commit does not hold",
+								objs[i].name, objs[i].deps[d])));
+			remaining[i]++;
+			nneeded_by[of]++;
+		}
+	for (int i = 0; i < n; i++)
+	{
+		needed_by[i] = palloc_array(int, Max(nneeded_by[i], 1));
+		nneeded_by[i] = 0;
+	}
+	for (int i = 0; i < n; i++)
+		for (int d = 0; d < objs[i].ndeps; d++)
+		{
+			int			of = find_object(objs, n, objs[i].deps[d]);
+
+			needed_by[of][nneeded_by[of]++] = i;
+		}
+
+	/* (the ready are taken lowest first, for one order whatever they were found in) */
+	for (int i = 0; i < n; i++)
+		if (remaining[i] == 0)
+			binaryheap_add(ready, Int32GetDatum(i));
+	while (!binaryheap_empty(ready))
+	{
+		int			next = DatumGetInt32(binaryheap_remove_first(ready));
+
+		CHECK_FOR_INTERRUPTS();
+		order[done++] = next;
+		for (int i = 0; i < nneeded_by[next]; i++)
+			if (--remaining[needed_by[next][i]] == 0)
+				binaryheap_add(ready, Int32GetDatum(needed_by[next][i]));
+	}
+	for (int i = 0; i < n; i++)
+		pfree(needed_by[i]);
+	pfree(needed_by);
+	pfree(nneeded_by);
+	pfree(remaining);
+	binaryheap_free(ready);
+	return done == n;
+}
+
 /* ---------------------------------------------------------- the catalogs */
 
 /*
@@ -403,16 +510,29 @@ static const char *const refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 "
 "      AND (a.attstattarget >= 0 OR a.attoptions IS NOT NULL)) THEN 'it has settings on a column' "
 "  WHEN c.relkind = 'm' AND c.relreplident <> 'd' THEN 'it has a replica identity' "
+"  WHEN EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = c.oid "
+"      AND a.attnum > 0 AND NOT a.attisdropped AND (a.attstorage <> t.typstorage OR a.attcompression <> '')) "
+"    THEN 'it has a column stored its own way' "
+"  WHEN EXISTS (SELECT 1 FROM pg_class o WHERE o.oid = c.reltoastrelid AND o.reloptions IS NOT NULL) "
+"    THEN 'it has settings on its TOAST table' "
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'x') "
+"    THEN 'it depends on an extension' "
+"  WHEN EXISTS (SELECT 1 FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass AND l.objoid = c.oid) "
+"    THEN 'it has a security label' "
+"  WHEN c.relacl IS NOT NULL AND (SELECT count(*) FROM aclexplode(c.relacl) e WHERE e.grantee = c.relowner) <> "
+"      (SELECT count(*) FROM aclexplode(acldefault('r', c.relowner))) THEN 'its owner''s rights have been changed' "
+"  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
+"        JOIN pg_type t ON (d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid AND t.typrelid = c.oid) "
+"      WHERE r.ev_class = c.oid AND d.deptype = 'n') "
+"    OR EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
+"      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND d.refclassid = 'pg_class'::regclass AND d.refobjid = c.oid "
+"        AND d.refobjsubid <> 0) "
+"    THEN 'it needs itself, as no commit could make it' "
 "  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
 "        CROSS JOIN LATERAL pg_identify_object(d.refclassid, d.refobjid, 0) i "
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND i.schema IS NOT NULL "
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) "
 "    THEN 'it needs something in another schema' "
-"  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
-"        JOIN pg_class q ON d.refclassid = 'pg_class'::regclass AND q.oid = d.refobjid "
-"        JOIN pg_class k ON k.relname = q.relname AND k.relnamespace = 'pg_catalog'::regnamespace "
-"      WHERE r.ev_class = c.oid AND q.relnamespace = n.oid) "
-"    THEN 'it needs a table named as a catalog is, which only its schema''s name tells apart' "
 "  WHEN EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
 "      WHERE r.ev_class = c.oid AND d.deptype = 'n' AND NOT ( "
 "        (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
@@ -421,11 +541,145 @@ static const char *const refusal_sql =
 "           WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
 "        OR (d.refclassid = 'pg_type'::regclass AND EXISTS (SELECT 1 FROM pg_type t JOIN pg_class q ON q.oid = t.typrelid "
 "           WHERE t.oid = d.refobjid AND q.relkind IN ('r', 'p', 'v', 'm'))) "
-"        OR (SELECT i.schema = 'pg_catalog' FROM pg_identify_object(d.refclassid, d.refobjid, 0) i))) "
+"        OR coalesce((SELECT i.schema = 'pg_catalog' FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false))) "
 "    THEN 'it needs an object no commit holds yet' "
 "  END "
 "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
 "WHERE n.nspname = $1::name AND c.relkind IN ('v', 'm') ORDER BY 1";
+
+/*
+ * What prints a definition reads its names by the catalog as it is now, whatever
+ * snapshot is active.  So read as it is now too: lock each object and what it needs,
+ * which keeps them from being renamed, until a new snapshot names nothing more to
+ * lock.  That snapshot stays pushed, for the caller to pop.
+ */
+static void
+push_locked_snapshot(const char *schema)
+{
+	const char *params[1] = {schema};
+	HTAB	   *locked;
+	HASHCTL		ctl = {.keysize = sizeof(Oid),.entrysize = sizeof(Oid),.hcxt = CurrentMemoryContext};
+
+	locked = hash_create("objects locked", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (;;)
+	{
+		WsSqlRows	rows;
+		bool		more = false;
+
+		CommandCounterIncrement();
+		PushActiveSnapshot(GetLatestSnapshot());
+		UpdateActiveSnapshotCommandId();
+		WsSql->read("SELECT c.oid::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+					"WHERE n.nspname = $1::name AND c.relkind IN ('v', 'm') "
+					"UNION SELECT q.oid::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+					"JOIN pg_rewrite r ON r.ev_class = c.oid "
+					"JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid "
+					"LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
+					"JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid ELSE t.typrelid END "
+					"WHERE n.nspname = $1::name AND c.relkind IN ('v', 'm')", 1, params, &rows);
+		for (int i = 0; i < rows.nrows; i++)
+		{
+			Oid			oid = atooid(ws_sql_value(&rows, i, 0));
+			bool		found;
+
+			(void) hash_search(locked, &oid, HASH_ENTER, &found);
+			if (!found)
+			{
+				LockRelationOid(oid, AccessShareLock);
+				more = true;
+			}
+		}
+		ws_sql_rows_free(&rows);
+		if (!more)
+			break;
+		PopActiveSnapshot();
+	}
+	hash_destroy(locked);
+}
+
+/* Whether a printed query must say what it can only say by naming its schema. */
+typedef struct NamesSchema
+{
+	const char *schema;
+	const char *why;
+} NamesSchema;
+
+static bool
+qualified_by(List *names, const char *schema)
+{
+	return list_length(names) >= 2 && IsA(linitial(names), String) &&
+		strcmp(strVal(linitial(names)), schema) == 0;
+}
+
+static bool
+names_schema_walker(Node *node, void *arg)
+{
+	NamesSchema *n = arg;
+	bool		named = false;
+
+	if (node == NULL)
+		return false;
+	switch (nodeTag(node))
+	{
+		case T_RangeVar:
+			named = ((RangeVar *) node)->schemaname != NULL &&
+				strcmp(((RangeVar *) node)->schemaname, n->schema) == 0;
+			break;
+		case T_TypeName:
+			named = qualified_by(((TypeName *) node)->names, n->schema);
+			break;
+		case T_FuncCall:
+			named = qualified_by(((FuncCall *) node)->funcname, n->schema);
+			break;
+		case T_A_Expr:
+			named = qualified_by(((A_Expr *) node)->name, n->schema);
+			break;
+		case T_CollateClause:
+			named = qualified_by(((CollateClause *) node)->collname, n->schema);
+			break;
+		case T_SortBy:
+			named = qualified_by(((SortBy *) node)->useOp, n->schema);
+			break;
+		case T_RangeSubselect:
+			{
+				RangeSubselect *r = (RangeSubselect *) node;
+
+				/*
+				 * (VALUES with column names prints as a subquery that prints
+				 * otherwise once it is one: two sets of bytes for one view)
+				 */
+				if (r->alias != NULL && strcmp(r->alias->aliasname, "*VALUES*") == 0)
+				{
+					n->why = "it is a VALUES list with column names, which does not print as itself";
+					return true;
+				}
+				break;
+			}
+		default:
+			break;
+	}
+	if (named)
+	{
+		n->why = "it must say its schema's name, having something named as the catalogs' is";
+		return true;
+	}
+	return raw_expression_tree_walker(node, names_schema_walker, arg);
+}
+
+/* Refuses a printed query that would not mean the same in another schema. */
+static void
+check_query_is_portable(const char *name, const char *schema, const char *query)
+{
+	List	   *parsed = raw_parser(query, RAW_PARSE_DEFAULT);
+	NamesSchema n = {schema, NULL};
+
+	if (list_length(parsed) != 1)
+		elog(ERROR, "a view's definition is not one query");
+	if (names_schema_walker(linitial_node(RawStmt, parsed)->stmt, &n))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: %s", name, schema, n.why)));
+}
 
 static void
 refuse_what_cannot_be_held(const char *schema)
@@ -621,9 +875,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	WsSqlRows	rels;
 	WsObject   *objs;
 
-	CommandCounterIncrement();
-	PushCopiedSnapshot(GetTransactionSnapshot());
-	UpdateActiveSnapshotCommandId();
+	push_locked_snapshot(schema);
 	refuse_what_cannot_be_held(schema);
 	nest = path_begin(schema);
 
@@ -662,6 +914,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		len = strlen(trimmed);
 		while (len > 0 && (trimmed[len - 1] == ';' || trimmed[len - 1] == ' ' || trimmed[len - 1] == '\n'))
 			trimmed[--len] = '\0';
+		check_query_is_portable(name, schema, trimmed);
 		ws_put_text(&text, trimmed);
 		pfree(trimmed);
 		if (matview)
@@ -679,6 +932,16 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	}
 	if (rels.nrows > 1)
 		qsort(objs, rels.nrows, sizeof(WsObject), object_cmp);
+	{
+		/* (views can be made to need each other, which no restore could make) */
+		int		   *order = palloc_array(int, Max(rels.nrows, 1));
+
+		if (!compute_order(objs, rels.nrows, order))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("schema \"%s\" cannot be held in a commit: its views need each other in a cycle", schema)));
+		pfree(order);
+	}
 	*n = rels.nrows;
 	*out = objs;
 	ws_sql_rows_free(&rels);
@@ -768,99 +1031,13 @@ ws_obj_list(ProllyCtx *ctx, const PHash *map, WsObject **out, int *n)
 
 /* ---------------------------------------------------------------- restore */
 
-static int
-find_object(const WsObject *objs, int n, const char *key)
-{
-	int			lo = 0,
-				hi = n - 1;
-
-	while (lo <= hi)
-	{
-		int			mid = lo + (hi - lo) / 2;
-		Buf			k = BUF_INIT;
-		int			c;
-
-		ws_obj_key(objs[mid].kind, objs[mid].name, &k);
-		buf_append_byte(&k, 0);
-		c = strcmp(key, (char *) k.data);
-		buf_free(&k);
-		if (c == 0)
-			return mid;
-		if (c < 0)
-			hi = mid - 1;
-		else
-			lo = mid + 1;
-	}
-	return -1;
-}
-
 void
 ws_obj_restore_order(const WsObject *objs, int n, int *order)
 {
-	int		   *remaining = palloc0_array(int, Max(n, 1));
-	int		  **needed_by = palloc0_array(int *, Max(n, 1));
-	int		   *nneeded_by = palloc0_array(int, Max(n, 1));
-	int		   *ready = palloc_array(int, Max(n, 1));
-	int			nready = 0;
-	int			done = 0;
-
-	/* (edges from each object's own needs, so bounded by the bytes it took to say so) */
-	for (int i = 0; i < n; i++)
-		for (int d = 0; d < objs[i].ndeps; d++)
-		{
-			int			of = find_object(objs, n, objs[i].deps[d]);
-
-			if (of < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("object \"%s\" needs \"%s\", which a commit does not hold",
-								objs[i].name, objs[i].deps[d])));
-			remaining[i]++;
-			nneeded_by[of]++;
-		}
-	for (int i = 0; i < n; i++)
-	{
-		needed_by[i] = palloc_array(int, Max(nneeded_by[i], 1));
-		nneeded_by[i] = 0;
-	}
-	for (int i = 0; i < n; i++)
-		for (int d = 0; d < objs[i].ndeps; d++)
-		{
-			int			of = find_object(objs, n, objs[i].deps[d]);
-
-			needed_by[of][nneeded_by[of]++] = i;
-		}
-
-	/* (the ready are taken lowest first, for one order whatever they were found in) */
-	for (int i = 0; i < n; i++)
-		if (remaining[i] == 0)
-			ready[nready++] = i;
-	while (done < n)
-	{
-		int			next;
-		int			at = 0;
-
-		CHECK_FOR_INTERRUPTS();
-		if (nready == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("a commit's objects need each other in a cycle")));
-		for (int i = 1; i < nready; i++)
-			if (ready[i] < ready[at])
-				at = i;
-		next = ready[at];
-		ready[at] = ready[--nready];
-		order[done++] = next;
-		for (int i = 0; i < nneeded_by[next]; i++)
-			if (--remaining[needed_by[next][i]] == 0)
-				ready[nready++] = needed_by[next][i];
-	}
-	for (int i = 0; i < n; i++)
-		pfree(needed_by[i]);
-	pfree(needed_by);
-	pfree(nneeded_by);
-	pfree(remaining);
-	pfree(ready);
+	if (!compute_order(objs, n, order))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a commit's objects need each other in a cycle")));
 }
 
 pg_noreturn static void
@@ -1099,6 +1276,34 @@ run_statement(Buf *sql)
 	buf_free(sql);
 }
 
+/*
+ * Refuses a schema with anything a definition's unqualified name could take for what
+ * it meant: an exact match here is preferred to a polymorphic one in the catalogs,
+ * though the catalogs come first.  A commit's tables are here, and name nothing.
+ */
+static void
+check_nothing_captures(const char *schema)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT what FROM (SELECT 'a function' AS what FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+			   "    WHERE n.nspname = $1::name "
+			   "  UNION ALL SELECT 'an operator' FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace "
+			   "    WHERE n.nspname = $1::name "
+			   "  UNION ALL SELECT 'a collation' FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace "
+			   "    WHERE n.nspname = $1::name "
+			   "  UNION ALL SELECT 'a type' FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
+			   "    WHERE n.nspname = $1::name AND t.typrelid = 0 "
+			   "      AND NOT EXISTS (SELECT 1 FROM pg_type a WHERE a.typarray = t.oid)) w LIMIT 1", 1, params, &rows);
+	if (rows.nrows > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("schema \"%s\" holds %s no commit holds, which the commit's definitions could be taken for",
+						schema, ws_sql_value(&rows, 0, 0))));
+	ws_sql_rows_free(&rows);
+}
+
 void
 ws_obj_restore(const WsObject *objs, int n, const char *schema)
 {
@@ -1114,6 +1319,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema)
 	}
 	ws_schema_check_relation_defaults(schema);
 	level = WsSql->begin();
+	check_nothing_captures(schema);
 	nest = path_begin(schema);
 	for (int i = 0; i < n; i++)
 	{

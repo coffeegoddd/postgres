@@ -21,8 +21,8 @@ static char *one_dep[] = {"view/a"};
 static WsObjectComment comments[] = {{.text = "on it"}, {.column = "c",.text = "on c"}};
 static WsObjectGrant grants[] = {
 	{.grantee = NULL,.privileges = "r"},
-	{.grantee = "g",.grant_option = true,.privileges = "ar"},
-	{.column = "c",.grantee = "g",.privileges = "r"},
+	{.grantee = "h",.grant_option = true,.privileges = "ar"},
+	{.column = "c",.grantee = "h",.privileges = "r"},
 };
 
 static WsObject
@@ -42,8 +42,14 @@ check_same(const WsObject *a, const WsObject *b)
 	CHECK(strcmp(a->name, b->name) == 0);
 	CHECK(strcmp(a->definition, b->definition) == 0);
 	CHECK_EQ(a->ndeps, b->ndeps);
+	for (int i = 0; i < a->ndeps; i++)
+		CHECK(strcmp(a->deps[i], b->deps[i]) == 0);
 	CHECK_EQ(a->ncomments, b->ncomments);
+	for (int i = 0; i < a->ncomments; i++)
+		CHECK(strcmp(a->comments[i].text, b->comments[i].text) == 0);
 	CHECK_EQ(a->ngrants, b->ngrants);
+	for (int i = 0; i < a->ngrants; i++)
+		CHECK(strcmp(a->grants[i].privileges, b->grants[i].privileges) == 0);
 }
 
 ENGINE_TEST(test_bytes)
@@ -132,6 +138,15 @@ ENGINE_TEST(test_malformed)
 
 	for (int i = 0; i < lengthof(bad); i++)
 		expect_error(decode_bad, &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
+
+	/* (what they are all wrong next to is right) */
+	{
+		WsObject	o;
+
+		WsObjectCodec->decode((const uint8 *) "view/v", 6, ok, sizeof(ok), &o);
+		CHECK(strcmp(o.definition, "x") == 0);
+		ws_obj_free(&o);
+	}
 }
 
 ENGINE_TEST(test_problems)
@@ -139,7 +154,7 @@ ENGINE_TEST(test_problems)
 	WsObject	o = example();
 	char	   *unordered[] = {"view/b", "view/a"};
 	WsObjectComment two_mine[] = {{.text = "x"}, {.text = "y"}};
-	WsObjectGrant twice[] = {{.grantee = "g",.privileges = "r"}, {.grantee = "g",.privileges = "a"}};
+	WsObjectGrant twice[] = {{.grantee = "h",.privileges = "r"}, {.grantee = "h",.privileges = "a"}};
 
 	CHECK(ws_obj_problem(&o) == NULL);
 	o.definition = "a lone @";
@@ -158,6 +173,29 @@ ENGINE_TEST(test_problems)
 	o = example();
 	o.owner = "pg_monitor";
 	CHECK(ws_obj_problem(&o) != NULL);
+	{
+		WsObjectComment empty[] = {{.text = ""}};
+		WsObjectGrant to_owner[] = {{.grantee = "g",.privileges = "r"}};
+		WsObjectGrant overlapping[] = {{.grantee = "h",.privileges = "r"},
+		{.grantee = "h",.grant_option = true,.privileges = "ar"}};
+		WsObjectGrant apart[] = {{.grantee = "h",.privileges = "r"},
+		{.grantee = "h",.grant_option = true,.privileges = "a"}};
+
+		o = example();
+		o.comments = empty;
+		o.ncomments = 1;
+		CHECK(ws_obj_problem(&o) != NULL);
+		o = example();
+		o.grants = to_owner;
+		o.ngrants = 1;
+		CHECK(ws_obj_problem(&o) != NULL);
+		o = example();
+		o.grants = overlapping;
+		o.ngrants = 2;
+		CHECK(ws_obj_problem(&o) != NULL);
+		o.grants = apart;
+		CHECK(ws_obj_problem(&o) == NULL);
+	}
 }
 
 static bool
@@ -248,8 +286,8 @@ ENGINE_TEST(test_statements)
 	static const char want[] = "CREATE VIEW s.at AS SELECT 'a@b'::text AS c";
 	static const char want_m_made[] = "CREATE MATERIALIZED VIEW s.m AS SELECT 1 AS c WITH NO DATA";
 	static const char want_comment[] = "COMMENT ON COLUMN s.v.c IS 'on c'";
-	static const char want_grant[] = "GRANT SELECT (c) ON TABLE s.v TO g";
-	static const char want_all[] = "GRANT INSERT, SELECT ON TABLE s.v TO g WITH GRANT OPTION";
+	static const char want_grant[] = "GRANT SELECT (c) ON TABLE s.v TO h";
+	static const char want_all[] = "GRANT INSERT, SELECT ON TABLE s.v TO h WITH GRANT OPTION";
 	static const char want_owner[] = "ALTER VIEW s.v OWNER TO g";
 	static const char want_m[] = "ALTER MATERIALIZED VIEW s.m OWNER TO g";
 

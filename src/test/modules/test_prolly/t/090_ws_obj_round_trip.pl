@@ -105,7 +105,17 @@ my @refused = (
 	[ q{CREATE MATERIALIZED VIEW r_idx AS SELECT a FROM t; CREATE INDEX ON r_idx (a)}, 'an index', undef, 'DROP MATERIALIZED VIEW "S rc".r_idx' ],
 	[ q{CREATE VIEW r_def AS SELECT a FROM t; ALTER VIEW r_def ALTER COLUMN a SET DEFAULT 1}, 'a default', undef, 'DROP VIEW "S rc".r_def' ],
 	[ q{CREATE VIEW r_rule AS SELECT a FROM t; CREATE RULE r AS ON DELETE TO r_rule DO INSTEAD NOTHING}, 'a rule', undef, 'DROP VIEW "S rc".r_rule' ],
-	[ q{CREATE TABLE pg_class (x int); CREATE VIEW r_shadow AS SELECT x FROM "S rc".pg_class}, 'named as a catalog is', undef, 'DROP TABLE "S rc".pg_class CASCADE' ],
+	[ q{CREATE TABLE pg_class (x int); CREATE VIEW r_shadow AS SELECT x FROM "S rc".pg_class}, "say its schema's name", undef, 'DROP TABLE "S rc".pg_class CASCADE' ],
+	[ q{CREATE TABLE "text" (x int); CREATE VIEW r_rowtype AS SELECT NULL::"S rc"."text" AS y}, "say its schema's name", undef, 'DROP TABLE "S rc"."text" CASCADE' ],
+	[ q{CREATE VIEW r_nsp AS SELECT '"S rc"'::regnamespace AS n}, 'no commit holds yet', undef, 'DROP VIEW "S rc".r_nsp' ],
+	[ q{CREATE VIEW r_nsp2 AS SELECT 'public'::regnamespace AS n}, 'no commit holds yet', undef, 'DROP VIEW "S rc".r_nsp2' ],
+	[ q{CREATE VIEW r_values (x, y) AS VALUES (1, 2)}, 'a VALUES list', undef, 'DROP VIEW "S rc".r_values' ],
+	[ q{CREATE VIEW r_self AS SELECT 1 AS a; CREATE OR REPLACE VIEW r_self AS SELECT a FROM r_self}, 'needs itself', undef, 'DROP VIEW "S rc".r_self' ],
+	[ q{CREATE VIEW r_c1 AS SELECT 1 AS a; CREATE VIEW r_c2 AS SELECT a FROM r_c1; CREATE OR REPLACE VIEW r_c1 AS SELECT a FROM r_c2}, 'a cycle', undef, 'DROP VIEW "S rc".r_c1, "S rc".r_c2 CASCADE' ],
+	[ q{CREATE MATERIALIZED VIEW r_store AS SELECT b FROM t; ALTER MATERIALIZED VIEW r_store ALTER COLUMN b SET STORAGE EXTERNAL}, 'stored its own way', undef, 'DROP MATERIALIZED VIEW "S rc".r_store' ],
+	[ q{CREATE MATERIALIZED VIEW r_comp AS SELECT b FROM t; ALTER MATERIALIZED VIEW r_comp ALTER COLUMN b SET COMPRESSION pglz}, 'stored its own way', undef, 'DROP MATERIALIZED VIEW "S rc".r_comp' ],
+	[ q{CREATE MATERIALIZED VIEW r_toast AS SELECT b FROM t; ALTER MATERIALIZED VIEW r_toast SET (toast.autovacuum_enabled = false)}, 'its TOAST table', undef, 'DROP MATERIALIZED VIEW "S rc".r_toast' ],
+	[ q{CREATE VIEW r_revoked AS SELECT a FROM t; REVOKE DELETE ON r_revoked FROM CURRENT_USER}, 'rights have been changed', undef, 'DROP VIEW "S rc".r_revoked' ],
 	[ q{CREATE VIEW r_login AS SELECT a FROM t; GRANT SELECT ON r_login TO x_person}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_login' ],
 	[ q{CREATE VIEW r_pg AS SELECT a FROM t; GRANT SELECT ON r_pg TO pg_monitor}, 'which cannot travel', undef, 'DROP VIEW "S rc".r_pg' ],
 );
@@ -135,24 +145,42 @@ $node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA "D3" GRANT SEL
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D3')});
 like($err, qr/default privileges would change what is made/, 'default privileges refuse a restore');
 
-# a view's text means what it meant, whatever the schema shadows
+# what an unqualified name could be taken for is refused, the catalogs coming first or not
+$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW uses_json AS SELECT to_json(1) AS j});
 $fresh->('D4');
-$node->safe_psql('postgres', q{CREATE FUNCTION "D4".now() RETURNS int LANGUAGE sql AS 'SELECT 1'});
-$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW uses_now AS SELECT now() AS n});
-$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D4')});
-is( $node->safe_psql('postgres', q{SELECT format_type(atttypid, NULL) FROM pg_attribute WHERE attrelid = '"D4".uses_now'::regclass AND attname = 'n'}),
-	'timestamp with time zone',
-	'a schema cannot shadow the catalogs');
+$node->safe_psql('postgres', q{CREATE FUNCTION "D4".to_json(integer) RETURNS text LANGUAGE sql AS $$SELECT 'shadow'$$});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D4')});
+like($err, qr/schema "D4" holds a function no commit holds/, 'an overload in the destination refuses a restore');
+$fresh->('D5');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('S rc', 'D5')});
+is( $node->safe_psql('postgres', q{SELECT format_type(atttypid, NULL) FROM pg_attribute WHERE attrelid = '"D5".uses_json'::regclass AND attname = 'j'}),
+	'json', 'and without one it means what it did');
 
-# one snapshot: what a read saw of one view is what it saw of the next
+# one point in time, by what every read of a definition sees: the catalogs as they are
+$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW now_a AS SELECT a AS was FROM t});
 my $s = $node->background_psql('postgres');
 $s->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $s->query_safe('SELECT count(*) FROM pg_class');
-$node->safe_psql('postgres', q{SET search_path = "S rc"; CREATE VIEW later AS SELECT 1 AS x});
-my $old = $s->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
+$node->safe_psql('postgres', q{SET search_path = "S rc"; ALTER TABLE t RENAME COLUMN a TO a_new; CREATE VIEW later AS SELECT 1 AS x});
+my $rr = $s->query_safe(q{SELECT test_ws_obj_bytes('S rc')});
 $s->query_safe('COMMIT');
-unlike($old, qr/view\/later/, 'a read is of its snapshot');
-$s->quit;
+is($rr, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('S rc')}), 'an old snapshot reads what a new one does');
+like($rr, qr/view\/later/, 'names and all');
+like(pack('H*', (split /\t/, (grep { /^view\/now_a\t/ } split /\n/, $rr)[0])[1]), qr/a_new AS was/, 'with no mix of old and new');
+
+# and in READ COMMITTED, a rename under way is waited for
+my $renamer = $node->background_psql('postgres');
+$renamer->query_safe('BEGIN');
+$renamer->query_safe(q{ALTER TABLE "S rc".t RENAME COLUMN a_new TO a_rc});
+my $reader = $node->background_psql('postgres');
+$reader->query_until(qr/started/, "\\echo started\nSELECT test_ws_obj_bytes('S rc');\n\\echo done\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'it did not wait';
+$renamer->query_safe('COMMIT');
+$reader->{stdin} .= "\\echo finished\n";
+$reader->{run}->pump until $reader->{stdout} =~ /finished/;
+my $line = (grep { /^view\/now_a\t/ } split /\n/, $reader->{stdout})[0];
+like(pack('H*', (split /\t/, $line)[1]), qr/a_rc AS was/, 'and read as it left things');
+$_->quit for ($renamer, $reader, $s);
 
 $node->stop;
 done_testing();

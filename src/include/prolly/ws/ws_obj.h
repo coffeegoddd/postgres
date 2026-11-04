@@ -95,10 +95,11 @@ extern void ws_obj_free(WsObject *o);
 extern void ws_obj_key(WsObjectKind kind, const char *name, Buf *out);
 
 /*
- * The objects of a schema from the catalogs, through WsSql under one snapshot, in
- * key order, in *out, palloc'd, each the caller's to ws_obj_free.  An object it
- * cannot hold raises ERRCODE_FEATURE_NOT_SUPPORTED, naming it: nothing is left out
- * of a commit in silence.
+ * The objects of a schema from the catalogs as they are now, whatever this
+ * transaction's snapshot, each locked, with what it needs, until the transaction
+ * ends; through WsSql, in key order, in *out, palloc'd, each the caller's to
+ * ws_obj_free.  An object it cannot hold raises ERRCODE_FEATURE_NOT_SUPPORTED,
+ * naming it: nothing is left out of a commit in silence.
  */
 extern void ws_obj_read(const char *schema, WsObject **out, int *n);
 
@@ -131,7 +132,8 @@ extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema,
  * Makes the objects in schema, through WsSql, in restore order, with their comments
  * and grants and then their owners, the tables being there already.  Raises
  * ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would make them other than
- * they are held.
+ * they are held, or if the schema holds a function, operator, collation or type, as
+ * a definition's unqualified name could be taken for it.
  */
 extern void ws_obj_restore(const WsObject *objs, int n, const char *schema);
 
