@@ -49,6 +49,10 @@ is( $node->safe_psql('postgres', qq{
 # copied and written in one transaction, a value out of line and a sequence
 # moved on, and a crash
 my $to2 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+# (the crash above moved the source's sequence on, by what it logs ahead)
+my $was = $node->safe_psql('postgres',
+	"SET catalog_branch = $from; SELECT last_value FROM c.s");
+my $next = $was + 1;
 $node->safe_psql('postgres', qq{
 	BEGIN;
 	SELECT pg_branch_catalog_copy($from, $to2);
@@ -58,11 +62,14 @@ $node->safe_psql('postgres', qq{
 	COMMIT;
 });
 my $read2 = qq{SET catalog_branch = $to2;
-	SELECT a, length(big) FROM c.t; SELECT last_value FROM c.s};
-is($node->safe_psql('postgres', $read2), "2|64000\n6", 'written in the copying transaction');
+	SELECT a, length(big) FROM c.t; SELECT last_value >= $next FROM c.s};
+is($node->safe_psql('postgres', $read2), "2|64000\nt", 'written in the copying transaction');
+is( $node->safe_psql('postgres', "SET catalog_branch = $to2; SELECT last_value FROM c.s"),
+	$next,
+	'its sequence moved on from the copied value');
 $node->stop('immediate');
 $node->start;
-is($node->safe_psql('postgres', $read2), "2|64000\n6", 'and after a crash');
+is($node->safe_psql('postgres', $read2), "2|64000\nt", 'and after a crash, not behind');
 
 # a copy rolled back to a savepoint leaves nothing for commit to do
 my $to3 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
