@@ -24,6 +24,7 @@
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
+#include "utils/snapmgr.h"
 
 #define FK_DEFERRABLE 0x01
 #define FK_INITDEFERRED 0x02
@@ -324,7 +325,7 @@ ws_fk_refuse(const char *oid, const char *table)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run(refusal_sql, 1, params, &rows);
+	WsSql->read(refusal_sql, 1, params, &rows);
 	for (int i = 0; i < rows.nrows; i++)
 		if (ws_sql_value(&rows, i, 1) != NULL)
 			ereport(ERROR,
@@ -342,7 +343,9 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 	WsSqlRows	rows;
 	WsSqlRows	rel;
 
-	WsSql->run("SELECT c.oid::text, ns.nspbranch::text FROM pg_class c "
+	PushCopiedSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
+	WsSql->read("SELECT c.oid::text, ns.nspbranch::text FROM pg_class c "
 			   "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
 			   "WHERE ns.nspname = $1 AND c.relname = $2", 2, params, &rel);
 	if (rel.nrows == 1)
@@ -355,7 +358,7 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 	}
 	ws_sql_rows_free(&rel);
 
-	WsSql->run("SELECT k.conname::text, p.relname::text, k.confmatchtype::text, "
+	WsSql->read("SELECT k.conname::text, p.relname::text, k.confmatchtype::text, "
 			   "  k.confupdtype::text, k.confdeltype::text, k.condeferrable::text, "
 			   "  k.condeferred::text, k.convalidated::text, "
 			   TAGS_OF("k.conkey", "k.conrelid") ", "
@@ -391,6 +394,7 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 	if (*n > 1)
 		qsort(*out, *n, sizeof(WsForeignKey), fk_cmp);
 	ws_sql_rows_free(&rows);
+	PopActiveSnapshot();
 	WsSql->end(level);
 }
 

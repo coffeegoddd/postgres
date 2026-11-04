@@ -47,7 +47,9 @@
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "catalog/indexing.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -68,10 +70,12 @@
 #include "prolly/ws/ws_tags.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #define WS_SCHEMA_VERSION 1
@@ -471,8 +475,23 @@ comments_problem(const WsTableSchema *s)
 					if (m->tag != 0 || m->name == NULL)
 						return "a comment on a constraint the table does not have";
 					found = s->key_name != NULL && strcmp(s->key_name, m->name) == 0;
-					for (int k = 0; k < s->nconstraints && !found; k++)
-						found = strcmp(s->constraints[k].name, m->name) == 0;
+					/* (in order by name, already checked: a record may hold a great many) */
+					{
+						int			lo = 0,
+									hi = s->nconstraints - 1;
+
+						while (lo <= hi && !found)
+						{
+							int			mid = lo + (hi - lo) / 2;
+							int			cmp = strcmp(m->name, s->constraints[mid].name);
+
+							found = cmp == 0;
+							if (cmp < 0)
+								hi = mid - 1;
+							else
+								lo = mid + 1;
+						}
+					}
 					for (int k = 0; k < s->ncols && !found; k++)
 						found = s->cols[k].not_null != NULL && strcmp(s->cols[k].not_null, m->name) == 0;
 					if (!found)
@@ -499,7 +518,7 @@ comments_problem(const WsTableSchema *s)
 	return NULL;
 }
 
-/* The privileges each target can have, in order by byte. */
+/* The privileges each target can have. */
 static const char *
 grantable_letters(char target)
 {
@@ -546,6 +565,8 @@ grants_problem(const WsTableSchema *s)
 			return "a grantee of no name, or too long a one";
 		if (g->grantee != NULL && s->owner != NULL && strcmp(g->grantee, s->owner) == 0)
 			return "a grant to the table's owner";
+		if (g->grantee == NULL && g->grant_option)
+			return "a grant option to PUBLIC, who cannot have one";
 		if (g->privileges == NULL || g->privileges[0] == '\0')
 			return "a grant of no privileges";
 		for (const char *l = g->privileges; *l; l++)
@@ -3876,6 +3897,48 @@ ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out)
 }
 
 void
+ws_schema_check_destination(const char *schema)
+{
+	const char *params[1] = {schema};
+	int			level = WsSql->begin();
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT FROM pg_default_acl d WHERE d.defaclrole = current_user::regrole "
+			   "AND d.defaclobjtype IN ('r', 'S') AND (d.defaclnamespace = 0 "
+			   "  OR d.defaclnamespace = (SELECT n.oid FROM pg_namespace n WHERE n.nspname = $1))",
+			   1, params, &rows);
+	if (rows.nrows > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("default privileges would add to what is made in schema \"%s\"", schema)));
+	ws_sql_rows_free(&rows);
+	WsSql->end(level);
+}
+
+/*
+ * A record may name any role here.  One that can log in, or with powers no commit
+ * holds, it could not have been read with, so it came from somewhere it should not.
+ */
+static void
+check_role_may_travel(const WsTableSchema *s, const char *role)
+{
+	HeapTuple	tup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
+
+	if (IsReservedName(role))
+		not_the_record(s, "a predefined role");
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_authid r = (Form_pg_authid) GETSTRUCT(tup);
+		bool		bad = r->rolcanlogin || r->rolsuper || r->rolcreaterole || r->rolcreatedb ||
+			r->rolreplication || r->rolbypassrls;
+
+		ReleaseSysCache(tup);
+		if (bad)
+			not_the_record(s, "a role that can log in, or with powers no commit holds");
+	}
+}
+
+void
 ws_schema_owner(const WsTableSchema *s, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
@@ -3893,6 +3956,7 @@ ws_schema_owner(const WsTableSchema *s, const char *schema, Buf *out)
 	ws_put_identifier(&sql, schema);
 	ws_put_text(&sql, ".");
 	ws_put_identifier(&sql, here.name);
+	check_role_may_travel(&here, here.owner);
 	ws_put_text(&sql, " OWNER TO ");
 	ws_put_identifier(&sql, here.owner);
 	buf_append_byte(&sql, 0);
@@ -3914,6 +3978,21 @@ ws_schema_grant(const WsTableSchema *s, int n, const char *schema, Buf *out)
 		elog(ERROR, "no grant %d", n);
 	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
+	if (here.grants[n].grantee != NULL)
+	{
+		check_role_may_travel(&here, here.grants[n].grantee);
+
+		/*
+		 * With no owner in the record, who restores owns it, and a grant to that
+		 * role is one to its owner, which a read would not see again.
+		 */
+		if (here.owner == NULL &&
+			strcmp(here.grants[n].grantee, GetUserNameFromId(GetUserId(), false)) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("table \"%s\" has a grant to role \"%s\", who would own it",
+							here.name, here.grants[n].grantee)));
+	}
 	write_grant(&here, &here.grants[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_grant_statement(&here, &here.grants[n], schema, (char *) sql.data);
@@ -4030,13 +4109,13 @@ static const char *const unsupported_sql =
 "  UNION ALL SELECT p.objid FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
 "    AND p.refclassid = 'pg_class'::regclass AND p.refobjid = $1::oid AND p.deptype = 'i' "
 "    AND p.refobjsubid > 0), "
-"acls(grantor, grantee, is_table, owner) AS ( "
-"  SELECT e.grantor, e.grantee, true, q.relowner FROM pg_class q, aclexplode(q.relacl) e "
+"acls(grantor, grantee, kind, owner, priv) AS ( "
+"  SELECT e.grantor, e.grantee, 't', q.relowner, e.privilege_type FROM pg_class q, aclexplode(q.relacl) e "
 "    WHERE q.oid = $1::oid "
-"  UNION ALL SELECT e.grantor, e.grantee, false, q.relowner FROM pg_class q "
+"  UNION ALL SELECT e.grantor, e.grantee, 'c', q.relowner, e.privilege_type FROM pg_class q "
 "    JOIN pg_attribute a ON a.attrelid = q.oid, aclexplode(a.attacl) e "
 "    WHERE q.oid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
-"  UNION ALL SELECT e.grantor, e.grantee, true, q.relowner FROM pg_class q, aclexplode(q.relacl) e "
+"  UNION ALL SELECT e.grantor, e.grantee, 's', q.relowner, e.privilege_type FROM pg_class q, aclexplode(q.relacl) e "
 "    WHERE q.oid IN (SELECT o FROM own) AND q.relkind = 'S') "
 "SELECT CASE "
 "  WHEN EXISTS (SELECT FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
@@ -4123,15 +4202,33 @@ static const char *const unsupported_sql =
 "  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
 "                (SELECT k.oid FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'f')) "
 "    THEN 'a foreign key has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d WHERE d.classoid = 'pg_type'::regclass AND d.objoid = c.reltype) "
+"    THEN 'its row type has a comment' "
+"  WHEN EXISTS (SELECT FROM pg_description d JOIN pg_index x ON x.indexrelid = d.objoid "
+"               WHERE d.classoid = 'pg_class'::regclass AND x.indrelid = c.reltoastrelid) "
+"    THEN 'its TOAST table has a comment' "
 "  WHEN EXISTS (SELECT FROM pg_seclabel l WHERE l.classoid = 'pg_class'::regclass "
 "               AND l.objoid IN (SELECT o FROM own)) THEN 'it has a security label' "
+"  WHEN EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum < 0 AND a.attacl IS NOT NULL) "
+"    THEN 'a system column has a grant' "
+"  WHEN EXISTS (SELECT FROM pg_class t WHERE t.oid = c.reltoastrelid AND t.relacl IS NOT NULL) "
+"    THEN 'its TOAST table has a grant' "
+"  WHEN EXISTS (SELECT FROM acls g WHERE g.grantee <> 0 AND NOT EXISTS (SELECT FROM pg_roles r WHERE r.oid = g.grantee)) "
+"    THEN 'it has a grant to a role that does not exist' "
+"  WHEN EXISTS (SELECT FROM acls g WHERE NOT ("
+"      (g.kind = 't' AND g.priv IN ('INSERT', 'SELECT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN')) OR "
+"      (g.kind = 'c' AND g.priv IN ('INSERT', 'SELECT', 'UPDATE', 'REFERENCES')) OR "
+"      (g.kind = 's' AND g.priv IN ('USAGE', 'SELECT', 'UPDATE')))) "
+"    THEN 'it has a grant of a privilege a commit does not know' "
 "  WHEN EXISTS (SELECT FROM acls g WHERE g.grantor <> g.owner) "
 "    THEN 'it has a grant by someone other than its owner' "
 "  WHEN EXISTS (SELECT FROM acls g JOIN pg_roles r ON r.oid = g.grantee WHERE g.grantee <> g.owner AND "
-"               (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)) "
+"               (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls "
+"                OR r.rolname::text LIKE 'pg\\_%')) "
 "    THEN 'it has a grant to a role that can log in, or with powers no commit holds: use a group role' "
 "  WHEN EXISTS (SELECT FROM pg_roles r WHERE r.oid = c.relowner AND NOT r.rolcanlogin AND "
-"               (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)) "
+"               (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls "
+"                OR r.rolname::text LIKE 'pg\\_%')) "
 "    THEN 'its owner has powers no commit holds' "
 "  WHEN EXISTS (SELECT FROM pg_class q WHERE (q.oid = c.oid OR (q.oid IN (SELECT o FROM own) AND q.relkind = 'S')) "
 "               AND q.relacl IS NOT NULL AND "
@@ -4140,7 +4237,7 @@ static const char *const unsupported_sql =
 "               (SELECT array_agg(e.privilege_type ORDER BY e.privilege_type) "
 "                  FROM aclexplode(acldefault(CASE q.relkind WHEN 'S' THEN 's' ELSE 'r' END::\"char\", q.relowner)) e)) "
 "    THEN 'its owner has other rights than owning gives' "
-"  WHEN EXISTS (SELECT FROM acls g WHERE NOT g.is_table AND g.grantee = g.owner) "
+"  WHEN EXISTS (SELECT FROM acls g WHERE g.kind = 'c' AND g.grantee = g.owner) "
 "    THEN 'its owner has other rights than owning gives' "
 "  WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'n' AND "
 "               (NOT k.convalidated OR k.connoinherit)) "
@@ -4312,7 +4409,7 @@ read_index_key(const char *table, const char *index_oid, int k, const IndexElem 
 		WsSqlRows	one;
 
 		snprintf(colno, sizeof(colno), "%d", k + 1);
-		WsSql->run("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
+		WsSql->read("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
 		if (ws_sql_value(&one, 0, 0) == NULL)
 			index_gone(table);
 		key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
@@ -4346,7 +4443,7 @@ read_exclusion(const char *table, const char *con_oid, const char *index_oid, co
 
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(atooid(index_oid))))
 		index_gone(table);
-	WsSql->run("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
+	WsSql->read("SELECT pg_get_constraintdef($1::oid)", 1, params, &printed);
 	if (ws_sql_value(&printed, 0, 0) == NULL)
 		index_gone(table);
 	parsed = raw_parser(psprintf("CREATE TABLE t (CONSTRAINT c %s)", ws_sql_value(&printed, 0, 0)),
@@ -4452,7 +4549,7 @@ read_partitioning(const char *table, const char *oid, ReadCols *rc, WsTableSchem
 			exprs = (List *) stringToNode(TextDatumGetCString(datum));
 	}
 	ReleaseSysCache(tup);
-	WsSql->run("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
+	WsSql->read("SELECT pg_get_partkeydef($1::oid)", 1, params, &printed);
 	if (ws_sql_value(&printed, 0, 0) == NULL)
 		elog(ERROR, "partitioned table \"%s\" printed no partitioning", table);
 	parsed = raw_parser(psprintf("CREATE TABLE t () PARTITION BY %s", ws_sql_value(&printed, 0, 0)),
@@ -4516,7 +4613,7 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
+	WsSql->read("SELECT o, false FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid "
 			   "UNION ALL SELECT o, true FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid, "
 			   "  unnest(t.reloptions) o WHERE c.oid = $1::oid", 1, params, &rows);
 	/*
@@ -4570,7 +4667,7 @@ read_options(const char *table, const char *oid, const WsSqlRows *cols, WsTableS
 			qsort(out->options, out->noptions, sizeof(WsOption), option_cmp);
 	}
 	ws_sql_rows_free(&rows);
-	WsSql->run("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
+	WsSql->read("SELECT a.attnum::text, o FROM pg_attribute a, unnest(a.attoptions) o "
 			   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY 1", 1, params, &rows);
 	for (int r = 0; r < rows.nrows;)
 	{
@@ -4635,7 +4732,7 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 	WsSqlRows	idx;
 	int			n = 0;
 
-	WsSql->run("SELECT ic.relname::text, ic.oid::text, "
+	WsSql->read("SELECT ic.relname::text, ic.oid::text, "
 			   "  CASE WHEN EXISTS (SELECT FROM pg_constraint k WHERE k.conindid = i.indexrelid "
 			   "      AND k.conrelid = i.indrelid AND k.contype IN ('p', 'u')) "
 			   "    THEN i.indnatts - i.indnkeyatts ELSE 0 END::text, "
@@ -4658,14 +4755,14 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 			set->include = px_malloc((size_t) set->ninclude * sizeof(uint64));
 			read_col_tags(table, cols, out, ws_sql_value(&idx, r, 3), set->ninclude, set->include);
 		}
-		WsSql->run("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
+		WsSql->read("SELECT o FROM pg_class c, unnest(c.reloptions) o WHERE c.oid = $1::oid", 1, iparams, &opts);
 		if (opts.nrows > 0)
 		{
 			set->options = read_option_rows(&opts, 0, 0, opts.nrows);
 			set->noptions = opts.nrows;
 		}
 		ws_sql_rows_free(&opts);
-		WsSql->run("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
+		WsSql->read("SELECT a.attnum::text, a.attstattarget::text FROM pg_attribute a "
 				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND a.attstattarget IS NOT NULL "
 				   "ORDER BY a.attnum", 1, iparams, &atts);
 		if (atts.nrows > 0)
@@ -4679,7 +4776,7 @@ read_index_settings(const char *table, const char *oid, const WsSqlRows *cols, W
 			}
 		}
 		ws_sql_rows_free(&atts);
-		WsSql->run("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
+		WsSql->read("SELECT a.attnum, o FROM pg_attribute a, unnest(a.attoptions) o "
 				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 ORDER BY a.attnum", 1, iparams, &keyopts);
 		if (keyopts.nrows > 0)
 		{
@@ -4727,14 +4824,18 @@ comment_cmp(const void *a, const void *b)
 	return x->name != NULL && y->name != NULL ? strcmp(x->name, y->name) : 0;
 }
 
-/* The comments on what the record holds; on any other, refused above. */
+/*
+ * The comments on what the record holds: those on a foreign key, a row type or a
+ * TOAST table are refused above, and those on triggers and the like go with those
+ * objects, which are not the table's.
+ */
 static void
 read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT 't', NULL::text, d.description FROM pg_description d "
+	WsSql->read("SELECT 't', NULL::text, d.description FROM pg_description d "
 			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid = 0 "
 			   "UNION ALL SELECT 'c', d.objsubid::text, d.description FROM pg_description d "
 			   "  WHERE d.classoid = 'pg_class'::regclass AND d.objoid = $1::oid AND d.objsubid > 0 "
@@ -4778,6 +4879,35 @@ read_comments(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 	ws_sql_rows_free(&rows);
 }
 
+/*
+ * A role's name as a commit holds it.  Roles are shared by a cluster's databases and
+ * a name's bytes are in the encoding of whichever made it, so if theirs differ, what
+ * is not ASCII here may be another name, or not this encoding at all.
+ */
+static char *
+role_name_to_utf8(const char *table, const char *role)
+{
+	bool		ascii = true;
+
+	for (const char *b = role; *b; b++)
+		ascii &= !IS_HIGHBIT_SET(*b);
+	if (!ascii)
+	{
+		WsSqlRows	rows;
+		bool		many;
+
+		WsSql->read("SELECT count(DISTINCT encoding) > 1 FROM pg_database", 0, NULL, &rows);
+		many = ws_sql_value(&rows, 0, 0)[0] == 't';
+		ws_sql_rows_free(&rows);
+		if (many)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the schema of table \"%s\" cannot be read yet: it names a role not in ASCII, in a cluster of databases of different encodings",
+							table)));
+	}
+	return ws_name_to_utf8(role);
+}
+
 static int
 grant_cmp(const void *a, const void *b)
 {
@@ -4797,7 +4927,7 @@ grant_cmp(const void *a, const void *b)
 
 /* Its owner, if the record holds it, and what it has granted, all refused above if not by it. */
 static void
-read_grants(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
+read_grants(const char *table, const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
@@ -4805,7 +4935,7 @@ read_grants(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 	WsSql->run("SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner "
 			   "WHERE c.oid = $1::oid AND NOT r.rolcanlogin", 1, params, &rows);
 	if (rows.nrows == 1)
-		out->owner = ws_name_to_utf8(ws_sql_value(&rows, 0, 0));
+		out->owner = role_name_to_utf8(table, ws_sql_value(&rows, 0, 0));
 	ws_sql_rows_free(&rows);
 	WsSql->run("WITH g(target, attnum, grantee, owner, is_grantable, privilege_type) AS ( "
 			   "  SELECT 't', NULL::int2, e.grantee, c.relowner, e.is_grantable, e.privilege_type "
@@ -4842,7 +4972,7 @@ read_grants(const char *oid, const WsSqlRows *cols, WsTableSchema *out)
 				if (g->tag == 0)
 					elog(ERROR, "a grant on a column the table does not have");
 			}
-			g->grantee = ws_sql_value(&rows, i, 2) ? ws_name_to_utf8(ws_sql_value(&rows, i, 2)) : NULL;
+			g->grantee = ws_sql_value(&rows, i, 2) ? role_name_to_utf8(table, ws_sql_value(&rows, i, 2)) : NULL;
 			g->grant_option = ws_sql_value(&rows, i, 3)[0] == 't';
 			/* (in order by byte, whatever order aclexplode gave them in) */
 			for (int a = 1; a < n; a++)
@@ -4868,7 +4998,7 @@ read_table_settings(const char *table, const char *oid, WsTableSchema *out)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT c.relreplident::text, "
+	WsSql->read("SELECT c.relreplident::text, "
 			   "  c.relrowsecurity::text, c.relforcerowsecurity::text, "
 			   "  (SELECT ic.relname::text FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 			   "    WHERE i.indrelid = c.oid AND i.indisreplident), "
@@ -4909,7 +5039,7 @@ read_inheritance(const char *oid, const WsSqlRows *cols, const WsSqlRows *others
 	WsSqlRows	parents;
 	int			n = 0;
 
-	WsSql->run("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
+	WsSql->read("SELECT q.relname::text FROM pg_inherits i JOIN pg_class q ON q.oid = i.inhparent "
 			   "WHERE i.inhrelid = $1::oid ORDER BY i.inhseqno", 1, params, &parents);
 	if (parents.nrows > 0)
 	{
@@ -5015,11 +5145,19 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("table \"%s\" is not in a versioned schema", table)));
+
+	/*
+	 * All the rest under one snapshot, taken now the lock is held, as that lock
+	 * keeps out only some of what can change a table's record: another
+	 * transaction's comment, or an index renamed, between one read and the next.
+	 */
+	PushCopiedSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 		WsSqlRows	why;
 
-		WsSql->run(unsupported_sql, 1, oid, &why);
+		WsSql->read(unsupported_sql, 1, oid, &why);
 		if (why.nrows == 1 && ws_sql_value(&why, 0, 0) != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -5032,7 +5170,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	{
 		const char *oid[1] = {ws_sql_value(&rel, 0, 0)};
 
-		WsSql->run("SELECT a.attnum::text, a.attname::text, "
+		WsSql->read("SELECT a.attnum::text, a.attname::text, "
 				   "  format_type(a.atttypid, a.atttypmod), a.attnotnull::text, "
 				   "  a.attidentity::text, a.attgenerated::text, "
 				   "  pg_get_expr(d.adbin, d.adrelid), "
@@ -5058,7 +5196,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace "
 				   "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped "
 				   "ORDER BY a.attnum", 1, oid, &cols);
-		WsSql->run("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
+		WsSql->read("SELECT con.conname::text, con.contype::text, pg_get_expr(con.conbin, con.conrelid), "
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				   "  i.indnullsnotdistinct::text, con.condeferrable::text, con.condeferred::text, "
 				   "  con.oid::text, "
@@ -5067,14 +5205,14 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 				   "  con.conislocal::text "
 				   "FROM pg_constraint con LEFT JOIN pg_index i ON i.indexrelid = con.conindid "
 				   "WHERE con.conrelid = $1::oid AND con.contype IN ('c', 'u', 'x')", 1, oid, &others);
-		WsSql->run("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
+		WsSql->read("SELECT ic.relname::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
 				   "  pg_get_expr(i.indpred, i.indrelid) "
 				   "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
 				   "WHERE i.indrelid = $1::oid AND NOT EXISTS (SELECT FROM pg_constraint k "
 				   "  WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid "
 				   "    AND k.contype <> 'f')",
 				   1, oid, &idxs);
-		WsSql->run("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
+		WsSql->read("SELECT con.conname::text, i.indnkeyatts::text, i.indnatts::text, "
 				   "  con.condeferrable::text, "
 				   "  array_to_string((i.indkey::int2[])[0:i.indnkeyatts - 1], ' '), "
 				   "  con.condeferred::text "
@@ -5209,11 +5347,12 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 		qsort(out->indexes, out->nindexes, sizeof(WsIndex), index_cmp);
 	if (relkind[0] == RELKIND_PARTITIONED_TABLE)
 		read_partitioning(table, ws_sql_value(&rel, 0, 0), &rc, out);
+	INJECTION_POINT("ws-schema-read-between", NULL);
 	read_options(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_index_settings(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	read_table_settings(table, ws_sql_value(&rel, 0, 0), out);
 	read_comments(ws_sql_value(&rel, 0, 0), &cols, out);
-	read_grants(ws_sql_value(&rel, 0, 0), &cols, out);
+	read_grants(table, ws_sql_value(&rel, 0, 0), &cols, out);
 	/* (their keys' parameters, in the settings, tell them apart) */
 	for (int i = 0; i < out->nconstraints; i++)
 		for (int j = 0; j < i; j++)
@@ -5240,6 +5379,7 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&key);
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
+	PopActiveSnapshot();
 	WsSql->end(level);
 	return true;
 }

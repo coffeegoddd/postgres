@@ -2499,6 +2499,19 @@ test_comments(void)
 	HAS("not in order", {.kind = 't',.text = "x"}, {.kind = 'c',.tag = 7,.text = "x"});
 	HAS("not in order", {.kind = 't',.text = "x"}, {.kind = 't',.text = "y"});
 	HAS("not in order", {.kind = 'c',.tag = 7,.text = "x"}, {.kind = 'c',.tag = 7,.text = "y"});
+	ix.name = "j";
+	{
+		WsIndex		two[] = {ix, ix};
+
+		two[0].name = "i";
+		s.nindexes = 2;
+		s.indexes = two;
+		HAS("not in order", {.kind = 'i',.name = "j",.text = "x"}, {.kind = 'i',.name = "i",.text = "x"});
+		HAS("not in order", {.kind = 'i',.name = "i",.text = "x"}, {.kind = 'i',.name = "i",.text = "y"});
+		s.nindexes = 1;
+		s.indexes = &ix;
+	}
+	ix.name = "i";
 #undef HAS
 	cols[0].identity = WS_IDENTITY_NONE;
 	cols[0].identity_seq = NULL;
@@ -2537,11 +2550,44 @@ test_comment_quoted(void)
 	Buf			b = BUF_INIT;
 
 	ws_schema_comment(&s, 0, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strstr((char *) b.data, "COMMENT ON TABLE x.\"t; DROP\" IS E'x''; DROP TABLE x.t; --") != NULL);
 	buf_free(&b);
 	s.comments = &onto;
 	b = (Buf) BUF_INIT;
 	ws_schema_comment(&s, 0, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "COMMENT ON COLUMN x.\"t; DROP\".\"a'; DROP\" IS 'y'") == 0);
 	buf_free(&b);
+	{
+		/* more than the decoder first makes room for */
+		WsComment	many[40];
+		char		names[40][8];
+		WsConstraint cons[40];
+		WsTableSchema t = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 40,.constraints = cons,
+		.ncomments = 40,.comments = many};
+		WsTableSchema got;
+
+		memset(cons, 0, sizeof(cons));
+		memset(many, 0, sizeof(many));
+		for (int i = 0; i < 40; i++)
+		{
+			snprintf(names[i], sizeof(names[i]), "c%02d", i);
+			cons[i].name = names[i];
+			cons[i].kind = WS_CONSTRAINT_CHECK;
+			cons[i].expr = "true";
+			many[i].kind = 'k';
+			many[i].name = names[i];
+			many[i].text = "x";
+		}
+		b = (Buf) BUF_INIT;
+		WsSchemaCodec->encode(&t, &b);
+		WsSchemaCodec->decode(b.data, b.len, &got);
+		CHECK_EQ(got.ncomments, 40);
+		CHECK(strcmp(got.comments[39].name, "c39") == 0);
+		ws_schema_free(&got);
+		buf_free(&b);
+	}
 }
 
 /* An owner and grants: bytes, and each one's statement. */
@@ -2608,13 +2654,14 @@ test_grants(void)
 	HAS("not in order", {.target = 't',.privileges = "ra"});
 	HAS("not in order", {.target = 't',.privileges = "aa"});
 	HAS("no name", {.target = 't',.grantee = "",.privileges = "r"});
+	HAS("to PUBLIC", {.target = 't',.grant_option = true,.privileges = "r"});
 	HAS("to the table's owner", {.target = 't',.grantee = "own",.privileges = "r"});
 	HAS("not in order", {.target = 't',.privileges = "r"}, {.target = 'c',.tag = 7,.privileges = "r"});
 	HAS("not in order", {.target = 't',.privileges = "r"}, {.target = 't',.privileges = "w"});
 	HAS("not in order", {.target = 't',.grantee = "b",.privileges = "r"}, {.target = 't',.grantee = "a",.privileges = "r"});
 	HAS("not in order", {.target = 't',.grantee = "a",.privileges = "r"}, {.target = 't',.privileges = "r"});
-	HAS("not in order", {.target = 't',.grant_option = true,.privileges = "r"}, {.target = 't',.privileges = "w"});
-	HAS("granted twice", {.target = 't',.privileges = "r"}, {.target = 't',.grant_option = true,.privileges = "r"});
+	HAS("not in order", {.target = 't',.grantee = "g",.grant_option = true,.privileges = "r"}, {.target = 't',.grantee = "g",.privileges = "w"});
+	HAS("granted twice", {.target = 't',.grantee = "g",.privileges = "r"}, {.target = 't',.grantee = "g",.grant_option = true,.privileges = "r"});
 #undef HAS
 	cols[0].identity = WS_IDENTITY_NONE;
 	cols[0].identity_seq = NULL;
@@ -2676,8 +2723,34 @@ test_grant_names(void)
 	buf_free(&b);
 	b = (Buf) BUF_INIT;
 	ws_schema_owner(&s, "x", &b);
+	buf_append_byte(&b, 0);
+	CHECK(strcmp((char *) b.data, "ALTER TABLE ONLY x.t OWNER TO \"o; DROP\"") == 0);
 	buf_free(&b);
 	expect_error(grant_public_named, "public", ERRCODE_DATA_CORRUPTED, NULL);
+	expect_error(grant_public_named, "pg_monitor", ERRCODE_DATA_CORRUPTED, NULL);
+	{
+		/* more than the decoder first makes room for */
+		WsGrant		many[40];
+		char		names[40][8];
+		WsTableSchema t = {.name = "t",.ncols = 1,.cols = cols,.ngrants = 40,.grants = many};
+		WsTableSchema got;
+
+		memset(many, 0, sizeof(many));
+		for (int i = 0; i < 40; i++)
+		{
+			snprintf(names[i], sizeof(names[i]), "g%02d", i);
+			many[i].target = 't';
+			many[i].grantee = names[i];
+			many[i].privileges = "r";
+		}
+		b = (Buf) BUF_INIT;
+		WsSchemaCodec->encode(&t, &b);
+		WsSchemaCodec->decode(b.data, b.len, &got);
+		CHECK_EQ(got.ngrants, 40);
+		CHECK(strcmp(got.grants[39].grantee, "g39") == 0);
+		ws_schema_free(&got);
+		buf_free(&b);
+	}
 }
 
 /* A column's not-null constraint's and sequence's names: what they must be. */

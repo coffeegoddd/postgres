@@ -433,6 +433,13 @@ extern void ws_schema_index_stats(const WsTableSchema *s, int n, const char *sch
 extern void ws_schema_comment(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
+ * Raises ERRCODE_FEATURE_NOT_SUPPORTED if default privileges would give what is made
+ * in the named schema, by the current role, grants a record does not say.  To call
+ * before making anything there.
+ */
+extern void ws_schema_check_destination(const char *schema);
+
+/*
  * The ALTER TABLE ONLY giving a table its owner, in the named schema, appended to
  * out; nothing, if the record holds none.  The GRANT giving the nth of its grants.
  * To run once everything is made, the owner first, the roles they name there

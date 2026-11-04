@@ -426,6 +426,14 @@ $node->safe_psql('postgres', q{
 	COMMENT ON TABLE src.cm_part IS 'the parent';
 	CREATE TABLE src.cm_part1 PARTITION OF src.cm_part FOR VALUES FROM (0) TO (1);
 	COMMENT ON TABLE src.cm_part1 IS 'its partition';
+	CREATE TABLE src.cm_clone (a integer NOT NULL, CONSTRAINT cm_clone_k PRIMARY KEY (a), CONSTRAINT cm_clone_c CHECK (a > 0)) PARTITION BY RANGE (a);
+	CREATE TABLE src.cm_clone1 PARTITION OF src.cm_clone FOR VALUES FROM (0) TO (1);
+	COMMENT ON CONSTRAINT cm_clone1_pkey ON src.cm_clone1 IS 'cm a partition''s key';
+	COMMENT ON CONSTRAINT cm_clone_c ON src.cm_clone1 IS 'cm an inherited check';
+	COMMENT ON INDEX src.cm_clone1_pkey IS 'cm a partition''s index';
+	CREATE TABLE src.cm_inh (a integer, CONSTRAINT cm_inh_c CHECK (a > 0));
+	CREATE TABLE src.cm_inh1 () INHERITS (src.cm_inh);
+	COMMENT ON CONSTRAINT cm_inh_c ON src.cm_inh1 IS 'cm an inherited check of a child';
 	CREATE ROLE rg_owner NOLOGIN;
 	CREATE ROLE rg_read NOLOGIN;
 	CREATE ROLE rg_write NOLOGIN;
@@ -433,6 +441,10 @@ $node->safe_psql('postgres', q{
 	CREATE ROLE rg_login LOGIN;
 	CREATE ROLE rg_powers NOLOGIN BYPASSRLS;
 	GRANT USAGE ON SCHEMA src TO rg_read;
+	CREATE ROLE "Rôle Odd" NOLOGIN;
+	CREATE TABLE src.g_odd (a integer);
+	ALTER TABLE src.g_odd OWNER TO "Rôle Odd";
+	GRANT SELECT ON src.g_odd TO rg_read;
 	CREATE TABLE src.g_all (a integer GENERATED ALWAYS AS IDENTITY, b integer, "Odd" text);
 	GRANT SELECT, INSERT ON src.g_all TO rg_read;
 	GRANT DELETE, TRUNCATE ON src.g_all TO rg_write;
@@ -479,7 +491,7 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'io_clu1', 'io_clu2', 'io_clu3', 'io_part', 'io_part1', 'io_ren',
 	'io_inc', 'io_ppart', 'io_ppart1', 'io_pdef', 'io_pdef1', 'io_prep', 'io_prep1', 'io_repck', 'io_xk',
 	'rs_on', 'rs_force', 'rs_both', 'rs_part', 'rs_part1', 'rs_inh', 'rs_inh1', 'rs_fkp', 'rs_fkc',
-	'cm', 'cm_ren', 'cm_part', 'cm_part1', 'g_all', 'g_owned', 'g_part', 'g_part1', 'g_ren');
+	'cm', 'cm_ren', 'cm_part', 'cm_part1', 'cm_clone', 'cm_clone1', 'cm_inh', 'cm_inh1', 'g_all', 'g_owned', 'g_part', 'g_part1', 'g_ren', 'g_odd');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -924,13 +936,45 @@ $node->safe_psql('postgres', q{
 my $cmts = q{SELECT string_agg(d.classoid::regclass::text || ' ' ||
 		coalesce((SELECT relname FROM pg_class WHERE oid = d.objoid AND d.classoid = 'pg_class'::regclass),
 			(SELECT conname FROM pg_constraint WHERE oid = d.objoid AND d.classoid = 'pg_constraint'::regclass)) || ' ' ||
-		d.objsubid || ': ' || d.description, E'\n' ORDER BY 1)
+		d.objsubid || ': ' || d.description, E'\n' ORDER BY d.classoid::regclass::text, d.objsubid, d.description)
 	FROM pg_description d WHERE (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT oid FROM pg_class WHERE relnamespace = '%1$s'::regnamespace AND relname LIKE 'cm%%'))
 		OR (d.classoid = 'pg_constraint'::regclass AND d.objoid IN (SELECT oid FROM pg_constraint WHERE connamespace = '%1$s'::regnamespace AND conname LIKE 'cm%%'))};
-$cmts =~ s/ORDER BY 1\)/ORDER BY d.classoid::regclass::text, d.description)/;
 isnt($node->safe_psql('postgres', sprintf($cmts, 'src')), '', '(there are some)');
 is($node->safe_psql('postgres', sprintf($cmts, 'dst')), $node->safe_psql('postgres', sprintf($cmts, 'src')), 'comments as they were');
-is($node->safe_psql('postgres', q{SELECT col_description('dst.cm_ren'::regclass, 1)}), 'followed', 'a comment follows its column by tag');
+is($node->safe_psql('postgres', q{SELECT col_description('dst.cm_ren'::regclass, 1)}), 'followed', 'a comment on a renamed column made again');
+
+# one read, one snapshot: what commits between its queries is not half in it
+if ($ENV{enable_injection_points} eq 'yes' && $node->check_extension('injection_points'))
+{
+	$node->safe_psql('postgres', q{
+		CREATE EXTENSION IF NOT EXISTS injection_points;
+		CREATE TABLE src.mid_p (id integer PRIMARY KEY);
+		CREATE TABLE src.mid (a integer, CONSTRAINT mid_k FOREIGN KEY (a) REFERENCES src.mid_p (id));
+		CREATE INDEX mid_i ON src.mid (a);
+		COMMENT ON INDEX src.mid_i IS 'an index';
+	});
+	my $before = $bytes->($node, 'postgres', 'mid');
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('ws-schema-read-between', 'wait')});
+	my $reader = $node->background_psql('postgres', on_error_stop => 0);
+	$reader->query_until(qr/reading/, q{\echo reading
+		SELECT encode(test_ws_schema_bytes('src', 'mid'), 'hex');
+		\echo done
+});
+	$node->poll_query_until('postgres',
+		q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event = 'ws-schema-read-between'}) or die 'no reader waiting';
+	$node->safe_psql('postgres', q{
+		ALTER INDEX src.mid_i RENAME TO mid_j;
+		COMMENT ON CONSTRAINT mid_k ON src.mid IS 'too late';
+		GRANT SELECT ON src.mid TO rg_login;
+		SELECT injection_points_wakeup('ws-schema-read-between');
+		SELECT injection_points_detach('ws-schema-read-between');
+	});
+	my $read = $reader->query_until(qr/done/, q{});
+	like($read, qr/\Q$before\E/, 'a read as of its one snapshot, not what committed since it began');
+	is($reader->{stderr}, '', '(and no error)');
+	$reader->quit;
+	$node->safe_psql('postgres', q{COMMENT ON CONSTRAINT mid_k ON src.mid IS NULL; REVOKE SELECT ON src.mid FROM rg_login});
+}
 
 # owners and grants as they were
 my $acls = q{SELECT string_agg(q.relname || ' ' || coalesce(q.relacl::text, '-') || ' ' || pg_get_userbyid(q.relowner) || ' ' ||
@@ -943,6 +987,47 @@ is($canon_acl->($node->safe_psql('postgres', sprintf($acls, 'dst'))), $canon_acl
 is($node->safe_psql('postgres', q{SELECT has_column_privilege('rg_read', 'dst.g_ren', 'z', 'SELECT')}), 't', 'a grant follows its column by tag');
 is($node->safe_psql('postgres', q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'dst.g_owned_a_seq'::regclass}), 'rg_owner',
 	'an identity\'s sequence goes with its table\'s owner');
+
+# what a destination would add, or a record should not have said
+$node->safe_psql('postgres', q{
+	CREATE SCHEMA dp VERSIONED;
+	CREATE TABLE src.g_dp (a integer GENERATED ALWAYS AS IDENTITY);
+	CREATE ROLE rg_later NOLOGIN;
+	CREATE TABLE src.g_later (a integer);
+	ALTER TABLE src.g_later OWNER TO rg_later;
+	CREATE ROLE rg_glater NOLOGIN;
+	CREATE TABLE src.g_glater (a integer);
+	GRANT SELECT ON src.g_glater TO rg_glater;
+	CREATE SCHEMA gl_dst VERSIONED;
+	CREATE TABLE src.g_self (a integer);
+	GRANT SELECT ON src.g_self TO rg_read;
+});
+{
+	my $hex = $bytes->($node, 'postgres', 'g_dp');
+	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp GRANT SELECT ON TABLES TO rg_read});
+	my ($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
+	like($err, qr/default privileges would add to what is made/, 'a destination whose default privileges would add to it refused');
+	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp REVOKE SELECT ON TABLES FROM rg_read;
+		ALTER DEFAULT PRIVILEGES IN SCHEMA dp GRANT USAGE ON SEQUENCES TO rg_read});
+	($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
+	like($err, qr/default privileges would add to what is made/, 'and on sequences');
+	$node->safe_psql('postgres', q{ALTER DEFAULT PRIVILEGES IN SCHEMA dp REVOKE USAGE ON SEQUENCES FROM rg_read});
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dp')});
+	is($bytes->($node, 'postgres', 'g_dp', undef, 'dp'), $hex, 'with none, the same bytes');
+
+	for my $t ([ 'g_later', 'rg_later' ], [ 'g_glater', 'rg_glater' ])
+	{
+		my $h = $bytes->($node, 'postgres', $t->[0]);
+		$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$h', 'hex'), 'gl_dst'); ALTER ROLE $t->[1] LOGIN});
+		($ret, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_schema_grants(decode('$h', 'hex'), 'gl_dst')});
+		like($err, qr/a role that can log in, or with powers/, "a record naming $t->[1], who can log in here, refused");
+		$node->safe_psql('postgres', qq{ALTER ROLE $t->[1] NOLOGIN});
+	}
+
+	my $self = $bytes->($node, 'postgres', 'g_self');
+	($ret, $out, $err) = $node->psql('postgres', qq{SET ROLE rg_read; SELECT test_ws_schema_grants(decode('$self', 'hex'), 'gl_dst')});
+	like($err, qr/has a grant to role "rg_read", who would own it/, 'a grant to who restores a table it would own refused');
+}
 
 # an owner that can log in is not held: whoever makes it owns it
 $node->safe_psql('postgres', q{CREATE ROLE rg_person LOGIN; GRANT CREATE, USAGE ON SCHEMA src TO rg_person;
@@ -988,7 +1073,7 @@ $node->safe_psql('postgres', q{CREATE SCHEMA dst2_idx VERSIONED});
 # (what each is refused for, where another clause could refuse it first)
 my %refused_for = (
 	ctrg => 'a constraint trigger',
-	fkcom => 'a foreign key has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace', 
+	fkcom => 'a foreign key has a comment', cmty => 'row type has a comment', cmto => 'TOAST table has a comment', xdup => 'two constraints alike', xspc => 'has a tablespace', 
 	repgone => 'no longer has', repgonek => 'no longer has', uoptd => 'two constraints alike', kuoptd => 'two constraints alike',
 	xoptd => 'two constraints alike', ixo1 => 'one for the other',
 	xext => 'depends on an extension', fksopt => 'has a tablespace',
@@ -1001,7 +1086,9 @@ my %refused_for = (
 	iext => 'depends on an extension', 
 	ispc => 'has a tablespace', 
 	gl => 'can log in', gsu => 'powers no commit holds', gby => 'other than its owner', gown => 'other rights', gsuo => 'its owner has powers',
-	gcown => 'other rights',
+	gcown => 'other rights', gcl => 'can log in', gsl => 'can log in', gbyc => 'other than its owner', gsown => 'other rights',
+	gsys => 'a system column', gtoast => 'TOAST table has a grant', gpg => 'powers no commit holds', gpgo => 'its owner has powers',
+	gunk => 'does not know', gdang => 'does not exist',
 	dup => 'two constraints alike', dupk => 'two constraints alike');
 for my $t (
 	[ 'pxs', q{CREATE SCHEMA ptother VERSIONED; CREATE TABLE src.pxs (a int) PARTITION BY RANGE (a); CREATE TABLE ptother.pxs1 PARTITION OF src.pxs FOR VALUES FROM (0) TO (1)} ],
@@ -1054,12 +1141,27 @@ for my $t (
 	[ 'kuoptd', 'CREATE TABLE src.kuoptd (a int PRIMARY KEY); ALTER TABLE src.kuoptd ADD CONSTRAINT kuoptd_2 UNIQUE (a) WITH (fillfactor = 50)' ],
 	[ 'xoptd', 'CREATE TABLE src.xoptd (r int4range, CONSTRAINT xoptd_1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xoptd ADD CONSTRAINT xoptd_2 EXCLUDE USING gist (r WITH &&) WITH (fillfactor = 50)' ],
 	[ 'ixo1', q{CREATE TABLE src.ixo (a integer) PARTITION BY RANGE (a); CREATE INDEX ixo_1 ON src.ixo (a); CREATE INDEX ixo_2 ON src.ixo (a) WITH (fillfactor = 50); CREATE TABLE src.ixo1 PARTITION OF src.ixo FOR VALUES FROM (0) TO (10)} ],
+	[ 'cmty', q{CREATE TABLE src.cmty (a int); COMMENT ON TYPE src.cmty IS 'x'} ],
+	[ 'cmto', q{CREATE TABLE src.cmto (a text);
+		SELECT format('COMMENT ON INDEX pg_toast.%I IS ''x''', i.relname) FROM pg_class t JOIN pg_index x ON x.indrelid = t.reltoastrelid JOIN pg_class i ON i.oid = x.indexrelid WHERE t.oid = 'src.cmto'::regclass \gexec} ],
 	[ 'fkcom', q{CREATE TABLE src.fkcom_p (id int PRIMARY KEY); CREATE TABLE src.fkcom (a int, CONSTRAINT fkcom_k FOREIGN KEY (a) REFERENCES src.fkcom_p (id)); COMMENT ON CONSTRAINT fkcom_k ON src.fkcom IS 'x'} ],
 	[ 'gl', q{CREATE TABLE src.gl (a int); GRANT SELECT ON src.gl TO rg_login} ],
 	[ 'gsu', q{CREATE TABLE src.gsu (a int); GRANT SELECT ON src.gsu TO rg_powers} ],
 	[ 'gby', q{CREATE TABLE src.gby (a int); GRANT SELECT ON src.gby TO rg_read WITH GRANT OPTION; SET ROLE rg_read; GRANT SELECT ON src.gby TO rg_write; RESET ROLE} ],
 	[ 'gown', q{CREATE TABLE src.gown (a int); REVOKE DELETE ON src.gown FROM CURRENT_USER} ],
 	[ 'gcown', q{CREATE TABLE src.gcown (a int); GRANT SELECT (a) ON src.gcown TO CURRENT_USER} ],
+	[ 'gcl', q{CREATE TABLE src.gcl (a int); GRANT SELECT (a) ON src.gcl TO rg_login} ],
+	[ 'gsl', q{CREATE TABLE src.gsl (a int GENERATED ALWAYS AS IDENTITY); GRANT USAGE ON SEQUENCE src.gsl_a_seq TO rg_login} ],
+	[ 'gbyc', q{CREATE TABLE src.gbyc (a int); GRANT SELECT (a) ON src.gbyc TO rg_read WITH GRANT OPTION; SET ROLE rg_read; GRANT SELECT (a) ON src.gbyc TO rg_write; RESET ROLE} ],
+	[ 'gsown', q{CREATE TABLE src.gsown (a int GENERATED ALWAYS AS IDENTITY); REVOKE UPDATE ON SEQUENCE src.gsown_a_seq FROM CURRENT_USER} ],
+	[ 'gsys', q{CREATE TABLE src.gsys (a int); GRANT SELECT (ctid) ON src.gsys TO rg_read} ],
+	[ 'gtoast', q{CREATE TABLE src.gtoast (a text);
+		SELECT format('GRANT SELECT ON pg_toast.%I TO rg_read', t.relname) FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid WHERE c.oid = 'src.gtoast'::regclass \gexec} ],
+	[ 'gpg', q{CREATE TABLE src.gpg (a int); GRANT SELECT ON src.gpg TO pg_monitor} ],
+	[ 'gpgo', q{CREATE TABLE src.gpgo (a int); ALTER TABLE src.gpgo OWNER TO pg_monitor} ],
+	[ 'gunk', q{CREATE TABLE src.gunk (a int);
+		UPDATE pg_class SET relacl = acldefault('r', relowner) || makeaclitem('rg_read'::regrole, relowner, 'CREATE', false) WHERE oid = 'src.gunk'::regclass} ],
+	[ 'gdang', q{CREATE TABLE src.gdang (a int); CREATE ROLE rg_gone NOLOGIN; GRANT SELECT ON src.gdang TO rg_gone; DELETE FROM pg_shdepend WHERE refobjid = 'rg_gone'::regrole; DELETE FROM pg_authid WHERE rolname = 'rg_gone'} ],
 	[ 'gsuo', q{CREATE TABLE src.gsuo (a int); ALTER TABLE src.gsuo OWNER TO rg_powers} ],
 	[ 'xdup', 'CREATE TABLE src.xdup (r int4range, CONSTRAINT x1 EXCLUDE USING gist (r WITH &&)); ALTER TABLE src.xdup ADD CONSTRAINT x2 EXCLUDE USING gist (r WITH &&)' ],
 	[ 'xspc', 'CREATE TABLE src.xspc (r int4range, EXCLUDE USING gist (r WITH &&) USING INDEX TABLESPACE t86)' ],
@@ -1670,16 +1772,36 @@ $node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE SCHEMA lié VERSION
 	like($err, qr/table "toasté" cannot be read yet/, 'a TOAST table\'s refusal in the server\'s encoding');
 }
 
+# a comment this encoding cannot hold, in a table made there: refused from the start
+{
+	$node->safe_psql('postgres', q{SET client_encoding = UTF8;
+		CREATE TABLE enc.cm_euro (a integer); COMMENT ON TABLE enc.cm_euro IS '€'});
+	my $hex = $node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('enc', 'cm_euro'), 'hex')});
+	my ($ret, $out, $err) = $node->psql('lat', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'dst')});
+	like($err, qr/has no equivalent in encoding/, 'a comment LATIN1 cannot hold refused');
+}
+# a role's name not in ASCII, in a cluster of databases of different encodings, can be
+# another name by the bytes: refused, either way round
+$node->safe_psql('postgres', q{SET client_encoding = UTF8; CREATE ROLE "lecteuré" NOLOGIN;
+	CREATE TABLE enc.g_oddu (a integer); GRANT SELECT ON enc.g_oddu TO "lecteuré"});
+$node->safe_psql('lat', q{SET client_encoding = UTF8; CREATE ROLE "propriété" NOLOGIN;
+	CREATE TABLE enc.g_oddl (a integer); ALTER TABLE enc.g_oddl OWNER TO "propriété"});
+{
+	my ($ret, $out, $err) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('enc', 'g_oddu')});
+	like($err, qr/names a role not in ASCII/, 'a role not in ASCII refused in UTF8');
+	($ret, $out, $err) = $node->psql('lat', q{SELECT test_ws_schema_bytes('enc', 'g_oddl')});
+	like($err, qr/names a role not in ASCII/, 'and in LATIN1');
+}
+
 # roles' names in each encoding
 my $gr_sql = q{
 	SET client_encoding = UTF8;
 	CREATE TABLE enc."droité" ("colonné" integer GENERATED ALWAYS AS IDENTITY);
-	ALTER TABLE enc."droité" OWNER TO "propriété";
-	GRANT SELECT ON enc."droité" TO "lecteuré";
-	GRANT SELECT ("colonné") ON enc."droité" TO "lecteuré";
+	ALTER TABLE enc."droité" OWNER TO rg_enc_owner;
+	GRANT SELECT ON enc."droité" TO rg_enc_read;
+	GRANT SELECT ("colonné") ON enc."droité" TO rg_enc_read;
 };
-# (a shared catalog's names are in whatever bytes made them, so each database makes its own)
-$node->safe_psql($_, q{SET client_encoding = UTF8; CREATE ROLE "propriété" NOLOGIN; CREATE ROLE "lecteuré" NOLOGIN}) for ('postgres', 'lat');
+$node->safe_psql('postgres', q{CREATE ROLE rg_enc_owner NOLOGIN; CREATE ROLE rg_enc_read NOLOGIN});
 $node->safe_psql($_, $gr_sql) for ('postgres', 'lat');
 my $gr_enc = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('%s', 'droité'), 'hex')};
 my $gr_utf8 = $node->safe_psql('postgres', sprintf($gr_enc, 'enc'));

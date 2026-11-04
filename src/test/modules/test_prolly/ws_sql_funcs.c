@@ -94,6 +94,7 @@ test_ws_schema_create(PG_FUNCTION_ARGS)
 	text	   *out;
 
 	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	ws_schema_check_destination(schema);
 	ws_schema_create_table(&s, schema, &sql);
 	buf_append_byte(&sql, 0);
 	WsSql->run((char *) sql.data, 0, NULL, &rows);
