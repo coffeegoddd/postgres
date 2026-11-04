@@ -15,12 +15,15 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "mb/pg_wchar.h"
@@ -31,7 +34,10 @@
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -441,22 +447,22 @@ ws_role_list(ProllyCtx *ctx, const PHash *map, WsRole **out, int *n)
 	const uint8 *val;
 	size_t		klen;
 	size_t		vlen;
-	uint64		count;
 	int			rc;
+	int			cap = 8;
 	int			i = 0;
 
-	rc = prolly_count(ctx, map, &count);
-	if (rc < 0)
-		prolly_report(ctx);
-	*out = palloc0_array(WsRole, Max(count, 1));
+	/* (grown as they are read: a root's count is not to be trusted with memory) */
+	*out = palloc0_array(WsRole, cap);
 	rc = prolly_iter_open(ctx, map, NULL, 0, &it);
 	if (rc < 0)
 		prolly_report(ctx);
 	while ((rc = prolly_iter_next(it, &key, &klen, &val, &vlen)) > 0)
 	{
-		/* (a root's count is as trusted as its entries, which is not at all) */
-		if ((uint64) i >= count)
-			malformed("a map of more keys than it says");
+		if (i == cap)
+		{
+			*out = repalloc0_array(*out, WsRole, cap, cap * 2);
+			cap *= 2;
+		}
 		WsRoleCodec->decode(key, klen, val, vlen, &(*out)[i++]);
 	}
 	if (rc < 0)
@@ -488,8 +494,130 @@ role_among(const WsRole *roles, int n, const char *name)
 	return false;
 }
 
+/* A membership's rows here, one a grantor. */
+typedef struct HereRow
+{
+	Oid			grantor;
+	bool		admin;
+	bool		inherit;
+	bool		set;
+} HereRow;
+
+/*
+ * What a role is a member of here, or of of alone if of is valid: from the catalog
+ * as GRANT will read it, not this transaction's snapshot, which may be old.
+ */
+static int
+memberships_here(Oid member, Oid of, HereRow **rows, Oid **ofs)
+{
+	Relation	rel = table_open(AuthMemRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	int			cap = 4;
+	int			n = 0;
+
+	ScanKeyInit(&key[0], Anum_pg_auth_members_member, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(member));
+	if (OidIsValid(of))
+		ScanKeyInit(&key[1], Anum_pg_auth_members_roleid, BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(of));
+	scan = systable_beginscan(rel, AuthMemMemRoleIndexId, true, NULL, OidIsValid(of) ? 2 : 1, key);
+	if (rows != NULL)
+		*rows = palloc_array(HereRow, cap);
+	if (ofs != NULL)
+		*ofs = palloc_array(Oid, cap);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_auth_members m = (Form_pg_auth_members) GETSTRUCT(tup);
+
+		if (n == cap)
+		{
+			cap *= 2;
+			if (rows != NULL)
+				*rows = repalloc_array(*rows, HereRow, cap);
+			if (ofs != NULL)
+				*ofs = repalloc_array(*ofs, Oid, cap);
+		}
+		if (rows != NULL)
+		{
+			(*rows)[n].grantor = m->grantor;
+			(*rows)[n].admin = m->admin_option;
+			(*rows)[n].inherit = m->inherit_option;
+			(*rows)[n].set = m->set_option;
+		}
+		if (ofs != NULL)
+			(*ofs)[n] = m->roleid;
+		n++;
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return n;
+}
+
+/* Whether a membership is here just as held: one row, of its options. */
+static bool
+membership_is_here(Oid member, Oid of, const WsRoleMembership *m)
+{
+	HereRow    *rows;
+	int			n = memberships_here(member, of, &rows, NULL);
+	bool		same = n == 1 && rows[0].admin == m->admin && rows[0].inherit == m->inherit &&
+		rows[0].set == m->set;
+
+	pfree(rows);
+	return same;
+}
+
+/*
+ * Refuses a membership of of that would reach, by memberships here, a role that
+ * roles do not hold: the role's members here would become members of it.
+ */
+static void
+check_reach(const WsRole *roles, int n, const char *role, Oid of)
+{
+	int			cap = 16;
+	Oid		   *seen = palloc_array(Oid, cap);
+	int			nseen = 0;
+
+	seen[nseen++] = of;
+	for (int q = 0; q < nseen; q++)
+	{
+		Oid		   *ofs;
+		int			m = memberships_here(seen[q], InvalidOid, NULL, &ofs);
+
+		CHECK_FOR_INTERRUPTS();
+		for (int i = 0; i < m; i++)
+		{
+			char	   *name = GetUserNameFromId(ofs[i], false);
+			char	   *held = pstrdup(pg_server_to_any(name, (int) strlen(name), PG_UTF8));
+			bool		dup = false;
+
+			if (!role_among(roles, n, held))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a commit's role \"%s\" would reach role \"%s\", which it does not hold",
+								role, name),
+						 errdetail("That role's members here would become members of it.")));
+			pfree(held);
+			for (int s = 0; s < nseen; s++)
+				dup |= seen[s] == ofs[i];
+			if (!dup)
+			{
+				if (nseen == cap)
+				{
+					cap *= 2;
+					seen = repalloc_array(seen, Oid, cap);
+				}
+				seen[nseen++] = ofs[i];
+			}
+		}
+		pfree(ofs);
+	}
+	pfree(seen);
+}
+
 void
-ws_role_check_arrival(const WsRole *roles, int n, const WsRole *known, int nknown)
+ws_role_check_arrival(const WsRole *roles, int n)
 {
 	for (int i = 0; i < n; i++)
 	{
@@ -497,6 +625,7 @@ ws_role_check_arrival(const WsRole *roles, int n, const WsRole *known, int nknow
 		char	   *here;
 		char	   *what;
 		const char *problem;
+		HeapTuple	tup;
 
 		CHECK_FOR_INTERRUPTS();
 		problem = ws_role_problem(r);
@@ -522,14 +651,72 @@ ws_role_check_arrival(const WsRole *roles, int n, const WsRole *known, int nknow
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("a commit's role \"%s\" cannot arrive here: %s", here, problem)));
-		if (SearchSysCacheExists1(AUTHNAME, PointerGetDatum(here)) && !role_among(known, nknown, r->name))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("a commit's role \"%s\" is here already, and not from this database", here),
-					 errdetail("What the commit grants would reach that role's members.")));
+		tup = SearchSysCache1(AUTHNAME, PointerGetDatum(here));
+		if (HeapTupleIsValid(tup))
+		{
+			bool		marked = ((Form_pg_authid) GETSTRUCT(tup))->roltravels;
+
+			ReleaseSysCache(tup);
+			if (!marked)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a commit's role \"%s\" is here already, and not held by any commit here", here),
+						 errdetail("What the commit grants would reach that role's members.")));
+		}
 		pfree(what);
 		pfree(here);
 	}
+	/* (once every role is known to be allowed: what a change here reaches) */
+	for (int i = 0; i < n; i++)
+	{
+		char	   *here = ws_name_from_utf8(roles[i].name);
+		Oid			member = get_role_oid(here, true);
+
+		for (int k = 0; k < roles[i].nmember_of; k++)
+		{
+			char	   *name = ws_name_from_utf8(roles[i].member_of[k].role);
+			Oid			of = get_role_oid(name, true);
+
+			if (OidIsValid(of) &&
+				(!OidIsValid(member) || !membership_is_here(member, of, &roles[i].member_of[k])))
+				check_reach(roles, n, here, of);
+			pfree(name);
+		}
+		pfree(here);
+	}
+}
+
+void
+ws_role_mark(const WsRole *roles, int n)
+{
+	Relation	rel = table_open(AuthIdRelationId, RowExclusiveLock);
+
+	for (int i = 0; i < n; i++)
+	{
+		char	   *here = ws_name_from_utf8(roles[i].name);
+		HeapTuple	tup = SearchSysCacheCopy1(AUTHNAME, PointerGetDatum(here));
+		Form_pg_authid form;
+
+		if (!HeapTupleIsValid(tup))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", here)));
+		form = (Form_pg_authid) GETSTRUCT(tup);
+		if (!form->roltravels)
+		{
+			if (!superuser() && !is_admin_of_role(GetUserId(), form->oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission denied to let role \"%s\" travel with a commit", here),
+						 errdetail("Only roles with the ADMIN option on it may do this.")));
+			form->roltravels = true;
+			CatalogTupleUpdate(rel, &tup->t_self, tup);
+		}
+		heap_freetuple(tup);
+		pfree(here);
+	}
+	table_close(rel, RowExclusiveLock);
+	CommandCounterIncrement();
 }
 
 /* ------------------------------------------------------------ statements */
@@ -711,31 +898,82 @@ ws_role_grant_statement(const WsRole *r, int k, Buf *out)
 	pfree(here);
 }
 
-/* (whether a membership is here as it is held: granting it again would add a row) */
-static bool
-membership_here(const char *role, const WsRoleMembership *m)
+void
+ws_role_revoke_statement(const char *member, const char *of, const char *grantor, Buf *out)
 {
-	char	   *of = ws_name_from_utf8(m->role);
-	const char *params[5] = {of, role, m->admin ? "t" : "f", m->inherit ? "t" : "f", m->set ? "t" : "f"};
-	WsSqlRows	rows;
-	bool		here;
+	Buf			sql = BUF_INIT;
+	List	   *parsed;
+	GrantRoleStmt *stmt;
 
-	WsSql->run("SELECT 1 FROM pg_auth_members m JOIN pg_roles p ON p.oid = m.roleid "
-			   "JOIN pg_roles r ON r.oid = m.member WHERE p.rolname = $1::name AND r.rolname = $2::name "
-			   "AND m.admin_option = $3::bool AND m.inherit_option = $4::bool AND m.set_option = $5::bool",
-			   5, params, &rows);
-	here = rows.nrows > 0;
+	ws_put_text(&sql, "REVOKE ");
+	ws_put_identifier(&sql, of);
+	ws_put_text(&sql, " FROM ");
+	ws_put_identifier(&sql, member);
+	ws_put_text(&sql, " GRANTED BY ");
+	ws_put_identifier(&sql, grantor);
+	buf_append_byte(&sql, 0);
+	parsed = parse_role_text(member, (char *) sql.data);
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, GrantRoleStmt))
+		not_the_role(member, "it is not one REVOKE");
+	stmt = (GrantRoleStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->is_grant || stmt->opt != NIL || list_length(stmt->granted_roles) != 1 ||
+		list_length(stmt->grantee_roles) != 1 ||
+		strcmp(linitial_node(AccessPriv, stmt->granted_roles)->priv_name, of) != 0 ||
+		linitial_node(RoleSpec, stmt->grantee_roles)->roletype != ROLESPEC_CSTRING ||
+		strcmp(linitial_node(RoleSpec, stmt->grantee_roles)->rolename, member) != 0 ||
+		stmt->grantor == NULL || stmt->grantor->roletype != ROLESPEC_CSTRING ||
+		strcmp(stmt->grantor->rolename, grantor) != 0)
+		not_the_role(member, "another revoke");
+	buf_append(out, sql.data, sql.len - 1);
+	buf_free(&sql);
+}
+
+static void
+run_role_statement(Buf *sql)
+{
+	WsSqlRows	rows;
+
+	buf_append_byte(sql, 0);
+	WsSql->run((char *) sql->data, 0, NULL, &rows);
 	ws_sql_rows_free(&rows);
-	pfree(of);
-	return here;
+	CommandCounterIncrement();
+	buf_free(sql);
+}
+
+/* Revokes what is here of a membership, whoever granted it. */
+static void
+revoke_membership(const char *member, const char *of)
+{
+	HereRow    *rows;
+	Oid			member_oid = get_role_oid(member, false);
+	Oid			of_oid = get_role_oid(of, false);
+	int			n = memberships_here(member_oid, of_oid, &rows, NULL);
+
+	for (int i = 0; i < n; i++)
+	{
+		Buf			sql = BUF_INIT;
+
+		ws_role_revoke_statement(member, of, GetUserNameFromId(rows[i].grantor, false), &sql);
+		run_role_statement(&sql);
+	}
+	pfree(rows);
+}
+
+static const WsRole *
+find_role(const WsRole *roles, int n, const char *name)
+{
+	for (int i = 0; i < n; i++)
+		if (strcmp(roles[i].name, name) == 0)
+			return &roles[i];
+	return NULL;
 }
 
 void
-ws_role_restore(const WsRole *roles, int n, const WsRole *known, int nknown)
+ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int nprevious)
 {
 	int			level;
 
-	ws_role_check_arrival(roles, n, known, nknown);
+	ws_role_check_arrival(roles, n);
 	level = WsSql->begin();
 	for (int i = 0; i < n; i++)
 	{
@@ -743,32 +981,57 @@ ws_role_restore(const WsRole *roles, int n, const WsRole *known, int nknown)
 
 		ws_role_make_statement(&roles[i], &sql);
 		if (sql.len > 0)
-		{
-			WsSqlRows	rows;
-
-			buf_append_byte(&sql, 0);
-			WsSql->run((char *) sql.data, 0, NULL, &rows);
-			ws_sql_rows_free(&rows);
-			CommandCounterIncrement();
-		}
+			run_role_statement(&sql);
 		buf_free(&sql);
+	}
+	ws_role_mark(roles, n);
+
+	/* (what a commit removed first, so that it may reverse a membership) */
+	for (int i = 0; i < nprevious; i++)
+	{
+		const WsRole *now = find_role(roles, n, previous[i].name);
+
+		if (now == NULL)
+			continue;
+		for (int k = 0; k < previous[i].nmember_of; k++)
+		{
+			const char *of = previous[i].member_of[k].role;
+			bool		kept = false;
+
+			if (find_role(roles, n, of) == NULL)
+				continue;
+			for (int j = 0; j < now->nmember_of; j++)
+				kept |= strcmp(now->member_of[j].role, of) == 0;
+			if (!kept)
+			{
+				char	   *here = ws_name_from_utf8(now->name);
+				char	   *of_here = ws_name_from_utf8(of);
+
+				revoke_membership(here, of_here);
+				pfree(of_here);
+				pfree(here);
+			}
+		}
 	}
 	for (int i = 0; i < n; i++)
 	{
 		char	   *here = ws_name_from_utf8(roles[i].name);
+		Oid			member = get_role_oid(here, false);
 
 		for (int k = 0; k < roles[i].nmember_of; k++)
 		{
+			char	   *of = ws_name_from_utf8(roles[i].member_of[k].role);
 			Buf			sql = BUF_INIT;
-			WsSqlRows	rows;
 
-			if (membership_here(here, &roles[i].member_of[k]))
-				continue;
-			ws_role_grant_statement(&roles[i], k, &sql);
-			buf_append_byte(&sql, 0);
-			WsSql->run((char *) sql.data, 0, NULL, &rows);
-			ws_sql_rows_free(&rows);
+			/* (a row of another grantor would keep what this one takes away) */
+			if (!membership_is_here(member, get_role_oid(of, false), &roles[i].member_of[k]))
+			{
+				revoke_membership(here, of);
+				ws_role_grant_statement(&roles[i], k, &sql);
+				run_role_statement(&sql);
+			}
 			buf_free(&sql);
+			pfree(of);
 		}
 		pfree(here);
 	}

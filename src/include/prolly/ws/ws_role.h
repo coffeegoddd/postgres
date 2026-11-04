@@ -99,28 +99,45 @@ extern void ws_role_map(ProllyCtx *ctx, const WsRole *roles, int n, PHash *map);
 extern void ws_role_list(ProllyCtx *ctx, const PHash *map, WsRole **out, int *n);
 
 /*
- * Whether roles from a commit may arrive here, given those this database's own root
- * holds, in order: raises ERRCODE_DATA_CORRUPTED if one is a member of a role not
- * among them, and ERRCODE_FEATURE_NOT_SUPPORTED if one is here already and not
- * among those this database knows, which would give that role's members what the
- * commit grants, or here is one that cannot travel.  To call before making anything.
+ * Marks roles here as held by commits (pg_authid.roltravels), so that a commit may
+ * later change them: what capture does with what ws_role_read gave it, once it is
+ * allowed to write.  Marking one not yet marked takes ADMIN on it, as a mark lets a
+ * commit say who is a member of it: ERRCODE_INSUFFICIENT_PRIVILEGE otherwise.  The
+ * mark goes with the role.  A mark says only that some versioned database of this
+ * cluster holds it, and those that hold one name share it.
  */
-extern void ws_role_check_arrival(const WsRole *roles, int n, const WsRole *known, int nknown);
+extern void ws_role_mark(const WsRole *roles, int n);
+
+/*
+ * Whether roles from a commit may arrive here: raises ERRCODE_DATA_CORRUPTED if one
+ * is a member of a role not among them, and ERRCODE_FEATURE_NOT_SUPPORTED if one is
+ * here already and not marked, as what the commit grants would reach that role's
+ * members; if one here cannot travel; or if a membership it would add or widen
+ * reaches, by memberships made here, a role not among them, which would give the
+ * members of its role what no commit could hold.  roles is in order.  To call
+ * before making anything.
+ */
+extern void ws_role_check_arrival(const WsRole *roles, int n);
 
 /*
  * The statement making a role here as it is held, appended to out: a CREATE ROLE, an
  * ALTER ROLE if it is here otherwise, or nothing.  The GRANT making it a member of
- * its kth, to run once they are all made.  Each checked by the grammar, as a table's
- * statement is: anything else raises ERRCODE_DATA_CORRUPTED.
+ * its kth, to run once they are all made.  The REVOKE of a membership of of, by a
+ * grantor.  Each checked by the grammar, as a table's statement is: anything else
+ * raises ERRCODE_DATA_CORRUPTED.
  */
 extern void ws_role_make_statement(const WsRole *r, Buf *out);
 extern void ws_role_grant_statement(const WsRole *r, int k, Buf *out);
+extern void ws_role_revoke_statement(const char *member, const char *of, const char *grantor, Buf *out);
 
 /*
  * Makes roles from a commit here, through WsSql, once ws_role_check_arrival has
- * allowed them, each before any membership.  Never drops a role or a membership: one
- * here that a commit no longer holds may be used by this cluster's other databases.
+ * allowed them, each before any membership, and marks them.  A membership is left
+ * exactly as held, whoever granted what was here.  One that previous, the roles of
+ * the root this database was on, held and these do not is revoked if these hold
+ * both its roles: the commit removed it.  One made here is not, and no role is ever
+ * dropped, as this cluster's other databases may use it.  previous is in order.
  */
-extern void ws_role_restore(const WsRole *roles, int n, const WsRole *known, int nknown);
+extern void ws_role_restore(const WsRole *roles, int n, const WsRole *previous, int nprevious);
 
 #endif							/* PROLLY_WS_ROLE_H */
