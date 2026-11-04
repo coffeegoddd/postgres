@@ -261,6 +261,15 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE src.fknv (id integer, r integer) PARTITION BY RANGE (id);
 	CREATE TABLE src.fknv1 PARTITION OF src.fknv FOR VALUES FROM (0) TO (10);
 	ALTER TABLE src.fknv ADD CONSTRAINT fknv_k FOREIGN KEY (r) REFERENCES src.fkn_q (id) NOT VALID;
+	CREATE TABLE src.ixx (r int4range, a integer) PARTITION BY RANGE (a);
+	CREATE TABLE src.ixx1 PARTITION OF src.ixx FOR VALUES FROM (0) TO (10);
+	ALTER TABLE src.ixx1 ADD CONSTRAINT ixx1_x EXCLUDE USING gist (r WITH &&);
+	ALTER TABLE src.ixx1 ADD CONSTRAINT ixx1_y EXCLUDE USING gist (r WITH -|-);
+	CREATE INDEX ixx1_i ON src.ixx1 USING gist (r);
+	CREATE TABLE src.fku_p (a integer, b integer, PRIMARY KEY (a, b)) PARTITION BY RANGE (a);
+	CREATE TABLE src.fku_p1 PARTITION OF src.fku_p FOR VALUES FROM (0) TO (10);
+	CREATE UNIQUE INDEX fku_p1_also ON src.fku_p1 (b, a);
+	CREATE TABLE src.fku_c (a integer, b integer, FOREIGN KEY (a, b) REFERENCES src.fku_p (a, b));
 	CREATE TABLE src.ats ("a@b" integer, "@{1}" integer DEFAULT 2,
 		c integer GENERATED ALWAYS AS ("a@b" + "@{1}") STORED, d text DEFAULT '@');
 	CREATE TABLE src.settings (d date DEFAULT '2020-02-01', t timestamptz DEFAULT '2020-02-01 03:04:05+00',
@@ -278,7 +287,8 @@ my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'iden
 	'pt', 'pt1', 'pt2', 'Odd Default', 'ptl', 'ptl1', 'pth', 'pth0', 'pth1', 'ptd', 'ptd1', 'ptm', 'ptm1', 'ptm1a',
 	'ptf_p', 'ptf_p1', 'ptf_c', 'ptf_c1',
 	'idt', 'idm', 'idl', 'pnv', 'pnv1', 'pnv2', 'ptbd', 'ptbd1', 'ptbn', 'ptbn1', 'ptby', 'ptby1', 'ptbs', 'ptbs1', 'ptbt', 'ptbt1',
-	'fkn_q', 'fkn_p', 'fkn_p1', 'fkn_c', 'fks', 'fksm', 'fksl', 'fknv', 'fknv1');
+	'fkn_q', 'fkn_p', 'fkn_p1', 'fkn_c', 'fks', 'fksm', 'fksl', 'fknv', 'fknv1',
+	'ixx', 'ixx1', 'fku_p', 'fku_p1', 'fku_c');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -519,15 +529,6 @@ my $nvchecks = q{SELECT string_agg(c.relname || '.' || k.conname || ' ' || k.con
 	FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid WHERE k.contype = 'c' AND c.relnamespace = '%s'::regnamespace AND c.relname LIKE 'pnv%%'};
 is($node->safe_psql('postgres', sprintf($nvchecks, 'dst')), $node->safe_psql('postgres', sprintf($nvchecks, 'src')),
 	'checks not valid across a partitioned table as they were');
-
-# a key's row on the referencing partition is not refused for the indexes of a partition it refers to
-$node->safe_psql('postgres', q{
-	CREATE TABLE src.fku_p (id integer PRIMARY KEY) PARTITION BY RANGE (id);
-	CREATE TABLE src.fku_p1 PARTITION OF src.fku_p FOR VALUES FROM (0) TO (10);
-	CREATE UNIQUE INDEX fku_p1_also ON src.fku_p1 (id);
-	CREATE TABLE src.fku_c (r integer REFERENCES src.fku_p (id));
-});
-isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fku_c')}), '', 'a key to a partitioned table reads, its partition\'s two indexes no matter');
 
 # an index a key on its own table uses is still the table's
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_index WHERE indrelid = 'dst.fk_selfu'::regclass}),

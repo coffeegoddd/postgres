@@ -193,7 +193,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance, a partition or
  * partitioned table across schemas, storage settings, a key's options, a
- * sequence's, a default using one,
+ * sequence's, a default using one, a partition detached, of another identity
+ * than its table's or with two indexes attaching could take for one another,
  * an index's options or its dependence on an extension, comments, grants, two
  * constraints alike)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit

@@ -101,8 +101,10 @@ extern void ws_fk_list(ProllyCtx *ctx, const PHash *map, WsForeignKey **out, int
 /*
  * The ALTER TABLE adding a key, in the named schema, to a table and from a
  * table whose records are these, appended to out, in the server's encoding.  A
- * table's are added last name first: adding one to a partitioned table names the
- * partitions' rows after it with a number, which a name later in order may have.  A
+ * table's are added last name first: a key to a partitioned table has a row for
+ * each of its partitions on the key's own table, named after it with a number,
+ * which a name later in order may have.  (A name so long that the number cuts it
+ * short can sort first, and then adding the other is refused as already there.)  A
  * column neither has raises ERRCODE_DATA_CORRUPTED, as does anything of the
  * statement, parsed whole, but this one key on this one table.
  */
