@@ -238,19 +238,6 @@ ws_fk_free(WsForeignKey *fk)
 
 /* ---------------------------------------------------------- the catalogs */
 
-static char *
-name_to_utf8(const char *name)
-{
-	const char *u = pg_server_to_any(name, (int) strlen(name), PG_UTF8);
-
-	if (strlen(u) >= NAMEDATALEN)
-		ereport(ERROR,
-				(errcode(ERRCODE_NAME_TOO_LONG),
-				 errmsg("name \"%s\" is too long for version control", name),
-				 errdetail("A commit holds names of up to %d bytes of UTF8.", NAMEDATALEN - 1)));
-	return px_memdup(u, strlen(u) + 1);
-}
-
 /* (a list of tags, signed as the catalog holds them, as space-separated text) */
 static uint64 *
 tags_from_text(const char *text, int *n)
@@ -290,18 +277,73 @@ fk_cmp(const void *a, const void *b)
 	"(SELECT string_agg(a.attcoltag::text, ' ' ORDER BY u.o) FROM unnest(" arr ") WITH ORDINALITY u(n, o) " \
 	"JOIN pg_attribute a ON a.attrelid = " rel " AND a.attnum = u.n)"
 
+/*
+ * What no commit can hold of a table's foreign keys, the first of it.  One that
+ * more than one unique index could serve is among them: the server picks by
+ * object id, which a restore would not repeat, so it could choose an index of
+ * another equality, or leave another droppable.
+ */
+static const char *const refusal_sql =
+"SELECT k.conname::text, CASE "
+"  WHEN p.relnamespace <> c.relnamespace "
+"    THEN 'is to a table outside its schema, which no commit can hold' "
+"  WHEN NOT k.conenforced OR k.conperiod THEN 'cannot be read yet: not enforced, or over a period' "
+"  WHEN k.conparentid <> 0 THEN 'cannot be read yet: it comes from its partitioned table''s' "
+"  WHEN EXISTS (SELECT FROM pg_trigger t WHERE t.tgconstraint = k.oid AND t.tgenabled <> 'O') "
+"    THEN 'cannot be read yet: its triggers are disabled' "
+"  WHEN EXISTS (SELECT FROM pg_trigger t JOIN pg_description d ON d.objoid = t.oid "
+"               AND d.classoid = 'pg_trigger'::regclass WHERE t.tgconstraint = k.oid) "
+"    THEN 'cannot be read yet: its triggers have comments' "
+"  WHEN (SELECT count(*) FROM pg_index x WHERE x.indrelid = k.confrelid AND x.indisunique "
+"        AND x.indisvalid AND x.indpred IS NULL AND x.indexprs IS NULL "
+"        AND x.indnkeyatts = cardinality(k.confkey) AND "
+"          (SELECT array_agg(a ORDER BY a) FROM unnest((x.indkey::int2[])[0:x.indnkeyatts - 1]) a) = "
+"          (SELECT array_agg(a ORDER BY a) FROM unnest(k.confkey) a)) > 1 "
+"    THEN 'cannot be read yet: more than one unique index could serve it' "
+"  END "
+"FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_class p ON p.oid = k.confrelid "
+"WHERE k.conrelid = $1::oid AND k.contype = 'f'";
+
+void
+ws_fk_refuse(const char *oid, const char *table)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+
+	WsSql->run(refusal_sql, 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_sql_value(&rows, i, 1) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("foreign key \"%s\" of table \"%s\" %s",
+							ws_sql_value(&rows, i, 0), table, ws_sql_value(&rows, i, 1))));
+	ws_sql_rows_free(&rows);
+}
+
 void
 ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 {
 	const char *params[2] = {schema, table};
 	int			level = WsSql->begin();
 	WsSqlRows	rows;
+	WsSqlRows	rel;
+
+	WsSql->run("SELECT c.oid::text, ns.nspbranch::text FROM pg_class c "
+			   "JOIN pg_namespace ns ON ns.oid = c.relnamespace "
+			   "WHERE ns.nspname = $1 AND c.relname = $2", 2, params, &rel);
+	if (rel.nrows == 1)
+	{
+		if (atoi(ws_sql_value(&rel, 0, 1)) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("table \"%s\" is not in a versioned schema", table)));
+		ws_fk_refuse(ws_sql_value(&rel, 0, 0), table);
+	}
+	ws_sql_rows_free(&rel);
 
 	WsSql->run("SELECT k.conname::text, p.relname::text, k.confmatchtype::text, "
 			   "  k.confupdtype::text, k.confdeltype::text, k.condeferrable::text, "
 			   "  k.condeferred::text, k.convalidated::text, "
-			   "  (p.relnamespace = c.relnamespace)::text, "
-			   "  (k.conenforced AND NOT k.conperiod)::text, "
 			   TAGS_OF("k.conkey", "k.conrelid") ", "
 			   TAGS_OF("k.confkey", "k.confrelid") ", "
 			   TAGS_OF("k.confdelsetcols", "k.conrelid") " "
@@ -317,28 +359,18 @@ ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n)
 		WsForeignKey *fk = &(*out)[i];
 		int			nref;
 
-		if (ws_sql_value(&rows, i, 8)[0] != 't')
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("foreign key \"%s\" of table \"%s\" is to a table outside its schema, which no commit can hold",
-							ws_sql_value(&rows, i, 0), table)));
-		if (ws_sql_value(&rows, i, 9)[0] != 't')
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("foreign key \"%s\" of table \"%s\" cannot be read yet: not enforced, or over a period",
-							ws_sql_value(&rows, i, 0), table)));
-		fk->table = name_to_utf8(table);
-		fk->name = name_to_utf8(ws_sql_value(&rows, i, 0));
-		fk->ref_table = name_to_utf8(ws_sql_value(&rows, i, 1));
+		fk->table = ws_name_to_utf8(table);
+		fk->name = ws_name_to_utf8(ws_sql_value(&rows, i, 0));
+		fk->ref_table = ws_name_to_utf8(ws_sql_value(&rows, i, 1));
 		fk->match = ws_sql_value(&rows, i, 2)[0];
 		fk->on_update = ws_sql_value(&rows, i, 3)[0];
 		fk->on_delete = ws_sql_value(&rows, i, 4)[0];
 		fk->deferrable = ws_sql_value(&rows, i, 5)[0] == 't';
 		fk->initdeferred = ws_sql_value(&rows, i, 6)[0] == 't';
 		fk->not_valid = ws_sql_value(&rows, i, 7)[0] != 't';
-		fk->cols = tags_from_text(ws_sql_value(&rows, i, 10), &fk->ncols);
-		fk->ref_cols = tags_from_text(ws_sql_value(&rows, i, 11), &nref);
-		fk->set_cols = tags_from_text(ws_sql_value(&rows, i, 12), &fk->nset);
+		fk->cols = tags_from_text(ws_sql_value(&rows, i, 8), &fk->ncols);
+		fk->ref_cols = tags_from_text(ws_sql_value(&rows, i, 9), &nref);
+		fk->set_cols = tags_from_text(ws_sql_value(&rows, i, 10), &fk->nset);
 		if (nref != fk->ncols)
 			elog(ERROR, "foreign key \"%s\" of %d columns and %d", fk->name, fk->ncols, nref);
 	}
@@ -379,6 +411,10 @@ ws_fk_map(ProllyCtx *ctx, const WsForeignKey *fks, int n, PHash *map)
 	}
 	if (n > 1)
 		qsort(kvs, n, sizeof(ProllyKV), kv_cmp);
+	/* (a tree of two entries of one key is no tree a read would take) */
+	for (int i = 1; i < n; i++)
+		if (kv_cmp(&kvs[i - 1], &kvs[i]) == 0)
+			elog(ERROR, "two foreign keys of one name on one table");
 	rc = prolly_build(ctx, 0, kvs, n, map);
 	if (rc < 0)
 		prolly_report(ctx);
@@ -412,7 +448,12 @@ ws_fk_list(ProllyCtx *ctx, const PHash *map, WsForeignKey **out, int *n)
 	if (rc < 0)
 		prolly_report(ctx);
 	while ((rc = prolly_iter_next(it, &key, &klen, &val, &vlen)) > 0)
+	{
+		/* (a root's count is as trusted as its entries, which is not at all) */
+		if ((uint64) i >= count)
+			malformed("a map of more keys than it says");
 		WsFkCodec->decode(key, klen, val, vlen, &(*out)[i++]);
+	}
 	if (rc < 0)
 		prolly_report(ctx);
 	prolly_iter_close(it);
@@ -430,31 +471,6 @@ not_the_key(const WsForeignKey *fk, const char *what)
 					fk->name, fk->table, what)));
 }
 
-/* (a name here may be longer: the grammar would cut it short, and quietly) */
-static char *
-name_here(const char *name)
-{
-	char	   *here = pstrdup(pg_any_to_server(name, (int) strlen(name), PG_UTF8));
-
-	if (strlen(here) >= NAMEDATALEN)
-		ereport(ERROR,
-				(errcode(ERRCODE_NAME_TOO_LONG),
-				 errmsg("name \"%s\" is too long in this database's encoding", here)));
-	return here;
-}
-
-static void
-put_text(Buf *out, const char *text)
-{
-	buf_append(out, text, strlen(text));
-}
-
-static void
-put_identifier(Buf *out, const char *name)
-{
-	put_text(out, quote_identifier(name));
-}
-
 static char *
 column_here(const WsForeignKey *fk, const WsTableSchema *s, uint64 tag)
 {
@@ -462,20 +478,20 @@ column_here(const WsForeignKey *fk, const WsTableSchema *s, uint64 tag)
 
 	if (c == NULL)
 		not_the_key(fk, "a column its table does not have");
-	return name_here(c->name);
+	return ws_name_from_utf8(c->name);
 }
 
 static void
 put_columns(Buf *out, const WsForeignKey *fk, const WsTableSchema *s, const uint64 *tags, int n)
 {
-	put_text(out, "(");
+	ws_put_text(out, "(");
 	for (int i = 0; i < n; i++)
 	{
 		if (i > 0)
-			put_text(out, ", ");
-		put_identifier(out, column_here(fk, s, tags[i]));
+			ws_put_text(out, ", ");
+		ws_put_identifier(out, column_here(fk, s, tags[i]));
 	}
-	put_text(out, ")");
+	ws_put_text(out, ")");
 }
 
 static const char *
@@ -523,7 +539,7 @@ check_statement(const WsForeignKey *fk, const WsTableSchema *table, const WsTabl
 	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
 	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
 		strcmp(stmt->relation->schemaname, schema) != 0 || !stmt->relation->inh ||
-		strcmp(stmt->relation->relname, name_here(fk->table)) != 0 ||
+		strcmp(stmt->relation->relname, ws_name_from_utf8(fk->table)) != 0 ||
 		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
 		not_the_key(fk, "another table");
 	cmd = linitial_node(AlterTableCmd, stmt->cmds);
@@ -532,7 +548,7 @@ check_statement(const WsForeignKey *fk, const WsTableSchema *table, const WsTabl
 		not_the_key(fk, "another change");
 	con = (Constraint *) cmd->def;
 	if (con->contype != CONSTR_FOREIGN || con->conname == NULL ||
-		strcmp(con->conname, name_here(fk->name)) != 0 ||
+		strcmp(con->conname, ws_name_from_utf8(fk->name)) != 0 ||
 		con->deferrable != fk->deferrable || con->initdeferred != fk->initdeferred ||
 		!con->is_enforced || con->skip_validation != fk->not_valid ||
 		con->initially_valid == fk->not_valid || con->is_no_inherit ||
@@ -541,7 +557,7 @@ check_statement(const WsForeignKey *fk, const WsTableSchema *table, const WsTabl
 		con->fk_del_action != fk->on_delete ||
 		con->pktable == NULL || con->pktable->catalogname != NULL ||
 		con->pktable->schemaname == NULL || strcmp(con->pktable->schemaname, schema) != 0 ||
-		strcmp(con->pktable->relname, name_here(fk->ref_table)) != 0 ||
+		strcmp(con->pktable->relname, ws_name_from_utf8(fk->ref_table)) != 0 ||
 		!same_names(fk, table, fk->cols, fk->ncols, con->fk_attrs) ||
 		!same_names(fk, ref, fk->ref_cols, fk->ncols, con->pk_attrs) ||
 		!same_names(fk, table, fk->set_cols, fk->nset, con->fk_del_set_cols))
@@ -559,41 +575,41 @@ ws_fk_add_statement(const WsForeignKey *fk, const WsTableSchema *table,
 		elog(ERROR, "%s", problem);
 	if (strcmp(table->name, fk->table) != 0 || strcmp(ref_table->name, fk->ref_table) != 0)
 		elog(ERROR, "records of other tables than foreign key \"%s\" names", fk->name);
-	put_text(&sql, "ALTER TABLE ");
-	put_identifier(&sql, schema);
-	put_text(&sql, ".");
-	put_identifier(&sql, name_here(fk->table));
-	put_text(&sql, " ADD CONSTRAINT ");
-	put_identifier(&sql, name_here(fk->name));
-	put_text(&sql, " FOREIGN KEY ");
+	ws_put_text(&sql, "ALTER TABLE ");
+	ws_put_identifier(&sql, schema);
+	ws_put_text(&sql, ".");
+	ws_put_identifier(&sql, ws_name_from_utf8(fk->table));
+	ws_put_text(&sql, " ADD CONSTRAINT ");
+	ws_put_identifier(&sql, ws_name_from_utf8(fk->name));
+	ws_put_text(&sql, " FOREIGN KEY ");
 	put_columns(&sql, fk, table, fk->cols, fk->ncols);
-	put_text(&sql, " REFERENCES ");
-	put_identifier(&sql, schema);
-	put_text(&sql, ".");
-	put_identifier(&sql, name_here(fk->ref_table));
-	put_text(&sql, " ");
+	ws_put_text(&sql, " REFERENCES ");
+	ws_put_identifier(&sql, schema);
+	ws_put_text(&sql, ".");
+	ws_put_identifier(&sql, ws_name_from_utf8(fk->ref_table));
+	ws_put_text(&sql, " ");
 	put_columns(&sql, fk, ref_table, fk->ref_cols, fk->ncols);
 	if (fk->match == FKCONSTR_MATCH_FULL)
-		put_text(&sql, " MATCH FULL");
+		ws_put_text(&sql, " MATCH FULL");
 	if (fk->on_update != FKCONSTR_ACTION_NOACTION)
 	{
-		put_text(&sql, " ON UPDATE ");
-		put_text(&sql, action_text(fk->on_update));
+		ws_put_text(&sql, " ON UPDATE ");
+		ws_put_text(&sql, action_text(fk->on_update));
 	}
 	if (fk->on_delete != FKCONSTR_ACTION_NOACTION)
 	{
-		put_text(&sql, " ON DELETE ");
-		put_text(&sql, action_text(fk->on_delete));
+		ws_put_text(&sql, " ON DELETE ");
+		ws_put_text(&sql, action_text(fk->on_delete));
 		if (fk->nset > 0)
 		{
-			put_text(&sql, " ");
+			ws_put_text(&sql, " ");
 			put_columns(&sql, fk, table, fk->set_cols, fk->nset);
 		}
 	}
 	if (fk->deferrable)
-		put_text(&sql, fk->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
+		ws_put_text(&sql, fk->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
 	if (fk->not_valid)
-		put_text(&sql, " NOT VALID");
+		ws_put_text(&sql, " NOT VALID");
 	buf_append_byte(&sql, 0);
 	check_statement(fk, table, ref_table, schema, (char *) sql.data);
 	buf_append(out, sql.data, sql.len - 1);

@@ -88,6 +88,7 @@ test_malformed(void)
 #define BAD(k, v) {k, sizeof(k) - 1, v, sizeof(v) - 1}
 	static const Bad bad[] = {
 		BAD("c", GOODV),		/* no name */
+		BAD("\0k", GOODV),		/* no table */
 		BAD("\xff\0k", GOODV),	/* not UTF8 */
 		BAD("c\0k\0x", GOODV),	/* a NUL in a name */
 		BAD("c\0", GOODV),		/* an empty name */
@@ -131,6 +132,8 @@ test_problems(void)
 	BAD("no name", name, "");
 	BAD("to no table", ref_table, "");
 	BAD("too long", name, "1234567890123456789012345678901234567890123456789012345678901234");
+	BAD("too long", table, "1234567890123456789012345678901234567890123456789012345678901234");
+	BAD("too long", ref_table, "1234567890123456789012345678901234567890123456789012345678901234");
 	BAD("no columns", ncols, 0);
 	BAD("or too many", ncols, INDEX_MAX_KEYS + 1);
 	BAD("no tag", cols, zero);
@@ -153,6 +156,47 @@ test_problems(void)
 	fk = base;
 	fk.nset = 2;
 	CHECK(strstr(ws_fk_problem(&fk), "more columns than it has") != NULL);
+	{
+		uint64		sevens[] = {7, 7};
+		uint64		both[] = {7, 8};
+		uint64		ref[] = {1, 2};
+
+		fk = base;
+		fk.ncols = 2;
+		fk.cols = both;
+		fk.ref_cols = ref;
+		fk.on_delete = FKCONSTR_ACTION_SETNULL;
+		fk.nset = 2;
+		fk.set_cols = sevens;
+		CHECK(strstr(ws_fk_problem(&fk), "setting a column twice") != NULL);
+	}
+}
+
+typedef struct Seen
+{
+	int			n;
+} Seen;
+
+static bool
+count_table(void *arg, const char *name, const VcTable *entry)
+{
+	((Seen *) arg)->n++;
+	return true;
+}
+
+typedef struct TwoKeys
+{
+	ProllyCtx  *ctx;
+	WsForeignKey keys[2];
+} TwoKeys;
+
+static void
+map_twice(void *arg)
+{
+	TwoKeys    *t = arg;
+	PHash		map;
+
+	ws_fk_map(t->ctx, t->keys, 2, &map);
 }
 
 /* The map on a root value: one set of keys, one map, in any order. */
@@ -186,6 +230,30 @@ ENGINE_TEST(test_map)
 	CHECK(strcmp(list[0].name, "a key") == 0 && strcmp(list[1].name, "k") == 0);
 	ws_fk_free(&list[0]);
 	ws_fk_free(&list[1]);
+
+	/* a table's listing passes the map by */
+	{
+		Seen		seen = {0};
+
+		WsRoot->tables(&ctx, &rv, count_table, &seen);
+		CHECK_EQ(seen.n, 0);
+	}
+
+	/* no keys: a map of nothing, and so no entry */
+	{
+		PHash		none;
+		PHash		empty_rv = vc_root_empty(&ctx);
+		PHash		out;
+
+		ws_fk_map(&ctx, NULL, 0, &none);
+		WsRoot->put_map(&ctx, &empty_rv, WS_ROOT_FOREIGN_KEYS, &none, &out);
+		CHECK(memcmp(out.b, empty_rv.b, PHASH_LEN) == 0);
+	}
+	{
+		TwoKeys		two_keys = {&ctx, {a, a}};
+
+		expect_error(map_twice, &two_keys, ERRCODE_INTERNAL_ERROR, NULL);
+	}
 }
 
 static WsColumn child_cols[] = {

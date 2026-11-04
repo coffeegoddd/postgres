@@ -10,7 +10,8 @@
  * every table and index.
  *
  * A key to a table outside its schema is the live database's alone: no commit
- * holds it, so reading one raises ERRCODE_FEATURE_NOT_SUPPORTED.
+ * holds it, so reading one, or its table's record, raises
+ * ERRCODE_FEATURE_NOT_SUPPORTED.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -74,10 +75,20 @@ extern void ws_fk_free(WsForeignKey *fk);
 
 /*
  * A table's foreign keys, from the catalogs, through WsSql, by name in UTF8's
- * order, in *out, palloc'd, each the caller's to ws_fk_free.  Refused (above) if
- * one's table is outside its schema, or it is not enforced, or over a period.
+ * order, in *out, palloc'd, each the caller's to ws_fk_free.  Raises
+ * ERRCODE_FEATURE_NOT_SUPPORTED as ws_fk_refuse does, and if the table is in no
+ * versioned schema.
  */
 extern void ws_fk_read(const char *schema, const char *table, WsForeignKey **out, int *n);
+
+/*
+ * Raises ERRCODE_FEATURE_NOT_SUPPORTED if a table (its object id as text, in a
+ * WsSql scope) has a key no commit can hold or the record cannot yet: to a table
+ * outside its schema, not enforced, over a period, from a partitioned table's,
+ * with its triggers disabled or commented on, or that more than one unique index
+ * could serve.
+ */
+extern void ws_fk_refuse(const char *oid, const char *table);
 
 /* The ~fk map of these, its root in *map: their order does not matter. */
 extern void ws_fk_map(ProllyCtx *ctx, const WsForeignKey *fks, int n, PHash *map);

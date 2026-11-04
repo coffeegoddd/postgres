@@ -87,6 +87,14 @@ $node->safe_psql('postgres', q{
 		CONSTRAINT "Odd Key" FOREIGN KEY ("Odd") REFERENCES src.fk_p ("Odd Ref") DEFERRABLE,
 		CONSTRAINT later FOREIGN KEY (z) REFERENCES src.fk_p (id) DEFERRABLE INITIALLY DEFERRED);
 	ALTER TABLE src.fk_c ADD CONSTRAINT nv FOREIGN KEY (y) REFERENCES src.fk_p (id) NOT VALID;
+	CREATE TABLE src.fk_setall (id integer PRIMARY KEY, y integer, z integer,
+		CONSTRAINT all_of FOREIGN KEY (y, z) REFERENCES src.fk_p (a, b) ON DELETE SET NULL (y, z),
+		CONSTRAINT none_said FOREIGN KEY (z, y) REFERENCES src.fk_p (a, b) ON DELETE SET NULL,
+		CONSTRAINT twice FOREIGN KEY (y, y) REFERENCES src.fk_p (a, b));
+	CREATE TABLE src.fk_old (id integer PRIMARY KEY);
+	CREATE TABLE src.fk_oc (a integer REFERENCES src.fk_old (id));
+	ALTER TABLE src.fk_old RENAME TO fk_newp;
+	ALTER TABLE src.fk_oc RENAME TO fk_newc;
 	CREATE TABLE src.fk_self (id integer PRIMARY KEY, parent integer REFERENCES src.fk_self (id));
 	CREATE TABLE src.fk_m1 (id integer PRIMARY KEY, o integer);
 	CREATE TABLE src.fk_m2 (id integer PRIMARY KEY, o integer REFERENCES src.fk_m1 (id));
@@ -113,7 +121,7 @@ $node->safe_psql('postgres', q{
 
 my @tables = ('plain', 'empty', 'keyed', 'later_key', 'types', 'defaults', 'ident', 'gen',
 	'colls', 'Odd Table', 'renamed', 'dropped', 'cons', 'cons_key', 'cons_ren', 'idxs', 'idx_ren', 'idx_key',
-	'fk_p', 'fk_c', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats');
+	'fk_p', 'fk_c', 'fk_setall', 'fk_newp', 'fk_newc', 'fk_self', 'fk_m1', 'fk_m2', 'fk_rp', 'fk_rc', 'settings', 'names', 'ats');
 $node->safe_psql('postgres', q{CREATE TYPE dst.mood AS ENUM ('a', 'b')});
 $node->safe_psql('postgres', q{CREATE DOMAIN dst.posint AS integer CHECK (VALUE > 0)});
 
@@ -361,12 +369,50 @@ $node->safe_psql('postgres', q{
 });
 my ($fret, $fout, $ferr) = $node->psql('postgres', 'INSERT INTO src.fko VALUES (99)');
 like($ferr, qr/violates foreign key constraint/, 'a key to a shared table enforced');
-for my $t (['fko', 'to_shared', 'outside its schema'], ['fkv2', 'to_other', 'outside its schema'],
-	['fkne', 'ne', 'not enforced'])
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.fkper_p (a int4range, r int4range, PRIMARY KEY (a, r WITHOUT OVERLAPS));
+	CREATE TABLE src.fkper (a int4range, r int4range,
+		CONSTRAINT per FOREIGN KEY (a, PERIOD r) REFERENCES src.fkper_p (a, PERIOD r));
+	CREATE TABLE src.fkdis_p (id int PRIMARY KEY);
+	CREATE TABLE src.fkdis (a int, CONSTRAINT dis FOREIGN KEY (a) REFERENCES src.fkdis_p (id));
+	ALTER TABLE src.fkdis DISABLE TRIGGER ALL;
+	CREATE TABLE src.fkcmt_p (id int PRIMARY KEY);
+	CREATE TABLE src.fkcmt (a int, CONSTRAINT cmt FOREIGN KEY (a) REFERENCES src.fkcmt_p (id));
+	SELECT format('COMMENT ON TRIGGER %I ON src.fkcmt IS ''x''', tgname) FROM pg_trigger
+	WHERE tgrelid = 'src.fkcmt'::regclass AND tgconstraint <> 0 LIMIT 1 \gexec
+	CREATE TABLE src.fkdup_p (id numeric, CONSTRAINT dup_u UNIQUE (id));
+	CREATE UNIQUE INDEX dup_also ON src.fkdup_p (id);
+	CREATE TABLE src.fkdup (a numeric, CONSTRAINT dup FOREIGN KEY (a) REFERENCES src.fkdup_p (id));
+	CREATE TABLE src.fkpart (a int, CONSTRAINT pk_fk FOREIGN KEY (a) REFERENCES src.keyed (id))
+		PARTITION BY RANGE (a);
+	CREATE TABLE src.fkpart1 PARTITION OF src.fkpart FOR VALUES FROM (0) TO (10);
+});
+for my $t (
+	[ 'fko', 'to_shared', 'outside its schema' ],
+	[ 'fkv2', 'to_other', 'outside its schema' ],
+	[ 'fkne', 'ne', 'not enforced' ],
+	[ 'fkper', 'per', 'over a period' ],
+	[ 'fkdis', 'dis', 'its triggers are disabled' ],
+	[ 'fkcmt', 'cmt', 'its triggers have comments' ],
+	[ 'fkdup', 'dup', 'more than one unique index could serve it' ])
 {
 	($fret, $fout, $ferr) = $node->psql('postgres', qq{SELECT test_ws_fk_bytes('src', '$t->[0]')});
 	like($ferr, qr/foreign key "$t->[1]" of table "$t->[0]".*$t->[2]/, "$t->[1] refused");
+	($fret, $fout, $ferr) = $node->psql('postgres', qq{SELECT test_ws_schema_bytes('src', '$t->[0]')});
+	like($ferr, qr/foreign key "$t->[1]" of table "$t->[0]".*$t->[2]/, "and its table's record refused");
 }
+($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkpart1')});
+like($ferr, qr/comes from its partitioned table/, 'a key from a partitioned table refused');
+($fret, $fout, $ferr) = $node->psql('postgres', q{SELECT test_ws_fk_bytes('sharedfk', 'p')});
+like($ferr, qr/is not in a versioned schema/, 'a shared table\'s keys are no commit\'s');
+
+# a key's one unique index is not refused, by what it takes to be one
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.fkone_p (a int, b int, UNIQUE (a), UNIQUE (a, b));
+	CREATE UNIQUE INDEX fkone_part ON src.fkone_p (b) WHERE b > 0;
+	CREATE TABLE src.fkone (x int REFERENCES src.fkone_p (a));
+});
+isnt($node->safe_psql('postgres', q{SELECT test_ws_fk_bytes('src', 'fkone')}), '', 'one index serving a key reads');
 
 # an index no longer valid: refused
 $node->safe_psql('postgres', q{
@@ -657,6 +703,8 @@ my $order = q{
 	CREATE SCHEMA ord VERSIONED;
 	CREATE TABLE ord.t (a integer, CONSTRAINT "€1" CHECK (a > 1), CONSTRAINT "é1" CHECK (a > 2),
 		CONSTRAINT "z1" CHECK (a > 3));
+	CREATE TABLE ord."parenté" ("clé" integer PRIMARY KEY);
+	CREATE TABLE ord."enfant" ("réf" integer, CONSTRAINT "lié" FOREIGN KEY ("réf") REFERENCES ord."parenté" ("clé"));
 	CREATE INDEX "€i" ON ord.t (a);
 	CREATE INDEX "éi" ON ord.t (a);
 	CREATE INDEX "zi" ON ord.t (a);
@@ -669,6 +717,9 @@ $node->safe_psql('postgres', $order);
 my $ord_sql = q{SET client_encoding = UTF8; SELECT encode(test_ws_schema_bytes('ord', 't'), 'hex')};
 is($node->safe_psql('lat9', $ord_sql), $node->safe_psql('postgres', $ord_sql),
 	'constraints in one order, whichever order the database sorts them in');
+my $ord_fk = q{SET client_encoding = UTF8; SELECT test_ws_fk_bytes('ord', 'enfant')};
+is($node->safe_psql('lat9', $ord_fk), $node->safe_psql('postgres', $ord_fk),
+	'a foreign key the same bytes in another encoding');
 
 # a name is limited in a commit by UTF8's bytes, whichever encoding could hold more
 my $long = 'é' x 40;

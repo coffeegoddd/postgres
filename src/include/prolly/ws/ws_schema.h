@@ -158,7 +158,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
  * The schema of a table, from the catalogs, through WsSql (its foreign keys,
- * which no one record holds, from ws_fk_read): false if the schema
+ * which no one record holds, from ws_fk_read, though one no commit can hold
+ * refuses the table here too): false if the schema
  * has no ordinary table of that name.  Each column's tag is its catalog row's,
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance and partitions,
@@ -212,5 +213,17 @@ extern void ws_schema_create_table(const WsTableSchema *s, const char *schema, B
  * ERRCODE_DATA_CORRUPTED and is not given back.
  */
 extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/*
+ * A name as a commit holds it, raising ERRCODE_NAME_TOO_LONG past a commit's
+ * limit; and as this database holds it, raising the same if it holds it in too
+ * many bytes, where the grammar would cut it short.  NULL gives NULL, there.
+ */
+extern char *ws_name_to_utf8(const char *name);
+extern char *ws_name_from_utf8(const char *name);
+
+/* Text of a statement being written; an identifier as quote_identifier quotes it. */
+extern void ws_put_text(Buf *out, const char *text);
+extern void ws_put_identifier(Buf *out, const char *name);
 
 #endif							/* PROLLY_WS_SCHEMA_H */
