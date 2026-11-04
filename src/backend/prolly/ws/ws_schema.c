@@ -30,7 +30,6 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
-#include "pg_config_manual.h"
 #include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodes.h"
@@ -87,9 +86,11 @@ index_problem(const WsTableSchema *s, const WsIndex *ix)
 		return "an index's name too long";
 	if (s->key_name != NULL && strcmp(ix->name, s->key_name) == 0)
 		return "an index named as the key is";
+	/* (a unique constraint's index has its name; a check has no relation) */
 	for (int c = 0; c < s->nconstraints; c++)
-		if (strcmp(ix->name, s->constraints[c].name) == 0)
-			return "an index named as a constraint is";
+		if (s->constraints[c].kind == WS_CONSTRAINT_UNIQUE &&
+			strcmp(ix->name, s->constraints[c].name) == 0)
+			return "an index named as a unique constraint is";
 	if (ix->method == NULL || ix->method[0] == '\0' || strlen(ix->method) >= NAMEDATALEN)
 		return "an index with no method";
 	if (ix->nulls_not_distinct && !ix->unique)
@@ -121,12 +122,15 @@ index_problem(const WsTableSchema *s, const WsIndex *ix)
 		if ((key->collation != NULL && key->collation[0] == '\0') ||
 			(key->opclass != NULL && key->opclass[0] == '\0'))
 			return "an index's key with an empty collation or opclass";
-		if (key->order != WS_INDEX_ORDER_DEFAULT && key->order != WS_INDEX_ORDER_ASC &&
-			key->order != WS_INDEX_ORDER_DESC)
+		if (key->order != WS_INDEX_ORDER_DEFAULT && key->order != WS_INDEX_ORDER_DESC)
 			return "an index's key of no known order";
 		if (key->nulls != WS_INDEX_NULLS_DEFAULT && key->nulls != WS_INDEX_NULLS_FIRST &&
 			key->nulls != WS_INDEX_NULLS_LAST)
 			return "an index's key of no known order of nulls";
+		/* (one index, one set of bytes: its default order of nulls is not said) */
+		if (key->nulls == (key->order == WS_INDEX_ORDER_DESC ? WS_INDEX_NULLS_FIRST :
+						   WS_INDEX_NULLS_LAST))
+			return "an index's key saying its default order of nulls";
 	}
 	for (int k = 0; k < ix->ninclude; k++)
 		if (ws_schema_column(s, ix->include[k]) == NULL)
@@ -892,6 +896,37 @@ check_expression(const WsTableSchema *s, const char *stored, Node *in_statement)
 	buf_free(&text);
 }
 
+/*
+ * Whether a collation's or opclass's text names these names, in its one form:
+ * as they print with no setting asking for more quotes, so no spaces, nor a
+ * name the grammar would cut short.
+ */
+static bool
+same_names(const char *text, List *names)
+{
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	List	   *want;
+	char	   *canonical;
+	bool		quote_all = quote_all_identifiers;
+
+	if (text == NULL)
+		return names == NIL;
+	want = stringToQualifiedNameList(text, (Node *) &escontext);
+	if (want == NIL || !equal(want, names))
+		return false;
+	quote_all_identifiers = false;
+	PG_TRY();
+	{
+		canonical = NameListToQuotedString(want);
+	}
+	PG_FINALLY();
+	{
+		quote_all_identifiers = quote_all;
+	}
+	PG_END_TRY();
+	return strcmp(canonical, text) == 0;
+}
+
 /* Whether a type name would create a sequence too: CREATE TABLE's serial types. */
 static bool
 is_serial(const TypeName *t)
@@ -928,12 +963,7 @@ check_column(const WsTableSchema *s, const WsColumn *c, const ColumnDef *def)
 		not_the_record(s, "a column's collation");
 	if (c->collation != NULL)
 	{
-		ErrorSaveContext escontext = {T_ErrorSaveContext};
-		List	   *names = stringToQualifiedNameList(c->collation, (Node *) &escontext);
-
-		/* (as lists of names: their quoting follows quote_all_identifiers) */
-		if (names == NIL || def->collClause->arg != NULL ||
-			!equal(names, def->collClause->collname))
+		if (def->collClause->arg != NULL || !same_names(c->collation, def->collClause->collname))
 			not_the_record(s, "a column's collation");
 	}
 	if (def->storage_name != NULL || def->compression != NULL || def->fdwoptions != NIL)
@@ -1144,7 +1174,7 @@ write_create_index(const WsTableSchema *s, const WsIndex *ix, const char *schema
 			put_text(out, key->opclass);
 		}
 		if (key->order != WS_INDEX_ORDER_DEFAULT)
-			put_text(out, key->order == WS_INDEX_ORDER_DESC ? " DESC" : " ASC");
+			put_text(out, " DESC");
 		if (key->nulls != WS_INDEX_NULLS_DEFAULT)
 			put_text(out, key->nulls == WS_INDEX_NULLS_FIRST ? " NULLS FIRST" : " NULLS LAST");
 	}
@@ -1168,19 +1198,6 @@ write_create_index(const WsTableSchema *s, const WsIndex *ix, const char *schema
 		put_expression(s, ix->predicate, out);
 		put_text(out, ")");
 	}
-}
-
-/* (a collation or opclass as lists of names: their quoting follows settings) */
-static bool
-same_names(const char *text, List *names)
-{
-	ErrorSaveContext escontext = {T_ErrorSaveContext};
-	List	   *want;
-
-	if (text == NULL)
-		return names == NIL;
-	want = stringToQualifiedNameList(text, (Node *) &escontext);
-	return want != NIL && equal(want, names);
 }
 
 /*
@@ -1220,8 +1237,7 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 		if (elem->indexcolname != NULL || elem->opclassopts != NIL ||
 			!same_names(key->collation, elem->collation) ||
 			!same_names(key->opclass, elem->opclass) ||
-			elem->ordering != (key->order == WS_INDEX_ORDER_DESC ? SORTBY_DESC :
-							   key->order == WS_INDEX_ORDER_ASC ? SORTBY_ASC : SORTBY_DEFAULT) ||
+			elem->ordering != (key->order == WS_INDEX_ORDER_DESC ? SORTBY_DESC : SORTBY_DEFAULT) ||
 			elem->nulls_ordering != (key->nulls == WS_INDEX_NULLS_FIRST ? SORTBY_NULLS_FIRST :
 									 key->nulls == WS_INDEX_NULLS_LAST ? SORTBY_NULLS_LAST :
 									 SORTBY_NULLS_DEFAULT))
@@ -1244,7 +1260,9 @@ check_index_statement(const WsTableSchema *s, const WsIndex *ix, const char *sch
 	{
 		IndexElem  *elem = lfirst_node(IndexElem, lc);
 
-		if (elem->name == NULL ||
+		if (elem->name == NULL || elem->expr != NULL || elem->indexcolname != NULL ||
+			elem->collation != NIL || elem->opclass != NIL || elem->opclassopts != NIL ||
+			elem->ordering != SORTBY_DEFAULT || elem->nulls_ordering != SORTBY_NULLS_DEFAULT ||
 			strcmp(elem->name, ws_schema_column(s, ix->include[k++])->name) != 0)
 			not_the_record(s, "another index");
 	}
@@ -1408,6 +1426,9 @@ static const char *const unsupported_sql =
 "                  EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = x.indexrelid AND "
 "                          (a.attstattarget IS NOT NULL OR a.attoptions IS NOT NULL)))) "
 "    THEN 'an index has options, or is not valid' "
+"  WHEN EXISTS (SELECT FROM pg_depend p WHERE p.classid = 'pg_class'::regclass "
+"               AND p.objid IN (SELECT o FROM own) AND p.deptype = 'x') "
+"    THEN 'it depends on an extension' "
 "  WHEN EXISTS (SELECT FROM pg_description d WHERE "
 "               (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT o FROM own)) OR "
 "               (d.classoid = 'pg_constraint'::regclass AND d.objoid IN "
@@ -1550,6 +1571,15 @@ stored_expression(const char *expression, ReadCols *rc)
 	return utf8;
 }
 
+/* (printed from the caches, not the snapshot its row was read under) */
+pg_noreturn static void
+index_gone(const char *table)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("an index of table \"%s\" was dropped since this transaction's snapshot", table)));
+}
+
 /*
  * An index, from the statement the server prints for it: which collations,
  * opclasses and orders are other than the default is its decision, so the
@@ -1561,11 +1591,14 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 {
 	const char *def = ws_sql_value(idxs, row, 2);
 	const char *predicate = ws_sql_value(idxs, row, 3);
-	List	   *parsed = raw_parser(def, RAW_PARSE_DEFAULT);
+	List	   *parsed;
 	IndexStmt  *stmt;
 	int			k = 0;
 	ListCell   *lc;
 
+	if (def == NULL)
+		index_gone(table);
+	parsed = raw_parser(def, RAW_PARSE_DEFAULT);
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, IndexStmt))
 		elog(ERROR, "an index of table \"%s\" printed as something else", table);
 	stmt = (IndexStmt *) linitial_node(RawStmt, parsed)->stmt;
@@ -1598,13 +1631,14 @@ read_index(const char *table, const WsSqlRows *idxs, int row, ReadCols *rc, WsIn
 
 			snprintf(colno, sizeof(colno), "%d", k + 1);
 			WsSql->run("SELECT pg_get_indexdef($1::oid, $2::int, false)", 2, params, &one);
+			if (ws_sql_value(&one, 0, 0) == NULL)
+				index_gone(table);
 			key->expr = stored_expression(ws_sql_value(&one, 0, 0), rc);
 			ws_sql_rows_free(&one);
 		}
 		key->collation = elem->collation ? to_utf8(NameListToQuotedString(elem->collation)) : NULL;
 		key->opclass = elem->opclass ? to_utf8(NameListToQuotedString(elem->opclass)) : NULL;
-		key->order = elem->ordering == SORTBY_DESC ? WS_INDEX_ORDER_DESC :
-			elem->ordering == SORTBY_ASC ? WS_INDEX_ORDER_ASC : WS_INDEX_ORDER_DEFAULT;
+		key->order = elem->ordering == SORTBY_DESC ? WS_INDEX_ORDER_DESC : WS_INDEX_ORDER_DEFAULT;
 		key->nulls = elem->nulls_ordering == SORTBY_NULLS_FIRST ? WS_INDEX_NULLS_FIRST :
 			elem->nulls_ordering == SORTBY_NULLS_LAST ? WS_INDEX_NULLS_LAST : WS_INDEX_NULLS_DEFAULT;
 		k++;

@@ -61,8 +61,8 @@ typedef struct WsConstraint
 } WsConstraint;
 
 #define WS_INDEX_ORDER_DEFAULT 'd'
-#define WS_INDEX_ORDER_ASC 'a'
 #define WS_INDEX_ORDER_DESC 'D'
+/* (the default's the other: first if descending, else last) */
 #define WS_INDEX_NULLS_DEFAULT 'd'
 #define WS_INDEX_NULLS_FIRST 'f'
 #define WS_INDEX_NULLS_LAST 'l'
@@ -72,8 +72,8 @@ typedef struct WsIndexKey
 {
 	uint64		tag;
 	char	   *expr;			/* as stored, or NULL: a column */
-	char	   *collation;		/* qualified and quoted, or NULL: the default */
-	char	   *opclass;		/* qualified and quoted, or NULL: the default */
+	char	   *collation;		/* quoted, qualified if not visible, or NULL: the default */
+	char	   *opclass;		/* quoted, qualified if not visible, or NULL: the default */
 	char		order;			/* WS_INDEX_ORDER_* */
 	char		nulls;			/* WS_INDEX_NULLS_* */
 } WsIndexKey;
@@ -115,10 +115,10 @@ typedef struct WsTableSchema
  * null and distinct; other constraints in order by name, none named as another
  * or as the key, a check with its expression and nothing else, a unique one
  * with its columns, its own, stored and distinct, initially deferred only if
- * deferrable; indexes in order by name, none named as a constraint or the key,
+ * deferrable; indexes in order by name, none named as a unique constraint or the key,
  * with a method and keys, each a column of its own or an expression, not both,
- * INCLUDE's columns its own and not keys, and NULLS NOT DISTINCT only if
- * unique.  NULL if it is so, or what is wrong.
+ * INCLUDE's columns its own, an order of nulls only if it is not the default,
+ * and NULLS NOT DISTINCT only if unique.  NULL if it is so, or what is wrong.
  */
 extern const char *ws_schema_problem(const WsTableSchema *s);
 
@@ -162,7 +162,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * so a table outside a versioned schema raises ERRCODE_FEATURE_NOT_SUPPORTED.
  * What the record cannot yet hold and would lose (inheritance and partitions,
  * storage settings, a key's options, a sequence's, a default using one, foreign
- * keys, exclusion constraints, an index's options, comments, grants)
+ * keys, exclusion constraints, an index's options or its dependence on an
+ * extension, comments, grants)
  * raises ERRCODE_FEATURE_NOT_SUPPORTED, and a name past a commit's limit
  * ERRCODE_NAME_TOO_LONG.  A not-null constraint's name and an identity
  * sequence's are not held, and are made again, and neither is the table's owner,
@@ -173,7 +174,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * dropped since the transaction's snapshot raises
  * ERRCODE_T_R_SERIALIZATION_FAILURE.  Other objects' names (a type's, a
  * function's in a default) are printed as they are now, so a reader on an old
- * snapshot must hold those still itself.  A sequence a default names only by
+ * snapshot must hold those still itself.  An index dropped since that snapshot
+ * raises ERRCODE_T_R_SERIALIZATION_FAILURE too.  A sequence a default names only by
  * text has no dependency to see, so the record holds that default as it is.
  * What it gives is the caller's to ws_schema_free.
  */

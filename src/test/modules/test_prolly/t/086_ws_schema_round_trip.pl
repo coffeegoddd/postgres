@@ -161,7 +161,8 @@ my %refused_for = (
 	cni => 'a check not valid', cne => 'a check not valid',
 	uinc => 'more than columns', uopt => 'more than columns', uclu => 'more than columns',
 	uover => 'more than columns', uspc => 'more than columns',
-	ifill => 'an index has options', ispc => 'an index has options', iclu => 'an index has options',
+	iext => 'depends on an extension', iops => 'an index has options', icmt => 'a comment',
+	irep => 'a replica identity', ifill => 'an index has options', ispc => 'an index has options', iclu => 'an index has options',
 	istat => 'an index has options', cmt => 'a comment', ccmt => 'a comment',
 	kcmt => 'a comment', kicmt => 'a comment', seqcmt => 'a comment',
 	grt => 'grants', cgrt => 'grants', seqgrt => 'grants',
@@ -196,6 +197,10 @@ for my $t (
 	[ 'uinc', 'CREATE TABLE src.uinc (a int, b int, UNIQUE (a) INCLUDE (b))' ],
 	[ 'uopt', 'CREATE TABLE src.uopt (a int, UNIQUE (a) WITH (fillfactor = 50))' ],
 	[ 'uclu', 'CREATE TABLE src.uclu (a int, CONSTRAINT u UNIQUE (a)); ALTER TABLE src.uclu CLUSTER ON u' ],
+	[ 'iext', 'CREATE TABLE src.iext (a int); CREATE INDEX iext_i ON src.iext (a); ALTER INDEX src.iext_i DEPENDS ON EXTENSION test_prolly' ],
+	[ 'iops', 'CREATE TABLE src.iops (t tsvector); CREATE INDEX iops_i ON src.iops USING gist (t tsvector_ops (siglen = 100))' ],
+	[ 'icmt', q{CREATE TABLE src.icmt (a int); CREATE INDEX icmt_i ON src.icmt (a); COMMENT ON INDEX src.icmt_i IS 'x'} ],
+	[ 'irep', 'CREATE TABLE src.irep (a int NOT NULL); CREATE UNIQUE INDEX irep_i ON src.irep (a); ALTER TABLE src.irep REPLICA IDENTITY USING INDEX irep_i' ],
 	[ 'ifill', 'CREATE TABLE src.ifill (a int); CREATE INDEX ON src.ifill (a) WITH (fillfactor = 50)' ],
 	[ 'ispc', 'CREATE TABLE src.ispc (a int); CREATE INDEX ON src.ispc (a) TABLESPACE t86' ],
 	[ 'iclu', 'CREATE TABLE src.iclu (a int); CREATE INDEX iclu_i ON src.iclu (a); ALTER TABLE src.iclu CLUSTER ON iclu_i' ],
@@ -260,6 +265,26 @@ like($sess->{stderr}, qr/was renamed or dropped since this transaction's snapsho
 $sess->query('ROLLBACK');
 $sess->quit;
 
+# an index dropped since the reader's snapshot, its row there but not its text
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.dropi (a int, b text);
+	CREATE INDEX dropi_i ON src.dropi (a);
+	CREATE INDEX dropi_e ON src.dropi (lower(b));
+});
+for my $index ('dropi_i', 'dropi_e')
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', "DROP INDEX src.$index");
+	$old->query(q{SELECT test_ws_schema_bytes('src', 'dropi')});
+	like($old->{stderr}, qr/was dropped since this transaction's snapshot/,
+		"$index dropped since a snapshot refused, not a crash");
+	$old->query('ROLLBACK');
+	$old->quit;
+}
+is($node->safe_psql('postgres', 'SELECT 1'), '1', 'and the server up');
+
 # (a table made like another has a sequence of another type, by the same limits)
 $node->safe_psql('postgres', q{
 	CREATE TABLE src.idsrc (a int GENERATED ALWAYS AS IDENTITY, b smallint GENERATED ALWAYS AS IDENTITY);
@@ -289,6 +314,35 @@ $node->safe_psql('postgres', q{
 });
 is($node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('src', 'lab') IS NOT NULL}),
 	't', 'a label cleared reads');
+
+# an index no longer valid: refused
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.iinv (a int);
+	INSERT INTO src.iinv VALUES (1), (1);
+});
+$node->psql('postgres', q{CREATE UNIQUE INDEX CONCURRENTLY iinv_i ON src.iinv (a)});
+my ($iret, $iout, $ierr) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('src', 'iinv')});
+like($ierr, qr/an index has options, or is not valid/, 'an index not valid refused');
+
+# an index may take a check's name, which is no relation's
+$node->safe_psql('postgres', q{
+	CREATE TABLE src.sharename (a int, CONSTRAINT sharedname CHECK (a > 0));
+	CREATE INDEX sharedname ON src.sharename (a);
+});
+my $shared = $bytes->($node, 'postgres', 'sharename');
+isnt($shared, '', 'an index named as a check reads');
+
+# what a statement does not say is what a record holds, whatever the session's defaults
+$node->safe_psql('postgres', q{CREATE SCHEMA dst6 VERSIONED});
+$node->safe_psql('postgres',
+	qq{SET default_tablespace = t86; SET default_table_access_method = otheram;
+	   SELECT test_ws_schema_create(decode('$shared', 'hex'), 'dst6')});
+is( $node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_class c JOIN pg_am am ON am.oid = c.relam
+		  WHERE c.relnamespace = 'dst6'::regnamespace AND c.reltablespace = 0
+		    AND am.amname IN ('heap', 'btree')}),
+	'2',
+	'a table and its index in the defaults, not the session\'s');
 
 # grants taken back again, and constraints differing in what CREATE TABLE tells
 # apart, are nothing the record loses

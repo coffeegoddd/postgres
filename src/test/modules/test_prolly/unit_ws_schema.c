@@ -719,6 +719,10 @@ test_create_table_injection(void)
 		{.type = "integer", .def = "1); --"},
 		/* a comment in the type, and an expression other than the record reads */
 		{.type = "text --", .def = "'harmless\nDEFAULT (pg_read_file('/etc/passwd')) --'"},
+		/* a collation not in its one form, or cut short */
+		{.type = "text", .collation = " \"C\""},
+		{.type = "text", .collation = "pg_catalog . \"C\""},
+		{.type = "text", .collation = "12345678901234567890123456789012345678901234567890123456789012345678"},
 		/* a clause standing in for another */
 		{.type = "integer --", .not_null = true, .def = "1\nNOT NULL NOT NULL --"},
 		{.type = "integer", .not_null = true, .def = "1) NOT NULL NO INHERIT --"},
@@ -1061,7 +1065,8 @@ static void
 index_invalid(WsIndex *ix, const char *why)
 {
 	WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED}};
-	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+	static uint64 tags[] = {7};
+	WsConstraint con = {.name = "c",.kind = WS_CONSTRAINT_UNIQUE,.ncols = 1,.cols = tags};
 	WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nconstraints = 1,.constraints = &con,
 	.nindexes = 1,.indexes = ix};
 	const char *problem = ws_schema_problem(&s);
@@ -1082,7 +1087,14 @@ test_index_problems(void)
 #define OK_KEY {.tag = 7,.order = WS_INDEX_ORDER_DEFAULT,.nulls = WS_INDEX_NULLS_DEFAULT}
 		{"no name", {.method = "btree"}, OK_KEY},
 		{"no method", {.name = "x"}, OK_KEY},
-		{"named as a constraint", {.name = "c",.method = "btree"}, OK_KEY},
+		{"too long", {.name = "1234567890123456789012345678901234567890123456789012345678901234",
+		.method = "btree"}, OK_KEY},
+		{"named as a unique constraint", {.name = "c",.method = "btree"}, OK_KEY},
+		{"does not have", {.name = "x",.method = "btree",.predicate = "(@{9} > 0)"}, OK_KEY},
+		{"malformed", {.name = "x",.method = "btree",.predicate = "@"}, OK_KEY},
+		{"no known order", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'a',.nulls = 'd'}},
+		{"its default order of nulls", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'd',.nulls = 'l'}},
+		{"its default order of nulls", {.name = "x",.method = "btree"}, {.tag = 7,.order = 'D',.nulls = 'f'}},
 		{"not unique", {.name = "x",.method = "btree",.nulls_not_distinct = true}, OK_KEY},
 		{"neither", {.name = "x",.method = "btree"}, {.order = 'd',.nulls = 'd'}},
 		{"neither", {.name = "x",.method = "btree"}, {.tag = 7,.expr = "true",.order = 'd',.nulls = 'd'}},
@@ -1108,6 +1120,44 @@ test_index_problems(void)
 		WsIndex		ix = {.name = "x",.method = "btree"};
 
 		index_invalid(&ix, "no keys");
+	}
+	{
+		WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+		uint64		none[] = {9};
+		WsIndex		ix = {.name = "x",.method = "btree",.nkeys = 1,.keys = &key,.ninclude = 1,.include = none};
+
+		index_invalid(&ix, "including a column the table does not have");
+		ix.ninclude = INDEX_MAX_KEYS;
+		index_invalid(&ix, "too many columns");
+	}
+	{
+		/* a key's name; indexes out of order; a check's name is free to take */
+		WsColumn	cols[] = {{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED,.not_null = true}};
+		uint64		a[] = {7};
+		WsIndexKey	key = {.tag = 7,.order = 'd',.nulls = 'd'};
+		WsConstraint check = {.name = "c",.kind = WS_CONSTRAINT_CHECK,.expr = "true"};
+		WsIndex		two[] = {
+			{.name = "y",.method = "btree",.nkeys = 1,.keys = &key},
+			{.name = "x",.method = "btree",.nkeys = 1,.keys = &key},
+		};
+		WsIndex		named = {.name = "k",.method = "btree",.nkeys = 1,.keys = &key};
+		WsIndex		as_check = {.name = "c",.method = "btree",.nkeys = 1,.keys = &key};
+		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 2,.indexes = two};
+
+		CHECK(strstr(ws_schema_problem(&s), "not in order") != NULL);
+		s.nindexes = 1;
+		s.indexes = &named;
+		s.key_name = "k";
+		s.nkey = 1;
+		s.key = a;
+		CHECK(strstr(ws_schema_problem(&s), "named as the key") != NULL);
+		s.key_name = NULL;
+		s.nkey = 0;
+		s.key = NULL;
+		s.indexes = &as_check;
+		s.nconstraints = 1;
+		s.constraints = &check;
+		CHECK(ws_schema_problem(&s) == NULL);
 	}
 }
 
@@ -1137,12 +1187,35 @@ index_injected(void *arg)
 }
 
 static void
+index_spanned(void *arg)
+{
+	WsColumn	cols[] = {
+		{.tag = 7,.name = "a",.type = "text",.kind = WS_COL_STORED},
+		{.tag = 8,.name = "b",.type = "text",.kind = WS_COL_STORED},
+	};
+	WsIndexKey	keys[] = {
+		{.expr = "1) --",.order = 'd',.nulls = 'd'},
+		{.expr = (char *) arg,.order = 'd',.nulls = 'd'},
+	};
+	WsIndex		ix = {.name = "i",.method = "btree",.nkeys = 2,.keys = keys};
+	WsTableSchema s = {.name = "t",.ncols = 2,.cols = cols,.nindexes = 1,.indexes = &ix};
+	Buf			b = BUF_INIT;
+
+	ws_schema_create_index(&s, 0, "x", &b);
+}
+
+static void
 test_index_injection(void)
 {
 	static const IndexAttack bad[] = {
 		{.expr = "1), (2"},
-		{.expr = "1) WHERE (true) --"},
-		{.expr = "1) INCLUDE (a) --"},
+		{.expr = "1)) WITH (fillfactor=10) --"},
+		{.expr = "@{7})) INCLUDE (a) --"},
+		{.expr = "@{7})) WHERE (true) --"},
+		{.collation = " \"C\""},
+		{.collation = "\"C\" "},
+		{.collation = "pg_catalog . \"C\""},
+		{.collation = "12345678901234567890123456789012345678901234567890123456789012345678"},
 		{.collation = "\"C\" text_ops"},
 		{.collation = "\"C\" DESC"},
 		{.collation = "\"C\", a"},
@@ -1160,6 +1233,24 @@ test_index_injection(void)
 	for (int i = 0; i < lengthof(bad); i++)
 		expect_error(index_injected, (void *) &bad[i], ERRCODE_DATA_CORRUPTED, NULL);
 
+	/*
+	 * A comment in one key's expression and a newline in the next's, so that
+	 * the statement says more after them; each alone is the expression it was.
+	 */
+	{
+		static const char *const clause[] = {
+			"2 /*\n, ((2))) INCLUDE (b DESC) -- */",
+			"2 /*\n, ((2))) INCLUDE (b) -- */",
+			"2 /*\n, ((2))) WITH (fillfactor = 10) -- */",
+			"2 /*\n, ((2))) TABLESPACE x -- */",
+			"2 /*\n, ((2))) WHERE (true) -- */",
+			"2 /*\n, ((2))) NULLS NOT DISTINCT -- */",
+		};
+
+		for (int i = 0; i < lengthof(clause); i++)
+			expect_error(index_spanned, (void *) clause[i], ERRCODE_DATA_CORRUPTED, NULL);
+	}
+
 	/* (these make what they say: an expression's tree is what is compared) */
 	for (int i = 0; i < lengthof(same); i++)
 	{
@@ -1171,6 +1262,8 @@ test_index_injection(void)
 		WsTableSchema s = {.name = "t",.ncols = 1,.cols = cols,.nindexes = 1,.indexes = &ix};
 
 		ws_schema_create_index(&s, 0, "x", &b);
+		buf_append_byte(&b, 0);
+		CHECK(strstr((char *) b.data, same[i]) != NULL);
 		buf_free(&b);
 	}
 }
