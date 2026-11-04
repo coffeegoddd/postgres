@@ -50,7 +50,8 @@ extern bool ChunkStoreHas(Relation log, Relation idx, const uint8 *hash);
 /*
  * The chunk's bytes, palloc'd, and their length in *len; NULL if absent to a
  * reader under the active snapshot: its insert not committed, or its freeing
- * committed before that snapshot.  So what a reader found the name of while it
+ * committed before that snapshot, or this transaction's own (unless an older
+ * entry of the same chunk answers, with the same bytes).  So what a reader found the name of while it
  * held a reference, or anything under that, it can read, however soon that is
  * let go of and freed.  They are not checked against its name (a page's
  * checksum covers the read; the audit, and puts, check names).

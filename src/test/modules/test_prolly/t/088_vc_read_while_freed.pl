@@ -91,11 +91,14 @@ $node->safe_psql('postgres', q{
 is( $node->safe_psql('postgres', qq{SELECT test_cs_has('pages', decode('$main', 'hex'))}),
 	'f',
 	'the branch chunk that snapshot could see is freed');
+my $live = $node->safe_psql('postgres',
+	q{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'vc/branch/main'});
 like(
 	$many->query_safe(
-		qq{SELECT (test_cs_get_many('pages', ARRAY[decode('$main', 'hex')]))[1] IS NOT NULL}),
+		qq{SELECT g[1] IS NOT NULL AND g[2] IS NOT NULL
+		   FROM test_cs_get_many('pages', ARRAY[decode('$main', 'hex'), decode('$live', 'hex')]) g}),
 	qr/^t$/m,
-	'and a read of many under it finds it');
+	'and a read of many under it finds it, among one not freed');
 $many->quit;
 
 # a later read, with a later snapshot, finds the branch as it is now
