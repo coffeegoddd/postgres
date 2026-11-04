@@ -21,7 +21,7 @@ my $to = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
 $node->safe_psql('postgres', qq{
 	SET catalog_branch = $from;
 	CREATE SCHEMA c VERSIONED;
-	CREATE TABLE c.t (a integer PRIMARY KEY, b text);
+	CREATE TABLE c.t (a integer PRIMARY KEY, b text, big text);
 	CREATE INDEX ON c.t (b);
 	CREATE SEQUENCE c.s;
 	SELECT nextval('c.s') FROM generate_series(1, 5);
@@ -53,12 +53,12 @@ $node->safe_psql('postgres', qq{
 	BEGIN;
 	SELECT pg_branch_catalog_copy($from, $to2);
 	SET LOCAL catalog_branch = $to2;
-	INSERT INTO c.t SELECT 2, string_agg(md5(g::text), '') FROM generate_series(1, 2000) g;
+	INSERT INTO c.t SELECT 2, 'y', string_agg(md5(g::text), '') FROM generate_series(1, 2000) g;
 	SELECT nextval('c.s');
 	COMMIT;
 });
 my $read2 = qq{SET catalog_branch = $to2;
-	SELECT a, length(b) FROM c.t; SELECT last_value FROM c.s};
+	SELECT a, length(big) FROM c.t; SELECT last_value FROM c.s};
 is($node->safe_psql('postgres', $read2), "2|64000\n6", 'written in the copying transaction');
 $node->stop('immediate');
 $node->start;
