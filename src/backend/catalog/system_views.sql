@@ -32,6 +32,7 @@ CREATE VIEW pg_roles AS
         '********'::text as rolpassword,
         rolvaliduntil,
         rolbypassrls,
+        roltravels,
         setconfig as rolconfig,
         pg_authid.oid
     FROM pg_authid LEFT JOIN pg_db_role_setting s

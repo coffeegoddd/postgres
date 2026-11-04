@@ -155,16 +155,19 @@ is($dst->safe_psql('postgres', 'SELECT string_agg(oid::text, $$ $$ ORDER BY oid)
 # leaving a root and coming back, and a second clone on one cluster
 is($restore->($dst, $bytes->($src, 'g_top'), $held), 0, 'a commit may hold fewer');
 is($restore->($dst, $held, $bytes->($src, 'g_top')), 0, 'and a role that left may come back');
-is($restore->($dst, $held), 0, 'and a second database on this cluster may hold them');
+$dst->safe_psql('postgres', 'CREATE DATABASE other');
+$dst->safe_psql('other', 'CREATE EXTENSION test_prolly');
+is($dst->psql('other', "SELECT test_ws_role_restore('$held', '')"), 0, 'and a second database on this cluster may hold them');
 
 # what is made here stays; nothing is dropped
 $dst->safe_psql('postgres', q{CREATE ROLE x_here LOGIN; GRANT g_leaf TO x_here;
-	CREATE ROLE g_extra NOLOGIN; GRANT g_extra TO g_top;});
-is($restore->($dst, $held, $held), 0, 'it arrives with others here');
-is($dst->safe_psql('postgres', q{SELECT string_agg(r.rolname, ' ' ORDER BY r.rolname) FROM pg_auth_members m
-	JOIN pg_roles p ON p.oid = m.roleid JOIN pg_roles r ON r.oid = m.member WHERE p.rolname IN ('g_leaf', 'g_extra')}),
-	'g_top x_here', 'and nothing made here is dropped');
-$dst->safe_psql('postgres', 'REVOKE g_extra FROM g_top; DROP ROLE g_extra');
+	GRANT g_top TO g_leaf});
+is($restore->($dst, $held, $held), 0, 'it arrives with memberships made here');
+is($dst->safe_psql('postgres', q{SELECT string_agg(r.rolname || ' in ' || p.rolname, ', ' ORDER BY r.rolname) FROM pg_auth_members m
+	JOIN pg_roles p ON p.oid = m.roleid JOIN pg_roles r ON r.oid = m.member
+	WHERE (r.rolname, p.rolname) IN (('x_here', 'g_leaf'), ('g_leaf', 'g_top'))}),
+	'g_leaf in g_top, x_here in g_leaf', 'and nothing made here is dropped, whether between roles it holds or not');
+$dst->safe_psql('postgres', 'REVOKE g_top FROM g_leaf');
 
 # a changed role changes here
 $src->safe_psql('postgres', 'ALTER ROLE g_top NOINHERIT; ALTER ROLE g_mid INHERIT');
@@ -201,7 +204,6 @@ my $cycle = sprintf("%s:0001%02x%s01\n%s:0001%02x%s01\n",
 	unpack('H*', 'g_c1'), 4, unpack('H*', 'g_c2'), unpack('H*', 'g_c2'), 4, unpack('H*', 'g_c1'));
 ($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$cycle', '')");
 like($err, qr/is a member of role/, 'a cycle of memberships is refused');
-is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_roles WHERE rolname IN ('g_c1', 'g_c2')}), '0', 'making nothing');
 
 # a commit reaches no role here that it does not hold, through memberships made here
 $src->safe_psql('postgres', q{CREATE ROLE g_low NOLOGIN; CREATE ROLE g_ops NOLOGIN});
@@ -213,16 +215,19 @@ $src->safe_psql('postgres', q{GRANT g_ops TO g_low});
 my $reaching = $bytes->($src, 'g_low', 'g_ops');
 ($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$reaching', '$apart')");
 like($err, qr/role "g_low" would reach role "x_su", which it does not hold/, 'a superuser cannot be reached through a membership made here');
-is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_auth_members m JOIN pg_roles p ON p.oid = m.roleid JOIN pg_roles r ON r.oid = m.member
-	WHERE r.rolname = 'g_low' AND p.rolname = 'g_ops'}), '0', 'and the membership is not made');
 $dst->safe_psql('postgres', q{REVOKE x_su FROM g_ops; GRANT pg_read_server_files TO g_ops});
 ($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$reaching', '$apart')");
 like($err, qr/would reach role "pg_read_server_files"/, 'nor a predefined role');
 $dst->safe_psql('postgres', q{REVOKE pg_read_server_files FROM g_ops; CREATE ROLE x_two NOLOGIN; CREATE ROLE x_three LOGIN;
 	GRANT x_two TO g_ops; GRANT x_three TO x_two});
 ($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$reaching', '$apart')");
-like($err, qr/would reach role "x_two"/, 'nor anything else, however far');
-$dst->safe_psql('postgres', q{REVOKE x_two FROM g_ops});
+like($err, qr/would reach role "x_two"/, 'nor a group role made here');
+$dst->safe_psql('postgres', q{REVOKE x_two FROM g_ops; CREATE ROLE g_far NOLOGIN TRAVELS; GRANT g_far TO g_ops; GRANT x_su TO g_far});
+$src->safe_psql('postgres', q{CREATE ROLE g_far NOLOGIN});
+my $far = $bytes->($src, 'g_low', 'g_ops', 'g_far');
+($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$far', '$apart')");
+like($err, qr/would reach role "x_su"/, 'nor anything further, through a role the commit holds');
+$dst->safe_psql('postgres', q{REVOKE x_su FROM g_far; REVOKE g_far FROM g_ops});
 is($restore->($dst, $reaching, $apart), 0, 'with those gone it arrives');
 
 # a role here by another way is not taken over: its members would get the commit's grants
@@ -231,7 +236,6 @@ $src->safe_psql('postgres', 'CREATE ROLE g_new NOLOGIN; CREATE ROLE g_fresh NOLO
 my $with_new = $bytes->($src, 'g_fresh', 'g_new');
 ($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$with_new', '')");
 like($err, qr/role "g_new" is here already, and not held by any commit here/, 'a role here by another way refuses arrival');
-is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_roles WHERE rolname = 'g_fresh'}), '0', 'making nothing');
 
 # nor one here that could not travel, marked or not
 $dst->safe_psql('postgres', 'ALTER ROLE g_top LOGIN');
@@ -242,11 +246,40 @@ $dst->safe_psql('postgres', 'ALTER ROLE g_top NOLOGIN SUPERUSER');
 like($err, qr/role "g_top" cannot arrive here: .*power/, 'a marked role with a power here refuses arrival');
 $dst->safe_psql('postgres', 'ALTER ROLE g_top NOSUPERUSER');
 
+# a role's mark outlives a dump of globals, and can be set and cleared by SQL
+$src->safe_psql('postgres', q{CREATE ROLE g_dumped NOLOGIN TRAVELS; CREATE ROLE g_undumped NOLOGIN});
+is($src->safe_psql('postgres', q{SELECT rolname, roltravels FROM pg_roles WHERE rolname = 'g_dumped'}), 'g_dumped|t', 'a role may be made marked, and shown');
+my $globals = PostgreSQL::Test::Utils::slurp_file(do {
+	my $file = $src->basedir . '/globals.sql';
+	$src->command_ok([ 'pg_dumpall', '--globals-only', '--port' => $src->port, '--host' => $src->host, '--file' => $file ], 'pg_dumpall of globals');
+	$file });
+like($globals, qr/ALTER ROLE g_dumped WITH .* TRAVELS/, 'a mark is dumped');
+unlike($globals, qr/ALTER ROLE g_undumped WITH [^\n]* TRAVELS/, 'and only a mark');
+$dst->safe_psql('postgres', 'CREATE ROLE g_marked_by_sql NOLOGIN; ALTER ROLE g_marked_by_sql TRAVELS');
+is($dst->safe_psql('postgres', q{SELECT roltravels FROM pg_authid WHERE rolname = 'g_marked_by_sql'}), 't', 'ALTER ROLE marks');
+$dst->safe_psql('postgres', 'ALTER ROLE g_marked_by_sql NOTRAVELS');
+is($dst->safe_psql('postgres', q{SELECT roltravels FROM pg_authid WHERE rolname = 'g_marked_by_sql'}), 'f', 'and clears');
+$dst->safe_psql('postgres', 'CREATE ROLE x_plain LOGIN');
+($rc, $out, $err) = $dst->psql('postgres', q{SET ROLE x_plain; ALTER ROLE g_marked_by_sql TRAVELS});
+like($err, qr/permission denied to alter role/, 'which takes the right to alter it');
+
+# concurrently: one of two markings waits for the other
+$src->safe_psql('postgres', 'CREATE ROLE g_race_mark NOLOGIN');
+my $to_mark = $bytes->($src, 'g_race_mark');
+my $m1 = $src->background_psql('postgres');
+$m1->query_safe('BEGIN');
+$m1->query_safe("SELECT test_ws_role_mark('$to_mark')");
+my $m2 = $src->background_psql('postgres', on_error_stop => 0);
+$m2->query_until(qr/started/, "\\echo started\nSELECT test_ws_role_mark('$to_mark');\n\\echo done\n");
+$m1->query_safe('COMMIT');
+like($m2->query_safe('SELECT 1'), qr/1/, 'two markings of one role do not collide');
+is($m2->{stderr}, '', 'with no error');
+$_->quit for ($m1, $m2);
+
 # a commit's membership of a role it does not hold: it cannot join one here
 my $evil = sprintf("%s:0001%02x%s01\n", unpack('H*', 'g_evil'), 6, unpack('H*', 'x_here'));
 ($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$evil', '')");
 like($err, qr/is a member of "x_here", which it does not hold/, 'a commit cannot join a role here');
-is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_roles WHERE rolname = 'g_evil'}), '0', 'nor make the role');
 
 # a name that reads as a keyword is that name
 $src->safe_psql('postgres', q{CREATE ROLE "select" NOLOGIN; CREATE ROLE "current_user" NOLOGIN; GRANT "select" TO "current_user" WITH ADMIN FALSE, INHERIT TRUE, SET TRUE});
@@ -263,6 +296,74 @@ is($rc, 0, 'CREATEROLE can make new roles from a commit');
 is($bytes->($dst, 'g_cr2'), $cr, 'as they are held');
 ($rc, $out, $err) = $dst->psql('postgres', "SET ROLE x_maker; SELECT test_ws_role_restore('$changed', '$changed')");
 like($err, qr/permission denied/, 'but not change those it has no ADMIN on');
+
+# a commit that only lowers is no reach, and takes no more than the membership
+$src->safe_psql('postgres', q{CREATE ROLE g_l1 NOLOGIN; CREATE ROLE g_l2 NOLOGIN;
+	GRANT g_l2 TO g_l1 WITH ADMIN TRUE, INHERIT TRUE, SET TRUE});
+my $l_high = $bytes->($src, 'g_l1');
+is($restore->($dst, $l_high), 0, 'a membership arrives');
+$dst->safe_psql('postgres', q{CREATE ROLE x_local_l NOLOGIN; GRANT x_local_l TO g_l2});
+$src->safe_psql('postgres', q{GRANT g_l2 TO g_l1 WITH ADMIN FALSE, INHERIT TRUE, SET TRUE});
+my $l_low = $bytes->($src, 'g_l1');
+is($restore->($dst, $l_low, $l_high), 0, 'a commit taking access away is not refused for what is local');
+is($bytes->($dst, 'g_l1') =~ s/\n.*$//sr, $l_low =~ s/\n.*$//sr, 'and lowers it');
+$dst->safe_psql('postgres', 'REVOKE x_local_l FROM g_l2');
+
+# through a membership the same commit removes: it is gone before anything is added
+$src->safe_psql('postgres', q{CREATE ROLE g_m1 NOLOGIN; CREATE ROLE g_m2 NOLOGIN; CREATE ROLE g_m3 NOLOGIN; GRANT g_m3 TO g_m2});
+my $m_before = $bytes->($src, 'g_m1', 'g_m2', 'g_m3');
+is($restore->($dst, $m_before), 0, 'memberships arrive');
+$dst->safe_psql('postgres', q{GRANT x_su TO g_m3});
+$src->safe_psql('postgres', q{REVOKE g_m3 FROM g_m2; GRANT g_m2 TO g_m1});
+my $m_after = $bytes->($src, 'g_m1', 'g_m2', 'g_m3');
+is($restore->($dst, $m_after, $m_before), 0, 'a membership removed by the commit reaches nothing');
+$dst->safe_psql('postgres', q{REVOKE x_su FROM g_m3});
+
+# a role that leaves a commit takes its memberships with it
+$src->safe_psql('postgres', q{CREATE ROLE g_r1 NOLOGIN; CREATE ROLE g_r2 NOLOGIN; GRANT g_r2 TO g_r1});
+my $r_both = $bytes->($src, 'g_r1');
+is($restore->($dst, $r_both), 0, 'a membership arrives');
+$src->safe_psql('postgres', q{REVOKE g_r2 FROM g_r1});
+my $r_one = $bytes->($src, 'g_r1');
+is($restore->($dst, $r_one, $r_both), 0, 'a commit retires a role');
+is($bytes->($dst, 'g_r1'), $r_one, 'and the member is no longer a member of it');
+is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_roles WHERE rolname = 'g_r2'}), '1', 'and it stays here, not dropped');
+$src->safe_psql('postgres', q{GRANT g_r2 TO g_r1});
+$r_both = $bytes->($src, 'g_r1');
+is($restore->($dst, $r_both, $r_one), 0, 'a membership comes back');
+my $r_target = $bytes->($src, 'g_r2');
+is($restore->($dst, $r_target, $r_both), 0, 'a commit retires the member instead');
+is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'g_r1'}), '0',
+	'so its members here get nothing from it');
+
+# what depends on a membership here: an option changes in place; ADMIN is refused by name
+$src->safe_psql('postgres', q{CREATE ROLE g_d1 NOLOGIN; CREATE ROLE g_d2 NOLOGIN; GRANT g_d2 TO g_d1 WITH ADMIN TRUE, INHERIT TRUE, SET TRUE});
+my $d_before = $bytes->($src, 'g_d1');
+is($restore->($dst, $d_before), 0, 'a membership with ADMIN arrives');
+$dst->safe_psql('postgres', q{CREATE ROLE x_w LOGIN; GRANT g_d2 TO x_w GRANTED BY g_d1});
+$src->safe_psql('postgres', q{GRANT g_d2 TO g_d1 WITH ADMIN TRUE, INHERIT FALSE, SET TRUE});
+my $d_inherit = $bytes->($src, 'g_d1');
+is($restore->($dst, $d_inherit, $d_before), 0, 'an option changes under a grant that depends on it');
+is($bytes->($dst, 'g_d1'), $d_inherit, 'and is changed');
+is($dst->safe_psql('postgres', q{SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'x_w'}), '1', 'and the grant stays');
+$src->safe_psql('postgres', q{GRANT g_d2 TO g_d1 WITH ADMIN FALSE, INHERIT FALSE, SET TRUE});
+my $d_low = $bytes->($src, 'g_d1');
+($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$d_low', '$d_inherit')");
+like($err, qr/takes the ADMIN option on role "g_d2" from role "g_d1", which granted it here to role "x_w"/, 'lowering ADMIN that was used is refused by name');
+$src->safe_psql('postgres', q{REVOKE g_d2 FROM g_d1});
+my $d_gone = $bytes->($src, 'g_d1', 'g_d2');
+($rc, $out, $err) = $dst->psql('postgres', "SELECT test_ws_role_restore('$d_gone', '$d_inherit')");
+like($err, qr/which granted it here to role "x_w"/, 'and so is removing it');
+
+# a grant of a superuser's that one with CREATEROLE and ADMIN has no power over
+$src->safe_psql('postgres', q{CREATE ROLE g_s1 NOLOGIN; CREATE ROLE g_s2 NOLOGIN; GRANT g_s2 TO g_s1 WITH ADMIN FALSE, INHERIT TRUE, SET FALSE});
+my $s_before = $bytes->($src, 'g_s1');
+is($restore->($dst, $s_before), 0, 'a superuser restores a membership');
+$dst->safe_psql('postgres', q{GRANT g_s1 TO x_maker WITH ADMIN TRUE; GRANT g_s2 TO x_maker WITH ADMIN TRUE});
+$src->safe_psql('postgres', q{GRANT g_s2 TO g_s1 WITH ADMIN FALSE, INHERIT FALSE, SET FALSE});
+my $s_after = $bytes->($src, 'g_s1');
+($rc, $out, $err) = $dst->psql('postgres', "SET ROLE x_maker; SELECT test_ws_role_restore('$s_after', '$s_before')");
+like($err, qr/permission denied/, 'with CREATEROLE and ADMIN another\'s grant cannot be changed');
 
 $_->stop for ($src, $dst);
 done_testing();

@@ -840,6 +840,7 @@ dumpRoles(PGconn *conn)
 				i_rolvaliduntil,
 				i_rolreplication,
 				i_rolbypassrls,
+				i_roltravels,
 				i_rolcomment,
 				i_is_current_user;
 	int			i;
@@ -853,11 +854,14 @@ dumpRoles(PGconn *conn)
 					  "rolcreaterole, rolcreatedb, "
 					  "rolcanlogin, rolconnlimit, rolpassword, "
 					  "rolvaliduntil, rolreplication, rolbypassrls, "
+					  "%s as roltravels, "
 					  "pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, "
 					  "rolname = current_user AS is_current_user "
 					  "FROM %s "
 					  "WHERE rolname !~ '^pg_' "
-					  "ORDER BY 2", role_catalog);
+					  "ORDER BY 2",
+					  server_version >= 200000 ? "roltravels" : "false",
+					  role_catalog);
 
 	res = executeQuery(conn, buf->data);
 
@@ -873,6 +877,7 @@ dumpRoles(PGconn *conn)
 	i_rolvaliduntil = PQfnumber(res, "rolvaliduntil");
 	i_rolreplication = PQfnumber(res, "rolreplication");
 	i_rolbypassrls = PQfnumber(res, "rolbypassrls");
+	i_roltravels = PQfnumber(res, "roltravels");
 	i_rolcomment = PQfnumber(res, "rolcomment");
 	i_is_current_user = PQfnumber(res, "is_current_user");
 
@@ -951,6 +956,10 @@ dumpRoles(PGconn *conn)
 			appendPQExpBufferStr(buf, " BYPASSRLS");
 		else
 			appendPQExpBufferStr(buf, " NOBYPASSRLS");
+
+		/* (only if so, so that a role that does not is dumped as upstream's is) */
+		if (strcmp(PQgetvalue(res, i, i_roltravels), "t") == 0)
+			appendPQExpBufferStr(buf, " TRAVELS");
 
 		if (strcmp(PQgetvalue(res, i, i_rolconnlimit), "-1") != 0)
 			appendPQExpBuffer(buf, " CONNECTION LIMIT %s",

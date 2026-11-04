@@ -1525,6 +1525,7 @@ pg_roles| SELECT pg_authid.rolname,
     '********'::text AS rolpassword,
     pg_authid.rolvaliduntil,
     pg_authid.rolbypassrls,
+    pg_authid.roltravels,
     s.setconfig AS rolconfig,
     pg_authid.oid
    FROM (pg_authid

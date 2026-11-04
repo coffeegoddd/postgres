@@ -1332,6 +1332,10 @@ AlterOptRoleElem:
 						$$ = makeDefElem("bypassrls", (Node *) makeBoolean(true), @1);
 					else if (strcmp($1, "nobypassrls") == 0)
 						$$ = makeDefElem("bypassrls", (Node *) makeBoolean(false), @1);
+					else if (strcmp($1, "travels") == 0)
+						$$ = makeDefElem("travels", (Node *) makeBoolean(true), @1);
+					else if (strcmp($1, "notravels") == 0)
+						$$ = makeDefElem("travels", (Node *) makeBoolean(false), @1);
 					else if (strcmp($1, "noinherit") == 0)
 					{
 						/*
