@@ -52,9 +52,14 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	my $name = basename($dir) . ' ' . basename($path, '.sql');
 	my $s = sections($path);
 	my @expect = grep { /\S/ } split /\n/, $s->{expect};
-	my @want_conflicts = map { /^conflict (.*)$/ ? ($1) : () } @expect;
-	my @want_violations = map { /^violation (\S+) (\S+) (.*)$/ ? ("$2 $1 $3") : () } @expect;
-	my @checks = map { /^check (.*) => (.*)$/ ? ([ $1, $2 ]) : () } @expect;
+	my (@want_conflicts, @want_violations, @checks);
+	for my $line (@expect)
+	{
+		if ($line =~ /^conflict (.*)$/) { push @want_conflicts, $1; }
+		elsif ($line =~ /^violation (.*)$/) { push @want_violations, $1; }
+		elsif ($line =~ /^check (.*) => (.*)$/) { push @checks, [ $1, $2 ]; }
+		elsif ($line ne 'clean') { die "$name: what is this: $line"; }
+	}
 	my ($b, $o, $t, $d) = ("b$i", "o$i", "t$i", "d$i");
 
 	my $script = qq{
@@ -82,7 +87,9 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	};
 	if (!@want_conflicts && !@want_violations)
 	{
+		$script .= qq{SELECT last_value AS calls FROM public.vc_gen_calls \\gset\n};
 		$script .= qq{SELECT test_ws_root_restore(:'m', '$d') IS NULL AS restored \\gset\n};
+		$script .= qq{\\echo =====calls\nSELECT last_value = :calls FROM public.vc_gen_calls;\n\\echo =====end\n};
 		$script .= qq{\\echo =====same\nSELECT test_ws_root_capture('$d') = :'m';\n\\echo =====end\n};
 		my $k = 0;
 		for my $check (@checks)
@@ -103,11 +110,13 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	  or diag(join("\n", 'it said:', @conflicts));
 	next if @want_conflicts;
 	my ($viol) = $out =~ /=====viol\n(.*?)\n?=====end/s;
-	my @got = map { /^(?:foreign key|not null|\S+) (\S+ \S+ .*)$/ ? ($1) : () } split /\n/, $viol // '';
+	my @got = split /\n/, $viol // '';
 	is_deeply([ sort @got ], [ sort @want_violations ], "$name: its violations");
 	next if @want_violations;
 	my ($same) = $out =~ /=====same\n(.*?)\n?=====end/s;
 	is($same // '', 't', "$name: restored, the root the merge made");
+	my ($calls) = $out =~ /=====calls\n(.*?)\n?=====end/s;
+	is($calls // '', 't', "$name: restored, computing nothing");
 	my $k = 0;
 	for my $check (@checks)
 	{
@@ -117,6 +126,8 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	}
 }
 }
+
+is($i, 35, 'every scenario ran');
 
 $node->stop;
 done_testing();

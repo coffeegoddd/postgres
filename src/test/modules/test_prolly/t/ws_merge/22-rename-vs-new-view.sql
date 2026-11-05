@@ -9,3 +9,4 @@ CREATE MATERIALIZED VIEW rt.top_names AS SELECT name FROM rt.acct WHERE score > 
 clean
 check SELECT string_agg(DISTINCT name, ',') FROM rt.top => n996,n997,n998,n999,o
 check SELECT ispopulated FROM pg_matviews WHERE matviewname = 'top_names' => f
+check REFRESH MATERIALIZED VIEW rt.top_names; SELECT count(*), max(name) FROM rt.top_names => 10|o

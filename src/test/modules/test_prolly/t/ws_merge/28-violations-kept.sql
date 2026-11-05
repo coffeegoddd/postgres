@@ -6,7 +6,7 @@ UPDATE rt.acct SET email = 'z@x' WHERE id = 1;
 UPDATE rt.item SET qty = 50 WHERE id IN (10, 20);
 INSERT INTO rt.acct VALUES (5001, 'z@x', 'x', 1);
 -- expect
-violation qty_small item 10
-violation qty_small item 20
-violation acct_email_key acct 1
-violation acct_email_key acct 5001
+violation check item qty_small 10
+violation check item qty_small 20
+violation unique acct acct_email_key 1
+violation unique acct acct_email_key 5001
