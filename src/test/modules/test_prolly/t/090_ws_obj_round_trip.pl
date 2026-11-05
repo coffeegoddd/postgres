@@ -1164,6 +1164,16 @@ $node->safe_psql('postgres', q{
 	CREATE OPERATOR FAMILY early USING btree;
 	ALTER OPERATOR FAMILY early USING btree ADD OPERATOR 3 =(integer, integer);
 	CREATE OPERATOR CLASS early_ops FOR TYPE integer USING btree FAMILY early AS OPERATOR 1 <(integer, integer), FUNCTION 1 btint4cmp(integer, integer);
+	-- a family another sorts by holds nothing of it
+	CREATE OPERATOR FAMILY sortf USING btree;
+	CREATE OPERATOR FAMILY g2 USING gist;
+	ALTER OPERATOR FAMILY g2 USING gist ADD OPERATOR 15 <->(point, point) FOR ORDER BY sortf;
+	-- a class with no members of its own, as they went to its family
+	CREATE TYPE m2 AS ENUM ('a');
+	CREATE OPERATOR CLASS only_fam FOR TYPE m2 USING btree AS FUNCTION 1 enum_cmp(anyenum, anyenum);
+	-- a member of a range on the class of its family: the class is before the range, and the member after
+	CREATE TYPE rg AS RANGE (SUBTYPE = m, SUBTYPE_OPCLASS = "Odd Ops");
+	ALTER OPERATOR FAMILY "Odd Ops" USING btree ADD FUNCTION 4 (rg, rg) btequalimage(oid);
 	-- a type a member says only in its row, with a name after what would hold it
 	CREATE OPERATOR FAMILY a_fam USING btree;
 	CREATE TYPE zz AS ENUM ('a');
@@ -1221,6 +1231,10 @@ like($op_val{'opmembers/g_fam(gist)'}, qr/FOR ORDER BY float_ops/, 'an ordering 
 like($op_val{'opclass/g_ops(gist)'}, qr/STORAGE box/, 'a class its storage');
 like($op_val{'opclass/g_ops(gist)'}, qr/opmembers\/g_fam\(gist\)/, 'and needs what its family holds outside it');
 like($op_val{'opmembers/a_fam(btree)'}, qr/type\/zz/, 'a member needs a type only its row says');
+like($op_val{'opmembers/g2(gist)'}, qr/FOR ORDER BY sortf/, 'an ordering operator is its family\'s');
+like($op_val{'opmembers/g2(gist)'}, qr/opfamily\/sortf\(btree\)/, 'and needs what it sorts by');
+ok(!exists $op_val{'opmembers/sortf(btree)'}, 'which holds nothing of it');
+like($op_val{'opclass/only_fam(btree)'}, qr/AS STORAGE m2/, 'a class with no members of its own has a statement to make it');
 $node->safe_psql('postgres', q{CREATE TABLE op2.pts (p point); CREATE INDEX pts_p ON op2.pts USING gist (p op2.g_ops)});
 pass('an index can be made on what was restored');
 is($node->safe_psql('postgres', q{SELECT opfowner::regrole FROM pg_opfamily WHERE opfname = 'fam' AND opfnamespace = 'op2'::regnamespace}), 'g_opowner', 'and its owner');
@@ -1233,9 +1247,8 @@ my @op_refused = (
 	[ q{CREATE FUNCTION f(integer, integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f, COMMUTATOR = OPERATOR(public.>>>)); CREATE OPERATOR public.>>> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = op5.f)}, 'in another schema' ],
 	[ q{CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = public.op_else)}, 'another schema' ],
 	[ q{CREATE OPERATOR FAMILY f USING btree; CREATE OPERATOR CLASS public.oc_else FOR TYPE integer USING btree FAMILY op5.f AS OPERATOR 1 <, FUNCTION 1 btint4cmp(integer, integer)}, 'a class of it is in another schema' ],
-	[ q{CREATE TYPE e AS ENUM ('a'); CREATE OPERATOR CLASS c FOR TYPE e USING btree AS FUNCTION 1 enum_cmp(anyenum, anyenum)}, 'no members of its own' ],
-	[ q{CREATE OPERATOR CLASS c DEFAULT FOR TYPE lseg USING hash AS FUNCTION 1 hashtext(text)}, 'a default for a type in the catalogs' ],
-	[ q{CREATE TABLE tq (a int); CREATE OPERATOR CLASS c FOR TYPE tq USING hash AS FUNCTION 1 (tq, tq) hash_record(record)}, 'row type' ],
+	[ q{CREATE OPERATOR CLASS c DEFAULT FOR TYPE lseg USING hash AS FUNCTION 1 hashtext(text)}, 'a default for a type not of this schema' ],
+	[ q{CREATE TABLE tq (a int); CREATE OPERATOR CLASS c FOR TYPE tq USING gist AS STORAGE box}, 'row type' ],
 	[ q{CREATE TABLE tq (a int); CREATE OPERATOR FAMILY f USING btree; ALTER OPERATOR FAMILY f USING btree ADD FUNCTION 4 (tq, tq) btequalimage(oid)}, 'row type' ],
 	[ q{CREATE TABLE tq (a int); CREATE FUNCTION f(tq) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR ### (RIGHTARG = tq, FUNCTION = f)}, 'row type' ],
 	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE OPERATOR CLASS c FOR TYPE op5."date" USING gist AS STORAGE box}, "say a schema's name" ],
@@ -1282,6 +1295,16 @@ $node->safe_psql('postgres', q{DROP OPERATOR FAMILY ff.here_only USING btree; SE
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_restore_family('here_only', 'ff')});
 like($err, qr/named as one in this server's catalogs/, 'and is refused where the catalogs have it');
 $node->safe_psql('postgres', q{SET allow_system_table_mods = on; DROP OPERATOR FAMILY pg_catalog.here_only USING btree; DROP SCHEMA ff});
+
+$node->safe_psql('postgres', q{CREATE SCHEMA ff; SET allow_system_table_mods = on; CREATE OPERATOR CLASS pg_catalog.here_only FOR TYPE integer USING btree AS STORAGE integer});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_restore_opclass('here_only', 'ff')});
+like($err, qr/operator class "here_only" of schema "ff" is named as one in this server's catalogs/, 'as is a class');
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DROP OPERATOR FAMILY pg_catalog.here_only USING btree; DROP SCHEMA ff});
+
+# a catalog table's row type is no table of this schema, which is what comes after
+$node->safe_psql('postgres', q{CREATE SCHEMA cr; CREATE FUNCTION cr.f(pg_class) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR cr.### (RIGHTARG = pg_class, FUNCTION = cr.f)});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('cr')}), qr/^operator\/###\(NONE, pg_class\)\t/m, 'an operator on a catalog table\'s row type is held');
+$node->safe_psql('postgres', q{DROP SCHEMA cr CASCADE});
 
 # a method's name in another encoding than a record's
 $node->safe_psql('postgres', q{CREATE DATABASE oplat TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});

@@ -42,6 +42,7 @@ PG_FUNCTION_INFO_V1(test_ws_obj_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_copy);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_collation);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_family);
+PG_FUNCTION_INFO_V1(test_ws_obj_restore_opclass);
 PG_FUNCTION_INFO_V1(test_ws_seq_copy);
 PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
@@ -558,6 +559,20 @@ test_ws_obj_restore_family(PG_FUNCTION_ARGS)
 {
 	WsObject	o = {.kind = WS_OBJ_OPFAMILY,.name = text_to_cstring(PG_GETARG_TEXT_PP(0)),.args = "btree",
 	.definition = "USING btree"};
+
+	ws_obj_restore(&o, 1, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_obj_restore_opclass(name text, schema text) returns void: makes a btree
+ * operator class from its record, as one captured on another server would arrive
+ */
+Datum
+test_ws_obj_restore_opclass(PG_FUNCTION_ARGS)
+{
+	WsObject	o = {.kind = WS_OBJ_OPCLASS,.name = text_to_cstring(PG_GETARG_TEXT_PP(0)),.args = "btree",
+	.definition = "FOR TYPE integer USING btree AS STORAGE integer"};
 
 	ws_obj_restore(&o, 1, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
 	PG_RETURN_VOID();
