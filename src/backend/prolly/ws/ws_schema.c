@@ -4614,6 +4614,10 @@ holds_names(Oid typid, int depth)
 		return true;
 	if (get_typtype(typid) == TYPTYPE_DOMAIN)
 		return holds_names(getBaseType(typid), depth + 1);
+	if (get_typtype(typid) == TYPTYPE_RANGE)
+		return holds_names(get_range_subtype(typid), depth + 1);
+	if (get_typtype(typid) == TYPTYPE_MULTIRANGE)
+		return holds_names(get_range_subtype(get_multirange_range(typid)), depth + 1);
 	element = get_element_type(typid);
 	if (OidIsValid(element))
 		return holds_names(element, depth + 1);
