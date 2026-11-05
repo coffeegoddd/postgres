@@ -168,6 +168,7 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("schema \"%s\" has constraints set aside and could not be checked: %s", schema, why)));
+		ws_viol_check_restorable(ctx, &rv);
 	}
 	WsSql->end(level);
 	*root = rv;
@@ -374,6 +375,10 @@ bare_record(const WsTableSchema *s, WsTableSchema *out)
 		out->cols[i].identity_seq = NULL;
 		if (!keep)
 			out->cols[i].not_null = NULL;
+
+		/* (no row is made by one, and it may name what is not made here) */
+		if (s->cols[i].kind == WS_COL_STORED)
+			out->cols[i].def = NULL;
 	}
 	out->nconstraints = 0;
 	out->indexes = palloc_array(WsIndex, Max(s->nindexes, 1));
@@ -570,6 +575,12 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	if (WsRoot->get_map(ctx, root, WS_ROOT_OBJECTS, &map))
 		ws_obj_list(ctx, &map, &objs, &nobjs);
 	owner_absent = palloc0_array(bool, Max(nobjs, 1));
+	if (roles_here)
+		for (int i = 0; i < nobjs; i++)
+		{
+			objs[i].owner = NULL;
+			objs[i].ngrants = 0;
+		}
 	if (definitions_only)
 		for (int i = 0; i < nobjs; i++)
 		{
@@ -605,6 +616,10 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 				definitions_record(&tables.recs[i], &bare);
 			else
 				bare_record(&tables.recs[i], &bare);
+
+			/* (it is not to be made as anyone's who may not be whoever asks) */
+			if (roles_here)
+				bare.owner = NULL;
 			make_table(ctx, &bare, no_rows != NULL ? no_rows : &tables.rows[i], schema);
 		}
 		else

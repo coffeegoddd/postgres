@@ -672,6 +672,7 @@ item_add(WsDeferrals *d, const char *table, char kind, const char *name, const B
 	item = &d->items[d->n++];
 	item->table = pstrdup(table);
 	item->ref_table = ref_table;
+	item->deferred.refrelid = InvalidOid;
 	item->deferred.kind = kind;
 	item->deferred.name = pstrdup(name);
 	item->deferred.record = *record;
@@ -812,6 +813,68 @@ replica_needs_not_null(const WsTableSchema *s, uint64 tag)
 	return false;
 }
 
+/* What a restore cannot yet set aside of a violation. */
+static void
+check_can_set_aside(const WsTableSchema *rec, const WsTableSchema *recs, int nrecs, const WsViolation *v)
+{
+	bool		tree = rec->partition != WS_PARTITION_NONE || rec->partition_of != NULL || rec->ninherits > 0;
+
+	for (int r = 0; !tree && r < nrecs; r++)
+		for (int p = 0; !tree && p < recs[r].ninherits; p++)
+			tree = strcmp(recs[r].inherits[p], rec->name) == 0;
+	if (tree)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" has violations and is partitioned or inherits, which a restore cannot yet set them aside of",
+						v->table)));
+	if (strcmp(v->kind, "not null") == 0)
+		for (int c = 0; c < rec->ncols; c++)
+			if (rec->cols[c].identity != WS_IDENTITY_NONE && rec->cols[c].not_null != NULL &&
+				strcmp(rec->cols[c].not_null, v->constraint) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("identity column \"%s\" of table \"%s\" holds a null, which a restore cannot set aside",
+								rec->cols[c].name, v->table)));
+}
+
+typedef struct AllRecords
+{
+	ProllyCtx  *ctx;
+	const PHash *root;
+	WsTableSchema *recs;
+	int			n;
+} AllRecords;
+
+static bool
+all_records_add(void *arg, const char *name, const VcTable *entry)
+{
+	AllRecords *all = arg;
+	PHash		rows;
+
+	all->recs = all->recs == NULL ? palloc_array(WsTableSchema, 1) : repalloc_array(all->recs, WsTableSchema, all->n + 1);
+	if (!WsRoot->get_table(all->ctx, all->root, name, &all->recs[all->n], &rows))
+		elog(ERROR, "a table listed is not there");
+	all->n++;
+	return true;
+}
+
+void
+ws_viol_check_restorable(ProllyCtx *ctx, const PHash *root)
+{
+	AllRecords	all = {ctx, root};
+	WsViolation *v;
+	int			n;
+
+	WsViol->list(ctx, root, &v, &n);
+	if (n == 0)
+		return;
+	WsRoot->tables(ctx, root, all_records_add, &all);
+	for (int i = 0; i < n; i++)
+		for (int r = 0; r < all.n; r++)
+			if (strcmp(all.recs[r].name, v[i].table) == 0)
+				check_can_set_aside(&all.recs[r], all.recs, all.n, &v[i]);
+}
+
 void
 ws_viol_defer(ProllyCtx *ctx, const PHash *root, WsTableSchema *recs, int nrecs, WsDeferrals *out)
 {
@@ -846,18 +909,7 @@ ws_viol_defer(ProllyCtx *ctx, const PHash *root, WsTableSchema *recs, int nrecs,
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("a violation is of table \"%s\", not there", v[i].table)));
-		if (rec->partition != WS_PARTITION_NONE || rec->partition_of != NULL || rec->ninherits > 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("table \"%s\" has violations and is partitioned or inherits, which a restore cannot yet set them aside of",
-							v[i].table)));
-		for (int r = 0; r < nrecs; r++)
-			for (int p = 0; p < recs[r].ninherits; p++)
-				if (strcmp(recs[r].inherits[p], rec->name) == 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("table \"%s\" has violations and is partitioned or inherits, which a restore cannot yet set them aside of",
-									v[i].table)));
+		check_can_set_aside(rec, recs, nrecs, &v[i]);
 		if (strcmp(v[i].kind, "foreign key") == 0)
 		{
 			for (int f = 0; f < nfks; f++)
@@ -879,14 +931,6 @@ ws_viol_defer(ProllyCtx *ctx, const PHash *root, WsTableSchema *recs, int nrecs,
 			for (int c = 0; c < rec->nconstraints; c++)
 				if (rec->constraints[c].kind == WS_CONSTRAINT_UNIQUE && strcmp(rec->constraints[c].name, v[i].constraint) == 0)
 					kind = WS_DEFERRED_UNIQUE;
-		if (kind == WS_DEFERRED_NOT_NULL)
-			for (int c = 0; c < rec->ncols; c++)
-				if (rec->cols[c].identity != WS_IDENTITY_NONE && rec->cols[c].not_null != NULL &&
-					strcmp(rec->cols[c].not_null, v[i].constraint) == 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("identity column \"%s\" of table \"%s\" holds a null, which a restore cannot set aside",
-									rec->cols[c].name, v[i].table)));
 		item_add(out, v[i].table, kind, v[i].constraint, bytes, NULL, NULL);
 	}
 
@@ -1032,18 +1076,28 @@ ws_viol_fold(const char *schema, WsTableSchema *s)
 		WsSchemaCodec->decode(d[i].record.data, d[i].record.len, &held);
 		if (d[i].kind == WS_DEFERRED_REPLICA)
 		{
+			if (s->replica_identity != WS_REPLICA_DEFAULT)
+				name_is_set_aside(s, "its replica identity");
 			s->replica_identity = held.replica_identity;
 			s->replica_index = held.replica_index;
 		}
 		else if (d[i].kind == WS_DEFERRED_CLUSTER)
+		{
+			if (s->clustered != NULL)
+				name_is_set_aside(s, "its clustering");
 			s->clustered = held.clustered;
+		}
 		else if (d[i].kind == WS_DEFERRED_NOT_NULL)
 		{
 			for (int c = 0; c < held.ncols; c++)
 				if (held.cols[c].not_null != NULL && strcmp(held.cols[c].not_null, d[i].name) == 0)
 					for (int k = 0; k < s->ncols; k++)
 						if (s->cols[k].tag == held.cols[c].tag)
+						{
+							if (s->cols[k].not_null != NULL)
+								name_is_set_aside(s, d[i].name);
 							s->cols[k].not_null = held.cols[c].not_null;
+						}
 		}
 		else if (d[i].kind == WS_DEFERRED_INDEX)
 		{
@@ -1076,6 +1130,22 @@ ws_viol_fold(const char *schema, WsTableSchema *s)
 	}
 	if (n > 0)
 	{
+		for (int i = 0; i < n; i++)
+		{
+			const char *through = d[i].kind == WS_DEFERRED_REPLICA ? s->replica_index :
+				d[i].kind == WS_DEFERRED_CLUSTER ? s->clustered : NULL;
+			bool		found = through == NULL || (s->key_name != NULL && strcmp(s->key_name, through) == 0);
+
+			for (int k = 0; !found && k < s->nconstraints; k++)
+				found = strcmp(s->constraints[k].name, through) == 0;
+			for (int k = 0; !found && k < s->nindexes; k++)
+				found = strcmp(s->indexes[k].name, through) == 0;
+			if (!found)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("table \"%s\" has its replica identity or clustering set aside, and index \"%s\" it goes through is gone",
+								s->name, through)));
+		}
 		qsort(s->constraints, s->nconstraints, sizeof(WsConstraint), constraint_name_cmp);
 		qsort(s->indexes, s->nindexes, sizeof(WsIndex), index_name_cmp);
 		qsort(s->index_settings, s->nindex_settings, sizeof(WsIndexSettings), settings_name_cmp);
@@ -1085,9 +1155,9 @@ ws_viol_fold(const char *schema, WsTableSchema *s)
 
 /* A foreign key set aside, by the names its tables have now. */
 static void
-deferred_key(const WsDeferred *d, const char *table, WsForeignKey *fk)
+deferred_key(const WsDeferred *d, const char *schema, const char *table, WsForeignKey *fk)
 {
-	char	   *ref = get_rel_name(d->refrelid);
+	char	   *ref = get_rel_namespace(d->refrelid) == get_namespace_oid(schema, false) ? get_rel_name(d->refrelid) : NULL;
 
 	WsFkCodec->decode(d->key.data, d->key.len, d->record.data, d->record.len, fk);
 	if (ref == NULL)
@@ -1109,7 +1179,7 @@ ws_viol_fold_keys(const char *schema, const char *table, WsForeignKey **fks, int
 		if (d[i].kind == WS_DEFERRED_FOREIGN_KEY)
 		{
 			*fks = *fks == NULL ? palloc_array(WsForeignKey, 1) : repalloc_array(*fks, WsForeignKey, *nfks + 1);
-			deferred_key(&d[i], table, &(*fks)[(*nfks)++]);
+			deferred_key(&d[i], schema, table, &(*fks)[(*nfks)++]);
 		}
 }
 
@@ -1174,7 +1244,7 @@ deferred_statement(const WsTableSchema *s, const WsDeferred *d, const char *sche
 				WsForeignKey fk;
 				WsTableSchema to;
 
-				deferred_key(d, table, &fk);
+				deferred_key(d, schema, table, &fk);
 				read_whole(schema, ws_name_from_utf8(fk.ref_table), &to);
 				ws_fk_add_statement(&fk, s, &to, schema, sql);
 				ws_schema_free(&to);

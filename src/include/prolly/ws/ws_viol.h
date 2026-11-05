@@ -31,9 +31,11 @@
  * root it came from, and rechecks to say which still are violated.  One clears only by
  * being applied again, with the rows fixed (resolve): nothing else does.  It can't yet be
  * dropped or changed while it waits, nor another made of its name, nor a column it names or
- * a table a foreign key references dropped, each of which capture then refuses.  What a
- * root that holds them cannot be restored as is a merge's conflict, as restoring it is
- * tried: a partitioned or inheriting table's violations, which cannot be set aside yet, an
+ * a table a foreign key references dropped or moved, nor an index a replica identity or
+ * clustering waits on renamed or dropped, nor those changed, each of which capture then
+ * refuses, and resolve too, which then clears nothing.  What a root that holds them cannot
+ * be restored as is a merge's conflict, as restoring it is tried, and a capture's if it
+ * came of a change since, as a table made to inherit: a partitioned or inheriting table's violations, which cannot be set aside yet, an
  * identity column's null, a rule naming what is set aside.
  *
  * What a root's rows cannot be, with no constraint on them, is a merge's conflict, and
@@ -143,6 +145,9 @@ typedef struct WsDeferrals
 extern void ws_viol_defer(ProllyCtx *ctx, const PHash *root, WsTableSchema *recs, int nrecs, WsDeferrals *out);
 extern bool ws_viol_key_deferred(const WsDeferrals *d, const WsForeignKey *fk);
 extern void ws_viol_defer_end(const char *schema, const WsDeferrals *d);
+
+/* ERRCODE_FEATURE_NOT_SUPPORTED if what a root holds as violated could not be set aside. */
+extern void ws_viol_check_restorable(ProllyCtx *ctx, const PHash *root);
 
 /* For capturing a schema: a record of a table, or its keys, with what is set aside of it. */
 extern void ws_viol_fold(const char *schema, WsTableSchema *s);
