@@ -1155,72 +1155,45 @@ has_settings(const WsColumn *c)
 }
 
 static void
-schema_encode(const WsTableSchema *s, Buf *out)
+put_constraint(const WsConstraint *con, Buf *out)
 {
-	const char *problem = ws_schema_problem(s);
-
-	if (problem != NULL)
-		elog(ERROR, "%s", problem);
-	buf_append_byte(out, WS_SCHEMA_VERSION);
-	put_string(out, s->name);
-	buf_append_uvarint(out, (uint64) s->ncols);
-	for (int i = 0; i < s->ncols; i++)
+	put_string(out, con->name);
+	buf_append_byte(out, (uint8) con->kind);
+	buf_append_byte(out, (con->nulls_not_distinct ? CON_NULLS_NOT_DISTINCT : 0) |
+					(con->deferrable ? CON_DEFERRABLE : 0) |
+					(con->initdeferred ? CON_INITDEFERRED : 0) |
+					(con->not_valid ? CON_NOT_VALID : 0) |
+					(con->no_inherit ? CON_NO_INHERIT : 0) |
+					(con->not_enforced ? CON_NOT_ENFORCED : 0));
+	if (con->kind == WS_CONSTRAINT_CHECK)
+		put_string(out, con->expr);
+	else if (con->kind == WS_CONSTRAINT_EXCLUSION)
 	{
-		const WsColumn *c = &s->cols[i];
-
-		buf_append_uvarint(out, c->tag);
-		put_string(out, c->name);
-		put_string(out, c->type);
-		buf_append_byte(out, (uint8) c->kind);
-		put_optional(out, c->not_null);
-		buf_append_byte(out, (uint8) c->identity);
-		if (c->identity != WS_IDENTITY_NONE)
-			put_string(out, c->identity_seq);
-		put_optional(out, c->def);
-		put_optional(out, c->collation);
+		put_string(out, con->excl.method);
+		put_index_body(out, &con->excl, true);
 	}
-	put_optional(out, s->key_name);
-	buf_append_uvarint(out, (uint64) s->nkey);
-	for (int i = 0; i < s->nkey; i++)
-		buf_append_uvarint(out, s->key[i]);
-	buf_append_uvarint(out, (uint64) s->nconstraints);
-	for (int i = 0; i < s->nconstraints; i++)
+	else
 	{
-		const WsConstraint *con = &s->constraints[i];
-
-		put_string(out, con->name);
-		buf_append_byte(out, (uint8) con->kind);
-		buf_append_byte(out, (con->nulls_not_distinct ? CON_NULLS_NOT_DISTINCT : 0) |
-						(con->deferrable ? CON_DEFERRABLE : 0) |
-						(con->initdeferred ? CON_INITDEFERRED : 0) |
-						(con->not_valid ? CON_NOT_VALID : 0) |
-						(con->no_inherit ? CON_NO_INHERIT : 0) |
-						(con->not_enforced ? CON_NOT_ENFORCED : 0));
-		if (con->kind == WS_CONSTRAINT_CHECK)
-			put_string(out, con->expr);
-		else if (con->kind == WS_CONSTRAINT_EXCLUSION)
-		{
-			put_string(out, con->excl.method);
-			put_index_body(out, &con->excl, true);
-		}
-		else
-		{
-			buf_append_uvarint(out, (uint64) con->ncols);
-			for (int k = 0; k < con->ncols; k++)
-				buf_append_uvarint(out, con->cols[k]);
-		}
+		buf_append_uvarint(out, (uint64) con->ncols);
+		for (int k = 0; k < con->ncols; k++)
+			buf_append_uvarint(out, con->cols[k]);
 	}
-	buf_append_uvarint(out, (uint64) s->nindexes);
-	for (int i = 0; i < s->nindexes; i++)
-	{
-		const WsIndex *ix = &s->indexes[i];
+}
 
-		put_string(out, ix->name);
-		put_string(out, ix->method);
-		buf_append_byte(out, (ix->unique ? IDX_UNIQUE : 0) |
-						(ix->nulls_not_distinct ? IDX_NULLS_NOT_DISTINCT : 0));
-		put_index_body(out, ix, false);
-	}
+static void
+put_index(const WsIndex *ix, Buf *out)
+{
+	put_string(out, ix->name);
+	put_string(out, ix->method);
+	buf_append_byte(out, (ix->unique ? IDX_UNIQUE : 0) |
+					(ix->nulls_not_distinct ? IDX_NULLS_NOT_DISTINCT : 0));
+	put_index_body(out, ix, false);
+}
+
+/* All of a table's record but its columns' main fields, key, constraints and indexes. */
+static void
+put_table_settings(const WsTableSchema *s, Buf *out)
+{
 	if (s->partition != WS_PARTITION_NONE)
 	{
 		buf_append_byte(out, (uint8) s->partition);
@@ -1367,6 +1340,62 @@ schema_encode(const WsTableSchema *s, Buf *out)
 			put_string(out, g->privileges);
 		}
 	}
+}
+
+void
+ws_schema_constraint_bytes(const WsConstraint *con, Buf *out)
+{
+	put_constraint(con, out);
+}
+
+void
+ws_schema_index_bytes(const WsIndex *ix, Buf *out)
+{
+	put_index(ix, out);
+}
+
+void
+ws_schema_settings_bytes(const WsTableSchema *s, Buf *out)
+{
+	put_table_settings(s, out);
+}
+
+static void
+schema_encode(const WsTableSchema *s, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	buf_append_byte(out, WS_SCHEMA_VERSION);
+	put_string(out, s->name);
+	buf_append_uvarint(out, (uint64) s->ncols);
+	for (int i = 0; i < s->ncols; i++)
+	{
+		const WsColumn *c = &s->cols[i];
+
+		buf_append_uvarint(out, c->tag);
+		put_string(out, c->name);
+		put_string(out, c->type);
+		buf_append_byte(out, (uint8) c->kind);
+		put_optional(out, c->not_null);
+		buf_append_byte(out, (uint8) c->identity);
+		if (c->identity != WS_IDENTITY_NONE)
+			put_string(out, c->identity_seq);
+		put_optional(out, c->def);
+		put_optional(out, c->collation);
+	}
+	put_optional(out, s->key_name);
+	buf_append_uvarint(out, (uint64) s->nkey);
+	for (int i = 0; i < s->nkey; i++)
+		buf_append_uvarint(out, s->key[i]);
+	buf_append_uvarint(out, (uint64) s->nconstraints);
+	for (int i = 0; i < s->nconstraints; i++)
+		put_constraint(&s->constraints[i], out);
+	buf_append_uvarint(out, (uint64) s->nindexes);
+	for (int i = 0; i < s->nindexes; i++)
+		put_index(&s->indexes[i], out);
+	put_table_settings(s, out);
 }
 
 pg_noreturn static void

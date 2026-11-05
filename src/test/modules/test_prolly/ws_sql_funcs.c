@@ -18,9 +18,11 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_role.h"
+#include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
@@ -53,6 +55,8 @@ PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
+PG_FUNCTION_INFO_V1(test_ws_root_capture);
+PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy_as);
 
 /*
@@ -824,6 +828,154 @@ test_ws_rows_copy(PG_FUNCTION_ARGS)
 	MemoryChunkStoreDestroy(cs);
 	ws_schema_free(&rec);
 	PG_RETURN_VOID();
+}
+
+/* A store for the backend's life, so that what one call captures another can read. */
+static ProllyCtx *
+backend_ctx(void)
+{
+	static ProllyCtx ctx;
+	static bool made = false;
+
+	if (!made)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		prolly_ctx_init(&ctx, MemoryChunkStoreCreate(), &prolly_default_policy);
+		MemoryContextSwitchTo(old);
+		made = true;
+	}
+	return &ctx;
+}
+
+static text *
+hash_text(const PHash *h)
+{
+	StringInfoData hex;
+
+	initStringInfo(&hex);
+	for (int i = 0; i < PHASH_LEN; i++)
+		appendStringInfo(&hex, "%02x", h->b[i]);
+	return cstring_to_text(hex.data);
+}
+
+static PHash
+text_hash(text *t)
+{
+	char	   *hex = text_to_cstring(t);
+	PHash		h;
+
+	if (strlen(hex) != PHASH_LEN * 2)
+		elog(ERROR, "\"%s\" is no hash", hex);
+	for (int i = 0; i < PHASH_LEN; i++)
+	{
+		unsigned int byte;
+
+		sscanf(hex + i * 2, "%2x", &byte);
+		h.b[i] = (uint8) byte;
+	}
+	return h;
+}
+
+/* test_ws_root_capture(schema text) returns text: a root value of it, in the backend's store */
+Datum
+test_ws_root_capture(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ProllyCtx  *ctx = backend_ctx();
+	const char *params[1] = {schema};
+	WsSqlRows	tables;
+	PHash		rv = vc_root_empty(ctx);
+	WsObject   *objs;
+	int			nobjs;
+	WsSeqPosition *seqs;
+	int			nseqs;
+	WsForeignKey *all = NULL;
+	int			nall = 0;
+	PHash		map;
+
+	WsSql->run("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') ORDER BY c.relname COLLATE \"C\"",
+			   1, params, &tables);
+	for (int i = 0; i < tables.nrows; i++)
+	{
+		const char *table = ws_sql_value(&tables, i, 0);
+		WsTableSchema rec;
+		PHash		rows;
+		WsForeignKey *fks;
+		int			nfks;
+
+		rows_record(schema, table, &rec);
+		WsRows->capture(ctx, schema, &rec, &rows);
+		WsRoot->put_table(ctx, &rv, &rec, &rows, &rv);
+		ws_schema_free(&rec);
+		ws_fk_read(schema, table, &fks, &nfks);
+		if (nfks > 0)
+		{
+			all = all == NULL ? palloc_array(WsForeignKey, nfks) : repalloc_array(all, WsForeignKey, nall + nfks);
+			memcpy(all + nall, fks, nfks * sizeof(WsForeignKey));
+			nall += nfks;
+		}
+	}
+	ws_sql_rows_free(&tables);
+	if (nall > 0)
+	{
+		ws_fk_map(ctx, all, nall, &map);
+		WsRoot->put_map(ctx, &rv, WS_ROOT_FOREIGN_KEYS, &map, &rv);
+	}
+	ws_obj_read(schema, &objs, &nobjs);
+	if (nobjs > 0)
+	{
+		ws_obj_map(ctx, objs, nobjs, &map);
+		WsRoot->put_map(ctx, &rv, WS_ROOT_OBJECTS, &map, &rv);
+	}
+	ws_seq_read(schema, &seqs, &nseqs);
+	if (nseqs > 0)
+	{
+		ws_seq_map(ctx, seqs, nseqs, &map);
+		WsRoot->put_map(ctx, &rv, WS_ROOT_SEQUENCES, &map, &rv);
+	}
+	{
+		WsSqlRows	names;
+
+		WsSql->run("SELECT rolname::text FROM pg_authid WHERE roltravels ORDER BY rolname COLLATE \"C\"",
+				   0, NULL, &names);
+		if (names.nrows > 0)
+		{
+			const char **list = palloc_array(const char *, names.nrows);
+			WsRole	   *roles;
+			int			nroles;
+
+			for (int i = 0; i < names.nrows; i++)
+				list[i] = ws_sql_value(&names, i, 0);
+			ws_role_read(list, names.nrows, &roles, &nroles);
+			ws_role_map(ctx, roles, nroles, &map);
+			WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
+		}
+		ws_sql_rows_free(&names);
+	}
+	PG_RETURN_TEXT_P(hash_text(&rv));
+}
+
+static void
+diff_line_to(void *arg, const WsDiffEvent *e)
+{
+	Buf		   *out = arg;
+
+	ws_diff_line(e, out);
+	buf_append_byte(out, '\n');
+}
+
+/* test_ws_diff(from text, to text) returns text: its lines, of two roots this backend captured */
+Datum
+test_ws_diff(PG_FUNCTION_ARGS)
+{
+	PHash		from = text_hash(PG_GETARG_TEXT_PP(0));
+	PHash		to = text_hash(PG_GETARG_TEXT_PP(1));
+	Buf			lines = BUF_INIT;
+
+	WsDiff->diff(backend_ctx(), &from, &to, diff_line_to, &lines);
+	PG_RETURN_TEXT_P(cstring_to_text_with_len((const char *) lines.data, (int) lines.len));
 }
 
 /*
