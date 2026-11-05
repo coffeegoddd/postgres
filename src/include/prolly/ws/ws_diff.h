@@ -22,6 +22,7 @@
  *	key changed <table>
  *	key renamed <table> <old> <new>
  *	constraint|index added|dropped|changed <table> <name>
+ *	violation added|resolved <constraint> <table> [<row>]
  *	data <table> same|changed			whether the row map is the same tree
  *	rows <table> +<inserted> -<deleted> ~<updated>
  *	rewritten <table> <n>				rows whose bytes changed but whose values, in
@@ -50,6 +51,7 @@ typedef enum WsDiffWhat
 	WS_DIFF_OBJECT,
 	WS_DIFF_FOREIGN_KEY,
 	WS_DIFF_SEQUENCE,
+	WS_DIFF_VIOLATION,
 	WS_DIFF_ROLE,
 	WS_DIFF_TABLE,
 	WS_DIFF_COLUMN,
@@ -82,6 +84,7 @@ typedef struct WsDiffEvent
 	const char *table;			/* a table's name, UTF8, of what is a table's */
 	const char *name;			/* a column's, constraint's, foreign key's, index's or object's */
 	const char *kind;			/* an object's */
+	const char *row;			/* a violation's row, or NULL: a constraint alone */
 	const char *from;			/* a column's old type, or a key's old name */
 	const char *to;				/* a column's new name or type, or a key's new name */
 	bool		same;			/* of WS_DIFF_DATA */

@@ -340,6 +340,55 @@ make_table(ProllyCtx *ctx, const WsTableSchema *s, const PHash *rows, const char
 	buf_free(&sql);
 }
 
+/*
+ * A record of what its rows need, sharing what it keeps: its key's and identities' not
+ * null, which a record must have, and indexes that refuse nothing.
+ */
+static void
+bare_record(const WsTableSchema *s, WsTableSchema *out)
+{
+	*out = *s;
+	out->cols = palloc_array(WsColumn, Max(s->ncols, 1));
+	for (int i = 0; i < s->ncols; i++)
+	{
+		bool		keep = s->cols[i].identity != WS_IDENTITY_NONE;
+
+		for (int k = 0; !keep && k < s->nkey; k++)
+			keep = s->key[k] == s->cols[i].tag;
+		out->cols[i] = s->cols[i];
+		if (!keep)
+			out->cols[i].not_null = NULL;
+	}
+	out->nconstraints = 0;
+	out->indexes = palloc_array(WsIndex, Max(s->nindexes, 1));
+	out->nindexes = 0;
+	for (int i = 0; i < s->nindexes; i++)
+		if (!s->indexes[i].unique)
+			out->indexes[out->nindexes++] = s->indexes[i];
+	out->index_settings = palloc_array(WsIndexSettings, Max(s->nindex_settings, 1));
+	out->nindex_settings = 0;
+	for (int i = 0; i < s->nindex_settings; i++)
+	{
+		const char *index = s->index_settings[i].index;
+		bool		keep = s->key_name != NULL && strcmp(index, s->key_name) == 0;
+
+		for (int k = 0; !keep && k < out->nindexes; k++)
+			keep = strcmp(index, out->indexes[k].name) == 0;
+		if (keep)
+			out->index_settings[out->nindex_settings++] = s->index_settings[i];
+	}
+	out->ninherits = 0;
+	out->ninherited_cols = 0;
+	out->ninherited_cons = 0;
+	out->replica_identity = WS_REPLICA_DEFAULT;
+	out->replica_index = NULL;
+	out->clustered = NULL;
+	out->row_security = false;
+	out->force_row_security = false;
+	out->ncomments = 0;
+	out->ngrants = 0;
+}
+
 static void
 add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const char *schema)
 {
@@ -368,8 +417,13 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
 	buf_free(&sql);
 }
 
+/*
+ * Restoring: all of it; with fn, only what restore_rows says, then fn; with no_rows, all
+ * of it, each table holding that.
+ */
 static void
-schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
+restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
+		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -443,7 +497,15 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 		int			i = tables.order[t];
 
 		CHECK_FOR_INTERRUPTS();
-		make_table(ctx, &tables.recs[i], &tables.rows[i], schema);
+		if (fn != NULL)
+		{
+			WsTableSchema bare;
+
+			bare_record(&tables.recs[i], &bare);
+			make_table(ctx, &bare, &tables.rows[i], schema);
+		}
+		else
+			make_table(ctx, &tables.recs[i], no_rows != NULL ? no_rows : &tables.rows[i], schema);
 	}
 	for (int t = 0; t < tables.n; t++)
 	{
@@ -454,6 +516,12 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 			ws_schema_attach(s, schema, &sql);
 			run_statement(&sql);
 		}
+	}
+	if (fn != NULL)
+	{
+		CommandCounterIncrement();
+		fn(arg, schema);
+		goto done;
 	}
 	for (int t = tables.n - 1; t >= 0; t--)
 	{
@@ -518,6 +586,7 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 		ws_schema_remember(&tables.recs[tables.order[t]], schema);
 	ws_obj_remember(objs, nobjs, schema);
 
+done:
 	for (int i = 0; i < nobjs; i++)
 		ws_obj_free(&objs[i]);
 	for (int i = 0; i < tables.nnames; i++)
@@ -527,10 +596,31 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 	WsSql->end(level);
 }
 
+static void
+schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
+{
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL);
+}
+
+static void
+schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
+					void (*fn) (void *arg, const char *schema), void *arg)
+{
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL);
+}
+
+static void
+schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
+{
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows);
+}
+
 const WsRootIORoutine SchemaWsRootIO = {
 	.name = "schema",
 	.capture = schema_capture,
 	.restore = schema_restore,
+	.restore_rows = schema_restore_rows,
+	.restore_statements = schema_restore_statements,
 };
 
 const WsRootIORoutine *WsRootIO = &SchemaWsRootIO;
@@ -541,6 +631,9 @@ typedef struct DryRun
 {
 	ProllyCtx  *ctx;
 	const PHash *root;
+	void		(*fn) (void *arg, const char *schema);	/* restore_rows, then this */
+	void	   *arg;
+	const PHash *no_rows;		/* restore_statements, with this */
 	bool		went_through;
 } DryRun;
 
@@ -577,7 +670,12 @@ dry_run(void *arg)
 	DryRun	   *d = arg;
 	char	   *schema = make_dry_run_schema();
 
-	WsRootIO->restore(d->ctx, d->root, NULL, schema);
+	if (d->fn != NULL)
+		WsRootIO->restore_rows(d->ctx, d->root, schema, d->fn, d->arg);
+	else if (d->no_rows != NULL)
+		WsRootIO->restore_statements(d->ctx, d->root, schema, d->no_rows);
+	else
+		WsRootIO->restore(d->ctx, d->root, NULL, schema);
 	d->went_through = true;
 
 	/* (what makes the subtransaction undo it: the only way this one ends) */
@@ -586,10 +684,10 @@ dry_run(void *arg)
 			 errmsg("a dry run is undone")));
 }
 
-bool
-ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
+static bool
+dry_run_refused(DryRun *dp, WsSqlFailure *failure)
 {
-	DryRun		d = {ctx, root, false};
+	DryRun		d = *dp;
 	MemoryContext cxt = CurrentMemoryContext;
 
 	PG_TRY();
@@ -626,4 +724,33 @@ ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
 		return false;
 	}
 	return true;
+}
+
+bool
+ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
+{
+	DryRun		d = {.ctx = ctx, .root = root};
+
+	return dry_run_refused(&d, failure);
+}
+
+bool
+ws_root_rows_refused(ProllyCtx *ctx, const PHash *root, void (*fn) (void *arg, const char *schema), void *arg,
+					 WsSqlFailure *failure)
+{
+	DryRun		d = {.ctx = ctx, .root = root, .fn = fn, .arg = arg};
+
+	return dry_run_refused(&d, failure);
+}
+
+bool
+ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
+{
+	PHash		no_rows;
+	DryRun		d = {.ctx = ctx, .root = root, .no_rows = &no_rows};
+
+	/* (made here, as what a dry run writes it may not keep) */
+	if (prolly_empty(ctx, WS_ROW_VREFS, &no_rows) < 0)
+		prolly_report(ctx);
+	return dry_run_refused(&d, failure);
 }

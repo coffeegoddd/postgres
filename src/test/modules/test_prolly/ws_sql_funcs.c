@@ -28,6 +28,7 @@
 #include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "prolly/ws/ws_viol.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "varatt.h"
@@ -63,6 +64,8 @@ PG_FUNCTION_INFO_V1(test_ws_root_restore_after);
 PG_FUNCTION_INFO_V1(test_ws_root_refused);
 PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_merge);
+PG_FUNCTION_INFO_V1(test_ws_merge_checked);
+PG_FUNCTION_INFO_V1(test_ws_violations);
 PG_FUNCTION_INFO_V1(test_ws_root_table_bytes);
 PG_FUNCTION_INFO_V1(test_ws_root_rows_restore);
 PG_FUNCTION_INFO_V1(test_ws_root_rows_hash);
@@ -1008,6 +1011,56 @@ test_ws_merge(PG_FUNCTION_ARGS)
 	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
 	for (int i = 0; i < res.nconflicts; i++)
 		appendStringInfo(&out, "\n%s", res.conflicts[i]);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_merge_checked(base text, ours text, theirs text, schemas text[]) returns text: as
+ * test_ws_merge, of the merge checked
+ */
+Datum
+test_ws_merge_checked(PG_FUNCTION_ARGS)
+{
+	PHash		base = text_hash(PG_GETARG_TEXT_PP(0));
+	PHash		ours = text_hash(PG_GETARG_TEXT_PP(1));
+	PHash		theirs = text_hash(PG_GETARG_TEXT_PP(2));
+	WsMergeResult res;
+	StringInfoData out;
+	Datum	   *names;
+	bool	   *nulls;
+	int			nnames;
+	const char **schemas;
+	WsEvalSchemas in;
+
+	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(3), TEXTOID, &names, &nulls, &nnames);
+	schemas = palloc_array(const char *, Max(nnames, 1));
+	for (int i = 0; i < nnames; i++)
+		schemas[i] = TextDatumGetCString(names[i]);
+	in.schemas = schemas;
+	in.n = nnames;
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &SqlWsEval, &in, &res);
+	ws_merge_check(backend_ctx(), &res);
+	initStringInfo(&out);
+	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
+	for (int i = 0; i < res.nconflicts; i++)
+		appendStringInfo(&out, "\n%s", res.conflicts[i]);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* test_ws_violations(root text) returns text: a line for each, in order */
+Datum
+test_ws_violations(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	WsViolation *v;
+	int			n;
+	StringInfoData out;
+
+	WsViol->list(backend_ctx(), &root, &v, &n);
+	initStringInfo(&out);
+	for (int i = 0; i < n; i++)
+		appendStringInfo(&out, "%s%s %s %s%s%s", i > 0 ? "\n" : "", v[i].kind, v[i].table, v[i].constraint,
+						 v[i].rowkey != NULL ? " " : "", v[i].rowkey != NULL ? v[i].rowkey : "");
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 

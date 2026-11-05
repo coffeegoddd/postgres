@@ -757,6 +757,14 @@ CREATE FUNCTION test_ws_merge(base text, ours text, theirs text, schemas text[] 
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_ws_merge_checked(base text, ours text, theirs text, schemas text[] DEFAULT '{}')
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_ws_violations(root text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_ws_root_table_bytes(root text, tab text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

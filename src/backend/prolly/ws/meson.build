@@ -14,4 +14,5 @@ backend_sources += files(
   'ws_schema.c',
   'ws_sql.c',
   'ws_tags.c',
+  'ws_viol.c',
 )

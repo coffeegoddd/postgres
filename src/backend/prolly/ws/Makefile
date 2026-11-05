@@ -26,6 +26,7 @@ OBJS = \
 	ws_rows.o \
 	ws_schema.o \
 	ws_sql.o \
-	ws_tags.o
+	ws_tags.o \
+	ws_viol.o
 
 include $(top_srcdir)/src/backend/common.mk
