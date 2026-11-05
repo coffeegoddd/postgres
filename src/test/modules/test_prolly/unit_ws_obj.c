@@ -508,8 +508,36 @@ ENGINE_TEST(test_refused_statements)
 		static const char *const links[] = {"ALTER OPERATOR <<< (a, a) OWNER TO x; DROP TABLE t", "DROP OPERATOR <<< (a, a)", "not sql"};
 		static const char *const members[] = {"ALTER OPERATOR FAMILY v USING b DROP FUNCTION 1 (a, a)", "DROP OPERATOR FAMILY v USING b", "not sql"};
 
+		static const char *const aggregates[] = {"(integer) (SFUNC = f, STYPE = integer); DROP TABLE t", "AS ENUM ('a')", "(integer, SFUNC = f, STYPE = integer)x", "not sql"};
+		static const char *const dicts[] = {"(TEMPLATE = t); DROP TABLE t", "AS ENUM ('a')", "not sql"};
+		static const char *const maps[] = {"ALTER TEXT SEARCH CONFIGURATION v DROP MAPPING FOR w", "DROP TEXT SEARCH CONFIGURATION v", "not sql"};
+		static const char *const stats[] = {"ON a, b FROM t; DROP TABLE t", "AS ENUM ('a')", "not sql"};
 		static const char *const families[] = {"USING b; DROP TABLE t", "AS ENUM ('a')", "not sql"};
 
+		for (int i = 0; i < lengthof(aggregates); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_AGGREGATE,.name = "v",.args = "integer",.definition = (char *) aggregates[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(dicts); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_TSDICT,.name = "v",.definition = (char *) dicts[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(maps); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_TSMAP,.name = "v",.args = "w",.definition = (char *) maps[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
+		for (int i = 0; i < lengthof(stats); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_STATISTICS,.name = "v",.definition = (char *) stats[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
 		for (int i = 0; i < lengthof(families); i++)
 		{
 			WsObject	o = {.kind = WS_OBJ_OPFAMILY,.name = "v",.args = "b",.definition = (char *) families[i]};

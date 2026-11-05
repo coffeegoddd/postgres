@@ -69,6 +69,13 @@ static const char *const kind_words[] = {
 	[WS_OBJ_OPCLASS] = "opclass",
 	[WS_OBJ_OPFAMILY] = "opfamily",
 	[WS_OBJ_OPMEMBERS] = "opmembers",
+	[WS_OBJ_AGGREGATE] = "aggregate",
+	[WS_OBJ_TSPARSER] = "tsparser",
+	[WS_OBJ_TSTEMPLATE] = "tstemplate",
+	[WS_OBJ_TSDICT] = "tsdict",
+	[WS_OBJ_TSCONFIG] = "tsconfig",
+	[WS_OBJ_TSMAP] = "tsmap",
+	[WS_OBJ_STATISTICS] = "statistics",
 	[WS_OBJ_DEFAULT] = "default",
 	[WS_OBJ_DOMAIN] = "domain",
 	[WS_OBJ_FUNCTION] = "function",
@@ -92,6 +99,13 @@ static const char *const kind_sql[] = {
 	[WS_OBJ_OPCLASS] = "OPERATOR CLASS",
 	[WS_OBJ_OPFAMILY] = "OPERATOR FAMILY",
 	[WS_OBJ_OPMEMBERS] = "OPERATOR FAMILY",
+	[WS_OBJ_AGGREGATE] = "ROUTINE", /* (of which all ways of saying one are alike) */
+	[WS_OBJ_TSPARSER] = "TEXT SEARCH PARSER",
+	[WS_OBJ_TSTEMPLATE] = "TEXT SEARCH TEMPLATE",
+	[WS_OBJ_TSDICT] = "TEXT SEARCH DICTIONARY",
+	[WS_OBJ_TSCONFIG] = "TEXT SEARCH CONFIGURATION",
+	[WS_OBJ_TSMAP] = "TEXT SEARCH CONFIGURATION",
+	[WS_OBJ_STATISTICS] = "STATISTICS",
 	[WS_OBJ_DEFAULT] = "DEFAULT",
 	[WS_OBJ_DOMAIN] = "DOMAIN",
 	[WS_OBJ_FUNCTION] = "FUNCTION",
@@ -114,9 +128,16 @@ is_of_operators(WsObjectKind kind)
 }
 
 static bool
+is_of_text_search(WsObjectKind kind)
+{
+	return kind == WS_OBJ_TSPARSER || kind == WS_OBJ_TSTEMPLATE || kind == WS_OBJ_TSDICT ||
+		kind == WS_OBJ_TSCONFIG || kind == WS_OBJ_TSMAP;
+}
+
+static bool
 is_function(WsObjectKind kind)
 {
-	return kind == WS_OBJ_FUNCTION || kind == WS_OBJ_PROCEDURE;
+	return kind == WS_OBJ_FUNCTION || kind == WS_OBJ_PROCEDURE || kind == WS_OBJ_AGGREGATE;
 }
 
 /* Whether it is of a table, named in what its key says as a function says its types. */
@@ -130,14 +151,14 @@ is_of_table(WsObjectKind kind)
 static bool
 has_args(WsObjectKind kind)
 {
-	return is_function(kind) || is_of_table(kind) || kind == WS_OBJ_CAST || is_of_operators(kind);
+	return is_function(kind) || is_of_table(kind) || kind == WS_OBJ_CAST || is_of_operators(kind) || kind == WS_OBJ_TSMAP;
 }
 
 /* Whether its definition is its whole statement, not what follows its name. */
 static bool
 is_whole_statement(WsObjectKind kind)
 {
-	return is_of_table(kind) || kind == WS_OBJ_CAST || kind == WS_OBJ_OPLINK || kind == WS_OBJ_OPMEMBERS;
+	return is_of_table(kind) || kind == WS_OBJ_CAST || kind == WS_OBJ_OPLINK || kind == WS_OBJ_OPMEMBERS || kind == WS_OBJ_TSMAP;
 }
 
 bool
@@ -145,7 +166,7 @@ ws_obj_before_tables(const WsObject *o)
 {
 	return o->kind == WS_OBJ_DOMAIN || o->kind == WS_OBJ_TYPE || o->kind == WS_OBJ_SEQUENCE ||
 		o->kind == WS_OBJ_COLLATION || o->kind == WS_OBJ_CONVERSION || o->kind == WS_OBJ_CAST ||
-		is_of_operators(o->kind) ||
+		is_of_operators(o->kind) || is_of_text_search(o->kind) ||
 		(is_function(o->kind) && !o->after_tables);
 }
 
@@ -229,6 +250,12 @@ ws_obj_problem(const WsObject *o)
 		return "a function with no input types, or something else with them";
 	if (is_of_table(o->kind) && (o->owner != NULL || o->ngrants > 0 || bad_name(o->args)))
 		return "something of a table with no table, or with an owner or grants of its own";
+	if ((is_of_text_search(o->kind) || o->kind == WS_OBJ_STATISTICS) && o->ngrants > 0)
+		return "what has no grants, with grants";
+	if (o->kind == WS_OBJ_TSMAP && (o->owner != NULL || o->ncomments > 0 || o->args == NULL || o->args[0] == '\0'))
+		return "a mapping with no token, or with an owner or comments of its own";
+	if ((o->kind == WS_OBJ_TSPARSER || o->kind == WS_OBJ_TSTEMPLATE) && o->owner != NULL)
+		return "a text search parser or template, which no one owns, with an owner";
 	if (is_of_operators(o->kind) && (o->ngrants > 0 || o->args == NULL || o->args[0] == '\0'))
 		return "something of operators with grants, or with no types or method";
 	if ((o->kind == WS_OBJ_OPLINK || o->kind == WS_OBJ_OPMEMBERS) && (o->owner != NULL || o->ncomments > 0))
@@ -657,7 +684,6 @@ static const char *const refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid WHERE i.indrelid = c.oid "
 "      AND (i.indisclustered OR ic.reltablespace <> 0 OR NOT i.indisvalid OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = ic.oid "
 "        AND a.attstattarget >= 0))) THEN 'it has an index clustered on, in a tablespace, invalid or with its own statistics' "
-"  WHEN EXISTS (SELECT 1 FROM pg_statistic_ext s WHERE s.stxrelid = c.oid) THEN 'it has a statistics object' "
 "  WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 "
 "      AND (a.attstattarget >= 0 OR a.attoptions IS NOT NULL)) THEN 'it has settings on a column' "
 "  WHEN c.relkind = 'm' AND c.relreplident <> 'd' THEN 'it has a replica identity' "
@@ -689,7 +715,7 @@ static const char *const refusal_sql =
 "      WHERE r.ev_class = c.oid AND r.rulename = '_RETURN' AND d.deptype = 'n' AND NOT ( "
 "        (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "           AND (q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S') OR q.relnamespace = 'pg_catalog'::regnamespace))) "
-"        OR d.refclassid IN ('pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) "
+"        OR d.refclassid IN ('pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass, 'pg_ts_config'::regclass, 'pg_ts_dict'::regclass) "
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k "
 "           WHERE k.oid = d.refobjid AND k.conrelid <> 0)) "
 "        OR d.refclassid = 'pg_type'::regclass "
@@ -780,6 +806,26 @@ relations_version(const char *schema)
 				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
 				"    JOIN pg_opfamily o ON d.classoid = 'pg_opfamily'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'p' || p.prtkey || ':' || p.xmin FROM pg_ws_print p JOIN pg_namespace n ON n.oid = p.prtnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'R' || o.oid || ':' || o.xmin FROM pg_ts_parser o JOIN pg_namespace n ON n.oid = o.prsnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'E' || o.oid || ':' || o.xmin FROM pg_ts_template o JOIN pg_namespace n ON n.oid = o.tmplnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'Y' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_ts_dict o JOIN pg_namespace n ON n.oid = o.dictnamespace "
+				"    JOIN pg_roles r ON r.oid = o.dictowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'Z' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_ts_config o JOIN pg_namespace n ON n.oid = o.cfgnamespace "
+				"    JOIN pg_roles r ON r.oid = o.cfgowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'z' || m.mapcfg || '.' || m.maptokentype || '.' || m.mapseqno || ':' || m.xmin FROM pg_ts_config_map m JOIN pg_ts_config o ON o.oid = m.mapcfg "
+				"    JOIN pg_namespace n ON n.oid = o.cfgnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'X' || o.oid || ':' || o.xmin || ':' || r.rolname FROM pg_statistic_ext o JOIN pg_namespace n ON n.oid = o.stxnamespace "
+				"    JOIN pg_roles r ON r.oid = o.stxowner WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_ts_parser o ON d.classoid = 'pg_ts_parser'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.prsnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_ts_template o ON d.classoid = 'pg_ts_template'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.tmplnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_ts_dict o ON d.classoid = 'pg_ts_dict'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.dictnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_ts_config o ON d.classoid = 'pg_ts_config'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.cfgnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
+				"    JOIN pg_statistic_ext o ON d.classoid = 'pg_statistic_ext'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.stxnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'x' || i.indexrelid || ':' || i.xmin FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'w' || w.oid || ':' || w.xmin FROM pg_attrdef w JOIN pg_class c ON c.oid = w.adrelid "
@@ -1179,11 +1225,12 @@ function_key(const char *schema, Oid oid, Buf *key)
 	char		prokind;
 	char	   *args = ws_text_to_utf8(function_args(schema, oid, &prokind));
 
-	ws_obj_key(prokind == PROKIND_PROCEDURE ? WS_OBJ_PROCEDURE : WS_OBJ_FUNCTION,
+	ws_obj_key(prokind == PROKIND_PROCEDURE ? WS_OBJ_PROCEDURE : prokind == PROKIND_AGGREGATE ? WS_OBJ_AGGREGATE : WS_OBJ_FUNCTION,
 			   ws_name_to_utf8(get_func_name(oid)), args, key);
 }
 
 static char *print_type(const char *schema, Oid typid, int32 typmod);
+static void add_dep(WsObject *o, Buf *key);
 static char *printed_or_retry(const char *schema, char *printed);
 
 /* An operator's input types as printed, NONE for what it has not. */
@@ -1260,6 +1307,14 @@ read_deps_of(WsObject *o, const char *schema, const char *oid, const char *sourc
 				   "  AND q.reltype <> $3::oid AND q.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'L', l.collname::text FROM d JOIN pg_collation l ON d.refclassid = 'pg_collation'::regclass "
 				   "  AND l.oid = d.refobjid WHERE l.collnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'E', o.tmplname::text FROM d JOIN pg_ts_template o ON d.refclassid = 'pg_ts_template'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.tmplnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'R', o.prsname::text FROM d JOIN pg_ts_parser o ON d.refclassid = 'pg_ts_parser'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.prsnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'Z', o.cfgname::text FROM d JOIN pg_ts_config o ON d.refclassid = 'pg_ts_config'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.cfgnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "UNION SELECT 'Y', o.dictname::text FROM d JOIN pg_ts_dict o ON d.refclassid = 'pg_ts_dict'::regclass "
+				   "  AND o.oid = d.refobjid WHERE o.dictnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'O', o.oid::text FROM d JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass "
 				   "  AND o.oid = d.refobjid WHERE o.oprnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'P', o.oid::text FROM d JOIN pg_opclass o ON d.refclassid = 'pg_opclass'::regclass "
@@ -1298,7 +1353,8 @@ read_deps_of(WsObject *o, const char *schema, const char *oid, const char *sourc
 		else if (k == 'P' || k == 'M')
 			method_key(k == 'P', atooid(ws_sql_value(&rows, i, 1)), &key);
 		else
-			ws_obj_key(k == 'L' ? WS_OBJ_COLLATION : k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN :
+			ws_obj_key(k == 'Z' ? WS_OBJ_TSCONFIG : k == 'E' ? WS_OBJ_TSTEMPLATE : k == 'R' ? WS_OBJ_TSPARSER : k == 'Y' ? WS_OBJ_TSDICT :
+					   k == 'L' ? WS_OBJ_COLLATION : k == 'm' ? WS_OBJ_MATVIEW : k == 'v' ? WS_OBJ_VIEW : k == 'D' ? WS_OBJ_DOMAIN :
 					   k == 'S' ? WS_OBJ_SEQUENCE : WS_OBJ_TYPE,
 					   ws_name_to_utf8(ws_sql_value(&rows, i, 1)), NULL, &key);
 		buf_append_byte(&key, 0);
@@ -1307,6 +1363,26 @@ read_deps_of(WsObject *o, const char *schema, const char *oid, const char *sourc
 	}
 	if (o->ndeps > 1)
 		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
+
+	/* (what is made may be checked as it is, so a configuration must be whole by then) */
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_sql_value(&rows, i, 0)[0] == 'Z')
+		{
+			const char *map_params[2] = {ws_sql_value(&rows, i, 1), schema};
+			WsSqlRows	maps;
+
+			WsSql->read("SELECT DISTINCT t.alias FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace "
+						"JOIN pg_ts_config_map m ON m.mapcfg = c.oid JOIN ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype "
+						"WHERE c.cfgname = $1::name AND n.nspname = $2::name", 2, map_params, &maps);
+			for (int m = 0; m < maps.nrows; m++)
+			{
+				Buf			key = BUF_INIT;
+
+				ws_obj_key(WS_OBJ_TSMAP, ws_name_to_utf8(ws_sql_value(&rows, i, 1)), ws_name_to_utf8(ws_sql_value(&maps, m, 0)), &key);
+				add_dep(o, &key);
+			}
+			ws_sql_rows_free(&maps);
+		}
 	ws_sql_rows_free(&rows);
 }
 
@@ -1529,7 +1605,7 @@ static const char *const type_refusal_sql =
 "        AND NOT (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid AND s.classid <> 'pg_constraint'::regclass) "
 "        AND NOT (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid AND q.relkind IN ('c', 'S') "
 "          AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass))) "
-"        AND d.refclassid NOT IN ('pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) "
+"        AND d.refclassid NOT IN ('pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass, 'pg_ts_config'::regclass, 'pg_ts_dict'::regclass) "
 "        AND NOT coalesce((SELECT i.schema = 'pg_catalog' "
 "        FROM pg_identify_object(d.refclassid, d.refobjid, 0) i), false)) "
 "    THEN 'it needs an object no commit holds yet' "
@@ -2669,6 +2745,211 @@ read_opclasses(const char *schema, WsObject *objs, int *n)
 	return objs;
 }
 
+/* ------------------------------------- text search */
+
+#define TS_REFUSAL(name_col, catalog, nsp_col, source) \
+"SELECT o." name_col "::text, CASE " \
+"  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '" catalog "'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) " \
+"    THEN 'it belongs to an extension' " \
+"  WHEN EXISTS (SELECT 1 FROM " catalog " c WHERE c." name_col " = o." name_col " AND c." nsp_col " = 'pg_catalog'::regnamespace) " \
+"    THEN 'it is named as one in the catalogs' " \
+NEEDS_ANOTHER_SCHEMA("(SELECT '" catalog "'::regclass::oid, o.oid) s(classid, objid)") \
+"  END FROM " catalog " o JOIN pg_namespace n ON n.oid = o." nsp_col " WHERE n.nspname = $1::name ORDER BY 1"
+
+static const char *const tsparser_refusal_sql = TS_REFUSAL("prsname", "pg_ts_parser", "prsnamespace", "");
+static const char *const tstemplate_refusal_sql = TS_REFUSAL("tmplname", "pg_ts_template", "tmplnamespace", "");
+static const char *const tsdict_refusal_sql = TS_REFUSAL("dictname", "pg_ts_dict", "dictnamespace", "");
+
+/*
+ * A thesaurus's dictionary option names another by text, which nothing records as a need,
+ * and may say its schema: only one in the catalogs reads the same wherever it arrives.
+ */
+static const char *const tsdict_option_refusal_sql =
+"SELECT o.dictname::text, 'its dictionary option names one not in the catalogs, which no commit can say' "
+"FROM pg_ts_dict o JOIN pg_namespace n ON n.oid = o.dictnamespace, "
+"  lower(substring(o.dictinitoption from '(?i)\\ydictionary\\y\\s*=\\s*''([^'']*)''')) v(val) "
+"WHERE n.nspname = $1::name AND v.val IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_ts_dict c "
+"  WHERE c.dictnamespace = 'pg_catalog'::regnamespace AND v.val IN (c.dictname::text, 'pg_catalog.' || c.dictname)) ORDER BY 1";
+static const char *const tsconfig_refusal_sql = TS_REFUSAL("cfgname", "pg_ts_config", "cfgnamespace", "");
+
+static WsObject *
+add_ts_object(WsObject *objs, int *n, WsObjectKind kind, const char *schema, const char *oid, const char *name,
+			  const char *definition, const char *catalog, const char *owner_sql)
+{
+	WsObject   *o = &objs[(*n)++];
+	char	   *source = psprintf("SELECT '%s'::regclass::oid, $1::oid", catalog);
+
+	o->kind = kind;
+	o->name = ws_name_to_utf8(name);
+	set_definition(o, definition);
+	px_free(o->deps);
+	o->deps = NULL;
+	/* (none of these is a type or function, whatever its oid) */
+	read_deps_of(o, schema, oid, source, "0");
+	read_owner_and_comments(o, oid, name, owner_sql, catalog);
+	pfree(source);
+	return o;
+}
+
+static WsObject *
+read_text_search(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT o.oid::text, o.prsname::text, o.prsstart::oid::text, o.prstoken::oid::text, o.prsend::oid::text, "
+				"  o.prslextype::oid::text, o.prsheadline::oid::text "
+				"FROM pg_ts_parser o JOIN pg_namespace n ON n.oid = o.prsnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		StringInfoData s;
+
+		initStringInfo(&s);
+		appendStringInfo(&s, "(START = %s, GETTOKEN = %s, END = %s, LEXTYPES = %s",
+						 function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 2))),
+						 function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 3))),
+						 function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 4))),
+						 function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 5))));
+		if (OidIsValid(atooid(ws_sql_value(&rows, i, 6))))
+			appendStringInfo(&s, ", HEADLINE = %s", function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 6))));
+		appendStringInfoChar(&s, ')');
+		add_ts_object(objs, n, WS_OBJ_TSPARSER, schema, ws_sql_value(&rows, i, 0), ws_sql_value(&rows, i, 1), s.data, "pg_ts_parser", NULL);
+	}
+	ws_sql_rows_free(&rows);
+
+	WsSql->read("SELECT o.oid::text, o.tmplname::text, o.tmplinit::oid::text, o.tmpllexize::oid::text "
+				"FROM pg_ts_template o JOIN pg_namespace n ON n.oid = o.tmplnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		StringInfoData s;
+
+		initStringInfo(&s);
+		appendStringInfoChar(&s, '(');
+		if (OidIsValid(atooid(ws_sql_value(&rows, i, 2))))
+			appendStringInfo(&s, "INIT = %s, ", function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 2))));
+		appendStringInfo(&s, "LEXIZE = %s)", function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 3))));
+		add_ts_object(objs, n, WS_OBJ_TSTEMPLATE, schema, ws_sql_value(&rows, i, 0), ws_sql_value(&rows, i, 1), s.data, "pg_ts_template", NULL);
+	}
+	ws_sql_rows_free(&rows);
+
+	WsSql->read("SELECT o.oid::text, o.dictname::text, quote_ident(t.tmplname), o.dictinitoption "
+				"FROM pg_ts_dict o JOIN pg_ts_template t ON t.oid = o.dicttemplate "
+				"JOIN pg_namespace n ON n.oid = o.dictnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		const char *options = ws_sql_value(&rows, i, 3);
+
+		add_ts_object(objs, n, WS_OBJ_TSDICT, schema, ws_sql_value(&rows, i, 0), ws_sql_value(&rows, i, 1),
+					  psprintf("(TEMPLATE = %s%s%s)", ws_sql_value(&rows, i, 2), options != NULL ? ", " : "", options != NULL ? options : ""),
+					  "pg_ts_dict", OWNER_IF_IT_CAN_TRAVEL("pg_ts_dict", "dictowner"));
+	}
+	ws_sql_rows_free(&rows);
+
+	WsSql->read("SELECT o.oid::text, o.cfgname::text, quote_ident(p.prsname), o.cfgparser::text "
+				"FROM pg_ts_config o JOIN pg_ts_parser p ON p.oid = o.cfgparser "
+				"JOIN pg_namespace n ON n.oid = o.cfgnamespace WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+		const char *map_params[2] = {oid, ws_sql_value(&rows, i, 3)};
+		WsObject   *config;
+		WsSqlRows	maps;
+
+		WsSql->read("SELECT t.alias, string_agg(quote_ident(d.dictname), ', ' ORDER BY m.mapseqno) "
+					"FROM pg_ts_config_map m JOIN pg_ts_dict d ON d.oid = m.mapdict "
+					"JOIN ts_token_type($2::oid) t ON t.tokid = m.maptokentype "
+					"WHERE m.mapcfg = $1::oid GROUP BY t.alias", 2, map_params, &maps);
+		objs = repalloc0_array(objs, WsObject, *n + (rows.nrows - i), *n + (rows.nrows - i) + maps.nrows);
+		config = add_ts_object(objs, n, WS_OBJ_TSCONFIG, schema, oid, name,
+							   psprintf("(PARSER = %s)", ws_sql_value(&rows, i, 2)),
+							   "pg_ts_config", OWNER_IF_IT_CAN_TRAVEL("pg_ts_config", "cfgowner"));
+		for (int m = 0; m < maps.nrows; m++)
+		{
+			WsObject   *map = &objs[(*n)++];
+			Buf			key = BUF_INIT;
+
+			map->kind = WS_OBJ_TSMAP;
+			map->name = ws_name_to_utf8(name);
+			map->args = ws_name_to_utf8(ws_sql_value(&maps, m, 0));
+			set_definition(map, psprintf("ALTER TEXT SEARCH CONFIGURATION %s ADD MAPPING FOR %s WITH %s", quote_identifier(name),
+										 quote_identifier(ws_sql_value(&maps, m, 0)), ws_sql_value(&maps, m, 1)));
+			/* (the configuration needs its dictionaries, so what follows it has them) */
+			ws_obj_key(WS_OBJ_TSCONFIG, config->name, NULL, &key);
+			add_dep(map, &key);
+		}
+		ws_sql_rows_free(&maps);
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
+/* ------------------------------------- statistics objects */
+
+static const char *const statistics_refusal_sql =
+"SELECT st.stxname::text, CASE "
+"  WHEN st.stxnamespace <> c.relnamespace THEN 'it is in another schema than its table' "
+"  WHEN c.relkind NOT IN ('r', 'p', 'm') THEN 'it is on what no commit holds' "
+"  WHEN st.stxstattarget IS NOT NULL THEN 'it has a statistics target of its own, which no commit holds yet' "
+NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_statistic_ext'::regclass::oid, st.oid) s(classid, objid)")
+"  END FROM pg_statistic_ext st JOIN pg_class c ON c.oid = st.stxrelid JOIN pg_namespace n ON n.oid IN (st.stxnamespace, c.relnamespace) "
+"WHERE n.nspname = $1::name ORDER BY 1";
+
+static WsObject *
+read_statistics(const char *schema, WsObject *objs, int *n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT s.oid::text, s.stxname::text, c.relname::text, c.relkind::text "
+				"FROM pg_statistic_ext s JOIN pg_class c ON c.oid = s.stxrelid JOIN pg_namespace n ON n.oid = s.stxnamespace "
+				"WHERE n.nspname = $1::name", 1, params, &rows);
+	objs = repalloc0_array(objs, WsObject, Max(*n, 1), Max(*n + rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		WsObject   *o = &objs[(*n)++];
+		const char *oid = ws_sql_value(&rows, i, 0);
+		const char *name = ws_sql_value(&rows, i, 1);
+		const char *table = ws_sql_value(&rows, i, 2);
+		char	   *printed = printed_or_retry(schema, ws_schema_print(schema, pg_get_statisticsobjdef, 1,
+																	   ObjectIdGetDatum(atooid(oid)), 0, 0));
+		char	   *head = psprintf("CREATE STATISTICS %s ", quote_qualified_identifier(schema, name));
+
+		/*
+		 * A rename since what is read here, as what prints it reads the catalogs now.
+		 * Its table prints bare under the path, or says its schema if it has to, which
+		 * is refused.
+		 */
+		if (strncmp(printed, head, strlen(head)) != 0)
+			printed_or_retry(schema, NULL);
+		check_of_table_is_portable(name, schema, printed);
+		check_constants_hold_no_names(name, schema, oid,
+									  "SELECT d.refobjid::text FROM pg_depend d WHERE d.classid = 'pg_statistic_ext'::regclass "
+									  "AND d.objid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
+		o->kind = WS_OBJ_STATISTICS;
+		o->name = ws_name_to_utf8(name);
+		set_definition(o, printed + strlen(head));
+		px_free(o->deps);
+		o->deps = NULL;
+		read_deps_of(o, schema, oid, "SELECT 'pg_statistic_ext'::regclass::oid, $1::oid", "0");
+		if (ws_sql_value(&rows, i, 3)[0] == RELKIND_MATVIEW)
+		{
+			Buf			key = BUF_INIT;
+
+			ws_obj_key(WS_OBJ_MATVIEW, ws_name_to_utf8(table), NULL, &key);
+			add_dep(o, &key);
+		}
+		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_statistic_ext", "stxowner"), "pg_statistic_ext");
+		pfree(head);
+	}
+	ws_sql_rows_free(&rows);
+	return objs;
+}
+
 /* ------------------------------------- triggers, rules and policies */
 
 /* What such a one needs that no commit can hold, of its row in a catalog and its source. */
@@ -2680,7 +2961,7 @@ read_opclasses(const char *schema, WsObject *objs, int *n)
 "      WHERE d.classid = '" catalog "'::regclass AND d.objid = " oid " AND d.deptype = 'n' AND i.schema IS NOT NULL " \
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' " \
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '" catalog "'::regclass AND d.objid = " oid " AND d.deptype = 'n' " \
-"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) " \
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass, 'pg_ts_config'::regclass, 'pg_ts_dict'::regclass) " \
 "        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid " \
 "          AND q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S'))) " \
 "        OR (d.refclassid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint k WHERE k.oid = d.refobjid AND k.conrelid <> 0)) " \
@@ -2692,6 +2973,9 @@ read_opclasses(const char *schema, WsObject *objs, int *n)
 
 static const char *const trigger_refusal_sql =
 "SELECT g.tgname::text, CASE "
+"  WHEN EXISTS (SELECT 1 FROM pg_proc f WHERE f.oid = g.tgfoid AND f.proname = 'tsvector_update_trigger' AND f.pronamespace = 'pg_catalog'::regnamespace) "
+"      AND split_part(encode(g.tgargs, 'escape'), '\\000', 2) !~ '^\\s*(\"pg_catalog\"|[pP][gG]_[cC][aA][tT][aA][lL][oO][gG])\\s*\\.' "
+"    THEN 'its text search configuration, which it must qualify, is not one in the catalogs' "
 "  WHEN g.tgconstrrelid <> 0 AND NOT EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = g.tgconstrrelid AND q.relkind IN ('r', 'p')) "
 "    THEN 'it is a constraint trigger from what is no table' "
 OF_TABLE_NEEDS("pg_trigger", "g.oid")
@@ -2789,6 +3073,32 @@ check_of_table_is_portable(const char *name, const char *schema, const char *sql
 	else if (IsA(node, CreatePolicyStmt))
 		named = names_schema_walker(((CreatePolicyStmt *) node)->qual, &n) ||
 			names_schema_walker(((CreatePolicyStmt *) node)->with_check, &n);
+	else if (IsA(node, DefineStmt))
+	{
+		DefineStmt *d = (DefineStmt *) node;
+		ListCell   *lc;
+
+		/* (an aggregate's: arguments, then how many are direct) */
+		if (d->args != NIL)
+			foreach(lc, (List *) linitial(d->args))
+				named |= names_schema_walker((Node *) lfirst_node(FunctionParameter, lc)->argType, &n);
+		foreach(lc, d->definition)
+		{
+			Node	   *arg = lfirst_node(DefElem, lc)->arg;
+
+			/* (some have no argument) */
+			named |= arg != NULL && IsA(arg, TypeName) && names_schema_walker(arg, &n);
+		}
+	}
+	else if (IsA(node, CreateStatsStmt))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((CreateStatsStmt *) node)->exprs)
+			named |= names_schema_walker(lfirst_node(StatsElem, lc)->expr, &n);
+		foreach(lc, ((CreateStatsStmt *) node)->relations)
+			named |= names_schema_walker(lfirst(lc), &n);
+	}
 	else if (IsA(node, CreateOpClassStmt) || IsA(node, AlterOpFamilyStmt))
 	{
 		List	   *items = IsA(node, CreateOpClassStmt) ? ((CreateOpClassStmt *) node)->items : ((AlterOpFamilyStmt *) node)->items;
@@ -3023,10 +3333,9 @@ read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 
 static const char *const function_refusal_sql =
 "SELECT p.proname::text, CASE "
-"  WHEN p.prokind = 'a' THEN 'it is an aggregate, which no commit holds yet' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype IN ('e', 'x')) "
 "    THEN 'it belongs to an extension, or depends on one' "
-"  WHEN l.lanname IN ('c', 'internal') THEN 'it is in a language whose code no commit can bring' "
+"  WHEN p.prokind <> 'a' AND l.lanname IN ('c', 'internal') THEN 'it is in a language whose code no commit can bring' "
 "  WHEN EXISTS (SELECT 1 FROM pg_proc c WHERE c.proname = p.proname AND c.pronamespace = 'pg_catalog'::regnamespace) "
 "    THEN 'it is named as one in the catalogs, which a name could be taken for' "
 "  WHEN p.prosecdef AND (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls "
@@ -3045,7 +3354,7 @@ static const char *const function_refusal_sql =
 "      WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' AND i.schema IS NOT NULL "
 "        AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) THEN 'it needs something in another schema' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'n' "
-"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass) "
+"      AND NOT (d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass, 'pg_language'::regclass, 'pg_collation'::regclass, 'pg_operator'::regclass, 'pg_opclass'::regclass, 'pg_opfamily'::regclass, 'pg_ts_config'::regclass, 'pg_ts_dict'::regclass) "
 "        OR (d.refclassid = 'pg_namespace'::regclass AND d.refobjid = n.oid) "
 "        OR (d.refclassid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = d.refobjid "
 "          AND q.relkind IN ('r', 'p', 'v', 'm', 'c', 'S'))) "
@@ -3145,6 +3454,116 @@ read_function_owner_and_grants(WsObject *o, const char *oid, const char *name)
 }
 
 /* Adds the functions of a schema to objs, of *n and room for it. */
+/*
+ * An aggregate says its functions by name alone, and which is meant is worked out from its
+ * types, so among overloads of its own schema's may be another when made again.
+ */
+static const char *const aggregate_refusal_sql =
+"SELECT p.proname::text, 'a function it uses has overloads, of which its name would not say which' "
+"FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid JOIN pg_namespace n ON n.oid = p.pronamespace, "
+"  unnest(ARRAY[a.aggtransfn, a.aggfinalfn, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, a.aggminvtransfn, a.aggmfinalfn]::oid[]) u(fn) "
+"JOIN pg_proc f ON f.oid = u.fn "
+"WHERE n.nspname = $1::name AND EXISTS (SELECT 1 FROM pg_proc x WHERE x.proname = f.proname AND x.pronamespace = f.pronamespace "
+"  AND x.oid <> f.oid AND x.oid <> a.aggfnoid AND f.pronamespace <> 'pg_catalog'::regnamespace) ORDER BY 1";
+
+/*
+ * Refuses a first state of a reg* type: read when the aggregate is made, so before what it
+ * names may be, and saying its schema if it has to.  What holds one is refused as a constant.
+ */
+static void
+check_first_state(const char *schema, const char *name, const char *state, Oid type)
+{
+	char	   *typname;
+
+	if (state == NULL || get_typtype(type) != TYPTYPE_BASE || type >= FirstUnpinnedObjectId)
+		return;
+	typname = format_type_be(type);
+	if (strncmp(typname, "reg", 3) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: its first state is a name, which may not be made yet",
+						name, schema)));
+	pfree(typname);
+}
+
+/* What follows an aggregate's name: its arguments, and what it is made of. */
+static char *
+aggregate_definition(const char *schema, const char *name, const char *oid)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+	StringInfoData s;
+	char	   *args = printed_or_retry(schema, ws_schema_print(schema, pg_get_function_arguments, 1,
+																ObjectIdGetDatum(atooid(oid)), 0, 0));
+	const char *const modify_words[] = {"READ_ONLY", "SHAREABLE", "READ_WRITE"};
+
+	WsSql->read("SELECT a.aggkind::text, a.aggtransfn::oid::text, a.aggfinalfn::oid::text, a.aggcombinefn::oid::text, "
+				"  a.aggserialfn::oid::text, a.aggdeserialfn::oid::text, a.aggmtransfn::oid::text, a.aggminvtransfn::oid::text, "
+				"  a.aggmfinalfn::oid::text, a.aggfinalextra::text, a.aggmfinalextra::text, a.aggfinalmodify::text, "
+				"  a.aggmfinalmodify::text, (SELECT x.oprname::text FROM pg_operator x WHERE x.oid = a.aggsortop), "
+				"  a.aggtranstype::text, a.aggtransspace::text, a.aggmtranstype::text, a.aggmtransspace::text, "
+				"  a.agginitval, a.aggminitval, p.proparallel::text "
+				"FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid WHERE a.aggfnoid = $1::oid", 1, params, &rows);
+	if (rows.nrows != 1)
+		printed_or_retry(schema, NULL);
+	check_first_state(schema, name, ws_sql_value(&rows, 0, 18), atooid(ws_sql_value(&rows, 0, 14)));
+	check_first_state(schema, name, ws_sql_value(&rows, 0, 19), atooid(ws_sql_value(&rows, 0, 16)));
+	initStringInfo(&s);
+
+#define AGG_FUNCTION(word, column) \
+	do { \
+		if (OidIsValid(atooid(ws_sql_value(&rows, 0, column)))) \
+			appendStringInfo(&s, ", %s = %s", word, function_name_or_retry(schema, atooid(ws_sql_value(&rows, 0, column)))); \
+	} while (0)
+#define AGG_MODIFY(word, column) \
+	appendStringInfo(&s, ", %s = %s", word, \
+					 modify_words[ws_sql_value(&rows, 0, column)[0] == 'r' ? 0 : ws_sql_value(&rows, 0, column)[0] == 's' ? 1 : 2])
+
+	appendStringInfo(&s, "(%s) (SFUNC = %s, STYPE = %s", args[0] != '\0' ? args : "*",
+					 function_name_or_retry(schema, atooid(ws_sql_value(&rows, 0, 1))),
+					 print_type(schema, atooid(ws_sql_value(&rows, 0, 14)), -1));
+	if (atoi(ws_sql_value(&rows, 0, 15)) != 0)
+		appendStringInfo(&s, ", SSPACE = %s", ws_sql_value(&rows, 0, 15));
+	AGG_FUNCTION("FINALFUNC", 2);
+	if (OidIsValid(atooid(ws_sql_value(&rows, 0, 2))))
+	{
+		if (ws_sql_value(&rows, 0, 9)[0] == 't')
+			appendStringInfoString(&s, ", FINALFUNC_EXTRA");
+		AGG_MODIFY("FINALFUNC_MODIFY", 11);
+	}
+	AGG_FUNCTION("COMBINEFUNC", 3);
+	AGG_FUNCTION("SERIALFUNC", 4);
+	AGG_FUNCTION("DESERIALFUNC", 5);
+	if (ws_sql_value(&rows, 0, 18) != NULL)
+		appendStringInfo(&s, ", INITCOND = %s", quote_literal_cstr(ws_sql_value(&rows, 0, 18)));
+	AGG_FUNCTION("MSFUNC", 6);
+	AGG_FUNCTION("MINVFUNC", 7);
+	if (OidIsValid(atooid(ws_sql_value(&rows, 0, 16))))
+		appendStringInfo(&s, ", MSTYPE = %s", print_type(schema, atooid(ws_sql_value(&rows, 0, 16)), -1));
+	if (atoi(ws_sql_value(&rows, 0, 17)) != 0)
+		appendStringInfo(&s, ", MSSPACE = %s", ws_sql_value(&rows, 0, 17));
+	AGG_FUNCTION("MFINALFUNC", 8);
+	if (OidIsValid(atooid(ws_sql_value(&rows, 0, 8))))
+	{
+		if (ws_sql_value(&rows, 0, 10)[0] == 't')
+			appendStringInfoString(&s, ", MFINALFUNC_EXTRA");
+		AGG_MODIFY("MFINALFUNC_MODIFY", 12);
+	}
+	if (ws_sql_value(&rows, 0, 19) != NULL)
+		appendStringInfo(&s, ", MINITCOND = %s", quote_literal_cstr(ws_sql_value(&rows, 0, 19)));
+	if (ws_sql_value(&rows, 0, 13) != NULL)
+		appendStringInfo(&s, ", SORTOP = %s", ws_sql_value(&rows, 0, 13));
+	if (ws_sql_value(&rows, 0, 20)[0] != 'u')
+		appendStringInfo(&s, ", PARALLEL = %s", ws_sql_value(&rows, 0, 20)[0] == 's' ? "SAFE" : "RESTRICTED");
+	if (ws_sql_value(&rows, 0, 0)[0] == 'h')
+		appendStringInfoString(&s, ", HYPOTHETICAL");
+	appendStringInfoChar(&s, ')');
+	ws_sql_rows_free(&rows);
+#undef AGG_FUNCTION
+#undef AGG_MODIFY
+	return s.data;
+}
+
 static WsObject *
 read_functions(const char *schema, WsObject *objs, int *n)
 {
@@ -3160,8 +3579,7 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		const char *oid = ws_sql_value(&funcs, i, 0);
 		const char *name = ws_sql_value(&funcs, i, 1);
 		bool		procedure = ws_sql_value(&funcs, i, 2)[0] == PROKIND_PROCEDURE;
-		char	   *printed = printed_or_retry(schema, ws_schema_print(schema, pg_get_functiondef, 1,
-																	   ObjectIdGetDatum(atooid(oid)), 0, 0));
+		bool		aggregate = ws_sql_value(&funcs, i, 2)[0] == PROKIND_AGGREGATE;
 		char	   *head = psprintf("CREATE OR REPLACE %s %s", procedure ? "PROCEDURE" : "FUNCTION",
 									quote_qualified_identifier(schema, name));
 		size_t		len;
@@ -3171,14 +3589,26 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		WsSqlRows	rows;
 
 		CHECK_FOR_INTERRUPTS();
-		if (strncmp(printed, head, strlen(head)) != 0)
-			elog(ERROR, "function \"%s\" printed as something else", name);
-		tail = printed + strlen(head);
-		len = strlen(tail);
-		while (len > 0 && (tail[len - 1] == '\n' || tail[len - 1] == ' '))
-			tail[--len] = '\0';
-		check_function_is_portable(name, schema, tail);
-		o->kind = procedure ? WS_OBJ_PROCEDURE : WS_OBJ_FUNCTION;
+		if (aggregate)
+		{
+			/* (nothing prints one) */
+			tail = aggregate_definition(schema, name, oid);
+			check_of_table_is_portable(name, schema, psprintf("CREATE AGGREGATE x %s", tail));
+		}
+		else
+		{
+			char	   *printed = printed_or_retry(schema, ws_schema_print(schema, pg_get_functiondef, 1,
+																		   ObjectIdGetDatum(atooid(oid)), 0, 0));
+
+			if (strncmp(printed, head, strlen(head)) != 0)
+				elog(ERROR, "function \"%s\" printed as something else", name);
+			tail = printed + strlen(head);
+			len = strlen(tail);
+			while (len > 0 && (tail[len - 1] == '\n' || tail[len - 1] == ' '))
+				tail[--len] = '\0';
+			check_function_is_portable(name, schema, tail);
+		}
+		o->kind = aggregate ? WS_OBJ_AGGREGATE : procedure ? WS_OBJ_PROCEDURE : WS_OBJ_FUNCTION;
 		o->name = ws_name_to_utf8(name);
 		o->args = ws_text_to_utf8(function_args(schema, atooid(oid), NULL));
 		ws_tags_escape(ws_text_to_utf8(tail), &stored);
@@ -3191,7 +3621,10 @@ read_functions(const char *schema, WsObject *objs, int *n)
 									  "WHERE p.oid = $1::oid AND i > p.pronargs - p.pronargdefaults "
 									  "UNION SELECT d.refobjid::text FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass "
 									  "AND d.objid = p.oid WHERE p.oid = $1::oid AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass "
-									  "AND p.prosqlbody IS NOT NULL AND d.refobjid <> p.prorettype AND NOT d.refobjid = ANY (p.proargtypes::oid[])");
+									  "AND p.prosqlbody IS NOT NULL AND d.refobjid <> p.prorettype AND NOT d.refobjid = ANY (p.proargtypes::oid[]) "
+									  /* (an aggregate's first states are as much constants) */
+									  "UNION SELECT a.aggtranstype::text FROM pg_aggregate a WHERE a.aggfnoid = $1::oid AND a.agginitval IS NOT NULL "
+									  "UNION SELECT a.aggmtranstype::text FROM pg_aggregate a WHERE a.aggfnoid = $1::oid AND a.aggminitval IS NOT NULL");
 		read_deps(o, schema, oid, "SELECT 'pg_proc'::regclass::oid, $1::oid");
 
 		/* (it needs a table if a body or a type of it does) */
@@ -3286,7 +3719,7 @@ static void
 hold_what_was_restored(const char *schema, WsObject *objs, int n)
 {
 	int			nentries;
-	WsPrintEntry *entries = WsPrints->load(schema, &nentries);
+	WsPrintEntry *entries = WsPrints->load(schema, "", &nentries);
 
 	for (int i = 0; i < nentries; i++)
 	{
@@ -3367,6 +3800,13 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_types(schema, opfamily_refusal_sql);
 	refuse_types(schema, opclass_refusal_sql);
 	refuse_types(schema, member_refusal_sql);
+	refuse_types(schema, tsparser_refusal_sql);
+	refuse_types(schema, tstemplate_refusal_sql);
+	refuse_types(schema, tsdict_refusal_sql);
+	refuse_types(schema, tsdict_option_refusal_sql);
+	refuse_types(schema, tsconfig_refusal_sql);
+	refuse_types(schema, statistics_refusal_sql);
+	refuse_types(schema, aggregate_refusal_sql);
 	refuse_types(schema, index_refusal_sql);
 	refuse_types(schema, default_refusal_sql);
 
@@ -3436,6 +3876,8 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	objs = read_operators(schema, objs, &total);
 	objs = read_opfamilies(schema, objs, &total);
 	objs = read_opclasses(schema, objs, &total);
+	objs = read_text_search(schema, objs, &total);
+	objs = read_statistics(schema, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_TRIGGER, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_RULE, objs, &total);
 	objs = read_of_table(schema, WS_OBJ_POLICY, objs, &total);
@@ -3692,7 +4134,7 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 	if (!is_whole_statement(o->kind))
 	{
 		ws_put_text(&sql, "CREATE ");
-		ws_put_text(&sql, kind_sql[o->kind]);
+		ws_put_text(&sql, o->kind == WS_OBJ_AGGREGATE ? "AGGREGATE" : kind_sql[o->kind]);
 		ws_put_text(&sql, " ");
 		ws_put_identifier(&sql, schema);
 		ws_put_text(&sql, ".");
@@ -3781,6 +4223,31 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 				pfree(table);
 				break;
 			}
+		case WS_OBJ_AGGREGATE:
+			if (node == NULL || !IsA(node, DefineStmt) || ((DefineStmt *) node)->kind != OBJECT_AGGREGATE ||
+				((DefineStmt *) node)->oldstyle || ((DefineStmt *) node)->replace || !names_it(((DefineStmt *) node)->defnames, schema, here))
+				not_the_object(o, "it is not one CREATE AGGREGATE of it");
+			break;
+		case WS_OBJ_TSPARSER:
+		case WS_OBJ_TSTEMPLATE:
+		case WS_OBJ_TSDICT:
+		case WS_OBJ_TSCONFIG:
+			if (node == NULL || !IsA(node, DefineStmt) ||
+				((DefineStmt *) node)->kind != (o->kind == WS_OBJ_TSPARSER ? OBJECT_TSPARSER : o->kind == WS_OBJ_TSTEMPLATE ? OBJECT_TSTEMPLATE :
+												o->kind == WS_OBJ_TSDICT ? OBJECT_TSDICTIONARY : OBJECT_TSCONFIGURATION) ||
+				!names_it(((DefineStmt *) node)->defnames, schema, here))
+				not_the_object(o, "it is not one CREATE TEXT SEARCH of it");
+			break;
+		case WS_OBJ_TSMAP:
+			if (node == NULL || !IsA(node, AlterTSConfigurationStmt) ||
+				((AlterTSConfigurationStmt *) node)->kind != ALTER_TSCONFIG_ADD_MAPPING)
+				not_the_object(o, "it is not one ADD MAPPING");
+			break;
+		case WS_OBJ_STATISTICS:
+			if (node == NULL || !IsA(node, CreateStatsStmt) || ((CreateStatsStmt *) node)->if_not_exists ||
+				!names_it(((CreateStatsStmt *) node)->defnames, schema, here))
+				not_the_object(o, "it is not one CREATE STATISTICS of it");
+			break;
 		case WS_OBJ_OPERATOR:
 			if (node == NULL || !IsA(node, DefineStmt) || ((DefineStmt *) node)->kind != OBJECT_OPERATOR ||
 				!names_it(((DefineStmt *) node)->defnames, schema, here))
@@ -4232,19 +4699,33 @@ check_collations_are_free(const WsObject *objs, int n, const char *schema)
 		else if (objs[i].kind == WS_OBJ_OPFAMILY)
 			sql = "SELECT 1 FROM pg_opfamily o JOIN pg_am a ON a.oid = o.opfmethod WHERE o.opfname = $1::name "
 				"AND o.opfnamespace = 'pg_catalog'::regnamespace AND quote_ident(a.amname) = $2";
+		else if (is_function(objs[i].kind))
+			sql = "SELECT 1 FROM pg_proc WHERE proname = $1::name AND pronamespace = 'pg_catalog'::regnamespace";
+		else if (objs[i].kind == WS_OBJ_OPERATOR)
+			sql = "SELECT 1 FROM pg_operator WHERE oprname = $1::name AND oprnamespace = 'pg_catalog'::regnamespace";
+		else if (objs[i].kind == WS_OBJ_TSPARSER)
+			sql = "SELECT 1 FROM pg_ts_parser WHERE prsname = $1::name AND prsnamespace = 'pg_catalog'::regnamespace";
+		else if (objs[i].kind == WS_OBJ_TSTEMPLATE)
+			sql = "SELECT 1 FROM pg_ts_template WHERE tmplname = $1::name AND tmplnamespace = 'pg_catalog'::regnamespace";
+		else if (objs[i].kind == WS_OBJ_TSDICT)
+			sql = "SELECT 1 FROM pg_ts_dict WHERE dictname = $1::name AND dictnamespace = 'pg_catalog'::regnamespace";
+		else if (objs[i].kind == WS_OBJ_TSCONFIG)
+			sql = "SELECT 1 FROM pg_ts_config WHERE cfgname = $1::name AND cfgnamespace = 'pg_catalog'::regnamespace";
 		else
 			continue;
 		here = name_here(&objs[i], objs[i].name);
 		method = objs[i].args != NULL ? ws_text_from_utf8(objs[i].args) : "";
 		params[0] = here;
 		params[1] = method;
-		WsSql->read(sql, objs[i].kind == WS_OBJ_COLLATION ? 1 : 2, params, &rows);
+		WsSql->read(sql, objs[i].kind == WS_OBJ_OPCLASS || objs[i].kind == WS_OBJ_OPFAMILY ? 2 : 1, params, &rows);
 		if (rows.nrows > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("%s \"%s\" of schema \"%s\" is named as one in this server's catalogs, which what uses it would be taken to mean",
 							objs[i].kind == WS_OBJ_COLLATION ? "collation" :
-							objs[i].kind == WS_OBJ_OPCLASS ? "operator class" : "operator family",
+							objs[i].kind == WS_OBJ_OPCLASS ? "operator class" :
+							objs[i].kind == WS_OBJ_OPFAMILY ? "operator family" :
+							is_function(objs[i].kind) ? "function" : objs[i].kind == WS_OBJ_OPERATOR ? "operator" : "text search object",
 							here, schema)));
 		ws_sql_rows_free(&rows);
 		pfree(here);
@@ -4271,7 +4752,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 	for (int i = 0; i < n; i++)
 		if (ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind) &&
 			objs[i].kind != WS_OBJ_CAST && objs[i].kind != WS_OBJ_COLLATION && objs[i].kind != WS_OBJ_CONVERSION &&
-			!is_of_operators(objs[i].kind))
+			!is_of_operators(objs[i].kind) && !is_of_text_search(objs[i].kind) && objs[i].kind != WS_OBJ_STATISTICS)
 			ws_schema_check_defaults(schema, is_function(objs[i].kind) ? DEFACLOBJ_FUNCTION :
 									 is_relation(objs[i].kind) ? DEFACLOBJ_RELATION :
 									 objs[i].kind == WS_OBJ_SEQUENCE ? DEFACLOBJ_SEQUENCE : DEFACLOBJ_TYPE);

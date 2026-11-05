@@ -776,6 +776,9 @@ RETURNS void STRICT AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_ws_obj_restore_opclass(name text, schema text)
 RETURNS void STRICT AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION test_ws_obj_restore_named(kind text, name text, schema text)
+RETURNS void STRICT AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_ws_obj_copy(from_schema text, to_schema text, which text DEFAULT 'both')
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -59,6 +59,13 @@ typedef enum WsObjectKind
 	WS_OBJ_OPCLASS,				/* its access method as its args, as of the next two */
 	WS_OBJ_OPFAMILY,
 	WS_OBJ_OPMEMBERS,			/* what a family holds outside any class */
+	WS_OBJ_AGGREGATE,			/* its input types as its args, as a function's */
+	WS_OBJ_TSPARSER,
+	WS_OBJ_TSTEMPLATE,
+	WS_OBJ_TSDICT,
+	WS_OBJ_TSCONFIG,
+	WS_OBJ_TSMAP,				/* a configuration's mapping of one token, as its args */
+	WS_OBJ_STATISTICS,
 	WS_OBJ_DEFAULT,				/* a view column's: its name, and its view */
 	WS_OBJ_DOMAIN,
 	WS_OBJ_FUNCTION,
