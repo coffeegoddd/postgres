@@ -1331,6 +1331,15 @@ $node->safe_psql('postgres', q{
 		SERIALFUNC = numeric_avg_serialize, DESERIALFUNC = numeric_avg_deserialize);
 	CREATE FUNCTION fx(integer, anyelement) RETURNS anyelement LANGUAGE sql IMMUTABLE AS 'SELECT $2';
 	CREATE AGGREGATE mx(anyelement) (SFUNC = int4pl_any, STYPE = integer, FINALFUNC = fx, FINALFUNC_EXTRA, MSFUNC = int4pl_any, MINVFUNC = int4pl_any, MSTYPE = integer, MFINALFUNC = fx, MFINALFUNC_EXTRA);
+	CREATE TYPE ev AS ENUM ('a'); CREATE TYPE cv AS (x integer); CREATE DOMAIN dv AS integer;
+	CREATE FUNCTION sfe(ev, integer) RETURNS ev LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE FUNCTION sfc(cv, integer) RETURNS cv LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE FUNCTION sfd(dv, integer) RETURNS dv LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE AGGREGATE first_enum(integer) (SFUNC = sfe, STYPE = ev, INITCOND = 'a');
+	CREATE AGGREGATE first_comp(integer) (SFUNC = sfc, STYPE = cv, INITCOND = '(0)');
+	CREATE AGGREGATE first_dom(integer) (SFUNC = sfd, STYPE = dv, INITCOND = '0');
+	CREATE FUNCTION sfself(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE AGGREGATE sfself(integer) (SFUNC = sfself, STYPE = integer);
 	CREATE AGGREGATE star(*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 	CREATE AGGREGATE poly(anycompatible) (SFUNC = array_append, STYPE = anycompatiblearray, INITCOND = '{}');
 	CREATE AGGREGATE ordered(float8 ORDER BY anyelement) (SFUNC = ordered_set_transition, STYPE = internal, FINALFUNC = percentile_disc_final, FINALFUNC_EXTRA, FINALFUNC_MODIFY = READ_WRITE);
@@ -1349,6 +1358,8 @@ my %ag_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, 
 ok($ag_val{$_}, "$_ is held") for ('aggregate/full_one(integer)', 'aggregate/moving(integer)', 'aggregate/star()', 'aggregate/poly(anycompatible)',
 	'aggregate/ordered(double precision, anyelement)', 'aggregate/hypo("any")');
 like($ag_val{'aggregate/star()'}, qr/\(\*\) \(SFUNC = int8inc/, 'an aggregate of no arguments says so');
+like($ag_val{'aggregate/first_enum(integer)'}, qr/INITCOND = 'a'/, 'a first state of a type of its own is held');
+like($ag_val{'aggregate/sfself(integer)'}, qr/SFUNC = sfself/, 'and an aggregate named as its function');
 like($ag_val{'aggregate/ser(numeric)'}, qr/SERIALFUNC = numeric_avg_serialize, DESERIALFUNC = numeric_avg_deserialize/, 'and says how to serialize');
 like($ag_val{'aggregate/mx(anyelement)'}, qr/MFINALFUNC_EXTRA/, 'and what a moving final function takes');
 like($ag_val{'aggregate/ordered(double precision, anyelement)'}, qr/ORDER BY anyelement/, 'and one of order');
@@ -1395,7 +1406,9 @@ $node->safe_psql('postgres', q{
 	CREATE TEXT SEARCH DICTIONARY thes (TEMPLATE = thesaurus, DictFile = thesaurus_sample, Dictionary = english_stem);
 	CREATE TABLE uses (a text); ALTER TABLE uses OWNER TO g_tsowner;
 	CREATE VIEW v AS SELECT to_tsvector('cfg'::regconfig, a) AS x FROM uses; ALTER VIEW v OWNER TO g_tsowner;
-	CREATE DOMAIN d AS text CHECK (to_tsvector('cfg'::regconfig, VALUE) IS NOT NULL);
+	CREATE DOMAIN d AS text CHECK (to_tsvector('cfg'::regconfig, VALUE) <> ''::tsvector);
+	CREATE FUNCTION sfd(d, integer) RETURNS d LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE AGGREGATE checked(integer) (SFUNC = sfd, STYPE = d, INITCOND = 'run');
 	COMMENT ON TEXT SEARCH DICTIONARY dict IS 'd'; COMMENT ON TEXT SEARCH CONFIGURATION cfg IS 'c';
 });
 my $ts_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ts')});
@@ -1407,6 +1420,7 @@ like($ts_val{'tsconfig/cfg'}, qr/tsparser\/prs/, 'a configuration needs its pars
 like($ts_val{'tsparser/prs'}, qr/HEADLINE = prsd_headline/, 'a parser says how it makes a headline');
 like($ts_val{'view/v'}, qr/tsconfig\/cfg/, 'a view needs a configuration');
 like($ts_val{'domain/d'}, qr/tsconfig\/cfg/, 'as does a domain');
+like($ts_val{'domain/d'}, qr/tsmap\/cfg\(asciiword\)/, 'and its mappings, for what a check of it finds');
 like($ts_val{'tsconfig/cfg'}, qr/tsdict\/dict/, 'and its dictionaries');
 like($ts_val{'tsmap/cfg(asciiword)'}, qr/ADD MAPPING FOR asciiword WITH dict, "Odd Dict"/, 'a mapping says them in order');
 like($ts_val{'tsmap/cfg(host)'}, qr/WITH simple/, 'and those of the catalogs');
@@ -1451,11 +1465,15 @@ $node->safe_psql('postgres', q{CREATE FUNCTION public.ag_else(integer, integer) 
 for my $case (
 	[ q{CREATE AGGREGATE a(integer) (SFUNC = public.ag_else, STYPE = integer)}, 'another schema' ],
 	[ q{CREATE FUNCTION sf(integer, anyelement) RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE FUNCTION sf(integer, integer) RETURNS integer LANGUAGE sql AS 'SELECT 2'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = integer)}, 'has overloads' ],
-	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, INITCOND = 'ka5.t')}, "say a schema's name" ],
-	[ q{CREATE TABLE t (a integer); CREATE TYPE hr AS (r regclass); CREATE FUNCTION sf(hr, integer) RETURNS hr LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = hr, INITCOND = '(ka5.t)')}, "say a schema's name" ],
+	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, INITCOND = 'ka5.t')}, 'its first state is a name' ],
+	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, INITCOND = 't')}, 'its first state is a name' ],
+	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, MSFUNC = sf, MINVFUNC = sf, MSTYPE = regclass, MINITCOND = 't')}, 'its first state is a name' ],
+	[ q{CREATE TABLE t (a integer); CREATE TYPE hr AS (r regclass); CREATE FUNCTION sf(hr, integer) RETURNS hr LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = hr, INITCOND = '(ka5.t)')}, 'hold names' ],
 	[ q{CREATE TEXT SEARCH DICTIONARY sub (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY th (TEMPLATE = thesaurus, DictFile = thesaurus_sample, Dictionary = sub)}, 'its dictionary option' ],
 	[ q{CREATE TEXT SEARCH DICTIONARY sub (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY th (TEMPLATE = thesaurus, DictFile = thesaurus_sample, Dictionary = 'ka5.sub')}, 'its dictionary option' ],
-	[ q{CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); CREATE TABLE t (a text, v tsvector); CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, 'ka5.c', a)}, 'says this schema' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); CREATE TABLE t (a text, v tsvector); CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, 'ka5.c', a)}, 'not one in the catalogs' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); CREATE TABLE t (a text, v tsvector); CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, '"ka5".c', a)}, 'not one in the catalogs' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); CREATE TABLE t (a text, v tsvector); CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, 'ka5 . c', a)}, 'not one in the catalogs' ],
 	[ q{CREATE TYPE h AS (r regclass); CREATE TABLE t (a text, b integer); CREATE STATISTICS s ON (('(ka5.t)'::h)::text || a), b FROM t}, 'hold names' ],
 	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE AGGREGATE a(ka5."date") (SFUNC = enum_larger, STYPE = ka5."date")}, "say a schema's name" ],
 	[ q{CREATE TEXT SEARCH DICTIONARY simple (TEMPLATE = simple)}, 'as one in the catalogs' ],

@@ -1210,6 +1210,7 @@ function_key(const char *schema, Oid oid, Buf *key)
 }
 
 static char *print_type(const char *schema, Oid typid, int32 typmod);
+static void add_dep(WsObject *o, Buf *key);
 static char *printed_or_retry(const char *schema, char *printed);
 
 /* An operator's input types as printed, NONE for what it has not. */
@@ -1342,6 +1343,26 @@ read_deps_of(WsObject *o, const char *schema, const char *oid, const char *sourc
 	}
 	if (o->ndeps > 1)
 		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
+
+	/* (what is made may be checked as it is, so a configuration must be whole by then) */
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_sql_value(&rows, i, 0)[0] == 'Z')
+		{
+			const char *map_params[2] = {ws_sql_value(&rows, i, 1), schema};
+			WsSqlRows	maps;
+
+			WsSql->read("SELECT DISTINCT t.alias FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace "
+						"JOIN pg_ts_config_map m ON m.mapcfg = c.oid JOIN ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype "
+						"WHERE c.cfgname = $1::name AND n.nspname = $2::name", 2, map_params, &maps);
+			for (int m = 0; m < maps.nrows; m++)
+			{
+				Buf			key = BUF_INIT;
+
+				ws_obj_key(WS_OBJ_TSMAP, ws_name_to_utf8(ws_sql_value(&rows, i, 1)), ws_name_to_utf8(ws_sql_value(&maps, m, 0)), &key);
+				add_dep(o, &key);
+			}
+			ws_sql_rows_free(&maps);
+		}
 	ws_sql_rows_free(&rows);
 }
 
@@ -2912,8 +2933,8 @@ read_statistics(const char *schema, WsObject *objs, int *n)
 static const char *const trigger_refusal_sql =
 "SELECT g.tgname::text, CASE "
 "  WHEN EXISTS (SELECT 1 FROM pg_proc f WHERE f.oid = g.tgfoid AND f.proname = 'tsvector_update_trigger' AND f.pronamespace = 'pg_catalog'::regnamespace) "
-"      AND starts_with(lower(split_part(encode(g.tgargs, 'escape'), '\\000', 2)), lower(quote_ident(n.nspname) || '.')) "
-"    THEN 'its text search configuration, which it must qualify, says this schema' "
+"      AND split_part(encode(g.tgargs, 'escape'), '\\000', 2) !~* '^\\s*\"?pg_catalog\"?\\s*\\.' "
+"    THEN 'its text search configuration, which it must qualify, is not one in the catalogs' "
 "  WHEN g.tgconstrrelid <> 0 AND NOT EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = g.tgconstrrelid AND q.relkind IN ('r', 'p')) "
 "    THEN 'it is a constraint trigger from what is no table' "
 OF_TABLE_NEEDS("pg_trigger", "g.oid")
@@ -3430,23 +3451,26 @@ static const char *const aggregate_refusal_sql =
 "  unnest(ARRAY[a.aggtransfn, a.aggfinalfn, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, a.aggminvtransfn, a.aggmfinalfn]::oid[]) u(fn) "
 "JOIN pg_proc f ON f.oid = u.fn "
 "WHERE n.nspname = $1::name AND EXISTS (SELECT 1 FROM pg_proc x WHERE x.proname = f.proname AND x.pronamespace = f.pronamespace "
-"  AND x.oid <> f.oid AND f.pronamespace <> 'pg_catalog'::regnamespace) ORDER BY 1";
+"  AND x.oid <> f.oid AND x.prokind <> 'a' AND f.pronamespace <> 'pg_catalog'::regnamespace) ORDER BY 1";
 
-/* Refuses a first state of a reg* type that says a schema, as a cast of it to one would. */
+/*
+ * Refuses a first state of a reg* type: read when the aggregate is made, so before what it
+ * names may be, and saying its schema if it has to.  What holds one is refused as a constant.
+ */
 static void
 check_first_state(const char *schema, const char *name, const char *state, Oid type)
 {
-	List	   *parsed;
-	NamesSchema n = {NULL, NULL};
+	char	   *typname;
 
-	if (state == NULL)
+	if (state == NULL || get_typtype(type) != TYPTYPE_BASE || type >= FirstUnpinnedObjectId)
 		return;
-	parsed = raw_parser(psprintf("SELECT %s::%s", quote_literal_cstr(state), format_type_be(type)), RAW_PARSE_DEFAULT);
-	if (names_schema_walker(linitial_node(RawStmt, parsed)->stmt, &n))
+	typname = format_type_be(type);
+	if (strncmp(typname, "reg", 3) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: %s", name, schema,
-						n.why ? n.why : "it must say a schema's name, as what it means has a name something else hides")));
+				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: its first state is a name, which may not be made yet",
+						name, schema)));
+	pfree(typname);
 }
 
 /* What follows an aggregate's name: its arguments, and what it is made of. */
