@@ -157,7 +157,7 @@ my $i = 0;
 for my $step (@steps)
 {
 	my $from = $i++;
-	$script .= qq{\n\\echo =====$i\nSET ROLE g_diff;\n$step->[1];\nRESET ROLE;\nSELECT test_ws_root_capture('s') AS r$i \\gset\nSELECT test_ws_diff(:'r$from', :'r$i');\n};
+	$script .= qq{\n\\echo =====$i\nSET ROLE g_diff;\n$step->[1];\nRESET ROLE;\nSELECT test_ws_root_capture('s') AS r$i \\gset\nSELECT test_ws_diff(:'r$from', :'r$i');\nCREATE SCHEMA d$i VERSIONED;\nSELECT test_ws_root_restore(:'r$i', 'd$i') IS NULL AS made \\gset\nSELECT 'restores to itself ' || (test_ws_root_capture('d$i') = :'r$i');\n};
 }
 my $out = $node->safe_psql('postgres', $script);
 my %said;
@@ -178,6 +178,7 @@ for my $step (@steps)
 	  grep { /^(object|foreign key|sequence|role|table|column|key|constraint|index|data|rows|rewritten) / } @{ $said{$i} };
 	my @wanted = sort grep { !/^data \S+ same$/ && !/^rows \S+ \+0 -0 ~0$/ } @$want;
 	is_deeply(\@said, \@wanted, $name) or diag(join("\n", 'it said:', @said));
+	ok((grep { $_ eq 'restores to itself true' } @{ $said{$i} }), "$name: restores to itself");
 }
 
 # a root against itself has every table's lines, and nothing changed
