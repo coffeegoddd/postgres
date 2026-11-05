@@ -1465,6 +1465,8 @@ $node->safe_psql('postgres', q{CREATE FUNCTION public.ag_else(integer, integer) 
 for my $case (
 	[ q{CREATE AGGREGATE a(integer) (SFUNC = public.ag_else, STYPE = integer)}, 'another schema' ],
 	[ q{CREATE FUNCTION sf(integer, anyelement) RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE FUNCTION sf(integer, integer) RETURNS integer LANGUAGE sql AS 'SELECT 2'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = integer)}, 'has overloads' ],
+	[ q{CREATE FUNCTION sf(integer, anyelement) RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE AGGREGATE z(integer) (SFUNC = sf, STYPE = integer); CREATE FUNCTION aa0(integer, integer, integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE AGGREGATE sf(integer, integer) (SFUNC = aa0, STYPE = integer)}, 'has overloads' ],
+	[ q{CREATE TABLE t (a integer); CREATE TYPE rr AS RANGE (SUBTYPE = regclass, SUBTYPE_OPCLASS = oid_ops); CREATE FUNCTION sf(rr, integer) RETURNS rr LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = rr, INITCOND = '[ka5.t,ka5.t]')}, 'hold names' ],
 	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, INITCOND = 'ka5.t')}, 'its first state is a name' ],
 	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, INITCOND = 't')}, 'its first state is a name' ],
 	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, MSFUNC = sf, MINVFUNC = sf, MSTYPE = regclass, MINITCOND = 't')}, 'its first state is a name' ],
@@ -1529,6 +1531,19 @@ for my $change ([ 'ts', q{COMMENT ON TEXT SEARCH PARSER ts.prs IS 'later'} ], [ 
 	like($old->{stderr}, qr/has changed since/, "to try again after: $sql");
 	$old->quit;
 }
+
+# a trigger's configuration may be one in the catalogs, however it says so
+for my $arg ('pg_catalog.english', 'PG_CATALOG.english', 'pg_catalog . english', '"pg_catalog".english')
+{
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS tgc CASCADE; CREATE SCHEMA tgc; SET search_path = tgc; CREATE TABLE t (a text, v tsvector);
+		CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, '$arg', a)});
+	like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('tgc')}), qr/^trigger\/g\(t\)\t/m, "a trigger on $arg is held");
+}
+$node->safe_psql('postgres', q{DROP SCHEMA tgc CASCADE; CREATE SCHEMA "PG_CATALOG"; SET search_path = "PG_CATALOG"; CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); CREATE TABLE t (a text, v tsvector);
+	CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, '"PG_CATALOG".c', a)});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('PG_CATALOG')});
+like($err, qr/not one in the catalogs/, 'and not a schema named so in another case');
+$node->safe_psql('postgres', q{DROP SCHEMA "PG_CATALOG" CASCADE});
 
 # what the catalogs hold is each server's, so what capture found free may not be free
 $node->safe_psql('postgres', q{CREATE SCHEMA nf; SET allow_system_table_mods = on;

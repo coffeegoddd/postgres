@@ -2933,7 +2933,7 @@ read_statistics(const char *schema, WsObject *objs, int *n)
 static const char *const trigger_refusal_sql =
 "SELECT g.tgname::text, CASE "
 "  WHEN EXISTS (SELECT 1 FROM pg_proc f WHERE f.oid = g.tgfoid AND f.proname = 'tsvector_update_trigger' AND f.pronamespace = 'pg_catalog'::regnamespace) "
-"      AND split_part(encode(g.tgargs, 'escape'), '\\000', 2) !~* '^\\s*\"?pg_catalog\"?\\s*\\.' "
+"      AND split_part(encode(g.tgargs, 'escape'), '\\000', 2) !~ '^\\s*(\"pg_catalog\"|[pP][gG]_[cC][aA][tT][aA][lL][oO][gG])\\s*\\.' "
 "    THEN 'its text search configuration, which it must qualify, is not one in the catalogs' "
 "  WHEN g.tgconstrrelid <> 0 AND NOT EXISTS (SELECT 1 FROM pg_class q WHERE q.oid = g.tgconstrrelid AND q.relkind IN ('r', 'p')) "
 "    THEN 'it is a constraint trigger from what is no table' "
@@ -3451,7 +3451,7 @@ static const char *const aggregate_refusal_sql =
 "  unnest(ARRAY[a.aggtransfn, a.aggfinalfn, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, a.aggminvtransfn, a.aggmfinalfn]::oid[]) u(fn) "
 "JOIN pg_proc f ON f.oid = u.fn "
 "WHERE n.nspname = $1::name AND EXISTS (SELECT 1 FROM pg_proc x WHERE x.proname = f.proname AND x.pronamespace = f.pronamespace "
-"  AND x.oid <> f.oid AND x.prokind <> 'a' AND f.pronamespace <> 'pg_catalog'::regnamespace) ORDER BY 1";
+"  AND x.oid <> f.oid AND x.oid <> a.aggfnoid AND f.pronamespace <> 'pg_catalog'::regnamespace) ORDER BY 1";
 
 /*
  * Refuses a first state of a reg* type: read when the aggregate is made, so before what it
