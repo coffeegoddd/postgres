@@ -5428,13 +5428,20 @@ constraint_cmp(const void *a, const void *b)
 typedef void (*ExprVisitor) (const char *key, char **text, void *arg);
 
 static void
-visit_index_exprs(const char *table, const char *what, WsIndex *ix, ExprVisitor visit, void *arg)
+visit_index_exprs(const char *prefix, const char *what, const char *name, WsIndex *ix, ExprVisitor visit, void *arg)
 {
 	for (int k = 0; k < ix->nkeys; k++)
 		if (ix->keys[k].expr != NULL)
-			visit(psprintf("table/%s/%s/%s/key/%d", table, what, ix->name, k), &ix->keys[k].expr, arg);
+			visit(psprintf("%s%s/%s/key/%d", prefix, what, name, k), &ix->keys[k].expr, arg);
 	if (ix->predicate != NULL)
-		visit(psprintf("table/%s/%s/%s/predicate", table, what, ix->name), &ix->predicate, arg);
+		visit(psprintf("%s%s/%s/predicate", prefix, what, name), &ix->predicate, arg);
+}
+
+/* What the keys of a table's expressions begin with: its name's length tells it from another's. */
+static char *
+expr_key_prefix(const WsTableSchema *s)
+{
+	return psprintf("table/%zu:%s/", strlen(s->name), s->name);
 }
 
 /*
@@ -5444,25 +5451,28 @@ visit_index_exprs(const char *table, const char *what, WsIndex *ix, ExprVisitor 
 static void
 visit_exprs(WsTableSchema *s, ExprVisitor visit, void *arg)
 {
+	char	   *prefix = expr_key_prefix(s);
+
 	for (int i = 0; i < s->ncols; i++)
 		if (s->cols[i].def != NULL)
-			visit(psprintf("table/%s/def/" UINT64_FORMAT, s->name, s->cols[i].tag), &s->cols[i].def, arg);
+			visit(psprintf("%sdef/" UINT64_FORMAT, prefix, s->cols[i].tag), &s->cols[i].def, arg);
 	for (int i = 0; i < s->nconstraints; i++)
 	{
 		WsConstraint *c = &s->constraints[i];
 
 		if (c->kind == WS_CONSTRAINT_CHECK)
-			visit(psprintf("table/%s/check/%s", s->name, c->name), &c->expr, arg);
+			visit(psprintf("%scheck/%s", prefix, c->name), &c->expr, arg);
 		else if (c->kind == WS_CONSTRAINT_EXCLUSION)
-			visit_index_exprs(s->name, "exclusion", &c->excl, visit, arg);
+			visit_index_exprs(prefix, "exclusion", c->name, &c->excl, visit, arg);
 	}
 	for (int i = 0; i < s->nindexes; i++)
-		visit_index_exprs(s->name, "index", &s->indexes[i], visit, arg);
+		visit_index_exprs(prefix, "index", s->indexes[i].name, &s->indexes[i], visit, arg);
 	for (int k = 0; k < s->npartition; k++)
 		if (s->partition_keys[k].expr != NULL)
-			visit(psprintf("table/%s/partition/%d", s->name, k), &s->partition_keys[k].expr, arg);
+			visit(psprintf("%spartition/%d", prefix, k), &s->partition_keys[k].expr, arg);
 	if (s->partition_bound != NULL)
-		visit(psprintf("table/%s/bound", s->name), &s->partition_bound, arg);
+		visit(psprintf("%sbound", prefix), &s->partition_bound, arg);
+	pfree(prefix);
 }
 
 typedef struct HoldExprs
@@ -5523,14 +5533,21 @@ ws_schema_remember(const WsTableSchema *s, const char *schema)
 	{
 		ListCell   *nk;
 		ListCell   *nx;
+		bool		found = false;
 
 		forboth(nk, now.keys, nx, now.texts)
 			if (strcmp(lfirst(k), lfirst(nk)) == 0)
 			{
 				if (strcmp(lfirst(x), lfirst(nx)) != 0)
 					WsPrints->remember(schema, lfirst(k), lfirst(nx), lfirst(x));
+				found = true;
 				break;
 			}
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("table \"%s\" has no %s yet: it is to be remembered once all of it is made",
+							s->name, (char *) lfirst(k))));
 	}
 	CommandCounterIncrement();
 	ws_schema_free(&read);
@@ -5881,15 +5898,16 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&key);
 	ws_sql_rows_free(&others);
 	ws_sql_rows_free(&idxs);
-	PopActiveSnapshot();
 	check_record_says_no_schema(out, ws_text_to_utf8(schema), schema, table);
 	{
+		/* (at the snapshot the record is of, or what it read may not be what they say) */
 		HoldExprs	h;
 
-		h.entries = WsPrints->load(schema, psprintf("table/%s/", out->name), &h.n);
+		h.entries = WsPrints->load(schema, expr_key_prefix(out), &h.n);
 		if (h.n > 0)
 			visit_exprs(out, hold_expr, &h);
 	}
+	PopActiveSnapshot();
 	WsSql->end(level);
 	return true;
 }

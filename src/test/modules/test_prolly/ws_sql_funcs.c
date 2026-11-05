@@ -626,9 +626,6 @@ test_ws_schema_remember(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_ws_obj_copy(from_schema text, to_schema text, which text) returns void: makes
- * the objects of the one in the other, through their bytes: those that go 'before'
- * tables, 'after', or 'both'
  * test_ws_obj_copy(from_schema text, to_schema text, which text, remember bool) returns
  * void: makes the objects of the one in the other, through their bytes: those that go
  * 'before' tables, 'after', or 'both'; and, once all are made, remembers what they print.

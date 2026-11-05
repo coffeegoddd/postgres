@@ -2253,14 +2253,17 @@ is( $node->safe_psql('postgres', q{SELECT o.opcnamespace::regnamespace FROM pg_i
 # a table's expressions read as the commit once restored, each by itself
 $node->safe_psql('postgres', q{CREATE SCHEMA tp_src VERSIONED; CREATE SCHEMA tp_dst VERSIONED;
 	CREATE TABLE tp_src.t (v varchar(10), i integer, w varchar(10) DEFAULT 'a', x boolean GENERATED ALWAYS AS (v IN ('a', 'b')) STORED,
-		d text DEFAULT ('a'::varchar IN ('a', 'b'))::text, e integer DEFAULT -1::int, f integer DEFAULT 5,
+		d text DEFAULT ('k8'::varchar IN ('k8', 'k9'))::text, e integer DEFAULT -1::int, f integer DEFAULT 5,
 		CONSTRAINT c1 CHECK (v IN ('k1', 'k2')), CONSTRAINT c2 CHECK (i BETWEEN 1 AND 2 AND v = 'a'), CONSTRAINT c3 CHECK (i > 0),
-		CONSTRAINT xc EXCLUDE USING btree (v WITH =) WHERE (v IN ('a', 'b')));
+		CONSTRAINT xc EXCLUDE USING btree (v WITH =) WHERE (v IN ('a', 'b')),
+		CONSTRAINT xd EXCLUDE USING btree (i WITH =) WHERE (v IN ('c', 'd')));
 	CREATE INDEX tp_p ON tp_src.t (v) WHERE v IN ('a', 'b');
 	CREATE INDEX tp_e ON tp_src.t ((v IN ('a', 'b')));
-	CREATE TABLE tp_src.pt (v varchar(10)) PARTITION BY LIST ((v IN ('a', 'b')));});
+	CREATE TABLE tp_src.pt (v varchar(10)) PARTITION BY LIST ((v IN ('a', 'b')));
+	CREATE TABLE tp_src."a" (v varchar(10), CONSTRAINT "check/y" CHECK (v IN ('s1', 's2')));
+	CREATE TABLE tp_src."a/check" (v varchar(10), CONSTRAINT y CHECK (v IN ('s3', 's4')));});
 my %tp_was;
-for my $table ('t', 'pt')
+for my $table ('t', 'pt', 'a', 'a/check')
 {
 	$tp_was{$table} = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('tp_src', '$table'), 'hex')});
 	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$tp_was{$table}', 'hex'), 'tp_dst');
@@ -2268,10 +2271,17 @@ for my $table ('t', 'pt')
 		SELECT test_ws_schema_remember(decode('$tp_was{$table}', 'hex'), 'tp_dst')});
 	is($node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('tp_dst', '$table'), 'hex')}), $tp_was{$table}, "$table is the same bytes restored");
 }
+# (both still, as one's keys are not the other's)
+is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 'a'), 'hex')}), $tp_was{a}, 'a name with a slash takes nothing of another table');
+# remembered again, it reads the same, having forgotten what it knew
+$node->safe_psql('postgres', qq{SELECT test_ws_schema_remember(decode('$tp_was{t}', 'hex'), 'tp_dst')});
+is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 't'), 'hex')}), $tp_was{t}, 'remembered again it reads the same');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/exclusion/xd/predicate'}), '1', 'each exclusion has its own');
 my $tp_rows = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace});
 cmp_ok($tp_rows, '>=', 8, 'what printed otherwise is remembered, by each expression');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/check/c3'}), '0', 'and what did not is not');
-like($node->safe_psql('postgres', q{SELECT string_agg(prtkey, ' ') FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace}), qr{/check/c1 .*/exclusion/.*/index/.*/partition/}, 'of each kind');
+my $tp_keys = $node->safe_psql('postgres', q{SELECT string_agg(prtkey, ' ') FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace});
+like($tp_keys, qr{$_}, "with a key of $_") for ('/def/', '/check/c1', '/exclusion/xc/predicate', '/index/tp_p/predicate', '/index/tp_e/key/0', '/partition/0');
 my $tp_held_check = $node->safe_psql('postgres', q{SELECT prtheld FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/check/c1'});
 my $tp_in_bytes = sub { $node->safe_psql('postgres', qq{SELECT position(convert_to(\$q\$$tp_held_check\$q\$, 'UTF8') in test_ws_schema_bytes('tp_dst', 't')) > 0}) };
 is($tp_in_bytes->(), 't', 'a check reads as held');
@@ -2281,6 +2291,11 @@ is($tp_in_bytes->(), 't', 'adding a column leaves the check as held');
 $node->safe_psql('postgres', q{ALTER TABLE tp_dst.t RENAME COLUMN w TO w2});
 is($tp_in_bytes->(), 't', 'as does renaming another column');
 is($node->safe_psql('postgres', q{SELECT position('''a''::character varying'::bytea in test_ws_schema_bytes('tp_dst', 't')) > 0}), 't', 'and the renamed column keeps its default');
+my $tp_held_default = $node->safe_psql('postgres', q{SELECT prtheld FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtheld LIKE '%k8%'});
+isnt($tp_held_default, '', 'a default that printed otherwise is remembered');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t RENAME COLUMN d TO d2});
+is($node->safe_psql('postgres', qq{SELECT position(convert_to(\$q\$$tp_held_default\$q\$, 'UTF8') in test_ws_schema_bytes('tp_dst', 't')) > 0}), 't', 'and keeps it, by its tag, when it is renamed');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t RENAME COLUMN d2 TO d});
 $node->safe_psql('postgres', q{ALTER TABLE tp_dst.t RENAME COLUMN v TO v2});
 is($tp_in_bytes->(), 't', 'or even a column it uses, which it holds by its tag');
 $node->safe_psql('postgres', q{ALTER TABLE tp_dst.t DROP CONSTRAINT c1; ALTER TABLE tp_dst.t ADD CONSTRAINT c1 CHECK (v2 IN ('k1', 'k3'))});
@@ -2294,7 +2309,24 @@ $node->safe_psql('postgres', q{ALTER TABLE tp_dst.t ADD CONSTRAINT c9 CHECK (v I
 $node->safe_psql('postgres', q{SET allow_system_table_mods = on; DELETE FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace});
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace}), '0', 'none are left');
 is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 'pt'), 'hex')}) ne $tp_was{pt} ? 't' : 'f', 't', 'lost, what it was for reads as printed');
-$node->safe_psql('postgres', q{DROP SCHEMA tp_src CASCADE; DROP SCHEMA tp_dst CASCADE});
+# remembered before it is all made is an error, as it would not read as its commit for good
+$node->safe_psql('postgres', q{CREATE SCHEMA tp_late VERSIONED; CREATE TABLE tp_src.late (v varchar(10)); ALTER TABLE tp_src.late ADD CONSTRAINT nv CHECK (v IN ('a', 'b')) NOT VALID});
+my $tp_late = $node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_src', 'late'), 'hex')});
+$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$tp_late', 'hex'), 'tp_late'); SELECT test_ws_schema_set_tags(decode('$tp_late', 'hex'), 'tp_late')});
+my ($tp_ret, $tp_out, $tp_err) = $node->psql('postgres', qq{SELECT test_ws_schema_remember(decode('$tp_late', 'hex'), 'tp_late')});
+like($tp_err, qr/once all of it is made/, 'remembered before its late check is added, it says so');
+$node->safe_psql('postgres', qq{SELECT test_ws_schema_add_checks(decode('$tp_late', 'hex'), 'tp_late'); SELECT test_ws_schema_remember(decode('$tp_late', 'hex'), 'tp_late')});
+is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_late', 'late'), 'hex')}), $tp_late, 'and after it reads the same');
+# a partition's bound goes through it too
+$node->safe_psql('postgres', q{CREATE TABLE tp_src.pp (v integer) PARTITION BY RANGE (v); CREATE TABLE tp_src.pp1 PARTITION OF tp_src.pp FOR VALUES FROM (1) TO (2)});
+for my $table ('pp', 'pp1')
+{
+	my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('tp_src', '$table'), 'hex')});
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$hex', 'hex'), 'tp_late'); SELECT test_ws_schema_attach(decode('$hex', 'hex'), 'tp_late');
+		SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'tp_late'); SELECT test_ws_schema_remember(decode('$hex', 'hex'), 'tp_late')});
+	is($node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('tp_late', '$table'), 'hex')}), $hex, "$table, attached, reads the same");
+}
+$node->safe_psql('postgres', q{DROP SCHEMA tp_src CASCADE; DROP SCHEMA tp_dst CASCADE; DROP SCHEMA tp_late CASCADE});
 
 $node->stop;
 done_testing();
