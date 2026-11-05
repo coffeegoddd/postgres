@@ -110,7 +110,7 @@ for my $case (@scenarios)
 	SELECT test_ws_root_capture('b$i') AS rb \\gset
 	SELECT test_ws_root_capture('o$i') AS ro \\gset
 	SELECT test_ws_root_capture('t$i') AS rt \\gset
-	SELECT test_ws_merge_checked(:'rb', :'ro', :'rt', ARRAY['o$i', 't$i', 'b$i']) AS merged \\gset
+	SELECT test_ws_merge_checked(:'rb', :'ro', :'rt') AS merged \\gset
 	\\echo =====merge
 	\\echo :merged
 	\\echo =====end
@@ -119,7 +119,7 @@ for my $case (@scenarios)
 	SELECT test_ws_root_refused(:'m') IS NULL;
 	\\echo =====end
 	\\echo =====plain
-	SELECT split_part(test_ws_merge(:'rb', :'ro', :'rt', ARRAY['o$i', 't$i', 'b$i']), E'\\n', 1) = :'m';
+	SELECT split_part(test_ws_merge(:'rb', :'ro', :'rt'), E'\\n', 1) = :'m';
 	\\echo =====end
 	\\echo =====viol
 	SELECT test_ws_violations(:'m');
@@ -169,7 +169,7 @@ my $lines = $node->safe_psql('postgres', q{
 	SET search_path = lo; CREATE TABLE t (id integer PRIMARY KEY, v integer, CONSTRAINT v_ex EXCLUDE USING btree (v WITH =)); ALTER TABLE t ADD CONSTRAINT v_pos CHECK (v > 0); INSERT INTO t VALUES (1, 7);
 	SET search_path = lt; CREATE TABLE t (id integer PRIMARY KEY, v integer, CONSTRAINT v_ex EXCLUDE USING btree (v WITH =)); INSERT INTO t VALUES (2, -7), (3, 7);
 	SET search_path = public;
-	SELECT test_ws_diff(test_ws_root_capture('lo'), split_part(test_ws_merge_checked(test_ws_root_capture('lb'), test_ws_root_capture('lo'), test_ws_root_capture('lt'), ARRAY['lo', 'lt', 'lb']), E'\n', 1));
+	SELECT test_ws_diff(test_ws_root_capture('lo'), split_part(test_ws_merge_checked(test_ws_root_capture('lb'), test_ws_root_capture('lo'), test_ws_root_capture('lt')), E'\n', 1));
 });
 like($lines, qr/^violation added v_pos t 2$/m, 'a row, as diff says it');
 like($lines, qr/^violation added v_ex t$/m, 'a constraint alone, as diff says it');

@@ -22,6 +22,7 @@
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
 #include "prolly/ws/ws_obj.h"
+#include "prolly/ws/ws_restore.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_rows.h"
@@ -43,7 +44,8 @@ typedef struct Merger
 {
 	ProllyCtx  *ctx;
 	const WsEvalRoutine *eval;
-	void	   *eval_arg;
+	void	   *eval_arg;		/* NULL, with eval, until the merged schema is known */
+	bool		schema_only;	/* what each table's record is, its rows left for later */
 	TypesDiffering ours_types;	/* its types and domains otherwise than merged */
 	TypesDiffering theirs_types;
 	TypesDiffering base_types;
@@ -2258,30 +2260,25 @@ merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *b, const
 
 /* ------------------------------------------------- computing, through SQL */
 
-/* Tries a statement in each schema in turn; its one value, or NULL for a null. */
+/* A statement among the merged definitions; its one value, or NULL for a null. */
 static bool
-eval_statement(const WsEvalSchemas *in, const char *sql, int nparams, const char *const *params, char **out)
+eval_statement(const char *schema, const char *sql, int nparams, const char *const *params, char **out)
 {
 	int			level = WsSql->begin();
-	bool		ok = false;
+	int			nest = ws_schema_path_begin(schema);
+	WsSqlRows	rows;
+	WsSqlFailure failure;
+	bool		ok = WsSql->attempt(sql, nparams, params, &rows, &failure);
 
-	for (int i = 0; !ok && i < in->n; i++)
+	if (ok && rows.nrows == 1 && rows.ncols == 1)
 	{
-		int			nest = ws_schema_path_begin(in->schemas[i]);
-		WsSqlRows	rows;
-		WsSqlFailure failure;
+		const char *value = ws_sql_value(&rows, 0, 0);
 
-		ok = WsSql->attempt(sql, nparams, params, &rows, &failure);
-		if (ok && rows.nrows == 1 && rows.ncols == 1)
-		{
-			const char *value = ws_sql_value(&rows, 0, 0);
-
-			*out = value != NULL ? pstrdup(value) : NULL;
-		}
-		else if (ok)
-			ok = false;
-		ws_schema_path_end(nest);
+		*out = value != NULL ? pstrdup(value) : NULL;
 	}
+	else if (ok)
+		ok = false;
+	ws_schema_path_end(nest);
 	WsSql->end(level);
 	return ok;
 }
@@ -2305,27 +2302,22 @@ check_varies(void *arg)
 static bool
 sql_column_default(void *arg, const char *expr, char **out, bool *varies)
 {
-	const WsEvalSchemas *in = arg;
+	const char *schema = arg;
 	char	   *sql = psprintf("SELECT (%s)", ws_text_from_utf8(expr));
 	VariesCheck vc = {sql, false};
 	int			level = WsSql->begin();
-	bool		parsed = false;
+	int			nest = ws_schema_path_begin(schema);
+	WsSqlFailure failure;
+	bool		parsed = WsSql->attempt_fn(check_varies, &vc, &failure);
 
-	for (int i = 0; !parsed && i < in->n; i++)
-	{
-		int			nest = ws_schema_path_begin(in->schemas[i]);
-		WsSqlFailure failure;
-
-		parsed = WsSql->attempt_fn(check_varies, &vc, &failure);
-		ws_schema_path_end(nest);
-	}
+	ws_schema_path_end(nest);
 	WsSql->end(level);
 	*varies = vc.varies;
 	if (!parsed)
 		return false;
 	if (vc.varies)
 		return true;
-	if (!eval_statement(in, sql, 0, NULL, out))
+	if (!eval_statement(schema, sql, 0, NULL, out))
 		return false;
 	if (*out != NULL)
 		*out = pstrdup(ws_text_to_utf8(*out));
@@ -2456,7 +2448,7 @@ keep_one_side(Merger *m, const PHash *from, const char *name, const TypesDifferi
 	if (!WsRoot->get_table(m->ctx, from, name, &rec, &rows))
 		elog(ERROR, "a table listed is not there");
 	read = rows;
-	if (td->n > 0)
+	if (td->n > 0 && !m->schema_only)
 		read_one_side(m, &rec, &rows, rv, td, &read);
 	if (m->nconflicts == before)
 		WsRoot->put_table(m->ctx, rv, &rec, &read, rv);
@@ -2556,8 +2548,10 @@ merge_table(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs
 	{
 		int			before = m->nconflicts;
 
-		merge_rows(m, &merged, has_base ? &sb : NULL, has_base ? &rb : NULL, &so, &ro, &st, &rt,
-				   rv, &rows);
+		rows = ro;
+		if (!m->schema_only)
+			merge_rows(m, &merged, has_base ? &sb : NULL, has_base ? &rb : NULL, &so, &ro, &st, &rt,
+					   rv, &rows);
 		if (m->nconflicts == before)
 			WsRoot->put_table(m->ctx, rv, &merged, &rows, rv);
 	}
@@ -2730,15 +2724,43 @@ check_merged_root(Merger *m, const PHash *rv)
 	}
 }
 
+/* Every table, each once: where it is first of ours, theirs, base. */
+static void
+merge_tables(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs, TableList **lists, PHash *rv)
+{
+	const TableList *lo = lists[0];
+	const TableList *lt = lists[1];
+	const TableList *lb = lists[2];
+
+	for (int s = 0; s < 3; s++)
+	{
+		const TableList *from = lists[s];
+
+		for (int i = 0; i < from->n; i++)
+		{
+			const char *name = from->v[i].name;
+
+			CHECK_FOR_INTERRUPTS();
+			if ((s > 0 && entry_of(lo, name) != NULL) || (s > 1 && entry_of(lt, name) != NULL))
+				continue;
+			merge_table(m, base, ours, theirs, name, entry_of(lb, name), entry_of(lo, name),
+						entry_of(lt, name), rv);
+		}
+	}
+}
+
 static void
 tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs,
-		   const WsEvalRoutine *eval, void *eval_arg, WsMergeResult *out)
+		   const WsEvalRoutine *eval, WsMergeResult *out)
 {
-	Merger		m = {ctx, eval, eval_arg};
+	Merger		m = {ctx};
 	TableList	lb = {0},
 				lo = {0},
 				lt = {0};
+	TableList **lists;
 	PHash		rv = vc_root_empty(ctx);
+	PHash		maps;
+	char	   *definitions = NULL;
 
 	merge_map(&m, base, ours, theirs, WS_ROOT_OBJECTS, "", &rv);
 	m.ours_types = types_differing(&m, ours, &rv);
@@ -2751,25 +2773,35 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 	WsRoot->tables(ctx, base, list_table, &lb);
 	WsRoot->tables(ctx, ours, list_table, &lo);
 	WsRoot->tables(ctx, theirs, list_table, &lt);
-	for (int s = 0; s < 3; s++)
-	{
-		const TableList *from = s == 0 ? &lo : s == 1 ? &lt : &lb;
+	lists = (TableList *[]) {&lo, &lt, &lb};
+	maps = rv;
 
-		for (int i = 0; i < from->n; i++)
-		{
-			const char *name = from->v[i].name;
-
-			CHECK_FOR_INTERRUPTS();
-
-			/* (each once: where it is first of ours, theirs, base) */
-			if ((s > 0 && entry_of(&lo, name) != NULL) || (s > 1 && entry_of(&lt, name) != NULL))
-				continue;
-			merge_table(&m, base, ours, theirs, name, entry_of(&lb, name), entry_of(&lo, name),
-						entry_of(&lt, name), &rv);
-		}
-	}
+	/*
+	 * First what the merged schema is: with no one schema, no value can be worked out,
+	 * so rows wait for that.
+	 */
+	m.schema_only = true;
+	merge_tables(&m, base, ours, theirs, lists, &rv);
 	drop_foreign_keys_of_dropped(&m, &rv);
 	check_merged_root(&m, &rv);
+	if (m.nconflicts == 0 && eval != NULL)
+	{
+		WsSqlFailure failure;
+
+		if (ws_root_definitions_begin(ctx, &rv, &definitions, &failure))
+			conflict(&m, "unapplied", failure.message != NULL ? failure.message : "it was refused");
+		m.eval = eval;
+		m.eval_arg = definitions;
+	}
+	if (m.nconflicts == 0)
+	{
+		m.schema_only = false;
+		rv = maps;
+		merge_tables(&m, base, ours, theirs, lists, &rv);
+		drop_foreign_keys_of_dropped(&m, &rv);
+	}
+	if (definitions != NULL)
+		ws_root_definitions_end(definitions);
 	out->root = rv;
 	out->nconflicts = m.nconflicts;
 	out->conflicts = m.conflicts;

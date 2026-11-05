@@ -76,7 +76,7 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	SELECT test_ws_root_capture('$b') AS rb \\gset
 	SELECT test_ws_root_capture('$o') AS ro \\gset
 	SELECT test_ws_root_capture('$t') AS rt_ \\gset
-	SELECT test_ws_merge_checked(:'rb', :'ro', :'rt_', ARRAY['$o', '$t', '$b']) AS merged \\gset
+	SELECT test_ws_merge_checked(:'rb', :'ro', :'rt_') AS merged \\gset
 	\\echo =====merge
 	\\echo :merged
 	\\echo =====end
@@ -127,7 +127,7 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 }
 }
 
-is($i, 35, 'every scenario ran');
+is($i, 36, 'every scenario ran');
 
 $node->stop;
 done_testing();

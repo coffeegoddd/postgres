@@ -12,8 +12,10 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "commands/user.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type_d.h"
 #include "prolly/branch_catalog.h"
@@ -419,11 +421,12 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
 
 /*
  * Restoring: all of it; with fn, only what restore_rows says, then fn; with no_rows, all
- * of it, each table holding that.
+ * of it, each table holding that, or if definitions_only, what restore_definitions says.
  */
 static void
 restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
-		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows)
+		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows,
+		   bool definitions_only)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -456,7 +459,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 				 errmsg("schema \"%s\" holds something, and a root is restored into one that does not", schema)));
 	ws_sql_rows_free(&rows);
 
-	if (WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
+	if (!definitions_only && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
 	{
 		WsRole	   *held;
 		WsRole	   *was = NULL;
@@ -489,6 +492,14 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	}
 	if (WsRoot->get_map(ctx, root, WS_ROOT_OBJECTS, &map))
 		ws_obj_list(ctx, &map, &objs, &nobjs);
+	if (definitions_only)
+		for (int i = 0; i < nobjs; i++)
+		{
+			objs[i].ncomments = 0;
+			objs[i].ngrants = 0;
+			if (objs[i].owner != NULL && !OidIsValid(get_role_oid(ws_name_from_utf8(objs[i].owner), true)))
+				objs[i].owner = NULL;
+		}
 	ws_obj_restore(objs, nobjs, schema, true);
 
 	tables_in_order(ctx, root, &tables);
@@ -497,16 +508,20 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 		int			i = tables.order[t];
 
 		CHECK_FOR_INTERRUPTS();
-		if (fn != NULL)
+		if (fn != NULL || definitions_only)
 		{
 			WsTableSchema bare;
 
 			bare_record(&tables.recs[i], &bare);
-			make_table(ctx, &bare, &tables.rows[i], schema);
+			if (definitions_only)
+				bare.owner = NULL;
+			make_table(ctx, &bare, no_rows != NULL ? no_rows : &tables.rows[i], schema);
 		}
 		else
 			make_table(ctx, &tables.recs[i], no_rows != NULL ? no_rows : &tables.rows[i], schema);
 	}
+	if (definitions_only)
+		goto done;
 	for (int t = 0; t < tables.n; t++)
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
@@ -599,20 +614,26 @@ done:
 static void
 schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false);
 }
 
 static void
 schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
 					void (*fn) (void *arg, const char *schema), void *arg)
 {
-	restore_as(ctx, root, NULL, schema, fn, arg, NULL);
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false);
 }
 
 static void
 schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false);
+}
+
+static void
+schema_restore_definitions(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
+{
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true);
 }
 
 const WsRootIORoutine SchemaWsRootIO = {
@@ -621,6 +642,7 @@ const WsRootIORoutine SchemaWsRootIO = {
 	.restore = schema_restore,
 	.restore_rows = schema_restore_rows,
 	.restore_statements = schema_restore_statements,
+	.restore_definitions = schema_restore_definitions,
 };
 
 const WsRootIORoutine *WsRootIO = &SchemaWsRootIO;
@@ -634,6 +656,8 @@ typedef struct DryRun
 	void		(*fn) (void *arg, const char *schema);	/* restore_rows, then this */
 	void	   *arg;
 	const PHash *no_rows;		/* restore_statements, with this */
+	char	  **kept;			/* restore_definitions in a schema that stays, named here */
+	MemoryContext cxt;			/* of that name */
 	bool		went_through;
 } DryRun;
 
@@ -670,6 +694,12 @@ dry_run(void *arg)
 	DryRun	   *d = arg;
 	char	   *schema = make_dry_run_schema();
 
+	if (d->kept != NULL)
+	{
+		WsRootIO->restore_definitions(d->ctx, d->root, schema, d->no_rows);
+		*d->kept = MemoryContextStrdup(d->cxt, schema);
+		return;
+	}
 	if (d->fn != NULL)
 		WsRootIO->restore_rows(d->ctx, d->root, schema, d->fn, d->arg);
 	else if (d->no_rows != NULL)
@@ -689,10 +719,12 @@ dry_run_refused(DryRun *dp, WsSqlFailure *failure)
 {
 	DryRun		d = *dp;
 	MemoryContext cxt = CurrentMemoryContext;
+	volatile bool kept = false;
 
+	memset(failure, 0, sizeof(*failure));
 	PG_TRY();
 	{
-		(void) WsSql->attempt_fn(dry_run, &d, failure);
+		kept = WsSql->attempt_fn(dry_run, &d, failure);
 	}
 	PG_CATCH();
 	{
@@ -717,6 +749,8 @@ dry_run_refused(DryRun *dp, WsSqlFailure *failure)
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
+	if (kept)
+		return false;
 	if (d.went_through)
 	{
 		ws_sql_failure_free(failure);
@@ -753,4 +787,25 @@ ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *fail
 	if (prolly_empty(ctx, WS_ROW_VREFS, &no_rows) < 0)
 		prolly_report(ctx);
 	return dry_run_refused(&d, failure);
+}
+
+bool
+ws_root_definitions_begin(ProllyCtx *ctx, const PHash *root, char **schema, WsSqlFailure *failure)
+{
+	PHash		no_rows;
+	DryRun		d = {.ctx = ctx, .root = root, .no_rows = &no_rows, .kept = schema, .cxt = CurrentMemoryContext};
+
+	if (prolly_empty(ctx, WS_ROW_VREFS, &no_rows) < 0)
+		prolly_report(ctx);
+	return dry_run_refused(&d, failure);
+}
+
+void
+ws_root_definitions_end(const char *schema)
+{
+	ObjectAddress address;
+
+	ObjectAddressSet(address, NamespaceRelationId, get_namespace_oid(schema, false));
+	performDeletion(&address, DROP_CASCADE, PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
+	CommandCounterIncrement();
 }

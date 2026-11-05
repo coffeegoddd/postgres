@@ -67,6 +67,15 @@ typedef struct WsRootIORoutine
 	/* All restore makes, each table holding no_rows, an empty map of rows. */
 	void		(*restore_statements) (ProllyCtx *ctx, const PHash *root, const char *schema,
 									   const PHash *no_rows);
+
+	/*
+	 * What a root's values mean and nothing else, for working them out: the objects
+	 * tables use, no comments or grants, an owner only if that role is here, and its
+	 * tables each holding no_rows, with no owner or constraint and unattached.  It names
+	 * no role and asks for none to be made.
+	 */
+	void		(*restore_definitions) (ProllyCtx *ctx, const PHash *root, const char *schema,
+										const PHash *no_rows);
 } WsRootIORoutine;
 
 extern PGDLLIMPORT const WsRootIORoutine SchemaWsRootIO;
@@ -86,5 +95,13 @@ extern bool ws_root_rows_refused(ProllyCtx *ctx, const PHash *root,
 								 void (*fn) (void *arg, const char *schema), void *arg,
 								 WsSqlFailure *failure);
 extern bool ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure);
+
+/*
+ * A schema of a root's definitions, named in *schema, that stays until _end, for work that
+ * must keep what it writes and so cannot be undone with it: true, with *failure, and no
+ * schema if the root was refused.  It goes by _end, or with its transaction.
+ */
+extern bool ws_root_definitions_begin(ProllyCtx *ctx, const PHash *root, char **schema, WsSqlFailure *failure);
+extern void ws_root_definitions_end(const char *schema);
 
 #endif							/* PROLLY_WS_RESTORE_H */

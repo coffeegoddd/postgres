@@ -51,8 +51,11 @@
  * reaching one set of rows add up if the columns did not change; if they changed alike,
  * that is one change.
  *
- * Computing those values, and whether a value reads, is what WsEval is for, and the only
- * user code a merge runs.  A default that isn't immutable, or an identity, has no one
+ * Rows merge only once the schema has: any conflict in it, and no row is looked at, as no
+ * value can be worked out with no one schema to mean it.  Computing those values, and
+ * whether a value reads, is what WsEval is for, by the merged definitions alone, and the
+ * only user code a merge runs; what the merged definitions cannot be made as is an
+ * unapplied conflict.  A default that isn't immutable, or an identity, has no one
  * value for a merge to give: a new row needing it is a generated conflict.  A primary
  * key column of another type is a key conflict, as a key is its values' text.  A value
  * is read as a type by its text, not cast: boolean to text gives true beside t, and
@@ -79,6 +82,7 @@
  *	row <table> <key>			both changed a value differently, one deleted a row
  *								the other changed, or a value does not read as the
  *								type the other side gave its column
+ *	unapplied <what was said>	Postgres would not have what the merge made
  *	generated <table> <key>		a default or generated value could not be computed, or
  *								a row has none that a merge can give
  *
@@ -105,8 +109,8 @@ typedef struct WsMergeResult
 } WsMergeResult;
 
 /*
- * What a merge has computed, in the schema of arg's choosing that has what the
- * expressions name, and has the types as merged.  A value is its output text, as a row
+ * What a merge has computed, among its merged definitions alone, in a schema it makes
+ * for that (ws_root_definitions_begin) and names in arg.  A value is its output text, as a row
  * holds it.  Each false if it could not be done, with nothing left undone.
  */
 typedef struct WsEvalRoutine
@@ -124,20 +128,14 @@ typedef struct WsEvalRoutine
 	bool		(*reads_as) (void *arg, const char *type, const char *text, char **as);
 } WsEvalRoutine;
 
-/* Through WsSql: arg is a WsEvalSchemas, each schema tried in turn. */
+/* Through WsSql: arg is the schema's name. */
 extern PGDLLIMPORT const WsEvalRoutine SqlWsEval;
-
-typedef struct WsEvalSchemas
-{
-	const char *const *schemas;
-	int			n;
-} WsEvalSchemas;
 
 typedef struct WsMergeRoutine
 {
 	const char *name;
 	void		(*merge) (ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs,
-						  const WsEvalRoutine *eval, void *eval_arg, WsMergeResult *out);
+						  const WsEvalRoutine *eval, WsMergeResult *out);
 } WsMergeRoutine;
 
 extern PGDLLIMPORT const WsMergeRoutine TagsWsMerge;
