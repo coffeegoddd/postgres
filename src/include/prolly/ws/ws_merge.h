@@ -56,9 +56,11 @@
  * value for a merge to give: a new row needing it is a generated conflict.  A primary
  * key column of another type is a key conflict, as a key is its values' text.  A value
  * is read as a type by its text, not cast: boolean to text gives true beside t, and
- * integer DEFAULT 2.0 is a generated conflict for a new row.  A column of a table's row
- * type, or an enum key renamed against a delete, is not seen here: restoring the merge
- * says.
+ * integer DEFAULT 2.0 is a generated conflict for a new row.  Not seen here, for restoring
+ * the merge to say: a column of a table's row type, an enum key renamed against a delete,
+ * a multirange whose range's name Postgres clipped to make its name.  Nor can anything
+ * here or there see a value renamed to what another was, as the text still reads: it
+ * means the other now, keyless rows reaching one set through that too.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped

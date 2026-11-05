@@ -1401,9 +1401,12 @@ moves_from_the_row_alone(const MoveMap *mm)
 
 #define MOVE_BATCH 1000
 
-/* A whole map in the merged record's form: a keyless table's, or one only to read. */
+/*
+ * A whole map in the merged record's form: a keyless table's, or one only to read.  Its
+ * rows take the default of a column their side lacks if they are_new.
+ */
 static void
-move_map(MoveMap *mm, const PHash *map, PHash *out)
+move_map(MoveMap *mm, const PHash *map, bool are_new, PHash *out)
 {
 	RowMerge   *rm = mm->rm;
 	Merger	   *m = rm->m;
@@ -1429,7 +1432,7 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
 	{
 		MemoryContext old = MemoryContextSwitchTo(rowcxt);
-		MoveResult	moved = move_row(mm, k, kl, v, vl, rm->shape.nkey == 0, f);
+		MoveResult	moved = move_row(mm, k, kl, v, vl, are_new, f);
 
 		CHECK_FOR_INTERRUPTS();
 		if (moved == MOVED)
@@ -2012,7 +2015,7 @@ read_one_side(Merger *m, const WsTableSchema *rec, const PHash *rows, const PHas
 
 	row_merge_init(&rm, m, rec);
 	mm = (MoveMap) {&rm, rec, columns_of_types_differing(&rm, rv, td)};
-	move_map(&mm, rows, out);
+	move_map(&mm, rows, false, out);
 	ws_row_shape_free(&rm.shape);
 }
 
@@ -2067,10 +2070,13 @@ merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const
 				mt = *rt,
 				cur;
 
-	/* both adding a column and reaching one set of rows is one change, not two to add up */
+	/*
+	 * Both adding a column and reaching one set of rows is one change, not two to add
+	 * up, and those rows are as both have them: a default of theirs is for no row here.
+	 */
 	if (phash_eq(ro, rt) && both_added_columns(sides))
 	{
-		move_map(&ours, ro, out);
+		move_map(&ours, ro, false, out);
 		return;
 	}
 
@@ -2103,9 +2109,9 @@ merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const
 		return;
 	}
 	if (base_moves)
-		move_map(&from_base, base, &mb);
-	move_map(&ours, ro, &mo);
-	move_map(&theirs, rt, &mt);
+		move_map(&from_base, base, true, &mb);
+	move_map(&ours, ro, true, &mo);
+	move_map(&theirs, rt, true, &mt);
 	cur = mo;
 	km.ours = &mo;
 	if (prolly_diff(m->ctx, &mb, &mt, keyless_change, &km) < 0)
