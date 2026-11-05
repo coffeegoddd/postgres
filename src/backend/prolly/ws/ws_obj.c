@@ -2026,7 +2026,8 @@ static const char *const collation_refusal_sql =
 "SELECT o.collname::text, CASE "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_collation'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
 "    THEN 'it belongs to an extension' "
-"  WHEN EXISTS (SELECT 1 FROM pg_collation c WHERE c.collname = o.collname AND c.collnamespace = 'pg_catalog'::regnamespace) "
+"  WHEN EXISTS (SELECT 1 FROM pg_collation c WHERE c.collname = o.collname AND c.collnamespace = 'pg_catalog'::regnamespace "
+"      AND c.collencoding IN (-1, pg_char_to_encoding(getdatabaseencoding()))) "
 "    THEN 'it is named as one in the catalogs, which its bare name would mean' "
 "  WHEN o.collencoding NOT IN (-1, pg_char_to_encoding(getdatabaseencoding())) "
 "    THEN 'it is for another encoding than this database''s' "
@@ -4184,7 +4185,9 @@ check_collations_are_free(const WsObject *objs, int n, const char *schema)
 		const char *sql;
 
 		if (objs[i].kind == WS_OBJ_COLLATION)
-			sql = "SELECT 1 FROM pg_collation WHERE collname = $1::name AND collnamespace = 'pg_catalog'::regnamespace";
+			/* (one for another encoding is no name this database can mean) */
+			sql = "SELECT 1 FROM pg_collation WHERE collname = $1::name AND collnamespace = 'pg_catalog'::regnamespace "
+				"AND collencoding IN (-1, pg_char_to_encoding(getdatabaseencoding()))";
 		else if (objs[i].kind == WS_OBJ_OPCLASS)
 			sql = "SELECT 1 FROM pg_opclass o JOIN pg_am a ON a.oid = o.opcmethod WHERE o.opcname = $1::name "
 				"AND o.opcnamespace = 'pg_catalog'::regnamespace AND quote_ident(a.amname) = $2";
