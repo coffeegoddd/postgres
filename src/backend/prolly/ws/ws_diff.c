@@ -15,6 +15,7 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "prolly/ws/ws_diff.h"
+#include "prolly/ws/ws_viol.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_rows.h"
@@ -85,18 +86,12 @@ map_entry(void *arg, const ProllyDiff *x)
 	}
 	else if (m->what == WS_DIFF_VIOLATION)
 	{
-		/* (its table, a zero byte, its constraint, a zero byte, its row if it says one) */
-		size_t		table = strlen(key);
-		size_t		name = table < x->klen ? strlen(key + table + 1) : 0;
+		WsViolation v;
 
-		if (table + 1 + name + 1 > x->klen)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("a violation's key has no constraint: \"%s\"", key)));
-		e.table = key;
-		e.name = key + table + 1;
-		if (table + 1 + name + 1 < x->klen)
-			e.row = key + table + 1 + name + 1;
+		ws_viol_key(x->key, x->klen, &v);
+		e.table = v.table;
+		e.name = v.constraint;
+		e.row = v.rowkey;
 	}
 	emit(m->d, &e);
 	pfree(key);

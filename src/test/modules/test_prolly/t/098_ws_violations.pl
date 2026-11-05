@@ -57,6 +57,36 @@ my @scenarios = (
 		q{ALTER TABLE pt ALTER COLUMN v SET NOT NULL}, q{INSERT INTO pt VALUES (1, NULL)}, [ 'not null pt1 pt_v_not_null 1' ] ],
 	[ 'a foreign key to partitions', q{CREATE TABLE p (id integer PRIMARY KEY) PARTITION BY RANGE (id); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (100); INSERT INTO p VALUES (1), (2); CREATE TABLE c (id integer PRIMARY KEY, pid integer REFERENCES p)},
 		q{DELETE FROM p WHERE id = 1}, q{INSERT INTO c VALUES (5, 1), (6, 2)}, [ 'foreign key c c_pid_fkey 5' ] ],
+	[ 'a column named as the query names its table', q{CREATE TABLE t (x integer, a integer, b text UNIQUE)}, q{INSERT INTO t VALUES (NULL, 1, 'k')}, q{INSERT INTO t VALUES (NULL, 2, 'k')},
+		[ 'unique t t_b_key (,1,k)', 'unique t t_b_key (,2,k)' ] ],
+	[ 'a deferrable exclusion constraint, kept', "$T; ALTER TABLE t ADD CONSTRAINT v_ex EXCLUDE USING btree (v WITH =) DEFERRABLE", q{INSERT INTO t VALUES (1, 7)}, q{INSERT INTO t VALUES (2, 8)}, [] ],
+	[ 'a deferrable exclusion constraint, violated', "$T; ALTER TABLE t ADD CONSTRAINT v_ex EXCLUDE USING btree (v WITH =) DEFERRABLE INITIALLY DEFERRED", q{INSERT INTO t VALUES (1, 7)}, q{INSERT INTO t VALUES (2, 7)}, [ 'exclusion t v_ex' ] ],
+	[ 'a foreign key across collations', q{CREATE TABLE p (k text COLLATE "C" PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k text COLLATE "POSIX" REFERENCES p); INSERT INTO p VALUES ('a'), ('b')}, q{DELETE FROM p WHERE k = 'b'; INSERT INTO c VALUES (1, 'a')}, q{INSERT INTO c VALUES (2, 'b')}, [ 'foreign key c c_k_fkey 2' ] ],
+	[ 'a foreign key of text to char', q{CREATE TABLE p (k character(3) PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k text REFERENCES p); INSERT INTO p VALUES ('a'), ('b')}, q{DELETE FROM p WHERE k = 'b'; INSERT INTO c VALUES (1, 'a ')}, q{INSERT INTO c VALUES (2, 'b')}, [ 'foreign key c c_k_fkey 2' ] ],
+	[ 'a foreign key to char, all of its length', q{CREATE TABLE p (k character(3) PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k text REFERENCES p); INSERT INTO p VALUES ('abc'), ('abd')}, q{DELETE FROM p WHERE k = 'abd'; INSERT INTO c VALUES (1, 'abc')}, q{INSERT INTO c VALUES (2, 'abd')}, [ 'foreign key c c_k_fkey 2' ] ],
+	[ 'a foreign key to bit, all of its length', q{CREATE TABLE p (k bit(4) PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k varbit REFERENCES p); INSERT INTO p VALUES (B'1010'), (B'1011')}, q{DELETE FROM p WHERE k = B'1011'; INSERT INTO c VALUES (1, B'1010')}, q{INSERT INTO c VALUES (2, B'1011')}, [ 'foreign key c c_k_fkey 2' ] ],
+	[ 'a foreign key across collations of domains', q{CREATE DOMAIN dc AS text COLLATE "C"; CREATE DOMAIN dp AS text COLLATE "POSIX"; CREATE TABLE p (k dc PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k dp REFERENCES p); INSERT INTO p VALUES ('a'), ('b')}, q{DELETE FROM p WHERE k = 'b'; INSERT INTO c VALUES (1, 'a')}, q{INSERT INTO c VALUES (2, 'b')}, [ 'foreign key c c_k_fkey 2' ] ],
+	[ 'a foreign key in a domain collation that makes values alike', q{CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); CREATE DOMAIN dci AS text COLLATE ci; CREATE TABLE p (k dci PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k text COLLATE ci REFERENCES p); INSERT INTO p VALUES ('a')}, q{INSERT INTO c VALUES (1, 'A')}, q{INSERT INTO c VALUES (2, 'a')}, [] ],
+	[ 'a foreign key of bigint to integer, too big for it', q{CREATE TABLE p (k integer PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, k bigint); INSERT INTO p VALUES (1)}, q{ALTER TABLE c ADD CONSTRAINT c_k_fkey FOREIGN KEY (k) REFERENCES p}, q{INSERT INTO c VALUES (2, 9999999999)},
+		[ 'foreign key c c_k_fkey 2' ] ],
+	[ 'a composite value with a null in it, twice', q{CREATE TYPE pr AS (a integer, b integer); CREATE TABLE t (id integer PRIMARY KEY, v pr UNIQUE)}, q{INSERT INTO t VALUES (1, ROW(1, NULL))}, q{INSERT INTO t VALUES (2, ROW(1, NULL))},
+		[ 'unique t t_v_key 1', 'unique t t_v_key 2' ] ],
+	[ 'a composite value of nulls is not null', q{CREATE TYPE pr AS (a integer, b integer); CREATE TABLE t (id integer PRIMARY KEY, v pr)}, q{ALTER TABLE t ALTER COLUMN v SET NOT NULL}, q{INSERT INTO t VALUES (1, ROW(NULL, NULL)), (2, NULL)},
+		[ 'not null t t_v_not_null 2' ] ],
+	[ 'a virtual column made not null', q{CREATE TABLE t (id integer PRIMARY KEY, a integer, g integer GENERATED ALWAYS AS (a) VIRTUAL)}, q{ALTER TABLE t ALTER COLUMN g SET NOT NULL}, q{INSERT INTO t VALUES (2, NULL)},
+		[ 'not null t t_g_not_null 2' ] ],
+	[ 'an empty key says a row', q{CREATE TABLE t (k text PRIMARY KEY, v integer UNIQUE)}, q{INSERT INTO t VALUES ('', 7)}, q{INSERT INTO t VALUES ('a', 7)},
+		[ 'unique t t_v_key ', 'unique t t_v_key a' ] ],
+	[ 'a check and an index of one name', q{CREATE TABLE t (id integer PRIMARY KEY, v integer); CREATE UNIQUE INDEX z ON t (abs(v))},
+		q{ALTER TABLE t ADD CONSTRAINT z CHECK (v > 0); INSERT INTO t VALUES (1, 7)}, q{INSERT INTO t VALUES (2, -7)},
+		[ 'check t z 2', 'unique t z 1', 'unique t z 2' ] ],
+	[ 'inheriting: a parent reads only its own', q{CREATE TABLE t (id integer PRIMARY KEY, v integer UNIQUE); CREATE TABLE k (w integer) INHERITS (t)}, q{INSERT INTO t VALUES (1, 7)}, q{INSERT INTO k VALUES (2, 7, 0)}, [] ],
+	[ 'an index collation', q{CREATE TABLE t (id integer PRIMARY KEY, v text); CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); CREATE UNIQUE INDEX v_ci ON t (v COLLATE ci)}, q{INSERT INTO t VALUES (1, 'a')}, q{INSERT INTO t VALUES (2, 'A')},
+		[ 'unique t v_ci 1', 'unique t v_ci 2' ] ],
+	[ 'a foreign key not valid has none', $FK, q{DELETE FROM p WHERE id = 1; ALTER TABLE c DROP CONSTRAINT c_pid_fkey; ALTER TABLE c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES p NOT VALID}, q{ALTER TABLE c DROP CONSTRAINT c_pid_fkey; INSERT INTO c VALUES (5, 1); ALTER TABLE c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES p NOT VALID}, [] ],
+	[ 'a check not enforced has none', $T, q{ALTER TABLE t ADD CONSTRAINT v_pos CHECK (v > 0) NOT ENFORCED}, q{INSERT INTO t VALUES (2, -1)}, [] ],
+	[ 'all a table has beyond its rows', q{CREATE TABLE t (id integer PRIMARY KEY, v integer NOT NULL UNIQUE, w integer); CREATE UNIQUE INDEX w_one ON t (w) WHERE w > 0; CREATE INDEX w_any ON t (w) WITH (fillfactor = 50); COMMENT ON INDEX w_one IS 'c'; COMMENT ON CONSTRAINT t_v_key ON t IS 'k'; COMMENT ON TABLE t IS 't'; ALTER TABLE t ALTER COLUMN w SET NOT NULL; ALTER TABLE t REPLICA IDENTITY USING INDEX t_v_key; ALTER TABLE t CLUSTER ON t_v_key; GRANT SELECT ON t TO PUBLIC; CREATE POLICY everyone ON t USING (true) WITH CHECK (true); ALTER TABLE t ENABLE ROW LEVEL SECURITY; ALTER TABLE t FORCE ROW LEVEL SECURITY},
+		q{INSERT INTO t VALUES (1, 1, 1)}, q{INSERT INTO t VALUES (2, 2, 2)}, [] ],
 	[ 'a key whose values print apart', q{CREATE TABLE t (id numeric PRIMARY KEY)}, q{INSERT INTO t VALUES (1.0)}, q{INSERT INTO t VALUES (1.00)}, undef, qr/^unapplied .*duplicate|^unapplied .*unique/ ],
 	[ 'a view of what the other dropped', "$T", q{ALTER TABLE t DROP COLUMN v}, q{CREATE VIEW w AS SELECT v FROM t}, undef, qr/^unapplied object "w" does not make that object/ ],
 	[ 'a check that raises for a row', "$T", q{ALTER TABLE t ADD CONSTRAINT z CHECK (1 / v > 0)}, q{INSERT INTO t VALUES (1, 0)}, undef, qr/^unapplied division by zero/ ],
@@ -85,6 +115,12 @@ for my $case (@scenarios)
 	\\echo :merged
 	\\echo =====end
 	SELECT split_part(:'merged', E'\\n', 1) AS m \\gset
+	\\echo =====refused
+	SELECT test_ws_root_refused(:'m') IS NULL;
+	\\echo =====end
+	\\echo =====plain
+	SELECT split_part(test_ws_merge(:'rb', :'ro', :'rt', ARRAY['o$i', 't$i', 'b$i']), E'\\n', 1) = :'m';
+	\\echo =====end
 	\\echo =====viol
 	SELECT test_ws_violations(:'m');
 	\\echo =====end
@@ -109,6 +145,14 @@ for my $case (@scenarios)
 	my ($viol) = $out =~ /=====viol\n(.*?)\n?=====end/s;
 	my @got = map { s/^(.*\(x+) [0-9a-f]{64}$/$1 @/r } split /\n/, $viol // '';
 	is_deeply(\@got, $violations, "$name: its violations");
+	if (!@$violations)
+	{
+		# nothing found: restoring it says so too, and it is the root the merge made
+		my ($refused) = $out =~ /=====refused\n(.*?)\n?=====end/s;
+		is($refused // '', 't', "$name: Postgres has it");
+		my ($plain) = $out =~ /=====plain\n(.*?)\n?=====end/s;
+		is($plain // '', 't', "$name: the merge's own root");
+	}
 
 	# as diff says, one way added and the other resolved
 	my ($added) = $out =~ /=====added\n(.*?)\n?=====end/s;

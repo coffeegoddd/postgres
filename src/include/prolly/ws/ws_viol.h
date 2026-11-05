@@ -14,12 +14,14 @@
  * and an exclusion constraint, which only Postgres can apply, without its rows.  A check
  * or foreign key not valid has none, and a domain's constraints are not applied to rows
  * restored, so not here.  Unique keys compare by their collation and their type's
- * equality, whatever an index's operator class would say.
+ * equality, and a foreign key by its referenced type's default operator class, whatever
+ * an index's own operator class would say.
  *
- * They are held in the root's ~viol map: (table, a zero byte, constraint, a zero byte, the
- * row's key as a conflict prints it, or nothing for a constraint alone) to its kind, so
- * one set is one map.  Only the root's rows say what they are, so a root is rechecked as
- * it stands, whoever fixed what.
+ * They are held in the root's ~viol map, as keys, each to one byte that says nothing: its
+ * table, kind and constraint, each after a zero byte but the first, and for a row a zero byte and its key
+ * as a conflict prints it.  So one set is one map, a check and an index of one name are
+ * two, and a violation of another kind is another.  Only the root's rows say what they
+ * are, so a root is rechecked as it stands, whoever fixed what.
  *
  * What a root's rows cannot be, with no constraint on them, is a merge's conflict, and
  * not a violation: a value of no type it now has, two keys alike as 1.0 and 1.00 are, a
@@ -60,6 +62,9 @@ typedef struct WsViolRoutine
 	/* What a root holds of them, in key order. */
 	void		(*list) (ProllyCtx *ctx, const PHash *root, WsViolation **out, int *n);
 } WsViolRoutine;
+
+/* A ~viol key's parts, palloc'd; ERRCODE_DATA_CORRUPTED if it has too few. */
+extern void ws_viol_key(const uint8 *key, size_t klen, WsViolation *out);
 
 extern PGDLLIMPORT const WsViolRoutine QueryWsViol;
 
