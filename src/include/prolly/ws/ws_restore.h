@@ -20,9 +20,12 @@
  * prints remembered.  A
  * restored schema captures as the root it came from.
  *
- * What it makes runs what a root's indexes are made of as the owner of each table, so a
- * role's code does not run with the rights of whoever restores it.  Whoever restores it
- * still runs what ATTACH checks of a partition key's expression, as pg_restore's does.
+ * What it makes runs what a root's indexes are made of as the owner of each table, and
+ * ATTACH as the partition's owner, restricted, so a role's code does not run with the
+ * rights of whoever restores it.  That takes having the owners' rights.  This is no
+ * sandbox: planning a statement over a table folds its immutable functions as whoever
+ * runs it, here a foreign key's check as in any query, as pg_restore's does, so what
+ * a role's branch holds is not for a superuser to restore blind.
  *
  * Whether Postgres would have a root at all is more than anything can say of it but
  * Postgres: ws_root_refused restores it and rolls that back.  It is what a merge's

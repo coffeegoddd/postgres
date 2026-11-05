@@ -13,6 +13,7 @@
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "commands/user.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type_d.h"
 #include "prolly/branch_catalog.h"
@@ -26,6 +27,7 @@
 #include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -307,8 +309,20 @@ make_table(ProllyCtx *ctx, const WsTableSchema *s, const PHash *rows, const char
 
 	/*
 	 * Its owner before them: an index runs what it is made of as its table's owner,
-	 * which must not be whoever is restoring this.
+	 * which must not be whoever is restoring this.  That takes having that owner's
+	 * rights, for all that is done to the table after.
 	 */
+	if (s->owner != NULL)
+	{
+		char	   *owner = ws_name_from_utf8(s->owner);
+
+		if (!has_privs_of_role(GetUserId(), get_role_oid(owner, false)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("restoring table \"%s\" takes having the privileges of its owner \"%s\"", s->name, owner),
+					 errhint("Being able to SET ROLE to it is not enough.")));
+		pfree(owner);
+	}
 	ws_schema_owner(s, schema, &sql);
 	run_statement(&sql);
 	for (int i = 0; i < s->nindexes; i++)
@@ -324,6 +338,61 @@ make_table(ProllyCtx *ctx, const WsTableSchema *s, const PHash *rows, const char
 	ws_schema_table_settings(s, schema, &sql);
 	run_statement(&sql);
 	buf_free(&sql);
+}
+
+/* An ALTER OWNER of a table, as whoever is restoring. */
+static void
+set_owner(const WsTableSchema *s, const char *owner, const char *schema)
+{
+	StringInfoData sql;
+	WsSqlRows	rows;
+	char	   *table = ws_name_from_utf8(s->name);
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "ALTER TABLE %s.%s OWNER TO %s", quote_identifier(schema), quote_identifier(table),
+					 quote_identifier(owner));
+	WsSql->run(sql.data, 0, NULL, &rows);
+	ws_sql_rows_free(&rows);
+	pfree(sql.data);
+	pfree(table);
+}
+
+/*
+ * ATTACH, which runs what a partition's checks and its table's indexes are made of,
+ * as the partition's owner and restricted as an index build is: not as whoever is
+ * restoring.  It asks to own both, so a table of another owner is the partition's for
+ * as long as that takes.  A partition of no owner held is whoever restores it's.
+ */
+static void
+attach_as_owner(const WsTableSchema *child, const WsTableSchema *parent, const char *schema, Buf *attach)
+{
+	Oid			user;
+	int			context;
+	char	   *owner = child->owner != NULL ? ws_name_from_utf8(child->owner) : NULL;
+	char	   *parent_owner = parent->owner != NULL ? ws_name_from_utf8(parent->owner) : NULL;
+	bool		differ = owner != NULL && (parent_owner == NULL || strcmp(owner, parent_owner) != 0);
+
+	if (owner == NULL)
+	{
+		run_statement(attach);
+		return;
+	}
+	if (differ)
+		set_owner(parent, owner, schema);
+	GetUserIdAndSecContext(&user, &context);
+	SetUserIdAndSecContext(get_role_oid(owner, false),
+						   context | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
+	PG_TRY();
+	{
+		run_statement(attach);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, context);
+	}
+	PG_END_TRY();
+	if (differ)
+		set_owner(parent, parent_owner != NULL ? parent_owner : GetUserNameFromId(user, false), schema);
 }
 
 static void
@@ -438,7 +507,7 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 		if (s->partition_of != NULL)
 		{
 			ws_schema_attach(s, schema, &sql);
-			run_statement(&sql);
+			attach_as_owner(s, &tables.recs[table_index(&tables, s->partition_of)], schema, &sql);
 		}
 	}
 	for (int t = tables.n - 1; t >= 0; t--)
