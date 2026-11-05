@@ -2363,10 +2363,51 @@ named_as_a_kept_using(Query *q, List *names)
 		{
 			if (merged++ >= rte->joinmergedcols)
 				break;
+			/* (a second USING of a name is suffixed, and what has that name is renamed too) */
 			foreach_node(String, name, names)
-				if (strcmp(strVal(used), strVal(name)) == 0)
+			{
+				size_t		len = strlen(strVal(used));
+
+				if (strncmp(strVal(used), strVal(name), len) == 0 &&
+					(strVal(name)[len] == '\0' ||
+					 (strVal(name)[len] == '_' && strspn(strVal(name) + len + 1, "0123456789") > 0 &&
+					  strVal(name)[len + 1 + strspn(strVal(name) + len + 1, "0123456789")] == '\0')))
 					return true;
+			}
 		}
+	}
+	return false;
+}
+
+/*
+ * Whether range table entry rtindex is under an aliased join that it, or a join above it,
+ * merges columns at.  Printing takes a USING's name, from the alias or above, down into what
+ * is under the join, so what has that name there is another; and only from under it, as by
+ * LATERAL, can a whole row of it be taken.  above says if a join on the way down merges.
+ */
+static bool
+under_an_aliased_join_with_using(Query *q, Node *node, int rtindex, bool aliased, bool merges)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblRef))
+		return ((RangeTblRef *) node)->rtindex == rtindex && aliased && merges;
+	if (IsA(node, FromExpr))
+	{
+		foreach_ptr(Node, item, ((FromExpr *) node)->fromlist)
+			if (under_an_aliased_join_with_using(q, item, rtindex, aliased, merges))
+				return true;
+		return false;
+	}
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) node;
+		RangeTblEntry *rte = rt_fetch(j->rtindex, q->rtable);
+
+		aliased |= rte->alias != NULL;
+		merges |= rte->joinmergedcols > 0;
+		return under_an_aliased_join_with_using(q, j->larg, rtindex, aliased, merges) ||
+			under_an_aliased_join_with_using(q, j->rarg, rtindex, aliased, merges);
 	}
 	return false;
 }
@@ -2448,7 +2489,8 @@ lost_in_print_walker(Node *node, void *arg)
 				l->why = "it has a whole row of columns of one name, which printing tells apart";
 				return true;
 			}
-			if (named_as_a_kept_using(q, rte->eref->colnames))
+			if (named_as_a_kept_using(q, rte->eref->colnames) ||
+				under_an_aliased_join_with_using(q, (Node *) q->jointree, v->varno, false, false))
 			{
 				l->why = "it has a whole row with a column named as a USING's, which printing renames";
 				return true;
