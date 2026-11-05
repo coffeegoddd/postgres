@@ -447,6 +447,7 @@ static void get_window_frame_options(int frameOptions,
 									 Node *startOffset, Node *endOffset,
 									 deparse_context *context);
 static char *column_name_for_print(Oid relid, AttrNumber attnum, char *name);
+static bool join_input_prints_list(deparse_namespace *dpns, int rti);
 static void base_column_of_join(deparse_namespace *dpns, RangeTblEntry *rte, AttrNumber attnum,
 								Oid *relid, AttrNumber *column);
 static char *get_variable(Var *var, int levelsup, bool istoplevel,
@@ -7631,6 +7632,22 @@ get_utility_query_def(Query *query, deparse_context *context)
 }
 
 /*
+ * Whether a join, or anything under it, prints an alias list: which then decides what a name
+ * of its means, whatever a column of a table is called.
+ */
+static bool
+join_input_prints_list(deparse_namespace *dpns, int rti)
+{
+	deparse_columns *colinfo = deparse_columns_fetch(rti, dpns);
+
+	if (colinfo->printaliases)
+		return true;
+	return rt_fetch(rti, dpns->rtable)->rtekind == RTE_JOIN &&
+		(join_input_prints_list(dpns, colinfo->leftrti) ||
+		 join_input_prints_list(dpns, colinfo->rightrti));
+}
+
+/*
  * The column of a table a join's column is, if it is simply that; a USING's merged column is not.
  */
 static void
@@ -7970,7 +7987,7 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 
 		if (rte->rtekind == RTE_RELATION)
 			relid = rte->relid;
-		else if (rte->rtekind == RTE_JOIN)
+		else if (rte->rtekind == RTE_JOIN && !join_input_prints_list(dpns, varno))
 			base_column_of_join(dpns, rte, attnum, &relid, &column);
 		if (OidIsValid(relid))
 		{

@@ -123,6 +123,9 @@ my @followers = (
 	# another column takes the old name: what it said must not be that
 	[ 'named_join', q{SELECT j.val FROM (s JOIN r USING (n)) j}, q{ALTER TABLE %s.s RENAME COLUMN val TO v2; ALTER TABLE %s.s RENAME COLUMN w TO val} ],
 	[ 'field', q{SELECT (x).val FROM (SELECT s FROM s) y(x)}, q{ALTER TABLE %s.s RENAME COLUMN val TO v2; ALTER TABLE %s.s RENAME COLUMN w TO val} ],
+	# a list under a named join, printed for a name it has twice, or written
+	[ 'list_under_join', q{SELECT o.w FROM ((s JOIN r ON s.n = r.n) i JOIN r r2 ON i.val IS NOT NULL AND r2.n = i.w) o}, q{ALTER TABLE %s.s RENAME COLUMN val TO v2; ALTER TABLE %s.s RENAME COLUMN w TO val; ALTER TABLE %s.s RENAME COLUMN v2 TO w} ],
+	[ 'written_under_join', q{SELECT j.w FROM (s x(l) JOIN r ON x.n = r.n) j}, q{ALTER TABLE %s.s RENAME COLUMN n TO n2; ALTER TABLE %s.s RENAME COLUMN w TO n; ALTER TABLE %s.s RENAME COLUMN n2 TO w} ],
 );
 my $fo_tables = q{SET ROLE g_tags; CREATE TABLE %s.s (val text, n integer, w integer); CREATE TABLE %s.r (n integer);
 	INSERT INTO %s.s VALUES ('a', 2, 1), ('b', 1, 3), ('c', 3, 2); INSERT INTO %s.r VALUES (1), (2), (3)};
@@ -180,6 +183,17 @@ like($erru, qr/its USING says "n" of table "a", and that column is now "n2"/, 'a
 ($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a DROP COLUMN n CASCADE});
 like($erru, qr/and that column is gone/, 'and a column gone');
 $node->safe_psql('postgres', q{DROP SCHEMA us1 CASCADE; DROP SCHEMA us2 CASCADE});
+# a merged column of a named join is no one table's, so stays its name
+$node->safe_psql('postgres', q{CREATE SCHEMA mg VERSIONED; ALTER SCHEMA mg OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mg.a (n integer, w integer); CREATE TABLE mg.b (n integer);
+	CREATE VIEW mg.v AS SELECT j.n, j.w FROM (mg.a JOIN mg.b USING (n)) j});
+like(pack('H*', (split /\t/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('mg')}))[1]), qr/j\.n,\s+j\.\@\{\d+\} AS w/, 'a merged column of a named join stays a name, and its others are tags');
+# a field set by name is a tag too, of a table's row type
+$node->safe_psql('postgres', q{SET ROLE g_tags; CREATE TABLE mg.h (c mg.a); CREATE FUNCTION mg.up() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE mg.h SET c.w = 1; END});
+my ($fsrc, $fsout, $fserr) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('mg')});
+like($fsout, qr/^function\/up\(\)\t/m, 'a function setting a field of a table\'s row type is held') or diag($fserr);
+my %fs = map { my ($k, $v) = split /\t/; $k => pack('H*', $v // '') } split /\n/, $fsout;
+like($fs{'function/up()'} // '', qr/SET \@\{\d+\}\.\@\{\d+\} = 1/, 'saying the field by its tag');
+$node->safe_psql('postgres', q{DROP SCHEMA mg CASCADE});
 
 # a byte that looks like what marks a tag is only that
 $node->safe_psql('postgres', q{CREATE SCHEMA mk VERSIONED; ALTER SCHEMA mk OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mk.t (a text);
