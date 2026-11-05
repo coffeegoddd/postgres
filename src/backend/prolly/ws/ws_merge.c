@@ -942,9 +942,11 @@ merge_sequences(Merger *m, const PHash *base, const PHash *ours, const PHash *th
 /* ------------------------------------------------------------------ rows */
 
 /*
- * Each of the three maps is first put in the merged record's form, and only then
- * merged: one row in two forms is otherwise two rows, and a row a side only reshaped
- * would look changed.  A map already in that form is not read.
+ * A keyed row has an identity, so rows merge as each side wrote them and only what
+ * is kept is put in the merged record's form: a row or a cell no one touched is never
+ * read, and a value the other side has since retyped is never asked to read as it.  A
+ * keyless row is all its cells: all three maps must be in one form to say which row
+ * is which, and that takes reshaping that follows from the row alone.
  */
 
 typedef struct DefaultValue
@@ -952,7 +954,7 @@ typedef struct DefaultValue
 	uint64		tag;
 	char	   *text;			/* NULL if it is null */
 	bool		computed;		/* false if it could not be */
-	bool		volatile_;		/* a value for each row, which a merge cannot give */
+	bool		varies;			/* no one value, which a merge cannot give */
 } DefaultValue;
 
 typedef struct RowMerge
@@ -963,7 +965,6 @@ typedef struct RowMerge
 	bool	   *custom_type;	/* of each of shape's: its type is a type of the objects */
 	DefaultValue *defaults;
 	int			ndefaults;
-	bool		left_unfilled;	/* a keyless row left without a value it has no way to get */
 	MemoryContext cxt;			/* what is for all its rows */
 } RowMerge;
 
@@ -974,14 +975,12 @@ typedef enum MoveResult
 	MOVE_NOT_COMPUTED,
 } MoveResult;
 
-/* A map being put in the merged form: one side's, or its base's. */
+/* What a row is being moved from: a side's record, or base's. */
 typedef struct MoveMap
 {
 	RowMerge   *rm;
 	const WsTableSchema *side;
-	bool		types_differ;	/* the side's types or domains are other than the merged */
-	bool		is_base;		/* what cannot be moved stays: it conflicts with nothing */
-	const PHash *base_map;		/* a side's: what says a row is new */
+	bool		types_differ;	/* its types or domains are other than the merged */
 } MoveMap;
 
 typedef struct EditList
@@ -1122,7 +1121,7 @@ default_value(RowMerge *rm, const WsColumn *col)
 	d->tag = col->tag;
 	old = MemoryContextSwitchTo(rm->cxt);	/* (not the row's: it is for them all) */
 	if (col->identity != WS_IDENTITY_NONE)
-		d->volatile_ = true;
+		d->varies = true;
 	else
 	{
 		Buf			expr = BUF_INIT;
@@ -1131,8 +1130,8 @@ default_value(RowMerge *rm, const WsColumn *col)
 		ws_schema_render_expression(rm->merged, col->def, &expr);
 		buf_append_byte(&expr, 0);
 		d->computed = rm->m->eval != NULL &&
-			rm->m->eval->column_default(rm->m->eval_arg, (const char *) expr.data, &raw, &d->volatile_);
-		if (d->computed && !d->volatile_ && raw != NULL)
+			rm->m->eval->column_default(rm->m->eval_arg, (const char *) expr.data, &raw, &d->varies);
+		if (d->computed && !d->varies && raw != NULL)
 			d->computed = rm->m->eval->reads_as(rm->m->eval_arg, col->type, raw, &d->text);
 		buf_free(&expr);
 	}
@@ -1143,7 +1142,8 @@ default_value(RowMerge *rm, const WsColumn *col)
 static bool
 written_otherwise(const WsColumn *was, const WsColumn *col)
 {
-	return was == NULL || was->kind != WS_COL_GENERATED_STORED || strcmp(was->def, col->def) != 0;
+	return was == NULL || was->kind != WS_COL_GENERATED_STORED || strcmp(was->def, col->def) != 0 ||
+		strcmp(was->type, col->type) != 0;
 }
 
 /*
@@ -1199,13 +1199,20 @@ regenerate(RowMerge *rm, const WsTableSchema *side, WsField *f)
 	return true;
 }
 
+/* Whether a side's value in a column must be read to be the merged column's. */
+static bool
+must_read(const MoveMap *mm, int i, const WsColumn *was, const WsColumn *col)
+{
+	return strcmp(was->type, col->type) != 0 || (mm->types_differ && mm->rm->custom_type[i]);
+}
+
 /*
  * A row, as fields of the merged record: what it no longer has is left by decoding, a
  * value under another type or a type changed under one name is read as the merged one,
- * and it is given what it lacks.
+ * and, if it is new, it is given the default of a column its side did not have.
  */
 static MoveResult
-move_row(MoveMap *mm, const uint8 *k, size_t kl, const uint8 *v, size_t vl, WsField *f)
+move_row(MoveMap *mm, const uint8 *k, size_t kl, const uint8 *v, size_t vl, bool is_new, WsField *f)
 {
 	RowMerge   *rm = mm->rm;
 	const WsRowShape *s = &rm->shape;
@@ -1217,8 +1224,7 @@ move_row(MoveMap *mm, const uint8 *k, size_t kl, const uint8 *v, size_t vl, WsFi
 		const WsColumn *was = ws_schema_column(mm->side, col->tag);
 		char	   *as = NULL;
 
-		if (f[i].null || was == NULL || col->kind == WS_COL_GENERATED_STORED ||
-			(strcmp(was->type, col->type) == 0 && !(mm->types_differ && rm->custom_type[i])))
+		if (f[i].null || was == NULL || col->kind == WS_COL_GENERATED_STORED || !must_read(mm, i, was, col))
 			continue;
 		if (rm->m->eval == NULL ||
 			!rm->m->eval->reads_as(rm->m->eval_arg, col->type, field_text(rm, &f[i]), &as))
@@ -1228,43 +1234,17 @@ move_row(MoveMap *mm, const uint8 *k, size_t kl, const uint8 *v, size_t vl, WsFi
 		if (i >= s->nkey)
 			field_set(rm, &f[i], as);
 	}
-	for (int i = s->nkey; i < s->nstored; i++)
+	for (int i = s->nkey; is_new && i < s->nstored; i++)
 	{
 		const WsColumn *col = ws_schema_column(rm->merged, s->tags[i]);
-		const WsColumn *was = ws_schema_column(mm->side, col->tag);
 		const DefaultValue *d;
 
-		if (was != NULL || col->kind != WS_COL_STORED ||
+		if (ws_schema_column(mm->side, col->tag) != NULL || col->kind != WS_COL_STORED ||
 			(col->def == NULL && col->identity == WS_IDENTITY_NONE))
 			continue;
 		d = default_value(rm, col);
-		if (d->volatile_ || !d->computed)
-		{
-			/*
-			 * A value for each row, or none to be had, which a merge cannot give.
-			 * The side that added it has given one to a row not new; or, keyless,
-			 * one that no change touched.
-			 */
-			if (mm->is_base)
-				continue;
-			if (s->nkey == 0)
-			{
-				rm->left_unfilled = true;
-				continue;
-			}
-			else
-			{
-				const uint8 *held;
-				size_t		heldlen;
-				int			rc = prolly_get(rm->m->ctx, mm->base_map, k, kl, &held, &heldlen);
-
-				if (rc < 0)
-					prolly_report(rm->m->ctx);
-				if (rc == PROLLY_OK)
-					continue;
-			}
+		if (d->varies || !d->computed)
 			return MOVE_NOT_COMPUTED;
-		}
 		field_set(rm, &f[i], d->text);
 	}
 	return regenerate(rm, mm->side, f) ? MOVED : MOVE_NOT_COMPUTED;
@@ -1308,7 +1288,7 @@ keyless_move(RowMerge *rm, PHash *cur, const uint8 *from, size_t flen, const uin
 	buf_free(&v);
 }
 
-/* Whether a map could hold anything not as the merged record would have it. */
+/* Whether a side's rows could hold anything not as the merged record would have it. */
 static bool
 needs_moving(const MoveMap *mm)
 {
@@ -1330,14 +1310,42 @@ needs_moving(const MoveMap *mm)
 		else if (col->kind == WS_COL_GENERATED_STORED)
 			needs = written_otherwise(was, col);
 		else
-			needs = strcmp(was->type, col->type) != 0 || (mm->types_differ && rm->custom_type[i]);
+			needs = must_read(mm, i, was, col);
 	}
 	return needs;
 }
 
+/*
+ * Whether moving a side's rows follows from each row alone, so that a row in one form
+ * is the same row in the other: not a retype, whose USING is its own, nor a value for
+ * each row, nor a value changed under its type's name.
+ */
+static bool
+moves_from_the_row_alone(const MoveMap *mm)
+{
+	RowMerge   *rm = mm->rm;
+
+	for (int i = 0; i < rm->shape.nstored; i++)
+	{
+		const WsColumn *col = ws_schema_column(rm->merged, rm->shape.tags[i]);
+		const WsColumn *was = ws_schema_column(mm->side, col->tag);
+
+		if (was == NULL && col->kind == WS_COL_STORED && (col->def != NULL || col->identity != WS_IDENTITY_NONE))
+		{
+			const DefaultValue *d = default_value(rm, col);
+
+			if (d->varies || !d->computed)
+				return false;
+		}
+		if (was != NULL && col->kind != WS_COL_GENERATED_STORED && must_read(mm, i, was, col))
+			return false;
+	}
+	return true;
+}
+
 #define MOVE_BATCH 1000
 
-/* A map in the merged record's form. */
+/* A whole map in the merged record's form: a keyless table's, or one only to read. */
 static void
 move_map(MoveMap *mm, const PHash *map, PHash *out)
 {
@@ -1364,7 +1372,7 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
 	{
 		MemoryContext old = MemoryContextSwitchTo(rowcxt);
-		MoveResult	moved = move_row(mm, k, kl, v, vl, f);
+		MoveResult	moved = move_row(mm, k, kl, v, vl, rm->shape.nkey == 0, f);
 
 		CHECK_FOR_INTERRUPTS();
 		if (moved == MOVED)
@@ -1373,21 +1381,24 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 						nv = BUF_INIT;
 
 			WsRowCodec->encode(&rm->shape, f, &nk, &nv);
-			MemoryContextSwitchTo(old);
-			if (rm->shape.nkey > 0)
+			if (rm->shape.nkey == 0)
 			{
-				if (nv.len != vl || memcmp(nv.data, v, vl) != 0)
-					edit_add(&edits, k, kl, nv.data, nv.len, false);
+				if (nk.len != kl || memcmp(nk.data, k, kl) != 0)
+					keyless_move(rm, &cur, k, kl, nk.data, nk.len, ws_rows_keyless_count(k, kl, v, vl));
 			}
-			else if (nk.len != kl || memcmp(nk.data, k, kl) != 0)
-				keyless_move(rm, &cur, k, kl, nk.data, nk.len, ws_rows_keyless_count(k, kl, v, vl));
+			else if (nv.len != vl || memcmp(nv.data, v, vl) != 0)
+			{
+				MemoryContextSwitchTo(old);
+				edit_add(&edits, k, kl, nv.data, nv.len, false);
+			}
 		}
 		else
 		{
+			/* (its line outlasts the row) */
 			MemoryContextSwitchTo(old);
-			if (!mm->is_base)
-				row_conflict(rm, moved == MOVE_NOT_READ ? "row" : "generated", k, kl);
+			row_conflict(rm, moved == MOVE_NOT_READ ? "row" : "generated", k, kl);
 		}
+		MemoryContextSwitchTo(old);
 		MemoryContextReset(rowcxt);
 		if (edits.n >= MOVE_BATCH)
 			edits_apply(m, &edits, &cur);
@@ -1404,11 +1415,83 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 #define SAME_CELL(ha, a, hx, x) \
 	((ha) == (hx) && (!(ha) || ((a).large == (x).large && (a).len == (x).len && memcmp((a).p, (x).p, (a).len) == 0)))
 
-/* A row both sides changed, cell by cell, into fields of the merged record; false, in conflict. */
+/* What a row's three sides are merged from. */
+typedef struct RowSides
+{
+	MoveMap		ours;
+	MoveMap		theirs;
+	const WsTableSchema *base;
+} RowSides;
+
 static bool
-merge_cells(RowMerge *rm, const ProllyConflict *c, WsField *f)
+same_type_in(const WsTableSchema *a, const WsTableSchema *b, uint64 tag)
+{
+	const WsColumn *ca = a != NULL ? ws_schema_column(a, tag) : NULL;
+	const WsColumn *cb = b != NULL ? ws_schema_column(b, tag) : NULL;
+
+	return ca != NULL && cb != NULL && strcmp(ca->type, cb->type) == 0;
+}
+
+/*
+ * Whether a side left a cell as base has it: it has no such column, or holds what base's
+ * value is, as its own type prints it.
+ */
+static bool
+cell_left(RowMerge *rm, const WsTableSchema *side, const WsTableSchema *b, uint64 tag,
+		  bool hs, const WsCell *cs, bool hb, const WsCell *cb)
+{
+	const WsColumn *now = ws_schema_column(side, tag);
+	WsField		fb;
+	WsField		fs;
+	char	   *as = NULL;
+
+	if (now == NULL || (b != NULL && same_type_in(side, b, tag) && SAME_CELL(hs, *cs, hb, *cb)))
+		return true;
+	if (b == NULL || ws_schema_column(b, tag) == NULL || same_type_in(side, b, tag) || hs != hb)
+		return false;
+	if (!hs)
+		return true;
+	fb = (WsField) {cb->p, cb->len, false, cb->large};
+	fs = (WsField) {cs->p, cs->len, false, cs->large};
+	return rm->m->eval != NULL &&
+		rm->m->eval->reads_as(rm->m->eval_arg, now->type, field_text(rm, &fb), &as) &&
+		as != NULL && strcmp(as, field_text(rm, &fs)) == 0;
+}
+
+/* A kept cell as a field of the merged record: read, if its side's column reads otherwise. */
+static bool
+keep_cell(RowMerge *rm, const MoveMap *from, int i, const WsCell *cell, WsField *f)
+{
+	const WsColumn *col = ws_schema_column(rm->merged, rm->shape.tags[i]);
+	const WsColumn *was = ws_schema_column(from->side, col->tag);
+	WsField		raw = {cell->p, cell->len, false, cell->large};
+	char	   *as = NULL;
+
+	f[i] = raw;
+	if (was == NULL || !must_read(from, i, was, col))
+		return true;
+	if (rm->m->eval == NULL ||
+		!rm->m->eval->reads_as(rm->m->eval_arg, col->type, field_text(rm, &raw), &as))
+		return false;
+	field_set(rm, &f[i], as);
+	return true;
+}
+
+/*
+ * A row both sides changed, cell by cell as each wrote it, into fields of the merged
+ * record; false, in conflict.  A cell one side left is the other's, and only a cell
+ * kept is read.  With no row of base each cell must be alike, as one side's NULL is no
+ * less a value it inserted, and so too of a column both added.  A value in a column
+ * one side dropped, changed by the other, would be lost: that is a conflict, as in
+ * Dolt.
+ */
+static bool
+merge_cells(RowMerge *rm, const RowSides *sides, const ProllyConflict *c, WsField *f)
 {
 	const WsRowShape *s = &rm->shape;
+	const WsTableSchema *o = sides->ours.side;
+	const WsTableSchema *t = sides->theirs.side;
+	const WsTableSchema *b = sides->base;
 
 	WsRowCodec->key_fields(s, c->key, c->klen, f);
 	for (int i = s->nkey; i < s->nstored; i++)
@@ -1420,7 +1503,9 @@ merge_cells(RowMerge *rm, const ProllyConflict *c, WsField *f)
 		bool		hb,
 					ho,
 					ht;
-		const WsCell *keep;
+		bool		base_has = b != NULL && c->base != NULL && ws_schema_column(b, col->tag) != NULL;
+		const MoveMap *from = NULL;
+		const WsCell *keep = NULL;
 
 		f[i].null = true;
 		f[i].large = false;
@@ -1433,33 +1518,165 @@ merge_cells(RowMerge *rm, const ProllyConflict *c, WsField *f)
 		hb = c->base != NULL && WsRowCodec->cell_get(c->base, c->blen, col->tag, &cb);
 		ho = WsRowCodec->cell_get(c->ours, c->olen, col->tag, &co);
 		ht = WsRowCodec->cell_get(c->theirs, c->tlen, col->tag, &ct);
-		if (SAME_CELL(ho, co, ht, ct))
-			keep = ho ? &co : NULL;
 
-		/* (with no row of base, one side's NULL is no less a value it inserted) */
-		else if (c->base == NULL)
-			return false;
-		else if (SAME_CELL(ho, co, hb, cb))
-			keep = ht ? &ct : NULL;
-		else if (SAME_CELL(ht, ct, hb, cb))
+		if (same_type_in(o, t, col->tag) && SAME_CELL(ho, co, ht, ct))
+		{
+			from = &sides->ours;
 			keep = ho ? &co : NULL;
+		}
+		else if (base_has || (c->base != NULL && (ws_schema_column(o, col->tag) == NULL || ws_schema_column(t, col->tag) == NULL)))
+		{
+			/* (a side without the column left it, as a side with it unchanged did) */
+			bool		theirs_left = cell_left(rm, t, b, col->tag, ht, &ct, hb, &cb);
+			bool		ours_left = cell_left(rm, o, b, col->tag, ho, &co, hb, &cb);
+
+			if (theirs_left)
+			{
+				from = &sides->ours;
+				keep = ho ? &co : NULL;
+			}
+			else if (ours_left)
+			{
+				from = &sides->theirs;
+				keep = ht ? &ct : NULL;
+			}
+			else
+				return false;
+		}
+		else if (ws_schema_column(o, col->tag) == NULL || ws_schema_column(t, col->tag) == NULL)
+		{
+			/* (both inserted the row, and one has no such column: its cell is null) */
+			if (ho || ht)
+				return false;
+		}
 		else
 			return false;
-		if (keep != NULL)
+		if (keep != NULL && !keep_cell(rm, from, i, keep, f))
+			return false;
+	}
+
+	/* a value of a column gone from the merged, changed by a side that still has it */
+	if (c->base != NULL && b != NULL)
+		for (int i = 0; i < b->ncols; i++)
 		{
-			f[i].null = false;
-			f[i].p = keep->p;
-			f[i].len = keep->len;
-			f[i].large = keep->large;
+			const WsColumn *col = &b->cols[i];
+			WsCell		cb,
+						cs;
+			bool		hb,
+						hs;
+
+			if (ws_schema_column(rm->merged, col->tag) != NULL || col->kind != WS_COL_STORED)
+				continue;
+			hb = WsRowCodec->cell_get(c->base, c->blen, col->tag, &cb);
+			if (ws_schema_column(o, col->tag) != NULL)
+			{
+				hs = WsRowCodec->cell_get(c->ours, c->olen, col->tag, &cs);
+				if (!SAME_CELL(hb, cb, hs, cs))
+					return false;
+			}
+			if (ws_schema_column(t, col->tag) != NULL)
+			{
+				hs = WsRowCodec->cell_get(c->theirs, c->tlen, col->tag, &cs);
+				if (!SAME_CELL(hb, cb, hs, cs))
+					return false;
+			}
 		}
+	return true;
+}
+
+/*
+ * Whether a row a side still has, and the other deleted, is only reshaped: each value
+ * of base's columns it still has is what base's was, as its type prints it.  Then the
+ * delete stands.
+ */
+static bool
+only_reshaped(RowMerge *rm, const WsTableSchema *side, const WsTableSchema *b, const uint8 *base_row,
+			  size_t blen, const uint8 *row, size_t len)
+{
+	for (int i = 0; i < b->ncols; i++)
+	{
+		const WsColumn *was = &b->cols[i];
+		const WsColumn *now = ws_schema_column(side, was->tag);
+		WsCell		cb,
+					cs;
+		bool		hb,
+					hs;
+		bool		in_key = false;
+
+		for (int k = 0; k < b->nkey; k++)
+			in_key |= b->key[k] == was->tag;
+		if (now == NULL || in_key || was->kind != WS_COL_STORED || now->kind != WS_COL_STORED)
+			continue;
+		hb = WsRowCodec->cell_get(base_row, blen, was->tag, &cb);
+		hs = WsRowCodec->cell_get(row, len, was->tag, &cs);
+		if (!cell_left(rm, side, b, was->tag, hs, &cs, hb, &cb))
+			return false;
 	}
 	return true;
+}
+
+/* A side's row taken as it wrote it, put in the merged form if it is still there as that. */
+typedef struct MoveTaken
+{
+	MoveMap    *from;
+	PHash	   *cur;
+	EditList	edits;
+} MoveTaken;
+
+static void
+move_taken_row(void *arg, const ProllyDiff *d)
+{
+	MoveTaken  *mt = arg;
+	RowMerge   *rm = mt->from->rm;
+	const uint8 *v;
+	size_t		vl;
+	int			rc;
+	WsField    *f;
+	MoveResult	moved;
+
+	CHECK_FOR_INTERRUPTS();
+	if (d->to == NULL)
+		return;
+	rc = prolly_get(rm->m->ctx, mt->cur, d->key, d->klen, &v, &vl);
+	if (rc < 0)
+		prolly_report(rm->m->ctx);
+	if (rc != PROLLY_OK || vl != d->tlen || memcmp(v, d->to, vl) != 0)
+		return;					/* (merged from both, or the other's) */
+	f = palloc_array(WsField, Max(rm->shape.nstored, 1));
+	moved = move_row(mt->from, d->key, d->klen, d->to, d->tlen, d->from == NULL, f);
+	if (moved == MOVED)
+	{
+		Buf			nk = BUF_INIT,
+					nv = BUF_INIT;
+
+		WsRowCodec->encode(&rm->shape, f, &nk, &nv);
+		if (nv.len != vl || memcmp(nv.data, d->to, vl) != 0)
+			edit_add(&mt->edits, d->key, d->klen, nv.data, nv.len, false);
+		buf_free(&nk);
+		buf_free(&nv);
+	}
+	else
+		row_conflict(rm, moved == MOVE_NOT_READ ? "row" : "generated", d->key, d->klen);
+	pfree(f);
+}
+
+static void
+move_taken_rows(MoveMap *from, const PHash *base, const PHash *side, PHash *cur)
+{
+	MoveTaken	mt = {from, cur};
+
+	if (!needs_moving(from))
+		return;
+	if (prolly_diff(from->rm->m->ctx, base, side, move_taken_row, &mt) < 0)
+		prolly_report(from->rm->m->ctx);
+	edits_apply(from->rm->m, &mt.edits, cur);
 }
 
 typedef struct KeylessMerge
 {
 	RowMerge   *rm;
 	const PHash *ours;
+	bool		reshaped;		/* so a row theirs removed must be one ours has */
 	EditList	edits;
 } KeylessMerge;
 
@@ -1482,7 +1699,9 @@ keyless_change(void *arg, const ProllyDiff *d)
 		prolly_report(ctx);
 	if (rc == PROLLY_OK)
 		ours = ws_rows_keyless_count(d->key, d->klen, held, heldlen);
-	if (ours + to <= from)
+	if (km->reshaped && ours + to < from)
+		row_conflict(km->rm, "row", d->key, d->klen);
+	else if (ours + to <= from)
 	{
 		if (rc == PROLLY_OK)
 			edit_add(&km->edits, d->key, d->klen, NULL, 0, true);
@@ -1512,8 +1731,16 @@ type_is_an_object(Merger *m, const PHash *objects, const char *type)
 		*cut = '\0';
 	if (name[0] == '"' && name[strlen(name) - 1] == '"')
 	{
+		char	   *to = name;
+
 		name[strlen(name) - 1] = '\0';
-		memmove(name, name + 1, strlen(name));
+		for (const char *p = name + 1; *p != '\0'; p++)
+		{
+			*to++ = *p;
+			if (p[0] == '"' && p[1] == '"')
+				p++;
+		}
+		*to = '\0';
 	}
 	for (int k = 0; !found && k < 2; k++)
 	{
@@ -1555,15 +1782,170 @@ static void
 read_one_side(Merger *m, const WsTableSchema *rec, const PHash *rows, const PHash *rv, PHash *out)
 {
 	RowMerge	rm;
-	PHash		empty;
 	MoveMap		mm;
 
-	if (prolly_empty(m->ctx, WS_ROW_VREFS, &empty) < 0)
-		prolly_report(m->ctx);
 	row_merge_init(&rm, m, rec, rv);
-	mm = (MoveMap) {&rm, rec, true, false, &empty};
+	mm = (MoveMap) {&rm, rec, true};
 	move_map(&mm, rows, out);
 	ws_row_shape_free(&rm.shape);
+}
+
+/* A keyless table's rows, all in one form if that follows from each row alone. */
+static void
+merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt, PHash *out)
+{
+	Merger	   *m = rm->m;
+	MoveMap		from_base = {rm, sides->base, m->ours_types_differ || m->theirs_types_differ};
+	MoveMap		ours = sides->ours;
+	MoveMap		theirs = sides->theirs;
+	bool		base_moves = sides->base != NULL && needs_moving(&from_base);
+	bool		ours_moves = needs_moving(&ours);
+	bool		theirs_moves = needs_moving(&theirs);
+	KeylessMerge km = {rm, NULL, base_moves || ours_moves || theirs_moves};
+	PHash		mb = *base,
+				mo = *ro,
+				mt = *rt,
+				cur;
+
+	/* one side only, already as merged: its rows are the merge's */
+	if (phash_eq(ro, base) && !theirs_moves)
+	{
+		*out = *rt;
+		return;
+	}
+	if (phash_eq(rt, base) && !ours_moves)
+	{
+		*out = *ro;
+		return;
+	}
+	if ((base_moves && !moves_from_the_row_alone(&from_base)) ||
+		(ours_moves && !moves_from_the_row_alone(&ours)) ||
+		(theirs_moves && !moves_from_the_row_alone(&theirs)))
+	{
+		row_conflict(rm, "row", NULL, 0);
+		*out = *ro;
+		return;
+	}
+	if (base_moves)
+		move_map(&from_base, base, &mb);
+	move_map(&ours, ro, &mo);
+	move_map(&theirs, rt, &mt);
+	cur = mo;
+	km.ours = &mo;
+	if (prolly_diff(m->ctx, &mb, &mt, keyless_change, &km) < 0)
+		prolly_report(m->ctx);
+	edits_apply(m, &km.edits, &cur);
+	*out = cur;
+}
+
+/*
+ * A column both sides added has no base to say which side left a row's value, even in a
+ * row only one changed: where they differ is a conflict.
+ */
+typedef struct BothAdded
+{
+	RowMerge   *rm;
+	uint64	   *tags;
+	int			n;
+} BothAdded;
+
+static void
+both_added_row(void *arg, const ProllyDiff *d)
+{
+	BothAdded  *ba = arg;
+
+	CHECK_FOR_INTERRUPTS();
+	if (d->from == NULL || d->to == NULL)
+		return;
+	for (int i = 0; i < ba->n; i++)
+	{
+		WsCell		ca,
+					cb;
+		bool		ha = WsRowCodec->cell_get(d->from, d->flen, ba->tags[i], &ca);
+		bool		hb = WsRowCodec->cell_get(d->to, d->tlen, ba->tags[i], &cb);
+
+		if (!SAME_CELL(ha, ca, hb, cb))
+		{
+			row_conflict(ba->rm, "row", d->key, d->klen);
+			return;
+		}
+	}
+}
+
+static void
+check_both_added(RowMerge *rm, const RowSides *sides, const PHash *ro, const PHash *rt)
+{
+	const WsTableSchema *o = sides->ours.side;
+	const WsTableSchema *t = sides->theirs.side;
+	const WsTableSchema *b = sides->base;
+	BothAdded	ba = {rm, palloc_array(uint64, Max(o->ncols, 1)), 0};
+
+	if (b == NULL)
+		return;					/* (a row with no base is compared cell by cell) */
+	for (int i = 0; i < o->ncols; i++)
+		if (o->cols[i].kind == WS_COL_STORED && ws_schema_column(t, o->cols[i].tag) != NULL &&
+			ws_schema_column(b, o->cols[i].tag) == NULL &&
+			ws_schema_column(rm->merged, o->cols[i].tag) != NULL)
+			ba.tags[ba.n++] = o->cols[i].tag;
+	if (ba.n > 0 && !phash_eq(ro, rt) && prolly_diff(rm->m->ctx, ro, rt, both_added_row, &ba) < 0)
+		prolly_report(rm->m->ctx);
+	pfree(ba.tags);
+}
+
+static void
+merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt, PHash *out)
+{
+	Merger	   *m = rm->m;
+	MoveMap		ours = sides->ours;
+	MoveMap		theirs = sides->theirs;
+	ProllyMergeResult res = {0};
+	EditList	edits = {0};
+	WsField    *f = palloc_array(WsField, Max(rm->shape.nstored, 1));
+	PHash		cur;
+
+	check_both_added(rm, sides, ro, rt);
+	if (prolly_merge(m->ctx, base, ro, rt, &res) < 0)
+		prolly_report(m->ctx);
+	cur = res.root;
+	for (size_t i = 0; i < res.nconflicts; i++)
+	{
+		const ProllyConflict *c = &res.conflicts[i];
+
+		CHECK_FOR_INTERRUPTS();
+		if (c->ours == NULL || c->theirs == NULL)
+		{
+			/* a delete: it stands if the other side only reshaped the row */
+			const WsTableSchema *still = c->ours != NULL ? ours.side : theirs.side;
+			const uint8 *row = c->ours != NULL ? c->ours : c->theirs;
+			size_t		len = c->ours != NULL ? c->olen : c->tlen;
+
+			if (c->base != NULL && sides->base != NULL &&
+				only_reshaped(rm, still, sides->base, c->base, c->blen, row, len))
+				edit_add(&edits, c->key, c->klen, NULL, 0, true);
+			else
+				row_conflict(rm, "row", c->key, c->klen);
+		}
+		else if (!merge_cells(rm, sides, c, f))
+			row_conflict(rm, "row", c->key, c->klen);
+		else if (!regenerate(rm, NULL, f))
+			row_conflict(rm, "generated", c->key, c->klen);
+		else
+		{
+			Buf			nk = BUF_INIT,
+						nv = BUF_INIT;
+
+			WsRowCodec->encode(&rm->shape, f, &nk, &nv);
+			edit_add(&edits, c->key, c->klen, nv.data, nv.len, false);
+			buf_free(&nk);
+			buf_free(&nv);
+		}
+	}
+	edits_apply(m, &edits, &cur);
+	prolly_merge_result_free(&res);
+	pfree(f);
+	move_taken_rows(&ours, base, ro, &cur);
+	move_taken_rows(&theirs, base, rt, &cur);
+	*out = cur;
 }
 
 static void
@@ -1572,80 +1954,23 @@ merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *b, const
 		   const PHash *rv, PHash *out)
 {
 	RowMerge	rm;
-	PHash		empty,
-				mb,
-				mo,
-				mt,
-				cur;
+	RowSides	sides;
+	PHash		empty;
 	const PHash *base = rb;
-	MoveMap		mm;
 
 	if (prolly_empty(m->ctx, WS_ROW_VREFS, &empty) < 0)
 		prolly_report(m->ctx);
 	if (base == NULL)
 		base = &empty;
 	row_merge_init(&rm, m, merged, rv);
-
-	mb = *base;
-	if (b != NULL)
-	{
-		mm = (MoveMap) {&rm, b, m->ours_types_differ || m->theirs_types_differ, true, base};
-		move_map(&mm, base, &mb);
-	}
-	rm.left_unfilled = false;
-	mm = (MoveMap) {&rm, o, m->ours_types_differ, false, base};
-	move_map(&mm, ro, &mo);
-	if (rm.left_unfilled && !phash_eq(ro, base))
-		row_conflict(&rm, "generated", NULL, 0);
-	rm.left_unfilled = false;
-	mm = (MoveMap) {&rm, t, m->theirs_types_differ, false, base};
-	move_map(&mm, rt, &mt);
-	if (rm.left_unfilled && !phash_eq(rt, base))
-		row_conflict(&rm, "generated", NULL, 0);
-
+	sides.ours = (MoveMap) {&rm, o, m->ours_types_differ};
+	sides.theirs = (MoveMap) {&rm, t, m->theirs_types_differ};
+	sides.base = b;
 	if (merged->nkey == 0)
-	{
-		KeylessMerge km = {&rm, &mo};
-
-		cur = mo;
-		if (prolly_diff(m->ctx, &mb, &mt, keyless_change, &km) < 0)
-			prolly_report(m->ctx);
-		edits_apply(m, &km.edits, &cur);
-	}
+		merge_keyless_rows(&rm, &sides, base, ro, rt, out);
 	else
-	{
-		ProllyMergeResult res = {0};
-		EditList	edits = {0};
-		WsField    *f = palloc_array(WsField, Max(rm.shape.nstored, 1));
-
-		if (prolly_merge(m->ctx, &mb, &mo, &mt, &res) < 0)
-			prolly_report(m->ctx);
-		cur = res.root;
-		for (size_t i = 0; i < res.nconflicts; i++)
-		{
-			const ProllyConflict *c = &res.conflicts[i];
-			Buf			nk = BUF_INIT,
-						nv = BUF_INIT;
-
-			CHECK_FOR_INTERRUPTS();
-			if (c->ours == NULL || c->theirs == NULL || !merge_cells(&rm, c, f))
-				row_conflict(&rm, "row", c->key, c->klen);
-			else if (!regenerate(&rm, NULL, f))
-				row_conflict(&rm, "generated", c->key, c->klen);
-			else
-			{
-				WsRowCodec->encode(&rm.shape, f, &nk, &nv);
-				edit_add(&edits, c->key, c->klen, nv.data, nv.len, false);
-			}
-			buf_free(&nk);
-			buf_free(&nv);
-		}
-		edits_apply(m, &edits, &cur);
-		prolly_merge_result_free(&res);
-		pfree(f);
-	}
+		merge_keyed_rows(&rm, &sides, base, ro, rt, out);
 	ws_row_shape_free(&rm.shape);
-	*out = cur;
 }
 
 /* ------------------------------------------------- computing, through SQL */
@@ -1678,28 +2003,28 @@ eval_statement(const WsEvalSchemas *in, const char *sql, int nparams, const char
 	return ok;
 }
 
-typedef struct VolatileCheck
+typedef struct VariesCheck
 {
 	const char *sql;
-	bool		volatile_;
-} VolatileCheck;
+	bool		varies;
+} VariesCheck;
 
 static void
-check_volatile(void *arg)
+check_varies(void *arg)
 {
-	VolatileCheck *vc = arg;
+	VariesCheck *vc = arg;
 	List	   *parsed = pg_parse_query(vc->sql);
 	Query	   *query = parse_analyze_fixedparams(linitial_node(RawStmt, parsed), vc->sql, NULL, 0, NULL);
 
-	vc->volatile_ = contain_volatile_functions((Node *) query->targetList);
+	vc->varies = contain_mutable_functions((Node *) query->targetList);
 }
 
 static bool
-sql_column_default(void *arg, const char *expr, char **out, bool *is_volatile)
+sql_column_default(void *arg, const char *expr, char **out, bool *varies)
 {
 	const WsEvalSchemas *in = arg;
 	char	   *sql = psprintf("SELECT (%s)", ws_text_from_utf8(expr));
-	VolatileCheck vc = {sql, false};
+	VariesCheck vc = {sql, false};
 	int			level = WsSql->begin();
 	bool		parsed = false;
 
@@ -1708,14 +2033,14 @@ sql_column_default(void *arg, const char *expr, char **out, bool *is_volatile)
 		int			nest = ws_schema_path_begin(in->schemas[i]);
 		WsSqlFailure failure;
 
-		parsed = WsSql->attempt_fn(check_volatile, &vc, &failure);
+		parsed = WsSql->attempt_fn(check_varies, &vc, &failure);
 		ws_schema_path_end(nest);
 	}
 	WsSql->end(level);
-	*is_volatile = vc.volatile_;
+	*varies = vc.varies;
 	if (!parsed)
 		return false;
-	if (vc.volatile_)
+	if (vc.varies)
 		return true;
 	if (!eval_statement(in, sql, 0, NULL, out))
 		return false;
@@ -1896,7 +2221,8 @@ keyless_rows_both_changed(Merger *m, const PHash *ours, const char *name, const 
 	PHash		rows;
 	bool		keyless;
 
-	if (b == NULL || o == NULL || phash_eq(&b->data, &o->data))
+	/* (a schema changed alike is one change: there is no adding it up) */
+	if (b == NULL || o == NULL || phash_eq(&b->data, &o->data) || !phash_eq(&b->schema, &o->schema))
 		return false;
 	if (!WsRoot->get_table(m->ctx, ours, name, &rec, &rows))
 		elog(ERROR, "a table listed is not there");

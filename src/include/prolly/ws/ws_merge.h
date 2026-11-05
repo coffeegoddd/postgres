@@ -12,7 +12,8 @@
  * As in Dolt: an index on a column dropped is dropped with it, a foreign key on one
  * goes too, and so does one on or to a table dropped.  Primary keys that differ, a key
  * both sides changed even alike, and a table both added otherwise are conflicts.
- * Unlike Dolt, whose checks of one column conflict, checks of other names both stay,
+ * A column dropped by one side and changed in a row by the other is a conflict, as in
+ * Dolt, though only for a row both changed.  Unlike Dolt, whose checks of one column conflict, checks of other names both stay,
  * as both can hold or be found violated; different privileges to one role conflict,
  * as Dolt has no grants to say otherwise.  Partition bounds that overlap are left for
  * ATTACH to refuse, on restore: a commit's bounds are text, not values.  So too what
@@ -22,20 +23,28 @@
  * sides reaching one set of a keyless table's rows still add up, as a multiset would,
  * where Dolt, seeing tables the same, keeps one side's.
  *
- * Rows merge in the merged record's form: each of the three maps is put in it first,
- * a dropped column's value gone, a column a map's side lacks given its default, and a
- * value under another type read as the merged one and written as that type does.  Then
- * by key, and where both sides changed a row, column by column; a keyless table's as a
- * multiset, theirs' change in a row's count added to ours'.  A stored generated column
- * is copied as it is unless its row is made from both sides, or written under another
- * expression, when it is computed from the merged values.  Those, a default's value
- * and whether a value reads, are what WsEval is for, and the only user code a merge
- * runs.
+ * Keyed rows merge by key as each side wrote them, and where both changed a row,
+ * column by column: a cell one side left is the other's, one both changed differently a
+ * conflict.  Only what is kept is put in the merged form, so a row or cell no one touched
+ * is never read: a dropped column's value goes, a value under another type, or one
+ * changed under one name, must read as the merged type and is written as that type
+ * prints it, not cast.  A row new on a side gets the default of a column only the
+ * other has; a row with a base does not, as the side that added the column gave it what
+ * it has.  A delete against a row the other side only reshaped stands.  A stored generated
+ * column is copied unless its row is made from both sides, or written under another
+ * expression or type, when it is computed from the merged values.
  *
- * A default of a value for each row, an identity's or a volatile one's, a merge has
- * none of: a row with one the side that added it gave stays, and a new one the other
- * side made has none to get, a generated conflict.  A primary key column of another
- * type is a key conflict, as a key is its values' text.
+ * Keyless rows have no identity but their cells, so all three maps are put in one form
+ * and theirs' change in each row's count added to ours', when that form follows from
+ * each row alone.  A retype, a value for each row or a type changed under one name does
+ * not, and with rows changed on the side that lacks it is a row conflict.  Both sides
+ * reaching one set of rows add up if the columns did not change; if they changed alike,
+ * that is one change.
+ *
+ * Computing those values, and whether a value reads, is what WsEval is for, and the only
+ * user code a merge runs.  A default that isn't immutable, or an identity, has no one
+ * value for a merge to give: a new row needing it is a generated conflict.  A primary
+ * key column of another type is a key conflict, as a key is its values' text.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
@@ -88,10 +97,10 @@ typedef struct WsEvalRoutine
 {
 	const char *name;
 	/*
-	 * An expression, its columns already names, as text; NULL as null.  If it is
-	 * volatile, only that, true: each row would have a value of its own.
+	 * An expression, its columns already names, as text; NULL as null.  If it is not
+	 * immutable, only that, true: it has no one value.
 	 */
-	bool		(*column_default) (void *arg, const char *expr, char **out, bool *is_volatile);
+	bool		(*column_default) (void *arg, const char *expr, char **out, bool *varies);
 	/* A generated column's expression over the columns of names, types and values (or NULL). */
 	bool		(*generated) (void *arg, const char *expr, int n, const char *const *names,
 							  const char *const *types, const char *const *values, char **out);
