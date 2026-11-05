@@ -2329,28 +2329,45 @@ duplicate_names(List *names)
 }
 
 /*
- * Whether a FULL JOIN's USING, in a query this one is in, has a column of one of these names:
- * printing keeps those apart from every other in the query, renaming the other.
+ * Whether printing would rename a column of one of these names in query q.  It keeps USING's
+ * columns apart from every other in a query if any join there, of no alias, merges one into
+ * what is not simply a column of a table, as a FULL JOIN does, or a join of two types.
  */
 static bool
-named_as_a_full_using(LostInPrint *l, List *names)
+named_as_a_kept_using(Query *q, List *names)
 {
-	foreach_ptr(Query, q, l->queries)
-		foreach_ptr(RangeTblEntry, rte, q->rtable)
-		{
-			int			merged = 0;
+	bool		kept = false;
 
-			if (rte->rtekind != RTE_JOIN || rte->jointype != JOIN_FULL)
-				continue;
-			foreach_node(String, used, rte->eref->colnames)
-			{
-				if (merged++ >= rte->joinmergedcols)
-					break;
-				foreach_node(String, name, names)
-					if (strcmp(strVal(used), strVal(name)) == 0)
-						return true;
-			}
+	foreach_ptr(RangeTblEntry, rte, q->rtable)
+	{
+		int			merged = 0;
+
+		if (rte->rtekind != RTE_JOIN || rte->alias != NULL)
+			continue;
+		foreach_ptr(Node, var, rte->joinaliasvars)
+		{
+			if (merged++ >= rte->joinmergedcols)
+				break;
+			kept |= var != NULL && !IsA(var, Var);
 		}
+	}
+	if (!kept)
+		return false;
+	foreach_ptr(RangeTblEntry, rte, q->rtable)
+	{
+		int			merged = 0;
+
+		if (rte->rtekind != RTE_JOIN)
+			continue;
+		foreach_node(String, used, rte->eref->colnames)
+		{
+			if (merged++ >= rte->joinmergedcols)
+				break;
+			foreach_node(String, name, names)
+				if (strcmp(strVal(used), strVal(name)) == 0)
+					return true;
+		}
+	}
 	return false;
 }
 
@@ -2369,9 +2386,12 @@ followed_by_columns_of_a_changed_type(RangeTblEntry *rte)
 
 		if (f->funccolnames == NIL && type != RECORDOID && type_is_rowtype(type))
 		{
-			TupleDesc	desc = lookup_rowtype_tupdesc(type, -1);
-			bool		changed = desc->natts != f->funccolcount;
+			TupleDesc	desc = lookup_rowtype_tupdesc_domain(type, -1, false);
+			bool		changed = false;
 
+			/* (columns since dropped hold no place a reader would see) */
+			for (int a = f->funccolcount; a < desc->natts; a++)
+				changed |= !TupleDescAttr(desc, a)->attisdropped;
 			ReleaseTupleDesc(desc);
 			if (changed)
 				return true;
@@ -2428,9 +2448,9 @@ lost_in_print_walker(Node *node, void *arg)
 				l->why = "it has a whole row of columns of one name, which printing tells apart";
 				return true;
 			}
-			if (named_as_a_full_using(l, rte->eref->colnames))
+			if (named_as_a_kept_using(q, rte->eref->colnames))
 			{
-				l->why = "it has a whole row with a column named as a FULL JOIN's USING, which printing renames";
+				l->why = "it has a whole row with a column named as a USING's, which printing renames";
 				return true;
 			}
 		}

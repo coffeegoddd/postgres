@@ -587,8 +587,9 @@ for my $case (
 	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT row_to_json(u) AS j FROM t1 a JOIN t2 b USING (i) AS u}, 'whole row of a join' ],
 	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT a.i FROM t1 a JOIN t2 b USING (i) AS u WHERE to_jsonb(u) ? 'i'}, 'whole row of a join' ],
 	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (k integer); CREATE VIEW w AS SELECT row_to_json(j) AS r FROM (t1 JOIN t2 ON i = k) AS j}, 'whole row of a join' ],
-	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS i, 9 AS z) x, t1 a FULL JOIN t2 c USING (i)}, 'FULL JOIN' ],
-	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT y.j FROM t1 a FULL JOIN t2 c USING (i), LATERAL (SELECT row_to_json(x) AS j FROM (SELECT 1 AS i) x) y}, 'FULL JOIN' ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS i, 9 AS z) x, t1 a FULL JOIN t2 c USING (i)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i bigint); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS i, 9 AS z) x, t1 a LEFT JOIN t2 c USING (i)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t3 (i integer); CREATE TABLE k1 (k integer); CREATE TABLE k2 (k integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS k, 9 AS z) x, t1 a FULL JOIN t3 c USING (i), k1 JOIN k2 USING (k)}, "named as a USING's" ],
 	[ q{CREATE TABLE t1 (i integer); CREATE FUNCTION tf() RETURNS SETOF t1 LANGUAGE sql AS 'SELECT 1'; CREATE VIEW w AS SELECT x.o FROM tf() WITH ORDINALITY x(a, o); ALTER TABLE t1 ADD n integer}, 'has changed since' ],
 	[ q{CREATE TABLE t1 (i integer); CREATE FUNCTION tf() RETURNS SETOF t1 LANGUAGE sql AS 'SELECT 1'; CREATE VIEW w AS SELECT x.q FROM ROWS FROM (tf(), generate_series(7, 7)) x(a, q); ALTER TABLE t1 ADD n integer}, 'has changed since' ])
 {
@@ -617,8 +618,16 @@ $node->safe_psql('postgres', q{CREATE SCHEMA kept AUTHORIZATION g_stable; SET RO
 	CREATE VIEW n AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id) x JOIN f1 USING (id);
 	CREATE VIEW o AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS z) x, f1 FULL JOIN f2 USING (id);
 	CREATE VIEW p AS SELECT x.ord FROM fr() WITH ORDINALITY x(a, b, ord);
-	CREATE VIEW q AS SELECT x.c FROM ROWS FROM (fr(), generate_series(1, 2)) x(a, b, c)});
-like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('kept')}), qr/^view\/d\t.*^view\/e\t.*^view\/f\t.*^view\/g\t.*^view\/h\t.*^view\/m\t.*^view\/n\t.*^view\/o\t.*^view\/p\t.*^view\/q\t/ms, 'columns of one name no whole row reads are held, a join\'s, ROW(), a whole row of a table with columns dropped, of a type, beside a join or a FULL JOIN of other names, and a function\'s columns while its type has not changed');
+	CREATE VIEW q AS SELECT x.c FROM ROWS FROM (fr(), generate_series(1, 2)) x(a, b, c);
+	CREATE VIEW r AS SELECT y.j FROM f1 a FULL JOIN f2 c USING (id), LATERAL (SELECT row_to_json(x) AS j FROM (SELECT 1 AS id) x) y;
+	CREATE VIEW s AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x, (f1 FULL JOIN f2 USING (id)) AS q;
+	CREATE VIEW u AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x, f1 JOIN f2 USING (id);
+	CREATE DOMAIN dtwo AS two; CREATE FUNCTION fd() RETURNS dtwo LANGUAGE sql AS 'SELECT ROW(1, 2)::two';
+	CREATE VIEW v AS SELECT x.o FROM fd() WITH ORDINALITY x(a, b, o);
+	CREATE TABLE grows (a integer); CREATE FUNCTION fg() RETURNS SETOF grows LANGUAGE sql AS 'SELECT 1';
+	CREATE VIEW x AS SELECT y.o FROM fg() WITH ORDINALITY y(a, o);
+	ALTER TABLE grows ADD COLUMN gone integer; ALTER TABLE grows DROP COLUMN gone});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('kept')}), qr/^view\/d\t.*^view\/e\t.*^view\/f\t.*^view\/g\t.*^view\/h\t.*^view\/m\t.*^view\/n\t.*^view\/o\t.*^view\/p\t.*^view\/q\t.*^view\/r\t.*^view\/s\t.*^view\/u\t.*^view\/v\t.*^view\/x\t/ms, 'columns of one name no whole row reads are held, a join\'s, ROW(), a whole row of a table with columns dropped, of a type, beside a join or a FULL JOIN of other names, a USING kept only in another query or under an alias, and a function\'s columns, of a domain too, while its type has not changed but for what is dropped');
 $node->safe_psql('postgres', q{DROP SCHEMA kept CASCADE});
 
 $node->stop;
