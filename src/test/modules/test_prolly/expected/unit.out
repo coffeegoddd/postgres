@@ -191,6 +191,11 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_row          | large_counted_values                 | ok     | 
  ws_row          | large_malformed                      | ok     | 
  ws_row          | large_wrong_tree                     | ok     | 
+ ws_row          | large_keyless_refs                   | ok     | 
+ ws_row          | large_refused_on_writing             | ok     | 
+ ws_row          | large_pieces_sharing_leaves          | ok     | 
+ ws_row          | large_trees_freed                    | ok     | 
+ ws_row          | large_change_bytes                   | ok     | 
  ws_sql          | rows                                 | ok     | 
  ws_sql          | attempt                              | ok     | 
  ws_sql          | attempt_cancelled                    | ok     | 
@@ -260,7 +265,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
  ws_tags         | tupdesc                              | ok     | 
-(248 rows)
+(253 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

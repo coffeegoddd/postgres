@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "engine_test_util.h"
+#include "prolly/engine/vc.h"
 #include "prolly/ws/ws_row.h"
 #include "test_prolly.h"
 
@@ -906,6 +907,242 @@ ENGINE_TEST(test_large_wrong_tree)
 	buf_free(&out);
 }
 
+typedef struct KeylessBad
+{
+	ProllyCtx  *ctx;
+	const WsRowShape *s;
+	Buf		   *k;
+	Buf		   *v;
+} KeylessBad;
+
+static void
+load_keyless_bad(void *arg)
+{
+	KeylessBad *b = arg;
+	WsField		got[1];
+	Buf			held = BUF_INIT;
+
+	ws_row_load(b->ctx, b->s, b->k->data, b->k->len, b->v->data, b->v->len, got, &held);
+}
+
+/* A keyless row's value says what its key names, or a read refuses it. */
+ENGINE_TEST(test_large_keyless_refs)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	uint64		tags[] = {1};
+	uint8	   *big = large_value(5000, 31);
+	WsField		f[1];
+	WsRowShape	s;
+	Buf			k = BUF_INIT,
+				v = BUF_INIT;
+	KeylessBad	b = {&ctx, &s, &k, &v};
+
+	f[0] = bytes_field(big, 5000);
+	ws_row_shape_init(&s, tags, 1, 0);
+	ws_row_store(&ctx, &s, f, &k, &v);
+	WsRowCodec->keyless_value(k.data, k.len, (const uint8 *) "\x01", 1, &v);
+	v.data[1] ^= 1;
+	expect_error(load_keyless_bad, &b, ERRCODE_DATA_CORRUPTED, NULL);
+	v.len = 0;
+	buf_append_uvarint(&v, 0);
+	expect_error(load_keyless_bad, &b, ERRCODE_DATA_CORRUPTED, NULL);
+	ws_row_shape_free(&s);
+	buf_free(&k);
+	buf_free(&v);
+}
+
+static void
+store_a_tree_as_a_value(void *arg)
+{
+	ProllyCtx  *ctx = arg;
+	uint64		tags[] = {1, 2};
+	WsField		f[2];
+	WsRowShape	s;
+	Buf			k = BUF_INIT,
+				v = BUF_INIT;
+
+	f[0] = text_field("k");
+	f[1] = text_field("named");
+	f[1].large = true;
+	ws_row_shape_init(&s, tags, 2, 1);
+	ws_row_store(ctx, &s, f, &k, &v);
+}
+
+static void
+encode_a_bad_tree(void *arg)
+{
+	WsCell		c[] = {{4, (const uint8 *) "short", 5, true}};
+	Buf			out = BUF_INIT;
+
+	WsRowCodec->cells_encode(c, 1, &out);
+}
+
+ENGINE_TEST(test_large_refused_on_writing)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+
+	expect_error(store_a_tree_as_a_value, &ctx, ERRCODE_INTERNAL_ERROR, NULL);
+	expect_error(encode_a_bad_tree, NULL, ERRCODE_DATA_CORRUPTED, NULL);
+}
+
+/* Pieces sharing a leaf are as much the value: nothing hangs on one piece a leaf. */
+ENGINE_TEST(test_large_pieces_sharing_leaves)
+{
+	static const ChunkPolicy wide = {16384, 65536, 262144};
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &wide);
+	uint8	   *big = large_value(100000, 41);
+	PHash		root;
+	Buf			out = BUF_INIT;
+
+	WsLargeValues->put(&ctx, big, 100000, &root);
+	WsLargeValues->get(&ctx, &root, 100000, &out);
+	CHECK(out.len == 100000 && memcmp(out.data, big, 100000) == 0);
+	buf_free(&out);
+}
+
+/* One row map's row, its key the given one, as a map. */
+static PHash
+map_of_row(ProllyCtx *ctx, const WsRowShape *s, WsField *f)
+{
+	Buf			k = BUF_INIT,
+				v = BUF_INIT;
+	ProllyKV	kv;
+	PHash		map;
+
+	ws_row_store(ctx, s, f, &k, &v);
+	kv.key = k.data;
+	kv.klen = k.len;
+	kv.val = v.data;
+	kv.vlen = v.len;
+	CHECK_OK(prolly_build(ctx, WS_ROW_VREFS, &kv, 1, &map));
+	buf_free(&k);
+	buf_free(&v);
+	return map;
+}
+
+/* A row's trees are held by the row map and go with it, one tree in two columns too. */
+ENGINE_MEMORY_TEST(test_large_trees_freed)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	uint64		tags[] = {1, 2, 3};
+	uint8	   *big = large_value(20000, 51);
+	uint8	   *other = large_value(20000, 52);
+	WsField		f[3];
+	WsRowShape	s;
+	PHash		map,
+				next,
+				tree,
+				kept;
+	Buf			out = BUF_INIT;
+
+	ws_row_shape_init(&s, tags, 3, 1);
+	f[0] = text_field("k");
+	f[1] = bytes_field(big, 20000);
+	f[2] = bytes_field(big, 20000);
+	map = map_of_row(&ctx, &s, f);
+	WsLargeValues->put(&ctx, big, 20000, &tree);
+	cs_ref_root(cs, map.b);
+
+	f[2] = bytes_field(other, 20000);
+	f[1] = bytes_field(other, 20000);
+	next = map_of_row(&ctx, &s, f);
+	WsLargeValues->put(&ctx, other, 20000, &kept);
+	cs_ref_root(cs, next.b);
+	settle_and_check(cs);
+	CHECK(cs_has(cs, tree.b));
+
+	/* the first row goes, and its tree with it; the other stays whole */
+	cs_unref_root(cs, map.b);
+	CHECK(cs_free(cs, map.b, 1) > 0);
+	settle_and_check(cs);
+	CHECK(!cs_has(cs, tree.b));
+	WsLargeValues->get(&ctx, &kept, 20000, &out);
+	CHECK(out.len == 20000 && memcmp(out.data, other, 20000) == 0);
+	ws_row_shape_free(&s);
+	buf_free(&out);
+}
+
+static void
+count_chunk(void *arg, const PHash *h)
+{
+	uint64	   *total = arg;
+
+	(*total)++;
+}
+
+/* What a commit measures counts a large value's tree, and shares its unchanged pieces. */
+ENGINE_TEST(test_large_change_bytes)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	size_t		len = 200000;
+	uint64		tags[] = {1, 2};
+	uint8	   *big = large_value(len, 61);
+	WsField		f[2];
+	WsRowShape	s;
+	PHash		empty,
+				one,
+				two,
+				rv,
+				rv1,
+				rv2,
+				c1,
+				c2,
+				c3;
+	uint64		nodes = 0;
+	VcCommit	k;
+	uint64		b1,
+				b2,
+				b3;
+
+	ws_row_shape_init(&s, tags, 2, 1);
+	f[0] = text_field("k");
+	f[1] = bytes_field(big, len);
+	one = map_of_row(&ctx, &s, f);
+	CHECK_OK(prolly_empty(&ctx, 0, &empty));
+
+	/* every piece new against nothing */
+	CHECK_OK(prolly_chunk_diff_values(&ctx, &one, &empty, count_chunk, &nodes));
+	CHECK(nodes >= len / 4000);
+
+	/* a byte changed: a piece and its way up */
+	big[100000] ^= 1;
+	two = map_of_row(&ctx, &s, f);
+	nodes = 0;
+	CHECK_OK(prolly_chunk_diff_values(&ctx, &two, &one, count_chunk, &nodes));
+	CHECK(nodes > 0 && nodes < 10);
+
+	/* nothing changed, and a tree of no references */
+	nodes = 0;
+	CHECK_OK(prolly_chunk_diff_values(&ctx, &one, &one, count_chunk, &nodes));
+	CHECK_OK(prolly_chunk_diff_values(&ctx, &empty, &one, count_chunk, &nodes));
+	CHECK_EQ(nodes, 0);
+
+	/* and through a commit: a value's size, then a piece's */
+	rv = vc_root_empty(&ctx);
+	vc_table_put(&ctx, &rv, "t", "x", 1, &one, &rv1);
+	vc_table_put(&ctx, &rv, "t", "x", 1, &two, &rv2);
+	c1 = vc_commit_write(&ctx, &rv, NULL, 0, 1, "none");
+	c2 = vc_commit_write(&ctx, &rv1, &c1, 1, 2, "large");
+	c3 = vc_commit_write(&ctx, &rv2, &c2, 1, 3, "edit");
+	CHECK(vc_commit_load(&ctx, &c1, &k));
+	b1 = k.bytes;
+	vc_commit_release(&k);
+	CHECK(vc_commit_load(&ctx, &c2, &k));
+	b2 = k.bytes;
+	vc_commit_release(&k);
+	CHECK(vc_commit_load(&ctx, &c3, &k));
+	b3 = k.bytes;
+	vc_commit_release(&k);
+	CHECK(b2 - b1 >= len);
+	CHECK(b3 - b2 > 4000 && b3 - b2 < 40000);
+	ws_row_shape_free(&s);
+}
+
 static const ProllyUnitTest tests[] = {
 	{"bytes", test_bytes},
 	{"round_trip", test_round_trip},
@@ -924,6 +1161,11 @@ static const ProllyUnitTest tests[] = {
 	{"large_counted_values", test_large_counted_values},
 	{"large_malformed", test_large_malformed},
 	{"large_wrong_tree", test_large_wrong_tree},
+	{"large_keyless_refs", test_large_keyless_refs},
+	{"large_refused_on_writing", test_large_refused_on_writing},
+	{"large_pieces_sharing_leaves", test_large_pieces_sharing_leaves},
+	{"large_trees_freed", test_large_trees_freed},
+	{"large_change_bytes", test_large_change_bytes},
 };
 
 const ProllyUnitSuite unit_ws_row_suite = {"ws_row", tests, lengthof(tests)};

@@ -120,6 +120,13 @@ cells_ready(WsCell *c, int n)
 			elog(ERROR, "a row with two cells of tag " UINT64_FORMAT, c[i].tag);
 		if (!c[i].large && c[i].len > WS_LARGE_CELL)
 			elog(ERROR, "a value of %zu bytes in its cell", c[i].len);
+		if (c[i].large)
+		{
+			PHash		root;
+			uint64		total;
+
+			large_decode(c[i].p, c[i].len, &root, &total);
+		}
 	}
 }
 
@@ -531,8 +538,9 @@ ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Bu
 
 	for (int i = 0; i < s->nstored; i++)
 	{
+		if (f[i].large)
+			elog(ERROR, "a large value's tree given as a value to store");
 		fields[i] = f[i];
-		fields[i].large = false;
 		if (i >= s->nkey && !f[i].null && f[i].len > WS_LARGE_CELL)
 		{
 			PHash		root;
@@ -561,6 +569,14 @@ ws_row_load(ProllyCtx *ctx, const WsRowShape *s, const uint8 *k, size_t kl,
 	size_t	   *at = palloc_array(size_t, Max(s->nstored, 1));
 
 	WsRowCodec->decode(s, k, kl, v, vl, f);
+	if (s->nkey == 0)
+	{
+		const uint8 *payload;
+		size_t		plen;
+
+		/* (decoding reads its key alone) */
+		WsRowCodec->keyless_payload(k, kl, v, vl, &payload, &plen);
+	}
 	held->len = 0;
 	for (int i = 0; i < s->nstored; i++)
 		if (f[i].large)

@@ -1657,6 +1657,96 @@ prolly_chunk_diff(ProllyCtx *ctx, const PHash *a, const PHash *b,
 	return rc;
 }
 
+typedef struct ValueTrees
+{
+	ProllyCtx  *ctx;
+	ProllyChunkFn fn;
+	void	   *arg;
+	bool		from_counted;
+	PHash		empty;
+	PHashMap	seen;
+	int			rc;
+} ValueTrees;
+
+static void
+value_tree_node(void *arg, const PHash *h)
+{
+	ValueTrees *w = arg;
+	bool		created;
+
+	(void) phmap_ref(&w->seen, h, &created);
+	if (created)
+		w->fn(w->arg, h);
+}
+
+static void
+value_trees_of_change(void *arg, const ProllyDiff *d)
+{
+	ValueTrees *w = arg;
+	const uint8 *to,
+			   *from = NULL;
+	uint64		nto,
+				nfrom = 0;
+
+	if (d->to == NULL || w->rc != PROLLY_OK)
+		return;
+	if (!engine_leaf_value_refs(d->to, d->tlen, &to, &nto) ||
+		(d->from != NULL && w->from_counted &&
+		 !engine_leaf_value_refs(d->from, d->flen, &from, &nfrom)))
+	{
+		w->rc = fail(w->ctx, PROLLY_ERR_BAD_VALUE, NULL);
+		return;
+	}
+	for (uint64 i = 0; i < nto && w->rc == PROLLY_OK; i++)
+	{
+		PHash		tree,
+					old = w->empty;
+
+		memcpy(tree.b, to + i * PHASH_LEN, PHASH_LEN);
+		if (i < nfrom)
+			memcpy(old.b, from + i * PHASH_LEN, PHASH_LEN);
+		w->rc = prolly_chunk_diff(w->ctx, &tree, &old, value_tree_node, w);
+	}
+}
+
+static int
+vrefs_of(ProllyCtx *ctx, const PHash *root, uint8 *vrefs)
+{
+	PNode	   *n = node_load(ctx, root);
+
+	if (n == NULL)
+		return ctx->err;
+	*vrefs = n->vrefs;
+	node_free(n);
+	return PROLLY_OK;
+}
+
+int
+prolly_chunk_diff_values(ProllyCtx *ctx, const PHash *a, const PHash *b,
+						 ProllyChunkFn fn, void *arg)
+{
+	ValueTrees	w = {ctx, fn, arg};
+	uint8		va = 0,
+				vb = 0;
+	int			rc;
+
+	if (phash_eq(a, b))
+		return PROLLY_OK;
+	rc = vrefs_of(ctx, a, &va);
+	if (rc == PROLLY_OK)
+		rc = vrefs_of(ctx, b, &vb);
+	if (rc != PROLLY_OK || va != CHUNK_VREFS_COUNTED)
+		return rc;
+	w.from_counted = vb == CHUNK_VREFS_COUNTED;
+	rc = prolly_empty(ctx, 0, &w.empty);
+	if (rc != PROLLY_OK)
+		return rc;
+	phmap_init(&w.seen);
+	rc = prolly_diff(ctx, b, a, value_trees_of_change, &w);
+	phmap_free(&w.seen);
+	return rc != PROLLY_OK ? rc : w.rc;
+}
+
 /* ---------------------------------------------------------------- merge */
 
 static bool

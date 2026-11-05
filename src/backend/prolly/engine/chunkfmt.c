@@ -60,6 +60,17 @@ engine_leaf_value_valid(uint8 vrefs, const uint8 *v, size_t vl)
 	return nrefs <= (uint64) (end - v) / PHASH_LEN;
 }
 
+bool
+engine_leaf_value_refs(const uint8 *v, size_t vl, const uint8 **hashes, uint64 *nrefs)
+{
+	const uint8 *end = v + vl;
+
+	if (!read_uvarint(&v, end, nrefs) || *nrefs > (uint64) (end - v) / PHASH_LEN)
+		return false;
+	*hashes = v;
+	return true;
+}
+
 void
 engine_node_header_write(Buf *b, const ChunkPolicy *p, int level, uint8 vrefs,
 				  uint32 count)

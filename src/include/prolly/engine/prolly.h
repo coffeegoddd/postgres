@@ -194,6 +194,15 @@ extern int	prolly_chunk_diff(ProllyCtx *ctx, const PHash *a, const PHash *b,
 							  ProllyChunkFn fn, void *arg);
 
 /*
+ * Of a tree of counted references, the nodes of the trees its changed entries
+ * name that are not in the tree at the same place of b's entry of that key, each
+ * once: the rest of what a has that b lacks, content alone deciding it.  A tree
+ * the entries of b name elsewhere counts as new.  Nothing for other trees.
+ */
+extern int	prolly_chunk_diff_values(ProllyCtx *ctx, const PHash *a, const PHash *b,
+									 ProllyChunkFn fn, void *arg);
+
+/*
  * A delta is a chunk listing the row edits that turn tree base into tree
  * target.  Because a tree is a function of its contents, applying it to
  * base reproduces target exactly; delta_apply checks the hash.

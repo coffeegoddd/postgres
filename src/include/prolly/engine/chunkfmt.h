@@ -111,6 +111,8 @@ typedef struct NodeHeader
 extern bool engine_policy_valid(const ChunkPolicy *p);
 /* Whether a leaf value holds the hashes a tree of this vrefs says it starts with. */
 extern bool engine_leaf_value_valid(uint8 vrefs, const uint8 *v, size_t vl);
+/* A tree-of-counted-vrefs leaf value's hashes, pointing into it; false if it has none it says. */
+extern bool engine_leaf_value_refs(const uint8 *v, size_t vl, const uint8 **hashes, uint64 *nrefs);
 extern bool engine_node_header_parse(const uint8 *data, size_t len, NodeHeader *h);
 extern void engine_node_header_write(Buf *b, const ChunkPolicy *p, int level,
 							  uint8 vrefs, uint32 count);
