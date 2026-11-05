@@ -15,7 +15,10 @@
  * Unlike Dolt, whose checks of one column conflict, checks of other names both stay,
  * as both can hold or be found violated; different privileges to one role conflict,
  * as Dolt has no grants to say otherwise.  Partition bounds that overlap are left for
- * ATTACH to refuse, on restore: a commit's bounds are text, not values.
+ * ATTACH to refuse, on restore: a commit's bounds are text, not values.  So too what
+ * only Postgres can tell of the whole: a key to columns no longer unique, or of a type
+ * no longer alike, a child without a constraint its table now has.  Whoever applies a
+ * merge restores it, and what is refused then is what the merge makes.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
@@ -23,7 +26,7 @@
  *	table-ddl <table>			both changed something of a table's other than a
  *								column differently, what the merge makes is not a
  *								table a record can be, a partition or child lacks
- *								what its table has, or its name is another's
+ *								its table's columns, or its name is another's
  *	column <table>.<name>		both changed a column differently, or one dropped
  *								what the other changed
  *	column-name <table>.<name>	two different columns took the same name

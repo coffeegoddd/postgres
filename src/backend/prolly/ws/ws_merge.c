@@ -22,6 +22,7 @@
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_schema.h"
+#include "prolly/ws/ws_tags.h"
 
 typedef struct Merger
 {
@@ -591,27 +592,52 @@ order_inherited_cols(WsTableSchema *out)
 	out->ninherited_cols = n;
 }
 
-/*
- * An index on a column dropped goes with it, with what is said of it: a record of
- * the merged columns and that index alone says so.
- */
+static const char *
+name_of_column(void *arg, uint64 tag)
+{
+	const WsColumn *col = ws_schema_column((const WsTableSchema *) arg, tag);
+
+	return col != NULL ? col->name : NULL;
+}
+
+/* Whether a stored expression names a column the record does not have. */
+static bool
+expression_lost_column(const WsTableSchema *s, const char *stored)
+{
+	Buf			rendered = BUF_INIT;
+	uint64		missing = 0;
+	bool		lost;
+
+	if (stored == NULL)
+		return false;
+	lost = !ws_tags_render(stored, name_of_column, (void *) s, &rendered, &missing);
+	buf_free(&rendered);
+	return lost;
+}
+
+/* Whether an index is on a column the record does not have. */
+static bool
+index_lost_column(const WsTableSchema *s, const WsIndex *ix)
+{
+	for (int k = 0; k < ix->nkeys; k++)
+		if (ix->keys[k].tag != 0 ? ws_schema_column(s, ix->keys[k].tag) == NULL :
+			expression_lost_column(s, ix->keys[k].expr))
+			return true;
+	for (int c = 0; c < ix->ninclude; c++)
+		if (ws_schema_column(s, ix->include[c]) == NULL)
+			return true;
+	return expression_lost_column(s, ix->predicate);
+}
+
+/* An index on a column dropped goes with it, with what is said of it. */
 static void
 drop_indexes_of_dropped(WsTableSchema *out)
 {
-	WsTableSchema columns_only = {.name = out->name, .ncols = out->ncols, .cols = out->cols,
-		.key_name = out->key_name, .nkey = out->nkey, .key = out->key,
-	.replica_identity = WS_REPLICA_DEFAULT};
 	int			kept = 0;
 
-	if (ws_schema_problem(&columns_only) != NULL)
-		return;
 	for (int i = 0; i < out->nindexes; i++)
 	{
-		WsTableSchema one = columns_only;
-
-		one.indexes = &out->indexes[i];
-		one.nindexes = 1;
-		if (ws_schema_problem(&one) == NULL)
+		if (!index_lost_column(out, &out->indexes[i]))
 		{
 			out->indexes[kept++] = out->indexes[i];
 			continue;
@@ -619,13 +645,14 @@ drop_indexes_of_dropped(WsTableSchema *out)
 		for (int s = 0; s < out->nindex_settings; s++)
 			if (strcmp(out->index_settings[s].index, out->indexes[i].name) == 0)
 			{
-				out->index_settings[s] = out->index_settings[--out->nindex_settings];
-				qsort(out->index_settings, out->nindex_settings, sizeof(WsIndexSettings), index_settings_cmp);
+				memmove(&out->index_settings[s], &out->index_settings[s + 1],
+						(out->nindex_settings - s - 1) * sizeof(WsIndexSettings));
+				out->nindex_settings--;
 				break;
 			}
 		for (int c = 0; c < out->ncomments; c++)
-			if (out->comments[c].name != NULL && strcmp(out->comments[c].name, out->indexes[i].name) == 0 &&
-				out->comments[c].kind != WS_COMMENT_COLUMN && out->comments[c].kind != WS_COMMENT_SEQUENCE)
+			if (out->comments[c].kind == WS_COMMENT_INDEX &&
+				strcmp(out->comments[c].name, out->indexes[i].name) == 0)
 			{
 				memmove(&out->comments[c], &out->comments[c + 1], (out->ncomments - c - 1) * sizeof(WsComment));
 				out->ncomments--;
@@ -1185,7 +1212,7 @@ typedef struct NameSeen
 	int			cap;
 } NameSeen;
 
-/* A relation's or type's name, of the one namespace they share. */
+/* A name, of a namespace of those a relation's or type's are in. */
 static void
 name_taken(NameSeen *seen, const char *name)
 {
@@ -1206,12 +1233,18 @@ name_taken(NameSeen *seen, const char *name)
 	seen->names[seen->n++] = pstrdup(name);
 }
 
-/* What only the merged root as a whole can show: Postgres would refuse to make it. */
+/*
+ * What no record alone says, plainly: a partition's or child's table and columns, and
+ * a name two of a namespace take.  A relation has a name among relations, and all but
+ * an index a type of that name among types; a type is only that.  What Postgres
+ * alone can tell, restoring the root says.
+ */
 static void
 check_merged_root(Merger *m, const PHash *rv)
 {
 	TableList	tables = {0};
-	NameSeen	seen = {m};
+	NameSeen	relations = {m};
+	NameSeen	types = {m};
 	PHash		objects;
 
 	WsRoot->tables(m->ctx, rv, list_table, &tables);
@@ -1226,15 +1259,19 @@ check_merged_root(Merger *m, const PHash *rv)
 			check_has_its_tables_columns(m, rv, &rec, rec.partition_of);
 		for (int p = 0; p < rec.ninherits; p++)
 			check_has_its_tables_columns(m, rv, &rec, rec.inherits[p]);
-		name_taken(&seen, rec.name);
-		name_taken(&seen, rec.key_name);
+		name_taken(&relations, rec.name);
+		name_taken(&types, rec.name);
+		name_taken(&relations, rec.key_name);
 		for (int k = 0; k < rec.nconstraints; k++)
 			if (rec.constraints[k].kind == WS_CONSTRAINT_UNIQUE || rec.constraints[k].kind == WS_CONSTRAINT_EXCLUSION)
-				name_taken(&seen, rec.constraints[k].name);
+				name_taken(&relations, rec.constraints[k].name);
 		for (int k = 0; k < rec.nindexes; k++)
-			name_taken(&seen, rec.indexes[k].name);
+			name_taken(&relations, rec.indexes[k].name);
 		for (int c = 0; c < rec.ncols; c++)
-			name_taken(&seen, rec.cols[c].identity_seq);
+		{
+			name_taken(&relations, rec.cols[c].identity_seq);
+			name_taken(&types, rec.cols[c].identity_seq);
+		}
 		ws_schema_free(&rec);
 	}
 	if (WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &objects))
@@ -1245,10 +1282,13 @@ check_merged_root(Merger *m, const PHash *rv)
 		ws_obj_list(m->ctx, &objects, &objs, &n);
 		for (int i = 0; i < n; i++)
 		{
-			if (objs[i].kind == WS_OBJ_VIEW || objs[i].kind == WS_OBJ_MATVIEW ||
-				objs[i].kind == WS_OBJ_SEQUENCE || objs[i].kind == WS_OBJ_INDEX ||
-				objs[i].kind == WS_OBJ_TYPE || objs[i].kind == WS_OBJ_DOMAIN)
-				name_taken(&seen, objs[i].name);
+			WsObjectKind kind = objs[i].kind;
+
+			if (kind == WS_OBJ_VIEW || kind == WS_OBJ_MATVIEW || kind == WS_OBJ_SEQUENCE || kind == WS_OBJ_INDEX)
+				name_taken(&relations, objs[i].name);
+			if (kind == WS_OBJ_VIEW || kind == WS_OBJ_MATVIEW || kind == WS_OBJ_SEQUENCE ||
+				kind == WS_OBJ_TYPE || kind == WS_OBJ_DOMAIN)
+				name_taken(&types, objs[i].name);
 			ws_obj_free(&objs[i]);
 		}
 	}
