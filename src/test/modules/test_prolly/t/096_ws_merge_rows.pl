@@ -191,7 +191,14 @@ my @scenarios = (
 		q{ALTER TABLE t ADD COLUMN c integer; ALTER TABLE t ALTER COLUMN c SET DEFAULT 7}, q{DELETE FROM t WHERE a = 1},
 		[ 'row t (keyless)' ], undef ],
 	[ 'keyless, one enum value renamed by both', q{CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (v e, x text); INSERT INTO t VALUES ('a', 'x')},
-		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, [], undef ],
+		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, [], 'as ours' ],
+	[ 'keyless, a type changed by one, one row inserted by both', q{CREATE TYPE e AS ENUM ('b'); CREATE TABLE t (v e, w text); INSERT INTO t VALUES ('b', 'x')},
+		q{ALTER TYPE e ADD VALUE 'c'; INSERT INTO t VALUES ('b', 'o')}, q{INSERT INTO t VALUES ('b', 'o')}, [ 'row t (keyless)' ], undef ],
+	[ 'keyless, both add a nullable column, a row by one', "$K; INSERT INTO t VALUES (1, 'x')",
+		q{ALTER TABLE t ADD COLUMN c integer; INSERT INTO t VALUES (2, 'y')}, q{ALTER TABLE t ADD COLUMN c integer}, [],
+		"1|x|\n2|y|" ],
+	[ 'a multirange of a changed enum range', q{CREATE TYPE e AS ENUM ('a', 'b'); CREATE TYPE er AS RANGE (subtype = e); CREATE TABLE t (id integer PRIMARY KEY, v er_multirange); INSERT INTO t VALUES (1, '{[b,b]}')},
+		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{INSERT INTO t VALUES (2, '{[a,b]}')}, [ 'row t 2' ], undef ],
 	[ 'keyless, one enum value renamed by both, a row deleted', q{CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (v e, x text); INSERT INTO t VALUES ('a', 'x')},
 		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{ALTER TYPE e RENAME VALUE 'a' TO 'z'; DELETE FROM t}, [ 'row t (keyless)' ], undef ],
 	[ 'keyless, an unrelated type, and rows by both', q{CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (v e, x text); INSERT INTO t VALUES ('a', 'x')},
@@ -201,7 +208,8 @@ my @scenarios = (
 	[ 'keyless, one column added by both, values differing', "$K; INSERT INTO t VALUES (1, 'x')",
 		q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, q{ALTER TABLE t ADD COLUMN c integer; ALTER TABLE t ALTER COLUMN c SET DEFAULT 7}, [ 'row t (keyless)' ], undef ],
 	[ 'keyless, many rows reshaped, some into one', q{CREATE TABLE t (a integer, b text); INSERT INTO t SELECT i % 3, 'v' || i FROM generate_series(1, 2500) i},
-		q{ALTER TABLE t DROP COLUMN b}, q{INSERT INTO t VALUES (1, 'new')}, [], undef ],
+		q{ALTER TABLE t DROP COLUMN b}, q{INSERT INTO t VALUES (1, 'new')}, [],
+		join("\n", (0) x 833, (1) x 835, (2) x 833) ],
 	[ 'keyless, a retype by both', "$K; INSERT INTO t VALUES (1, 'x')", q{ALTER TABLE t ALTER COLUMN a TYPE bigint}, q{ALTER TABLE t ALTER COLUMN a TYPE bigint}, [],
 		"1|x" ],
 	[ 'a table only one side changed, an unrelated type the other', "$T; $ROWS",
@@ -290,7 +298,12 @@ for my $case (@scenarios)
 	\\echo =====same
 	SELECT test_ws_root_rows_hash(:'m', 't') = test_ws_rows_hash('d$i', 't');
 	\\echo =====end
-	} if defined $rows;
+	} if defined $rows && $rows ne 'as ours';
+	$script .= qq{
+	\\echo =====same
+	SELECT test_ws_root_rows_hash(:'m', 't') = test_ws_rows_hash('o$i', 't');
+	\\echo =====end
+	} if defined $rows && $rows eq 'as ours';
 	my ($rc, $out, $err) = $node->psql('postgres', $script);
 	is($rc, 0, "$name: runs") or diag($err);
 	my ($merge) = $out =~ /=====merge\n(.*?)\n?=====end/s;
@@ -300,7 +313,7 @@ for my $case (@scenarios)
 	if (defined $rows)
 	{
 		my ($got) = $out =~ /=====rows\n(.*?)\n?=====end/s;
-		is($got // '', $rows, "$name: its rows");
+		is($got // '', $rows, "$name: its rows") if $rows ne 'as ours';
 		# what restored and captured again is what the merge made: the same map
 		my ($same) = $out =~ /=====same\n(.*?)\n?=====end/s;
 		is($same // '', 't', "$name: restored, the map the merge made");

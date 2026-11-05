@@ -1865,22 +1865,27 @@ static char *
 type_base_name(const char *type)
 {
 	char	   *name = pstrdup(type);
-	char	   *cut = strpbrk(name, "[(");
 
-	if (cut != NULL)
-		*cut = '\0';
-	if (name[0] == '"' && name[strlen(name) - 1] == '"')
+	if (name[0] == '"')
 	{
+		const char *p = name + 1;
 		char	   *to = name;
 
-		name[strlen(name) - 1] = '\0';
-		for (const char *p = name + 1; *p != '\0'; p++)
+		/* (what is in quotes is the name, whatever it holds) */
+		for (; *p != '\0' && !(p[0] == '"' && p[1] != '"'); p++)
 		{
 			*to++ = *p;
-			if (p[0] == '"' && p[1] == '"')
+			if (p[0] == '"')
 				p++;
 		}
 		*to = '\0';
+	}
+	else
+	{
+		char	   *cut = strpbrk(name, "[(");
+
+		if (cut != NULL)
+			*cut = '\0';
 	}
 	return name;
 }
@@ -1957,12 +1962,19 @@ columns_of_types_differing(RowMerge *rm, const PHash *rv, const TypesDiffering *
 	for (int i = 0; i < rm->shape.nstored; i++)
 	{
 		char	   *name = type_base_name(ws_schema_column(rm->merged, rm->shape.tags[i])->type);
+		char	   *suffix = strlen(name) > 11 ? name + strlen(name) - 11 : NULL;
+		char	   *range = NULL;
 
-		for (int k = 0; !differs[i] && k < 2; k++)
+		/* (a multirange is no object of its own: it is its range's, as Postgres names it) */
+		if (suffix != NULL && strcmp(suffix, "_multirange") == 0)
+			range = pnstrdup(name, suffix - name);
+		for (int k = 0; !differs[i] && k < 3; k++)
 		{
 			Buf			key = BUF_INIT;
 
-			ws_obj_key(k == 0 ? WS_OBJ_TYPE : WS_OBJ_DOMAIN, name, NULL, &key);
+			if (k == 2 && range == NULL)
+				break;
+			ws_obj_key(k == 1 ? WS_OBJ_DOMAIN : WS_OBJ_TYPE, k == 2 ? range : name, NULL, &key);
 			buf_append_byte(&key, 0);
 			differs[i] = object_needs_differing(m, &objects, (const char *) key.data, td, 0);
 			buf_free(&key);
@@ -1997,6 +2009,40 @@ read_one_side(Merger *m, const WsTableSchema *rec, const PHash *rows, const PHas
 	ws_row_shape_free(&rm.shape);
 }
 
+typedef struct AddedValues
+{
+	const RowSides *sides;
+	bool		found;
+} AddedValues;
+
+static void
+added_value_row(void *arg, const ProllyDiff *d)
+{
+	AddedValues *av = arg;
+	WsCell		cells[WS_MAX_COLS];
+	int			n;
+
+	if (d->to == NULL || av->found)
+		return;
+	n = WsRowCodec->key_cells(d->key, d->klen, cells);
+	for (int i = 0; i < n; i++)
+		if (ws_schema_column(av->sides->base, cells[i].tag) == NULL &&
+			ws_schema_column(av->sides->ours.side, cells[i].tag) != NULL &&
+			ws_schema_column(av->sides->theirs.side, cells[i].tag) != NULL)
+			av->found = true;
+}
+
+/* Whether a side's changed rows hold a value in a column both added: else they are null alike. */
+static bool
+keyless_values_in_added(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *side)
+{
+	AddedValues av = {sides, false};
+
+	if (prolly_diff(rm->m->ctx, base, side, added_value_row, &av) < 0)
+		prolly_report(rm->m->ctx);
+	return av.found;
+}
+
 /* A keyless table's rows, all in one form if that follows from each row alone. */
 static void
 merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt, PHash *out)
@@ -2015,7 +2061,8 @@ merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const
 				cur;
 
 	/* a column both added has no base to say which side's rows are the merge's */
-	if (both_added_columns(sides) && !phash_eq(ro, rt))
+	if (!phash_eq(ro, rt) && both_added_columns(sides) &&
+		(keyless_values_in_added(rm, sides, base, ro) || keyless_values_in_added(rm, sides, base, rt)))
 	{
 		row_conflict(rm, "row", NULL, 0);
 		*out = *ro;
@@ -2416,14 +2463,21 @@ keyless_rows_both_changed(Merger *m, const PHash *ours, const char *name, const 
 	keyless = rec.nkey == 0;
 	if (keyless && m->base_types.n > 0)
 	{
-		/* (a type changed alike, its values with it, is one change too) */
+		/*
+		 * A type changed alike, its values with it, is one change too.  Changed on
+		 * one side, it is no such thing: that side's differs from the merged.
+		 */
 		RowMerge	rm;
-		const bool *differs;
+		const bool *from_base;
+		const bool *from_ours;
+		const bool *from_theirs;
 
 		row_merge_init(&rm, m, &rec);
-		differs = columns_of_types_differing(&rm, rv, &m->base_types);
+		from_base = columns_of_types_differing(&rm, rv, &m->base_types);
+		from_ours = columns_of_types_differing(&rm, rv, &m->ours_types);
+		from_theirs = columns_of_types_differing(&rm, rv, &m->theirs_types);
 		for (int i = 0; keyless && i < rm.shape.nstored; i++)
-			keyless = !differs[i];
+			keyless = !(from_base[i] && !from_ours[i] && !from_theirs[i]);
 		ws_row_shape_free(&rm.shape);
 	}
 	ws_schema_free(&rec);
