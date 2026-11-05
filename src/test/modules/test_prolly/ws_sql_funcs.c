@@ -20,6 +20,7 @@
 #include "mb/pg_wchar.h"
 #include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_fk.h"
+#include "prolly/ws/ws_merge.h"
 #include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_root.h"
@@ -57,6 +58,7 @@ PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
 PG_FUNCTION_INFO_V1(test_ws_diff);
+PG_FUNCTION_INFO_V1(test_ws_merge);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy_as);
 
 /*
@@ -1005,4 +1007,25 @@ test_ws_rows_copy_as(PG_FUNCTION_ARGS)
 	ws_schema_free(&from);
 	ws_schema_free(&as);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_merge(base text, ours text, theirs text) returns text: the merged root on
+ * its first line, then each conflict's, of roots this backend captured
+ */
+Datum
+test_ws_merge(PG_FUNCTION_ARGS)
+{
+	PHash		base = text_hash(PG_GETARG_TEXT_PP(0));
+	PHash		ours = text_hash(PG_GETARG_TEXT_PP(1));
+	PHash		theirs = text_hash(PG_GETARG_TEXT_PP(2));
+	WsMergeResult res;
+	StringInfoData out;
+
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &res);
+	initStringInfo(&out);
+	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
+	for (int i = 0; i < res.nconflicts; i++)
+		appendStringInfo(&out, "\n%s", res.conflicts[i]);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
