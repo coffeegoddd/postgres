@@ -1,0 +1,523 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+#
+# What a commit holds must read the same once it has been restored, with nothing changed.
+# Postgres's printing does not promise that of itself, so a restore remembers what it
+# printed.  This holds a broad set of expressions in each place one can be, compares
+# every object's bytes and what it returns, and then what a real change does.
+
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+my $node = PostgreSQL::Test::Cluster->new('stable');
+$node->init;
+$node->start;
+$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
+
+my @exprs = split /\n/, <<'EXPRS';
+v IN ('a','b')
+v NOT IN ('a','b')
+v = ANY (ARRAY['a','b'])
+v = ANY (ARRAY['a','b']::varchar[])
+v::text = ANY (ARRAY['a','b']::text[])
+i IN (1,2)
+i NOT IN (1,2)
+i = ANY (ARRAY[1,2])
+b IN (1,2)
+i::bigint IN (1,2)
+n IN (1.5,2)
+t IN ('a','b')
+t IN ('a', v)
+c IN ('a','b')
+v LIKE 'a%'
+v ILIKE 'a%'
+v NOT LIKE 'a%'
+t ~ 'a'
+v SIMILAR TO 'a'
+'a'
+'a'::text
+'a'::varchar
+'a'::varchar(3)
+'a'::char(3)
+1
+1::bigint
+1::smallint
+1.5
+1.5::numeric(4,2)
+1e10
+true
+NULL
+NULL::int
+NULL::text
+'2020-01-01'::date
+'2020-01-01'::timestamp
+'1 day'::interval
+interval '1 day'
+date '2020-01-01'
+timestamp '2020-01-01'
+time '12:00'
+'{1,2}'::int[]
+ARRAY[1,2]
+ARRAY['a','b']
+ARRAY['a','b']::varchar[]
+ARRAY[v,'b']
+ARRAY[]::int[]
+ARRAY[[1,2],[3,4]]
+i + 1
+i + b
+i * 2 + 1
+(i + 1) * 2
+-i
+- 1
+i::text
+v::text
+t::varchar
+t::varchar(3)
+i::numeric(10,2)
+n::int
+CAST(i AS text)
+i::text::int
+v || 'x'
+t || 'x'
+v || t
+t || i
+CASE WHEN i > 0 THEN 'a' ELSE 'b' END
+CASE i WHEN 1 THEN 'a' ELSE 'b' END
+CASE WHEN i > 0 THEN 1 END
+CASE v WHEN 'a' THEN 1 END
+COALESCE(v,'x')
+COALESCE(i,0)
+NULLIF(i,0)
+NULLIF(v,'x')
+GREATEST(i,1)
+LEAST(i,b)
+i IS NULL
+i IS NOT NULL
+b2 IS TRUE
+b2 IS NOT FALSE
+b2 IS UNKNOWN
+i IS DISTINCT FROM 1
+i IS NOT DISTINCT FROM 1
+ROW(i,b) IS NULL
+ROW(i,b) = ROW(1,2)
+ROW(i,b) < ROW(1,2)
+ROW(i,b) IS DISTINCT FROM ROW(1,2)
+ROW(v,t) = ROW('a','b')
+i BETWEEN 1 AND 2
+i NOT BETWEEN 1 AND 2
+i BETWEEN SYMMETRIC 1 AND 2
+v BETWEEN 'a' AND 'b'
+b2 AND i > 0
+b2 OR i > 0
+NOT b2
+upper(v)
+upper(t)
+length(v)
+substring(v from 1 for 2)
+substring(t, 1, 2)
+position('a' in v)
+overlay(t placing 'a' from 1)
+trim(v)
+trim(both 'x' from v)
+trim(leading from t)
+extract(year from d)
+date_part('year', d)
+date_trunc('day', ts)
+ts AT TIME ZONE 'UTC'
+tz AT LOCAL
+current_date
+current_time
+current_timestamp
+localtimestamp
+localtime
+current_timestamp(2)
+current_user
+session_user
+current_role
+current_schema
+current_catalog
+now()
+t COLLATE "C"
+v COLLATE "C"
+'a' COLLATE "C"
+(t COLLATE "C") < 'a'
+t < 'a' COLLATE "C"
+t IN ('a' COLLATE "C",'b')
+j -> 'a'
+j ->> 'a'
+j #> '{a}'
+jb @> '{}'
+jb ? 'a'
+jb -> 0
+jb['a']
+a[1]
+a[1:2]
+a[:2]
+a[1:]
+(p).x
+(ROW(1,2)::pt).x
+to_tsvector('english', t)
+'a b'::tsvector
+i::oid
+now()::date
+format('%s', i)
+format('%s %s', i, v)
+concat(i, v)
+concat_ws(',', i, v)
+num_nulls(VARIADIC ARRAY[1,2])
+(SELECT 1)
+(SELECT i)
+(SELECT 'a')
+(SELECT 'a' AS x)
+(SELECT v)
+(SELECT max(i) FROM s)
+EXISTS (SELECT 1 FROM s)
+i IN (SELECT i FROM s)
+v IN (SELECT v FROM s)
+v IN (SELECT t FROM s)
+i = ANY (SELECT i FROM s)
+i > ALL (SELECT i FROM s)
+ARRAY(SELECT i FROM s)
+ROW(i,b) IN (SELECT i,i FROM s)
+json_object('a': 1)
+json_array(1,2)
+JSON_VALUE(jb, '$.a')
+JSON_QUERY(jb, '$.a')
+JSON_EXISTS(jb, '$.a')
+jb IS JSON
+t IS JSON OBJECT
+JSON_OBJECT('a': v RETURNING text)
+int4range(1,2)
+'[1,2)'::int4range
+int4range(1,2) @> i
+pos(t)
+t NOTNULL
+i ISNULL
+t IS NORMALIZED
+normalize(t)
+t IS NFC NORMALIZED
+collation for (t)
+'a' = 'a'
+1 = 1
+'a'::text = v
+v = 'a'
+v = 'a'::text
+v = 'a'::varchar
+c = 'a'
+c = v
+c = t
+c::text = t
+b = i
+i = b
+n = i
+n = 1
+f = 1
+f = 1.5
+f = i
+d = '2020-01-01'
+d = ts
+d = tz
+ts = tz
+ts > now()
+d > now()
+d + 1
+d + i
+d - 1
+d - d
+ts + '1 day'
+ts - interval '1 day'
+tz + '1 day'::interval
+i::bool
+b2::int
+i::bigint::int
+v::varchar(3)
+v::char(3)
+c::varchar
+c::text
+c::char(2)
+t::char
+t::name
+n2::text
+n2 = 'a'
+n2 = t
+v = n2
+n2 IN ('a','b')
+c IN ('a','b')
+c NOT IN ('a','b')
+d IN ('2020-01-01','2020-01-02')
+ts IN ('2020-01-01','2020-01-02')
+n IN (1,2)
+f IN (1,2)
+b IN (1,i)
+m IN ('a','b')
+m = 'a'
+m::text = 'a'
+m::text IN ('a','b')
+v::m
+'a'::m
+dm = 1
+dm IN (1,2)
+dm::int
+1::dm
+dv = 'a'
+dv IN ('a','b')
+dv::text
+'a'::dv
+dv || 'x'
+ad[1]
+'{1}'::ad
+ARRAY[['a','b'],['c','d']]::varchar[]
+ARRAY[ARRAY['a'::varchar]]::text[]
+ARRAY['a','b']::varchar(3)[]
+ARRAY['a'::varchar(5)]::varchar(3)[]
+ARRAY[v,'b']::text[]
+ARRAY[i,1]::text[]
+ARRAY[i]::bigint[]
+ARRAY[1,2]::bigint[]
+ARRAY[1.5]::int[]
+ARRAY[]::varchar[]::text[]
+a::text[]
+a::bigint[]
+'{a}'::varchar[]::text[]
+(ARRAY['a']::varchar[])[1]
+v::text = ANY (ARRAY[v,t]::text[])
+i::bigint = ANY (ARRAY[1,2]::bigint[])
+m::text IN ('a',v)
+ARRAY['a','b']::m[]
+ARRAY[1]::ad
+ARRAY['a']::dv[]
+ARRAY[ROW(1,2)]::pt[]
+i BETWEEN 1 AND 2 AND v = 'a'
+i BETWEEN 1 AND 2 OR b2
+i NOT BETWEEN 1 AND 2 OR b2
+i NOT BETWEEN 1 AND 2 AND b2
+ROW(i,b) = ROW(1,2) AND b2
+ROW(i,b) <> ROW(1,2) OR b2
+v IN ('a', t) AND b2
+v NOT IN ('a', t) AND b2
+v IN ('a', t) OR b2
+(b2 AND i > 0) AND i < 5
+b2 AND (i > 0 AND i < 5)
+(b2 OR i > 0) OR i < 5
+b2 OR (i > 0 OR i < 5)
+(b2 OR i > 0) AND i < 5
+(i BETWEEN 1 AND 2 AND i BETWEEN 0 AND 3) AND b2
+NOT (i BETWEEN 1 AND 2 AND b2)
+-1::int < i
+-1::int
+-1.5::numeric
+-1.5::numeric < n
+-(1::int)
+-(1.5::numeric)
+- 1.5
+- 1.5 < n
++1
++1::int
+- i
+-1::bigint
+-1::smallint
+-1.5::float8
+- 1e10
+- - 1
+-(-1)
+(-1)::int
+i - 1
+i - -1
+i - (-1::int)
+n - -1.5
+ARRAY['a']::varchar[]::text[]::varchar[]
+ARRAY[1]::bigint[]::ad
+ARRAY[1]::bigint[]::integer[]::bigint[]::integer[]::text[]
+v IN ('a' COLLATE "C",'b')
+v NOT IN ('a' COLLATE "C",'b')
+ARRAY[a,a2]::int[]::text[]
+ARRAY[a,a2]::text[]
+ARRAY[a,a2]::int[]::bigint[]
+ARRAY[a,a2]::bigint[]
+t = ANY (ARRAY[va,vb])
+t = ANY (ARRAY[ARRAY[v],vb])
+ARRAY[ARRAY[]::int[]]::int[]::text[]
+ARRAY[va,vb]::text[]
+ARRAY[va]::text[]
+ARRAY[[1,2],[3,4]]::text[]
+ARRAY[[1,2],[3,4]]::bigint[]
+ARRAY[ARRAY[1,2],a2]::text[]
+ARRAY[]::int[]::text[]
+ARRAY[]::varchar[]::dv[]
+EXPRS
+
+my $types = q{
+	CREATE TYPE m AS ENUM ('a', 'b');
+	CREATE TYPE pt AS (x integer, y integer);
+	CREATE DOMAIN dm AS integer;
+	CREATE DOMAIN dv AS varchar(10);
+	CREATE DOMAIN ad AS integer[];
+	CREATE FUNCTION pos(text) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+};
+my $tables = q{
+	CREATE TABLE s (i integer, v varchar, t text);
+	CREATE TABLE t0 (i integer, b bigint, n numeric, f float8, v varchar(10), t text, c char(2), n2 name, b2 boolean,
+		d date, ts timestamp, tz timestamptz, j json, jb jsonb, a integer[], p pt, u uuid, m m, dm dm, dv dv, ad ad,
+		a2 integer[], va varchar[], vb varchar[]);
+};
+
+my $make = "CREATE ROLE g_stable NOLOGIN; CREATE SCHEMA sp AUTHORIZATION g_stable; CREATE SCHEMA sp2 AUTHORIZATION g_stable; SET ROLE g_stable; SET search_path = sp;\n"
+  . $types . $tables;
+my $k = 0;
+for my $e (@exprs)
+{
+	$k++;
+	$make .= "CREATE VIEW v$k AS SELECT $e AS col FROM t0;\n";
+	$make .= "CREATE VIEW w$k AS SELECT 1 AS col FROM t0 WHERE ($e) IS NOT NULL;\n";
+	$make .= "CREATE FUNCTION f$k() RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT $e FROM t0; END;\n";
+}
+$node->safe_psql('postgres', $make);
+
+# the other places an expression can be, and what has no column of a table to read
+$node->safe_psql('postgres', q{SET ROLE g_stable; SET search_path = sp;
+	CREATE DOMAIN dc AS varchar(10) CHECK (VALUE IN ('a', 'b'));
+	CREATE DOMAIN dd AS varchar(10) DEFAULT 'a' CHECK (VALUE NOT IN ('c'));
+	CREATE FUNCTION fd(x boolean DEFAULT ('a'::varchar IN ('a', 'b'))) RETURNS boolean LANGUAGE sql RETURN x;
+	CREATE FUNCTION fp(p integer, q varchar) RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT p; SELECT p FROM t0; SELECT q IN ('a', 'b'); SELECT 1 WHERE p IN (SELECT p); INSERT INTO s(i) SELECT p RETURNING p; END;
+	CREATE FUNCTION fu() RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT 'a' UNION ALL SELECT 'b'; SELECT x FROM (SELECT 'a' UNION ALL SELECT 'b') y(x); WITH z AS (SELECT 'a') SELECT * FROM z; SELECT * FROM (SELECT 'a') z; SELECT 'a', 'b', 1; SELECT ROW(1, 'a'); SELECT ROW(i, v) FROM t0; SELECT array_agg(i) OVER () FROM t0; SELECT sum(i) OVER (PARTITION BY v) FROM t0; SELECT rank() OVER (ORDER BY i) FROM t0; SELECT sum(i) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t0; UPDATE s SET v = 'a' RETURNING 'a'; DELETE FROM s RETURNING 'a'; INSERT INTO s(v) VALUES ('a') RETURNING 'a'; END;
+	CREATE FUNCTION fr() RETURNS text LANGUAGE sql RETURN (SELECT 'a');
+	CREATE MATERIALIZED VIEW mv AS SELECT v FROM t0 WITH NO DATA;
+	CREATE INDEX mvi ON mv (v) WHERE v IN ('a', 'b');
+	CREATE INDEX mve ON mv ((v IN ('a', 'b')));
+	CREATE VIEW dfl AS SELECT v FROM t0;
+	ALTER VIEW dfl ALTER COLUMN v SET DEFAULT ('a'::varchar IN ('a'))::text;
+	CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+	CREATE TRIGGER tg BEFORE UPDATE ON s FOR EACH ROW WHEN (NEW.v IN ('a', 'b')) EXECUTE FUNCTION trf();
+	CREATE POLICY po ON s USING (v IN ('a', 'b')) WITH CHECK (v NOT IN ('c'));
+	CREATE RULE ru AS ON DELETE TO s WHERE OLD.v IN ('a', 'b') DO ALSO DELETE FROM s WHERE v IN ('c', 'd');
+});
+
+my $held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp')});
+my %was = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $held;
+cmp_ok(scalar(keys %was), '>', 3 * scalar(@exprs), 'every expression is held in each place');
+
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp', 'sp2', 'before')});
+$node->safe_psql('postgres', "SET ROLE g_stable; SET search_path = sp2;\n" . $tables);
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp', 'sp2', 'after')});
+
+# (all at once, so this says which, not only that one did)
+my %is = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')});
+my @differ = grep { ($is{$_} // '') ne $was{$_} } sort keys %was;
+for my $key (@differ[0 .. ($#differ < 9 ? $#differ : 9)])
+{
+	diag("$key:\n  was " . pack('H*', $was{$key}) . "\n  is  " . pack('H*', $is{$key} // ''));
+}
+is(scalar(@differ), 0, 'every object is the same bytes restored');
+is(scalar(keys %is), scalar(keys %was), 'and there are no others');
+
+# the same bytes cannot see a value that has changed, if it prints the same both times
+my $row = q{INSERT INTO %s.t0 (i, b, n, f, v, t, c, n2, b2, d, ts, tz, j, jb, a, p, u, m, dm, dv, ad, a2, va, vb) VALUES
+	(1, 2, 1.5, 2.5, 'a', '{a,b}', 'a', 'a', true, '2020-01-01', '2020-01-01', '2020-01-01 00:00+00', '{"a":1}', '{"a":1}', '{1,2}', ROW(1,2), NULL, 'a', 1, 'a', '{1}', '{3,4}', '{a,b}', '{c,d}'),
+	(-1, NULL, NULL, NULL, 'z', 'c', NULL, NULL, false, NULL, NULL, NULL, NULL, NULL, '{1,2}', NULL, NULL, 'b', NULL, 'z', NULL, '{5,6}', '{x}', '{y}')};
+$node->safe_psql('postgres', sprintf($row, $_)) for ('sp', 'sp2');
+$node->safe_psql('postgres', q{CREATE PROCEDURE public.values_of(s text) LANGUAGE plpgsql AS $$
+	DECLARE r record; got text;
+	BEGIN
+		CREATE TEMP TABLE IF NOT EXISTS seen (schema_name text, view_name text, got text);
+		FOR r IN SELECT c.relname FROM pg_class c WHERE c.relnamespace = s::regnamespace AND c.relkind = 'v' AND c.relname ~ '^[vw][0-9]' LOOP
+			BEGIN
+				EXECUTE format('SELECT string_agg(col::text, %L) FROM %I.%I', '|', s, r.relname) INTO got;
+			EXCEPTION WHEN OTHERS THEN
+				got := 'ERROR ' || SQLSTATE;
+			END;
+			INSERT INTO seen VALUES (s, r.relname, got);
+		END LOOP;
+	END $$});
+# (what depends on the moment is no matter of printing)
+my @moving = map { $_ + 1 } grep { $exprs[$_] =~ /now\(\)|current_|localtime|session_user/ } 0 .. $#exprs;
+my $moving = join(',', map { "'v$_','w$_'" } @moving);
+my $differ = $node->safe_psql('postgres', qq{CALL public.values_of('sp'); CALL public.values_of('sp2');
+	SELECT coalesce(string_agg(a.view_name || ' was ' || coalesce(a.got, 'NULL') || ' is ' || coalesce(b.got, 'NULL'), E'\\n'), '')
+	FROM seen a JOIN seen b ON b.view_name = a.view_name AND b.schema_name = 'sp2' WHERE a.schema_name = 'sp' AND a.view_name NOT IN ($moving)
+	AND a.got IS DISTINCT FROM b.got});
+is($differ, '', 'every view has the same values restored');
+my $looked = $node->safe_psql('postgres', qq{CALL public.values_of('sp'); SELECT count(*) > 0 AND count(*) FILTER (WHERE got NOT LIKE 'ERROR%') * 2 > count(*) FROM seen});
+is($looked, 't', 'most of which could be read');
+
+# a second round, as a form that only settled later would pass the first by chance
+$node->safe_psql('postgres', q{CREATE SCHEMA sp3 AUTHORIZATION g_stable; SELECT test_ws_obj_copy('sp2', 'sp3', 'before')});
+$node->safe_psql('postgres', "SET ROLE g_stable; SET search_path = sp3;\n" . $tables);
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp2', 'sp3', 'after')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp3')}), $held, 'and again');
+
+# only what printed otherwise is remembered
+my $remembered = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'sp2'::regnamespace});
+cmp_ok($remembered, '>', 0, 'what printed otherwise is remembered');
+cmp_ok($remembered, '<', scalar(keys %was) / 2, 'and not most of it');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'sp'::regnamespace}), '0', 'and nothing where nothing was restored');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'sp2'::regnamespace AND prtprinted = prtheld}), '0', 'and no entry says nothing');
+
+# a real change reads as one, on what was remembered as on what was not, and undone is as it was
+$node->safe_psql('postgres', q{ALTER TABLE sp2.t0 RENAME COLUMN v TO v_renamed});
+%is = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')});
+my @uses = grep { $_ =~ /^view\/[vw]/ && pack('H*', $was{$_}) =~ /\bv\b/ } sort keys %was;
+cmp_ok(scalar(@uses), '>', 20, 'enough use the column');
+my @missed = grep { $is{$_} eq $was{$_} } @uses;
+is(scalar(@missed), 0, 'a rename reads as a change on all that use it') or diag(join(', ', @missed[0 .. ($#missed < 5 ? $#missed : 5)]));
+$node->safe_psql('postgres', q{ALTER TABLE sp2.t0 RENAME COLUMN v_renamed TO v});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')}), $held, 'and undone reads as the commit again');
+
+# made anew as it was first made, or as what the restore printed, it is as the commit
+my ($stale) = grep { pack('H*', $was{$_}) =~ /ANY \(\(ARRAY/ } grep { /^view\/w/ } sort keys %was;
+ok($stale, 'there is a view that printed otherwise');
+(my $stale_name = $stale) =~ s/^view\///;
+my $first_form = substr(pack('H*', $was{$stale}), 0);
+my $restored_def = $node->safe_psql('postgres', qq{SET search_path = pg_catalog, sp2; SELECT pg_get_viewdef('sp2.$stale_name'::regclass)});
+$node->safe_psql('postgres', qq{SET ROLE g_stable; SET search_path = pg_catalog, sp2, public; DROP VIEW sp2.$stale_name; CREATE VIEW sp2.$stale_name AS $restored_def});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')}), $held, 'made anew from what the restore printed, it reads as the commit');
+
+# lost, what it was for reads as changed, and nothing else; and it reads so from then on
+my %before = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $held;
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DELETE FROM pg_ws_print WHERE prtnamespace = 'sp2'::regnamespace});
+my %lost = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')});
+is(scalar(grep { ($lost{$_} // '') ne $before{$_} } keys %before), $remembered, 'lost, only what it remembered reads as changed');
+
+# a schema dropped takes them with it
+$node->safe_psql('postgres', q{DROP SCHEMA sp3 CASCADE});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print p WHERE NOT EXISTS (SELECT 1 FROM pg_namespace n WHERE n.oid = p.prtnamespace)}), '0', 'a dropped schema leaves nothing');
+
+# they go with a branch's catalogs: a branch of a restored schema reads as its commit, and
+# no other branch sees them
+my $from = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+my $to = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$node->safe_psql('postgres', qq{SET catalog_branch = $from; CREATE SCHEMA bsrc VERSIONED; CREATE SCHEMA bdst VERSIONED;
+	CREATE TABLE bsrc.t (v varchar(10)); CREATE TABLE bdst.t (v varchar(10));
+	CREATE ROLE g_branch NOLOGIN; ALTER TABLE bsrc.t OWNER TO g_branch; ALTER TABLE bdst.t OWNER TO g_branch;
+	CREATE VIEW bsrc.w AS SELECT v FROM bsrc.t WHERE v IN ('a', 'b'); ALTER VIEW bsrc.w OWNER TO g_branch});
+my $branch_held = $node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bsrc')});
+$node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_copy('bsrc', 'bdst')});
+is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'restored on a branch, it reads as its commit');
+is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT count(*) FROM pg_ws_print p JOIN pg_namespace n ON n.oid = p.prtnamespace WHERE n.nspname = 'bdst'}), '1', 'with what it remembers');
+$node->safe_psql('postgres', "SELECT pg_branch_catalog_copy($from, $to)");
+is($node->safe_psql('postgres', qq{SET catalog_branch = $to; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'a branch of it reads so too');
+is($node->safe_psql('postgres', q{SET catalog_branch = 0; SELECT count(*) FROM pg_ws_print p WHERE p.prtkey = 'view/w'}), '0', 'and what is on no branch sees nothing of it');
+$node->safe_psql('postgres', qq{SET catalog_branch = $to; ALTER TABLE bdst.t RENAME COLUMN v TO v2});
+isnt($node->safe_psql('postgres', qq{SET catalog_branch = $to; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'a change on the branch reads as one');
+is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'and not on the other');
+
+# what printing itself loses is refused, as no text held would make it again
+for my $case (
+	[ q{CREATE VIEW w AS SELECT ARRAY[1, 2]::int2vector AS x}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT i FROM t0 WHERE (ARRAY[1]::oidvector)::text <> ''}, 'int2vector or oidvector' ],
+	[ q{CREATE TABLE t0 (i integer, x text DEFAULT (ARRAY[1]::int2vector)::text)}, 'int2vector or oidvector' ],
+	[ q{CREATE VIEW w AS SELECT ARRAY[1]::oidvector AS x}, 'oidvector' ],
+	[ q{CREATE FUNCTION f() RETURNS int2vector LANGUAGE sql BEGIN ATOMIC SELECT ARRAY[1]::int2vector AS x; END}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT i + 1, i + 2 FROM t0) x}, 'of no name' ])
+{
+	my ($sql, $why) = @$case;
+	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS lost CASCADE; CREATE SCHEMA lost AUTHORIZATION g_stable; SET ROLE g_stable; SET search_path = lost; $sql});
+	my ($rcl, $outl, $errl) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('lost')});
+	isnt($rcl, 0, "refused: $sql");
+	like($errl, qr/\Q$why\E/, "for why: $sql");
+}
+$node->safe_psql('postgres', q{DROP SCHEMA lost CASCADE});
+
+$node->stop;
+done_testing();

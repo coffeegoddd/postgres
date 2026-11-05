@@ -43,6 +43,7 @@ CATALOG_HEADERS := \
 	pg_trigger.h \
 	pg_event_trigger.h \
 	pg_description.h \
+	pg_ws_print.h \
 	pg_cast.h \
 	pg_enum.h \
 	pg_namespace.h \

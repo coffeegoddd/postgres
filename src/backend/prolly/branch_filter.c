@@ -101,6 +101,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_config_map.h"
+#include "catalog/pg_ws_print.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
@@ -285,6 +286,9 @@ row_owners(Oid relid, HeapTuple tup, RowOwners *owners)
 		case TSConfigMapRelationId:
 			add_owner(owners, TSConfigRelationId, ((Form_pg_ts_config_map) row)->mapcfg);
 			break;
+		case WsPrintRelationId:
+			add_owner(owners, NamespaceRelationId, ((Form_pg_ws_print) row)->prtnamespace);
+			break;
 		case StatisticExtDataRelationId:
 			add_owner(owners, StatisticExtRelationId, ((Form_pg_statistic_ext_data) row)->stxoid);
 			break;
@@ -403,6 +407,7 @@ filtered_catalog(Oid relid)
 		case CastRelationId:
 		case TransformRelationId:
 		case TSConfigMapRelationId:
+		case WsPrintRelationId:
 		case StatisticExtDataRelationId:
 		case DependRelationId:
 		case DescriptionRelationId:

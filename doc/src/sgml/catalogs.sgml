@@ -366,6 +366,11 @@
      </row>
 
      <row>
+      <entry><link linkend="catalog-pg-ws-print"><structname>pg_ws_print</structname></link></entry>
+      <entry>what a restore printed of what a commit of a versioned schema holds</entry>
+     </row>
+
+     <row>
       <entry><link linkend="catalog-pg-user-mapping"><structname>pg_user_mapping</structname></link></entry>
       <entry>mappings of users to foreign servers</entry>
      </row>
@@ -9895,6 +9900,76 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
  </sect1>
 
+
+ <sect1 id="catalog-pg-ws-print">
+  <title><structname>pg_ws_print</structname></title>
+
+  <indexterm zone="catalog-pg-ws-print">
+   <primary>pg_ws_print</primary>
+  </indexterm>
+
+  <para>
+   The catalog <structname>pg_ws_print</structname> records, of what a restore
+   made in a versioned schema, what prints otherwise than the commit held it,
+   as text that is read back may print differently with nothing changed.  While an
+   object prints as a row says, a read of the schema holds the commit's text.
+  </para>
+
+  <table>
+   <title><structname>pg_ws_print</structname> Columns</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>prtnamespace</structfield> <type>oid</type>
+       (references <link linkend="catalog-pg-namespace"><structname>pg_namespace</structname></link>.<structfield>oid</structfield>)
+      </para>
+      <para>
+       The versioned schema
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>prtkey</structfield> <type>text</type>
+      </para>
+      <para>
+       The object, as a commit keys it
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>prtprinted</structfield> <type>text</type>
+      </para>
+      <para>
+       What it printed once restored
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>prtheld</structfield> <type>text</type>
+      </para>
+      <para>
+       What the commit held of it
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+ </sect1>
 
  <sect1 id="catalog-pg-user-mapping">
   <title><structname>pg_user_mapping</structname></title>

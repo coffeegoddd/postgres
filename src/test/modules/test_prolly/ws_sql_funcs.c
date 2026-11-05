@@ -607,7 +607,10 @@ test_ws_obj_copy(PG_FUNCTION_ARGS)
 	if (strcmp(which, "after") != 0)
 		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
 	if (strcmp(which, "before") != 0)
+	{
 		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), false);
+		ws_obj_remember(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	}
 	PG_RETURN_VOID();
 }
 

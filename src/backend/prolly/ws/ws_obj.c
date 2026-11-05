@@ -31,9 +31,9 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
-#include "parser/parse_target.h"
 #include "parser/parser.h"
 #include "prolly/ws/ws_obj.h"
+#include "prolly/ws/ws_print.h"
 #include "storage/lmgr.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_root.h"
@@ -779,6 +779,7 @@ relations_version(const char *schema)
 				"    JOIN pg_opclass o ON d.classoid = 'pg_opclass'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.opcnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'd' || d.classoid || '.' || d.objoid || ':' || d.description FROM pg_description d "
 				"    JOIN pg_opfamily o ON d.classoid = 'pg_opfamily'::regclass AND o.oid = d.objoid JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name "
+				"  UNION ALL SELECT 'p' || p.prtkey || ':' || p.xmin FROM pg_ws_print p JOIN pg_namespace n ON n.oid = p.prtnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'x' || i.indexrelid || ':' || i.xmin FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
 				"    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'w' || w.oid || ':' || w.xmin FROM pg_attrdef w JOIN pg_class c ON c.oid = w.adrelid "
@@ -1027,6 +1028,25 @@ names_schema_walker(Node *node, void *arg)
 			/* (a function's RETURN, which the tree walker has no case for) */
 			return names_schema_walker(((ReturnStmt *) node)->returnval, arg);
 		case T_RangeSubselect:
+			if (IsA(((RangeSubselect *) node)->subquery, SelectStmt))
+			{
+				ListCell   *lc;
+				int			unnamed = 0;
+
+				foreach(lc, ((SelectStmt *) ((RangeSubselect *) node)->subquery)->targetList)
+				{
+					ResTarget  *rt = lfirst_node(ResTarget, lc);
+
+					if (rt->name != NULL && strncmp(rt->name, "?column?", 8) == 0)
+						unnamed++;
+				}
+				/* (read back, an alias of one of them is told apart, so its row reads otherwise) */
+				if (unnamed > 1)
+				{
+					n->why = "a subquery has columns of no name, which would read back with names";
+					return true;
+				}
+			}
 			{
 				RangeSubselect *r = (RangeSubselect *) node;
 
@@ -2222,6 +2242,27 @@ read_casts(const char *schema, WsObject *objs, int *n)
 "      JOIN pg_class q ON q.oid = coalesce(e.typrelid, ty.typrelid) WHERE q.relkind <> 'c' AND q.relnamespace = n.oid) " \
 "    THEN 'it is of a table''s or a view''s row type, and a table may need it' "
 
+/*
+ * An ARRAY[] of int2vector or oidvector prints as an array of its elements, saying nothing
+ * of its type, so reads back as another type, and returns other values.  Nothing in what
+ * is printed shows it; what is stored does.
+ */
+#define VECTOR_ARRAY "':array_typeid (22|30) '"
+static const char *const vector_array_refusal_sql =
+"SELECT what, 'it has an ARRAY[] of int2vector or oidvector, which printing loses' FROM ("
+"  SELECT c.relname::text AS what, r.ev_action::text AS tree FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT c.relname::text, r.ev_qual::text FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT p.proname::text, p.prosqlbody::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT p.proname::text, p.proargdefaults::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT c.relname::text, d.adbin::text FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT k.conname::text, k.conbin::text FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT c.relname::text, i.indexprs::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT c.relname::text, i.indpred::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT g.tgname::text, g.tgqual::text FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT y.polname::text, y.polqual::text FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT y.polname::text, y.polwithcheck::text FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+") t WHERE tree ~ " VECTOR_ARRAY " ORDER BY 1";
+
 static const char *const operator_refusal_sql =
 "SELECT o.oprname::text, CASE "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_operator'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
@@ -3014,28 +3055,6 @@ static const char *const function_refusal_sql =
 "  END " FUNCTIONS_OF_SCHEMA "ORDER BY 1";
 
 /* Refuses a qualified name in a function's statement, or a path naming its schema. */
-/*
- * Whether a body has a column with no name that would be given one if made again: a
- * constant no AS named prints with the cast that, read back, names it for its type, so
- * its text would differ.  (What is a column prints as its name, which read back is that.)
- */
-static bool
-unstable_column_walker(Node *node, void *arg)
-{
-	if (node == NULL)
-		return false;
-	if (IsA(node, ReturnStmt))
-		return unstable_column_walker(((ReturnStmt *) node)->returnval, arg);
-	if (IsA(node, ResTarget))
-	{
-		ResTarget  *rt = (ResTarget *) node;
-
-		if (rt->name == NULL && rt->val != NULL && !IsA(rt->val, ColumnRef) && strcmp(FigureColname(rt->val), "?column?") != 0)
-			return true;
-	}
-	return raw_expression_tree_walker(node, unstable_column_walker, arg);
-}
-
 static void
 check_function_is_portable(const char *name, const char *schema, const char *tail)
 {
@@ -3055,12 +3074,6 @@ check_function_is_portable(const char *name, const char *schema, const char *tai
 		named = named || names_schema_walker((Node *) p->argType, &n) || names_schema_walker(p->defexpr, &n);
 	}
 	named = named || names_schema_walker((Node *) f->returnType, &n) || names_schema_walker(f->sql_body, &n);
-	if (unstable_column_walker(f->sql_body, NULL))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: a column of its body has no name, and made again would be given one",
-						name, schema),
-				 errhint("Name the column with AS.")));
 	foreach(lc, f->options)
 	{
 		DefElem    *d = lfirst_node(DefElem, lc);
@@ -3266,6 +3279,65 @@ settle_phases(const char *schema, WsObject *objs, int n)
 	ws_sql_rows_free(&rows);
 }
 
+pg_noreturn static void not_the_object(const WsObject *o, const char *what);
+
+/* An object that prints as a restore remembers is as its commit held it. */
+static void
+hold_what_was_restored(const char *schema, WsObject *objs, int n)
+{
+	int			nentries;
+	WsPrintEntry *entries = WsPrints->load(schema, &nentries);
+
+	for (int i = 0; i < nentries; i++)
+	{
+		int			of = find_object(objs, n, entries[i].key);
+
+		if (of >= 0 && strcmp(objs[of].definition, entries[i].printed) == 0)
+		{
+			px_free(objs[of].definition);
+			objs[of].definition = px_memdup(entries[i].held, strlen(entries[i].held) + 1);
+		}
+	}
+}
+
+void
+ws_obj_remember(const WsObject *objs, int n, const char *schema)
+{
+	WsObject   *read;
+	int			nread;
+
+	/* (what was remembered of what was just made would be taken for it) */
+	for (int i = 0; i < n; i++)
+	{
+		Buf			key = BUF_INIT;
+
+		ws_obj_key(objs[i].kind, objs[i].name, objs[i].args, &key);
+		buf_append_byte(&key, 0);
+		WsPrints->forget(schema, (char *) key.data);
+		buf_free(&key);
+	}
+	CommandCounterIncrement();
+	ws_obj_read(schema, &read, &nread);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			key = BUF_INIT;
+		int			of;
+
+		ws_obj_key(objs[i].kind, objs[i].name, objs[i].args, &key);
+		buf_append_byte(&key, 0);
+		of = find_object(read, nread, (char *) key.data);
+		if (of < 0)
+			not_the_object(&objs[i], "it was not made");
+		if (strcmp(read[of].definition, objs[i].definition) != 0)
+			WsPrints->remember(schema, (char *) key.data, read[of].definition, objs[i].definition);
+		buf_free(&key);
+	}
+	CommandCounterIncrement();
+	for (int i = 0; i < nread; i++)
+		ws_obj_free(&read[i]);
+	pfree(read);
+}
+
 void
 ws_obj_read(const char *schema, WsObject **out, int *n)
 {
@@ -3290,6 +3362,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_types(schema, policy_refusal_sql);
 	refuse_types(schema, collation_refusal_sql);
 	refuse_types(schema, conversion_refusal_sql);
+	refuse_types(schema, vector_array_refusal_sql);
 	refuse_types(schema, operator_refusal_sql);
 	refuse_types(schema, opfamily_refusal_sql);
 	refuse_types(schema, opclass_refusal_sql);
@@ -3370,6 +3443,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	objs = read_of_table(schema, WS_OBJ_DEFAULT, objs, &total);
 	if (total > 1)
 		qsort(objs, total, sizeof(WsObject), object_cmp);
+	hold_what_was_restored(schema, objs, total);
 	settle_phases(schema, objs, total);
 	{
 		/* (views can be made to need each other, which no restore could make) */

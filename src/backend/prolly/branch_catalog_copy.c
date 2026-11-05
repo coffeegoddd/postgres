@@ -115,6 +115,7 @@
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_ws_print.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -1651,6 +1652,12 @@ fix_description(CopyState *cs, Datum *values, bool *nulls)
 }
 
 static void
+fix_ws_print(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_ws_print_prtnamespace, NamespaceRelationId);
+}
+
+static void
 fix_statistic(CopyState *cs, Datum *values, bool *nulls)
 {
 	MAP(Anum_pg_statistic_starelid, RelationRelationId);
@@ -1733,6 +1740,8 @@ copy_all_rows(CopyState *cs)
 				NamespaceCheckNameFree(get_namespace_name(obj.oid), cs->dst);
 				copy_rows_of(cs, NamespaceRelationId, NamespaceOidIndexId,
 							 Anum_pg_namespace_oid, obj.oid, fix_namespace);
+				copy_rows_of(cs, WsPrintRelationId, WsPrintNamespaceKeyIndexId,
+							 Anum_pg_ws_print_prtnamespace, obj.oid, fix_ws_print);
 				break;
 			case RelationRelationId:
 				copy_rows_of(cs, RelationRelationId, ClassOidIndexId,

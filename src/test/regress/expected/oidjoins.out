@@ -179,6 +179,7 @@ NOTICE:  checking pg_trigger {tgrelid,tgattr} => pg_attribute {attrelid,attnum}
 NOTICE:  checking pg_event_trigger {evtowner} => pg_authid {oid}
 NOTICE:  checking pg_event_trigger {evtfoid} => pg_proc {oid}
 NOTICE:  checking pg_description {classoid} => pg_class {oid}
+NOTICE:  checking pg_ws_print {prtnamespace} => pg_namespace {oid}
 NOTICE:  checking pg_cast {castsource} => pg_type {oid}
 NOTICE:  checking pg_cast {casttarget} => pg_type {oid}
 NOTICE:  checking pg_cast {castfunc} => pg_proc {oid}
