@@ -196,7 +196,7 @@ spi_scan(const char *sql, int nparams, const char *const *params, int batch,
 			values[i] = params[i] ? CStringGetTextDatum(params[i]) : (Datum) 0;
 		}
 	}
-	portal = SPI_cursor_open_with_args(NULL, sql, nparams, types, values, nulls, true, 0);
+	portal = SPI_cursor_open_with_args(NULL, sql, nparams, types, values, nulls, false, 0);
 	if (portal == NULL)
 		elog(ERROR, "\"%s\" failed: %s", sql, SPI_result_code_string(SPI_result));
 	for (;;)

@@ -22,6 +22,7 @@
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
 #include "prolly/ws/ws_obj.h"
+#include "prolly/ws/ws_restore.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_rows.h"
@@ -57,6 +58,9 @@ PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
+PG_FUNCTION_INFO_V1(test_ws_root_restore);
+PG_FUNCTION_INFO_V1(test_ws_root_restore_after);
+PG_FUNCTION_INFO_V1(test_ws_root_refused);
 PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_merge);
 PG_FUNCTION_INFO_V1(test_ws_root_table_bytes);
@@ -886,80 +890,43 @@ text_hash(text *t)
 Datum
 test_ws_root_capture(PG_FUNCTION_ARGS)
 {
-	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	ProllyCtx  *ctx = backend_ctx();
-	const char *params[1] = {schema};
-	WsSqlRows	tables;
-	PHash		rv = vc_root_empty(ctx);
-	WsObject   *objs;
-	int			nobjs;
-	WsSeqPosition *seqs;
-	int			nseqs;
-	WsForeignKey *all = NULL;
-	int			nall = 0;
-	PHash		map;
+	PHash		root;
 
-	WsSql->run("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-			   "WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') ORDER BY c.relname COLLATE \"C\"",
-			   1, params, &tables);
-	for (int i = 0; i < tables.nrows; i++)
-	{
-		const char *table = ws_sql_value(&tables, i, 0);
-		WsTableSchema rec;
-		PHash		rows;
-		WsForeignKey *fks;
-		int			nfks;
+	WsRootIO->capture(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(0)), &root);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
 
-		rows_record(schema, table, &rec);
-		WsRows->capture(ctx, schema, &rec, &rows);
-		WsRoot->put_table(ctx, &rv, &rec, &rows, &rv);
-		ws_schema_free(&rec);
-		ws_fk_read(schema, table, &fks, &nfks);
-		if (nfks > 0)
-		{
-			all = all == NULL ? palloc_array(WsForeignKey, nfks) : repalloc_array(all, WsForeignKey, nall + nfks);
-			memcpy(all + nall, fks, nfks * sizeof(WsForeignKey));
-			nall += nfks;
-		}
-	}
-	ws_sql_rows_free(&tables);
-	if (nall > 0)
-	{
-		ws_fk_map(ctx, all, nall, &map);
-		WsRoot->put_map(ctx, &rv, WS_ROOT_FOREIGN_KEYS, &map, &rv);
-	}
-	ws_obj_read(schema, &objs, &nobjs);
-	if (nobjs > 0)
-	{
-		ws_obj_map(ctx, objs, nobjs, &map);
-		WsRoot->put_map(ctx, &rv, WS_ROOT_OBJECTS, &map, &rv);
-	}
-	ws_seq_read(schema, &seqs, &nseqs);
-	if (nseqs > 0)
-	{
-		ws_seq_map(ctx, seqs, nseqs, &map);
-		WsRoot->put_map(ctx, &rv, WS_ROOT_SEQUENCES, &map, &rv);
-	}
-	{
-		WsSqlRows	names;
+/* test_ws_root_restore(root text, dest text) returns void: of a root this backend captured */
+Datum
+test_ws_root_restore(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
 
-		WsSql->run("SELECT rolname::text FROM pg_authid WHERE roltravels ORDER BY rolname COLLATE \"C\"",
-				   0, NULL, &names);
-		if (names.nrows > 0)
-		{
-			const char **list = palloc_array(const char *, names.nrows);
-			WsRole	   *roles;
-			int			nroles;
+	WsRootIO->restore(backend_ctx(), &root, NULL, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	PG_RETURN_VOID();
+}
 
-			for (int i = 0; i < names.nrows; i++)
-				list[i] = ws_sql_value(&names, i, 0);
-			ws_role_read(list, names.nrows, &roles, &nroles);
-			ws_role_map(ctx, roles, nroles, &map);
-			WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
-		}
-		ws_sql_rows_free(&names);
-	}
-	PG_RETURN_TEXT_P(hash_text(&rv));
+/* test_ws_root_restore_after(root text, previous text, dest text) returns void */
+Datum
+test_ws_root_restore_after(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	PHash		previous = text_hash(PG_GETARG_TEXT_PP(1));
+
+	WsRootIO->restore(backend_ctx(), &root, &previous, text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	PG_RETURN_VOID();
+}
+
+/* test_ws_root_refused(root text) returns text: what a dry run of it was refused for, or NULL */
+Datum
+test_ws_root_refused(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	WsSqlFailure failure;
+
+	if (!ws_root_refused(backend_ctx(), &root, &failure))
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%s %s", failure.sqlstate, failure.message)));
 }
 
 static void

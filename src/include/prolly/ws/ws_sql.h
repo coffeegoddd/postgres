@@ -78,8 +78,9 @@ typedef struct WsSqlRoutine
 	void		(*read) (const char *sql, int nparams, const char *const *params,
 						 WsSqlRows *rows);
 	/*
-	 * A read as read's, a batch of at most batch rows at a time given to fn, so
-	 * its rows need not all fit in memory.  What fn is given is gone after it.
+	 * A statement as run's, reading only, with a snapshot of its own, a batch of at
+	 * most batch rows at a time given to fn, so its rows need not all fit in memory.
+	 * What fn is given is gone after it.
 	 */
 	void		(*scan) (const char *sql, int nparams, const char *const *params, int batch,
 						 void (*fn) (void *arg, const WsSqlRows *rows), void *arg);

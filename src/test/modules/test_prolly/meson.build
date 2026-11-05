@@ -223,6 +223,7 @@ tests += {
       't/094_ws_diff.pl',
       't/095_ws_merge_schema.pl',
       't/096_ws_merge_rows.pl',
+      't/097_ws_root_round_trip.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
