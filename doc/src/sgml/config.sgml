@@ -13103,6 +13103,24 @@ dynamic_library_path = '/usr/local/lib/postgresql:$libdir'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-stable-deparse" xreflabel="stable_deparse">
+      <term><varname>stable_deparse</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>stable_deparse</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Makes functions such as <function>pg_get_viewdef</function> print SQL
+        in the form that printing it again gives once it has been read back:
+        every output column is named, and a cast of an
+        <literal>ARRAY[]</literal> is printed on its elements.  Version control
+        turns this on for what it holds in a commit.  The default is
+        <literal>off</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-trace-sort" xreflabel="trace_sort">
       <term><varname>trace_sort</varname> (<type>boolean</type>)
       <indexterm>

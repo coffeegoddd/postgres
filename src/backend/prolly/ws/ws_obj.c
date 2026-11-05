@@ -31,7 +31,6 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
-#include "parser/parse_target.h"
 #include "parser/parser.h"
 #include "prolly/ws/ws_obj.h"
 #include "storage/lmgr.h"
@@ -2477,28 +2476,6 @@ static const char *const function_refusal_sql =
 "  END " FUNCTIONS_OF_SCHEMA "ORDER BY 1";
 
 /* Refuses a qualified name in a function's statement, or a path naming its schema. */
-/*
- * Whether a body has a column with no name that would be given one if made again: a
- * constant no AS named prints with the cast that, read back, names it for its type, so
- * its text would differ.  (What is a column prints as its name, which read back is that.)
- */
-static bool
-unstable_column_walker(Node *node, void *arg)
-{
-	if (node == NULL)
-		return false;
-	if (IsA(node, ReturnStmt))
-		return unstable_column_walker(((ReturnStmt *) node)->returnval, arg);
-	if (IsA(node, ResTarget))
-	{
-		ResTarget  *rt = (ResTarget *) node;
-
-		if (rt->name == NULL && rt->val != NULL && !IsA(rt->val, ColumnRef) && strcmp(FigureColname(rt->val), "?column?") != 0)
-			return true;
-	}
-	return raw_expression_tree_walker(node, unstable_column_walker, arg);
-}
-
 static void
 check_function_is_portable(const char *name, const char *schema, const char *tail)
 {
@@ -2518,12 +2495,6 @@ check_function_is_portable(const char *name, const char *schema, const char *tai
 		named = named || names_schema_walker((Node *) p->argType, &n) || names_schema_walker(p->defexpr, &n);
 	}
 	named = named || names_schema_walker((Node *) f->returnType, &n) || names_schema_walker(f->sql_body, &n);
-	if (unstable_column_walker(f->sql_body, NULL))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: a column of its body has no name, and made again would be given one",
-						name, schema),
-				 errhint("Name the column with AS.")));
 	foreach(lc, f->options)
 	{
 		DefElem    *d = lfirst_node(DefElem, lc);

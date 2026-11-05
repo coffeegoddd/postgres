@@ -2237,5 +2237,14 @@ $node->safe_psql('postgres', q{CREATE COLLATION dst.own_coll FROM "C"; SELECT te
 is( $node->safe_psql('postgres', q{SELECT o.collnamespace::regnamespace FROM pg_attribute a JOIN pg_collation o ON o.oid = a.attcollation WHERE a.attrelid = 'dst.ocoll'::regclass AND a.attname = 'a'}),
 	'dst', 'and restores on the collation of the schema it arrives in');
 
+# what a table's expressions print must be the same restored, as a commit holds them
+$node->safe_psql('postgres', q{CREATE TABLE src.stable_print (v varchar(10) CHECK (v IN ('a', 'b')), w varchar(10) DEFAULT 'a',
+	x boolean GENERATED ALWAYS AS (v IN ('a', 'b')) STORED, CHECK (w NOT IN ('c')));
+	CREATE INDEX stable_print_v ON src.stable_print (v) WHERE v IN ('a', 'b');
+	CREATE INDEX stable_print_e ON src.stable_print ((v IN ('a', 'b')))});
+$node->safe_psql('postgres', q{SELECT test_ws_schema_create(test_ws_schema_bytes('src', 'stable_print'), 'dst')});
+is( $node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('dst', 'stable_print') = test_ws_schema_bytes('src', 'stable_print')}),
+	't', 'a table\'s expressions are the same bytes restored');
+
 $node->stop;
 done_testing();

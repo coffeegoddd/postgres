@@ -2992,6 +2992,13 @@
 # We removed support for non-conforming string literals in PostgreSQL 19,
 # but this parameter must be kept indefinitely, since client code might
 # consult it or attempt to set it.  We allow it to be explicitly set to true.
+{ name => 'stable_deparse', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Prints SQL in the form that reading it back and printing it again gives.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'stable_deparse',
+  boot_val => 'false',
+},
+
 { name => 'standard_conforming_strings', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',
   short_desc => 'Nonstandard strings are no longer supported; this can only be true.',
   flags => 'GUC_REPORT | GUC_NOT_IN_SAMPLE',

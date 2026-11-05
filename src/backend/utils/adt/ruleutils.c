@@ -337,6 +337,7 @@ static const char *const query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrit
 
 /* GUC parameters */
 bool		quote_all_identifiers = false;
+bool		stable_deparse = false;
 
 
 /* ----------
@@ -490,6 +491,8 @@ static bool get_func_sql_syntax(FuncExpr *expr, deparse_context *context);
 static void get_coercion_expr(Node *arg, deparse_context *context,
 							  Oid resulttype, int32 resulttypmod,
 							  Node *parentNode);
+static void get_cast_array_elements(ArrayExpr *array, deparse_context *context,
+									Oid elemtype, int32 typmod);
 static void get_const_expr(Const *constval, deparse_context *context,
 						   int showtype);
 static void get_const_collation(Const *constval, deparse_context *context);
@@ -6309,9 +6312,11 @@ get_target_list(List *targetList, deparse_context *context)
 			/*
 			 * When colNamesVisible is true, we should always show the
 			 * assigned column name explicitly.  Otherwise, show it only if
-			 * it's not FigureColname's fallback.
+			 * it's not FigureColname's fallback.  (That fallback may not be
+			 * what the text we print would be given when read back, as a
+			 * constant's now shows a cast.)
 			 */
-			attname = context->colNamesVisible ? NULL : "?column?";
+			attname = (context->colNamesVisible || stable_deparse) ? NULL : "?column?";
 		}
 
 		/*
@@ -9820,6 +9825,14 @@ get_rule_expr(Node *node, deparse_context *context,
 					/* don't show the implicit cast */
 					get_rule_expr_paren(arg, context, false, node);
 				}
+				else if (stable_deparse && IsA(arg, ArrayExpr) &&
+						 ((ArrayExpr *) arg)->elements != NIL &&
+						 OidIsValid(get_element_type(acoerce->resulttype)))
+				{
+					get_cast_array_elements((ArrayExpr *) arg, context,
+											get_element_type(acoerce->resulttype),
+											acoerce->resulttypmod);
+				}
 				else
 				{
 					get_coercion_expr(arg, context,
@@ -11534,6 +11547,36 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * get_cast_array_elements
+ *
+ *	Print a cast of an ARRAY[] as what reading one back makes of it: the parser
+ *	pushes such a cast down onto the elements, so that is the form that prints
+ *	the same however many times it is read and printed.
+ */
+static void
+get_cast_array_elements(ArrayExpr *array, deparse_context *context,
+						Oid elemtype, int32 typmod)
+{
+	StringInfo	buf = context->buf;
+	const char *sep = "";
+	ListCell   *lc;
+
+	appendStringInfoString(buf, "ARRAY[");
+	foreach(lc, array->elements)
+	{
+		Node	   *elem = (Node *) lfirst(lc);
+
+		appendStringInfoString(buf, sep);
+		if (array->multidims && IsA(elem, ArrayExpr))
+			get_cast_array_elements((ArrayExpr *) elem, context, elemtype, typmod);
+		else
+			get_coercion_expr(elem, context, elemtype, typmod, (Node *) array);
+		sep = ", ";
+	}
+	appendStringInfoChar(buf, ']');
 }
 
 /* ----------

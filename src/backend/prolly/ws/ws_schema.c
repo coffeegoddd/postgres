@@ -2108,6 +2108,13 @@ ws_schema_path_begin(const char *schema)
 	(void) set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
 	pfree(path);
+
+	/*
+	 * What is printed here goes into a commit, and must read the same once it
+	 * has been restored and is printed again.
+	 */
+	(void) set_config_option("stable_deparse", "on", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 	return nest;
 }
 
