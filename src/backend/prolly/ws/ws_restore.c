@@ -454,18 +454,20 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
  * refused, as what it works out could not be what it means.
  */
 static void
-refuse_definers_with_no_owner(const WsObject *o, const char *schema)
+refuse_definers_with_no_owner(const WsObject *o)
 {
-	const char *params[2] = {schema, ws_name_from_utf8(o->name)};
+	const char *params[1] = {psprintf("%s(%s)", quote_identifier(ws_name_from_utf8(o->name)), ws_text_from_utf8(o->args))};
 	WsSqlRows	rows;
+	const char *kind = o->kind == WS_OBJ_PROCEDURE ? "procedure" : "function";
 
-	WsSql->run("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-			   "WHERE n.nspname = $1::name AND p.proname = $2::name AND p.prosecdef LIMIT 1",
-			   2, params, &rows);
-	if (rows.nrows > 0)
+	/* (on the schema's path, by its arguments: another of its name may be its own) */
+	WsSql->run("SELECT p.prosecdef FROM pg_proc p WHERE p.oid = to_regprocedure($1)", 1, params, &rows);
+	if (rows.nrows != 1)
+		elog(ERROR, "%s \"%s\" was not made", kind, o->name);
+	if (ws_sql_value(&rows, 0, 0)[0] == 't')
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("function \"%s\" runs as its owner, a role not here", o->name)));
+				 errmsg("%s \"%s\" runs as its owner, a role not here", kind, o->name)));
 	ws_sql_rows_free(&rows);
 }
 
@@ -581,7 +583,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 			if (objs[i].owner != NULL && !OidIsValid(get_role_oid(ws_name_from_utf8(objs[i].owner), true)))
 			{
 				objs[i].owner = NULL;
-				if (objs[i].kind == WS_OBJ_FUNCTION)
+				if (objs[i].kind == WS_OBJ_FUNCTION || objs[i].kind == WS_OBJ_PROCEDURE)
 					owner_absent[i] = true;
 			}
 		}
@@ -622,7 +624,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 		pfree(usable);
 		for (int i = 0; i < nobjs; i++)
 			if (owner_absent[i])
-				refuse_definers_with_no_owner(&objs[i], schema);
+				refuse_definers_with_no_owner(&objs[i]);
 		CommandCounterIncrement();
 		exhaust_sequences(schema);
 		goto done;

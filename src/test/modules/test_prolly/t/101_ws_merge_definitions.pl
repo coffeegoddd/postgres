@@ -128,6 +128,27 @@ $node->safe_psql('postgres', 'CREATE ROLE g_gone3 NOLOGIN TRAVELS; GRANT g_gone3
 	q{DROP ROLE g_gone3;});
 is_deeply($c, [], 'a definer of its own, another object with its owner gone: clean') or diag($e);
 
+# a procedure that runs as an owner not here, as a function does
+$node->safe_psql('postgres', 'CREATE ROLE g_gone4 NOLOGIN TRAVELS; GRANT g_gone4 TO g_def');
+($c, $r, $e) = scenario(q{CREATE PROCEDURE who(INOUT x text) SECURITY DEFINER LANGUAGE plpgsql AS $$ BEGIN x := current_user; END $$;
+	RESET ROLE; GRANT CREATE ON SCHEMA app TO g_gone4; SET ROLE g_def;
+	ALTER PROCEDURE who(text) OWNER TO g_gone4;
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, b integer, g integer GENERATED ALWAYS AS (a * 2) STORED);
+	INSERT INTO t VALUES (1, 1, 1)}, q{UPDATE t SET a = 10}, q{UPDATE t SET b = 5},
+	q{DROP ROLE g_gone4;});
+like($c->[0] // '', qr/^unapplied procedure "who" runs as its owner/, 'a definer procedure with its owner gone') or diag($e);
+
+# another of its name is another function
+$node->safe_psql('postgres', 'CREATE ROLE g_gone5 NOLOGIN TRAVELS; GRANT g_gone5 TO g_def');
+($c, $r, $e) = scenario(q{CREATE FUNCTION f(integer) RETURNS integer IMMUTABLE LANGUAGE sql AS 'SELECT $1';
+	RESET ROLE; GRANT CREATE ON SCHEMA app TO g_gone5; SET ROLE g_def;
+	ALTER FUNCTION f(integer) OWNER TO g_gone5;
+	CREATE FUNCTION f(text) RETURNS integer IMMUTABLE SECURITY DEFINER LANGUAGE sql AS 'SELECT 1';
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, b integer, g integer GENERATED ALWAYS AS (a * 2) STORED);
+	INSERT INTO t VALUES (1, 1, 1)}, q{UPDATE t SET a = 10}, q{UPDATE t SET b = 5},
+	q{DROP ROLE g_gone5;});
+is_deeply($c, [], 'a definer of its own beside another of its name, whose owner is gone: clean') or diag($e);
+
 # a body that names a constraint has it there
 ($c, $r, $e) = scenario(q{CREATE TABLE p (id integer PRIMARY KEY, u integer, CONSTRAINT pk UNIQUE (u));
 	CREATE FUNCTION put(integer) RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO p VALUES ($1, $1) ON CONFLICT ON CONSTRAINT pk DO NOTHING; END;
