@@ -57,6 +57,7 @@ PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
 PG_FUNCTION_INFO_V1(test_ws_diff);
+PG_FUNCTION_INFO_V1(test_ws_rows_copy_as);
 
 /*
  * test_ws_schema_bytes(schema text, table text) returns bytea: the table's
@@ -934,6 +935,25 @@ test_ws_root_capture(PG_FUNCTION_ARGS)
 		ws_seq_map(ctx, seqs, nseqs, &map);
 		WsRoot->put_map(ctx, &rv, WS_ROOT_SEQUENCES, &map, &rv);
 	}
+	{
+		WsSqlRows	names;
+
+		WsSql->run("SELECT rolname::text FROM pg_authid WHERE roltravels ORDER BY rolname COLLATE \"C\"",
+				   0, NULL, &names);
+		if (names.nrows > 0)
+		{
+			const char **list = palloc_array(const char *, names.nrows);
+			WsRole	   *roles;
+			int			nroles;
+
+			for (int i = 0; i < names.nrows; i++)
+				list[i] = ws_sql_value(&names, i, 0);
+			ws_role_read(list, names.nrows, &roles, &nroles);
+			ws_role_map(ctx, roles, nroles, &map);
+			WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
+		}
+		ws_sql_rows_free(&names);
+	}
 	PG_RETURN_TEXT_P(hash_text(&rv));
 }
 
@@ -956,4 +976,33 @@ test_ws_diff(PG_FUNCTION_ARGS)
 
 	WsDiff->diff(backend_ctx(), &from, &to, diff_line_to, &lines);
 	PG_RETURN_TEXT_P(cstring_to_text_with_len((const char *) lines.data, (int) lines.len));
+}
+
+/*
+ * test_ws_rows_copy_as(schema text, rows_of text, record_of text, dest text) returns
+ * void: one table's rows restored as another's record says
+ */
+Datum
+test_ws_rows_copy_as(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *rows_of = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *record_of = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *dest = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	ChunkStore *cs = MemoryChunkStoreCreate();
+	ProllyCtx	ctx;
+	WsTableSchema from,
+				as;
+	PHash		map;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	rows_record(schema, rows_of, &from);
+	rows_record(schema, record_of, &as);
+	WsRows->capture(&ctx, schema, &from, &map);
+	WsRows->restore(&ctx, dest, &as, &map);
+	prolly_ctx_free(&ctx);
+	MemoryChunkStoreDestroy(cs);
+	ws_schema_free(&from);
+	ws_schema_free(&as);
+	PG_RETURN_VOID();
 }

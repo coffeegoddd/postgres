@@ -137,6 +137,7 @@ patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page 
 patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/adt/ddlutils.c  4  TRAVELS in a role's definition
+patch src/backend/utils/adt/domains.c  4  a domain's checks suspended while values are restored as a commit holds them
 patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/ri_triggers.c  1b  a foreign key's queries resolve names on its table's branch, whatever branch the session is on
 patch src/backend/utils/adt/ruleutils.c  1b  a constraint rebuilt by DDL is looked up with a catalog snapshot; also (4) deparse_column_name_hook, by which a commit holds column tags
@@ -218,6 +219,7 @@ patch src/include/utils/guc_hooks.h  3  check_chunk_format(), the hook of the ch
 patch src/include/utils/pgstat_internal.h  1a  the block map statistics kind's shared entry and callbacks
 patch src/include/utils/pgstat_kind.h  1a  PGSTAT_KIND_BLOCK_MAP, a variable-numbered kind after the fixed ones
 patch src/include/utils/plancache.h  1b  a cached expression's branch (CachedExpressionIsValid())
+patch src/include/utils/builtins.h  4  the flag suspending a domain's checks
 patch src/include/utils/ruleutils.h  4  deparse_column_name_hook
 patch src/include/utils/snapshot.h  1b  SnapshotData.is_catalog, set on catalog snapshots
 patch src/pl/plpgsql/src/pl_exec.c  1b  a cached cast is used on the branch it was planned on

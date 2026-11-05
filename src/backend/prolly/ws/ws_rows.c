@@ -23,7 +23,9 @@
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_sql.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -36,6 +38,7 @@ typedef struct CaptureBatch
 	ProllyCtx  *ctx;
 	const WsRowShape *shape;
 	PHash		map;
+	uint64		seen;
 } CaptureBatch;
 
 static int
@@ -115,6 +118,7 @@ capture_batch(void *arg, const WsSqlRows *rows)
 	ProllyEdit *edits = palloc_array(ProllyEdit, Max(rows->nrows, 1));
 	size_t		n = (size_t) rows->nrows;
 
+	b->seen += n;
 	for (int r = 0; r < rows->nrows; r++)
 	{
 		Buf			k = BUF_INIT,
@@ -179,6 +183,19 @@ direct_capture(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash
 		level = WsSql->begin();
 		WsSql->scan((const char *) sql.data, 0, NULL, CAPTURE_BATCH, capture_batch, &b);
 		WsSql->end(level);
+		if (shape.nkey > 0)
+		{
+			uint64		held;
+
+			if (prolly_count(ctx, &b.map, &held) < 0)
+				prolly_report(ctx);
+			if (held != b.seen)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("table \"%s\" has rows whose keys print alike, " UINT64_FORMAT " rows to " UINT64_FORMAT " keys",
+								table, b.seen, held),
+						 errhint("A commit tells its rows apart by the text of their keys.")));
+		}
 		ws_row_shape_free(&shape);
 	}
 	*map = b.map;
@@ -230,6 +247,7 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 	size_t		kl,
 				vl;
 	WsField    *f;
+	MemoryContext rowcxt;
 	int			rc;
 	int			level;
 
@@ -250,6 +268,9 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 		pfree(table);
 		return;
 	}
+	PreventCommandIfReadOnly("restoring rows");
+	PreventCommandIfParallelMode("restoring rows");
+	PreventCommandDuringRecovery("restoring rows");
 	rel = table_open(relid, RowExclusiveLock);
 	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, table);
@@ -296,48 +317,72 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 	slot = table_slot_create(rel, NULL);
 	cid = GetCurrentCommandId(true);
 	f = palloc_array(WsField, Max(shape.nstored, 1));
+	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "ws_rows row", ALLOCSET_DEFAULT_SIZES);
 
 	level = WsSql->begin();
 	if (prolly_iter_open(ctx, map, NULL, 0, &it) < 0)
 		prolly_report(ctx);
-	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
+	domain_checks_suspended = true;
+	PG_TRY();
 	{
-		MemoryContext old;
-		uint64		count = 1;
-		Buf			held = BUF_INIT;	/* (the tuple's, as all else of the row) */
-
-		CHECK_FOR_INTERRUPTS();
-		ResetPerTupleExprContext(estate);
-		old = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-		ws_row_load(ctx, &shape, k, kl, v, vl, f, &held);
-		if (shape.nkey == 0)
-			count = ws_rows_keyless_count(k, kl, v, vl);
-		ExecClearTuple(slot);
-		memset(slot->tts_isnull, true, desc->natts * sizeof(bool));
-		for (int i = 0; i < shape.nstored; i++)
-			if (!f[i].null)
-			{
-				char	   *text = pnstrdup((const char *) f[i].p, f[i].len);
-				int			att = cols[i].attnum - 1;
-
-				slot->tts_values[att] = InputFunctionCall(&cols[i].input, ws_text_from_utf8(text),
-														  cols[i].ioparam, cols[i].typmod);
-				slot->tts_isnull[att] = false;
-			}
-		ExecStoreVirtualTuple(slot);
-		for (uint64 i = 0; i < count; i++)
+		while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
 		{
-			table_tuple_insert(rel, slot, cid, 0, NULL);
-			if (rri->ri_NumIndices > 0)
-				(void) ExecInsertIndexTuples(rri, estate, 0, slot, NIL, NULL);
+			MemoryContext old;
+			uint64		count = 1;
+			Buf			held = BUF_INIT;	/* (the row's, as all else of it) */
+
+			CHECK_FOR_INTERRUPTS();
+			MemoryContextReset(rowcxt);
+			old = MemoryContextSwitchTo(rowcxt);
+			ws_row_load(ctx, &shape, k, kl, v, vl, f, &held);
+			if (shape.nkey == 0)
+				count = ws_rows_keyless_count(k, kl, v, vl);
+			ExecClearTuple(slot);
+			memset(slot->tts_isnull, true, desc->natts * sizeof(bool));
+			for (int i = 0; i < shape.nstored; i++)
+				if (!f[i].null)
+				{
+					char	   *text = pnstrdup((const char *) f[i].p, f[i].len);
+					int			att = cols[i].attnum - 1;
+
+					slot->tts_values[att] = InputFunctionCall(&cols[i].input, ws_text_from_utf8(text),
+															  cols[i].ioparam, cols[i].typmod);
+					slot->tts_isnull[att] = false;
+				}
+			ExecStoreVirtualTuple(slot);
+			MemoryContextSwitchTo(old);
+			for (uint64 i = 0; i < count; i++)
+			{
+				CHECK_FOR_INTERRUPTS();
+				ResetPerTupleExprContext(estate);
+				old = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+				table_tuple_insert(rel, slot, cid, 0, NULL);
+
+				/*
+				 * (A deferrable key says what it would check at commit.  All of a
+				 * state is written here, so that is now.)
+				 */
+				if (rri->ri_NumIndices > 0 &&
+					ExecInsertIndexTuples(rri, estate, 0, slot, NIL, NULL) != NIL)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNIQUE_VIOLATION),
+							 errmsg("a row of table \"%s\" has a key another has, under a deferrable constraint",
+									table)));
+				MemoryContextSwitchTo(old);
+			}
 		}
-		MemoryContextSwitchTo(old);
 	}
+	PG_FINALLY();
+	{
+		domain_checks_suspended = false;
+	}
+	PG_END_TRY();
 	prolly_iter_close(it);
 	if (rc < 0)
 		prolly_report(ctx);
 	WsSql->end(level);
 
+	MemoryContextDelete(rowcxt);
 	ExecDropSingleTupleTableSlot(slot);
 	ExecCloseIndices(rri);
 	FreeExecutorState(estate);

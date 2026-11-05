@@ -26,6 +26,7 @@ extern bool parse_bool(const char *value, bool *result);
 extern bool parse_bool_with_len(const char *value, size_t len, bool *result);
 
 /* domains.c */
+extern PGDLLIMPORT bool domain_checks_suspended;
 extern void domain_check(Datum value, bool isnull, Oid domainType,
 						 void **extra, MemoryContext mcxt);
 extern bool domain_check_safe(Datum value, bool isnull, Oid domainType,
