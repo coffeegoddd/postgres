@@ -2277,6 +2277,18 @@ is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', '
 $node->safe_psql('postgres', qq{SELECT test_ws_schema_remember(decode('$tp_was{t}', 'hex'), 'tp_dst')});
 is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 't'), 'hex')}), $tp_was{t}, 'remembered again it reads the same');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/exclusion/xd/predicate'}), '1', 'each exclusion has its own');
+# restored from a commit that holds what it prints, what was remembered of the last is gone
+{
+	my $printed_record = (split /\n/, $node->safe_psql('postgres', q{BEGIN; SET LOCAL allow_system_table_mods = on;
+		DELETE FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE 'table/1:a/%';
+		SELECT encode(test_ws_schema_bytes('tp_dst', 'a'), 'hex'); ROLLBACK}))[0];
+	isnt($printed_record, $tp_was{a}, 'a commit may hold what it prints');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_remember(decode('$printed_record', 'hex'), 'tp_dst')});
+	is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE 'table/1:a/%'}), '0', 'and then none is remembered of it');
+	is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 'a'), 'hex')}), $printed_record, 'and it reads as that commit');
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_remember(decode('$tp_was{a}', 'hex'), 'tp_dst')});
+	is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 'a'), 'hex')}), $tp_was{a}, 'and back again');
+}
 my $tp_rows = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace});
 cmp_ok($tp_rows, '>=', 8, 'what printed otherwise is remembered, by each expression');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/check/c3'}), '0', 'and what did not is not');
