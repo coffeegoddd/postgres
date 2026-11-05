@@ -1740,7 +1740,7 @@ copy_all_rows(CopyState *cs)
 				NamespaceCheckNameFree(get_namespace_name(obj.oid), cs->dst);
 				copy_rows_of(cs, NamespaceRelationId, NamespaceOidIndexId,
 							 Anum_pg_namespace_oid, obj.oid, fix_namespace);
-				copy_rows_of(cs, WsPrintRelationId, WsPrintNamespaceKeyIndexId,
+				copy_rows_of(cs, WsPrintRelationId, WsPrintNamespaceKeyHashIndexId,
 							 Anum_pg_ws_print_prtnamespace, obj.oid, fix_ws_print);
 				break;
 			case RelationRelationId:

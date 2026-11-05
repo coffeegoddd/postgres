@@ -25,13 +25,16 @@
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "common/int.h"
 #include "lib/binaryheap.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/readfuncs.h"
 #include "parser/parser.h"
+#include "parser/parsetree.h"
 #include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_print.h"
 #include "storage/lmgr.h"
@@ -1074,25 +1077,6 @@ names_schema_walker(Node *node, void *arg)
 			/* (a function's RETURN, which the tree walker has no case for) */
 			return names_schema_walker(((ReturnStmt *) node)->returnval, arg);
 		case T_RangeSubselect:
-			if (IsA(((RangeSubselect *) node)->subquery, SelectStmt))
-			{
-				ListCell   *lc;
-				int			unnamed = 0;
-
-				foreach(lc, ((SelectStmt *) ((RangeSubselect *) node)->subquery)->targetList)
-				{
-					ResTarget  *rt = lfirst_node(ResTarget, lc);
-
-					if (rt->name != NULL && strncmp(rt->name, "?column?", 8) == 0)
-						unnamed++;
-				}
-				/* (read back, an alias of one of them is told apart, so its row reads otherwise) */
-				if (unnamed > 1)
-				{
-					n->why = "a subquery has columns of no name, which would read back with names";
-					return true;
-				}
-			}
 			{
 				RangeSubselect *r = (RangeSubselect *) node;
 
@@ -2319,25 +2303,107 @@ read_casts(const char *schema, WsObject *objs, int *n)
 "    THEN 'it is of a table''s or a view''s row type, and a table may need it' "
 
 /*
- * An ARRAY[] of int2vector or oidvector prints as an array of its elements, saying nothing
- * of its type, so reads back as another type, and returns other values.  Nothing in what
- * is printed shows it; what is stored does.
+ * What printing itself loses, which shows only in what is stored.  An ARRAY[] of int2vector
+ * or oidvector prints as an array of its elements, saying nothing of its type.  Columns of
+ * one name in a subquery, join or the like print with names told apart, so a whole row of
+ * it reads back with other names.  Both then return other values, printing the same.
  */
-#define VECTOR_ARRAY "':array_typeid (22|30) '"
-static const char *const vector_array_refusal_sql =
-"SELECT what, 'it has an ARRAY[] of int2vector or oidvector, which printing loses' FROM ("
+typedef struct LostInPrint
+{
+	List	   *queries;		/* the innermost first */
+	const char *why;
+} LostInPrint;
+
+static bool
+duplicate_names(List *names)
+{
+	ListCell   *a;
+	ListCell   *b;
+
+	foreach(a, names)
+		for_each_cell(b, names, lnext(names, a))
+			if (strcmp(strVal(lfirst(a)), strVal(lfirst(b))) == 0)
+				return true;
+	return false;
+}
+
+static bool
+lost_in_print_walker(Node *node, void *arg)
+{
+	LostInPrint *l = arg;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, ArrayExpr) && (((ArrayExpr *) node)->array_typeid == INT2VECTOROID ||
+								 ((ArrayExpr *) node)->array_typeid == OIDVECTOROID))
+	{
+		l->why = "it has an ARRAY[] of int2vector or oidvector, which printing loses";
+		return true;
+	}
+	if (IsA(node, Var) && ((Var *) node)->varattno == 0 &&
+		((Var *) node)->varlevelsup < list_length(l->queries))
+	{
+		Var		   *v = (Var *) node;
+		Query	   *q = list_nth(l->queries, v->varlevelsup);
+
+		if (v->varno >= 1 && v->varno <= list_length(q->rtable) &&
+			duplicate_names(rt_fetch(v->varno, q->rtable)->eref->colnames))
+		{
+			l->why = "it has a whole row of columns of one name, which printing tells apart";
+			return true;
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+	{
+		bool		found;
+
+		l->queries = lcons(node, l->queries);
+		found = query_tree_walker((Query *) node, lost_in_print_walker, arg, 0);
+		l->queries = list_delete_first(l->queries);
+		return found;
+	}
+	return expression_tree_walker(node, lost_in_print_walker, arg);
+}
+
+static const char *const stored_trees_sql =
+"SELECT what, tree FROM ("
 "  SELECT c.relname::text AS what, r.ev_action::text AS tree FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT c.relname::text, r.ev_qual::text FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT p.proname::text, p.prosqlbody::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT p.proname::text, p.proargdefaults::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT t.typname::text, t.typdefaultbin::text FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT c.relname::text, d.adbin::text FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT k.conname::text, k.conbin::text FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT c.relname::text, i.indexprs::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT c.relname::text, i.indpred::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT c.relname::text, p.partexprs::text FROM pg_partitioned_table p JOIN pg_class c ON c.oid = p.partrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+"  UNION ALL SELECT s.stxname::text, s.stxexprs::text FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT g.tgname::text, g.tgqual::text FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT y.polname::text, y.polqual::text FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
 "  UNION ALL SELECT y.polname::text, y.polwithcheck::text FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
-") t WHERE tree ~ " VECTOR_ARRAY " ORDER BY 1";
+") t WHERE tree IS NOT NULL";
+
+static void
+refuse_what_printing_loses(const char *schema)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read(stored_trees_sql, 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		LostInPrint l = {NIL, NULL};
+		Node	   *tree = stringToNode(ws_sql_value(&rows, i, 1));
+
+		if (lost_in_print_walker(tree, &l))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: %s",
+							ws_sql_value(&rows, i, 0), schema, l.why)));
+	}
+	ws_sql_rows_free(&rows);
+}
 
 static const char *const operator_refusal_sql =
 "SELECT o.oprname::text, CASE "
@@ -3795,7 +3861,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_types(schema, policy_refusal_sql);
 	refuse_types(schema, collation_refusal_sql);
 	refuse_types(schema, conversion_refusal_sql);
-	refuse_types(schema, vector_array_refusal_sql);
+	refuse_what_printing_loses(schema);
 	refuse_types(schema, operator_refusal_sql);
 	refuse_types(schema, opfamily_refusal_sql);
 	refuse_types(schema, opclass_refusal_sql);

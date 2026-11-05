@@ -1350,7 +1350,7 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 	DeleteComments(object->objectId, object->classId, object->objectSubId);
 	DeleteSecurityLabel(object);
 	if (object->classId == NamespaceRelationId)
-		WsPrintsForgetSchema(object->objectId);
+		WsPrints->forget_schema(object->objectId);
 	DeleteInitPrivs(object);
 
 	/*

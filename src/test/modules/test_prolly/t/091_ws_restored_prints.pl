@@ -400,7 +400,7 @@ cmp_ok(scalar(keys %was), '>', 3 * scalar(@exprs), 'every expression is held in 
 
 $node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp', 'sp2', 'before')});
 $node->safe_psql('postgres', "SET ROLE g_stable; SET search_path = sp2;\n" . $tables);
-$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp', 'sp2', 'after')});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp', 'sp2', 'after', true)});
 
 # (all at once, so this says which, not only that one did)
 my %is = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')});
@@ -444,7 +444,7 @@ is($looked, 't', 'most of which could be read');
 # a second round, as a form that only settled later would pass the first by chance
 $node->safe_psql('postgres', q{CREATE SCHEMA sp3 AUTHORIZATION g_stable; SELECT test_ws_obj_copy('sp2', 'sp3', 'before')});
 $node->safe_psql('postgres', "SET ROLE g_stable; SET search_path = sp3;\n" . $tables);
-$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp2', 'sp3', 'after')});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sp2', 'sp3', 'after', true)});
 is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp3')}), $held, 'and again');
 
 # only what printed otherwise is remembered
@@ -467,11 +467,62 @@ is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')}), $held, 'and
 # made anew as it was first made, or as what the restore printed, it is as the commit
 my ($stale) = grep { pack('H*', $was{$_}) =~ /ANY \(\(ARRAY/ } grep { /^view\/w/ } sort keys %was;
 ok($stale, 'there is a view that printed otherwise');
+is($node->safe_psql('postgres', qq{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'sp2'::regnamespace AND prtkey = '$stale'}), '1', 'and is remembered');
 (my $stale_name = $stale) =~ s/^view\///;
-my $first_form = substr(pack('H*', $was{$stale}), 0);
 my $restored_def = $node->safe_psql('postgres', qq{SET search_path = pg_catalog, sp2; SELECT pg_get_viewdef('sp2.$stale_name'::regclass)});
 $node->safe_psql('postgres', qq{SET ROLE g_stable; SET search_path = pg_catalog, sp2, public; DROP VIEW sp2.$stale_name; CREATE VIEW sp2.$stale_name AS $restored_def});
-is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')}), $held, 'made anew from what the restore printed, it reads as the commit');
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')}), $held, 'one made anew from what the restore printed reads as the commit');
+
+# other real changes read as changes, and each is the fresh print, on what was remembered
+for my $change (
+	[ qq{CREATE OR REPLACE VIEW sp2.$stale_name AS SELECT 2 AS col FROM t0 WHERE v IN ('a', 'b')}, $stale ],
+	[ q{CREATE DOMAIN sp2.dc2 AS varchar(10); ALTER DOMAIN sp2.dc DROP CONSTRAINT dc_check; ALTER DOMAIN sp2.dc ADD CONSTRAINT dc_check CHECK (VALUE IN ('a', 'c')); DROP DOMAIN sp2.dc2}, 'domain/dc' ],
+	[ q{CREATE OR REPLACE FUNCTION sp2.fr() RETURNS text LANGUAGE sql RETURN (SELECT 'b')}, 'function/fr()' ],
+	[ q{DROP RULE ru ON sp2.s; CREATE RULE ru AS ON DELETE TO sp2.s WHERE OLD.v IN ('a', 'c') DO ALSO DELETE FROM sp2.s WHERE v IN ('c', 'd')}, 'rule/ru(s)' ],
+	[ q{DROP POLICY po ON sp2.s; CREATE POLICY po ON sp2.s USING (v IN ('a', 'c')) WITH CHECK (v NOT IN ('c'))}, 'policy/po(s)' ])
+{
+	my ($sql, $key) = @$change;
+	$node->safe_psql('postgres', "SET search_path = pg_catalog, sp2, public; $sql");
+	my %after = map { my ($k, $v) = split /\t/; $k => $v } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp2')});
+	isnt($after{$key}, $was{$key}, "a change reads as one: $key");
+}
+
+# a restore over what was remembered of another commit replaces it
+$node->safe_psql('postgres', q{CREATE SCHEMA twice AUTHORIZATION g_stable; CREATE SCHEMA twice2 AUTHORIZATION g_stable; SET ROLE g_stable; CREATE TABLE twice.t (v varchar(10));
+	CREATE VIEW twice.w AS SELECT v FROM twice.t WHERE v IN ('a', 'b');
+	CREATE TABLE twice2.t (v varchar(10))});
+my $twice_first = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('twice')});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('twice', 'twice2', 'both', true)});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('twice2')}), $twice_first, 'a schema restored once reads as it was');
+$node->safe_psql('postgres', q{SET ROLE g_stable; DROP VIEW twice.w; CREATE VIEW twice.w AS SELECT v FROM twice.t WHERE v IN ('a', 'c'); DROP VIEW twice2.w});
+my $twice_second = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('twice')});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('twice', 'twice2', 'both', true)});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('twice2')}), $twice_second, 'and restored from another commit reads as that');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'twice2'::regnamespace}), '1', 'with one entry, not two');
+
+# a long key is fine
+{
+	my $long = join(', ', map { "d$_" } 1 .. 60);
+	my $domains = join('; ', map { "CREATE DOMAIN lk.d$_" . ('x' x 50) . " AS integer" } 1 .. 60);
+	my $args = join(', ', map { "lk.d$_" . ('x' x 50) } 1 .. 60);
+	$node->safe_psql('postgres', qq{CREATE SCHEMA lk AUTHORIZATION g_stable; CREATE SCHEMA lk2 AUTHORIZATION g_stable; SET ROLE g_stable; $domains;
+		CREATE FUNCTION lk.f($args) RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a'; END});
+	my $lk = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('lk')});
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('lk', 'lk2', 'both', true)});
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('lk2')}), $lk, 'a function whose key is too long for an index is remembered');
+}
+
+# one read while what is remembered changes is to try again
+{
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DELETE FROM pg_ws_print WHERE prtnamespace = 'twice2'::regnamespace});
+	$old->{stderr} = '';
+	$old->query(q{SELECT test_ws_obj_bytes('twice2')});
+	like($old->{stderr}, qr/has changed since/, 'a read at a snapshot from before what is remembered changed tries again');
+	$old->quit;
+}
 
 # lost, what it was for reads as changed, and nothing else; and it reads so from then on
 my %before = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $held;
@@ -492,7 +543,7 @@ $node->safe_psql('postgres', qq{SET catalog_branch = $from; CREATE SCHEMA bsrc V
 	CREATE ROLE g_branch NOLOGIN; ALTER TABLE bsrc.t OWNER TO g_branch; ALTER TABLE bdst.t OWNER TO g_branch;
 	CREATE VIEW bsrc.w AS SELECT v FROM bsrc.t WHERE v IN ('a', 'b'); ALTER VIEW bsrc.w OWNER TO g_branch});
 my $branch_held = $node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bsrc')});
-$node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_copy('bsrc', 'bdst')});
+$node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_copy('bsrc', 'bdst', 'both', true)});
 is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'restored on a branch, it reads as its commit');
 is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT count(*) FROM pg_ws_print p JOIN pg_namespace n ON n.oid = p.prtnamespace WHERE n.nspname = 'bdst'}), '1', 'with what it remembers');
 $node->safe_psql('postgres', "SELECT pg_branch_catalog_copy($from, $to)");
@@ -503,13 +554,32 @@ isnt($node->safe_psql('postgres', qq{SET catalog_branch = $to; SELECT test_ws_ob
 is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'and not on the other');
 
 # what printing itself loses is refused, as no text held would make it again
+my $vec = q{(ARRAY[1]::int2vector)::text <> ''};
 for my $case (
 	[ q{CREATE VIEW w AS SELECT ARRAY[1, 2]::int2vector AS x}, 'int2vector' ],
-	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT i FROM t0 WHERE (ARRAY[1]::oidvector)::text <> ''}, 'int2vector or oidvector' ],
-	[ q{CREATE TABLE t0 (i integer, x text DEFAULT (ARRAY[1]::int2vector)::text)}, 'int2vector or oidvector' ],
 	[ q{CREATE VIEW w AS SELECT ARRAY[1]::oidvector AS x}, 'oidvector' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT i FROM t0 WHERE (ARRAY[1]::oidvector)::text <> ''}, 'int2vector or oidvector' ],
 	[ q{CREATE FUNCTION f() RETURNS int2vector LANGUAGE sql BEGIN ATOMIC SELECT ARRAY[1]::int2vector AS x; END}, 'int2vector' ],
-	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT i + 1, i + 2 FROM t0) x}, 'of no name' ])
+	[ qq{CREATE FUNCTION f(a boolean DEFAULT $vec) RETURNS boolean LANGUAGE sql RETURN a}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer, x text DEFAULT (ARRAY[1]::int2vector)::text)}, 'int2vector or oidvector' ],
+	[ q{CREATE DOMAIN dd AS text DEFAULT ((ARRAY[1, 2]::int2vector))::text}, 'int2vector' ],
+	[ qq{CREATE DOMAIN dd AS boolean CHECK ($vec)}, 'int2vector' ],
+	[ qq{CREATE TABLE t0 (i integer, CONSTRAINT k CHECK ($vec))}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE INDEX k ON t0 (i) WHERE (ARRAY[i::oid]::oidvector) IS NOT NULL}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE INDEX k ON t0 ((ARRAY[i::oid]::oidvector))}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer) PARTITION BY LIST ((ARRAY[i::oid]::oidvector))}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer, b text); CREATE STATISTICS s ON ((ARRAY[i::oid]::oidvector) IS NULL), i FROM t0}, 'int2vector' ],
+	[ qq{CREATE FUNCTION g() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TABLE t0 (i integer); CREATE TRIGGER k BEFORE INSERT ON t0 FOR EACH ROW WHEN ($vec) EXECUTE FUNCTION g()}, 'int2vector' ],
+	[ qq{CREATE TABLE t0 (i integer); CREATE POLICY k ON t0 USING ($vec)}, 'int2vector' ],
+	[ qq{CREATE TABLE t0 (i integer); CREATE POLICY k ON t0 FOR INSERT WITH CHECK ($vec)}, 'int2vector' ],
+	[ qq{CREATE TABLE t0 (i integer); CREATE RULE k AS ON DELETE TO t0 WHERE $vec DO ALSO DELETE FROM t0}, 'int2vector' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT i + 1, i + 2 FROM t0) x}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer, b integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT i AS a, b AS a FROM t0) x}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT i, i FROM t0) x}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS WITH x AS (SELECT i, i FROM t0) SELECT row_to_json(x) AS j FROM x}, 'whole row' ],
+	[ q{CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (VALUES (1, 2)) x(a, a)}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE FUNCTION f() RETURNS SETOF json LANGUAGE sql BEGIN ATOMIC SELECT row_to_json(x) AS j FROM (SELECT i, i FROM t0) x; END}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE POLICY k ON t0 USING ((SELECT row_to_json(x)::text FROM (SELECT 1 AS a, 2 AS a) x) IS NOT NULL)}, 'whole row' ])
 {
 	my ($sql, $why) = @$case;
 	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS lost CASCADE; CREATE SCHEMA lost AUTHORIZATION g_stable; SET ROLE g_stable; SET search_path = lost; $sql});
@@ -518,6 +588,15 @@ for my $case (
 	like($errl, qr/\Q$why\E/, "for why: $sql");
 }
 $node->safe_psql('postgres', q{DROP SCHEMA lost CASCADE});
+
+# what looks like it but loses nothing is held
+$node->safe_psql('postgres', q{CREATE SCHEMA kept AUTHORIZATION g_stable; SET ROLE g_stable; SET search_path = kept; CREATE TABLE t0 (i integer, b integer);
+	CREATE VIEW a AS SELECT 1 AS k FROM (SELECT i + 1, i + 2 FROM t0) x;
+	CREATE VIEW b AS SELECT 1 AS k FROM (SELECT i AS a, b AS a FROM t0) x;
+	CREATE VIEW c AS SELECT row_to_json(x) AS j FROM (SELECT i AS "?column?1", b AS "?column?2" FROM t0) x;
+	CREATE VIEW d AS SELECT row_to_json(t0) AS j FROM t0 JOIN t0 u USING (i)});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('kept')}), qr/^view\/d\t/m, 'columns of one name no whole row reads are held, and a join\'s');
+$node->safe_psql('postgres', q{DROP SCHEMA kept CASCADE});
 
 $node->stop;
 done_testing();

@@ -41,7 +41,6 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_ws_print.h"
 #include "miscadmin.h"
 #include "storage/bmap.h"
 #include "utils/fmgroids.h"
@@ -165,7 +164,6 @@ IsCatalogTextUniqueIndexOid(Oid relid)
 		case ParameterAclParnameIndexId:
 		case ReplicationOriginNameIndex:
 		case SecLabelObjectIndexId:
-		case WsPrintNamespaceKeyIndexId:
 		case SharedSecLabelObjectIndexId:
 			return true;
 	}
