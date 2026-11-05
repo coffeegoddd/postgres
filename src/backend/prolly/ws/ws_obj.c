@@ -53,6 +53,7 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 const WsObjectCodecRoutine *WsObjectCodec = &BinaryWsObjectCodec;
 
@@ -2327,6 +2328,78 @@ duplicate_names(List *names)
 	return false;
 }
 
+/*
+ * Whether printing would rename a column of one of these names in query q.  It keeps USING's
+ * columns apart from every other in a query if any join there, of no alias, merges one into
+ * what is not simply a column of a table, as a FULL JOIN does, or a join of two types.
+ */
+static bool
+named_as_a_kept_using(Query *q, List *names)
+{
+	bool		kept = false;
+
+	foreach_ptr(RangeTblEntry, rte, q->rtable)
+	{
+		int			merged = 0;
+
+		if (rte->rtekind != RTE_JOIN || rte->alias != NULL)
+			continue;
+		foreach_ptr(Node, var, rte->joinaliasvars)
+		{
+			if (merged++ >= rte->joinmergedcols)
+				break;
+			kept |= var != NULL && !IsA(var, Var);
+		}
+	}
+	if (!kept)
+		return false;
+	foreach_ptr(RangeTblEntry, rte, q->rtable)
+	{
+		int			merged = 0;
+
+		if (rte->rtekind != RTE_JOIN)
+			continue;
+		foreach_node(String, used, rte->eref->colnames)
+		{
+			if (merged++ >= rte->joinmergedcols)
+				break;
+			foreach_node(String, name, names)
+				if (strcmp(strVal(used), strVal(name)) == 0)
+					return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Columns follow a composite function's in a range table entry by position, and its text
+ * says no list of what it took, so if its type has since changed they read back elsewhere.
+ */
+static bool
+followed_by_columns_of_a_changed_type(RangeTblEntry *rte)
+{
+	if (rte->rtekind != RTE_FUNCTION || (!rte->funcordinality && list_length(rte->functions) < 2))
+		return false;
+	foreach_node(RangeTblFunction, f, rte->functions)
+	{
+		Oid			type = exprType(f->funcexpr);
+
+		if (f->funccolnames == NIL && type != RECORDOID && type_is_rowtype(type))
+		{
+			TupleDesc	desc = lookup_rowtype_tupdesc_domain(type, -1, false);
+			bool		changed = false;
+
+			/* (columns since dropped hold no place a reader would see) */
+			for (int a = f->funccolcount; a < desc->natts; a++)
+				changed |= !TupleDescAttr(desc, a)->attisdropped;
+			ReleaseTupleDesc(desc);
+			if (changed)
+				return true;
+		}
+	}
+	return false;
+}
+
 static bool
 lost_in_print_walker(Node *node, void *arg)
 {
@@ -2340,17 +2413,46 @@ lost_in_print_walker(Node *node, void *arg)
 		l->why = "it has an ARRAY[] of int2vector or oidvector, which printing loses";
 		return true;
 	}
-	if (IsA(node, Var) && ((Var *) node)->varattno == 0 &&
+	/* (a whole row of a USING's alias is expanded, and prints as ROW() of no names) */
+	if (IsA(node, RowExpr) && ((RowExpr *) node)->row_typeid == RECORDOID)
+	{
+		int			i = 0;
+		ListCell   *lc;
+
+		foreach(lc, ((RowExpr *) node)->colnames)
+			if (strcmp(strVal(lfirst(lc)), psprintf("f%d", ++i)) != 0)
+			{
+				l->why = "it has a whole row of a join's alias, whose names printing loses";
+				return true;
+			}
+	}
+	/* (of a type its names are the type's, whatever the range table says) */
+	if (IsA(node, Var) && ((Var *) node)->varattno == 0 && ((Var *) node)->vartype == RECORDOID &&
 		((Var *) node)->varlevelsup < list_length(l->queries))
 	{
 		Var		   *v = (Var *) node;
 		Query	   *q = list_nth(l->queries, v->varlevelsup);
 
-		if (v->varno >= 1 && v->varno <= list_length(q->rtable) &&
-			duplicate_names(rt_fetch(v->varno, q->rtable)->eref->colnames))
+		if (v->varno >= 1 && v->varno <= list_length(q->rtable))
 		{
-			l->why = "it has a whole row of columns of one name, which printing tells apart";
-			return true;
+			RangeTblEntry *rte = rt_fetch(v->varno, q->rtable);
+
+			/* (printed with no list of columns, read back it is of those there then) */
+			if (rte->rtekind == RTE_JOIN)
+			{
+				l->why = "it has a whole row of a join, which reads back as of the columns then";
+				return true;
+			}
+			if (duplicate_names(rte->eref->colnames))
+			{
+				l->why = "it has a whole row of columns of one name, which printing tells apart";
+				return true;
+			}
+			if (named_as_a_kept_using(q, rte->eref->colnames))
+			{
+				l->why = "it has a whole row with a column named as a USING's, which printing renames";
+				return true;
+			}
 		}
 		return false;
 	}
@@ -2358,6 +2460,12 @@ lost_in_print_walker(Node *node, void *arg)
 	{
 		bool		found;
 
+		foreach_ptr(RangeTblEntry, rte, ((Query *) node)->rtable)
+			if (followed_by_columns_of_a_changed_type(rte))
+			{
+				l->why = "it has a function's columns before others, and the function's type has changed since";
+				return true;
+			}
 		l->queries = lcons(node, l->queries);
 		found = query_tree_walker((Query *) node, lost_in_print_walker, arg, 0);
 		l->queries = list_delete_first(l->queries);

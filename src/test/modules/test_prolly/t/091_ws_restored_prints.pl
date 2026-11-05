@@ -10,6 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Digest::SHA qw(sha1_hex);
 
 my $node = PostgreSQL::Test::Cluster->new('stable');
 $node->init;
@@ -502,9 +503,10 @@ is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtname
 
 # a long key is fine
 {
-	my $long = join(', ', map { "d$_" } 1 .. 60);
-	my $domains = join('; ', map { "CREATE DOMAIN lk.d$_" . ('x' x 50) . " AS integer" } 1 .. 60);
-	my $args = join(', ', map { "lk.d$_" . ('x' x 50) } 1 .. 60);
+	# (names that do not compress, or it would fit in an index anyway)
+	my @names = map { 'd' . substr(sha1_hex($_) . sha1_hex("x$_"), 0, 60) } 1 .. 100;
+	my $domains = join('; ', map { "CREATE DOMAIN lk.$_ AS integer" } @names);
+	my $args = join(', ', map { "lk.$_" } @names);
 	$node->safe_psql('postgres', qq{CREATE SCHEMA lk AUTHORIZATION g_stable; CREATE SCHEMA lk2 AUTHORIZATION g_stable; SET ROLE g_stable; $domains;
 		CREATE FUNCTION lk.f($args) RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a'; END});
 	my $lk = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('lk')});
@@ -579,7 +581,17 @@ for my $case (
 	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS WITH x AS (SELECT i, i FROM t0) SELECT row_to_json(x) AS j FROM x}, 'whole row' ],
 	[ q{CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (VALUES (1, 2)) x(a, a)}, 'whole row' ],
 	[ q{CREATE TABLE t0 (i integer); CREATE FUNCTION f() RETURNS SETOF json LANGUAGE sql BEGIN ATOMIC SELECT row_to_json(x) AS j FROM (SELECT i, i FROM t0) x; END}, 'whole row' ],
-	[ q{CREATE TABLE t0 (i integer); CREATE POLICY k ON t0 USING ((SELECT row_to_json(x)::text FROM (SELECT 1 AS a, 2 AS a) x) IS NOT NULL)}, 'whole row' ])
+	[ q{CREATE TABLE t0 (i integer); CREATE POLICY k ON t0 USING ((SELECT row_to_json(x)::text FROM (SELECT 1 AS a, 2 AS a) x) IS NOT NULL)}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT (SELECT row_to_json(x) FROM (SELECT 1) y) AS j FROM (SELECT i, i FROM t0) x}, 'whole row' ],
+	[ q{CREATE TABLE t0 (i integer); CREATE VIEW w AS SELECT y.j FROM (SELECT i, i FROM t0) x, LATERAL (SELECT row_to_json(x) AS j) y}, 'whole row' ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT row_to_json(u) AS j FROM t1 a JOIN t2 b USING (i) AS u}, 'whole row of a join' ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT a.i FROM t1 a JOIN t2 b USING (i) AS u WHERE to_jsonb(u) ? 'i'}, 'whole row of a join' ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (k integer); CREATE VIEW w AS SELECT row_to_json(j) AS r FROM (t1 JOIN t2 ON i = k) AS j}, 'whole row of a join' ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS i, 9 AS z) x, t1 a FULL JOIN t2 c USING (i)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t2 (i bigint); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS i, 9 AS z) x, t1 a LEFT JOIN t2 c USING (i)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t3 (i integer); CREATE TABLE k1 (k integer); CREATE TABLE k2 (k integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS k, 9 AS z) x, t1 a FULL JOIN t3 c USING (i), k1 JOIN k2 USING (k)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (i integer); CREATE FUNCTION tf() RETURNS SETOF t1 LANGUAGE sql AS 'SELECT 1'; CREATE VIEW w AS SELECT x.o FROM tf() WITH ORDINALITY x(a, o); ALTER TABLE t1 ADD n integer}, 'has changed since' ],
+	[ q{CREATE TABLE t1 (i integer); CREATE FUNCTION tf() RETURNS SETOF t1 LANGUAGE sql AS 'SELECT 1'; CREATE VIEW w AS SELECT x.q FROM ROWS FROM (tf(), generate_series(7, 7)) x(a, q); ALTER TABLE t1 ADD n integer}, 'has changed since' ])
 {
 	my ($sql, $why) = @$case;
 	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS lost CASCADE; CREATE SCHEMA lost AUTHORIZATION g_stable; SET ROLE g_stable; SET search_path = lost; $sql});
@@ -594,8 +606,28 @@ $node->safe_psql('postgres', q{CREATE SCHEMA kept AUTHORIZATION g_stable; SET RO
 	CREATE VIEW a AS SELECT 1 AS k FROM (SELECT i + 1, i + 2 FROM t0) x;
 	CREATE VIEW b AS SELECT 1 AS k FROM (SELECT i AS a, b AS a FROM t0) x;
 	CREATE VIEW c AS SELECT row_to_json(x) AS j FROM (SELECT i AS "?column?1", b AS "?column?2" FROM t0) x;
-	CREATE VIEW d AS SELECT row_to_json(t0) AS j FROM t0 JOIN t0 u USING (i)});
-like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('kept')}), qr/^view\/d\t/m, 'columns of one name no whole row reads are held, and a join\'s');
+	CREATE VIEW d AS SELECT row_to_json(t0) AS j FROM t0 JOIN t0 u USING (i);
+	CREATE VIEW e AS SELECT row_to_json(ROW(1, 2)) AS r;
+	CREATE TABLE gone (a integer, b integer, c integer, d integer); ALTER TABLE gone DROP COLUMN a; ALTER TABLE gone DROP COLUMN b;
+	CREATE VIEW f AS SELECT row_to_json(gone) AS j FROM gone;
+	CREATE VIEW g AS SELECT row_to_json(x) AS j FROM gone x(p);
+	CREATE TYPE two AS (a integer, b integer); CREATE FUNCTION fr() RETURNS two LANGUAGE sql AS 'SELECT 1, 2';
+	CREATE VIEW h AS SELECT row_to_json(x) AS j FROM fr() x(a, a);
+	CREATE VIEW m AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id) x JOIN t0 ON id = i;
+	CREATE TABLE f1 (id integer); CREATE TABLE f2 (id integer);
+	CREATE VIEW n AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id) x JOIN f1 USING (id);
+	CREATE VIEW o AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS z) x, f1 FULL JOIN f2 USING (id);
+	CREATE VIEW p AS SELECT x.ord FROM fr() WITH ORDINALITY x(a, b, ord);
+	CREATE VIEW q AS SELECT x.c FROM ROWS FROM (fr(), generate_series(1, 2)) x(a, b, c);
+	CREATE VIEW r AS SELECT y.j FROM f1 a FULL JOIN f2 c USING (id), LATERAL (SELECT row_to_json(x) AS j FROM (SELECT 1 AS id) x) y;
+	CREATE VIEW s AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x, (f1 FULL JOIN f2 USING (id)) AS q;
+	CREATE VIEW u AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x, f1 JOIN f2 USING (id);
+	CREATE DOMAIN dtwo AS two; CREATE FUNCTION fd() RETURNS dtwo LANGUAGE sql AS 'SELECT ROW(1, 2)::two';
+	CREATE VIEW v AS SELECT x.o FROM fd() WITH ORDINALITY x(a, b, o);
+	CREATE TABLE grows (a integer); CREATE FUNCTION fg() RETURNS SETOF grows LANGUAGE sql AS 'SELECT 1';
+	CREATE VIEW x AS SELECT y.o FROM fg() WITH ORDINALITY y(a, o);
+	ALTER TABLE grows ADD COLUMN gone integer; ALTER TABLE grows DROP COLUMN gone});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('kept')}), qr/^view\/d\t.*^view\/e\t.*^view\/f\t.*^view\/g\t.*^view\/h\t.*^view\/m\t.*^view\/n\t.*^view\/o\t.*^view\/p\t.*^view\/q\t.*^view\/r\t.*^view\/s\t.*^view\/u\t.*^view\/v\t.*^view\/x\t/ms, 'columns of one name no whole row reads are held, a join\'s, ROW(), a whole row of a table with columns dropped, of a type, beside a join or a FULL JOIN of other names, a USING kept only in another query or under an alias, and a function\'s columns, of a domain too, while its type has not changed but for what is dropped');
 $node->safe_psql('postgres', q{DROP SCHEMA kept CASCADE});
 
 $node->stop;
