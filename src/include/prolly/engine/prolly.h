@@ -148,7 +148,10 @@ pg_noreturn extern void prolly_report(ProllyCtx *ctx);
 extern int	prolly_put_chunk(ProllyCtx *ctx, const uint8 *data, size_t len,
 							 PHash *out);
 
-/* vrefs: leading hashes in each value that the map holds strongly. */
+/*
+ * vrefs: leading hashes in each value that the map holds strongly, or
+ * CHUNK_VREFS_COUNTED if each value says how many.
+ */
 extern int	prolly_empty(ProllyCtx *ctx, uint8 vrefs, PHash *out);
 /* kvs must be sorted by key with no duplicates. */
 extern int	prolly_build(ProllyCtx *ctx, uint8 vrefs, const ProllyKV *kvs,
@@ -189,6 +192,16 @@ extern void prolly_merge_result_free(ProllyMergeResult *r);
  */
 extern int	prolly_chunk_diff(ProllyCtx *ctx, const PHash *a, const PHash *b,
 							  ProllyChunkFn fn, void *arg);
+
+/*
+ * Of a tree of counted references, the nodes of the trees its changed entries
+ * name that b's entry of that key does not, each once: nearly the rest of what a
+ * has that b lacks, content alone deciding it.  A tree new to its entry is
+ * measured against one its old entry no longer names, in order; a tree only
+ * another key's entry names counts as new.  Nothing for other trees.
+ */
+extern int	prolly_chunk_diff_values(ProllyCtx *ctx, const PHash *a, const PHash *b,
+									 ProllyChunkFn fn, void *arg);
 
 /*
  * A delta is a chunk listing the row edits that turn tree base into tree

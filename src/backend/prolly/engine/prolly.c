@@ -218,7 +218,7 @@ node_decode(const PHash *h, const uint8 *data, size_t len)
 		n->vl[i] = (uint32) vl;
 		p += vl;
 		if (n->level > 0 ? !ref_decode(n->v[i], vl, &ch, &t)
-			: vl < (uint64) n->vrefs * PHASH_LEN)
+			: !engine_leaf_value_valid(n->vrefs, n->v[i], vl))
 			goto bad;
 		if (i > 0 && key_cmp(n->k[i - 1], n->kl[i - 1], n->k[i], n->kl[i]) >= 0)
 			goto bad;
@@ -475,7 +475,7 @@ lc_add(LevelChunker *lc, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 
 	/* (a build, or edits, of many rows reads no node to check at) */
 	CHECK_FOR_INTERRUPTS();
-	if (lc->level == 0 && vl < (size_t) lc->shape.vrefs * PHASH_LEN)
+	if (lc->level == 0 && !engine_leaf_value_valid(lc->shape.vrefs, v, vl))
 		return fail(lc->ctx, PROLLY_ERR_BAD_VALUE, NULL);
 	buf_append_uvarint(&lc->items, kl);
 	lc->lastkoff = lc->items.len;
@@ -1655,6 +1655,120 @@ prolly_chunk_diff(ProllyCtx *ctx, const PHash *a, const PHash *b,
 	phmap_free(&la);
 	phmap_free(&lb);
 	return rc;
+}
+
+typedef struct ValueTrees
+{
+	ProllyCtx  *ctx;
+	ProllyChunkFn fn;
+	void	   *arg;
+	bool		from_counted;
+	PHash		empty;
+	PHashMap	seen;
+	int			rc;
+} ValueTrees;
+
+static void
+value_tree_node(void *arg, const PHash *h)
+{
+	ValueTrees *w = arg;
+	bool		created;
+
+	(void) phmap_ref(&w->seen, h, &created);
+	if (created)
+		w->fn(w->arg, h);
+}
+
+static void
+value_trees_of_change(void *arg, const ProllyDiff *d)
+{
+	ValueTrees *w = arg;
+	const uint8 *to,
+			   *from = NULL;
+	uint64		nto,
+				nfrom = 0;
+	bool	   *used;
+	bool	   *new_tree;
+
+	if (d->to == NULL || w->rc != PROLLY_OK)
+		return;
+	if (!engine_leaf_value_refs(d->to, d->tlen, &to, &nto) ||
+		(d->from != NULL && w->from_counted &&
+		 !engine_leaf_value_refs(d->from, d->flen, &from, &nfrom)))
+	{
+		w->rc = fail(w->ctx, PROLLY_ERR_BAD_VALUE, NULL);
+		return;
+	}
+	used = nfrom > 0 ? palloc0_array(bool, nfrom) : NULL;
+	new_tree = palloc0_array(bool, Max(nto, 1));
+
+	/* a tree it had is nothing new, wherever in the row it now is */
+	for (uint64 i = 0; i < nto; i++)
+	{
+		uint64		j = 0;
+
+		while (j < nfrom && (used[j] || memcmp(to + i * PHASH_LEN, from + j * PHASH_LEN, PHASH_LEN) != 0))
+			j++;
+		if (j < nfrom)
+			used[j] = true;
+		else
+			new_tree[i] = true;
+	}
+	/* the others are measured against what it no longer has, in order */
+	for (uint64 i = 0, j = 0; i < nto && w->rc == PROLLY_OK; i++)
+		if (new_tree[i])
+		{
+			PHash		tree,
+						old = w->empty;
+
+			while (j < nfrom && used[j])
+				j++;
+			memcpy(tree.b, to + i * PHASH_LEN, PHASH_LEN);
+			if (j < nfrom)
+				memcpy(old.b, from + j++ * PHASH_LEN, PHASH_LEN);
+			w->rc = prolly_chunk_diff(w->ctx, &tree, &old, value_tree_node, w);
+		}
+	if (used != NULL)
+		pfree(used);
+	pfree(new_tree);
+}
+
+static int
+vrefs_of(ProllyCtx *ctx, const PHash *root, uint8 *vrefs)
+{
+	PNode	   *n = node_load(ctx, root);
+
+	if (n == NULL)
+		return ctx->err;
+	*vrefs = n->vrefs;
+	node_free(n);
+	return PROLLY_OK;
+}
+
+int
+prolly_chunk_diff_values(ProllyCtx *ctx, const PHash *a, const PHash *b,
+						 ProllyChunkFn fn, void *arg)
+{
+	ValueTrees	w = {ctx, fn, arg};
+	uint8		va = 0,
+				vb = 0;
+	int			rc;
+
+	if (phash_eq(a, b))
+		return PROLLY_OK;
+	rc = vrefs_of(ctx, a, &va);
+	if (rc == PROLLY_OK)
+		rc = vrefs_of(ctx, b, &vb);
+	if (rc != PROLLY_OK || va != CHUNK_VREFS_COUNTED)
+		return rc;
+	w.from_counted = vb == CHUNK_VREFS_COUNTED;
+	rc = prolly_empty(ctx, 0, &w.empty);
+	if (rc != PROLLY_OK)
+		return rc;
+	phmap_init(&w.seen);
+	rc = prolly_diff(ctx, b, a, value_trees_of_change, &w);
+	phmap_free(&w.seen);
+	return rc != PROLLY_OK ? rc : w.rc;
 }
 
 /* ---------------------------------------------------------------- merge */

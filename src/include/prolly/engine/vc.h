@@ -313,7 +313,7 @@ extern bool vc_in_window(VcRepo *r, const PHash *commit);
  *	commits is how many generations it lies back (the head is 1),
  *	bytes is the change bytes of it and every commit after it up to the head
  *		(a commit's change bytes: the chunks its root has that its first
- *		parent's root lacks),
+ *		parent's root lacks, with the trees of its changed rows' large values),
  *	age is how long ago it was committed.
  * A floor keeps a commit while commits <= depth, or bytes from the commits
  * after it < keep_bytes, or age < keep_seconds: any floor keeps it, and with

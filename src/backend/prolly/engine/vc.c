@@ -526,12 +526,14 @@ table_bytes_fn(void *arg, const VcTableChange *c)
 	else
 		vc_must(a->ctx, prolly_empty(a->ctx, 0, &from));
 	vc_must(a->ctx, prolly_chunk_diff(a->ctx, &c->to.data, &from, size_fn, a));
+	vc_must(a->ctx, prolly_chunk_diff_values(a->ctx, &c->to.data, &from, size_fn, a));
 }
 
 /*
  * A commit's change bytes: the chunks its root value has that base (its
- * first parent's, or an empty one) lacks.  Content alone decides it, so it
- * costs what changed and is the same wherever the commit is written.
+ * first parent's, or an empty one) lacks, and those of the trees of its
+ * changed rows' large values.  Content alone decides it, so it costs what
+ * changed and is the same wherever the commit is written.
  */
 static uint64
 change_bytes(ProllyCtx *ctx, const PHash *root, const PHash *base)
