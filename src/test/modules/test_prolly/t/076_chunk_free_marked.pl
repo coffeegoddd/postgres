@@ -194,7 +194,7 @@ $gone->(q{h(leaf(81001))}, 'the reference let go of, committed: freed');
 # sets (a session's chunk_format is the format of indexes it makes): a
 # chunk naming one not there is refused under the leaf format too
 my ($ret, $out, $err) = $node->psql('postgres',
-	'SET chunk_format = leaf; SELECT test_cs_put(\'pages\', node(leaf(99991)))');
+	'SET chunk_format = leaf; SELECT test_cs_put(\'pages\', node(leaf(990001)))');
 like($err, qr/which the store does not have/,
 	'the history store reads its chunks by its own format, not the session\'s');
 

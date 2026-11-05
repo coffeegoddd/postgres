@@ -104,15 +104,15 @@ SELECT ok FROM test_cs_check('tier');
 
 -- a read of what was pushed: an error; so is a root taken of it
 SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p1())));
-ERROR:  chunk 945b62a93f883e2101004a36817d4dff433aaa87 was pushed to the history store's tier
+ERROR:  chunk 7bfd9a610cbce1d898e536db4c53fd59b4ca61e5 was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 SELECT ARRAY(SELECT test_engine_unchunk(c) FROM unnest(test_cs_get_many('pages',
 	ARRAY[pg_temp.h(pg_temp.p2()), pg_temp.h('\x0a1101')])) WITH ORDINALITY u(c, o) ORDER BY o)
 	AS test_cs_get_many;
-ERROR:  chunk eb0aba93d807033934d9e66c5534265c437b0bed was pushed to the history store's tier
+ERROR:  chunk b8e400a4904dbebc91ca54b4d6c8b263efa9cc6d was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 SELECT test_cs_ref_root('pages', pg_temp.h(pg_temp.p1()));
-ERROR:  chunk 945b62a93f883e2101004a36817d4dff433aaa87 was pushed to the history store's tier
+ERROR:  chunk 7bfd9a610cbce1d898e536db4c53fd59b4ca61e5 was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 -- (what is shared, and was kept, reads)
 SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h('\x0a11ff')));
@@ -162,11 +162,11 @@ SELECT (test_cs_put('pages', test_engine_chunk('\x0a1199'))).stored;
 (1 row)
 
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1199'), pg_temp.h('\x0a1199')]);
-ERROR:  root 9265ed1596cc5c65af3837e8bc5aeeb5abaa2f4c is given twice
+ERROR:  root c12bfbe9da5b9efdc2eaa927627dd878ead6a8af is given twice
 SELECT pg_history_push('b3', ARRAY[]::bytea[]);
 ERROR:  a bundle has a root at least
 SELECT pg_history_push('b3', ARRAY[pg_temp.h('\x0a1198')]);
-ERROR:  the history store has no chunk 4a83b55a90b9db07a11bead71a30902617f32aa2 to push
+ERROR:  the history store has no chunk e09ca304c9c0c9b6cde955125bf37b31b4567aa4 to push
 -- a chunk something still holds (a pointer, here): pushed, and kept here,
 -- read here still; the pointer as it was
 INSERT INTO pg_history.pointers VALUES ('main', pg_temp.h('\x0a1199'));
@@ -194,7 +194,7 @@ SELECT pg_history_release('b6') AS freed;
 -- (a bundle's row of a root twice: refused, its roots each once)
 INSERT INTO pg_history.bundles VALUES ('dupx', ARRAY[pg_temp.h('\x0a11ff'), pg_temp.h('\x0a11ff')], 0);
 ERROR:  new row for relation "bundles" violates check constraint "bundles_manifest_check"
-DETAIL:  Failing row contains (dupx, {"\\x574f74d65da0705b384f7715b02d0077f389c8a4","\\x574f74d65da07..., 0).
+DETAIL:  Failing row contains (dupx, {"\\x49d5605eb2353c433e30d52b5a6a7fb76036c517","\\x49d5605eb2353..., 0).
 -- the bundles' rows are not changed, nor truncated (the table a system
 -- catalog: by one allowed to change those)
 UPDATE pg_history.bundles SET name = 'b9' WHERE name = 'b1';
@@ -338,7 +338,7 @@ SELECT pg_history_push('b7', ARRAY[pg_temp.h(pg_temp.p7())]) AS copied;
 
 COMMIT;
 SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p7())));
-ERROR:  chunk 3bfe8b225fe35ce99a3eb8e39aaf9c5c3b4acb37 was pushed to the history store's tier
+ERROR:  chunk cae1660b001f19823deac621598cdced444de84d was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 -- (a fetch aborted: still pushed)
 BEGIN;
@@ -350,7 +350,7 @@ SELECT pg_history_fetch('b7') AS copied;
 
 ROLLBACK;
 SELECT test_engine_unchunk(test_cs_get('pages', pg_temp.h(pg_temp.p7())));
-ERROR:  chunk 3bfe8b225fe35ce99a3eb8e39aaf9c5c3b4acb37 was pushed to the history store's tier
+ERROR:  chunk cae1660b001f19823deac621598cdced444de84d was pushed to the history store's tier
 DETAIL:  History pushed is not fetched back yet.
 BEGIN;
 SELECT pg_history_fetch('b7') AS copied;
@@ -679,7 +679,7 @@ SELECT pg_history_push('b13', ARRAY[pg_temp.h('\x0a1905')]) AS copied;
 
 INSERT INTO pg_history.bundles VALUES ('b14', ARRAY[pg_temp.h('\x0a1905')], -5);
 ERROR:  new row for relation "bundles" violates check constraint "bundles_manifest_check"
-DETAIL:  Failing row contains (b14, {"\\x9c4cf54eef164febdd14389b446aa5bf3aaf16db"}, -5).
+DETAIL:  Failing row contains (b14, {"\\xcad95fb14143cfb1ead2daaf959a4fb2d1db164c"}, -5).
 -- (terse: the number another bundle's, whatever it is)
 \set VERBOSITY terse
 INSERT INTO pg_history.bundles SELECT 'b14', roots, manifest FROM pg_history.bundles WHERE name = 'b13';

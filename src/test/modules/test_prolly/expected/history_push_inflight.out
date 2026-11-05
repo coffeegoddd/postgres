@@ -40,7 +40,7 @@ bytes
 (1 row)
 
 step p_after: SELECT test_engine_unchunk(test_cs_get('pages', hp_h('\x0a2101'))) AS bytes;
-ERROR:  chunk 32d6705e2813adee9402dfdbd62529cc61930905 was pushed to the history store's tier
+ERROR:  chunk 702fdc4e3c7ef66ae9f7e4ca564ca57e444e576f was pushed to the history store's tier
 step r_commit: COMMIT;
 test_cs_free
 ------------

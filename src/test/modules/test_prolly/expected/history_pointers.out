@@ -93,9 +93,9 @@ SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
 
 -- refused: a pointer to a chunk the store hasn't, and TRUNCATE
 INSERT INTO pg_history.pointers VALUES ('nowhere', h('\x7a'));
-ERROR:  the store has no chunk 09505f4dd52d649b01990d71ac89e779c1d3872a
+ERROR:  the store has no chunk d564f332fb8c2ab42981197f0ca171ba8c90748e
 UPDATE pg_history.pointers SET hash = h('\x7a') WHERE name = 'trunk';
-ERROR:  the store has no chunk 09505f4dd52d649b01990d71ac89e779c1d3872a
+ERROR:  the store has no chunk d564f332fb8c2ab42981197f0ca171ba8c90748e
 INSERT INTO pg_history.pointers VALUES ('short', '\x01');
 ERROR:  new row for relation "pointers" violates check constraint "pointers_hash_check"
 DETAIL:  Failing row contains (short, \x01).

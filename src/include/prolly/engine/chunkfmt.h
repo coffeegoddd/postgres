@@ -85,7 +85,7 @@
  * Covers the encodings and the chunk boundary function; anything that
  * changes the bytes a given set of rows produces must bump it.
  */
-#define CHUNK_FORMAT_VERSION 3
+#define CHUNK_FORMAT_VERSION 4
 
 /* A tree's vrefs when each leaf value says how many hashes it starts with. */
 #define CHUNK_VREFS_COUNTED 0xFF
