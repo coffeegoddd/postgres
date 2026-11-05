@@ -13,6 +13,17 @@
  * 'r', and its value is the caller's to give (how many such rows there
  * are).  Values are each type's output text.
  *
+ * A cell's value longer than WS_LARGE_CELL is in a tree of its own, which the
+ * cell names with the value's length, so changing part of a large value leaves
+ * the rest of it shared.  Whether a value is by the cell depends on nothing but
+ * its length, so one value is always the same bytes.  A primary key's values
+ * stay in the key, which is what the row is found by.  A row's value starts
+ * with a uvarint and the hashes of the trees its cells name, in order of their
+ * tags, which storage reads to keep them; a keyless row's start its value,
+ * though its key names them.
+ *
+ * Row maps are of WS_ROW_VREFS.
+ *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
  * src/include/prolly/ws/ws_row.h
@@ -22,10 +33,17 @@
 #ifndef PROLLY_WS_ROW_H
 #define PROLLY_WS_ROW_H
 
+#include "prolly/engine/prolly.h"
 #include "prolly/engine/util.h"
 
 /* Postgres's limit on a table's columns */
 #define WS_MAX_COLS 1600
+
+/* The longest value a cell holds itself; one longer is in a tree. */
+#define WS_LARGE_CELL 2048
+
+/* What a row map's leaf values start with. */
+#define WS_ROW_VREFS CHUNK_VREFS_COUNTED
 
 /*
  * A uvarint read as read_uvarint does, and false too if it is not the
@@ -48,20 +66,28 @@ ws_read_canonical_uvarint(const uint8 **p, const uint8 *end, uint64 *out)
 	return len <= 10;
 }
 
-/* A stored column's value: its output text, or NULL. */
+/*
+ * A stored column's value: its output text, or NULL.  If large, p and len are
+ * what names its tree: the codec's view, as ws_row_load gives the value.
+ */
 typedef struct WsField
 {
 	const uint8 *p;
 	size_t		len;
 	bool		null;
+	bool		large;
 } WsField;
 
-/* A cell of a row: a stored column's value that is not NULL. */
+/*
+ * A cell of a row: a stored column's value that is not NULL.  If large, p and
+ * len are what names its tree, equal if and only if the values are.
+ */
 typedef struct WsCell
 {
 	uint64		tag;
 	const uint8 *p;
 	size_t		len;
+	bool		large;
 } WsCell;
 
 typedef struct WsShapeTag
@@ -123,14 +149,50 @@ typedef struct WsRowCodecRoutine
 	/* A value's cells, at most WS_MAX_COLS: how many. */
 	int			(*cells) (const uint8 *v, size_t vl, WsCell *out);
 	/* A value's cell of this tag, if it has one (read only as far as it). */
-	bool		(*cell_get) (const uint8 *v, size_t vl, uint64 tag, const uint8 **p,
-							 size_t *len);
+	bool		(*cell_get) (const uint8 *v, size_t vl, uint64 tag, WsCell *out);
+	/* A keyless row's value (replacing it): what the key names, and payload. */
+	void		(*keyless_value) (const uint8 *k, size_t kl, const uint8 *payload, size_t plen,
+								  Buf *val);
+	/* The caller's part of a keyless row's value, pointing into it. */
+	void		(*keyless_payload) (const uint8 *k, size_t kl, const uint8 *v, size_t vl,
+									const uint8 **payload, size_t *plen);
+	/* What names a tree of a value of this length, appended to out. */
+	void		(*large_encode) (const PHash *root, uint64 total, Buf *out);
+	/* The tree a large cell or field names, and its value's length. */
+	void		(*large_decode) (const uint8 *p, size_t len, PHash *root, uint64 *total);
 } WsRowCodecRoutine;
 
 extern PGDLLIMPORT const WsRowCodecRoutine CellsWsRowCodec;
 
 /* The codec the working-set model uses. */
 extern PGDLLIMPORT const WsRowCodecRoutine *WsRowCodec;
+
+/*
+ * Where a large value is.  A store's errors, and a missing chunk, are raised
+ * as prolly_report does; a tree that is not this value's is ERRCODE_DATA_CORRUPTED.
+ */
+typedef struct WsLargeValueRoutine
+{
+	const char *name;
+	void		(*put) (ProllyCtx *ctx, const uint8 *p, size_t len, PHash *root);
+	/* The value, its length len, appended to out. */
+	void		(*get) (ProllyCtx *ctx, const PHash *root, uint64 len, Buf *out);
+} WsLargeValueRoutine;
+
+extern PGDLLIMPORT const WsLargeValueRoutine TreeWsLargeValues;
+
+/* The implementation in use. */
+extern PGDLLIMPORT const WsLargeValueRoutine *WsLargeValues;
+
+/* A row's key and value, its large values put in their trees. */
+extern void ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val);
+
+/*
+ * A row's fields, as the values they were: its large values read into held,
+ * which the fields then point into, as the others do into k and v.
+ */
+extern void ws_row_load(ProllyCtx *ctx, const WsRowShape *s, const uint8 *k, size_t kl,
+						const uint8 *v, size_t vl, WsField *f, Buf *held);
 
 /* COPY text: a value escaped, a line split, and a line from a row's fields. */
 extern void ws_copy_escape(Buf *b, const uint8 *v, size_t len);

@@ -148,7 +148,10 @@ pg_noreturn extern void prolly_report(ProllyCtx *ctx);
 extern int	prolly_put_chunk(ProllyCtx *ctx, const uint8 *data, size_t len,
 							 PHash *out);
 
-/* vrefs: leading hashes in each value that the map holds strongly. */
+/*
+ * vrefs: leading hashes in each value that the map holds strongly, or
+ * CHUNK_VREFS_COUNTED if each value says how many.
+ */
 extern int	prolly_empty(ProllyCtx *ctx, uint8 vrefs, PHash *out);
 /* kvs must be sorted by key with no duplicates. */
 extern int	prolly_build(ProllyCtx *ctx, uint8 vrefs, const ProllyKV *kvs,

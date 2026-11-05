@@ -14,6 +14,7 @@
  *			vrefs, uvarint count, items (uvarint klen, key, uvarint vlen, value)
  *			Internal values: child hash, uvarint leaf count (strong).
  *			Leaf values start with vrefs hashes (strong); the rest is opaque.
+ *			Of vrefs CHUNK_VREFS_COUNTED, each starts with a uvarint of how many.
  *			Every node of a tree carries the same policy and vrefs.
  * Schema:	tag, version, DDL bytes
  * Commit:	tag, version, root value hash (strong), uvarint generation,
@@ -86,6 +87,9 @@
  */
 #define CHUNK_FORMAT_VERSION 3
 
+/* A tree's vrefs when each leaf value says how many hashes it starts with. */
+#define CHUNK_VREFS_COUNTED 0xFF
+
 /* Chunk size policy; chunks average about target_bytes. */
 typedef struct ChunkPolicy
 {
@@ -105,6 +109,8 @@ typedef struct NodeHeader
 } NodeHeader;
 
 extern bool engine_policy_valid(const ChunkPolicy *p);
+/* Whether a leaf value holds the hashes a tree of this vrefs says it starts with. */
+extern bool engine_leaf_value_valid(uint8 vrefs, const uint8 *v, size_t vl);
 extern bool engine_node_header_parse(const uint8 *data, size_t len, NodeHeader *h);
 extern void engine_node_header_write(Buf *b, const ChunkPolicy *p, int level,
 							  uint8 vrefs, uint32 count);

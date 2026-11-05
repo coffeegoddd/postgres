@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
+
 #include "prolly/ws/ws_row.h"
 
 const WsRowCodecRoutine *WsRowCodec = &CellsWsRowCodec;
@@ -85,21 +87,74 @@ cell_cmp(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
+/* What names a tree: its root, and its value's length, which only a large value has. */
 static void
-cells_encode(WsCell *c, int n, Buf *out)
+large_decode(const uint8 *p, size_t len, PHash *root, uint64 *total)
+{
+	const uint8 *q = p + PHASH_LEN;
+	const uint8 *end = p + len;
+
+	if (len <= PHASH_LEN || !ws_read_canonical_uvarint(&q, end, total) || q != end ||
+		*total <= WS_LARGE_CELL)
+		malformed("a large value's cell is not a tree and the length of a large value");
+	memcpy(root->b, p, PHASH_LEN);
+}
+
+static void
+large_encode(const PHash *root, uint64 total, Buf *out)
+{
+	buf_append(out, root->b, PHASH_LEN);
+	buf_append_uvarint(out, total);
+}
+
+/* Sorted, each tag once, and what cell_next would read. */
+static void
+cells_ready(WsCell *c, int n)
 {
 	if (n > WS_MAX_COLS)
 		elog(ERROR, "a row of %d cells", n);
 	qsort(c, (size_t) n, sizeof(WsCell), cell_cmp);
-	for (int i = 1; i < n; i++)
-		if (c[i].tag == c[i - 1].tag)
+	for (int i = 0; i < n; i++)
+	{
+		if (i > 0 && c[i].tag == c[i - 1].tag)
 			elog(ERROR, "a row with two cells of tag " UINT64_FORMAT, c[i].tag);
+		if (!c[i].large && c[i].len > WS_LARGE_CELL)
+			elog(ERROR, "a value of %zu bytes in its cell", c[i].len);
+	}
+}
+
+static void
+cells_put(const WsCell *c, int n, Buf *out)
+{
 	for (int i = 0; i < n; i++)
 	{
 		buf_append_uvarint(out, c[i].tag);
-		buf_append_uvarint(out, c[i].len);
+		buf_append_uvarint(out, ((uint64) c[i].len << 1) | (c[i].large ? 1 : 0));
 		buf_append(out, c[i].p, c[i].len);
 	}
+}
+
+/* The trees cells name, as what a value starts with. */
+static void
+refs_put(const WsCell *c, int n, Buf *out)
+{
+	uint64		nrefs = 0;
+
+	for (int i = 0; i < n; i++)
+		if (c[i].large)
+			nrefs++;
+	buf_append_uvarint(out, nrefs);
+	for (int i = 0; i < n; i++)
+		if (c[i].large)
+			buf_append(out, c[i].p, PHASH_LEN);
+}
+
+static void
+cells_encode(WsCell *c, int n, Buf *out)
+{
+	cells_ready(c, n);
+	refs_put(c, n, out);
+	cells_put(c, n, out);
 }
 
 /*
@@ -110,18 +165,30 @@ static bool
 cell_next(const uint8 **p, const uint8 *end, bool has_prev, uint64 prev, WsCell *c)
 {
 	uint64		tag = 0,
-				len = 0;
+				sized = 0,
+				len;
 
 	if (*p >= end)
 		return false;
-	if (!ws_read_canonical_uvarint(p, end, &tag) || !ws_read_canonical_uvarint(p, end, &len) ||
-		len > (uint64) (end - *p))
+	if (!ws_read_canonical_uvarint(p, end, &tag) || !ws_read_canonical_uvarint(p, end, &sized) ||
+		(sized >> 1) > (uint64) (end - *p))
 		malformed("a cell runs past its end, or is not in its shortest form");
 	if (has_prev && tag <= prev)
 		malformed("its cells are not in order of their tags");
+	len = sized >> 1;
 	c->tag = tag;
 	c->p = *p;
 	c->len = (size_t) len;
+	c->large = (sized & 1) != 0;
+	if (c->large)
+	{
+		PHash		root;
+		uint64		total;
+
+		large_decode(c->p, c->len, &root, &total);
+	}
+	else if (len > WS_LARGE_CELL)
+		malformed("a value in its cell that belongs in a tree");
 	*p += len;
 	return true;
 }
@@ -143,22 +210,66 @@ cells_parse(const uint8 *v, size_t vl, WsCell *out)
 	return n;
 }
 
-static bool
-cells_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *len)
+/* The hashes a value starts with, and how many; *rest is what follows them. */
+static const uint8 *
+refs_parse(const uint8 *v, size_t vl, uint64 *nrefs, const uint8 **rest)
 {
-	const uint8 *q = v,
+	const uint8 *p = v,
 			   *end = v + vl;
+
+	if (!ws_read_canonical_uvarint(&p, end, nrefs) || *nrefs > WS_MAX_COLS ||
+		*nrefs * PHASH_LEN > (uint64) (end - p))
+		malformed("a value's trees run past its end, or are not in their shortest form");
+	*rest = p + *nrefs * PHASH_LEN;
+	return p;
+}
+
+/* What cells name is what a value says it holds, or a tree could go uncounted. */
+static void
+refs_check(const uint8 *refs, uint64 nrefs, const WsCell *c, int n)
+{
+	uint64		at = 0;
+
+	for (int i = 0; i < n; i++)
+		if (c[i].large)
+		{
+			if (at == nrefs || memcmp(refs + at * PHASH_LEN, c[i].p, PHASH_LEN) != 0)
+				malformed("a large value's tree is not one its value starts with");
+			at++;
+		}
+	if (at != nrefs)
+		malformed("a value starts with a tree no cell names");
+}
+
+static int
+value_cells(const uint8 *v, size_t vl, WsCell *out)
+{
+	uint64		nrefs;
+	const uint8 *rest;
+	const uint8 *refs = refs_parse(v, vl, &nrefs, &rest);
+	int			n = cells_parse(rest, (size_t) (v + vl - rest), out);
+
+	refs_check(refs, nrefs, out, n);
+	return n;
+}
+
+static bool
+cells_cell_get(const uint8 *v, size_t vl, uint64 tag, WsCell *out)
+{
+	uint64		nrefs;
+	const uint8 *q;
+	const uint8 *end = v + vl;
 	WsCell		c;
 	bool		has_prev = false;
 	uint64		prev = 0;
 
+	(void) refs_parse(v, vl, &nrefs, &q);
 	/* (in order of their tags: past it, it is not there) */
 	while (cell_next(&q, end, has_prev, prev, &c) && c.tag <= tag)
 	{
 		if (c.tag == tag)
 		{
-			*p = c.p;
-			*len = c.len;
+			*out = c;
 			return true;
 		}
 		has_prev = true;
@@ -167,9 +278,9 @@ cells_cell_get(const uint8 *v, size_t vl, uint64 tag, const uint8 **p, size_t *l
 	return false;
 }
 
-/* The non-NULL fields from from on, as cells appended to out. */
+/* The non-NULL fields from from on, as cells appended to out: as a value's, or a key's. */
 static void
-put_cells(const WsRowShape *s, const WsField *f, int from, Buf *out)
+put_cells(const WsRowShape *s, const WsField *f, int from, bool as_value, Buf *out)
 {
 	WsCell		cells[WS_MAX_COLS];
 	int			n = 0;
@@ -180,9 +291,16 @@ put_cells(const WsRowShape *s, const WsField *f, int from, Buf *out)
 			cells[n].tag = s->tags[i];
 			cells[n].p = f[i].p;
 			cells[n].len = f[i].len;
+			cells[n].large = f[i].large;
 			n++;
 		}
-	cells_encode(cells, n, out);
+	if (as_value)
+		cells_encode(cells, n, out);
+	else
+	{
+		cells_ready(cells, n);
+		cells_put(cells, n, out);
+	}
 }
 
 static void
@@ -193,17 +311,19 @@ cells_row_encode(const WsRowShape *s, const WsField *f, Buf *key, Buf *val)
 	if (s->nkey == 0)
 	{
 		buf_append(key, "r", 1);
-		put_cells(s, f, 0, key);
+		put_cells(s, f, 0, false, key);
 		return;
 	}
 	for (int i = 0; i < s->nkey; i++)
 	{
 		if (f[i].null)
 			elog(ERROR, "a NULL in a primary key");
+		if (f[i].large)
+			elog(ERROR, "a large value's tree in a primary key");
 		buf_append_uvarint(key, f[i].len);
 		buf_append(key, f[i].p, f[i].len);
 	}
-	put_cells(s, f, s->nkey, val);
+	put_cells(s, f, s->nkey, true, val);
 }
 
 static void
@@ -221,6 +341,7 @@ cells_key_fields(const WsRowShape *s, const uint8 *k, size_t kl, WsField *f)
 		f[i].p = p;
 		f[i].len = (size_t) len;
 		f[i].null = false;
+		f[i].large = false;
 		p += len;
 	}
 	if (p != end)
@@ -248,13 +369,14 @@ cells_row_decode(const WsRowShape *s, const uint8 *k, size_t kl, const uint8 *v,
 		f[i].p = NULL;
 		f[i].len = 0;
 		f[i].null = true;
+		f[i].large = false;
 	}
 	if (s->nkey == 0)
 		n = cells_key_cells(k, kl, c);
 	else
 	{
 		cells_key_fields(s, k, kl, f);
-		n = cells_parse(v, vl, c);
+		n = value_cells(v, vl, c);
 	}
 
 	/* (both in order of their tags: a cell the shape has no column for skipped) */
@@ -271,8 +393,33 @@ cells_row_decode(const WsRowShape *s, const uint8 *k, size_t kl, const uint8 *v,
 			to->p = c[i].p;
 			to->len = c[i].len;
 			to->null = false;
+			to->large = c[i].large;
 		}
 	}
+}
+
+static void
+cells_keyless_value(const uint8 *k, size_t kl, const uint8 *payload, size_t plen, Buf *val)
+{
+	WsCell		c[WS_MAX_COLS];
+	int			n = cells_key_cells(k, kl, c);
+
+	val->len = 0;
+	refs_put(c, n, val);
+	buf_append(val, payload, plen);
+}
+
+static void
+cells_keyless_payload(const uint8 *k, size_t kl, const uint8 *v, size_t vl,
+					  const uint8 **payload, size_t *plen)
+{
+	WsCell		c[WS_MAX_COLS];
+	int			n = cells_key_cells(k, kl, c);
+	uint64		nrefs;
+	const uint8 *refs = refs_parse(v, vl, &nrefs, payload);
+
+	refs_check(refs, nrefs, c, n);
+	*plen = (size_t) (v + vl - *payload);
 }
 
 const WsRowCodecRoutine CellsWsRowCodec = {
@@ -282,9 +429,159 @@ const WsRowCodecRoutine CellsWsRowCodec = {
 	.key_fields = cells_key_fields,
 	.key_cells = cells_key_cells,
 	.cells_encode = cells_encode,
-	.cells = cells_parse,
+	.cells = value_cells,
 	.cell_get = cells_cell_get,
+	.keyless_value = cells_keyless_value,
+	.keyless_payload = cells_keyless_payload,
+	.large_encode = large_encode,
+	.large_decode = large_decode,
 };
+
+/* --------------------------------------------------------- large values */
+
+/* A tree's pieces, by the offset each starts at. */
+#define LARGE_PIECE 4000
+
+static void
+offset_key(uint64 at, uint8 *key)
+{
+	for (int i = 7; i >= 0; i--)
+	{
+		key[i] = (uint8) at;
+		at >>= 8;
+	}
+}
+
+static void
+tree_put(ProllyCtx *ctx, const uint8 *p, size_t len, PHash *root)
+{
+	size_t		n = (len + LARGE_PIECE - 1) / LARGE_PIECE;
+	ProllyKV   *kvs = palloc_array(ProllyKV, n);
+	uint8	   *keys = palloc_array(uint8, n * 8);
+
+	for (size_t i = 0; i < n; i++)
+	{
+		size_t		at = i * LARGE_PIECE;
+
+		offset_key(at, keys + i * 8);
+		kvs[i].key = keys + i * 8;
+		kvs[i].klen = 8;
+		kvs[i].val = p + at;
+		kvs[i].vlen = Min(len - at, LARGE_PIECE);
+	}
+	if (prolly_build(ctx, 0, kvs, n, root) < 0)
+		prolly_report(ctx);
+	pfree(keys);
+	pfree(kvs);
+}
+
+static void
+not_its_tree(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("a malformed row: a large value's tree does not hold the value its cell says")));
+}
+
+static void
+tree_get(ProllyCtx *ctx, const PHash *root, uint64 len, Buf *out)
+{
+	ProllyIter *it;
+	const uint8 *k,
+			   *v;
+	size_t		kl,
+				vl;
+	uint64		at = 0;
+	int			rc;
+
+	if (prolly_iter_open(ctx, root, NULL, 0, &it) < 0)
+		prolly_report(ctx);
+	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
+	{
+		uint8		want[8];
+
+		CHECK_FOR_INTERRUPTS();
+		offset_key(at, want);
+		if (kl != 8 || memcmp(k, want, 8) != 0 || at >= len || vl != Min(len - at, LARGE_PIECE))
+			not_its_tree();
+		buf_append(out, v, vl);
+		at += vl;
+	}
+	prolly_iter_close(it);
+	if (rc < 0)
+		prolly_report(ctx);
+	if (at != len)
+		not_its_tree();
+}
+
+const WsLargeValueRoutine TreeWsLargeValues = {
+	.name = "tree",
+	.put = tree_put,
+	.get = tree_get,
+};
+
+const WsLargeValueRoutine *WsLargeValues = &TreeWsLargeValues;
+
+void
+ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val)
+{
+	WsField    *fields = palloc_array(WsField, Max(s->nstored, 1));
+	Buf			named = BUF_INIT;
+	size_t	   *at = palloc_array(size_t, Max(s->nstored, 1));
+
+	for (int i = 0; i < s->nstored; i++)
+	{
+		fields[i] = f[i];
+		fields[i].large = false;
+		if (i >= s->nkey && !f[i].null && f[i].len > WS_LARGE_CELL)
+		{
+			PHash		root;
+
+			WsLargeValues->put(ctx, f[i].p, f[i].len, &root);
+			at[i] = named.len;
+			WsRowCodec->large_encode(&root, f[i].len, &named);
+			fields[i].len = named.len - at[i];
+			fields[i].large = true;
+		}
+	}
+	/* (named has stopped moving) */
+	for (int i = 0; i < s->nstored; i++)
+		if (fields[i].large)
+			fields[i].p = named.data + at[i];
+	WsRowCodec->encode(s, fields, key, val);
+	buf_free(&named);
+	pfree(at);
+	pfree(fields);
+}
+
+void
+ws_row_load(ProllyCtx *ctx, const WsRowShape *s, const uint8 *k, size_t kl,
+			const uint8 *v, size_t vl, WsField *f, Buf *held)
+{
+	size_t	   *at = palloc_array(size_t, Max(s->nstored, 1));
+
+	WsRowCodec->decode(s, k, kl, v, vl, f);
+	held->len = 0;
+	for (int i = 0; i < s->nstored; i++)
+		if (f[i].large)
+		{
+			PHash		root;
+			uint64		total;
+
+			WsRowCodec->large_decode(f[i].p, f[i].len, &root, &total);
+			at[i] = held->len;
+			WsLargeValues->get(ctx, &root, total, held);
+			f[i].len = (size_t) total;
+		}
+	/* (held has stopped moving) */
+	for (int i = 0; i < s->nstored; i++)
+		if (f[i].large)
+		{
+			f[i].p = held->data + at[i];
+			f[i].large = false;
+		}
+	pfree(at);
+}
 
 /* ------------------------------------------------------------ COPY text */
 
@@ -351,6 +648,7 @@ ws_copy_split(const char *line, size_t len, WsField *f, int n, Buf *scratch)
 		if (j - start == 2 && line[start] == '\\' && line[start + 1] == 'N')
 		{
 			f[i].null = true;
+			f[i].large = false;
 			f[i].p = NULL;
 			f[i].len = 0;
 		}
@@ -372,6 +670,7 @@ ws_copy_split(const char *line, size_t len, WsField *f, int n, Buf *scratch)
 				scratch->data[scratch->len++] = (uint8) c;
 			}
 			f[i].null = false;
+			f[i].large = false;
 			f[i].p = scratch->data + off;
 			f[i].len = scratch->len - off;
 		}

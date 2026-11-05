@@ -218,7 +218,7 @@ node_decode(const PHash *h, const uint8 *data, size_t len)
 		n->vl[i] = (uint32) vl;
 		p += vl;
 		if (n->level > 0 ? !ref_decode(n->v[i], vl, &ch, &t)
-			: vl < (uint64) n->vrefs * PHASH_LEN)
+			: !engine_leaf_value_valid(n->vrefs, n->v[i], vl))
 			goto bad;
 		if (i > 0 && key_cmp(n->k[i - 1], n->kl[i - 1], n->k[i], n->kl[i]) >= 0)
 			goto bad;
@@ -475,7 +475,7 @@ lc_add(LevelChunker *lc, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 
 	/* (a build, or edits, of many rows reads no node to check at) */
 	CHECK_FOR_INTERRUPTS();
-	if (lc->level == 0 && vl < (size_t) lc->shape.vrefs * PHASH_LEN)
+	if (lc->level == 0 && !engine_leaf_value_valid(lc->shape.vrefs, v, vl))
 		return fail(lc->ctx, PROLLY_ERR_BAD_VALUE, NULL);
 	buf_append_uvarint(&lc->items, kl);
 	lc->lastkoff = lc->items.len;
