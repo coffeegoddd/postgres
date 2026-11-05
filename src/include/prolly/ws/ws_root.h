@@ -22,7 +22,7 @@
  * no second copy can disagree with them.  A tag is unique within its table, not
  * across them.
  *
- * Row maps and maps are of vrefs 0.  Merging these roots is this library's, not
+ * Row maps are of WS_ROW_VREFS and maps of vrefs 0.  Merging these roots is this library's, not
  * vc_merge_roots's, which would leave a map's entry with nothing in it.
  *
  * Reads raise ERRCODE_DATA_CORRUPTED for what no writer here makes, as a

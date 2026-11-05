@@ -49,6 +49,28 @@ engine_node_header_parse(const uint8 *data, size_t len, NodeHeader *h)
 	return true;
 }
 
+bool
+engine_leaf_value_valid(uint8 vrefs, const uint8 *v, size_t vl)
+{
+	const uint8 *end = v + vl;
+	uint64		nrefs = vrefs;
+
+	if (vrefs == CHUNK_VREFS_COUNTED && !read_uvarint(&v, end, &nrefs))
+		return false;
+	return nrefs <= (uint64) (end - v) / PHASH_LEN;
+}
+
+bool
+engine_leaf_value_refs(const uint8 *v, size_t vl, const uint8 **hashes, uint64 *nrefs)
+{
+	const uint8 *end = v + vl;
+
+	if (!read_uvarint(&v, end, nrefs) || *nrefs > (uint64) (end - v) / PHASH_LEN)
+		return false;
+	*hashes = v;
+	return true;
+}
+
 void
 engine_node_header_write(Buf *b, const ChunkPolicy *p, int level, uint8 vrefs,
 				  uint32 count)
@@ -107,12 +129,18 @@ node_refs(const uint8 *data, size_t len, EngineRefFn fn, void *arg)
 			fn(arg, &ref, true);
 		}
 		else
-			for (int r = 0; r < h.vrefs; r++)
+		{
+			uint64		nrefs = h.vrefs;
+
+			if (h.vrefs == CHUNK_VREFS_COUNTED && !read_uvarint(&v, vend, &nrefs))
+				return false;
+			for (uint64 r = 0; r < nrefs; r++)
 			{
 				if (!read_hash(&v, vend, &ref))
 					return false;
 				fn(arg, &ref, true);
 			}
+		}
 	}
 	return p == h.end;
 }
