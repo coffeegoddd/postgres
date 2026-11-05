@@ -969,6 +969,8 @@ $node->safe_psql('postgres', q{
 	CREATE CAST (co.mood[] AS text[]) WITH INOUT AS IMPLICIT;
 	COMMENT ON CAST (co.mood AS integer) IS 'in and out';
 	CREATE CONVERSION co.conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;
+	ALTER CONVERSION co.conv OWNER TO g_coowner;
+	CREATE FUNCTION co.fc(a text) RETURNS text LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT a COLLATE co.mine AS x; END;
 	COMMENT ON CONVERSION co.conv IS 'a conversion';
 	CREATE TABLE co.t (a text COLLATE co.mine, m co.mood);
 	CREATE VIEW co.v AS SELECT a COLLATE co.mine AS c, m::integer AS i FROM co.t;
@@ -984,6 +986,9 @@ ok($co_val{$_}, "$_ is held") for ('collation/mine', 'collation/Odd name', 'cast
 unlike(join('', values %co_val), qr/\bco\./, 'none names its schema');
 like($co_val{'collation/mine'}, qr/PROVIDER = libc, LC_COLLATE = 'C', LC_CTYPE = 'C'/, 'a collation is said');
 like($co_val{'domain/dom'}, qr/collation\/mine/, 'a domain needs its collation');
+like($co_val{'function/fc(text)'}, qr/collation\/mine/, 'and a function');
+like($co_val{'collation/mine'}, qr/g_coowner/, 'a collation has its owner');
+like($co_val{'conversion/conv'}, qr/g_coowner/, 'and a conversion');
 like($co_val{'index/mi(m)'}, qr/collation\/mine/, 'and an index');
 like($co_val{'cast/mood(text)'}, qr/WITH FUNCTION m2t\(mood\) AS ASSIGNMENT.*function\/m2t\(mood\).*type\/mood/s, 'a cast says its function, and needs it');
 
@@ -1025,7 +1030,53 @@ is( $node->safe_psql('postgres', q{SELECT castcontext::text, castmethod::text FR
 	'i|f', 'and as it was');
 is($node->safe_psql('postgres', q{SELECT obj_description(oid, 'pg_cast') FROM pg_cast WHERE castsource = 'ca2.e'::regtype AND casttarget = 'integer'::regtype}), 'x', 'with its comment');
 
+# who holds which collations is each server's, so what capture found free may not be free
+$node->safe_psql('postgres', q{CREATE SCHEMA cf; SELECT test_ws_obj_restore_collation('here_only', 'cf')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_collation WHERE collname = 'here_only' AND collnamespace = 'cf'::regnamespace}), '1', 'a collation arrives where its name is free');
+$node->safe_psql('postgres', q{DROP COLLATION cf.here_only; SET allow_system_table_mods = on; CREATE COLLATION pg_catalog.here_only FROM "C"});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_restore_collation('here_only', 'cf')});
+like($err, qr/named as one in this server's catalogs/, 'and is refused where the catalogs have it');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_collation WHERE collnamespace = 'cf'::regnamespace}), '0', 'with nothing made');
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DROP COLLATION pg_catalog.here_only; DROP SCHEMA cf});
+
+# every provider's say is the same read back
+{
+	my $icu = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_collation WHERE collprovider = 'i'}) > 0;
+	$node->safe_psql('postgres', q{CREATE SCHEMA cp; CREATE SCHEMA cp2; CREATE COLLATION cp.b (PROVIDER = builtin, LOCALE = 'C')});
+	$node->safe_psql('postgres', q{CREATE COLLATION cp.i (PROVIDER = icu, LOCALE = 'und'); CREATE COLLATION cp.n (PROVIDER = icu, LOCALE = 'und', DETERMINISTIC = false);
+		CREATE COLLATION cp.r (PROVIDER = icu, LOCALE = 'und', RULES = '&a < b')}) if $icu;
+	my $cp_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('cp')});
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('cp', 'cp2')});
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('cp2')}), $cp_held, 'a collation of each provider is the same bytes restored');
+	like($cp_held, qr/^collation\/b\t/m, 'a builtin one is held');
+	if ($icu)
+	{
+		is( $node->safe_psql('postgres', q{SELECT string_agg(format('%s %s %s', collname, collisdeterministic, collicurules), ', ' ORDER BY collname) FROM pg_collation WHERE collnamespace = 'cp2'::regnamespace AND collprovider = 'i'}),
+			'i t , n f , r t &a < b', 'and ICU\'s as they were');
+	}
+}
+
+# what belongs to an extension is the extension's to bring
+for my $x (
+	[ q{CREATE COLLATION cx.c FROM "C"}, 'COLLATION cx.c' ],
+	[ q{CREATE CONVERSION cx.c FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8}, 'CONVERSION cx.c' ],
+	[ q{CREATE TYPE cx.e AS ENUM ('a'); CREATE CAST (cx.e AS integer) WITH INOUT}, 'CAST (cx.e AS integer)' ])
+{
+	my ($make, $member) = @$x;
+	$node->safe_psql('postgres', qq{CREATE SCHEMA cx; $make; ALTER EXTENSION test_prolly ADD $member});
+	my ($rcx, $outx, $errx) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('cx')});
+	like($errx, qr/belongs to an extension/, "refused: $member");
+	$node->safe_psql('postgres', qq{ALTER EXTENSION test_prolly DROP $member; DROP SCHEMA cx CASCADE});
+}
+
 my @co_refused = (
+	[ q{CREATE FUNCTION pt(point) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT 1'; CREATE CAST (point AS text) WITH FUNCTION pt(point)}, 'between types in the catalogs' ],
+	[ q{CREATE TYPE rr AS RANGE (SUBTYPE = int4); COMMENT ON CAST (co5.rr AS co5.rr_multirange) IS 'x'}, 'a range\'s own' ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE CAST (co5."date" AS integer) WITH INOUT}, "say a schema's name" ],
+	[ q{CREATE COLLATION c FROM "C"; SET allow_system_table_mods = on; UPDATE pg_collation SET collencoding = CASE WHEN getdatabaseencoding() = 'LATIN1' THEN 6 ELSE 8 END WHERE collname = 'c' AND collnamespace = 'co5'::regnamespace}, 'another encoding' ],
+	[ q{CREATE FUNCTION f() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a'; END}, 'Name the column with AS' ],
+	[ q{CREATE COLLATION m FROM "C"; CREATE FUNCTION f() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a' COLLATE m; END}, 'Name the column with AS' ],
+	[ q{CREATE FUNCTION f() RETURNS SETOF text LANGUAGE sql BEGIN ATOMIC SELECT x FROM (SELECT 'a' UNION ALL SELECT 'b') s(x) ; END}, 'Name the column with AS' ],
 	[ q{CREATE COLLATION "C" FROM "POSIX"}, 'named as one in the catalogs' ],
 	[ q{CREATE DEFAULT CONVERSION c FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8}, 'a default conversion' ],
 	[ q{CREATE FUNCTION public.co_conv(integer, integer, cstring, internal, integer, boolean) RETURNS integer LANGUAGE c AS '$libdir/utf8_and_iso8859_1', 'iso8859_1_to_utf8'; CREATE CONVERSION c FOR 'LATIN1' TO 'UTF8' FROM public.co_conv}, 'its function is not one in the catalogs' ],
@@ -1040,8 +1091,8 @@ for my $case (@co_refused)
 }
 
 # since a snapshot, one to try again
-for my $change (q{COMMENT ON COLLATION co.mine IS 'later'}, q{ALTER COLLATION co.mine RENAME TO mine2}, q{COMMENT ON CONVERSION co.conv IS 'later'},
-	q{COMMENT ON CAST (ca.e AS integer) IS 'later'})
+for my $change (q{COMMENT ON COLLATION co.mine IS 'later'}, q{COMMENT ON CONVERSION co.conv IS 'later'}, q{ALTER CONVERSION co.conv RENAME TO conv2},
+	q{COMMENT ON CAST (ca.e AS integer) IS 'later'}, q{DROP CAST (ca.e AS integer); CREATE CAST (ca.e AS integer) WITH INOUT AS ASSIGNMENT})
 {
 	my $where = $change =~ /ca\.e/ ? 'ca' : 'co';
 	my $old = $node->background_psql('postgres', on_error_stop => 0);

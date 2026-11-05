@@ -40,6 +40,7 @@ PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_copy);
+PG_FUNCTION_INFO_V1(test_ws_obj_restore_collation);
 PG_FUNCTION_INFO_V1(test_ws_seq_copy);
 PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
@@ -531,6 +532,20 @@ test_ws_obj_bytes(PG_FUNCTION_ARGS)
 		ws_obj_free(&objs[i]);
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * test_ws_obj_restore_collation(name text, schema text) returns void: makes a collation
+ * from its record, as one captured on another server would arrive
+ */
+Datum
+test_ws_obj_restore_collation(PG_FUNCTION_ARGS)
+{
+	WsObject	o = {.kind = WS_OBJ_COLLATION,.name = text_to_cstring(PG_GETARG_TEXT_PP(0)),
+	.definition = "(PROVIDER = libc, LC_COLLATE = 'C', LC_CTYPE = 'C')"};
+
+	ws_obj_restore(&o, 1, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
+	PG_RETURN_VOID();
 }
 
 /*
