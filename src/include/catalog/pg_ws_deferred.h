@@ -25,9 +25,11 @@ BEGIN_CATALOG_STRUCT
 CATALOG(pg_ws_deferred,8857,WsDeferredRelationId)
 {
 	Oid			defrelid BKI_LOOKUP(pg_class);	/* the table it is of */
-	char		defkind;		/* check, not null, unique, exclusion, index
-								 * or foreign key: c, n, u, x, i or f */
+	char		defkind;		/* check, not null, unique, exclusion, index,
+								 * foreign key, replica identity or clustering:
+								 * c, n, u, x, i, f, r or l */
 	NameData	defname;		/* its name */
+	Oid			defrefrelid BKI_LOOKUP_OPT(pg_class);	/* what a foreign key references, or 0 */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	bytea		defrecord BKI_FORCE_NOT_NULL;	/* the record that holds it, or a

@@ -1662,6 +1662,8 @@ static void
 fix_ws_deferred(CopyState *cs, Datum *values, bool *nulls)
 {
 	MAP(Anum_pg_ws_deferred_defrelid, RelationRelationId);
+	if (OidIsValid(DatumGetObjectId(values[Anum_pg_ws_deferred_defrefrelid - 1])))
+		MAP(Anum_pg_ws_deferred_defrefrelid, RelationRelationId);
 }
 
 static void

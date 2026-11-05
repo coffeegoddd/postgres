@@ -30,9 +30,11 @@
  * trusts what a check says.  Capture folds them back, so what is restored captures as the
  * root it came from, and rechecks to say which still are violated.  One clears only by
  * being applied again, with the rows fixed (resolve): nothing else does.  It can't yet be
- * dropped or changed while it waits, nor a column it names dropped, which capture then
- * refuses.  A partitioned or inheriting table's violations cannot be set aside yet:
- * restoring one is refused.
+ * dropped or changed while it waits, nor another made of its name, nor a column it names or
+ * a table a foreign key references dropped, each of which capture then refuses.  What a
+ * root that holds them cannot be restored as is a merge's conflict, as restoring it is
+ * tried: a partitioned or inheriting table's violations, which cannot be set aside yet, an
+ * identity column's null, a rule naming what is set aside.
  *
  * What a root's rows cannot be, with no constraint on them, is a merge's conflict, and
  * not a violation: a value of no type it now has, two keys alike as 1.0 and 1.00 are, a
@@ -68,16 +70,19 @@ typedef struct WsViolRoutine
 
 	/*
 	 * A root as its rows now are, its ~viol map what they violate, in *out; false, with
-	 * what was wrong in *why, palloc'd, if it is one no constraint explains.
+	 * what was wrong in *why, palloc'd, if it is one no constraint explains.  from_here
+	 * says it was just captured, so only its rows are asked of, its statements being here.
 	 */
-	bool		(*recheck) (ProllyCtx *ctx, const PHash *root, const char *schema, PHash *out, char **why);
+	bool		(*recheck) (ProllyCtx *ctx, const PHash *root, const char *schema, bool from_here,
+							PHash *out, char **why);
 
 	/* What a root holds of them, in key order. */
 	void		(*list) (ProllyCtx *ctx, const PHash *root, WsViolation **out, int *n);
 
 	/*
 	 * Applies again each constraint set aside of a schema, as many as now hold going
-	 * from pg_ws_deferred; how many still do not.  A foreign key waits for what it needs.
+	 * from pg_ws_deferred; how many still do not.  A foreign key waits for what it needs,
+	 * and what raises for its rows waits too, with a warning of why.
 	 */
 	int			(*resolve) (ProllyCtx *ctx, const char *schema);
 } WsViolRoutine;
@@ -91,12 +96,15 @@ extern void ws_viol_key(const uint8 *key, size_t klen, WsViolation *out);
 #define WS_DEFERRED_EXCLUSION 'x'
 #define WS_DEFERRED_INDEX 'i'
 #define WS_DEFERRED_FOREIGN_KEY 'f'
+#define WS_DEFERRED_REPLICA 'r'
+#define WS_DEFERRED_CLUSTER 'l'
 
 /* One set aside: of a record's bytes, or a foreign key's value and key. */
 typedef struct WsDeferred
 {
 	char		kind;			/* WS_DEFERRED_* */
 	const char *name;			/* UTF8 */
+	Oid			refrelid;		/* what a foreign key references */
 	Buf			record;
 	Buf			key;
 } WsDeferred;
@@ -116,6 +124,7 @@ extern const WsDeferredStore *const WsDeferreds;
 typedef struct WsDeferredItem
 {
 	const char *table;
+	const char *ref_table;		/* a foreign key's */
 	WsDeferred	deferred;
 } WsDeferredItem;
 
