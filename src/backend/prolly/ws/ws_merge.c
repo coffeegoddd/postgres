@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
+#include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -22,6 +24,7 @@
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
 #include "prolly/ws/ws_obj.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_restore.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
@@ -31,6 +34,7 @@
 #include "prolly/ws/ws_tags.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
 /* The keys of the types and domains that differ between a side's objects and the merged. */
@@ -2260,15 +2264,83 @@ merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *b, const
 
 /* ------------------------------------------------- computing, through SQL */
 
+/* What a merge computes among: its merged definitions, made when first needed. */
+typedef struct EvalScope
+{
+	ProllyCtx  *ctx;
+	const PHash *root;
+	const char *schema;
+	bool		made;
+	char	   *refused;		/* why they could not be made */
+} EvalScope;
+
+static bool
+eval_ready(EvalScope *scope)
+{
+	WsSqlFailure failure;
+
+	if (!scope->made && scope->refused == NULL)
+	{
+		if (ws_root_definitions_begin(scope->ctx, scope->root, scope->schema, &failure))
+			scope->refused = failure.message != NULL ? failure.message : pstrdup("it was refused");
+		else
+			scope->made = true;
+	}
+	return scope->made;
+}
+
+static ExecutorCheckPerms_hook_type eval_prior_hook = NULL;
+static Oid	eval_namespace = InvalidOid;
+
+/*
+ * Their tables hold no rows here, and a value worked out from none is no value, whatever a
+ * function's label says it reads.
+ */
+static bool
+eval_reads_no_table(List *rangeTable, List *rtePermInfos, bool ereport_on_violation)
+{
+	ListCell   *lc;
+
+	foreach(lc, rangeTable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_RELATION && get_rel_namespace(rte->relid) == eval_namespace)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("a merge cannot work out a value from table \"%s\"", get_rel_name(rte->relid))));
+	}
+	return eval_prior_hook != NULL ? eval_prior_hook(rangeTable, rtePermInfos, ereport_on_violation) : true;
+}
+
 /* A statement among the merged definitions; its one value, or NULL for a null. */
 static bool
-eval_statement(const char *schema, const char *sql, int nparams, const char *const *params, char **out)
+eval_statement(EvalScope *scope, const char *sql, int nparams, const char *const *params, char **out)
 {
-	int			level = WsSql->begin();
-	int			nest = ws_schema_path_begin(schema);
+	int			level;
+	int			branch;
+	int			nest;
 	WsSqlRows	rows;
 	WsSqlFailure failure;
-	bool		ok = WsSql->attempt(sql, nparams, params, &rows, &failure);
+	bool		ok = false;
+
+	if (!eval_ready(scope))
+		return false;
+	level = WsSql->begin();
+	branch = CatalogBranchEnter(ws_root_scratch_branch());
+	nest = ws_schema_path_begin(scope->schema);
+	eval_namespace = get_namespace_oid(scope->schema, false);
+	eval_prior_hook = ExecutorCheckPerms_hook;
+	ExecutorCheckPerms_hook = eval_reads_no_table;
+	PG_TRY();
+	{
+		ok = WsSql->attempt(sql, nparams, params, &rows, &failure);
+	}
+	PG_FINALLY();
+	{
+		ExecutorCheckPerms_hook = eval_prior_hook;
+	}
+	PG_END_TRY();
 
 	if (ok && rows.nrows == 1 && rows.ncols == 1)
 	{
@@ -2279,6 +2351,7 @@ eval_statement(const char *schema, const char *sql, int nparams, const char *con
 	else if (ok)
 		ok = false;
 	ws_schema_path_end(nest);
+	CatalogBranchLeave(branch);
 	WsSql->end(level);
 	return ok;
 }
@@ -2302,22 +2375,31 @@ check_varies(void *arg)
 static bool
 sql_column_default(void *arg, const char *expr, char **out, bool *varies)
 {
-	const char *schema = arg;
+	EvalScope  *scope = arg;
 	char	   *sql = psprintf("SELECT (%s)", ws_text_from_utf8(expr));
 	VariesCheck vc = {sql, false};
-	int			level = WsSql->begin();
-	int			nest = ws_schema_path_begin(schema);
+	int			level;
+	int			branch;
+	int			nest;
 	WsSqlFailure failure;
-	bool		parsed = WsSql->attempt_fn(check_varies, &vc, &failure);
+	bool		parsed;
 
+	*varies = false;
+	if (!eval_ready(scope))
+		return false;
+	level = WsSql->begin();
+	branch = CatalogBranchEnter(ws_root_scratch_branch());
+	nest = ws_schema_path_begin(scope->schema);
+	parsed = WsSql->attempt_fn(check_varies, &vc, &failure);
 	ws_schema_path_end(nest);
+	CatalogBranchLeave(branch);
 	WsSql->end(level);
 	*varies = vc.varies;
 	if (!parsed)
 		return false;
 	if (vc.varies)
 		return true;
-	if (!eval_statement(schema, sql, 0, NULL, out))
+	if (!eval_statement(scope, sql, 0, NULL, out))
 		return false;
 	if (*out != NULL)
 		*out = pstrdup(ws_text_to_utf8(*out));
@@ -2750,7 +2832,7 @@ merge_tables(Merger *m, const PHash *base, const PHash *ours, const PHash *their
 }
 
 static void
-tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs,
+tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs, const char *schema,
 		   const WsEvalRoutine *eval, WsMergeResult *out)
 {
 	Merger		m = {ctx};
@@ -2760,7 +2842,6 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 	TableList **lists;
 	PHash		rv = vc_root_empty(ctx);
 	PHash		maps;
-	char	   *definitions = NULL;
 
 	merge_map(&m, base, ours, theirs, WS_ROOT_OBJECTS, "", &rv);
 	m.ours_types = types_differing(&m, ours, &rv);
@@ -2784,24 +2865,26 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 	merge_tables(&m, base, ours, theirs, lists, &rv);
 	drop_foreign_keys_of_dropped(&m, &rv);
 	check_merged_root(&m, &rv);
-	if (m.nconflicts == 0 && eval != NULL)
-	{
-		WsSqlFailure failure;
-
-		if (ws_root_definitions_begin(ctx, &rv, &definitions, &failure))
-			conflict(&m, "unapplied", failure.message != NULL ? failure.message : "it was refused");
-		m.eval = eval;
-		m.eval_arg = definitions;
-	}
 	if (m.nconflicts == 0)
 	{
+		PHash		definitions = rv;
+		EvalScope	scope = {ctx, &definitions, schema};
+
+		m.eval = eval;
+		m.eval_arg = &scope;
 		m.schema_only = false;
 		rv = maps;
 		merge_tables(&m, base, ours, theirs, lists, &rv);
 		drop_foreign_keys_of_dropped(&m, &rv);
+		if (scope.made)
+			ws_root_definitions_end(schema);
+		if (scope.refused != NULL)
+		{
+			/* (what could not be worked out then was for this, and says nothing of itself) */
+			m.nconflicts = 0;
+			conflict(&m, "unapplied", scope.refused);
+		}
 	}
-	if (definitions != NULL)
-		ws_root_definitions_end(definitions);
 	out->root = rv;
 	out->nconflicts = m.nconflicts;
 	out->conflicts = m.conflicts;

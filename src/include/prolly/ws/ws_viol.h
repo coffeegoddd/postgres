@@ -57,7 +57,7 @@ typedef struct WsViolRoutine
 	 * A root as its rows now are, its ~viol map what they violate, in *out; false, with
 	 * what was wrong in *why, palloc'd, if it is one no constraint explains.
 	 */
-	bool		(*recheck) (ProllyCtx *ctx, const PHash *root, PHash *out, char **why);
+	bool		(*recheck) (ProllyCtx *ctx, const PHash *root, const char *schema, PHash *out, char **why);
 
 	/* What a root holds of them, in key order. */
 	void		(*list) (ProllyCtx *ctx, const PHash *root, WsViolation **out, int *n);
@@ -75,6 +75,6 @@ extern PGDLLIMPORT const WsViolRoutine *WsViol;
  * A merge with no conflicts, checked: its root rechecked, or an unapplied conflict added
  * if it is refused.
  */
-extern void ws_merge_check(ProllyCtx *ctx, WsMergeResult *result);
+extern void ws_merge_check(ProllyCtx *ctx, const char *schema, WsMergeResult *result);
 
 #endif							/* PROLLY_WS_VIOL_H */

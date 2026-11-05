@@ -753,11 +753,11 @@ CREATE FUNCTION test_ws_root_capture(schema text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION test_ws_merge(base text, ours text, theirs text)
+CREATE FUNCTION test_ws_merge(base text, ours text, theirs text, schema text DEFAULT 'merged')
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION test_ws_merge_checked(base text, ours text, theirs text)
+CREATE FUNCTION test_ws_merge_checked(base text, ours text, theirs text, schema text DEFAULT 'merged')
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 

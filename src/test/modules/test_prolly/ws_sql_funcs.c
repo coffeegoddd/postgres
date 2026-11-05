@@ -927,7 +927,7 @@ test_ws_root_refused(PG_FUNCTION_ARGS)
 	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
 	WsSqlFailure failure;
 
-	if (!ws_root_refused(backend_ctx(), &root, &failure))
+	if (!ws_root_refused(backend_ctx(), &root, "merged", &failure))
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%s %s", failure.sqlstate, failure.message)));
 }
@@ -995,7 +995,7 @@ test_ws_merge(PG_FUNCTION_ARGS)
 	WsMergeResult res;
 	StringInfoData out;
 
-	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &SqlWsEval, &res);
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, text_to_cstring(PG_GETARG_TEXT_PP(3)), &SqlWsEval, &res);
 	initStringInfo(&out);
 	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
 	for (int i = 0; i < res.nconflicts; i++)
@@ -1016,8 +1016,8 @@ test_ws_merge_checked(PG_FUNCTION_ARGS)
 	WsMergeResult res;
 	StringInfoData out;
 
-	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &SqlWsEval, &res);
-	ws_merge_check(backend_ctx(), &res);
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, text_to_cstring(PG_GETARG_TEXT_PP(3)), &SqlWsEval, &res);
+	ws_merge_check(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(3)), &res);
 	initStringInfo(&out);
 	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
 	for (int i = 0; i < res.nconflicts; i++)

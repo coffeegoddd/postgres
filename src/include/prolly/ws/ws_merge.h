@@ -63,7 +63,8 @@
  * the merge to say: a column of a table's row type, an enum key renamed against a delete,
  * a multirange whose range's name Postgres clipped to make its name.  Nor can anything
  * here or there see a value renamed to what another was, as the text still reads: it
- * means the other now, keyless rows reaching one set through that too.
+ * means the other now, keyless rows reaching one set through that too, nor a composite
+ * type's attributes reordered.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
@@ -110,7 +111,9 @@ typedef struct WsMergeResult
 
 /*
  * What a merge has computed, among its merged definitions alone, in a schema it makes
- * for that (ws_root_definitions_begin) and names in arg.  A value is its output text, as a row
+ * the first time one is asked (ws_root_definitions_begin), under its name, as a function's
+ * text may say that.  A function reading one of its tables is refused, as they hold no rows
+ * there.  A value is its output text, as a row
  * holds it.  Each false if it could not be done, with nothing left undone.
  */
 typedef struct WsEvalRoutine
@@ -128,14 +131,15 @@ typedef struct WsEvalRoutine
 	bool		(*reads_as) (void *arg, const char *type, const char *text, char **as);
 } WsEvalRoutine;
 
-/* Through WsSql: arg is the schema's name. */
+/* Through WsSql: arg is the merge's. */
 extern PGDLLIMPORT const WsEvalRoutine SqlWsEval;
 
 typedef struct WsMergeRoutine
 {
 	const char *name;
+	/* schema is the name the root goes by, which what a function's text says may name. */
 	void		(*merge) (ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs,
-						  const WsEvalRoutine *eval, WsMergeResult *out);
+						  const char *schema, const WsEvalRoutine *eval, WsMergeResult *out);
 } WsMergeRoutine;
 
 extern PGDLLIMPORT const WsMergeRoutine TagsWsMerge;

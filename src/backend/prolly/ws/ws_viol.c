@@ -510,14 +510,14 @@ query_list(ProllyCtx *ctx, const PHash *root, WsViolation **out, int *n)
 /* --------------------------------------------------------------- rechecking */
 
 static bool
-query_recheck(ProllyCtx *ctx, const PHash *root, PHash *out, char **why)
+query_recheck(ProllyCtx *ctx, const PHash *root, const char *schema, PHash *out, char **why)
 {
 	Found		found = {.cxt = CurrentMemoryContext};
 	Search		search = {ctx, root, &found};
 	WsSqlFailure failure;
 
-	if (ws_root_rows_refused(ctx, root, search_rows, &search, &failure) ||
-		ws_root_statements_refused(ctx, root, &failure))
+	if (ws_root_rows_refused(ctx, root, schema, search_rows, &search, &failure) ||
+		ws_root_statements_refused(ctx, root, schema, &failure))
 	{
 		*why = psprintf("%s", failure.message != NULL ? failure.message : "it was refused");
 		ws_sql_failure_free(&failure);
@@ -536,14 +536,14 @@ const WsViolRoutine QueryWsViol = {
 const WsViolRoutine *WsViol = &QueryWsViol;
 
 void
-ws_merge_check(ProllyCtx *ctx, WsMergeResult *result)
+ws_merge_check(ProllyCtx *ctx, const char *schema, WsMergeResult *result)
 {
 	char	   *why = NULL;
 	PHash		checked;
 
 	if (result->nconflicts > 0)
 		return;
-	if (WsViol->recheck(ctx, &result->root, &checked, &why))
+	if (WsViol->recheck(ctx, &result->root, schema, &checked, &why))
 	{
 		result->root = checked;
 		return;
