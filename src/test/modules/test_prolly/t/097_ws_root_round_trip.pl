@@ -159,6 +159,28 @@ like($err, qr/schema "c2" holds something/, 'a collation is something');
 is($rc, 0, 'a restore and capture in one statement runs') or diag($err);
 like($out, qr/^1\|t$/m, 'and captures as what was restored');
 
+# a table named as a built-in type is no loop, by that name
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE SCHEMA tn VERSIONED; CREATE SCHEMA tn2 VERSIONED;
+	CREATE TABLE tn.t2 (x text); CREATE TABLE tn."text" (a integer, b tn.t2);
+	SELECT test_ws_root_capture('tn') AS r \gset
+	SELECT test_ws_root_restore(:'r', 'tn2');
+	SELECT test_ws_root_capture('tn2') = :'r';
+});
+is($rc, 0, 'a table named as a built-in type restores') or diag($err);
+like($out, qr/^t$/m, 'as itself');
+
+# an array of a view's row type too; and a view of another schema is not one made after
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE SCHEMA vr2 VERSIONED;
+	CREATE TABLE vr2.t (a integer);
+	CREATE VIEW vr2.vv AS SELECT a FROM vr2.t;
+	CREATE TABLE vr2.u (x vr2.vv[]);
+	SELECT test_ws_root_capture('vr2')});
+like($err, qr/column "x" of table "u" .* its type is the row of view "vv"/, 'an array of a view\'s row type is refused');
+
 # a column of a view's row type cannot be restored, so is not held
 ($rc, $out, $err) = in_one_session(q{
 	SET client_min_messages = warning;
@@ -173,9 +195,11 @@ like($err, qr/column "x" of table "u" .* its type is the row of view "vv"/, 'a c
 ($rc, $out, $err) = in_one_session(q{
 	SET client_min_messages = warning;
 	CREATE ROLE g_lost NOLOGIN TRAVELS; CREATE ROLE g_up NOLOGIN TRAVELS; GRANT g_up TO g_lost;
-	CREATE SCHEMA ml VERSIONED; CREATE SCHEMA ml2 VERSIONED;
+	CREATE SCHEMA ml VERSIONED; ALTER SCHEMA ml OWNER TO g_root; CREATE SCHEMA ml2 VERSIONED;
+	SET ROLE g_root;
 	CREATE TABLE ml.t (a integer);
 	GRANT SELECT ON ml.t TO g_lost;
+	RESET ROLE;
 	SELECT test_ws_root_capture('ml') AS before \gset
 	REVOKE SELECT ON ml.t FROM g_lost;
 	SELECT test_ws_root_capture('ml') AS after \gset
@@ -272,7 +296,6 @@ for my $case (
 ($rc, $out, $err) = in_one_session(q{
 	SET client_min_messages = warning;
 	CREATE ROLE g_small NOLOGIN; CREATE ROLE g_owner2 NOLOGIN TRAVELS; GRANT g_owner2 TO g_small;
-	REVOKE CREATE ON DATABASE postgres FROM PUBLIC;
 	CREATE SCHEMA dr VERSIONED; ALTER SCHEMA dr OWNER TO g_owner2;
 	SET ROLE g_owner2;
 	CREATE TABLE dr.t (a integer); INSERT INTO dr.t VALUES (1);
@@ -287,6 +310,25 @@ for my $case (
 is($rc, 0, 'a dry run by a role with no right to make schemas runs') or diag($err);
 like($out, qr/^nothing$/m, 'and goes through');
 like($out, qr/^g_small$/m, 'and is as that role after');
+
+# nothing of it runs as anyone but who asked: not an event trigger on what it does
+my $superuser = $node->safe_psql('postgres', 'SELECT current_user');
+($rc, $out, $err) = in_one_session(q{
+	CREATE FUNCTION public.who_ran() RETURNS event_trigger LANGUAGE plpgsql AS $$
+	BEGIN RAISE NOTICE 'ran as %', current_user; END $$;
+	CREATE EVENT TRIGGER who_ran ON ddl_command_end EXECUTE FUNCTION public.who_ran();
+	SELECT test_ws_root_capture('dr') AS r \gset
+	SET ROLE g_small;
+	SELECT coalesce(test_ws_root_refused(:'r'), 'nothing');
+	RESET ROLE;
+	DROP EVENT TRIGGER who_ran;
+});
+is($rc, 0, 'a dry run under an event trigger runs') or diag($err);
+like($err, qr/ran as g_small/, 'which fires as who asked');
+my @ran = $err =~ /ran as (\S+)/g;
+my $during = grep { $_ eq 'g_small' } @ran;
+ok($during > 0, 'it fired during the run');
+is(scalar(grep { $_ ne 'g_small' && $_ ne $superuser } @ran), 0, 'as no one else');
 
 # a name a schema already has is no refusal of the root
 ($rc, $out, $err) = in_one_session(q{

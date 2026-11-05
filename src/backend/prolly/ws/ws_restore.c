@@ -13,7 +13,9 @@
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_authid_d.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_type_d.h"
+#include "prolly/branch_catalog.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "prolly/ws/ws_fk.h"
@@ -26,6 +28,7 @@
 #include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 /* ---------------------------------------------------------------- capture */
 
@@ -77,9 +80,10 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 	/* (run, not read: a statement may have made these, and it sees what that did) */
 	WsSql->run("SELECT c.relname::text, a.attname::text, r.relname::text FROM pg_class c "
 			   "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid "
-			   "JOIN pg_type t ON t.oid = a.atttypid JOIN pg_class r ON r.oid = t.typrelid "
+			   "JOIN pg_type t ON t.oid = a.atttypid LEFT JOIN pg_type e ON e.oid = t.typelem AND t.typcategory = 'A' "
+			   "JOIN pg_class r ON r.oid = coalesce(nullif(t.typrelid, 0), e.typrelid) "
 			   "WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') AND NOT a.attisdropped AND r.relkind IN ('v', 'm') "
-			   "LIMIT 1", 1, params, &viewed);
+			   "AND r.relnamespace = n.oid LIMIT 1", 1, params, &viewed);
 	if (viewed.nrows > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -178,6 +182,7 @@ typedef struct TableOrder
 	WsTableSchema *recs;
 	PHash	   *rows;
 	bool	   *placed;
+	bool	   *visiting;
 	int		   *order;
 	int			n;
 } TableOrder;
@@ -226,9 +231,13 @@ table_named_by_type(const TableOrder *o, const char *type)
 		}
 		*to = '\0';
 	}
-	for (int i = 0; found < 0 && i < o->nnames; i++)
-		if (strcmp(o->names[i], name) == 0)
-			found = i;
+
+	/* (a name a built-in type has too is taken as that: a table's would fail loudly) */
+	if (!OidIsValid(GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(name),
+									ObjectIdGetDatum(PG_CATALOG_NAMESPACE))))
+		for (int i = 0; found < 0 && i < o->nnames; i++)
+			if (strcmp(o->names[i], name) == 0)
+				found = i;
 	pfree(name);
 	return found;
 }
@@ -250,11 +259,12 @@ place_table(TableOrder *o, int i, int depth)
 		place_table(o, table_index(o, rec->inherits[p]), depth + 1);
 
 	/* (a column of another table's row type: it has to be there) */
+	o->visiting[i] = true;
 	for (int c = 0; c < rec->ncols; c++)
 	{
 		int			of = table_named_by_type(o, rec->cols[c].type);
 
-		if (of >= 0 && of != i)
+		if (of >= 0 && !o->visiting[of])
 			place_table(o, of, depth + 1);
 	}
 	o->placed[i] = true;
@@ -271,6 +281,7 @@ tables_in_order(ProllyCtx *ctx, const PHash *root, TableOrder *o)
 	o->recs = palloc_array(WsTableSchema, Max(o->nnames, 1));
 	o->rows = palloc_array(PHash, Max(o->nnames, 1));
 	o->placed = palloc0_array(bool, Max(o->nnames, 1));
+	o->visiting = palloc0_array(bool, Max(o->nnames, 1));
 	o->order = palloc_array(int, Max(o->nnames, 1));
 	for (int i = 0; i < o->nnames; i++)
 		if (!WsRoot->get_table(ctx, root, o->names[i], &o->recs[i], &o->rows[i]))
@@ -516,19 +527,16 @@ typedef struct DryRun
 } DryRun;
 
 /*
- * A schema for a dry run, which whoever merges has no need of the right to make: made as
- * the superuser, for it to own, all may use it, as a root's owners must, and nothing
- * else is done as that.  It goes when the run does.
+ * A schema for a dry run, which whoever merges needs no right to make, for it to own: made
+ * by no statement, so that nothing a statement would fire runs for it.  All may use it, as
+ * a root's owners must.  It goes when the run does.
  */
 static char *
 make_dry_run_schema(void)
 {
-	Oid			user;
-	int			context;
-	Oid			me = GetUserId();
 	WsSqlRows	rows;
 	char	   *schema = NULL;
-	StringInfoData sql;
+	char	   *sql;
 
 	for (int i = 0; schema == NULL; i++)
 	{
@@ -536,30 +544,12 @@ make_dry_run_schema(void)
 		if (OidIsValid(get_namespace_oid(schema, true)))
 			schema = NULL;
 	}
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "CREATE SCHEMA %s VERSIONED", quote_identifier(schema));
-	GetUserIdAndSecContext(&user, &context);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, context | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		WsSql->run(sql.data, 0, NULL, &rows);
-		ws_sql_rows_free(&rows);
-		resetStringInfo(&sql);
-		appendStringInfo(&sql, "ALTER SCHEMA %s OWNER TO %s", quote_identifier(schema),
-						 quote_identifier(GetUserNameFromId(me, false)));
-		WsSql->run(sql.data, 0, NULL, &rows);
-		ws_sql_rows_free(&rows);
-		resetStringInfo(&sql);
-		appendStringInfo(&sql, "GRANT ALL ON SCHEMA %s TO PUBLIC", quote_identifier(schema));
-		WsSql->run(sql.data, 0, NULL, &rows);
-		ws_sql_rows_free(&rows);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, context);
-	}
-	PG_END_TRY();
-	pfree(sql.data);
+	(void) NamespaceCreateOnBranch(schema, GetUserId(), false, VersionedNamespaceBranch(schema));
+	CommandCounterIncrement();
+	sql = psprintf("GRANT ALL ON SCHEMA %s TO PUBLIC", quote_identifier(schema));
+	WsSql->run(sql, 0, NULL, &rows);
+	ws_sql_rows_free(&rows);
+	pfree(sql);
 	return schema;
 }
 
@@ -597,7 +587,9 @@ ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
 
 		/*
 		 * What a merge made naming what it no longer has: a view of a column
-		 * dropped, a function of a type dropped.  It is the merge's to say.  (Its
+		 * dropped, a function of a type dropped.  It is the merge's to say, as is
+		 * this code's every other meaning here, its message saying which: a
+		 * chunk missing is no less a root that cannot be restored.  (Its
 		 * subtransaction is gone already, as attempt_fn raises only after that.)
 		 */
 		if (edata->sqlerrcode != ERRCODE_DATA_CORRUPTED)
