@@ -338,6 +338,7 @@ static const char *const query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrit
 /* GUC parameters */
 bool		quote_all_identifiers = false;
 DeparseColumnNameHook deparse_column_name_hook = NULL;
+bool		deparse_printed_alias_list = false;
 
 
 /* ----------
@@ -12904,6 +12905,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 		else
 		{
 			/* Else print column aliases as needed */
+			if (colinfo->printaliases && rte->rtekind == RTE_RELATION)
+				deparse_printed_alias_list = true;
 			get_column_alias_list(colinfo, context);
 		}
 
@@ -13023,6 +13026,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 			appendStringInfo(buf, " %s",
 							 quote_identifier(get_rtable_name(j->rtindex,
 															  context)));
+			if (colinfo->printaliases)
+				deparse_printed_alias_list = true;
 			get_column_alias_list(colinfo, context);
 		}
 	}

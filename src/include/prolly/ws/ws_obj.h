@@ -108,6 +108,17 @@ typedef struct WsObjectUsing
 	uint64		tag;
 } WsObjectUsing;
 
+/*
+ * A table whose columns an alias list goes by the place of: what prints a list of its, or of a
+ * join over it.  The tags of its columns in order are held beside it, and a restore that finds
+ * them otherwise refuses, rather than reading another column.
+ */
+typedef struct WsObjectPlaces
+{
+	char	   *table;
+	char	   *columns;		/* its columns' tags in order, comma-separated */
+} WsObjectPlaces;
+
 typedef struct WsObject
 {
 	WsObjectKind kind;
@@ -131,6 +142,8 @@ typedef struct WsObject
 	WsObjectGrant *grants;		/* in order: by column, grantee, grant option */
 	int			nusings;
 	WsObjectUsing *usings;		/* in order: by table, column, tag */
+	int			nplaces;
+	WsObjectPlaces *places;		/* in order, by table */
 } WsObject;
 
 /*

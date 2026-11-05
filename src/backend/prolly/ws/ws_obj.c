@@ -10,6 +10,7 @@
  * one's column, empty for none, and text; uvarint ngrants and each one's column, empty
  * for none, grantee, empty for PUBLIC, grant option byte, privileges.
  * Then uvarint nusings, and each's table, column and tag.
+ * Then uvarint nplaces, and each's table and its columns' tags.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -288,6 +289,13 @@ ws_obj_problem(const WsObject *o)
 		if (i > 0 && using_cmp(&o->usings[i - 1], &o->usings[i]) >= 0)
 			return "USINGs out of order";
 	}
+	for (int i = 0; i < o->nplaces; i++)
+	{
+		if (bad_name(o->places[i].table) || o->places[i].columns == NULL || o->places[i].columns[0] == '\0')
+			return "a list's table with no name or columns";
+		if (i > 0 && strcmp(o->places[i - 1].table, o->places[i].table) >= 0)
+			return "lists' tables out of order";
+	}
 	if (o->kind == WS_OBJ_CAST && (o->owner != NULL || o->ngrants > 0 || o->args == NULL || o->args[0] == '\0'))
 		return "a cast with no target, or with an owner or grants of its own";
 	if ((o->after_tables || o->public_revoked) && !is_function(o->kind))
@@ -428,6 +436,12 @@ obj_encode_value(const WsObject *o, Buf *out)
 		put_string(out, o->usings[i].table);
 		put_string(out, o->usings[i].column);
 		buf_append_uvarint(out, o->usings[i].tag);
+	}
+	buf_append_uvarint(out, (uint64) o->nplaces);
+	for (int i = 0; i < o->nplaces; i++)
+	{
+		put_string(out, o->places[i].table);
+		put_string(out, o->places[i].columns);
 	}
 }
 
@@ -579,6 +593,13 @@ obj_decode(const uint8 *key, size_t klen, const uint8 *val, size_t vlen, WsObjec
 		if (!ws_read_canonical_uvarint(&p, end, &o->usings[i].tag))
 			malformed("a USING's tag cut short");
 	}
+	o->nplaces = get_count(&p, end, 2);
+	o->places = zeroed(o->nplaces, sizeof(WsObjectPlaces));
+	for (int i = 0; i < o->nplaces; i++)
+	{
+		o->places[i].table = get_string(&p, end, false);
+		o->places[i].columns = get_string(&p, end, false);
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_obj_problem(o);
@@ -608,6 +629,12 @@ ws_obj_free(WsObject *o)
 		px_free(o->usings[i].column);
 	}
 	px_free(o->usings);
+	for (int i = 0; i < o->nplaces; i++)
+	{
+		px_free(o->places[i].table);
+		px_free(o->places[i].columns);
+	}
+	px_free(o->places);
 	for (int i = 0; i < o->ndeps; i++)
 		px_free(o->deps[i]);
 	px_free(o->deps);
@@ -1541,6 +1568,7 @@ typedef struct UsingWalk
 {
 	Oid			nspoid;
 	List	   *found;			/* of WsObjectUsing * */
+	List	   *tables;			/* oids of the tables of this schema it reads */
 } UsingWalk;
 
 /* The column of a table that a column of a range table entry simply is, or false. */
@@ -1641,10 +1669,60 @@ usings_walker(Node *node, void *arg)
 		return false;
 	if (IsA(node, Query))
 	{
+		foreach_ptr(RangeTblEntry, rte, ((Query *) node)->rtable)
+			if (rte->rtekind == RTE_RELATION && get_rel_namespace(rte->relid) == w->nspoid)
+				w->tables = list_append_unique_oid(w->tables, rte->relid);
 		usings_of_jointree(w, (Query *) node, (Node *) ((Query *) node)->jointree);
 		return query_tree_walker((Query *) node, usings_walker, arg, 0);
 	}
 	return expression_tree_walker(node, usings_walker, arg);
+}
+
+static int
+places_cmp(const void *a, const void *b)
+{
+	return strcmp(((const WsObjectPlaces *) a)->table, ((const WsObjectPlaces *) b)->table);
+}
+
+/* The tags in order of a table's columns, as text; NULL if none has one. */
+static char *
+column_tags_of(const char *oid)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+	char	   *tags;
+
+	WsSql->read("SELECT string_agg(a.attcoltag::text, ',' ORDER BY a.attnum) FROM pg_attribute a "
+				"WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attcoltag <> 0", 1, params, &rows);
+	tags = ws_sql_value(&rows, 0, 0) != NULL ? pstrdup(ws_sql_value(&rows, 0, 0)) : NULL;
+	ws_sql_rows_free(&rows);
+	return tags;
+}
+
+/* For what prints an alias list: the column order of every table of its it reads. */
+static void
+read_places(WsObject *o, const UsingWalk *w)
+{
+	WsObjectPlaces *places = zeroed(list_length(w->tables), sizeof(WsObjectPlaces));
+	int			n = 0;
+
+	foreach_oid(relid, w->tables)
+	{
+		char	   *oid = psprintf("%u", relid);
+		char	   *tags = column_tags_of(oid);
+
+		if (tags != NULL)
+		{
+			places[n].table = ws_name_to_utf8(get_rel_name(relid));
+			places[n++].columns = px_memdup(tags, strlen(tags) + 1);
+			pfree(tags);
+		}
+		pfree(oid);
+	}
+	if (n > 1)
+		qsort(places, n, sizeof(WsObjectPlaces), places_cmp);
+	o->places = places;
+	o->nplaces = n;
 }
 
 /* What an object's stored trees (sql, of its oid, a row each) merge by USING, held in order. */
@@ -1653,16 +1731,20 @@ read_usings(WsObject *o, const char *schema, const char *oid, const char *sql)
 {
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
-	UsingWalk	w = {get_namespace_oid(schema, false), NIL};
+	UsingWalk	w = {get_namespace_oid(schema, false), NIL, NIL};
+	bool		printed_a_list = deparse_printed_alias_list;
 	WsObjectUsing *sorted;
 	int			n;
 	int			kept = 0;
 
+	deparse_printed_alias_list = false;
 	WsSql->read(sql, 1, params, &rows);
 	for (int i = 0; i < rows.nrows; i++)
 		if (ws_sql_value(&rows, i, 0) != NULL)
 			usings_walker(stringToNode(ws_sql_value(&rows, i, 0)), &w);
 	ws_sql_rows_free(&rows);
+	if (printed_a_list)
+		read_places(o, &w);
 	n = list_length(w.found);
 	if (n == 0)
 		return;
@@ -1687,6 +1769,27 @@ read_usings(WsObject *o, const char *schema, const char *oid, const char *sql)
 static void
 check_usings(const WsObject *o, const char *schema)
 {
+	for (int i = 0; i < o->nplaces; i++)
+	{
+		char	   *table = ws_name_from_utf8(o->places[i].table);
+		char	   *qualified = psprintf("%s.%s", quote_identifier(schema), quote_identifier(table));
+		const char *params[1] = {qualified};
+		WsSqlRows	rows;
+		char	   *now = NULL;
+
+		WsSql->read("SELECT to_regclass($1)::oid::text", 1, params, &rows);
+		if (ws_sql_value(&rows, 0, 0) != NULL)
+			now = column_tags_of(ws_sql_value(&rows, 0, 0));
+		ws_sql_rows_free(&rows);
+		if (now == NULL || strcmp(now, o->places[i].columns) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be made: an alias list of it goes by the place of the columns of table \"%s\", which have changed",
+							o->name, schema, table),
+					 errhint("An alias list cannot follow a column added or dropped. Make the object again.")));
+		pfree(qualified);
+		pfree(table);
+	}
 	for (int i = 0; i < o->nusings; i++)
 	{
 		const WsObjectUsing *u = &o->usings[i];

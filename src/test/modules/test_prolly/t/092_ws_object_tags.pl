@@ -195,6 +195,44 @@ my %fs = map { my ($k, $v) = split /\t/; $k => pack('H*', $v // '') } split /\n/
 like($fs{'function/up()'} // '', qr/SET \@\{\d+\}\.\@\{\d+\} = 1/, 'saying the field by its tag');
 $node->safe_psql('postgres', q{DROP SCHEMA mg CASCADE});
 
+# an alias list goes by place: restored where a table's columns are otherwise, it says so
+for my $case (
+	[ 'written', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{ALTER TABLE pl2.t DROP COLUMN n; ALTER TABLE pl2.t ADD COLUMN z integer DEFAULT 7} ],
+	[ 'written, added', q{CREATE VIEW pl1.v AS SELECT x.l FROM pl1.t x(l)}, q{ALTER TABLE pl2.t ADD COLUMN z integer} ],
+	[ 'named join, written', q{CREATE VIEW pl1.v AS SELECT j.q FROM (pl1.t JOIN pl1.u ON t.n = u.k) j(a, b, c, d, q)}, q{ALTER TABLE pl2.t ADD COLUMN y integer DEFAULT 99} ],
+	[ 'named join, printed', q{CREATE VIEW pl1.v AS SELECT j.other FROM (pl1.t JOIN pl1.u2 ON t.n = u2.n) j}, q{ALTER TABLE pl2.t ADD COLUMN y text} ])
+{
+	my ($name, $view, $change) = @$case;
+	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
+		CREATE TABLE pl1.t (val text, n integer, w integer, tv text); CREATE TABLE pl1.u (k integer); CREATE TABLE pl1.u2 (n integer, other text)});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $view");
+	for my $table ('t', 'u', 'u2')
+	{
+		my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('pl1', '$table'), 'hex')});
+		$node->safe_psql('postgres', qq{SET ROLE g_tags; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'pl2'); SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'pl2')});
+	}
+	my $pl_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $change");
+	my ($rcp, $outp, $errp) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	like($errp, qr/goes by the place of the columns of table "t", which have changed/, "$name: a change under it says so");
+	$node->safe_psql('postgres', q{DROP SCHEMA pl2 CASCADE; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags});
+	for my $table ('t', 'u', 'u2')
+	{
+		my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('pl1', '$table'), 'hex')});
+		$node->safe_psql('postgres', qq{SET ROLE g_tags; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'pl2'); SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'pl2')});
+	}
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $pl_held, "$name: with none it reads as its commit");
+	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+}
+# with no list, a column added changes nothing
+$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE pl1.t (a integer); CREATE VIEW pl1.v AS SELECT a FROM pl1.t; CREATE TABLE pl2.t (a integer); ALTER TABLE pl2.t ADD COLUMN b integer});
+my $no_list = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
+my ($rcq, $outq, $errq) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+is($rcq, 0, 'with no list, a column added makes no difference') or diag($errq);
+$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+
 # a byte that looks like what marks a tag is only that
 $node->safe_psql('postgres', q{CREATE SCHEMA mk VERSIONED; ALTER SCHEMA mk OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mk.t (a text);
 	CREATE VIEW mk.w AS SELECT E'"\0011\001"'::text AS k, E'\001' AS m, a FROM mk.t});
