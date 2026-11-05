@@ -1384,6 +1384,7 @@ store_printed(const char *text, Buf *out)
 }
 
 /* A column's name by its tag in a schema, for what is restored there. */
+/* (run, not read: a restore's own tables are seen only by a statement with a snapshot of its own) */
 static const char *
 column_of_schema(void *arg, uint64 tag)
 {
@@ -1393,7 +1394,7 @@ column_of_schema(void *arg, uint64 tag)
 	WsSqlRows	rows;
 	char	   *name = NULL;
 
-	WsSql->read("SELECT DISTINCT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+	WsSql->run("SELECT DISTINCT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
 				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND a.attcoltag = $2::bigint "
 				"AND NOT a.attisdropped", 2, params, &rows);
 	if (rows.nrows > 1)
@@ -1423,7 +1424,7 @@ column_of_table(void *arg, uint64 tag)
 	WsSqlRows	rows;
 	char	   *name = NULL;
 
-	WsSql->read("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+	WsSql->run("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
 				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relname = $2::name "
 				"AND a.attcoltag = $3::bigint AND NOT a.attisdropped", 3, params, &rows);
 	if (rows.nrows == 1)

@@ -6,6 +6,7 @@ backend_sources += files(
   'ws_merge.c',
   'ws_obj.c',
   'ws_print.c',
+  'ws_restore.c',
   'ws_role.c',
   'ws_root.c',
   'ws_row.c',

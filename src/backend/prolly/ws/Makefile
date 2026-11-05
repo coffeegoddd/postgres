@@ -19,6 +19,7 @@ OBJS = \
 	ws_merge.o \
 	ws_obj.o \
 	ws_print.o \
+	ws_restore.o \
 	ws_role.o \
 	ws_root.o \
 	ws_row.o \
