@@ -217,6 +217,7 @@ tests += {
       't/088_vc_read_while_freed.pl',
       't/089_ws_role_round_trip.pl',
       't/090_ws_obj_round_trip.pl',
+      't/091_ws_restored_prints.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

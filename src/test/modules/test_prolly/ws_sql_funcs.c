@@ -609,9 +609,10 @@ test_ws_obj_restore_named(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_ws_obj_copy(from_schema text, to_schema text, which text) returns void: makes
- * the objects of the one in the other, through their bytes: those that go 'before'
- * tables, 'after', or 'both'
+ * test_ws_obj_copy(from_schema text, to_schema text, which text, remember bool) returns
+ * void: makes the objects of the one in the other, through their bytes: those that go
+ * 'before' tables, 'after', or 'both'; and, once all are made, remembers what they print.
+ * Not by default: what is remembered would hide a restore that made the wrong object.
  */
 Datum
 test_ws_obj_copy(PG_FUNCTION_ARGS)
@@ -637,7 +638,11 @@ test_ws_obj_copy(PG_FUNCTION_ARGS)
 	if (strcmp(which, "after") != 0)
 		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
 	if (strcmp(which, "before") != 0)
+	{
 		ws_obj_restore(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)), false);
+		if (PG_GETARG_BOOL(3))
+			ws_obj_remember(back, n, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	}
 	PG_RETURN_VOID();
 }
 

@@ -199,6 +199,13 @@ extern void ws_obj_list(ProllyCtx *ctx, const PHash *map, WsObject **out, int *n
 extern void ws_obj_restore_order(const WsObject *objs, int n, int *order);
 
 /*
+ * After objs are restored in schema, remembers what each now prints as if not as the commit
+ * holds it, so that a read holds the commit's text while it does (prolly/ws/ws_print.h).
+ * It reads the whole schema once.
+ */
+extern void ws_obj_remember(const WsObject *objs, int n, const char *schema);
+
+/*
  * The statement making an object, appended to out, checked by the grammar to be
  * only that: ERRCODE_DATA_CORRUPTED otherwise.
  */

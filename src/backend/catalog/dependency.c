@@ -80,6 +80,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
+#include "prolly/ws/ws_print.h"
 #include "rewrite/rewriteRemove.h"
 #include "storage/lmgr.h"
 #include "utils/fmgroids.h"
@@ -1348,6 +1349,8 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 	 */
 	DeleteComments(object->objectId, object->classId, object->objectSubId);
 	DeleteSecurityLabel(object);
+	if (object->classId == NamespaceRelationId)
+		WsPrints->forget_schema(object->objectId);
 	DeleteInitPrivs(object);
 
 	/*

@@ -779,7 +779,7 @@ RETURNS void STRICT AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_ws_obj_restore_named(kind text, name text, schema text)
 RETURNS void STRICT AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_ws_obj_copy(from_schema text, to_schema text, which text DEFAULT 'both')
+CREATE FUNCTION test_ws_obj_copy(from_schema text, to_schema text, which text DEFAULT 'both', remember bool DEFAULT false)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 

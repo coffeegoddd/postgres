@@ -31,6 +31,7 @@ own   src/backend/prolly/
 own   src/backend/storage/smgr/bmap.c
 own   src/backend/utils/activity/pgstat_block_map.c
 own   src/backend/utils/adt/blockmapfuncs.c
+own   src/include/catalog/pg_ws_print.h
 own   src/include/prolly/
 own   src/include/storage/bmap.h
 own   src/include/storage/bmap_files.h
@@ -44,7 +45,7 @@ own   src/tools/prolly_bench/
 patch contrib/Makefile         0  builds the fork's extensions under contrib/prolly
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
 patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
-patch doc/src/sgml/catalogs.sgml  4  pg_attribute.attcoltag documented; also (4) pg_authid.roltravels documented
+patch doc/src/sgml/catalogs.sgml  4  pg_attribute.attcoltag documented; also (4) pg_authid.roltravels documented; also (4) pg_ws_print
 patch doc/src/sgml/config.sgml  1b  catalog_branch
 patch doc/src/sgml/libpq.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/protocol.sgml  1b  catalog_branch is reported
@@ -81,6 +82,7 @@ patch src/backend/backup/basebackup.c  1a  skips checksum verification of the pa
 patch src/backend/backup/basebackup_incremental.c  1a  sends the block-mapped page store in full in incremental backups (WAL summaries don't name its physical blocks)
 patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bootstrap catalogs
 patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file; also (2) pg_history's relations are the system's (IsHistoryStoreNamespace)
+patch src/backend/catalog/dependency.c  4  forgets what a restore printed of a dropped schema
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager; a sequence's is chosen as a new heap's; also (1b) refuses an unlogged relation in a versioned schema; also (2) refuses to drop a tier of the history store that has packs, or the chunk index bound to it; also (4) a new table's columns get their tags
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema; a search path matcher notes the branch names resolved on
@@ -179,9 +181,11 @@ patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown
 patch src/include/access/xlog.h  1a  declares GetBackupState, GetRecoveryHold, XLogNoteSyncedPages, XLogSyncedSince and XLogNoteSyncedReplay
 patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the block map's changed WAL records; also (2) XLOG_PAGE_MAGIC for ChunkLog and ChunkIndex
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
+patch src/include/catalog/Makefile  4  pg_ws_print
 patch src/include/catalog/catalog.h  2  IsHistoryStoreNamespace()
-patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs; also (2) the history store's access methods, relations and functions; also (3) pg_chunk_index_format(); also (4) pg_attribute.attcoltag; also (4) pg_authid.roltravels
+patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs; also (2) the history store's access methods, relations and functions; also (3) pg_chunk_index_format(); also (4) pg_attribute.attcoltag; also (4) pg_authid.roltravels; also (4) pg_ws_print
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
+patch src/include/catalog/meson.build  4  pg_ws_print
 patch src/include/catalog/namespace.h  1b  SearchPathMatcher.branch
 patch src/include/catalog/pg_am.dat  2  the prolly_chunks, prolly_chunk_index and prolly_tier table access methods (the history store's chunk log, its index, and its tier's log)
 patch src/include/catalog/pg_attribute.h  4  attcoltag, a column's identity in version control
@@ -223,6 +227,7 @@ patch src/test/modules/meson.build  0  builds and runs the engine's unit and con
 patch src/test/recovery/t/016_min_consistency.pl  1a  reads a block-mapped relation's pages from the page store when the suite runs block-mapped
 patch src/test/recovery/t/018_wal_optimize.pl  1a  counts the page store's files and map forks as the relations' when the suite runs block-mapped
 patch src/test/regress/expected/create_am.out  2  pg_am lists prolly_chunks, prolly_chunk_index and prolly_tier
+patch src/test/regress/expected/oidjoins.out  4  pg_ws_print
 patch src/test/regress/expected/psql.out  2  \dA lists prolly_chunks, prolly_chunk_index and prolly_tier
 patch src/test/regress/expected/rules.out  1a  shows the pg_stat_block_mapped view; also (4) pg_roles shows roltravels
 patch src/test/regress/expected/stats.out  1a  lists the block_map statistics kind
