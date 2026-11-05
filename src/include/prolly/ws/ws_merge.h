@@ -12,13 +12,55 @@
  * As in Dolt: an index on a column dropped is dropped with it, a foreign key on one
  * goes too, and so does one on or to a table dropped.  Primary keys that differ, a key
  * both sides changed even alike, and a table both added otherwise are conflicts.
- * Unlike Dolt, whose checks of one column conflict, checks of other names both stay,
+ * A column dropped by one side and changed in a row by the other is a conflict, as in
+ * Dolt.
+ *
+ * Unlike Dolt: a keyless table has no row to say that of, and the value goes; a delete
+ * against a retype whose print differs, or a value changed under one name in a row
+ * holding it, is a conflict, and so is one key inserted or one value set under
+ * different types, rather than cast; both sides deleting one keyless row while its form
+ * changes is a false conflict.  Checks of other names on one column both stay, where
+ * Dolt's conflict,
  * as both can hold or be found violated; different privileges to one role conflict,
  * as Dolt has no grants to say otherwise.  Partition bounds that overlap are left for
  * ATTACH to refuse, on restore: a commit's bounds are text, not values.  So too what
  * only Postgres can tell of the whole: a key to columns no longer unique, or of a type
  * no longer alike, a child without a constraint its table now has.  Whoever applies a
- * merge restores it, and what is refused then is what the merge makes.
+ * merge restores it, and what is refused then is what the merge makes.  And both
+ * sides reaching one set of a keyless table's rows still add up, as a multiset would,
+ * where Dolt, seeing tables the same, keeps one side's.
+ *
+ * Keyed rows merge by key as each side wrote them, and where both changed a row,
+ * column by column: a cell one side left is the other's, one both changed differently a
+ * conflict.  Only what is kept is put in the merged form, so a row or cell no one touched
+ * is never read: a dropped column's value goes, a value under another type, or one
+ * changed under one name, must read as the merged type and is written as that type
+ * prints it, not cast.  A row new on a side gets the default of a column only the
+ * other has; a row with a base does not, as the side that added the column gave it what
+ * it has.  A delete against a row the other side only reshaped stands.  A stored generated
+ * column is copied unless its row is made from both sides, or written under another
+ * expression or type, when it is computed from the merged values.
+ *
+ * Keyless rows have no identity but their cells, so all three maps are put in one form
+ * and theirs' change in each row's count added to ours', when that form follows from
+ * each row alone.  A retype, a value for each row or a type changed under one name does
+ * not, and with rows changed on the side that lacks it is a row conflict; a reshape
+ * that does follow is a row conflict too where theirs removes what ours does not have,
+ * as a default set after a column was added, or where a row holds a value in a column
+ * both sides added, unless both reached one set of rows.  Both sides
+ * reaching one set of rows add up if the columns did not change; if they changed alike,
+ * that is one change.
+ *
+ * Computing those values, and whether a value reads, is what WsEval is for, and the only
+ * user code a merge runs.  A default that isn't immutable, or an identity, has no one
+ * value for a merge to give: a new row needing it is a generated conflict.  A primary
+ * key column of another type is a key conflict, as a key is its values' text.  A value
+ * is read as a type by its text, not cast: boolean to text gives true beside t, and
+ * integer DEFAULT 2.0 is a generated conflict for a new row.  Not seen here, for restoring
+ * the merge to say: a column of a table's row type, an enum key renamed against a delete,
+ * a multirange whose range's name Postgres clipped to make its name.  Nor can anything
+ * here or there see a value renamed to what another was, as the text still reads: it
+ * means the other now, keyless rows reaching one set through that too.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
@@ -34,6 +76,11 @@
  *								from their base's
  *	table <table>				one dropped a table the other changed, or both
  *								added it otherwise
+ *	row <table> <key>			both changed a value differently, one deleted a row
+ *								the other changed, or a value does not read as the
+ *								type the other side gave its column
+ *	generated <table> <key>		a default or generated value could not be computed, or
+ *								a row has none that a merge can give
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -57,11 +104,40 @@ typedef struct WsMergeResult
 	char	  **conflicts;		/* lines, in order, palloc'd */
 } WsMergeResult;
 
+/*
+ * What a merge has computed, in the schema of arg's choosing that has what the
+ * expressions name, and has the types as merged.  A value is its output text, as a row
+ * holds it.  Each false if it could not be done, with nothing left undone.
+ */
+typedef struct WsEvalRoutine
+{
+	const char *name;
+	/*
+	 * An expression, its columns already names, as text; NULL as null.  If it is not
+	 * immutable, only that, true: it has no one value.
+	 */
+	bool		(*column_default) (void *arg, const char *expr, char **out, bool *varies);
+	/* A generated column's expression over the columns of names, types and values (or NULL). */
+	bool		(*generated) (void *arg, const char *expr, int n, const char *const *names,
+							  const char *const *types, const char *const *values, char **out);
+	/* Whether text reads as a value of a type, not cut to fit, and how it prints as one. */
+	bool		(*reads_as) (void *arg, const char *type, const char *text, char **as);
+} WsEvalRoutine;
+
+/* Through WsSql: arg is a WsEvalSchemas, each schema tried in turn. */
+extern PGDLLIMPORT const WsEvalRoutine SqlWsEval;
+
+typedef struct WsEvalSchemas
+{
+	const char *const *schemas;
+	int			n;
+} WsEvalSchemas;
+
 typedef struct WsMergeRoutine
 {
 	const char *name;
 	void		(*merge) (ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs,
-						  WsMergeResult *out);
+						  const WsEvalRoutine *eval, void *eval_arg, WsMergeResult *out);
 } WsMergeRoutine;
 
 extern PGDLLIMPORT const WsMergeRoutine TagsWsMerge;

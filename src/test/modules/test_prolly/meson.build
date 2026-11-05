@@ -222,6 +222,7 @@ tests += {
       't/093_ws_rows_round_trip.pl',
       't/094_ws_diff.pl',
       't/095_ws_merge_schema.pl',
+      't/096_ws_merge_rows.pl',
       't/097_ws_root_round_trip.pl',
     ],
     'env': {

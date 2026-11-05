@@ -2116,6 +2116,12 @@ put_expression(const WsTableSchema *s, const char *stored, Buf *out)
 						s->name, missing)));
 }
 
+void
+ws_schema_render_expression(const WsTableSchema *s, const char *stored, Buf *out)
+{
+	put_expression(s, stored, out);
+}
+
 /*
  * The catalogs come first and temporary objects last, so that nothing of the schema's
  * can be taken for theirs or the other way about: what the schema shadows is printed
