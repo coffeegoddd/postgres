@@ -593,6 +593,9 @@ for my $case (
 	[ q{CREATE VIEW w AS SELECT q.j FROM ((SELECT 1 AS i, 9 AS z) x JOIN LATERAL (SELECT row_to_json(x) AS j, 1 AS i) y USING (i)) AS q(r)}, "named as a USING's" ],
 	[ q{CREATE TABLE t1 (i integer); CREATE VIEW w AS SELECT q.j FROM ((SELECT 1 AS i, 9 AS z) x CROSS JOIN LATERAL (SELECT row_to_json(x) AS j, 1 AS w) y) AS q(a, b, j, i) JOIN t1 USING (i)}, "named as a USING's" ],
 	[ q{CREATE TABLE t1 (i integer); CREATE TABLE t3 (i integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS i_1, 9 AS z) x, t1 a FULL JOIN t3 c USING (i), t1 d JOIN t3 e USING (i)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa integer); CREATE TABLE t3 (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa integer); CREATE VIEW w AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_1, 9 AS z) x, t1 a FULL JOIN t3 c USING (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa), t1 d JOIN t3 e USING (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (k integer); CREATE VIEW w AS SELECT q.j FROM (((SELECT 1 AS i, 9 AS z) x JOIN LATERAL (SELECT row_to_json(x) AS j, 1 AS i) y USING (i)) CROSS JOIN t1) AS q}, "named as a USING's" ],
+	[ q{CREATE TABLE t1 (i integer); CREATE VIEW w AS SELECT q.j FROM t1 JOIN ((SELECT 1 AS i, 9 AS z) x CROSS JOIN LATERAL (SELECT row_to_json(x) AS j, 1 AS w) y) AS q(a, b, j, i) USING (i)}, "named as a USING's" ],
 	[ q{CREATE TABLE t1 (i integer); CREATE FUNCTION tf() RETURNS SETOF t1 LANGUAGE sql AS 'SELECT 1'; CREATE VIEW w AS SELECT x.o FROM tf() WITH ORDINALITY x(a, o); ALTER TABLE t1 ADD n integer}, 'has changed since' ],
 	[ q{CREATE TABLE t1 (i integer); CREATE FUNCTION tf() RETURNS SETOF t1 LANGUAGE sql AS 'SELECT 1'; CREATE VIEW w AS SELECT x.q FROM ROWS FROM (tf(), generate_series(7, 7)) x(a, q); ALTER TABLE t1 ADD n integer}, 'has changed since' ])
 {
@@ -626,6 +629,7 @@ $node->safe_psql('postgres', q{CREATE SCHEMA kept AUTHORIZATION g_stable; SET RO
 	CREATE VIEW s AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x, (f1 FULL JOIN f2 USING (id)) AS q;
 	CREATE VIEW u AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x, f1 JOIN f2 USING (id);
 	CREATE VIEW y AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id, 9 AS z) x JOIN f1 USING (id);
+	CREATE VIEW y2 AS SELECT row_to_json(x) AS j FROM (SELECT 1 AS id_, 2 AS id_1a, 3 AS id_1_) x, f1 FULL JOIN f2 USING (id), f1 d JOIN f2 e USING (id);
 	CREATE VIEW z AS SELECT q.j FROM ((SELECT 1 AS k, 9 AS z) x CROSS JOIN LATERAL (SELECT row_to_json(x) AS j) y) AS q;
 	CREATE DOMAIN dtwo AS two; CREATE FUNCTION fd() RETURNS dtwo LANGUAGE sql AS 'SELECT ROW(1, 2)::two';
 	CREATE VIEW v AS SELECT x.o FROM fd() WITH ORDINALITY x(a, b, o);

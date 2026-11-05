@@ -2329,6 +2329,25 @@ duplicate_names(List *names)
 }
 
 /*
+ * Whether name is what printing would make of used for a second USING of it, and so what
+ * would be renamed too: used and a number, used cut short if that would be too long.
+ */
+static bool
+is_suffixed_name(const char *name, const char *used)
+{
+	const char *mark = strrchr(name, '_');
+	size_t		base;
+
+	if (mark == NULL || mark[1] == '\0' || strspn(mark + 1, "0123456789") != strlen(mark + 1))
+		return false;
+	base = mark - name;
+	if (strncmp(name, used, base) != 0)
+		return false;
+	return used[base] == '\0' ||
+		(strlen(name) >= NAMEDATALEN - MAX_MULTIBYTE_CHAR_LEN && strlen(used) > base);
+}
+
+/*
  * Whether printing would rename a column of one of these names in query q.  It keeps USING's
  * columns apart from every other in a query if any join there, of no alias, merges one into
  * what is not simply a column of a table, as a FULL JOIN does, or a join of two types.
@@ -2363,17 +2382,9 @@ named_as_a_kept_using(Query *q, List *names)
 		{
 			if (merged++ >= rte->joinmergedcols)
 				break;
-			/* (a second USING of a name is suffixed, and what has that name is renamed too) */
 			foreach_node(String, name, names)
-			{
-				size_t		len = strlen(strVal(used));
-
-				if (strncmp(strVal(used), strVal(name), len) == 0 &&
-					(strVal(name)[len] == '\0' ||
-					 (strVal(name)[len] == '_' && strspn(strVal(name) + len + 1, "0123456789") > 0 &&
-					  strVal(name)[len + 1 + strspn(strVal(name) + len + 1, "0123456789")] == '\0')))
+				if (strcmp(strVal(used), strVal(name)) == 0 || is_suffixed_name(strVal(name), strVal(used)))
 					return true;
-			}
 		}
 	}
 	return false;
