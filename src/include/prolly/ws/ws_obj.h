@@ -16,6 +16,10 @@
  * A trigger, rule or policy is of its table, whose name is in its key, and has no owner
  * or grants of its own, as is a materialized view's index and a view column's default.
  *
+ * A cast is in no schema: it is held if its source, target or function is of this one.
+ * What needs one says so only if by its function, so a cast comes as early as what it
+ * needs lets it, its key sorting before functions'.
+ *
  * What is made before an object is named rather than found by trying, as the order
  * of a restore must not depend on what fails.
  *
@@ -42,6 +46,9 @@
 
 typedef enum WsObjectKind
 {
+	WS_OBJ_CAST,				/* its source type as its name, its target as its args */
+	WS_OBJ_COLLATION,
+	WS_OBJ_CONVERSION,
 	WS_OBJ_DEFAULT,				/* a view column's: its name, and its view */
 	WS_OBJ_DOMAIN,
 	WS_OBJ_FUNCTION,
