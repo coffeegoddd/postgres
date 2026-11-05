@@ -142,6 +142,45 @@ for my $f (@followers)
 	$node->safe_psql('postgres', q{DROP SCHEMA fo1 CASCADE; DROP SCHEMA fo2 CASCADE});
 }
 
+# a USING can only say a name: restored where that is now another column, it says so
+$node->safe_psql('postgres', q{CREATE SCHEMA us1 VERSIONED; ALTER SCHEMA us1 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE us1.a (n integer, w integer); CREATE TABLE us1.b (n integer, x integer); CREATE TABLE us1.c (n integer);
+	CREATE VIEW us1.j AS SELECT a.w FROM us1.a JOIN us1.b USING (n);
+	CREATE VIEW us1.nat AS SELECT w FROM us1.a NATURAL JOIN us1.b;
+	CREATE VIEW us1.three AS SELECT a.w FROM us1.a JOIN us1.b USING (n) JOIN us1.c USING (n);
+	CREATE VIEW us1.inner_q AS SELECT w, (SELECT count(*) FROM us1.b JOIN us1.c USING (n)) AS k FROM us1.a;
+	CREATE VIEW us1.listed AS SELECT x.m FROM us1.a x(m) JOIN us1.b y(m) USING (m);
+	CREATE FUNCTION us1.body() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM us1.a JOIN us1.b USING (n); END;
+	CREATE RULE ru AS ON DELETE TO us1.c DO ALSO DELETE FROM us1.b WHERE n IN (SELECT n FROM us1.a JOIN us1.b b2 USING (n));
+	CREATE POLICY po ON us1.c USING (n IN (SELECT n FROM us1.a JOIN us1.b USING (n)))});
+my $us_tag = $node->safe_psql('postgres', q{SELECT attcoltag FROM pg_attribute WHERE attrelid = 'us1.a'::regclass AND attname = 'n'});
+my %us = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('us1')});
+like($us{$_}, qr/\x01b\x01n/, "$_ holds what its USING merges") for ('view/j', 'view/nat', 'view/three', 'view/inner_q', 'function/body()', 'rule/ru(c)', 'policy/po(c)');
+like($us{'view/three'}, qr/\x01c\x01n/, 'of each table');
+unlike($us{'view/listed'}, qr/\x01a\x01m/, 'but not a name an alias list gave, which is by its place');
+my $us_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('us1')});
+my $us_make = sub {
+	my ($rename) = @_;
+	$node->safe_psql('postgres', q{DROP SCHEMA IF EXISTS us2 CASCADE; CREATE SCHEMA us2 VERSIONED; ALTER SCHEMA us2 OWNER TO g_tags});
+	for my $table ('a', 'b', 'c')
+	{
+		my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('us1', '$table'), 'hex')});
+		$node->safe_psql('postgres', qq{SET ROLE g_tags; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'us2'); SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'us2')});
+	}
+	$node->safe_psql('postgres', "SET ROLE g_tags; $rename") if $rename;
+	return $node->psql('postgres', q{SELECT test_ws_obj_copy('us1', 'us2', 'both', true)});
+};
+my ($rcu, $outu, $erru) = $us_make->('');
+is($rcu, 0, 'restored as it was, it is made');
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('us2')}), $us_held, 'and reads as its commit');
+($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a RENAME COLUMN n TO n2});
+like($erru, qr/its USING says "n" of table "a", and that column is now "n2"/, 'a rename under a USING says so');
+($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a RENAME COLUMN n TO n2; ALTER TABLE us2.a RENAME COLUMN w TO n});
+like($erru, qr/its USING says "n" of table "a", and that column is now "n2"/, 'as does another column taking its name, which would join on that');
+($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a DROP COLUMN n CASCADE});
+like($erru, qr/and that column is gone/, 'and a column gone');
+$node->safe_psql('postgres', q{DROP SCHEMA us1 CASCADE; DROP SCHEMA us2 CASCADE});
+
 # a byte that looks like what marks a tag is only that
 $node->safe_psql('postgres', q{CREATE SCHEMA mk VERSIONED; ALTER SCHEMA mk OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mk.t (a text);
 	CREATE VIEW mk.w AS SELECT E'"\0011\001"'::text AS k, E'\001' AS m, a FROM mk.t});

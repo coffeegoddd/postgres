@@ -9,6 +9,7 @@
  * input types; uvarint ndeps and keys; owner, empty for none; uvarint ncomments and each
  * one's column, empty for none, and text; uvarint ngrants and each one's column, empty
  * for none, grantee, empty for PUBLIC, grant option byte, privileges.
+ * Then uvarint nusings, and each's table, column and tag.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -211,6 +212,20 @@ name_here(const WsObject *o, const char *name)
 		ws_text_from_utf8(name) : ws_name_from_utf8(name);
 }
 
+static int
+using_cmp(const void *a, const void *b)
+{
+	const WsObjectUsing *x = a;
+	const WsObjectUsing *y = b;
+	int			c = strcmp(x->table, y->table);
+
+	if (c == 0)
+		c = strcmp(x->column, y->column);
+	if (c == 0)
+		c = x->tag < y->tag ? -1 : x->tag > y->tag ? 1 : 0;
+	return c;
+}
+
 /* (order: none first, then by name) */
 static int
 opt_cmp(const char *a, const char *b)
@@ -266,6 +281,13 @@ ws_obj_problem(const WsObject *o)
 		return "something of operators with grants, or with no types or method";
 	if ((o->kind == WS_OBJ_OPLINK || o->kind == WS_OBJ_OPMEMBERS) && (o->owner != NULL || o->ncomments > 0))
 		return "what comes after an operator or family, with an owner or comments of its own";
+	for (int i = 0; i < o->nusings; i++)
+	{
+		if (bad_name(o->usings[i].table) || bad_name(o->usings[i].column) || o->usings[i].tag == 0)
+			return "a USING of no table, column or tag";
+		if (i > 0 && using_cmp(&o->usings[i - 1], &o->usings[i]) >= 0)
+			return "USINGs out of order";
+	}
 	if (o->kind == WS_OBJ_CAST && (o->owner != NULL || o->ngrants > 0 || o->args == NULL || o->args[0] == '\0'))
 		return "a cast with no target, or with an owner or grants of its own";
 	if ((o->after_tables || o->public_revoked) && !is_function(o->kind))
@@ -399,6 +421,13 @@ obj_encode_value(const WsObject *o, Buf *out)
 		put_string(out, o->grants[i].grantee);
 		buf_append_byte(out, o->grants[i].grant_option ? 1 : 0);
 		put_string(out, o->grants[i].privileges);
+	}
+	buf_append_uvarint(out, (uint64) o->nusings);
+	for (int i = 0; i < o->nusings; i++)
+	{
+		put_string(out, o->usings[i].table);
+		put_string(out, o->usings[i].column);
+		buf_append_uvarint(out, o->usings[i].tag);
 	}
 }
 
@@ -541,6 +570,15 @@ obj_decode(const uint8 *key, size_t klen, const uint8 *val, size_t vlen, WsObjec
 		g->grant_option = *p++ == 1;
 		g->privileges = get_string(&p, end, false);
 	}
+	o->nusings = get_count(&p, end, 3);
+	o->usings = zeroed(o->nusings, sizeof(WsObjectUsing));
+	for (int i = 0; i < o->nusings; i++)
+	{
+		o->usings[i].table = get_string(&p, end, false);
+		o->usings[i].column = get_string(&p, end, false);
+		if (!ws_read_canonical_uvarint(&p, end, &o->usings[i].tag))
+			malformed("a USING's tag cut short");
+	}
 	if (p != end)
 		malformed("it has bytes left over");
 	problem = ws_obj_problem(o);
@@ -564,6 +602,12 @@ ws_obj_free(WsObject *o)
 	px_free(o->owned_column);
 	px_free(o->definition);
 	px_free(o->owner);
+	for (int i = 0; i < o->nusings; i++)
+	{
+		px_free(o->usings[i].table);
+		px_free(o->usings[i].column);
+	}
+	px_free(o->usings);
 	for (int i = 0; i < o->ndeps; i++)
 		px_free(o->deps[i]);
 	px_free(o->deps);
@@ -1489,6 +1533,183 @@ method_key(bool is_class, Oid oid, Buf *key)
 			   ws_name_to_utf8(ws_sql_value(&rows, 0, 1)), key);
 	ws_sql_rows_free(&rows);
 	pfree(text);
+}
+
+/* ------------------------------------- what a USING merges */
+
+typedef struct UsingWalk
+{
+	Oid			nspoid;
+	List	   *found;			/* of WsObjectUsing * */
+} UsingWalk;
+
+/* The column of a table that a column of a range table entry simply is, or false. */
+static bool
+base_column(Query *q, int rtindex, AttrNumber attno, Oid *relid, AttrNumber *column)
+{
+	RangeTblEntry *rte = rt_fetch(rtindex, q->rtable);
+
+	while (rte->rtekind == RTE_JOIN)
+	{
+		Var		   *var;
+
+		if (attno < 1 || attno > list_length(rte->joinaliasvars))
+			return false;
+		var = (Var *) list_nth(rte->joinaliasvars, attno - 1);
+		if (var == NULL || !IsA(var, Var) || var->varlevelsup != 0)
+			return false;
+		rte = rt_fetch(var->varno, q->rtable);
+		attno = var->varattno;
+	}
+	if (rte->rtekind != RTE_RELATION || attno < 1)
+		return false;
+	*relid = rte->relid;
+	*column = attno;
+	return true;
+}
+
+static int
+join_input_rtindex(Node *node)
+{
+	if (IsA(node, RangeTblRef))
+		return ((RangeTblRef *) node)->rtindex;
+	return ((JoinExpr *) node)->rtindex;
+}
+
+static void
+add_using(UsingWalk *w, Query *q, int rtindex, AttrNumber attno, const char *name)
+{
+	Oid			relid;
+	AttrNumber	column;
+	HeapTuple	tup;
+	uint64		tag;
+	bool		same;
+
+	if (!base_column(q, rtindex, attno, &relid, &column) || get_rel_namespace(relid) != w->nspoid)
+		return;
+	tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(column));
+	if (!HeapTupleIsValid(tup))
+		return;
+	tag = (uint64) ((Form_pg_attribute) GETSTRUCT(tup))->attcoltag;
+	/* (an alias list's name is by its place, which follows a rename) */
+	same = strcmp(NameStr(((Form_pg_attribute) GETSTRUCT(tup))->attname), name) == 0;
+	ReleaseSysCache(tup);
+	if (tag != 0 && same)
+	{
+		WsObjectUsing *u = palloc0_object(WsObjectUsing);
+
+		u->table = get_rel_name(relid);
+		u->column = pstrdup(name);
+		u->tag = tag;
+		w->found = lappend(w->found, u);
+	}
+}
+
+static void
+usings_of_jointree(UsingWalk *w, Query *q, Node *node)
+{
+	if (node == NULL)
+		return;
+	if (IsA(node, FromExpr))
+	{
+		foreach_ptr(Node, item, ((FromExpr *) node)->fromlist)
+			usings_of_jointree(w, q, item);
+	}
+	else if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) node;
+		RangeTblEntry *rte = rt_fetch(j->rtindex, q->rtable);
+
+		for (int i = 0; i < rte->joinmergedcols; i++)
+		{
+			const char *name = strVal(list_nth(rte->eref->colnames, i));
+
+			add_using(w, q, join_input_rtindex(j->larg), list_nth_int(rte->joinleftcols, i), name);
+			add_using(w, q, join_input_rtindex(j->rarg), list_nth_int(rte->joinrightcols, i), name);
+		}
+		usings_of_jointree(w, q, j->larg);
+		usings_of_jointree(w, q, j->rarg);
+	}
+}
+
+static bool
+usings_walker(Node *node, void *arg)
+{
+	UsingWalk  *w = arg;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		usings_of_jointree(w, (Query *) node, (Node *) ((Query *) node)->jointree);
+		return query_tree_walker((Query *) node, usings_walker, arg, 0);
+	}
+	return expression_tree_walker(node, usings_walker, arg);
+}
+
+/* What an object's stored trees (sql, of its oid, a row each) merge by USING, held in order. */
+static void
+read_usings(WsObject *o, const char *schema, const char *oid, const char *sql)
+{
+	const char *params[1] = {oid};
+	WsSqlRows	rows;
+	UsingWalk	w = {get_namespace_oid(schema, false), NIL};
+	WsObjectUsing *sorted;
+	int			n;
+	int			kept = 0;
+
+	WsSql->read(sql, 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		if (ws_sql_value(&rows, i, 0) != NULL)
+			usings_walker(stringToNode(ws_sql_value(&rows, i, 0)), &w);
+	ws_sql_rows_free(&rows);
+	n = list_length(w.found);
+	if (n == 0)
+		return;
+	sorted = palloc_array(WsObjectUsing, n);
+	for (int i = 0; i < n; i++)
+	{
+		WsObjectUsing *u = list_nth(w.found, i);
+
+		sorted[i].table = ws_name_to_utf8(u->table);
+		sorted[i].column = ws_name_to_utf8(u->column);
+		sorted[i].tag = u->tag;
+	}
+	qsort(sorted, n, sizeof(WsObjectUsing), using_cmp);
+	o->usings = zeroed(n, sizeof(WsObjectUsing));
+	for (int i = 0; i < n; i++)
+		if (i == 0 || using_cmp(&sorted[i - 1], &sorted[i]) != 0)
+			o->usings[kept++] = sorted[i];
+	o->nusings = kept;
+}
+
+/* Refuses to make an object whose USING's name is not the column it meant, where it arrives. */
+static void
+check_usings(const WsObject *o, const char *schema)
+{
+	for (int i = 0; i < o->nusings; i++)
+	{
+		const WsObjectUsing *u = &o->usings[i];
+		char	   *table = ws_name_from_utf8(u->table);
+		char	   *meant = ws_name_from_utf8(u->column);
+		char	   *tag = psprintf(INT64_FORMAT, (int64) u->tag);
+		const char *params[3] = {schema, table, tag};
+		WsSqlRows	rows;
+
+		WsSql->read("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+					"WHERE n.nspname = $1::name AND c.relname = $2::name AND a.attcoltag = $3::bigint AND NOT a.attisdropped", 3, params, &rows);
+		if (rows.nrows != 1 || strcmp(ws_sql_value(&rows, 0, 0), meant) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("\"%s\" in schema \"%s\" cannot be made: its USING says \"%s\" of table \"%s\", and that column is %s",
+							o->name, schema, meant, table,
+							rows.nrows == 1 ? psprintf("now \"%s\"", ws_sql_value(&rows, 0, 0)) : "gone"),
+					 errhint("A USING cannot follow a rename. Rename the column back, or make the object again.")));
+		ws_sql_rows_free(&rows);
+		pfree(table);
+		pfree(meant);
+		pfree(tag);
+	}
 }
 
 /*
@@ -3761,6 +3982,10 @@ read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 		if ((kind == WS_OBJ_TRIGGER || kind == WS_OBJ_RULE) && ws_sql_value(&rows, i, 5)[0] != 'O')
 			o->fires = ws_sql_value(&rows, i, 5)[0];
 		read_deps(o, schema, oid, source);
+		if (kind == WS_OBJ_RULE)
+			read_usings(o, schema, oid, "SELECT ev_action::text FROM pg_rewrite WHERE oid = $1::oid UNION ALL SELECT ev_qual::text FROM pg_rewrite WHERE oid = $1::oid");
+		else if (kind == WS_OBJ_POLICY)
+			read_usings(o, schema, oid, "SELECT polqual::text FROM pg_policy WHERE oid = $1::oid UNION ALL SELECT polwithcheck::text FROM pg_policy WHERE oid = $1::oid");
 		if (relkind == RELKIND_VIEW || relkind == RELKIND_MATVIEW)
 			add_need(o, relkind == RELKIND_VIEW ? WS_OBJ_VIEW : WS_OBJ_MATVIEW, o->args);
 		WsSql->read(comments, 1, self, &said);
@@ -4081,6 +4306,7 @@ read_functions(const char *schema, WsObject *objs, int *n)
 									  "UNION SELECT a.aggtranstype::text FROM pg_aggregate a WHERE a.aggfnoid = $1::oid AND a.agginitval IS NOT NULL "
 									  "UNION SELECT a.aggmtranstype::text FROM pg_aggregate a WHERE a.aggfnoid = $1::oid AND a.aggminitval IS NOT NULL");
 		read_deps(o, schema, oid, "SELECT 'pg_proc'::regclass::oid, $1::oid");
+		read_usings(o, schema, oid, "SELECT prosqlbody::text FROM pg_proc WHERE oid = $1::oid");
 
 		/* (it needs a table if a body or a type of it does) */
 		WsSql->read("SELECT 1 FROM pg_depend d LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
@@ -4318,6 +4544,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 									  "SELECT d.refobjid::text FROM pg_rewrite r JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass "
 									  "AND d.objid = r.oid WHERE r.ev_class = $1::oid AND r.rulename = '_RETURN' AND d.deptype = 'n' AND d.refclassid = 'pg_type'::regclass");
 		read_deps(o, schema, oid, "SELECT 'pg_rewrite'::regclass::oid, oid FROM pg_rewrite WHERE ev_class = $1::oid AND rulename = '_RETURN'");
+		read_usings(o, schema, oid, "SELECT ev_action::text FROM pg_rewrite WHERE ev_class = $1::oid AND rulename = '_RETURN'");
 		read_comments(o, oid);
 		read_owner_and_grants(o, oid, name, true);
 	}
@@ -5230,6 +5457,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 
 		if (ws_obj_before_tables(&objs[order[i]]) != before_tables)
 			continue;
+		check_usings(&objs[order[i]], schema);
 		ws_obj_create_statement(&objs[order[i]], schema, &sql);
 		run_statement(&sql);
 	}
