@@ -14,9 +14,11 @@
  * would be one row, so they are refused.
  *
  * Restore writes the rows as held: it computes no stored generated column, fires
- * no trigger and checks no domain, however deep in a value, as version control runs
- * no user code; other rows' keys it does check, deferrable or not, as what is written
- * is all of a state.  So only a table's owner may, in a transaction that can
+ * no trigger and reading a value checks no domain, however deep in it.  An index
+ * already on the table is kept up, which runs what it is made of, so whoever wants
+ * none of a table's code run makes its indexes after, which run it then.  It does
+ * check other rows' keys, deferrable or not, as what is written is all of a state.
+ * So only a table's owner may, in a transaction that can
  * write, and a partition's rows go in before it is attached, whose check of its bound
  * then stands behind them; unless the table's own checks imply its bound, as ATTACH
  * then scans nothing, so whatever makes rows from two sides must see to that.

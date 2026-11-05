@@ -323,7 +323,6 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 	level = WsSql->begin();
 	if (prolly_iter_open(ctx, map, NULL, 0, &it) < 0)
 		prolly_report(ctx);
-	domain_checks_suspended = true;
 	PG_TRY();
 	{
 		while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
@@ -340,6 +339,9 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 				count = keyless_count(k, kl, v, vl);
 			ExecClearTuple(slot);
 			memset(slot->tts_isnull, true, desc->natts * sizeof(bool));
+
+			/* (the values' own only: an index's functions may rely on a domain) */
+			domain_checks_suspended = true;
 			for (int i = 0; i < shape.nstored; i++)
 				if (!f[i].null)
 				{
@@ -350,6 +352,7 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 															  cols[i].ioparam, cols[i].typmod);
 					slot->tts_isnull[att] = false;
 				}
+			domain_checks_suspended = false;
 			ExecStoreVirtualTuple(slot);
 			MemoryContextSwitchTo(old);
 			for (uint64 i = 0; i < count; i++)

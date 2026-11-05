@@ -1209,7 +1209,82 @@ ENGINE_TEST(test_short_value_refused)
 	cs_destroy(cs);
 }
 
+/* Keys so long that few fit a node, built and edited, stay a tree that reads. */
+ENGINE_TEST(test_long_keys)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	static const size_t lengths[] = {2500, 20000};
+
+	for (size_t l = 0; l < lengthof(lengths); l++)
+	{
+		size_t		klen = lengths[l];
+		int			n = 300;
+		uint8	   *keys = palloc0((size_t) n * klen);
+		ProllyKV   *kvs = palloc_array(ProllyKV, n);
+		PHash		built,
+					edited,
+					empty;
+		uint64		count;
+		int			height;
+
+		for (int i = 0; i < n; i++)
+		{
+			uint32		seed = (uint32) i + 1;
+
+			/* (in order by their first bytes; each's rest its own) */
+			keys[(size_t) i * klen] = (uint8) (i >> 8);
+			keys[(size_t) i * klen + 1] = (uint8) i;
+			for (size_t b = 2; b < klen; b++)
+			{
+				seed = seed * 2654435761U + 1;
+				keys[(size_t) i * klen + b] = (uint8) (seed >> 24);
+			}
+			kvs[i].key = keys + (size_t) i * klen;
+			kvs[i].klen = klen;
+			kvs[i].val = (const uint8 *) "v";
+			kvs[i].vlen = 1;
+		}
+		CHECK_OK(prolly_build(&ctx, 0, kvs, n, &built));
+		CHECK_OK(prolly_height(&ctx, &built, &height));
+		CHECK(height <= 8);
+		CHECK_OK(prolly_count(&ctx, &built, &count));
+		CHECK_EQ(count, n);
+		for (int i = 0; i < n; i += 37)
+		{
+			const uint8 *v;
+			size_t		vl;
+
+			CHECK_OK(prolly_get(&ctx, &built, kvs[i].key, klen, &v, &vl));
+			CHECK(vl == 1 && v[0] == 'v');
+		}
+
+		/* one set of entries is one tree, however it came to be */
+		CHECK_OK(prolly_empty(&ctx, 0, &empty));
+		edited = empty;
+		for (int at = 0; at < n; at += 50)
+		{
+			int			m = Min(50, n - at);
+			ProllyEdit *edits = palloc0_array(ProllyEdit, m);
+
+			for (int i = 0; i < m; i++)
+			{
+				edits[i].key = kvs[at + i].key;
+				edits[i].klen = klen;
+				edits[i].val = kvs[at + i].val;
+				edits[i].vlen = 1;
+			}
+			CHECK_OK(prolly_apply(&ctx, &edited, edits, m, &edited));
+			pfree(edits);
+		}
+		CHECK(phash_eq(&built, &edited));
+		pfree(keys);
+		pfree(kvs);
+	}
+}
+
 static const ProllyUnitTest tests[] = {
+	{"long_keys", test_long_keys},
 	{"sha256_vectors", test_sha256_vectors},
 	{"empty_map", test_empty_map},
 	{"random_edits_small_chunks", test_random_edits_small_chunks},

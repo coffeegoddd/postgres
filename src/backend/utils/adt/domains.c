@@ -44,7 +44,7 @@ static bool domain_check_internal(Datum value, bool isnull, Oid domainType,
 								  void **extra, MemoryContext mcxt,
 								  Node *escontext);
 
-/* Set while values are written as a commit holds them, which runs no user code. */
+/* Set while a commit's values are read in, as held: nothing else may rely on it. */
 bool		domain_checks_suspended = false;
 
 /*

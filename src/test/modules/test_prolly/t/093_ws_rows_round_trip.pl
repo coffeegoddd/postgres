@@ -103,7 +103,7 @@ $node->safe_psql('postgres', q{
 	CREATE TABLE s.typed (id integer PRIMARY KEY, m money, e s.en, z double precision);
 	INSERT INTO s.typed VALUES (1, 12.5, 'b', '-0')});
 is($node->safe_psql('postgres', q{SET extra_float_digits = 0; SELECT test_ws_rows_hash('s', 'typed')}),
-	hash_of('s', 'typed'), 'money, an enum and -0 are one map under other settings');
+	hash_of('s', 'typed'), '-0, with money and an enum, is one map under other float digits');
 copy_table('typed');
 is($node->safe_psql('postgres', q{SELECT id, m, e::text, z::text FROM d.typed}), '1|$12.50|b|-0', 'and restored as they were');
 
@@ -170,8 +170,37 @@ $node->safe_psql('postgres', q{
 	INSERT INTO s.deep VALUES (1, '{5}', ROW(5), '[1,5)')});
 copy_table('deep');
 is($node->safe_psql('postgres', q{SELECT a, c, r FROM d.deep}), '{5}|(5)|[1,5)', 'no domain checked in an array, composite or range');
-($rc, $out, $err) = $node->psql('postgres', q{SELECT ARRAY[5]::d.pos[]});
-like($err, qr/violates check constraint/, 'and checks are back once restored');
+# in one session, after a restore, and after one that failed reading a value in
+$node->safe_psql('postgres', q{CREATE TABLE s.badval (id integer PRIMARY KEY, x text); INSERT INTO s.badval VALUES (1, 'abc')});
+make_table('badval');
+$node->safe_psql('postgres', q{ALTER TABLE d.badval ALTER COLUMN x TYPE integer USING 0; TRUNCATE d.badval});
+$node->safe_psql('postgres', q{CREATE TABLE s.okval (id integer PRIMARY KEY); INSERT INTO s.okval VALUES (1)});
+make_table('okval');
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_rows_copy('s', 'okval', 'd'); SELECT '{5}'::d.pos[]});
+like($err, qr/violates check constraint/, 'checks are back after a restore, in its session');
+($rc, $out, $err) = $node->psql('postgres', q{
+	DO $$ BEGIN PERFORM test_ws_rows_copy('s', 'badval', 'd'); RAISE 'it read'; EXCEPTION WHEN invalid_text_representation THEN NULL; END $$;
+	SELECT '{5}'::d.pos[]});
+like($err, qr/violates check constraint/, 'and after one that failed reading a value');
+unlike($err, qr/it read/, 'which did fail');
+
+# an index's functions see a domain's checks as they always do, though what is read in does not
+$node->safe_psql('postgres', q{
+	CREATE DOMAIN s.ip AS integer CHECK (VALUE > 0);
+	CREATE FUNCTION s.safe(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $$
+	BEGIN RETURN (('{' || $1 || '}')::s.ip[])[1]; EXCEPTION WHEN check_violation THEN RETURN 0; END $$;
+	CREATE TABLE s.ixf (id integer PRIMARY KEY, x integer);
+	INSERT INTO s.ixf VALUES (1, -5)});
+make_table('ixf');
+$node->safe_psql('postgres', q{CREATE INDEX ixf_safe ON d.ixf (s.safe(x)); SELECT test_ws_rows_copy('s', 'ixf', 'd')});
+is($node->safe_psql('postgres', q{SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT id FROM d.ixf WHERE s.safe(x) = 0}), '1', 'an index expression relying on a domain indexes what it should');
+
+# keys long enough that few fit a node: a tree of them is still one that reads
+$node->safe_psql('postgres', q{
+	CREATE TABLE s.lk (k text PRIMARY KEY, v integer);
+	INSERT INTO s.lk SELECT (SELECT string_agg(md5(i::text || g::text), '') FROM generate_series(1, 78) g), i FROM generate_series(1, 500) i});
+copy_table('lk');
+same_rows('lk', 'v', 'long keys');
 
 # a key's rows while a deferrable key lets two be: refused, not one row of two
 $node->safe_psql('postgres', q{
