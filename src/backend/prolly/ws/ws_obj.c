@@ -2480,7 +2480,7 @@ read_operators(const char *schema, WsObject *objs, int *n)
 		if (ws_sql_value(&rows, i, 8)[0] == 't')
 			appendStringInfoString(&s, ", MERGES");
 		appendStringInfoChar(&s, ')');
-		check_of_table_is_portable(name, schema, psprintf("CREATE OPERATOR %s %s", name, s.data));
+		/* (its types are its function's, and a function that must name one is refused) */
 		o->kind = WS_OBJ_OPERATOR;
 		o->name = ws_name_to_utf8(name);
 		o->args = ws_text_to_utf8(args);
@@ -2772,18 +2772,6 @@ check_of_table_is_portable(const char *name, const char *schema, const char *sql
 	else if (IsA(node, CreatePolicyStmt))
 		named = names_schema_walker(((CreatePolicyStmt *) node)->qual, &n) ||
 			names_schema_walker(((CreatePolicyStmt *) node)->with_check, &n);
-	else if (IsA(node, DefineStmt))
-	{
-		ListCell   *lc;
-
-		/* (HASHES and MERGES have no argument) */
-		foreach(lc, ((DefineStmt *) node)->definition)
-		{
-			Node	   *arg = lfirst_node(DefElem, lc)->arg;
-
-			named |= arg != NULL && IsA(arg, TypeName) && names_schema_walker(arg, &n);
-		}
-	}
 	else if (IsA(node, CreateOpClassStmt) || IsA(node, AlterOpFamilyStmt))
 	{
 		List	   *items = IsA(node, CreateOpClassStmt) ? ((CreateOpClassStmt *) node)->items : ((AlterOpFamilyStmt *) node)->items;
