@@ -761,6 +761,10 @@ CREATE FUNCTION test_ws_root_restore(root text, dest text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_ws_root_restore_after(root text, previous text, dest text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_ws_root_refused(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

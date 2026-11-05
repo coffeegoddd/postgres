@@ -1820,7 +1820,7 @@ check_usings(const WsObject *o, const char *schema)
 		const char *params[3] = {schema, table, tag};
 		WsSqlRows	rows;
 
-		WsSql->read("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+		WsSql->run("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
 					"WHERE n.nspname = $1::name AND c.relname = $2::name AND a.attcoltag = $3::bigint AND NOT a.attisdropped", 3, params, &rows);
 		if (rows.nrows != 1 || strcmp(ws_sql_value(&rows, 0, 0), meant) != 0)
 			ereport(ERROR,

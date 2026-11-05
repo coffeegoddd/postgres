@@ -12,6 +12,8 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_authid_d.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "prolly/ws/ws_fk.h"
@@ -23,6 +25,7 @@
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 
 /* ---------------------------------------------------------------- capture */
 
@@ -58,6 +61,8 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	tables;
+	WsSqlRows	viewed;
+	int			level = WsSql->begin();
 	PHash		rv = vc_root_empty(ctx);
 	WsObject   *objs;
 	int			nobjs;
@@ -69,9 +74,21 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 	int			nroles = 0;
 	PHash		map;
 
-	WsSql->read("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-				"WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') ORDER BY c.relname COLLATE \"C\"",
-				1, params, &tables);
+	/* (run, not read: a statement may have made these, and it sees what that did) */
+	WsSql->run("SELECT c.relname::text, a.attname::text, r.relname::text FROM pg_class c "
+			   "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid "
+			   "JOIN pg_type t ON t.oid = a.atttypid JOIN pg_class r ON r.oid = t.typrelid "
+			   "WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') AND NOT a.attisdropped AND r.relkind IN ('v', 'm') "
+			   "LIMIT 1", 1, params, &viewed);
+	if (viewed.nrows > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("column \"%s\" of table \"%s\" in schema \"%s\" cannot be held in a commit: its type is the row of view \"%s\", which is made after tables",
+						ws_sql_value(&viewed, 0, 1), ws_sql_value(&viewed, 0, 0), schema, ws_sql_value(&viewed, 0, 2))));
+	ws_sql_rows_free(&viewed);
+	WsSql->run("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p') ORDER BY c.relname COLLATE \"C\"",
+			   1, params, &tables);
 	for (int i = 0; i < tables.nrows; i++)
 	{
 		const char *table = ws_sql_value(&tables, i, 0);
@@ -125,10 +142,14 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		WsRole	   *held;
 		int			nheld;
 
+		/* (as a commit holds them, and it reads them by this database's names) */
+		for (int i = 0; i < nroles; i++)
+			roles[i] = ws_name_from_utf8(roles[i]);
 		ws_role_read((const char *const *) roles, nroles, &held, &nheld);
 		ws_role_map(ctx, held, nheld, &map);
 		WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
 	}
+	WsSql->end(level);
 	*root = rv;
 }
 
@@ -182,6 +203,36 @@ table_index(const TableOrder *o, const char *name)
 			 errmsg("a table of this root's names table \"%s\", which it does not hold", name)));
 }
 
+/* The table a column's type is the row of, or an array of, if any. */
+static int
+table_named_by_type(const TableOrder *o, const char *type)
+{
+	char	   *name = pstrdup(type);
+	char	   *cut = strchr(name, '[');
+	int			found = -1;
+
+	if (cut != NULL)
+		*cut = '\0';
+	if (name[0] == '"' && name[strlen(name) - 1] == '"')
+	{
+		char	   *to = name;
+
+		name[strlen(name) - 1] = '\0';
+		for (const char *p = name + 1; *p != '\0'; p++)
+		{
+			*to++ = *p;
+			if (p[0] == '"' && p[1] == '"')
+				p++;
+		}
+		*to = '\0';
+	}
+	for (int i = 0; found < 0 && i < o->nnames; i++)
+		if (strcmp(o->names[i], name) == 0)
+			found = i;
+	pfree(name);
+	return found;
+}
+
 static void
 place_table(TableOrder *o, int i, int depth)
 {
@@ -197,6 +248,15 @@ place_table(TableOrder *o, int i, int depth)
 		place_table(o, table_index(o, rec->partition_of), depth + 1);
 	for (int p = 0; p < rec->ninherits; p++)
 		place_table(o, table_index(o, rec->inherits[p]), depth + 1);
+
+	/* (a column of another table's row type: it has to be there) */
+	for (int c = 0; c < rec->ncols; c++)
+	{
+		int			of = table_named_by_type(o, rec->cols[c].type);
+
+		if (of >= 0 && of != i)
+			place_table(o, of, depth + 1);
+	}
 	o->placed[i] = true;
 	o->order[o->n++] = i;
 }
@@ -289,10 +349,21 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 	int			nobjs = 0;
 	Buf			sql = BUF_INIT;
 
-	WsSql->read("SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-				"WHERE n.nspname = $1::name) + (SELECT count(*) FROM pg_type t JOIN pg_namespace n "
-				"ON n.oid = t.typnamespace WHERE n.nspname = $1::name) + (SELECT count(*) FROM pg_proc p "
-				"JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1::name)", 1, params, &rows);
+	WsSql->run("SELECT (SELECT count(*) FROM pg_namespace n, LATERAL (" \
+			   "SELECT 1 FROM pg_class WHERE relnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_type WHERE typnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_proc WHERE pronamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_collation WHERE collnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_conversion WHERE connamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_operator WHERE oprnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_opclass WHERE opcnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_opfamily WHERE opfnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_statistic_ext WHERE stxnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_ts_config WHERE cfgnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_ts_dict WHERE dictnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_ts_parser WHERE prsnamespace = n.oid UNION ALL " \
+			   "SELECT 1 FROM pg_ts_template WHERE tmplnamespace = n.oid) x WHERE n.nspname = $1::name)",
+			   1, params, &rows);
 	if (strcmp(ws_sql_value(&rows, 0, 0), "0") != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_SCHEMA),
@@ -309,7 +380,24 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 
 		ws_role_list(ctx, &map, &held, &nheld);
 		if (previous != NULL && WsRoot->get_map(ctx, previous, WS_ROOT_ROLES, &before))
-			ws_role_list(ctx, &before, &was, &nwas);
+		{
+			/*
+			 * A role this root does not name is one it no longer uses, not one a
+			 * commit took a membership from: only roles it holds can have lost one.
+			 */
+			WsRole	   *all;
+			int			nall;
+
+			ws_role_list(ctx, &before, &all, &nall);
+			was = palloc_array(WsRole, Max(nall, 1));
+			for (int i = 0; i < nall; i++)
+				for (int k = 0; k < nheld; k++)
+					if (strcmp(all[i].name, held[k].name) == 0)
+					{
+						was[nwas++] = all[i];
+						break;
+					}
+		}
 		ws_role_check_arrival(held, nheld, was, nwas);
 		ws_role_restore(held, nheld, was, nwas);
 	}
@@ -427,16 +515,60 @@ typedef struct DryRun
 	bool		went_through;
 } DryRun;
 
+/*
+ * A schema for a dry run, which whoever merges has no need of the right to make: made as
+ * the superuser, for it to own, all may use it, as a root's owners must, and nothing
+ * else is done as that.  It goes when the run does.
+ */
+static char *
+make_dry_run_schema(void)
+{
+	Oid			user;
+	int			context;
+	Oid			me = GetUserId();
+	WsSqlRows	rows;
+	char	   *schema = NULL;
+	StringInfoData sql;
+
+	for (int i = 0; schema == NULL; i++)
+	{
+		schema = psprintf("ws_dry_run_%d_%d", MyProcPid, i);
+		if (OidIsValid(get_namespace_oid(schema, true)))
+			schema = NULL;
+	}
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "CREATE SCHEMA %s VERSIONED", quote_identifier(schema));
+	GetUserIdAndSecContext(&user, &context);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, context | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		WsSql->run(sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		resetStringInfo(&sql);
+		appendStringInfo(&sql, "ALTER SCHEMA %s OWNER TO %s", quote_identifier(schema),
+						 quote_identifier(GetUserNameFromId(me, false)));
+		WsSql->run(sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		resetStringInfo(&sql);
+		appendStringInfo(&sql, "GRANT ALL ON SCHEMA %s TO PUBLIC", quote_identifier(schema));
+		WsSql->run(sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, context);
+	}
+	PG_END_TRY();
+	pfree(sql.data);
+	return schema;
+}
+
 static void
 dry_run(void *arg)
 {
 	DryRun	   *d = arg;
-	char	   *schema = psprintf("ws_dry_run_%d", MyProcPid);
-	char	   *sql = psprintf("CREATE SCHEMA %s VERSIONED", quote_identifier(schema));
-	WsSqlRows	rows;
+	char	   *schema = make_dry_run_schema();
 
-	WsSql->run(sql, 0, NULL, &rows);
-	ws_sql_rows_free(&rows);
 	WsRootIO->restore(d->ctx, d->root, NULL, schema);
 	d->went_through = true;
 
@@ -450,8 +582,33 @@ bool
 ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
 {
 	DryRun		d = {ctx, root, false};
+	MemoryContext cxt = CurrentMemoryContext;
 
-	(void) WsSql->attempt_fn(dry_run, &d, failure);
+	PG_TRY();
+	{
+		(void) WsSql->attempt_fn(dry_run, &d, failure);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+
+		/*
+		 * What a merge made naming what it no longer has: a view of a column
+		 * dropped, a function of a type dropped.  It is the merge's to say.  (Its
+		 * subtransaction is gone already, as attempt_fn raises only after that.)
+		 */
+		if (edata->sqlerrcode != ERRCODE_DATA_CORRUPTED)
+			PG_RE_THROW();
+		FlushErrorState();
+		memset(failure, 0, sizeof(*failure));
+		memcpy(failure->sqlstate, unpack_sql_state(edata->sqlerrcode), 6);
+		failure->message = edata->message != NULL ? pstrdup(edata->message) : NULL;
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
 	if (d.went_through)
 	{
 		ws_sql_failure_free(failure);

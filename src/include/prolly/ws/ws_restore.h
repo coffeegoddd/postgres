@@ -5,7 +5,10 @@
  *
  * Capture holds all a schema has: its tables' records and rows, its objects, foreign
  * keys, sequences' positions, and the roles what it has names.  A caller wanting one
- * point in time is in REPEATABLE READ, as each read of the catalogs says.
+ * point in time is in REPEATABLE READ, as each read of the catalogs says.  It marks no
+ * role: whoever commits does that (ws_role_mark), and a root naming one unmarked is
+ * refused in restoring it here.  A column of a view's row type is refused, as views
+ * are made after tables.
  *
  * Restore makes all of it in a schema with nothing in it, in the one order each part
  * needs: the roles; the objects tables use; each table with its tags, then its rows,
@@ -19,7 +22,8 @@
  *
  * Whether Postgres would have a root at all is more than anything can say of it but
  * Postgres: ws_root_refused restores it and rolls that back.  It is what a merge's
- * result has to pass, and what it refuses is its conflict.
+ * result has to pass, and what it refuses is its conflict.  It needs no right to
+ * make schemas, and is refused what the role running it could not do of a real one.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *

@@ -46,6 +46,13 @@ my $everything = q{
 	CREATE TABLE mutual_b (id integer PRIMARY KEY, a integer REFERENCES mutual_a (id));
 	ALTER TABLE mutual_a ADD FOREIGN KEY (b) REFERENCES mutual_b (id);
 
+	CREATE VIEW v_using AS SELECT a.id, a.note FROM child_t a JOIN child_t b USING (id);
+	CREATE VIEW v_natural AS SELECT * FROM mutual_a NATURAL JOIN mutual_a m2;
+	CREATE FUNCTION f_using() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM child_t a JOIN child_t b USING (id); END;
+	CREATE TABLE z_row (x integer);
+	CREATE TABLE a_row_user (y z_row, ys z_row[]);
+	INSERT INTO z_row VALUES (1); INSERT INTO a_row_user VALUES (ROW(1), ARRAY[ROW(2)::z_row]);
+
 	CREATE TABLE keyless (a integer, b text);
 	INSERT INTO keyless VALUES (1, 'x'), (1, 'x'), (NULL, NULL);
 	CREATE TABLE ident (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, x text);
@@ -131,6 +138,53 @@ like($err, qr/duplicate key/, 'its key holds across partitions');
 	SELECT test_ws_root_restore(:'r', 'd')});
 like($err, qr/schema "d" holds something/, 'a schema holding something is refused');
 
+# anything in the schema: a collation holds no relation, type or function
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE SCHEMA c1 VERSIONED; CREATE SCHEMA c2 VERSIONED;
+	CREATE COLLATION c2.held (LOCALE = 'C');
+	SELECT test_ws_root_capture('c1') AS r \gset
+	SELECT test_ws_root_restore(:'r', 'c2')});
+like($err, qr/schema "c2" holds something/, 'a collation is something');
+
+# all in one statement: capture sees what a restore in it made, and names only what it holds
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE SCHEMA st1 VERSIONED; CREATE SCHEMA st2 VERSIONED;
+	CREATE TABLE st1.t (a integer); INSERT INTO st1.t VALUES (1);
+	SELECT test_ws_root_capture('st1') AS r \gset
+	WITH done AS (SELECT test_ws_root_restore(:'r', 'st2'))
+	SELECT (SELECT count(*) FROM done), test_ws_root_capture('st2') = :'r';
+});
+is($rc, 0, 'a restore and capture in one statement runs') or diag($err);
+like($out, qr/^1\|t$/m, 'and captures as what was restored');
+
+# a column of a view's row type cannot be restored, so is not held
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE SCHEMA vr VERSIONED;
+	CREATE TABLE vr.t (a integer);
+	CREATE VIEW vr.vv AS SELECT a FROM vr.t;
+	CREATE TABLE vr.u (x vr.vv);
+	SELECT test_ws_root_capture('vr')});
+like($err, qr/column "x" of table "u" .* its type is the row of view "vv"/, 'a column of a view\'s row type is refused');
+
+# no longer naming a role is not taking its membership
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE ROLE g_lost NOLOGIN TRAVELS; CREATE ROLE g_up NOLOGIN TRAVELS; GRANT g_up TO g_lost;
+	CREATE SCHEMA ml VERSIONED; CREATE SCHEMA ml2 VERSIONED;
+	CREATE TABLE ml.t (a integer);
+	GRANT SELECT ON ml.t TO g_lost;
+	SELECT test_ws_root_capture('ml') AS before \gset
+	REVOKE SELECT ON ml.t FROM g_lost;
+	SELECT test_ws_root_capture('ml') AS after \gset
+	SELECT test_ws_root_restore_after(:'after', :'before', 'ml2');
+	SELECT pg_has_role('g_lost', 'g_up', 'MEMBER');
+});
+is($rc, 0, 'a root no longer naming a role restores') or diag($err);
+like($out, qr/^t$/m, 'and its memberships stay');
+
 # an empty root, and a schema holding only a table
 ($rc, $out, $err) = in_one_session(q{
 	SET client_min_messages = warning;
@@ -171,6 +225,15 @@ for my $case (
 	[ 'partitions overlapping', 'CREATE TABLE p (a integer) PARTITION BY RANGE (a)',
 		'CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10)', 'CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (5) TO (15)',
 		qr/would overlap/ ],
+	[ 'a view of a column the other drops', 'CREATE TABLE p (a integer, b integer)',
+		'CREATE VIEW vb AS SELECT b FROM p', 'ALTER TABLE p DROP COLUMN b',
+		qr/does not exist|a reference to a column|does not make/ ],
+	[ 'a view of a table the other drops', 'CREATE TABLE p (a integer); CREATE TABLE q (a integer)',
+		'CREATE VIEW vp AS SELECT a FROM p', 'DROP TABLE p',
+		qr/does not exist|does not make/ ],
+	[ 'a function of a type the other drops', q{CREATE TYPE e AS ENUM ('a')},
+		'CREATE FUNCTION fe(e) RETURNS integer LANGUAGE sql AS \'SELECT 1\'', 'DROP TYPE e',
+		qr/needs "type\/e", which a commit does not hold/ ],
 	[ 'a clean merge', 'CREATE TABLE p (a integer)',
 		'ALTER TABLE p ADD COLUMN b integer', 'ALTER TABLE p ADD COLUMN c integer', undef ])
 {
@@ -204,6 +267,35 @@ for my $case (
 	my ($left) = $out =~ /=====left\n(.*?)\n=====end/s;
 	is($left // '', '0', "$name: and leaves nothing");
 }
+
+# a dry run needs no right to make schemas, and a root of another owner goes through
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	CREATE ROLE g_small NOLOGIN; CREATE ROLE g_owner2 NOLOGIN TRAVELS; GRANT g_owner2 TO g_small;
+	REVOKE CREATE ON DATABASE postgres FROM PUBLIC;
+	CREATE SCHEMA dr VERSIONED; ALTER SCHEMA dr OWNER TO g_owner2;
+	SET ROLE g_owner2;
+	CREATE TABLE dr.t (a integer); INSERT INTO dr.t VALUES (1);
+	CREATE VIEW dr.vv AS SELECT a FROM dr.t;
+	RESET ROLE;
+	SELECT test_ws_root_capture('dr') AS r \gset
+	SET ROLE g_small;
+	SELECT coalesce(test_ws_root_refused(:'r'), 'nothing');
+	SELECT current_user;
+	RESET ROLE;
+});
+is($rc, 0, 'a dry run by a role with no right to make schemas runs') or diag($err);
+like($out, qr/^nothing$/m, 'and goes through');
+like($out, qr/^g_small$/m, 'and is as that role after');
+
+# a name a schema already has is no refusal of the root
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = warning;
+	SELECT format('CREATE SCHEMA ws_dry_run_%s_0', pg_backend_pid()) \gexec
+	SELECT test_ws_root_capture('dr') AS r \gset
+	SELECT coalesce(test_ws_root_refused(:'r'), 'nothing');
+});
+like($out, qr/^nothing$/m, 'a schema already of that name leaves the run another') or diag($err);
 
 $node->stop;
 done_testing();

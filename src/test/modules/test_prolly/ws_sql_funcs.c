@@ -59,6 +59,7 @@ PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
 PG_FUNCTION_INFO_V1(test_ws_root_restore);
+PG_FUNCTION_INFO_V1(test_ws_root_restore_after);
 PG_FUNCTION_INFO_V1(test_ws_root_refused);
 PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_merge);
@@ -899,6 +900,17 @@ test_ws_root_restore(PG_FUNCTION_ARGS)
 	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
 
 	WsRootIO->restore(backend_ctx(), &root, NULL, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	PG_RETURN_VOID();
+}
+
+/* test_ws_root_restore_after(root text, previous text, dest text) returns void */
+Datum
+test_ws_root_restore_after(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	PHash		previous = text_hash(PG_GETARG_TEXT_PP(1));
+
+	WsRootIO->restore(backend_ctx(), &root, &previous, text_to_cstring(PG_GETARG_TEXT_PP(2)));
 	PG_RETURN_VOID();
 }
 
