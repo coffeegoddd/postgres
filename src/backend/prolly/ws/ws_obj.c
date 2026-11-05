@@ -2215,6 +2215,12 @@ read_casts(const char *schema, WsObject *objs, int *n)
 "      WHERE d.deptype IN ('n', 'a') AND i.schema IS NOT NULL AND i.schema <> 'pg_catalog' AND i.schema <> quote_ident(n.nspname)) " \
 "    THEN 'it needs something in another schema' "
 
+/* A table's row type, or an array of one, among some types: a table is made after these. */
+#define ROW_TYPE_AMONG(types) \
+"  WHEN EXISTS (SELECT 1 FROM " types " JOIN pg_type ty ON ty.oid = u.t LEFT JOIN pg_type e ON e.oid = ty.typelem AND e.typarray = ty.oid " \
+"      JOIN pg_class q ON q.oid = coalesce(e.typrelid, ty.typrelid) WHERE q.relkind <> 'c') " \
+"    THEN 'it is of a table''s or a view''s row type, and a table may need it' "
+
 static const char *const operator_refusal_sql =
 "SELECT o.oprname::text, CASE "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_operator'::regclass AND d.objid = o.oid AND d.deptype IN ('e', 'x')) "
@@ -2230,6 +2236,7 @@ static const char *const operator_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_operator x WHERE x.oid = o.oprnegate AND x.oprnegate <> o.oid) "
 "    THEN 'its negator does not say it back, as ALTER OPERATOR SET would make it' "
 NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_operator'::regclass::oid, o.oid) s(classid, objid)")
+ROW_TYPE_AMONG("unnest(ARRAY[o.oprleft, o.oprright]) u(t)")
 "  END FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace WHERE n.nspname = $1::name ORDER BY 1";
 
 static const char *const opfamily_refusal_sql =
@@ -2238,7 +2245,11 @@ static const char *const opfamily_refusal_sql =
 "    THEN 'it belongs to an extension' "
 "  WHEN EXISTS (SELECT 1 FROM pg_opfamily c WHERE c.opfname = o.opfname AND c.opfmethod = o.opfmethod AND c.opfnamespace = 'pg_catalog'::regnamespace) "
 "    THEN 'it is named as one in the catalogs' "
+"  WHEN EXISTS (SELECT 1 FROM pg_opclass c WHERE c.opcfamily = o.oid AND c.opcnamespace <> o.opfnamespace) "
+"    THEN 'a class of it is in another schema' "
 NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_amop'::regclass::oid, a.oid FROM pg_amop a WHERE a.amopfamily = o.oid UNION ALL SELECT 'pg_amproc'::regclass::oid, a.oid FROM pg_amproc a WHERE a.amprocfamily = o.oid) s(classid, objid)")
+ROW_TYPE_AMONG("(SELECT x FROM pg_amop a, unnest(ARRAY[a.amoplefttype, a.amoprighttype]) x WHERE a.amopfamily = o.oid "
+			   "UNION SELECT x FROM pg_amproc a, unnest(ARRAY[a.amproclefttype, a.amprocrighttype]) x WHERE a.amprocfamily = o.oid) u(t)")
 "  END FROM pg_opfamily o JOIN pg_namespace n ON n.oid = o.opfnamespace WHERE n.nspname = $1::name ORDER BY 1";
 
 static const char *const opclass_refusal_sql =
@@ -2248,7 +2259,10 @@ static const char *const opclass_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_opclass c WHERE c.opcname = o.opcname AND c.opcmethod = o.opcmethod AND c.opcnamespace = 'pg_catalog'::regnamespace) "
 "    THEN 'it is named as one in the catalogs' "
 "  WHEN f.opfnamespace <> o.opcnamespace THEN 'its family is in another schema' "
+"  WHEN o.opcdefault AND EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = o.opcintype AND t.typnamespace <> o.opcnamespace) "
+"    THEN 'it is a default for a type in the catalogs, which where it arrives may already have' "
 NEEDS_ANOTHER_SCHEMA("(SELECT 'pg_opclass'::regclass::oid, o.oid) s(classid, objid)")
+ROW_TYPE_AMONG("unnest(ARRAY[o.opcintype, o.opckeytype]) u(t)")
 "  END FROM pg_opclass o JOIN pg_namespace n ON n.oid = o.opcnamespace JOIN pg_opfamily f ON f.oid = o.opcfamily "
 "WHERE n.nspname = $1::name ORDER BY 1";
 
@@ -2268,12 +2282,16 @@ function_name_or_retry(const char *schema, Oid fn)
 	return quote_identifier(printed_or_retry(schema, get_func_name(fn)));
 }
 
+#define MEMBER_OF_CLASS "d.refclassid = 'pg_opclass'::regclass AND d.deptype = 'i'"
+#define MEMBER_OF_FAMILY "d.refclassid = 'pg_opfamily'::regclass AND d.deptype IN ('a', 'i')"
+
 /* An item of a class or family, to sort by, as nothing else is the same on every server. */
 typedef struct OpItem
 {
 	int			is_function;
 	int			number;
 	char	   *text;
+	char	   *in_utf8;		/* to sort by: an encoding's order is its own */
 } OpItem;
 
 static int
@@ -2286,12 +2304,13 @@ op_item_cmp(const void *a, const void *b)
 		return x->is_function - y->is_function;
 	if (x->number != y->number)
 		return x->number - y->number;
-	return strcmp(x->text, y->text);
+	return strcmp(x->in_utf8, y->in_utf8);
 }
 
 /*
  * The items of a class or family, as its statement says them: of what depends on it,
- * oid, by deptype, a class's its own and a family's those of no class.
+ * a class's its own and a family's those of no class, soft or, as an access method may
+ * have a required one, hard.
  */
 static char *
 op_items(const char *schema, const char *oid, bool is_class)
@@ -2302,8 +2321,7 @@ op_items(const char *schema, const char *oid, bool is_class)
 	OpItem	   *items;
 	int			n = 0;
 	StringInfoData s;
-	const char *of = is_class ? "d.refclassid = 'pg_opclass'::regclass AND d.deptype = 'i'" :
-		"d.refclassid = 'pg_opfamily'::regclass AND d.deptype = 'a'";
+	const char *of = is_class ? MEMBER_OF_CLASS : MEMBER_OF_FAMILY;
 	char	   *ops_sql = psprintf("SELECT a.amopstrategy::text, x.oprname::text, a.amoplefttype::text, a.amoprighttype::text, "
 								   "  a.amoppurpose::text, a.amopsortfamily::text "
 								   "FROM pg_amop a JOIN pg_operator x ON x.oid = a.amopopr "
@@ -2336,16 +2354,17 @@ op_items(const char *schema, const char *oid, bool is_class)
 			ws_sql_rows_free(&fam);
 			buf_free(&key);
 		}
-		items[n++] = (OpItem) {0, atoi(ws_sql_value(&ops, i, 0)), one.data};
+		items[n++] = (OpItem) {0, atoi(ws_sql_value(&ops, i, 0)), one.data, ws_text_to_utf8(one.data)};
 	}
 	for (int i = 0; i < procs.nrows; i++)
 	{
 		Oid			fn = atooid(ws_sql_value(&procs, i, 3));
 
-		items[n++] = (OpItem) {1, atoi(ws_sql_value(&procs, i, 0)),
-			psprintf("FUNCTION %s (%s) %s(%s)", ws_sql_value(&procs, i, 0),
-					 operator_args(schema, atooid(ws_sql_value(&procs, i, 1)), atooid(ws_sql_value(&procs, i, 2))),
-					 function_name_or_retry(schema, fn), function_args(schema, fn, NULL))};
+		char	   *text = psprintf("FUNCTION %s (%s) %s(%s)", ws_sql_value(&procs, i, 0),
+									operator_args(schema, atooid(ws_sql_value(&procs, i, 1)), atooid(ws_sql_value(&procs, i, 2))),
+									function_name_or_retry(schema, fn), function_args(schema, fn, NULL));
+
+		items[n++] = (OpItem) {1, atoi(ws_sql_value(&procs, i, 0)), text, ws_text_to_utf8(text)};
 	}
 	if (n > 1)
 		qsort(items, n, sizeof(OpItem), op_item_cmp);
@@ -2379,6 +2398,40 @@ add_dep(WsObject *o, Buf *key)
 	if (o->ndeps > 1)
 		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
 	buf_free(key);
+}
+
+/*
+ * The types of an item are in its row, and not all are depended on, as a function
+ * taking oid may be for any type: what the items of one class or family (of $1) say.
+ */
+static void
+add_member_type_needs(WsObject *o, const char *schema, const char *oid, const char *of)
+{
+	const char *params[2] = {oid, schema};
+	WsSqlRows	rows;
+	char	   *sql = psprintf("WITH n(typ) AS ("
+							   "  SELECT x FROM pg_amop a JOIN pg_depend d ON d.classid = 'pg_amop'::regclass AND d.objid = a.oid, "
+							   "    unnest(ARRAY[a.amoplefttype, a.amoprighttype]) x WHERE %s AND d.refobjid = $1::oid "
+							   "  UNION SELECT x FROM pg_amproc a JOIN pg_depend d ON d.classid = 'pg_amproc'::regclass AND d.objid = a.oid, "
+							   "    unnest(ARRAY[a.amproclefttype, a.amprocrighttype]) x WHERE %s AND d.refobjid = $1::oid) "
+							   "SELECT DISTINCT CASE b.typtype WHEN 'd' THEN 'D' ELSE 'T' END, b.typname::text FROM n "
+							   "JOIN pg_type t ON t.oid = n.typ "
+							   "LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
+							   "LEFT JOIN pg_range r ON r.rngmultitypid = coalesce(e.oid, t.oid) "
+							   "JOIN pg_type b ON b.oid = coalesce(r.rngtypid, e.oid, t.oid) "
+							   "WHERE b.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name)", of, of);
+
+	WsSql->read(sql, 2, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		Buf			key = BUF_INIT;
+
+		ws_obj_key(ws_sql_value(&rows, i, 0)[0] == 'D' ? WS_OBJ_DOMAIN : WS_OBJ_TYPE,
+				   ws_name_to_utf8(ws_sql_value(&rows, i, 1)), NULL, &key);
+		add_dep(o, &key);
+	}
+	ws_sql_rows_free(&rows);
+	pfree(sql);
 }
 
 #define OWNER_IF_IT_CAN_TRAVEL(catalog, column) \
@@ -2521,9 +2574,10 @@ read_opfamilies(const char *schema, WsObject *objs, int *n)
 			m->deps = NULL;
 			read_deps_of(m, schema, oid,
 						 "SELECT d.classid, d.objid FROM pg_depend d WHERE d.refclassid = 'pg_opfamily'::regclass AND d.refobjid = $1::oid "
-						 "AND d.deptype = 'a' AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)", "0");
+						 "AND d.deptype IN ('a', 'i') AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)", "0");
 			ws_obj_key(WS_OBJ_OPFAMILY, o->name, o->args, &key);
 			add_dep(m, &key);
+			add_member_type_needs(m, schema, oid, MEMBER_OF_FAMILY);
 		}
 	}
 	ws_sql_rows_free(&rows);
@@ -2576,6 +2630,21 @@ read_opclasses(const char *schema, WsObject *objs, int *n)
 					 "AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)", "0");
 		ws_obj_key(WS_OBJ_OPFAMILY, ws_name_to_utf8(ws_sql_value(&rows, i, 6)), o->args, &family);
 		add_dep(o, &family);
+		add_member_type_needs(o, schema, oid, MEMBER_OF_CLASS);
+
+		/*
+		 * A member added once its class is there is tied to it, so what its family
+		 * holds outside any class goes first, as those are what was not.
+		 */
+		for (int m = 0; m < *n; m++)
+			if (objs[m].kind == WS_OBJ_OPMEMBERS && strcmp(objs[m].args, o->args) == 0 &&
+				strcmp(objs[m].name, ws_name_to_utf8(ws_sql_value(&rows, i, 6))) == 0)
+			{
+				Buf			members = BUF_INIT;
+
+				ws_obj_key(WS_OBJ_OPMEMBERS, objs[m].name, objs[m].args, &members);
+				add_dep(o, &members);
+			}
 		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_opclass", "opcowner"), "pg_opclass");
 	}
 	ws_sql_rows_free(&rows);
@@ -3793,8 +3862,11 @@ put_object(const WsObject *o, const char *schema, Buf *sql)
 	pfree(here);
 	if (o->kind == WS_OBJ_OPCLASS || o->kind == WS_OBJ_OPFAMILY)
 	{
+		char	   *method = ws_text_from_utf8(o->args);
+
 		ws_put_text(sql, " USING ");
-		ws_put_text(sql, o->args);
+		ws_put_text(sql, method);
+		pfree(method);
 	}
 	else if (o->args != NULL)
 	{
@@ -4106,19 +4178,32 @@ check_collations_are_free(const WsObject *objs, int n, const char *schema)
 	for (int i = 0; i < n; i++)
 	{
 		char	   *here;
-		const char *params[1];
+		char	   *method;
+		const char *params[2];
 		WsSqlRows	rows;
+		const char *sql;
 
-		if (objs[i].kind != WS_OBJ_COLLATION)
+		if (objs[i].kind == WS_OBJ_COLLATION)
+			sql = "SELECT 1 FROM pg_collation WHERE collname = $1::name AND collnamespace = 'pg_catalog'::regnamespace";
+		else if (objs[i].kind == WS_OBJ_OPCLASS)
+			sql = "SELECT 1 FROM pg_opclass o JOIN pg_am a ON a.oid = o.opcmethod WHERE o.opcname = $1::name "
+				"AND o.opcnamespace = 'pg_catalog'::regnamespace AND quote_ident(a.amname) = $2";
+		else if (objs[i].kind == WS_OBJ_OPFAMILY)
+			sql = "SELECT 1 FROM pg_opfamily o JOIN pg_am a ON a.oid = o.opfmethod WHERE o.opfname = $1::name "
+				"AND o.opfnamespace = 'pg_catalog'::regnamespace AND quote_ident(a.amname) = $2";
+		else
 			continue;
 		here = name_here(&objs[i], objs[i].name);
+		method = objs[i].args != NULL ? ws_text_from_utf8(objs[i].args) : "";
 		params[0] = here;
-		WsSql->read("SELECT 1 FROM pg_collation WHERE collname = $1::name AND collnamespace = 'pg_catalog'::regnamespace",
-					1, params, &rows);
+		params[1] = method;
+		WsSql->read(sql, objs[i].kind == WS_OBJ_COLLATION ? 1 : 2, params, &rows);
 		if (rows.nrows > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("collation \"%s\" of schema \"%s\" is named as one in this server's catalogs, which what uses it would be taken to mean",
+					 errmsg("%s \"%s\" of schema \"%s\" is named as one in this server's catalogs, which what uses it would be taken to mean",
+							objs[i].kind == WS_OBJ_COLLATION ? "collation" :
+							objs[i].kind == WS_OBJ_OPCLASS ? "operator class" : "operator family",
 							here, schema)));
 		ws_sql_rows_free(&rows);
 		pfree(here);

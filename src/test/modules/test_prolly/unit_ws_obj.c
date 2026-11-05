@@ -508,6 +508,14 @@ ENGINE_TEST(test_refused_statements)
 		static const char *const links[] = {"ALTER OPERATOR <<< (a, a) OWNER TO x; DROP TABLE t", "DROP OPERATOR <<< (a, a)", "not sql"};
 		static const char *const members[] = {"ALTER OPERATOR FAMILY v USING b DROP FUNCTION 1 (a, a)", "DROP OPERATOR FAMILY v USING b", "not sql"};
 
+		static const char *const families[] = {"USING b; DROP TABLE t", "AS ENUM ('a')", "not sql"};
+
+		for (int i = 0; i < lengthof(families); i++)
+		{
+			WsObject	o = {.kind = WS_OBJ_OPFAMILY,.name = "v",.args = "b",.definition = (char *) families[i]};
+
+			expect_error(statement_of, &o, ERRCODE_DATA_CORRUPTED, NULL);
+		}
 		for (int i = 0; i < lengthof(operators); i++)
 		{
 			WsObject	o = {.kind = WS_OBJ_OPERATOR,.name = "<<<",.args = "a, a",.definition = (char *) operators[i]};

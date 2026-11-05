@@ -1140,6 +1140,26 @@ $node->safe_psql('postgres', q{
 	CREATE OPERATOR CLASS in_fam FOR TYPE m USING btree FAMILY fam AS
 		OPERATOR 1 <<<, OPERATOR 2 <<==, OPERATOR 3 ===, OPERATOR 4 >>==, OPERATOR 5 >>>, FUNCTION 1 mcmp(m, m);
 	ALTER OPERATOR FAMILY fam USING btree ADD FUNCTION 1 (m, integer) mcmp2(m, integer);
+	CREATE FUNCTION mhash(m) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+	CREATE OPERATOR CLASS hash_ops2 FOR TYPE m USING hash AS OPERATOR 1 ===, FUNCTION 1 mhash(m);
+	-- required members of a family made only by adding them, tied to the family
+	CREATE OPERATOR FAMILY g_fam USING gist;
+	CREATE OPERATOR CLASS g_ops FOR TYPE point USING gist FAMILY g_fam AS STORAGE box,
+		OPERATOR 1 <<(point, point), OPERATOR 15 <->(point, point) FOR ORDER BY pg_catalog.float_ops,
+		FUNCTION 1 gist_point_consistent(internal, point, smallint, oid, internal),
+		FUNCTION 2 gist_box_union(internal, internal);
+	ALTER OPERATOR FAMILY g_fam USING gist ADD
+		FUNCTION 3 (point, point) gist_point_compress(internal), FUNCTION 5 (point, point) gist_box_penalty(internal, internal, internal),
+		FUNCTION 6 (point, point) gist_box_picksplit(internal, internal), FUNCTION 7 (point, point) gist_box_same(box, box, internal),
+		FUNCTION 8 (point, point) gist_point_distance(internal, point, smallint, oid, internal);
+	-- what a family holds before its class is there stays the family's
+	CREATE OPERATOR FAMILY early USING btree;
+	ALTER OPERATOR FAMILY early USING btree ADD OPERATOR 3 =(integer, integer);
+	CREATE OPERATOR CLASS early_ops FOR TYPE integer USING btree FAMILY early AS OPERATOR 1 <(integer, integer), FUNCTION 1 btint4cmp(integer, integer);
+	-- a type a member says only in its row, with a name after what would hold it
+	CREATE OPERATOR FAMILY a_fam USING btree;
+	CREATE TYPE zz AS ENUM ('a');
+	ALTER OPERATOR FAMILY a_fam USING btree ADD FUNCTION 4 (zz, zz) btequalimage(oid);
 	CREATE TABLE t (a m);
 	CREATE VIEW v AS SELECT a FROM t WHERE a <<< 'b' AND a === 'a';
 	CREATE MATERIALIZED VIEW mv AS SELECT a FROM t WITH NO DATA;
@@ -1176,6 +1196,25 @@ is( $node->safe_psql('postgres', q{SELECT (SELECT count(*) FROM pg_amop a JOIN p
 		(SELECT count(*) FROM pg_amproc a JOIN pg_opfamily f ON f.oid = a.amprocfamily WHERE f.opfnamespace = 'op'::regnamespace) || ' ' ||
 		(SELECT opcdefault FROM pg_opclass WHERE opcname = 'Odd Ops' AND opcnamespace = 'op'::regnamespace)}), 'and of its classes and families');
 is($node->safe_psql('postgres', q{SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily WHERE opfname = 'fam' AND opfnamespace = 'op2'::regnamespace}), 'a family', 'a family has its comment');
+# the same bytes cannot see a member lost on both sides, nor whose it is
+my $op_members = sub {
+	my $s = shift;
+	return $node->safe_psql('postgres', qq{SELECT string_agg(x, ', ' ORDER BY x) FROM (
+		SELECT format('op %s %s %s %s', f.opfname, a.amopstrategy, d.refclassid::regclass, d.deptype) x FROM pg_amop a JOIN pg_opfamily f ON f.oid = a.amopfamily
+			JOIN pg_depend d ON d.classid = 'pg_amop'::regclass AND d.objid = a.oid AND d.refclassid IN ('pg_opclass'::regclass, 'pg_opfamily'::regclass) WHERE f.opfnamespace = '$s'::regnamespace
+		UNION ALL SELECT format('fn %s %s %s %s', f.opfname, a.amprocnum, d.refclassid::regclass, d.deptype) FROM pg_amproc a JOIN pg_opfamily f ON f.oid = a.amprocfamily
+			JOIN pg_depend d ON d.classid = 'pg_amproc'::regclass AND d.objid = a.oid AND d.refclassid IN ('pg_opclass'::regclass, 'pg_opfamily'::regclass) WHERE f.opfnamespace = '$s'::regnamespace) y});
+};
+is($op_members->('op2'), $op_members->('op'), 'every member is tied as it was');
+like($op_members->('op'), qr/fn g_fam 5 pg_opfamily i/, 'a required member is on its family');
+like($op_members->('op'), qr/op early 3 pg_opfamily a/, 'and what was there before its class');
+like($op_val{'opmembers/g_fam(gist)'}, qr/FUNCTION 5 /, 'which is held');
+like($op_val{'opmembers/g_fam(gist)'}, qr/FOR ORDER BY float_ops/, 'an ordering operator says its family');
+like($op_val{'opclass/g_ops(gist)'}, qr/STORAGE box/, 'a class its storage');
+like($op_val{'opclass/g_ops(gist)'}, qr/opmembers\/g_fam\(gist\)/, 'and needs what its family holds outside it');
+like($op_val{'opmembers/a_fam(btree)'}, qr/type\/zz/, 'a member needs a type only its row says');
+$node->safe_psql('postgres', q{CREATE TABLE op2.pts (p point); CREATE INDEX pts_p ON op2.pts USING gist (p op2.g_ops)});
+pass('an index can be made on what was restored');
 is($node->safe_psql('postgres', q{SELECT opfowner::regrole FROM pg_opfamily WHERE opfname = 'fam' AND opfnamespace = 'op2'::regnamespace}), 'g_opowner', 'and its owner');
 
 my @op_refused = (
@@ -1185,6 +1224,14 @@ my @op_refused = (
 	[ q{CREATE FUNCTION f(integer, integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f, COMMUTATOR = >>>)}, 'a shell' ],
 	[ q{CREATE FUNCTION f(integer, integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f, COMMUTATOR = OPERATOR(public.>>>)); CREATE OPERATOR public.>>> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = op5.f)}, 'in another schema' ],
 	[ q{CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = public.op_else)}, 'another schema' ],
+	[ q{CREATE OPERATOR FAMILY f USING btree; CREATE OPERATOR CLASS public.oc_else FOR TYPE integer USING btree FAMILY op5.f AS OPERATOR 1 <, FUNCTION 1 btint4cmp(integer, integer)}, 'a class of it is in another schema' ],
+	[ q{CREATE OPERATOR CLASS c DEFAULT FOR TYPE lseg USING hash AS FUNCTION 1 hashtext(text)}, 'a default for a type in the catalogs' ],
+	[ q{CREATE TABLE tq (a int); CREATE OPERATOR CLASS c FOR TYPE tq USING hash AS FUNCTION 1 (tq, tq) hash_record(record)}, 'row type' ],
+	[ q{CREATE TABLE tq (a int); CREATE OPERATOR FAMILY f USING btree; ALTER OPERATOR FAMILY f USING btree ADD FUNCTION 4 (tq, tq) btequalimage(oid)}, 'row type' ],
+	[ q{CREATE TABLE tq (a int); CREATE OPERATOR ### (LEFTARG = tq, RIGHTARG = tq, FUNCTION = record_eq)}, 'row type' ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE OPERATOR !!! (RIGHTARG = op5."date", FUNCTION = enum_first)}, "say a schema's name" ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE OPERATOR CLASS c FOR TYPE op5."date" USING btree AS FUNCTION 1 enum_cmp(anyenum, anyenum)}, "say a schema's name" ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE OPERATOR FAMILY f USING btree; ALTER OPERATOR FAMILY f USING btree ADD FUNCTION 4 (op5."date", op5."date") btequalimage(oid)}, "say a schema's name" ],
 	[ q{CREATE FUNCTION f(integer, integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f, COMMUTATOR = >>>); CREATE OPERATOR >>> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f)}, 'does not say it back' ],
 	[ q{CREATE FUNCTION f(integer, integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'; CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f, NEGATOR = >>>); CREATE OPERATOR >>> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = f)}, 'does not say it back' ],
 	[ q{CREATE OPERATOR CLASS c FOR TYPE integer USING btree FAMILY public.fam_else AS OPERATOR 1 <, FUNCTION 1 btint4cmp(integer, integer)}, 'family is in another schema' ],
@@ -1198,12 +1245,12 @@ $node->safe_psql('postgres', q{CREATE FUNCTION public.op_else(integer, integer) 
 for my $case (@op_refused)
 {
 	my ($sql, $why) = @$case;
-	$node->safe_psql('postgres', qq{DROP SCHEMA IF EXISTS op5 CASCADE; DROP OPERATOR IF EXISTS public.>>> (integer, integer); CREATE SCHEMA op5; SET search_path = op5; $sql});
+	$node->safe_psql('postgres', qq{DROP OPERATOR CLASS IF EXISTS public.oc_else USING btree; DROP SCHEMA IF EXISTS op5 CASCADE; DROP OPERATOR IF EXISTS public.>>> (integer, integer); CREATE SCHEMA op5; SET search_path = op5; $sql});
 	my ($rc9, $out9, $err9) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('op5')});
 	isnt($rc9, 0, "refused: $sql");
 	like($err9, qr/\Q$why\E/, "for why: $sql");
 }
-$node->safe_psql('postgres', q{DROP SCHEMA op5 CASCADE; DROP OPERATOR IF EXISTS public.>>> (integer, integer); DROP OPERATOR FAMILY public.fam_else USING btree; DROP FUNCTION public.op_else(integer, integer); DROP FUNCTION public.fam_cmp(integer, bigint)});
+$node->safe_psql('postgres', q{DROP OPERATOR CLASS IF EXISTS public.oc_else USING btree; DROP SCHEMA op5 CASCADE; DROP OPERATOR IF EXISTS public.>>> (integer, integer); DROP OPERATOR FAMILY public.fam_else USING btree; DROP FUNCTION public.op_else(integer, integer); DROP FUNCTION public.fam_cmp(integer, bigint)});
 
 # since a snapshot, one to try again
 for my $change (q{COMMENT ON OPERATOR op.!!! (NONE, op.m) IS 'later'}, q{ALTER OPERATOR op.!!! (NONE, op.m) OWNER TO CURRENT_USER},
@@ -1219,6 +1266,22 @@ for my $change (q{COMMENT ON OPERATOR op.!!! (NONE, op.m) IS 'later'}, q{ALTER O
 	like($old->{stderr}, qr/has changed since/, "to try again after: $change");
 	$old->quit;
 }
+
+# what the catalogs hold is each server's, so what capture found free may not be free
+$node->safe_psql('postgres', q{CREATE SCHEMA ff; SELECT test_ws_obj_restore_family('here_only', 'ff')});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_opfamily WHERE opfnamespace = 'ff'::regnamespace}), '1', 'a family arrives where its name is free');
+$node->safe_psql('postgres', q{DROP OPERATOR FAMILY ff.here_only USING btree; SET allow_system_table_mods = on; CREATE OPERATOR FAMILY pg_catalog.here_only USING btree});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_restore_family('here_only', 'ff')});
+like($err, qr/named as one in this server's catalogs/, 'and is refused where the catalogs have it');
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DROP OPERATOR FAMILY pg_catalog.here_only USING btree; DROP SCHEMA ff});
+
+# a method's name in another encoding than a record's
+$node->safe_psql('postgres', q{CREATE DATABASE oplat TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+$node->safe_psql('oplat', q{CREATE EXTENSION test_prolly});
+$node->safe_psql('oplat', qq{SET client_encoding = 'UTF8'; CREATE ACCESS METHOD "b\xc3\xa9" TYPE INDEX HANDLER bthandler;
+	CREATE SCHEMA la; CREATE SCHEMA la2; CREATE OPERATOR FAMILY la.f USING "b\xc3\xa9"; COMMENT ON OPERATOR FAMILY la.f USING "b\xc3\xa9" IS 'x';});
+$node->safe_psql('oplat', q{SELECT test_ws_obj_copy('la', 'la2')});
+is($node->safe_psql('oplat', q{SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily WHERE opfnamespace = 'la2'::regnamespace}), 'x', 'a family of a method not in ASCII has its comment');
 
 $node->stop;
 done_testing();
