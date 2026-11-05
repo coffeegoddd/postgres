@@ -13112,10 +13112,12 @@ dynamic_library_path = '/usr/local/lib/postgresql:$libdir'
       <listitem>
        <para>
         Makes functions such as <function>pg_get_viewdef</function> print SQL
-        in the form that printing it again gives once it has been read back:
-        every output column is named, and a cast of an
-        <literal>ARRAY[]</literal> is printed on its elements.  Version control
-        turns this on for what it holds in a commit.  The default is
+        in a form that reads back to what prints the same again: every output
+        column is named, a cast of an <literal>ARRAY[]</literal> first says the
+        array's own type, a minus on a number says the number's type, and an
+        <literal>AND</literal> or <literal>OR</literal> on the left of another is
+        printed as one list.  Version control turns this on for what it holds in
+        a commit.  The default is
         <literal>off</literal>.
        </para>
       </listitem>

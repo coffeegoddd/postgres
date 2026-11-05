@@ -288,6 +288,63 @@ ARRAY['a','b']::m[]
 ARRAY[1]::ad
 ARRAY['a']::dv[]
 ARRAY[ROW(1,2)]::pt[]
+i BETWEEN 1 AND 2 AND v = 'a'
+i BETWEEN 1 AND 2 OR b2
+i NOT BETWEEN 1 AND 2 OR b2
+i NOT BETWEEN 1 AND 2 AND b2
+ROW(i,b) = ROW(1,2) AND b2
+ROW(i,b) <> ROW(1,2) OR b2
+v IN ('a', t) AND b2
+v NOT IN ('a', t) AND b2
+v IN ('a', t) OR b2
+(b2 AND i > 0) AND i < 5
+b2 AND (i > 0 AND i < 5)
+(b2 OR i > 0) OR i < 5
+b2 OR (i > 0 OR i < 5)
+(b2 OR i > 0) AND i < 5
+(i BETWEEN 1 AND 2 AND i BETWEEN 0 AND 3) AND b2
+NOT (i BETWEEN 1 AND 2 AND b2)
+-1::int < i
+-1::int
+-1.5::numeric
+-1.5::numeric < n
+-(1::int)
+-(1.5::numeric)
+- 1.5
+- 1.5 < n
++1
++1::int
+- i
+-1::bigint
+-1::smallint
+-1.5::float8
+- 1e10
+- - 1
+-(-1)
+(-1)::int
+i - 1
+i - -1
+i - (-1::int)
+n - -1.5
+ARRAY['a']::varchar[]::text[]::varchar[]
+ARRAY[1]::bigint[]::ad
+ARRAY[1]::bigint[]::integer[]::bigint[]::integer[]::text[]
+v IN ('a' COLLATE "C",'b')
+v NOT IN ('a' COLLATE "C",'b')
+ARRAY[a,a2]::int[]::text[]
+ARRAY[a,a2]::text[]
+ARRAY[a,a2]::int[]::bigint[]
+ARRAY[a,a2]::bigint[]
+t = ANY (ARRAY[va,vb])
+t = ANY (ARRAY[ARRAY[v],vb])
+ARRAY[ARRAY[]::int[]]::int[]::text[]
+ARRAY[va,vb]::text[]
+ARRAY[va]::text[]
+ARRAY[[1,2],[3,4]]::text[]
+ARRAY[[1,2],[3,4]]::bigint[]
+ARRAY[ARRAY[1,2],a2]::text[]
+ARRAY[]::int[]::text[]
+ARRAY[]::varchar[]::dv[]
 EXPRS
 
 my $types = q{
@@ -301,7 +358,8 @@ my $types = q{
 my $tables = q{
 	CREATE TABLE s (i integer, v varchar, t text);
 	CREATE TABLE t0 (i integer, b bigint, n numeric, f float8, v varchar(10), t text, c char(2), n2 name, b2 boolean,
-		d date, ts timestamp, tz timestamptz, j json, jb jsonb, a integer[], p pt, u uuid, m m, dm dm, dv dv, ad ad);
+		d date, ts timestamp, tz timestamptz, j json, jb jsonb, a integer[], p pt, u uuid, m m, dm dm, dv dv, ad ad,
+		a2 integer[], va varchar[], vb varchar[]);
 };
 
 my $make = "CREATE ROLE g_stable NOLOGIN; CREATE SCHEMA sp AUTHORIZATION g_stable; CREATE SCHEMA sp2 AUTHORIZATION g_stable; SET ROLE g_stable; SET search_path = sp;\n"
@@ -336,8 +394,9 @@ $node->safe_psql('postgres', q{SET ROLE g_stable; SET search_path = sp;
 });
 
 # printing is what is stable, so what it does not ask for is as Postgres has always been
+is( $node->safe_psql('postgres', q{SELECT pg_get_function_sqlbody('sp.fr()'::regprocedure) NOT LIKE '%?column?%'}), 't', 'ordinary printing leaves a column of no name so');
 is( $node->safe_psql('postgres', q{SELECT pg_get_viewdef('sp.w1'::regclass) LIKE '%ANY ((ARRAY[%])::text[])%'}), 't', 'ordinary printing is as it was');
-is( $node->safe_psql('postgres', q{SET stable_deparse = on; SELECT pg_get_viewdef('sp.w1'::regclass) LIKE '%ANY (ARRAY[(%)::text%'}), 't', 'and the setting prints what reading it back gives');
+is( $node->safe_psql('postgres', q{SET stable_deparse = on; SELECT pg_get_viewdef('sp.w1'::regclass) LIKE '%ANY ((ARRAY[%]::character varying[])::text[])%'}), 't', 'and the setting prints what reading it back gives');
 
 my $held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sp')});
 my %was = map { my ($key, $v) = split /\t/; $key => $v } split /\n/, $held;
@@ -357,6 +416,35 @@ for my $key (@differ[0 .. ($#differ < 9 ? $#differ : 9)])
 }
 is(scalar(@differ), 0, 'every object is the same bytes restored');
 is(scalar(keys %is), scalar(keys %was), 'and there are no others');
+
+# the same bytes cannot see a value that has changed, if it prints the same both times
+my $row = q{INSERT INTO %s.t0 (i, b, n, f, v, t, c, n2, b2, d, ts, tz, j, jb, a, p, u, m, dm, dv, ad, a2, va, vb) VALUES
+	(1, 2, 1.5, 2.5, 'a', '{a,b}', 'a', 'a', true, '2020-01-01', '2020-01-01', '2020-01-01 00:00+00', '{"a":1}', '{"a":1}', '{1,2}', ROW(1,2), NULL, 'a', 1, 'a', '{1}', '{3,4}', '{a,b}', '{c,d}'),
+	(-1, NULL, NULL, NULL, 'z', 'c', NULL, NULL, false, NULL, NULL, NULL, NULL, NULL, '{1,2}', NULL, NULL, 'b', NULL, 'z', NULL, '{5,6}', '{x}', '{y}')};
+$node->safe_psql('postgres', sprintf($row, $_)) for ('sp', 'sp2');
+$node->safe_psql('postgres', q{CREATE PROCEDURE public.values_of(s text) LANGUAGE plpgsql AS $$
+	DECLARE r record; got text;
+	BEGIN
+		CREATE TEMP TABLE IF NOT EXISTS seen (schema_name text, view_name text, got text);
+		FOR r IN SELECT c.relname FROM pg_class c WHERE c.relnamespace = s::regnamespace AND c.relkind = 'v' AND c.relname ~ '^[vw][0-9]' LOOP
+			BEGIN
+				EXECUTE format('SELECT string_agg(col::text, %L) FROM %I.%I', '|', s, r.relname) INTO got;
+			EXCEPTION WHEN OTHERS THEN
+				got := 'ERROR ' || SQLSTATE;
+			END;
+			INSERT INTO seen VALUES (s, r.relname, got);
+		END LOOP;
+	END $$});
+# (what depends on the moment is no matter of printing)
+my @moving = map { $_ + 1 } grep { $exprs[$_] =~ /now\(\)|current_|localtime|session_user/ } 0 .. $#exprs;
+my $moving = join(',', map { "'v$_','w$_'" } @moving);
+my $differ = $node->safe_psql('postgres', qq{CALL public.values_of('sp'); CALL public.values_of('sp2');
+	SELECT coalesce(string_agg(a.view_name || ' was ' || coalesce(a.got, 'NULL') || ' is ' || coalesce(b.got, 'NULL'), E'\\n'), '')
+	FROM seen a JOIN seen b ON b.view_name = a.view_name AND b.schema_name = 'sp2' WHERE a.schema_name = 'sp' AND a.view_name NOT IN ($moving)
+	AND a.got IS DISTINCT FROM b.got});
+is($differ, '', 'every view has the same values restored');
+my $looked = $node->safe_psql('postgres', qq{CALL public.values_of('sp'); SELECT count(*) > 0 AND count(*) FILTER (WHERE got NOT LIKE 'ERROR%') * 2 > count(*) FROM seen});
+is($looked, 't', 'most of which could be read');
 
 # a second round, as a form that only settled later would pass the first by chance
 $node->safe_psql('postgres', q{CREATE SCHEMA sp3 AUTHORIZATION g_stable; SELECT test_ws_obj_copy('sp2', 'sp3', 'before')});

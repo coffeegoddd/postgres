@@ -474,6 +474,9 @@ static void get_rule_expr_funccall(Node *node, deparse_context *context,
 								   bool showimplicit);
 static bool looks_like_function(Node *node);
 static void get_oper_expr(OpExpr *expr, deparse_context *context);
+static void get_bool_first_arg(BoolExpr *expr, Node *first_arg, const char *word,
+							   deparse_context *context, Node *node);
+static void get_array_to_be_cast(ArrayExpr *array, deparse_context *context, bool top);
 static void get_func_expr(FuncExpr *expr, deparse_context *context,
 						  bool showimplicit);
 static void get_agg_expr(Aggref *aggref, deparse_context *context,
@@ -491,8 +494,6 @@ static bool get_func_sql_syntax(FuncExpr *expr, deparse_context *context);
 static void get_coercion_expr(Node *arg, deparse_context *context,
 							  Oid resulttype, int32 resulttypmod,
 							  Node *parentNode);
-static void get_cast_array_elements(ArrayExpr *array, deparse_context *context,
-									Oid elemtype, int32 typmod);
 static void get_const_expr(Const *constval, deparse_context *context,
 						   int showtype);
 static void get_const_collation(Const *constval, deparse_context *context);
@@ -9534,8 +9535,7 @@ get_rule_expr(Node *node, deparse_context *context,
 					case AND_EXPR:
 						if (!PRETTY_PAREN(context))
 							appendStringInfoChar(buf, '(');
-						get_rule_expr_paren(first_arg, context,
-											false, node);
+						get_bool_first_arg(expr, first_arg, " AND ", context, node);
 						for_each_from(arg, expr->args, 1)
 						{
 							appendStringInfoString(buf, " AND ");
@@ -9549,8 +9549,7 @@ get_rule_expr(Node *node, deparse_context *context,
 					case OR_EXPR:
 						if (!PRETTY_PAREN(context))
 							appendStringInfoChar(buf, '(');
-						get_rule_expr_paren(first_arg, context,
-											false, node);
+						get_bool_first_arg(expr, first_arg, " OR ", context, node);
 						for_each_from(arg, expr->args, 1)
 						{
 							appendStringInfoString(buf, " OR ");
@@ -9819,19 +9818,12 @@ get_rule_expr(Node *node, deparse_context *context,
 				ArrayCoerceExpr *acoerce = (ArrayCoerceExpr *) node;
 				Node	   *arg = (Node *) acoerce->arg;
 
+				/* (what is not shown of an ARRAY[] would read back on its elements) */
 				if (acoerce->coerceformat == COERCE_IMPLICIT_CAST &&
-					!showimplicit)
+					!showimplicit && !(stable_deparse && IsA(arg, ArrayExpr)))
 				{
 					/* don't show the implicit cast */
 					get_rule_expr_paren(arg, context, false, node);
-				}
-				else if (stable_deparse && IsA(arg, ArrayExpr) &&
-						 ((ArrayExpr *) arg)->elements != NIL &&
-						 OidIsValid(get_element_type(acoerce->resulttype)))
-				{
-					get_cast_array_elements((ArrayExpr *) arg, context,
-											get_element_type(acoerce->resulttype),
-											acoerce->resulttypmod);
 				}
 				else
 				{
@@ -10876,6 +10868,35 @@ looks_like_function(Node *node)
 
 
 /*
+ * get_bool_first_arg - Parse back the first operand of an AND or OR
+ *
+ * The grammar flattens an AND on the left of an AND, as an OR on the left of an OR, so
+ * one that analysis made (of a BETWEEN, say) has no text of its own that stays so.
+ */
+static void
+get_bool_first_arg(BoolExpr *expr, Node *first_arg, const char *word,
+				   deparse_context *context, Node *node)
+{
+	StringInfo	buf = context->buf;
+
+	if (stable_deparse && IsA(first_arg, BoolExpr) &&
+		((BoolExpr *) first_arg)->boolop == expr->boolop)
+	{
+		BoolExpr   *inner = (BoolExpr *) first_arg;
+		ListCell   *arg;
+
+		get_bool_first_arg(inner, (Node *) linitial(inner->args), word, context, first_arg);
+		for_each_from(arg, inner->args, 1)
+		{
+			appendStringInfoString(buf, word);
+			get_rule_expr_paren((Node *) lfirst(arg), context, false, first_arg);
+		}
+		return;
+	}
+	get_rule_expr_paren(first_arg, context, false, node);
+}
+
+/*
  * get_oper_expr			- Parse back an OpExpr node
  */
 static void
@@ -10909,7 +10930,17 @@ get_oper_expr(OpExpr *expr, deparse_context *context)
 						 generate_operator_name(opno,
 												InvalidOid,
 												exprType(arg)));
-		get_rule_expr_paren(arg, context, true, (Node *) expr);
+
+		/*
+		 * The grammar folds a minus on a bare number, so a constant that prints
+		 * as one must say its type to read back as what it was.
+		 */
+		if (stable_deparse && IsA(arg, Const) && !((Const *) arg)->constisnull &&
+			(((Const *) arg)->consttype == INT4OID || ((Const *) arg)->consttype == NUMERICOID) &&
+			strcmp(get_opname(opno), "-") == 0)
+			get_const_expr((Const *) arg, context, 1);
+		else
+			get_rule_expr_paren(arg, context, true, (Node *) expr);
 	}
 	if (!PRETTY_PAREN(context))
 		appendStringInfoChar(buf, ')');
@@ -11549,16 +11580,20 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 	return false;
 }
 
-/*
- * get_cast_array_elements
+/* ----------
+ * get_coercion_expr
  *
- *	Print a cast of an ARRAY[] as what reading one back makes of it: the parser
- *	pushes such a cast down onto the elements, so that is the form that prints
- *	the same however many times it is read and printed.
+ *	Make a string representation of a value coerced to a specific type
+ * ----------
+ */
+/*
+ * get_array_to_be_cast - Parse back an ARRAY[] that a cast to its own type follows
+ *
+ * The cast also reaches the elements of an ARRAY[] within it, dropping any type modifier,
+ * so such an element says that it has.  One at the top keeps its own.
  */
 static void
-get_cast_array_elements(ArrayExpr *array, deparse_context *context,
-						Oid elemtype, int32 typmod)
+get_array_to_be_cast(ArrayExpr *array, deparse_context *context, bool top)
 {
 	StringInfo	buf = context->buf;
 	const char *sep = "";
@@ -11570,27 +11605,42 @@ get_cast_array_elements(ArrayExpr *array, deparse_context *context,
 		Node	   *elem = (Node *) lfirst(lc);
 
 		appendStringInfoString(buf, sep);
-		if (array->multidims && IsA(elem, ArrayExpr))
-			get_cast_array_elements((ArrayExpr *) elem, context, elemtype, typmod);
+		if (IsA(elem, ArrayExpr) && ((ArrayExpr *) elem)->elements != NIL)
+			get_array_to_be_cast((ArrayExpr *) elem, context, false);
+		else if (!top && exprTypmod(elem) >= 0)
+		{
+			appendStringInfoChar(buf, '(');
+			get_rule_expr(elem, context, false);
+			appendStringInfo(buf, ")::%s", format_type_with_typemod(exprType(elem), -1));
+		}
 		else
-			get_coercion_expr(elem, context, elemtype, typmod, (Node *) array);
+			get_rule_expr(elem, context, false);
 		sep = ", ";
 	}
 	appendStringInfoChar(buf, ']');
 }
 
-/* ----------
- * get_coercion_expr
- *
- *	Make a string representation of a value coerced to a specific type
- * ----------
- */
 static void
 get_coercion_expr(Node *arg, deparse_context *context,
 				  Oid resulttype, int32 resulttypmod,
 				  Node *parentNode)
 {
 	StringInfo	buf = context->buf;
+
+	/*
+	 * A cast on an ARRAY[] reads back as a cast of each element, which is another
+	 * tree, and prints otherwise.  One on a cast to what it already is reads back
+	 * as what it was.
+	 */
+	if (stable_deparse && IsA(arg, ArrayExpr) && ((ArrayExpr *) arg)->elements != NIL)
+	{
+		appendStringInfoChar(buf, '(');
+		get_array_to_be_cast((ArrayExpr *) arg, context, true);
+		appendStringInfo(buf, "::%s)::%s",
+						 format_type_with_typemod(((ArrayExpr *) arg)->array_typeid, -1),
+						 format_type_with_typemod(resulttype, resulttypmod));
+		return;
+	}
 
 	/*
 	 * Since parse_coerce.c doesn't immediately collapse application of
