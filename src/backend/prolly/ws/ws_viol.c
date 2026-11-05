@@ -11,11 +11,17 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/table.h"
+#include "access/xact.h"
 #include "access/stratnum.h"
+#include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/pg_ws_deferred.h"
 #include "commands/defrem.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -28,6 +34,8 @@
 #include "prolly/ws/ws_viol.h"
 #include "utils/builtins.h"
 #include "utils/errcodes.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ruleutils.h"
@@ -161,7 +169,7 @@ exclusion_violated(Found *f, const WsTableSchema *s, int n, const char *schema)
 	WsSqlRows	rows;
 	WsSqlFailure failure;
 
-	ws_schema_add_exclusion(s, n, schema, &sql);
+	ws_schema_add_constraint(s, n, schema, &sql);
 	buf_append_byte(&sql, 0);
 	if (WsSql->attempt((const char *) sql.data, 0, NULL, &rows, &failure))
 		ws_sql_rows_free(&rows);
@@ -527,10 +535,651 @@ query_recheck(ProllyCtx *ctx, const PHash *root, const char *schema, PHash *out,
 	return true;
 }
 
+/* -------------------------------------------------- what the catalog holds */
+
+/* What is deferred of a table, read now, palloc'd, of *n. */
+static WsDeferred *
+catalog_load(Oid relid, int *n)
+{
+	const char *params[1] = {psprintf("%u", relid)};
+	WsSqlRows	rows;
+	WsDeferred *out;
+
+	WsSql->run("SELECT defkind::text, defname::text, encode(defrecord, 'hex'), encode(defkey, 'hex') "
+			   "FROM pg_ws_deferred WHERE defrelid = $1::oid ORDER BY defkind, defname COLLATE \"C\"",
+			   1, params, &rows);
+	out = palloc0_array(WsDeferred, Max(rows.nrows, 1));
+	for (int i = 0; i < rows.nrows; i++)
+	{
+		const char *record = ws_sql_value(&rows, i, 2);
+		const char *key = ws_sql_value(&rows, i, 3);
+
+		out[i].kind = ws_sql_value(&rows, i, 0)[0];
+		out[i].name = ws_name_to_utf8(ws_sql_value(&rows, i, 1));
+		out[i].record.data = palloc(strlen(record) / 2 + 1);
+		out[i].record.len = hex_decode(record, strlen(record), (char *) out[i].record.data);
+		out[i].key.data = palloc(strlen(key) / 2 + 1);
+		out[i].key.len = hex_decode(key, strlen(key), (char *) out[i].key.data);
+	}
+	*n = rows.nrows;
+	ws_sql_rows_free(&rows);
+	return out;
+}
+
+static bytea *
+bytes_of(const Buf *b)
+{
+	bytea	   *out = palloc(VARHDRSZ + b->len);
+
+	SET_VARSIZE(out, VARHDRSZ + b->len);
+	if (b->len > 0)
+		memcpy(VARDATA(out), b->data, b->len);
+	return out;
+}
+
+static void
+catalog_add(Oid relid, const WsDeferred *d)
+{
+	Relation	rel = table_open(WsDeferredRelationId, RowExclusiveLock);
+	Datum		values[Natts_pg_ws_deferred];
+	bool		nulls[Natts_pg_ws_deferred] = {false};
+	NameData	name;
+	HeapTuple	tup;
+
+	namestrcpy(&name, ws_name_from_utf8(d->name));
+	values[Anum_pg_ws_deferred_defrelid - 1] = ObjectIdGetDatum(relid);
+	values[Anum_pg_ws_deferred_defkind - 1] = CharGetDatum(d->kind);
+	values[Anum_pg_ws_deferred_defname - 1] = NameGetDatum(&name);
+	values[Anum_pg_ws_deferred_defrecord - 1] = PointerGetDatum(bytes_of(&d->record));
+	values[Anum_pg_ws_deferred_defkey - 1] = PointerGetDatum(bytes_of(&d->key));
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
+}
+
+static void
+catalog_forget(Oid relid, char kind, const char *name)
+{
+	Relation	rel = table_open(WsDeferredRelationId, RowExclusiveLock);
+	ScanKeyData keys[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	char	   *here = ws_name_from_utf8(name);
+
+	ScanKeyInit(&keys[0], Anum_pg_ws_deferred_defrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, WsDeferredRelidKindNameIndexId, true, NULL, 1, keys);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_ws_deferred form = (Form_pg_ws_deferred) GETSTRUCT(tup);
+
+		if (form->defkind == kind && strcmp(NameStr(form->defname), here) == 0)
+			CatalogTupleDelete(rel, &tup->t_self);
+	}
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
+}
+
+static void
+catalog_forget_table(Oid relid)
+{
+	Relation	rel = table_open(WsDeferredRelationId, RowExclusiveLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	ScanKeyInit(&key, Anum_pg_ws_deferred_defrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, WsDeferredRelidKindNameIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		CatalogTupleDelete(rel, &tup->t_self);
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
+}
+
+static const WsDeferredStore catalog_store = {
+	.load = catalog_load,
+	.add = catalog_add,
+	.forget = catalog_forget,
+	.forget_table = catalog_forget_table,
+};
+
+const WsDeferredStore *const WsDeferreds = &catalog_store;
+
+/* ------------------------------------------------- restoring: setting aside */
+
+static const WsDeferredItem *
+deferred_item(const WsDeferrals *d, const char *table, char kind, const char *name)
+{
+	for (int i = 0; i < d->n; i++)
+		if (d->items[i].deferred.kind == kind && strcmp(d->items[i].table, table) == 0 &&
+			strcmp(d->items[i].deferred.name, name) == 0)
+			return &d->items[i];
+	return NULL;
+}
+
+static void
+item_add(WsDeferrals *d, const char *table, char kind, const char *name, const Buf *record, const Buf *key)
+{
+	static const Buf none = BUF_INIT;
+	WsDeferredItem *item;
+
+	if (deferred_item(d, table, kind, name) != NULL)
+		return;
+	d->items = d->items == NULL ? palloc_array(WsDeferredItem, 8) : repalloc_array(d->items, WsDeferredItem, d->n + 8);
+	item = &d->items[d->n++];
+	item->table = pstrdup(table);
+	item->deferred.kind = kind;
+	item->deferred.name = pstrdup(name);
+	item->deferred.record = *record;
+	item->deferred.key = key != NULL ? *key : none;
+}
+
+static bool
+same_columns(const uint64 *a, int na, const uint64 *b, int nb)
+{
+	if (na != nb)
+		return false;
+	for (int i = 0; i < na; i++)
+	{
+		bool		found = false;
+
+		for (int k = 0; !found && k < nb; k++)
+			found = a[i] == b[k];
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/* Whether a table's deferred unique constraint or index is what a key to it would need. */
+static bool
+key_needs_deferred(const WsDeferrals *d, const WsTableSchema *to, const WsForeignKey *fk)
+{
+	for (int i = 0; i < to->nconstraints; i++)
+		if (to->constraints[i].kind == WS_CONSTRAINT_UNIQUE &&
+			deferred_item(d, to->name, WS_DEFERRED_UNIQUE, to->constraints[i].name) != NULL &&
+			same_columns(fk->ref_cols, fk->ncols, to->constraints[i].cols, to->constraints[i].ncols))
+			return true;
+	for (int i = 0; i < to->nindexes; i++)
+	{
+		const WsIndex *ix = &to->indexes[i];
+		uint64	   *tags;
+
+		if (deferred_item(d, to->name, WS_DEFERRED_INDEX, ix->name) == NULL || ix->nkeys != fk->ncols)
+			continue;
+		tags = palloc_array(uint64, Max(ix->nkeys, 1));
+		for (int k = 0; k < ix->nkeys; k++)
+			tags[k] = ix->keys[k].tag;
+		if (same_columns(fk->ref_cols, fk->ncols, tags, ix->nkeys))
+			return true;
+	}
+	return false;
+}
+
+static void
+strip_comments(WsTableSchema *s, const WsDeferrals *d)
+{
+	int			kept = 0;
+
+	for (int i = 0; i < s->ncomments; i++)
+	{
+		const WsComment *c = &s->comments[i];
+		bool		named = c->kind == WS_COMMENT_CONSTRAINT || c->kind == WS_COMMENT_INDEX;
+
+		if (!named || (deferred_item(d, s->name, WS_DEFERRED_CHECK, c->name) == NULL &&
+					   deferred_item(d, s->name, WS_DEFERRED_NOT_NULL, c->name) == NULL &&
+					   deferred_item(d, s->name, WS_DEFERRED_UNIQUE, c->name) == NULL &&
+					   deferred_item(d, s->name, WS_DEFERRED_EXCLUSION, c->name) == NULL &&
+					   deferred_item(d, s->name, WS_DEFERRED_INDEX, c->name) == NULL))
+			s->comments[kept++] = *c;
+	}
+	s->ncomments = kept;
+}
+
+static void
+strip_record(WsTableSchema *s, const WsDeferrals *d)
+{
+	int			kept = 0;
+
+	for (int i = 0; i < s->ncols; i++)
+		if (s->cols[i].not_null != NULL && deferred_item(d, s->name, WS_DEFERRED_NOT_NULL, s->cols[i].not_null) != NULL)
+			s->cols[i].not_null = NULL;
+	for (int i = 0; i < s->nconstraints; i++)
+	{
+		const WsConstraint *con = &s->constraints[i];
+		char		kind = con->kind == WS_CONSTRAINT_CHECK ? WS_DEFERRED_CHECK :
+			con->kind == WS_CONSTRAINT_UNIQUE ? WS_DEFERRED_UNIQUE : WS_DEFERRED_EXCLUSION;
+
+		if (deferred_item(d, s->name, kind, con->name) == NULL)
+			s->constraints[kept++] = *con;
+	}
+	s->nconstraints = kept;
+	kept = 0;
+	for (int i = 0; i < s->nindexes; i++)
+		if (deferred_item(d, s->name, WS_DEFERRED_INDEX, s->indexes[i].name) == NULL)
+			s->indexes[kept++] = s->indexes[i];
+	s->nindexes = kept;
+	kept = 0;
+	for (int i = 0; i < s->nindex_settings; i++)
+	{
+		const char *index = s->index_settings[i].index;
+
+		if (deferred_item(d, s->name, WS_DEFERRED_INDEX, index) == NULL &&
+			deferred_item(d, s->name, WS_DEFERRED_UNIQUE, index) == NULL &&
+			deferred_item(d, s->name, WS_DEFERRED_EXCLUSION, index) == NULL)
+			s->index_settings[kept++] = s->index_settings[i];
+	}
+	s->nindex_settings = kept;
+	strip_comments(s, d);
+	if (s->replica_index != NULL && (deferred_item(d, s->name, WS_DEFERRED_INDEX, s->replica_index) != NULL ||
+									 deferred_item(d, s->name, WS_DEFERRED_UNIQUE, s->replica_index) != NULL))
+	{
+		s->replica_identity = WS_REPLICA_DEFAULT;
+		s->replica_index = NULL;
+	}
+	if (s->clustered != NULL && (deferred_item(d, s->name, WS_DEFERRED_INDEX, s->clustered) != NULL ||
+								 deferred_item(d, s->name, WS_DEFERRED_UNIQUE, s->clustered) != NULL ||
+								 deferred_item(d, s->name, WS_DEFERRED_EXCLUSION, s->clustered) != NULL))
+		s->clustered = NULL;
+}
+
+void
+ws_viol_defer(ProllyCtx *ctx, const PHash *root, WsTableSchema *recs, int nrecs, WsDeferrals *out)
+{
+	WsViolation *v;
+	int			n;
+	PHash		map;
+	Buf		   *encoded = palloc0_array(Buf, Max(nrecs, 1));
+	WsForeignKey *fks = NULL;
+	int			nfks = 0;
+
+	memset(out, 0, sizeof(*out));
+	WsViol->list(ctx, root, &v, &n);
+	if (n == 0)
+		return;
+	if (WsRoot->get_map(ctx, root, WS_ROOT_FOREIGN_KEYS, &map))
+		ws_fk_list(ctx, &map, &fks, &nfks);
+	for (int i = 0; i < nrecs; i++)
+		WsSchemaCodec->encode(&recs[i], &encoded[i]);
+	for (int i = 0; i < n; i++)
+	{
+		WsTableSchema *rec = NULL;
+		const Buf  *bytes = NULL;
+		char		kind;
+
+		for (int r = 0; r < nrecs && rec == NULL; r++)
+			if (strcmp(recs[r].name, v[i].table) == 0)
+			{
+				rec = &recs[r];
+				bytes = &encoded[r];
+			}
+		if (rec == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a violation is of table \"%s\", not there", v[i].table)));
+		if (rec->partition != WS_PARTITION_NONE || rec->partition_of != NULL || rec->ninherits > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("table \"%s\" has violations and is partitioned or inherits, which a restore cannot yet set them aside of",
+							v[i].table)));
+		for (int r = 0; r < nrecs; r++)
+			for (int p = 0; p < recs[r].ninherits; p++)
+				if (strcmp(recs[r].inherits[p], rec->name) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("table \"%s\" has violations and is partitioned or inherits, which a restore cannot yet set them aside of",
+									v[i].table)));
+		if (strcmp(v[i].kind, "foreign key") == 0)
+		{
+			for (int f = 0; f < nfks; f++)
+				if (strcmp(fks[f].table, v[i].table) == 0 && strcmp(fks[f].name, v[i].constraint) == 0)
+				{
+					Buf			key = BUF_INIT;
+					Buf			value = BUF_INIT;
+
+					WsFkCodec->encode_key(&fks[f], &key);
+					WsFkCodec->encode_value(&fks[f], &value);
+					item_add(out, v[i].table, WS_DEFERRED_FOREIGN_KEY, v[i].constraint, &value, &key);
+				}
+			continue;
+		}
+		kind = strcmp(v[i].kind, "check") == 0 ? WS_DEFERRED_CHECK :
+			strcmp(v[i].kind, "not null") == 0 ? WS_DEFERRED_NOT_NULL :
+			strcmp(v[i].kind, "exclusion") == 0 ? WS_DEFERRED_EXCLUSION : WS_DEFERRED_INDEX;
+		if (kind == WS_DEFERRED_INDEX)
+			for (int c = 0; c < rec->nconstraints; c++)
+				if (rec->constraints[c].kind == WS_CONSTRAINT_UNIQUE && strcmp(rec->constraints[c].name, v[i].constraint) == 0)
+					kind = WS_DEFERRED_UNIQUE;
+		item_add(out, v[i].table, kind, v[i].constraint, bytes, NULL);
+	}
+
+	/* (a key to what is set aside has nothing to be made on: it waits with it) */
+	for (int f = 0; f < nfks; f++)
+		for (int r = 0; r < nrecs; r++)
+			if (strcmp(recs[r].name, fks[f].ref_table) == 0 && key_needs_deferred(out, &recs[r], &fks[f]))
+			{
+				Buf			key = BUF_INIT;
+				Buf			value = BUF_INIT;
+
+				WsFkCodec->encode_key(&fks[f], &key);
+				WsFkCodec->encode_value(&fks[f], &value);
+				item_add(out, fks[f].table, WS_DEFERRED_FOREIGN_KEY, fks[f].name, &value, &key);
+			}
+	for (int r = 0; r < nrecs; r++)
+		strip_record(&recs[r], out);
+}
+
+bool
+ws_viol_key_deferred(const WsDeferrals *d, const WsForeignKey *fk)
+{
+	return deferred_item(d, fk->table, WS_DEFERRED_FOREIGN_KEY, fk->name) != NULL;
+}
+
+void
+ws_viol_defer_end(const char *schema, const WsDeferrals *d)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+
+	for (int i = 0; i < d->n; i++)
+		WsDeferreds->add(get_relname_relid(ws_name_from_utf8(d->items[i].table), nsp), &d->items[i].deferred);
+	if (d->n > 0)
+		CommandCounterIncrement();
+}
+
+/* ------------------------------------------------- capturing: folding back */
+
+static int
+constraint_name_cmp(const void *a, const void *b)
+{
+	return strcmp(((const WsConstraint *) a)->name, ((const WsConstraint *) b)->name);
+}
+
+static int
+index_name_cmp(const void *a, const void *b)
+{
+	return strcmp(((const WsIndex *) a)->name, ((const WsIndex *) b)->name);
+}
+
+static int
+settings_name_cmp(const void *a, const void *b)
+{
+	return strcmp(((const WsIndexSettings *) a)->index, ((const WsIndexSettings *) b)->index);
+}
+
+static int
+comment_order_cmp(const void *a, const void *b)
+{
+	const WsComment *x = a;
+	const WsComment *y = b;
+
+	if (x->kind != y->kind)
+		return (unsigned char) x->kind < (unsigned char) y->kind ? -1 : 1;
+	if (x->name != NULL && y->name != NULL)
+		return strcmp(x->name, y->name);
+	return x->tag < y->tag ? -1 : x->tag > y->tag;
+}
+
+/* What of a name a record held comes back: its comment, settings, and what it serves. */
+static void
+fold_named(WsTableSchema *s, const WsTableSchema *held, const char *name)
+{
+	for (int i = 0; i < held->nindex_settings; i++)
+		if (strcmp(held->index_settings[i].index, name) == 0)
+		{
+			s->index_settings = s->index_settings == NULL ? palloc_array(WsIndexSettings, 1) :
+				repalloc_array(s->index_settings, WsIndexSettings, s->nindex_settings + 1);
+			s->index_settings[s->nindex_settings++] = held->index_settings[i];
+		}
+	for (int i = 0; i < held->ncomments; i++)
+		if ((held->comments[i].kind == WS_COMMENT_CONSTRAINT || held->comments[i].kind == WS_COMMENT_INDEX) &&
+			strcmp(held->comments[i].name, name) == 0)
+		{
+			s->comments = s->comments == NULL ? palloc_array(WsComment, 1) :
+				repalloc_array(s->comments, WsComment, s->ncomments + 1);
+			s->comments[s->ncomments++] = held->comments[i];
+		}
+	if (held->replica_index != NULL && strcmp(held->replica_index, name) == 0)
+	{
+		s->replica_identity = held->replica_identity;
+		s->replica_index = held->replica_index;
+	}
+	if (held->clustered != NULL && strcmp(held->clustered, name) == 0)
+		s->clustered = held->clustered;
+}
+
+void
+ws_viol_fold(const char *schema, WsTableSchema *s)
+{
+	Oid			relid = get_relname_relid(ws_name_from_utf8(s->name), get_namespace_oid(schema, false));
+	int			n;
+	WsDeferred *d = WsDeferreds->load(relid, &n);
+
+	for (int i = 0; i < n; i++)
+	{
+		WsTableSchema held;
+
+		if (d[i].kind == WS_DEFERRED_FOREIGN_KEY)
+			continue;
+		WsSchemaCodec->decode(d[i].record.data, d[i].record.len, &held);
+		if (d[i].kind == WS_DEFERRED_NOT_NULL)
+		{
+			for (int c = 0; c < held.ncols; c++)
+				if (held.cols[c].not_null != NULL && strcmp(held.cols[c].not_null, d[i].name) == 0)
+					for (int k = 0; k < s->ncols; k++)
+						if (s->cols[k].tag == held.cols[c].tag)
+							s->cols[k].not_null = held.cols[c].not_null;
+		}
+		else if (d[i].kind == WS_DEFERRED_INDEX)
+		{
+			for (int k = 0; k < held.nindexes; k++)
+				if (strcmp(held.indexes[k].name, d[i].name) == 0)
+				{
+					s->indexes = s->indexes == NULL ? palloc_array(WsIndex, 1) :
+						repalloc_array(s->indexes, WsIndex, s->nindexes + 1);
+					s->indexes[s->nindexes++] = held.indexes[k];
+				}
+		}
+		else
+		{
+			for (int k = 0; k < held.nconstraints; k++)
+				if (strcmp(held.constraints[k].name, d[i].name) == 0)
+				{
+					s->constraints = s->constraints == NULL ? palloc_array(WsConstraint, 1) :
+						repalloc_array(s->constraints, WsConstraint, s->nconstraints + 1);
+					s->constraints[s->nconstraints++] = held.constraints[k];
+				}
+		}
+		fold_named(s, &held, d[i].name);
+	}
+	if (n > 0)
+	{
+		qsort(s->constraints, s->nconstraints, sizeof(WsConstraint), constraint_name_cmp);
+		qsort(s->indexes, s->nindexes, sizeof(WsIndex), index_name_cmp);
+		qsort(s->index_settings, s->nindex_settings, sizeof(WsIndexSettings), settings_name_cmp);
+		qsort(s->comments, s->ncomments, sizeof(WsComment), comment_order_cmp);
+	}
+}
+
+void
+ws_viol_fold_keys(const char *schema, const char *table, WsForeignKey **fks, int *nfks)
+{
+	Oid			relid = get_relname_relid(table, get_namespace_oid(schema, false));
+	int			n;
+	WsDeferred *d = WsDeferreds->load(relid, &n);
+
+	for (int i = 0; i < n; i++)
+		if (d[i].kind == WS_DEFERRED_FOREIGN_KEY)
+		{
+			*fks = *fks == NULL ? palloc_array(WsForeignKey, 1) : repalloc_array(*fks, WsForeignKey, *nfks + 1);
+			WsFkCodec->decode(d[i].key.data, d[i].key.len, d[i].record.data, d[i].record.len, &(*fks)[(*nfks)++]);
+		}
+}
+
+bool
+ws_viol_any_deferred(const char *schema)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+	bool		any;
+
+	WsSql->run("SELECT EXISTS (SELECT FROM pg_ws_deferred d JOIN pg_class c ON c.oid = d.defrelid "
+			   "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name)", 1, params, &rows);
+	any = ws_sql_value(&rows, 0, 0)[0] == 't';
+	ws_sql_rows_free(&rows);
+	return any;
+}
+
+/* ---------------------------------------------------------------- resolving */
+
+/* A table's whole record, what is deferred of it included. */
+static void
+read_whole(const char *schema, const char *table, WsTableSchema *s)
+{
+	if (!ws_schema_read(schema, table, s))
+		elog(ERROR, "table \"%s\" of schema \"%s\" is gone", table, schema);
+	ws_viol_fold(schema, s);
+}
+
+/* The statement making what is deferred, in *sql. */
+static void
+deferred_statement(const WsTableSchema *s, const WsDeferred *d, const char *schema, const char *table, Buf *sql)
+{
+	switch (d->kind)
+	{
+		case WS_DEFERRED_NOT_NULL:
+			for (int c = 0; c < s->ncols; c++)
+				if (s->cols[c].not_null != NULL && strcmp(s->cols[c].not_null, d->name) == 0)
+					ws_schema_add_not_null(s, s->cols[c].tag, schema, sql);
+			return;
+		case WS_DEFERRED_INDEX:
+			for (int i = 0; i < s->nindexes; i++)
+				if (strcmp(s->indexes[i].name, d->name) == 0)
+					ws_schema_create_index(s, i, schema, sql);
+			return;
+		case WS_DEFERRED_FOREIGN_KEY:
+			{
+				WsForeignKey fk;
+				WsTableSchema to;
+
+				WsFkCodec->decode(d->key.data, d->key.len, d->record.data, d->record.len, &fk);
+				read_whole(schema, ws_name_from_utf8(fk.ref_table), &to);
+				ws_fk_add_statement(&fk, s, &to, schema, sql);
+				ws_schema_free(&to);
+				return;
+			}
+		default:
+			for (int i = 0; i < s->nconstraints; i++)
+				if (strcmp(s->constraints[i].name, d->name) == 0)
+					ws_schema_add_constraint(s, i, schema, sql);
+	}
+}
+
+/* What goes with what was just made: its comment, settings and what it serves. */
+static void
+made_named(const WsTableSchema *s, const char *name, const char *schema)
+{
+	Buf			sql = BUF_INIT;
+	WsSqlRows	rows;
+
+	for (int i = 0; i < s->ncomments; i++)
+		if ((s->comments[i].kind == WS_COMMENT_CONSTRAINT || s->comments[i].kind == WS_COMMENT_INDEX) &&
+			strcmp(s->comments[i].name, name) == 0)
+			ws_schema_comment(s, i, schema, &sql);
+	if (sql.len > 0)
+	{
+		buf_append_byte(&sql, 0);
+		WsSql->run((const char *) sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		sql.len = 0;
+	}
+	for (int i = 0; i < s->nindex_settings; i++)
+		if (strcmp(s->index_settings[i].index, name) == 0)
+			ws_schema_index_stats(s, i, schema, &sql);
+	if (sql.len > 0)
+	{
+		buf_append_byte(&sql, 0);
+		WsSql->run((const char *) sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+		sql.len = 0;
+	}
+	if ((s->replica_index != NULL && strcmp(s->replica_index, name) == 0) ||
+		(s->clustered != NULL && strcmp(s->clustered, name) == 0))
+	{
+		ws_schema_table_settings(s, schema, &sql);
+		buf_append_byte(&sql, 0);
+		WsSql->run((const char *) sql.data, 0, NULL, &rows);
+		ws_sql_rows_free(&rows);
+	}
+	buf_free(&sql);
+}
+
+static int
+query_resolve(ProllyCtx *ctx, const char *schema)
+{
+	const char *params[1] = {schema};
+	int			level = WsSql->begin();
+	int			nest = ws_schema_path_begin(schema);
+	WsSqlRows	tables;
+	int			left = 0;
+
+	/* (foreign keys last, as one may need a unique constraint that was waiting too) */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		WsSql->run("SELECT DISTINCT c.oid::text, c.relname::text FROM pg_ws_deferred d JOIN pg_class c ON c.oid = d.defrelid "
+				   "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name ORDER BY 2", 1, params, &tables);
+		for (int t = 0; t < tables.nrows; t++)
+		{
+			Oid			relid = atooid(ws_sql_value(&tables, t, 0));
+			const char *table = ws_sql_value(&tables, t, 1);
+			int			n;
+			WsDeferred *d = WsDeferreds->load(relid, &n);
+
+			for (int i = 0; i < n; i++)
+			{
+				WsTableSchema s;
+				Buf			sql = BUF_INIT;
+				WsSqlRows	rows;
+				WsSqlFailure failure;
+
+				CHECK_FOR_INTERRUPTS();
+				if ((d[i].kind == WS_DEFERRED_FOREIGN_KEY) != (pass == 1))
+					continue;
+				read_whole(schema, table, &s);
+				deferred_statement(&s, &d[i], schema, table, &sql);
+				buf_append_byte(&sql, 0);
+				if (WsSql->attempt((const char *) sql.data, 0, NULL, &rows, &failure))
+				{
+					ws_sql_rows_free(&rows);
+					WsDeferreds->forget(relid, d[i].kind, d[i].name);
+					CommandCounterIncrement();
+					made_named(&s, d[i].name, schema);
+				}
+				else if (strncmp(failure.sqlstate, "23", 2) == 0 || strcmp(failure.sqlstate, "42830") == 0)
+				{
+					left++;
+					ws_sql_failure_free(&failure);
+				}
+				else
+					ereport(ERROR,
+							(errcode(MAKE_SQLSTATE(failure.sqlstate[0], failure.sqlstate[1], failure.sqlstate[2],
+												   failure.sqlstate[3], failure.sqlstate[4])),
+							 errmsg("%s", failure.message != NULL ? failure.message : "a deferred constraint was refused")));
+				ws_schema_free(&s);
+				buf_free(&sql);
+			}
+		}
+		ws_sql_rows_free(&tables);
+	}
+	ws_schema_path_end(nest);
+	WsSql->end(level);
+	return left;
+}
+
 const WsViolRoutine QueryWsViol = {
 	.name = "query",
 	.recheck = query_recheck,
 	.list = query_list,
+	.resolve = query_resolve,
 };
 
 const WsViolRoutine *WsViol = &QueryWsViol;

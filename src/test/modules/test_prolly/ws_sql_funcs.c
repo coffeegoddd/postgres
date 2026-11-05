@@ -66,6 +66,7 @@ PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_merge);
 PG_FUNCTION_INFO_V1(test_ws_merge_checked);
 PG_FUNCTION_INFO_V1(test_ws_violations);
+PG_FUNCTION_INFO_V1(test_ws_viol_resolve);
 PG_FUNCTION_INFO_V1(test_ws_root_table_bytes);
 PG_FUNCTION_INFO_V1(test_ws_root_rows_restore);
 PG_FUNCTION_INFO_V1(test_ws_root_rows_hash);
@@ -1040,6 +1041,13 @@ test_ws_violations(PG_FUNCTION_ARGS)
 		appendStringInfo(&out, "%s%s %s %s%s%s", i > 0 ? "\n" : "", v[i].kind, v[i].table, v[i].constraint,
 						 v[i].rowkey != NULL ? " " : "", v[i].rowkey != NULL ? v[i].rowkey : "");
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* test_ws_viol_resolve(schema text) returns integer: how many a schema still has set aside */
+Datum
+test_ws_viol_resolve(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(WsViol->resolve(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(0))));
 }
 
 /* test_ws_root_table_bytes(root text, tab text) returns bytea: a table's record in a root */

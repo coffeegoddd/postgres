@@ -81,6 +81,7 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #include "prolly/ws/ws_print.h"
+#include "prolly/ws/ws_viol.h"
 #include "rewrite/rewriteRemove.h"
 #include "storage/lmgr.h"
 #include "utils/fmgroids.h"
@@ -1351,6 +1352,8 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 	DeleteSecurityLabel(object);
 	if (object->classId == NamespaceRelationId)
 		WsPrints->forget_schema(object->objectId);
+	if (object->classId == RelationRelationId && object->objectSubId == 0)
+		WsDeferreds->forget_table(object->objectId);
 	DeleteInitPrivs(object);
 
 	/*

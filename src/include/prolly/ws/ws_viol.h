@@ -23,6 +23,17 @@
  * two, and a violation of another kind is another.  Only the root's rows say what they
  * are, so a root is rechecked as it stands, whoever fixed what.
  *
+ * A root holding them restores as it is: its rows in their tables, and each constraint
+ * violated, and a foreign key on a unique one, set aside with what goes with it (its
+ * comment, an index's settings, a replica identity or clustering through it), in
+ * pg_ws_deferred, as real tables cannot hold what a unique index refuses and the planner
+ * trusts what a check says.  Capture folds them back, so what is restored captures as the
+ * root it came from, and rechecks to say which still are violated.  One clears only by
+ * being applied again, with the rows fixed (resolve): nothing else does.  It can't yet be
+ * dropped or changed while it waits, nor a column it names dropped, which capture then
+ * refuses.  A partitioned or inheriting table's violations cannot be set aside yet:
+ * restoring one is refused.
+ *
  * What a root's rows cannot be, with no constraint on them, is a merge's conflict, and
  * not a violation: a value of no type it now has, two keys alike as 1.0 and 1.00 are, a
  * row outside its partition, an expression that raises for a row.  So is what Postgres
@@ -39,7 +50,9 @@
 #define PROLLY_WS_VIOL_H
 
 #include "prolly/engine/prolly.h"
+#include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
+#include "prolly/ws/ws_schema.h"
 
 typedef struct WsViolation
 {
@@ -61,10 +74,71 @@ typedef struct WsViolRoutine
 
 	/* What a root holds of them, in key order. */
 	void		(*list) (ProllyCtx *ctx, const PHash *root, WsViolation **out, int *n);
+
+	/*
+	 * Applies again each constraint set aside of a schema, as many as now hold going
+	 * from pg_ws_deferred; how many still do not.  A foreign key waits for what it needs.
+	 */
+	int			(*resolve) (ProllyCtx *ctx, const char *schema);
 } WsViolRoutine;
 
 /* A ~viol key's parts, palloc'd; ERRCODE_DATA_CORRUPTED if it has too few. */
 extern void ws_viol_key(const uint8 *key, size_t klen, WsViolation *out);
+
+#define WS_DEFERRED_CHECK 'c'
+#define WS_DEFERRED_NOT_NULL 'n'
+#define WS_DEFERRED_UNIQUE 'u'
+#define WS_DEFERRED_EXCLUSION 'x'
+#define WS_DEFERRED_INDEX 'i'
+#define WS_DEFERRED_FOREIGN_KEY 'f'
+
+/* One set aside: of a record's bytes, or a foreign key's value and key. */
+typedef struct WsDeferred
+{
+	char		kind;			/* WS_DEFERRED_* */
+	const char *name;			/* UTF8 */
+	Buf			record;
+	Buf			key;
+} WsDeferred;
+
+typedef struct WsDeferredStore
+{
+	/* A table's, palloc'd, of *n: at what WsSql reads now. */
+	WsDeferred *(*load) (Oid relid, int *n);
+	void		(*add) (Oid relid, const WsDeferred *d);
+	void		(*forget) (Oid relid, char kind, const char *name);
+	/* All of a table's, as it is dropped. */
+	void		(*forget_table) (Oid relid);
+} WsDeferredStore;
+
+extern const WsDeferredStore *const WsDeferreds;
+
+typedef struct WsDeferredItem
+{
+	const char *table;
+	WsDeferred	deferred;
+} WsDeferredItem;
+
+typedef struct WsDeferrals
+{
+	int			n;
+	WsDeferredItem *items;
+} WsDeferrals;
+
+/*
+ * For restoring a root: what it holds as violated, in *out, and these records of its
+ * tables without that.  ERRCODE_FEATURE_NOT_SUPPORTED for a partitioned or inheriting
+ * table's.  What it leaves of a record is the restore's to make, and _end remembers the
+ * rest once its tables are.
+ */
+extern void ws_viol_defer(ProllyCtx *ctx, const PHash *root, WsTableSchema *recs, int nrecs, WsDeferrals *out);
+extern bool ws_viol_key_deferred(const WsDeferrals *d, const WsForeignKey *fk);
+extern void ws_viol_defer_end(const char *schema, const WsDeferrals *d);
+
+/* For capturing a schema: a record of a table, or its keys, with what is set aside of it. */
+extern void ws_viol_fold(const char *schema, WsTableSchema *s);
+extern void ws_viol_fold_keys(const char *schema, const char *table, WsForeignKey **fks, int *nfks);
+extern bool ws_viol_any_deferred(const char *schema);
 
 extern PGDLLIMPORT const WsViolRoutine QueryWsViol;
 

@@ -29,6 +29,7 @@
 #include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "prolly/ws/ws_viol.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -108,6 +109,7 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		CHECK_FOR_INTERRUPTS();
 		if (!ws_schema_read(schema, table, &rec))
 			elog(ERROR, "table \"%s\" of schema \"%s\" is gone", table, schema);
+		ws_viol_fold(schema, &rec);
 		WsRows->capture(ctx, schema, &rec, &rows);
 		WsRoot->put_table(ctx, &rv, &rec, &rows, &rv);
 		if (rec.owner != NULL)
@@ -117,6 +119,7 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 				name_add(&roles, &nroles, rec.grants[g].grantee);
 		ws_schema_free(&rec);
 		ws_fk_read(schema, table, &fks, &nfks);
+		ws_viol_fold_keys(schema, table, &fks, &nfks);
 		if (nfks > 0)
 		{
 			all = all == NULL ? palloc_array(WsForeignKey, nfks) : repalloc_array(all, WsForeignKey, nall + nfks);
@@ -156,6 +159,15 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		ws_role_read((const char *const *) roles, nroles, &held, &nheld);
 		ws_role_map(ctx, held, nheld, &map);
 		WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
+	}
+	if (ws_viol_any_deferred(schema))
+	{
+		char	   *why = NULL;
+
+		if (!WsViol->recheck(ctx, &rv, schema, &rv, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("schema \"%s\" has constraints set aside and could not be checked: %s", schema, why)));
 	}
 	WsSql->end(level);
 	*root = rv;
@@ -392,7 +404,8 @@ bare_record(const WsTableSchema *s, WsTableSchema *out)
 }
 
 static void
-add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const char *schema)
+add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const WsDeferrals *deferred,
+				 const char *schema)
 {
 	PHash		map;
 	WsForeignKey *fks;
@@ -408,7 +421,7 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
 
 		/* (a table's last name first: the list is by table, then name) */
 		for (int i = n - 1; i >= 0; i--)
-			if (strcmp(fks[i].table, rec->name) == 0)
+			if (strcmp(fks[i].table, rec->name) == 0 && !ws_viol_key_deferred(deferred, &fks[i]))
 			{
 				const WsTableSchema *to = &tables->recs[table_index(tables, fks[i].ref_table)];
 
@@ -457,6 +470,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	WsObject   *objs = NULL;
 	int			nobjs = 0;
 	Buf			sql = BUF_INIT;
+	WsDeferrals deferred = {0};
 	bool		owner_absent = false;
 
 	WsSql->run("SELECT (SELECT count(*) FROM pg_namespace n, LATERAL (" \
@@ -532,6 +546,8 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	ws_obj_restore(objs, nobjs, schema, true);
 
 	tables_in_order(ctx, root, &tables);
+	if (fn == NULL && no_rows == NULL)
+		ws_viol_defer(ctx, root, tables.recs, tables.nnames, &deferred);
 	for (int t = 0; t < tables.n; t++)
 	{
 		int			i = tables.order[t];
@@ -604,7 +620,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	}
 	for (int t = 0; t < tables.n; t++)
 		ws_schema_set_inherited(schema, &tables.recs[tables.order[t]]);
-	add_foreign_keys(ctx, root, &tables, schema);
+	add_foreign_keys(ctx, root, &tables, &deferred, schema);
 	for (int t = 0; t < tables.n; t++)
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
@@ -643,6 +659,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	for (int t = 0; t < tables.n; t++)
 		ws_schema_remember(&tables.recs[tables.order[t]], schema);
 	ws_obj_remember(objs, nobjs, schema);
+	ws_viol_defer_end(schema, &deferred);
 
 done:
 	for (int i = 0; i < nobjs; i++)

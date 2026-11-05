@@ -4,8 +4,9 @@
 # and checked.  What each expects is exact: its conflicts, or its violations, or, if it is
 # clean, what its merged root says once restored.  The schema a file calls rt is each
 # side's own here, and what a function's body names is by its path, as a body is the same
-# text on each side only then.  Materialized views restore with no data.  What a file says
-# to resolve waits for a root with violations to be restored.
+# text on each side only then.  Materialized views restore with no data.  A root with
+# violations restores too, capturing as itself, and what a file says to resolve must clear
+# them.
 
 use strict;
 use warnings FATAL => 'all';
@@ -85,7 +86,9 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	SELECT test_ws_violations(:'m');
 	\\echo =====end
 	};
-	if (!@want_conflicts && !@want_violations)
+	my @after = map { /^check (.*) => (.*)$/ ? ([ $1, $2 ]) : die "$name: what is this: $_" }
+	  grep { /\S/ } split /\n/, $s->{after} // '';
+	if (!@want_conflicts)
 	{
 		$script .= qq{SELECT last_value AS calls FROM public.vc_gen_calls \\gset\n};
 		$script .= qq{SELECT test_ws_root_restore(:'m', '$d') IS NULL AS restored \\gset\n};
@@ -96,6 +99,18 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 		{
 			$k++;
 			$script .= "\\echo =====check$k\n" . in_schema($check->[0], $d) . ";\n\\echo =====end\n";
+		}
+		if (defined $s->{resolve})
+		{
+			$script .= in_schema($s->{resolve}, $d);
+			$script .= qq{\\echo =====left\nSELECT test_ws_viol_resolve('$d');\n\\echo =====end\n};
+			$script .= qq{\\echo =====cleared\nSELECT test_ws_violations(test_ws_root_capture('$d'));\n\\echo =====end\n};
+			$k = 0;
+			for my $check (@after)
+			{
+				$k++;
+				$script .= "\\echo =====after$k\n" . in_schema($check->[0], $d) . ";\n\\echo =====end\n";
+			}
 		}
 	}
 	# (a scenario's catalog checks see only what it restored)
@@ -112,7 +127,6 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 	my ($viol) = $out =~ /=====viol\n(.*?)\n?=====end/s;
 	my @got = split /\n/, $viol // '';
 	is_deeply([ sort @got ], [ sort @want_violations ], "$name: its violations");
-	next if @want_violations;
 	my ($same) = $out =~ /=====same\n(.*?)\n?=====end/s;
 	is($same // '', 't', "$name: restored, the root the merge made");
 	my ($calls) = $out =~ /=====calls\n(.*?)\n?=====end/s;
@@ -123,6 +137,20 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 		$k++;
 		my ($got) = $out =~ /=====check$k\n(.*?)\n?=====end/s;
 		is($got // '', in_schema($check->[1], $d), "$name: $check->[0]");
+	}
+	if (defined $s->{resolve})
+	{
+		my ($left) = $out =~ /=====left\n(.*?)\n?=====end/s;
+		is($left // '', '0', "$name: resolved");
+		my ($cleared) = $out =~ /=====cleared\n(.*?)\n?=====end/s;
+		is($cleared // 'none', '', "$name: captures with no violations");
+		$k = 0;
+		for my $check (@after)
+		{
+			$k++;
+			my ($got) = $out =~ /=====after$k\n(.*?)\n?=====end/s;
+			is($got // '', in_schema($check->[1], $d), "$name, resolved: $check->[0]");
+		}
 	}
 }
 }
