@@ -1320,12 +1320,17 @@ $node->safe_psql('postgres', q{
 	SET search_path = ag;
 	CREATE FUNCTION sfn(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
 	CREATE FUNCTION ffn(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE FUNCTION int4pl_any(integer, anyelement) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
 	CREATE FUNCTION lt(integer, integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 < $2';
 	CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = lt);
 	CREATE AGGREGATE full_one(integer) (SFUNC = sfn, STYPE = integer, SSPACE = 16, INITCOND = '0', FINALFUNC = ffn, FINALFUNC_MODIFY = READ_WRITE,
 		COMBINEFUNC = sfn, SORTOP = <<<, PARALLEL = SAFE);
 	CREATE AGGREGATE moving(integer) (SFUNC = sfn, STYPE = integer, MSFUNC = sfn, MINVFUNC = sfn, MSTYPE = integer, MSSPACE = 8, MFINALFUNC = ffn, MFINALFUNC_MODIFY = SHAREABLE, MINITCOND = '0', PARALLEL = RESTRICTED);
 	CREATE AGGREGATE quoted(text) (SFUNC = textcat, STYPE = text, INITCOND = 'it''s');
+	CREATE AGGREGATE ser(numeric) (SFUNC = numeric_avg_accum, STYPE = internal, FINALFUNC = numeric_avg, COMBINEFUNC = numeric_avg_combine,
+		SERIALFUNC = numeric_avg_serialize, DESERIALFUNC = numeric_avg_deserialize);
+	CREATE FUNCTION fx(integer, anyelement) RETURNS anyelement LANGUAGE sql IMMUTABLE AS 'SELECT $2';
+	CREATE AGGREGATE mx(anyelement) (SFUNC = int4pl_any, STYPE = integer, FINALFUNC = fx, FINALFUNC_EXTRA, MSFUNC = int4pl_any, MINVFUNC = int4pl_any, MSTYPE = integer, MFINALFUNC = fx, MFINALFUNC_EXTRA);
 	CREATE AGGREGATE star(*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
 	CREATE AGGREGATE poly(anycompatible) (SFUNC = array_append, STYPE = anycompatiblearray, INITCOND = '{}');
 	CREATE AGGREGATE ordered(float8 ORDER BY anyelement) (SFUNC = ordered_set_transition, STYPE = internal, FINALFUNC = percentile_disc_final, FINALFUNC_EXTRA, FINALFUNC_MODIFY = READ_WRITE);
@@ -1344,6 +1349,8 @@ my %ag_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, 
 ok($ag_val{$_}, "$_ is held") for ('aggregate/full_one(integer)', 'aggregate/moving(integer)', 'aggregate/star()', 'aggregate/poly(anycompatible)',
 	'aggregate/ordered(double precision, anyelement)', 'aggregate/hypo("any")');
 like($ag_val{'aggregate/star()'}, qr/\(\*\) \(SFUNC = int8inc/, 'an aggregate of no arguments says so');
+like($ag_val{'aggregate/ser(numeric)'}, qr/SERIALFUNC = numeric_avg_serialize, DESERIALFUNC = numeric_avg_deserialize/, 'and says how to serialize');
+like($ag_val{'aggregate/mx(anyelement)'}, qr/MFINALFUNC_EXTRA/, 'and what a moving final function takes');
 like($ag_val{'aggregate/ordered(double precision, anyelement)'}, qr/ORDER BY anyelement/, 'and one of order');
 like($ag_val{'aggregate/hypo("any")'}, qr/HYPOTHETICAL/, 'and a hypothetical one');
 like($ag_val{'aggregate/full_one(integer)'}, qr/operator\/<<<\(integer, integer\)/, 'it needs its operator');
@@ -1357,7 +1364,9 @@ is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ag2')}), $ag_held, '
 my $ag_cat = sub {
 	my $s = shift;
 	return $node->safe_psql('postgres', qq{SELECT string_agg(format('%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s', p.proname, a.aggkind, a.aggnumdirectargs, a.aggfinalextra, a.aggmfinalextra, a.aggfinalmodify, a.aggmfinalmodify,
-		a.aggtransspace, a.aggmtransspace, a.agginitval, a.aggminitval, p.proparallel, a.aggcombinefn::oid <> 0, a.aggsortop <> 0, a.aggtranstype::regtype::text LIKE '%int%', a.aggminvtransfn::oid <> 0), ', ' ORDER BY p.proname)
+		a.aggtransspace, a.aggmtransspace, a.agginitval, a.aggminitval, p.proparallel, 
+		regexp_replace(concat_ws(' ', a.aggtransfn, a.aggfinalfn, a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, a.aggminvtransfn, a.aggmfinalfn), '\\yag2?\\.', '', 'g'),
+		a.aggsortop <> 0, regexp_replace(a.aggtranstype::regtype::text, '\\yag2?\\.', ''), regexp_replace(a.aggmtranstype::regtype::text, '\\yag2?\\.', '')), ', ' ORDER BY p.proname)
 		FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = '$s'::regnamespace});
 };
 is($ag_cat->('ag2'), $ag_cat->('ag'), 'and as they were');
@@ -1383,6 +1392,10 @@ $node->safe_psql('postgres', q{
 	ALTER TEXT SEARCH CONFIGURATION cfg OWNER TO g_tsowner;
 	CREATE TEXT SEARCH CONFIGURATION "Odd Cfg" (PARSER = "default");
 	COMMENT ON TEXT SEARCH PARSER prs IS 'p'; COMMENT ON TEXT SEARCH TEMPLATE tmp IS 't';
+	CREATE TEXT SEARCH DICTIONARY thes (TEMPLATE = thesaurus, DictFile = thesaurus_sample, Dictionary = english_stem);
+	CREATE TABLE uses (a text); ALTER TABLE uses OWNER TO g_tsowner;
+	CREATE VIEW v AS SELECT to_tsvector('cfg'::regconfig, a) AS x FROM uses; ALTER VIEW v OWNER TO g_tsowner;
+	CREATE DOMAIN d AS text CHECK (to_tsvector('cfg'::regconfig, VALUE) IS NOT NULL);
 	COMMENT ON TEXT SEARCH DICTIONARY dict IS 'd'; COMMENT ON TEXT SEARCH CONFIGURATION cfg IS 'c';
 });
 my $ts_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ts')});
@@ -1391,11 +1404,15 @@ ok($ts_val{$_}, "$_ is held") for ('tsparser/prs', 'tstemplate/tmp', 'tsdict/dic
 like($ts_val{'tsdict/dict'}, qr/TEMPLATE = tmp, stopwords = 'english', accept = 'false'/, 'a dictionary says its options');
 like($ts_val{'tsdict/dict'}, qr/tstemplate\/tmp/, 'and needs its template');
 like($ts_val{'tsconfig/cfg'}, qr/tsparser\/prs/, 'a configuration needs its parser');
+like($ts_val{'tsparser/prs'}, qr/HEADLINE = prsd_headline/, 'a parser says how it makes a headline');
+like($ts_val{'view/v'}, qr/tsconfig\/cfg/, 'a view needs a configuration');
+like($ts_val{'domain/d'}, qr/tsconfig\/cfg/, 'as does a domain');
 like($ts_val{'tsconfig/cfg'}, qr/tsdict\/dict/, 'and its dictionaries');
 like($ts_val{'tsmap/cfg(asciiword)'}, qr/ADD MAPPING FOR asciiword WITH dict, "Odd Dict"/, 'a mapping says them in order');
 like($ts_val{'tsmap/cfg(host)'}, qr/WITH simple/, 'and those of the catalogs');
 unlike(join('', values %ts_val), qr/\bts\./, 'none names its schema');
-$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ts', 'ts2')});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ts', 'ts2', 'before'); SET ROLE g_tsowner; CREATE TABLE ts2.uses (a text)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ts', 'ts2', 'after')});
 is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ts2')}), $ts_held, 'text search objects are the same bytes restored');
 is( $node->safe_psql('postgres', q{SELECT to_tsvector('ts2.cfg', 'The quick host.example.com') = to_tsvector('ts.cfg', 'The quick host.example.com')}), 't', 'and work as they did');
 is($node->safe_psql('postgres', q{SELECT cfgowner::regrole FROM pg_ts_config WHERE cfgname = 'cfg' AND cfgnamespace = 'ts2'::regnamespace}), 'g_tsowner', 'with their owners');
@@ -1433,6 +1450,13 @@ $node->safe_psql('postgres', q{CREATE FUNCTION public.ag_else(integer, integer) 
 	CREATE FOREIGN DATA WRAPPER fdw_st; CREATE SERVER srv_st FOREIGN DATA WRAPPER fdw_st});
 for my $case (
 	[ q{CREATE AGGREGATE a(integer) (SFUNC = public.ag_else, STYPE = integer)}, 'another schema' ],
+	[ q{CREATE FUNCTION sf(integer, anyelement) RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE FUNCTION sf(integer, integer) RETURNS integer LANGUAGE sql AS 'SELECT 2'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = integer)}, 'has overloads' ],
+	[ q{CREATE TABLE t (a integer); CREATE FUNCTION sf(regclass, integer) RETURNS regclass LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = regclass, INITCOND = 'ka5.t')}, "say a schema's name" ],
+	[ q{CREATE TABLE t (a integer); CREATE TYPE hr AS (r regclass); CREATE FUNCTION sf(hr, integer) RETURNS hr LANGUAGE sql AS 'SELECT $1'; CREATE AGGREGATE a(integer) (SFUNC = sf, STYPE = hr, INITCOND = '(ka5.t)')}, "say a schema's name" ],
+	[ q{CREATE TEXT SEARCH DICTIONARY sub (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY th (TEMPLATE = thesaurus, DictFile = thesaurus_sample, Dictionary = sub)}, 'its dictionary option' ],
+	[ q{CREATE TEXT SEARCH DICTIONARY sub (TEMPLATE = simple); CREATE TEXT SEARCH DICTIONARY th (TEMPLATE = thesaurus, DictFile = thesaurus_sample, Dictionary = 'ka5.sub')}, 'its dictionary option' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); CREATE TABLE t (a text, v tsvector); CREATE TRIGGER g BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger(v, 'ka5.c', a)}, 'says this schema' ],
+	[ q{CREATE TYPE h AS (r regclass); CREATE TABLE t (a text, b integer); CREATE STATISTICS s ON (('(ka5.t)'::h)::text || a), b FROM t}, 'hold names' ],
 	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE AGGREGATE a(ka5."date") (SFUNC = enum_larger, STYPE = ka5."date")}, "say a schema's name" ],
 	[ q{CREATE TEXT SEARCH DICTIONARY simple (TEMPLATE = simple)}, 'as one in the catalogs' ],
 	[ q{CREATE TEXT SEARCH CONFIGURATION english (PARSER = "default")}, 'as one in the catalogs' ],
@@ -1473,7 +1497,8 @@ for my $x (
 # since a snapshot, one to try again
 for my $change ([ 'ts', q{COMMENT ON TEXT SEARCH PARSER ts.prs IS 'later'} ], [ 'ts', q{COMMENT ON TEXT SEARCH TEMPLATE ts.tmp IS 'later'} ],
 	[ 'ts', q{ALTER TEXT SEARCH DICTIONARY ts.dict (accept = true)} ], [ 'ts', q{ALTER TEXT SEARCH CONFIGURATION ts.cfg ALTER MAPPING FOR host WITH ts.dict} ],
-	[ 'ts', q{COMMENT ON TEXT SEARCH CONFIGURATION ts.cfg IS 'later'} ], [ 'sx', q{ALTER STATISTICS sx.ex RENAME TO ex2} ], [ 'sx', q{COMMENT ON STATISTICS sx.st IS 'later'} ],
+	[ 'ts', q{COMMENT ON TEXT SEARCH CONFIGURATION ts.cfg IS 'later'} ], [ 'ts', q{COMMENT ON TEXT SEARCH DICTIONARY ts.dict IS 'later'} ],
+	[ 'ts', q{ALTER TEXT SEARCH TEMPLATE ts.no_init RENAME TO no_init2} ], [ 'ts', q{ALTER TEXT SEARCH PARSER ts."Odd Prs" RENAME TO odd_prs} ], [ 'sx', q{ALTER STATISTICS sx.ex RENAME TO ex2} ], [ 'sx', q{COMMENT ON STATISTICS sx.st IS 'later'} ],
 	[ 'ag', q{COMMENT ON AGGREGATE ag.star(*) IS 'later'} ])
 {
 	my ($where, $sql) = @$change;
@@ -1486,6 +1511,23 @@ for my $change ([ 'ts', q{COMMENT ON TEXT SEARCH PARSER ts.prs IS 'later'} ], [ 
 	like($old->{stderr}, qr/has changed since/, "to try again after: $sql");
 	$old->quit;
 }
+
+# what the catalogs hold is each server's, so what capture found free may not be free
+$node->safe_psql('postgres', q{CREATE SCHEMA nf; SET allow_system_table_mods = on;
+	CREATE FUNCTION pg_catalog.here_only() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+	CREATE FUNCTION pg_catalog.op_here(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+	CREATE OPERATOR pg_catalog.#### (RIGHTARG = integer, FUNCTION = pg_catalog.op_here);
+	CREATE TEXT SEARCH PARSER pg_catalog.here_only (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype);
+	CREATE TEXT SEARCH TEMPLATE pg_catalog.here_only (LEXIZE = dsimple_lexize);
+	CREATE TEXT SEARCH DICTIONARY pg_catalog.here_only (TEMPLATE = simple);
+	CREATE TEXT SEARCH CONFIGURATION pg_catalog.here_only (PARSER = "default")});
+for my $x ([ 'function', 'here_only' ], [ 'aggregate', 'here_only' ], [ 'operator', '####' ], [ 'parser', 'here_only' ], [ 'template', 'here_only' ], [ 'dictionary', 'here_only' ], [ 'configuration', 'here_only' ])
+{
+	($rc, $out, $err) = $node->psql('postgres', qq{SELECT test_ws_obj_restore_named('$x->[0]', '$x->[1]', 'nf')});
+	like($err, qr/named as one in this server's catalogs/, "a $x->[0] is refused where the catalogs have its name");
+}
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DROP OPERATOR pg_catalog.#### (NONE, integer); DROP FUNCTION pg_catalog.op_here(integer); DROP FUNCTION pg_catalog.here_only();
+	DROP TEXT SEARCH CONFIGURATION pg_catalog.here_only; DROP TEXT SEARCH DICTIONARY pg_catalog.here_only; DROP TEXT SEARCH TEMPLATE pg_catalog.here_only; DROP TEXT SEARCH PARSER pg_catalog.here_only; DROP SCHEMA nf});
 
 $node->stop;
 done_testing();
