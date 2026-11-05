@@ -220,6 +220,7 @@ tests += {
       't/091_ws_restored_prints.pl',
       't/092_ws_object_tags.pl',
       't/093_ws_rows_round_trip.pl',
+      't/094_ws_diff.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

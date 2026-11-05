@@ -44,4 +44,7 @@ extern PGDLLIMPORT const WsRowsRoutine DirectWsRows;
 /* The implementation in use. */
 extern PGDLLIMPORT const WsRowsRoutine *WsRows;
 
+/* How many of a keyless row a row map's value says, one or more. */
+extern uint64 ws_rows_keyless_count(const uint8 *k, size_t kl, const uint8 *v, size_t vl);
+
 #endif							/* PROLLY_WS_ROWS_H */

@@ -316,6 +316,16 @@ extern const WsColumn *ws_schema_column_named(const WsTableSchema *s, const char
 extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 
 /*
+ * Bytes that are equal if and only if what they are of is, as a record holds them,
+ * appended to out: a constraint, an index, and all else of a table but its columns'
+ * tag, name, type, kind, not-null, identity, default and collation, and its key,
+ * constraints and indexes.
+ */
+extern void ws_schema_constraint_bytes(const WsConstraint *con, Buf *out);
+extern void ws_schema_index_bytes(const WsIndex *ix, Buf *out);
+extern void ws_schema_settings_bytes(const WsTableSchema *s, Buf *out);
+
+/*
  * A record does not name the schema it is of: it says mood, not src.mood, as a commit
  * can be restored under any name.  So what it holds is printed, and its statements are
  * run, under ws_schema_path_begin with the schema they are in; what it uses in another

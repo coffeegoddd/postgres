@@ -50,9 +50,8 @@ edit_cmp(const void *a, const void *b)
 	return (x->klen > y->klen) - (x->klen < y->klen);
 }
 
-/* How many of a keyless row a map's value says. */
-static uint64
-keyless_count(const uint8 *k, size_t kl, const uint8 *v, size_t vl)
+uint64
+ws_rows_keyless_count(const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 {
 	const uint8 *p;
 	size_t		len;
@@ -94,7 +93,7 @@ keyless_entries(CaptureBatch *b, ProllyEdit *edits, size_t n)
 		if (rc < 0)
 			prolly_report(b->ctx);
 		if (rc == PROLLY_OK)
-			count += keyless_count(edits[i].key, edits[i].klen, held, heldlen);
+			count += ws_rows_keyless_count(edits[i].key, edits[i].klen, held, heldlen);
 		buf_append_uvarint(&count_bytes, count);
 		WsRowCodec->keyless_value(edits[i].key, edits[i].klen, count_bytes.data, count_bytes.len, &val);
 		edits[out] = edits[i];
@@ -312,7 +311,7 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 		old = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 		ws_row_load(ctx, &shape, k, kl, v, vl, f, &held);
 		if (shape.nkey == 0)
-			count = keyless_count(k, kl, v, vl);
+			count = ws_rows_keyless_count(k, kl, v, vl);
 		ExecClearTuple(slot);
 		memset(slot->tts_isnull, true, desc->natts * sizeof(bool));
 		for (int i = 0; i < shape.nstored; i++)
