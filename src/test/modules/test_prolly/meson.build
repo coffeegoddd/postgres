@@ -226,6 +226,7 @@ tests += {
       't/097_ws_root_round_trip.pl',
       't/098_ws_violations.pl',
       't/099_ws_merge_scenarios.pl',
+      't/101_ws_merge_definitions.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

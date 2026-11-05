@@ -298,7 +298,7 @@ for my $case (@scenarios)
 	SELECT test_ws_root_capture('o$i') AS ro \\gset
 	SELECT test_ws_root_capture('t$i') AS rt \\gset
 	\\echo =====merge
-	SELECT test_ws_merge(:'rb', :'ro', :'rt', ARRAY['o$i', 't$i', 'b$i']) AS merged \\gset
+	SELECT test_ws_merge(:'rb', :'ro', :'rt') AS merged \\gset
 	\\echo :merged
 	\\echo =====end
 	SELECT split_part(:'merged', E'\\n', 1) AS m \\gset

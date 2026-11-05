@@ -12,8 +12,10 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "commands/user.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type_d.h"
 #include "prolly/branch_catalog.h"
@@ -389,6 +391,21 @@ bare_record(const WsTableSchema *s, WsTableSchema *out)
 	out->ngrants = 0;
 }
 
+/* A table holding nothing, with all that says what it is, and no one's that it would need. */
+static void
+definitions_record(const WsTableSchema *s, WsTableSchema *out)
+{
+	*out = *s;
+	out->owner = NULL;
+	out->ninherits = 0;
+	out->ninherited_cols = 0;
+	out->ninherited_cons = 0;
+	out->row_security = false;
+	out->force_row_security = false;
+	out->ncomments = 0;
+	out->ngrants = 0;
+}
+
 static void
 add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const char *schema)
 {
@@ -418,12 +435,58 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
 }
 
 /*
+ * A function that runs as its owner runs as no one it should with that owner not here:
+ * refused, as what it works out could not be what it means.
+ */
+static void
+refuse_definers_with_no_owner(const WsObject *o)
+{
+	const char *params[1] = {psprintf("%s(%s)", quote_identifier(ws_name_from_utf8(o->name)), ws_text_from_utf8(o->args))};
+	WsSqlRows	rows;
+	const char *kind = o->kind == WS_OBJ_PROCEDURE ? "procedure" : "function";
+
+	/* (on the schema's path, by its arguments: another of its name may be its own) */
+	WsSql->run("SELECT p.prosecdef FROM pg_proc p WHERE p.oid = to_regprocedure($1)", 1, params, &rows);
+	if (rows.nrows != 1)
+		elog(ERROR, "%s \"%s\" was not made", kind, o->name);
+	if (ws_sql_value(&rows, 0, 0)[0] == 't')
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("%s \"%s\" runs as its owner, a role not here", kind, o->name)));
+	ws_sql_rows_free(&rows);
+}
+
+/* A sequence that hands out nothing, as no one should see it hand out what it held. */
+static void
+exhaust_sequences(const char *schema)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT format('ALTER SEQUENCE %I.%I NO CYCLE', n.nspname, c.relname), "
+			   "format('SELECT pg_catalog.setval(%L::regclass, %s)', format('%I.%I', n.nspname, c.relname), "
+			   "CASE WHEN s.seqincrement > 0 THEN s.seqmax ELSE s.seqmin END) "
+			   "FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name", 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		for (int k = 0; k < 2; k++)
+		{
+			WsSqlRows	done;
+
+			WsSql->run(ws_sql_value(&rows, i, k), 0, NULL, &done);
+			ws_sql_rows_free(&done);
+		}
+	ws_sql_rows_free(&rows);
+}
+
+/*
  * Restoring: all of it; with fn, only what restore_rows says, then fn; with no_rows, all
- * of it, each table holding that.
+ * of it, each table holding that, or if definitions_only, what restore_definitions says.
  */
 static void
 restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
-		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows)
+		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows,
+		   bool definitions_only)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -434,6 +497,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	WsObject   *objs = NULL;
 	int			nobjs = 0;
 	Buf			sql = BUF_INIT;
+	bool	   *owner_absent;
 
 	WsSql->run("SELECT (SELECT count(*) FROM pg_namespace n, LATERAL (" \
 			   "SELECT 1 FROM pg_class WHERE relnamespace = n.oid UNION ALL " \
@@ -456,7 +520,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 				 errmsg("schema \"%s\" holds something, and a root is restored into one that does not", schema)));
 	ws_sql_rows_free(&rows);
 
-	if (WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
+	if (!definitions_only && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
 	{
 		WsRole	   *held;
 		WsRole	   *was = NULL;
@@ -489,6 +553,24 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	}
 	if (WsRoot->get_map(ctx, root, WS_ROOT_OBJECTS, &map))
 		ws_obj_list(ctx, &map, &objs, &nobjs);
+	owner_absent = palloc0_array(bool, Max(nobjs, 1));
+	if (definitions_only)
+		for (int i = 0; i < nobjs; i++)
+		{
+			objs[i].ncomments = 0;
+			objs[i].ngrants = 0;
+			objs[i].public_revoked = false;
+
+			/* (a sequence owned by a table has its owner, here whoever merges) */
+			if (objs[i].kind == WS_OBJ_SEQUENCE)
+				objs[i].owner = NULL;
+			if (objs[i].owner != NULL && !OidIsValid(get_role_oid(ws_name_from_utf8(objs[i].owner), true)))
+			{
+				objs[i].owner = NULL;
+				if (objs[i].kind == WS_OBJ_FUNCTION || objs[i].kind == WS_OBJ_PROCEDURE)
+					owner_absent[i] = true;
+			}
+		}
 	ws_obj_restore(objs, nobjs, schema, true);
 
 	tables_in_order(ctx, root, &tables);
@@ -497,15 +579,37 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 		int			i = tables.order[t];
 
 		CHECK_FOR_INTERRUPTS();
-		if (fn != NULL)
+		if (fn != NULL || definitions_only)
 		{
 			WsTableSchema bare;
 
-			bare_record(&tables.recs[i], &bare);
-			make_table(ctx, &bare, &tables.rows[i], schema);
+			if (definitions_only)
+				definitions_record(&tables.recs[i], &bare);
+			else
+				bare_record(&tables.recs[i], &bare);
+			make_table(ctx, &bare, no_rows != NULL ? no_rows : &tables.rows[i], schema);
 		}
 		else
 			make_table(ctx, &tables.recs[i], no_rows != NULL ? no_rows : &tables.rows[i], schema);
+	}
+	if (definitions_only)
+	{
+		/* (what a function's text may use, for all that is said of it: not what acts on tables) */
+		WsObject   *usable = palloc_array(WsObject, Max(nobjs, 1));
+		int			nusable = 0;
+
+		for (int i = 0; i < nobjs; i++)
+			if (objs[i].kind != WS_OBJ_TRIGGER && objs[i].kind != WS_OBJ_RULE && objs[i].kind != WS_OBJ_POLICY)
+				usable[nusable++] = objs[i];
+		CommandCounterIncrement();
+		ws_obj_restore(usable, nusable, schema, false);
+		pfree(usable);
+		for (int i = 0; i < nobjs; i++)
+			if (owner_absent[i])
+				refuse_definers_with_no_owner(&objs[i]);
+		CommandCounterIncrement();
+		exhaust_sequences(schema);
+		goto done;
 	}
 	for (int t = 0; t < tables.n; t++)
 	{
@@ -599,20 +703,26 @@ done:
 static void
 schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false);
 }
 
 static void
 schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
 					void (*fn) (void *arg, const char *schema), void *arg)
 {
-	restore_as(ctx, root, NULL, schema, fn, arg, NULL);
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false);
 }
 
 static void
 schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false);
+}
+
+static void
+schema_restore_definitions(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
+{
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true);
 }
 
 const WsRootIORoutine SchemaWsRootIO = {
@@ -621,6 +731,7 @@ const WsRootIORoutine SchemaWsRootIO = {
 	.restore = schema_restore,
 	.restore_rows = schema_restore_rows,
 	.restore_statements = schema_restore_statements,
+	.restore_definitions = schema_restore_definitions,
 };
 
 const WsRootIORoutine *WsRootIO = &SchemaWsRootIO;
@@ -634,42 +745,58 @@ typedef struct DryRun
 	void		(*fn) (void *arg, const char *schema);	/* restore_rows, then this */
 	void	   *arg;
 	const PHash *no_rows;		/* restore_statements, with this */
+	const char *schema;			/* what it is named */
+	bool		kept;			/* restore_definitions in a schema that stays */
 	bool		went_through;
 } DryRun;
 
+/* A branch of this backend's for what is undone or deleted, on which nothing else is. */
+int32
+ws_root_scratch_branch(void)
+{
+	static int32 branch = 0;
+
+	if (branch == 0)
+		branch = BranchIds->allocate();
+	return branch;
+}
+
 /*
- * A schema for a dry run, which whoever merges needs no right to make, for it to own: made
- * by no statement, so that nothing a statement would fire runs for it.  All may use it, as
- * a root's owners must.  It goes when the run does.
+ * A schema for a dry run, on the branch that is for them, under the name it is to have: what
+ * a function's text says of its own schema then means this one, and not what is on the
+ * branch whoever merges is on.  Whoever merges needs no right to make it, for it to own: it is
+ * made by no statement, so that nothing a statement would fire runs for it.  All may use
+ * it, as a root's owners must.  It goes when the run does.
  */
-static char *
-make_dry_run_schema(void)
+static void
+make_dry_run_schema(const char *schema)
 {
 	WsSqlRows	rows;
-	char	   *schema = NULL;
 	char	   *sql;
 
-	for (int i = 0; schema == NULL; i++)
-	{
-		schema = psprintf("ws_dry_run_%d_%d", MyProcPid, i);
-		if (OidIsValid(get_namespace_oid(schema, true)))
-			schema = NULL;
-	}
 	(void) NamespaceCreateOnBranch(schema, GetUserId(), false, VersionedNamespaceBranch(schema));
 	CommandCounterIncrement();
 	sql = psprintf("GRANT ALL ON SCHEMA %s TO PUBLIC", quote_identifier(schema));
 	WsSql->run(sql, 0, NULL, &rows);
 	ws_sql_rows_free(&rows);
 	pfree(sql);
-	return schema;
 }
 
 static void
 dry_run(void *arg)
 {
 	DryRun	   *d = arg;
-	char	   *schema = make_dry_run_schema();
+	const char *schema = d->schema;
+	int			nest = CatalogBranchEnter(ws_root_scratch_branch());
 
+	make_dry_run_schema(schema);
+	if (d->kept)
+	{
+		WsRootIO->restore_definitions(d->ctx, d->root, schema, d->no_rows);
+		d->went_through = true;
+		CatalogBranchLeave(nest);
+		return;
+	}
 	if (d->fn != NULL)
 		WsRootIO->restore_rows(d->ctx, d->root, schema, d->fn, d->arg);
 	else if (d->no_rows != NULL)
@@ -689,10 +816,12 @@ dry_run_refused(DryRun *dp, WsSqlFailure *failure)
 {
 	DryRun		d = *dp;
 	MemoryContext cxt = CurrentMemoryContext;
+	volatile bool kept = false;
 
+	memset(failure, 0, sizeof(*failure));
 	PG_TRY();
 	{
-		(void) WsSql->attempt_fn(dry_run, &d, failure);
+		kept = WsSql->attempt_fn(dry_run, &d, failure);
 	}
 	PG_CATCH();
 	{
@@ -717,6 +846,8 @@ dry_run_refused(DryRun *dp, WsSqlFailure *failure)
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
+	if (kept)
+		return false;
 	if (d.went_through)
 	{
 		ws_sql_failure_free(failure);
@@ -727,30 +858,53 @@ dry_run_refused(DryRun *dp, WsSqlFailure *failure)
 }
 
 bool
-ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
+ws_root_refused(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure)
 {
-	DryRun		d = {.ctx = ctx, .root = root};
+	DryRun		d = {.ctx = ctx, .root = root, .schema = schema};
 
 	return dry_run_refused(&d, failure);
 }
 
 bool
-ws_root_rows_refused(ProllyCtx *ctx, const PHash *root, void (*fn) (void *arg, const char *schema), void *arg,
-					 WsSqlFailure *failure)
+ws_root_rows_refused(ProllyCtx *ctx, const PHash *root, const char *schema, void (*fn) (void *arg, const char *schema),
+					 void *arg, WsSqlFailure *failure)
 {
-	DryRun		d = {.ctx = ctx, .root = root, .fn = fn, .arg = arg};
+	DryRun		d = {.ctx = ctx, .root = root, .schema = schema, .fn = fn, .arg = arg};
 
 	return dry_run_refused(&d, failure);
 }
 
 bool
-ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure)
+ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure)
 {
 	PHash		no_rows;
-	DryRun		d = {.ctx = ctx, .root = root, .no_rows = &no_rows};
+	DryRun		d = {.ctx = ctx, .root = root, .schema = schema, .no_rows = &no_rows};
 
 	/* (made here, as what a dry run writes it may not keep) */
 	if (prolly_empty(ctx, WS_ROW_VREFS, &no_rows) < 0)
 		prolly_report(ctx);
 	return dry_run_refused(&d, failure);
+}
+
+bool
+ws_root_definitions_begin(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure)
+{
+	PHash		no_rows;
+	DryRun		d = {.ctx = ctx, .root = root, .schema = schema, .no_rows = &no_rows, .kept = true};
+
+	if (prolly_empty(ctx, WS_ROW_VREFS, &no_rows) < 0)
+		prolly_report(ctx);
+	return dry_run_refused(&d, failure);
+}
+
+void
+ws_root_definitions_end(const char *schema)
+{
+	int			nest = CatalogBranchEnter(ws_root_scratch_branch());
+	ObjectAddress address;
+
+	ObjectAddressSet(address, NamespaceRelationId, get_namespace_oid(schema, false));
+	performDeletion(&address, DROP_CASCADE, PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
+	CommandCounterIncrement();
+	CatalogBranchLeave(nest);
 }

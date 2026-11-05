@@ -67,6 +67,16 @@ typedef struct WsRootIORoutine
 	/* All restore makes, each table holding no_rows, an empty map of rows. */
 	void		(*restore_statements) (ProllyCtx *ctx, const PHash *root, const char *schema,
 									   const PHash *no_rows);
+
+	/*
+	 * What a root's values mean and nothing else, for working them out: its objects but
+	 * triggers, rules and policies, no comments or grants, an owner only if that role is
+	 * here, sequences with nothing to hand out, and its tables each holding no_rows, with
+	 * no owner or foreign keys and unattached.  It names no role and asks for none to be
+	 * made.
+	 */
+	void		(*restore_definitions) (ProllyCtx *ctx, const PHash *root, const char *schema,
+										const PHash *no_rows);
 } WsRootIORoutine;
 
 extern PGDLLIMPORT const WsRootIORoutine SchemaWsRootIO;
@@ -75,16 +85,31 @@ extern PGDLLIMPORT const WsRootIORoutine SchemaWsRootIO;
 extern PGDLLIMPORT const WsRootIORoutine *WsRootIO;
 
 /*
- * Restores a root in a schema made for it, and undoes all of that.  False if that went
- * through; true, with what was wrong in *failure, if the root was refused for
- * something its statements or rows did.  Any other error is raised, as ever.
+ * Restores a root in a schema made for it, and undoes all of that: on a branch of this
+ * backend's for that, under the name it is to have, so what a function's text says of its own
+ * schema means this one.  False if that went through; true, with what was wrong in
+ * *failure, if the root was refused for something its statements or rows did.  Any other
+ * error is raised, as ever.
  */
-extern bool ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure);
+extern bool ws_root_refused(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure);
 
 /* The same of restore_rows and fn, and of restore_statements. */
-extern bool ws_root_rows_refused(ProllyCtx *ctx, const PHash *root,
+extern bool ws_root_rows_refused(ProllyCtx *ctx, const PHash *root, const char *schema,
 								 void (*fn) (void *arg, const char *schema), void *arg,
 								 WsSqlFailure *failure);
-extern bool ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure);
+extern bool ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure);
+
+/*
+ * A schema of a root's definitions on that branch, that stays until _end, for work that must
+ * keep what it writes and so cannot be undone with it: true, with *failure, and no schema if
+ * the root was refused, as it is for a function running as an owner that is not here.  It goes
+ * by _end, or with its transaction.  What it does not hold, as what names another
+ * versioned schema, fails as anything refused does.
+ */
+extern bool ws_root_definitions_begin(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure);
+extern void ws_root_definitions_end(const char *schema);
+
+/* The branch those are on. */
+extern int32 ws_root_scratch_branch(void);
 
 #endif							/* PROLLY_WS_RESTORE_H */

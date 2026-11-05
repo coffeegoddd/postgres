@@ -927,7 +927,7 @@ test_ws_root_refused(PG_FUNCTION_ARGS)
 	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
 	WsSqlFailure failure;
 
-	if (!ws_root_refused(backend_ctx(), &root, &failure))
+	if (!ws_root_refused(backend_ctx(), &root, "merged", &failure))
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%s %s", failure.sqlstate, failure.message)));
 }
@@ -994,19 +994,8 @@ test_ws_merge(PG_FUNCTION_ARGS)
 	PHash		theirs = text_hash(PG_GETARG_TEXT_PP(2));
 	WsMergeResult res;
 	StringInfoData out;
-	Datum	   *names;
-	bool	   *nulls;
-	int			nnames;
-	const char **schemas;
-	WsEvalSchemas in;
 
-	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(3), TEXTOID, &names, &nulls, &nnames);
-	schemas = palloc_array(const char *, Max(nnames, 1));
-	for (int i = 0; i < nnames; i++)
-		schemas[i] = TextDatumGetCString(names[i]);
-	in.schemas = schemas;
-	in.n = nnames;
-	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &SqlWsEval, &in, &res);
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, text_to_cstring(PG_GETARG_TEXT_PP(3)), &SqlWsEval, &res);
 	initStringInfo(&out);
 	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
 	for (int i = 0; i < res.nconflicts; i++)
@@ -1015,7 +1004,7 @@ test_ws_merge(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_ws_merge_checked(base text, ours text, theirs text, schemas text[]) returns text: as
+ * test_ws_merge_checked(base text, ours text, theirs text) returns text: as
  * test_ws_merge, of the merge checked
  */
 Datum
@@ -1026,20 +1015,9 @@ test_ws_merge_checked(PG_FUNCTION_ARGS)
 	PHash		theirs = text_hash(PG_GETARG_TEXT_PP(2));
 	WsMergeResult res;
 	StringInfoData out;
-	Datum	   *names;
-	bool	   *nulls;
-	int			nnames;
-	const char **schemas;
-	WsEvalSchemas in;
 
-	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(3), TEXTOID, &names, &nulls, &nnames);
-	schemas = palloc_array(const char *, Max(nnames, 1));
-	for (int i = 0; i < nnames; i++)
-		schemas[i] = TextDatumGetCString(names[i]);
-	in.schemas = schemas;
-	in.n = nnames;
-	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &SqlWsEval, &in, &res);
-	ws_merge_check(backend_ctx(), &res);
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, text_to_cstring(PG_GETARG_TEXT_PP(3)), &SqlWsEval, &res);
+	ws_merge_check(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(3)), &res);
 	initStringInfo(&out);
 	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
 	for (int i = 0; i < res.nconflicts; i++)
