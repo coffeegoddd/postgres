@@ -337,6 +337,7 @@ static const char *const query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrit
 
 /* GUC parameters */
 bool		quote_all_identifiers = false;
+DeparseColumnNameHook deparse_column_name_hook = NULL;
 
 
 /* ----------
@@ -445,6 +446,7 @@ static void get_rule_windowspec(WindowClause *wc, List *targetList,
 static void get_window_frame_options(int frameOptions,
 									 Node *startOffset, Node *endOffset,
 									 deparse_context *context);
+static char *column_name_for_print(Oid relid, AttrNumber attnum, char *name);
 static char *get_variable(Var *var, int levelsup, bool istoplevel,
 						  deparse_context *context);
 static void get_special_variable(Node *node, deparse_context *context,
@@ -993,6 +995,7 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 					appendStringInfoString(&buf, ", ");
 				attname = get_attname(trigrec->tgrelid,
 									  trigrec->tgattr.values[i], false);
+				attname = column_name_for_print(trigrec->tgrelid, trigrec->tgattr.values[i], attname);
 				appendStringInfoString(&buf, quote_identifier(attname));
 			}
 		}
@@ -1796,6 +1799,7 @@ pg_get_statisticsobj_worker(Oid statextid, bool columns_only, bool missing_ok)
 			appendStringInfoString(&buf, ", ");
 
 		attname = get_attname(statextrec->stxrelid, attnum, false);
+		attname = column_name_for_print(statextrec->stxrelid, attnum, attname);
 
 		appendStringInfoString(&buf, quote_identifier(attname));
 	}
@@ -7035,9 +7039,8 @@ get_insert_query_def(Query *query, deparse_context *context)
 		 * tle->resname, since resname will fail to track RENAME.
 		 */
 		appendStringInfoString(buf,
-							   quote_identifier(get_attname(rte->relid,
-															tle->resno,
-															false)));
+							   quote_identifier(column_name_for_print(rte->relid, tle->resno,
+															get_attname(rte->relid, tle->resno, false))));
 
 		/*
 		 * Print any indirection needed (subfields or subscripts), and strip
@@ -7354,9 +7357,8 @@ get_update_query_targetlist_def(Query *query, List *targetList,
 		 * tle->resname, since resname will fail to track RENAME.
 		 */
 		appendStringInfoString(buf,
-							   quote_identifier(get_attname(rte->relid,
-															tle->resno,
-															false)));
+							   quote_identifier(column_name_for_print(rte->relid, tle->resno,
+															get_attname(rte->relid, tle->resno, false))));
 
 		/*
 		 * Print any indirection needed (subfields or subscripts), and strip
@@ -7551,9 +7553,8 @@ get_merge_query_def(Query *query, deparse_context *context)
 				sep = ", ";
 
 				appendStringInfoString(buf,
-									   quote_identifier(get_attname(rte->relid,
-																	tle->resno,
-																	false)));
+									   quote_identifier(column_name_for_print(rte->relid, tle->resno,
+																	get_attname(rte->relid, tle->resno, false))));
 				strippedexprs = lappend(strippedexprs,
 										processIndirection((Node *) tle->expr,
 														   context));
@@ -7625,6 +7626,22 @@ get_utility_query_def(Query *query, deparse_context *context)
 		/* Currently only NOTIFY utility commands can appear in rules */
 		elog(ERROR, "unexpected utility statement type");
 	}
+}
+
+/*
+ * What to print of a column of a table: what the hook says, if one is set and says, or its name.
+ */
+static char *
+column_name_for_print(Oid relid, AttrNumber attnum, char *name)
+{
+	if (deparse_column_name_hook)
+	{
+		char	   *printed = deparse_column_name_hook(relid, attnum);
+
+		if (printed)
+			return printed;
+	}
+	return name;
 }
 
 /*
@@ -7906,6 +7923,15 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 	{
 		appendStringInfoString(buf, quote_identifier(refname));
 		appendStringInfoChar(buf, '.');
+	}
+
+	/* (not if a FROM item's alias list has renamed it: that is another name) */
+	if (deparse_column_name_hook && attname && attnum > 0 && rte->rtekind == RTE_RELATION)
+	{
+		char	   *real = get_attname(rte->relid, attnum, true);
+
+		if (real != NULL && strcmp(attname, real) == 0)
+			attname = column_name_for_print(rte->relid, attnum, attname);
 	}
 	if (attname)
 		appendStringInfoString(buf, quote_identifier(attname));

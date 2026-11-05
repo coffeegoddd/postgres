@@ -24,6 +24,13 @@ typedef struct PlannedStmt PlannedStmt;
 #define RULE_INDEXDEF_PRETTY		0x01
 #define RULE_INDEXDEF_KEYS_ONLY		0x02	/* ignore included attributes */
 
+/*
+ * If set, what to print of a column of a table, as a name to be quoted, or NULL for its own.
+ * The one who sets it must reset it, on error too.
+ */
+typedef char *(*DeparseColumnNameHook) (Oid relid, AttrNumber attnum);
+extern PGDLLIMPORT DeparseColumnNameHook deparse_column_name_hook;
+
 extern char *pg_get_indexdef_string(Oid indexrelid);
 extern char *pg_get_indexdef_columns(Oid indexrelid, bool pretty);
 extern char *pg_get_indexdef_columns_extended(Oid indexrelid,

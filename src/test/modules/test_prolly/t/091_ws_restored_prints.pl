@@ -551,7 +551,7 @@ is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT count(*) F
 $node->safe_psql('postgres', "SELECT pg_branch_catalog_copy($from, $to)");
 is($node->safe_psql('postgres', qq{SET catalog_branch = $to; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'a branch of it reads so too');
 is($node->safe_psql('postgres', q{SET catalog_branch = 0; SELECT count(*) FROM pg_ws_print p WHERE p.prtkey = 'view/w'}), '0', 'and what is on no branch sees nothing of it');
-$node->safe_psql('postgres', qq{SET catalog_branch = $to; ALTER TABLE bdst.t RENAME COLUMN v TO v2});
+$node->safe_psql('postgres', qq{SET catalog_branch = $to; DROP VIEW bdst.w; CREATE VIEW bdst.w AS SELECT v FROM bdst.t WHERE v IN ('a', 'c'); ALTER VIEW bdst.w OWNER TO g_branch});
 isnt($node->safe_psql('postgres', qq{SET catalog_branch = $to; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'a change on the branch reads as one');
 is($node->safe_psql('postgres', qq{SET catalog_branch = $from; SELECT test_ws_obj_bytes('bdst')}), $branch_held, 'and not on the other');
 
