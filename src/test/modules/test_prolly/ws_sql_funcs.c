@@ -43,6 +43,7 @@ PG_FUNCTION_INFO_V1(test_ws_obj_copy);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_collation);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_family);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_opclass);
+PG_FUNCTION_INFO_V1(test_ws_obj_restore_named);
 PG_FUNCTION_INFO_V1(test_ws_seq_copy);
 PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
@@ -575,6 +576,35 @@ test_ws_obj_restore_opclass(PG_FUNCTION_ARGS)
 	.definition = "FOR TYPE integer USING btree AS STORAGE integer"};
 
 	ws_obj_restore(&o, 1, text_to_cstring(PG_GETARG_TEXT_PP(1)), true);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_obj_restore_named(kind text, name text, schema text) returns void: makes an object
+ * of the kind, as one captured on another server would arrive, for what is checked of its
+ * name first: its statement is not one that could be run
+ */
+Datum
+test_ws_obj_restore_named(PG_FUNCTION_ARGS)
+{
+	char	   *kind = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	WsObject	o = {.name = text_to_cstring(PG_GETARG_TEXT_PP(1)),.definition = "(not this)"};
+
+	if (strcmp(kind, "function") == 0)
+		o.kind = WS_OBJ_FUNCTION, o.args = "";
+	else if (strcmp(kind, "aggregate") == 0)
+		o.kind = WS_OBJ_AGGREGATE, o.args = "";
+	else if (strcmp(kind, "operator") == 0)
+		o.kind = WS_OBJ_OPERATOR, o.args = "NONE, integer";
+	else if (strcmp(kind, "parser") == 0)
+		o.kind = WS_OBJ_TSPARSER;
+	else if (strcmp(kind, "template") == 0)
+		o.kind = WS_OBJ_TSTEMPLATE;
+	else if (strcmp(kind, "dictionary") == 0)
+		o.kind = WS_OBJ_TSDICT;
+	else
+		o.kind = WS_OBJ_TSCONFIG;
+	ws_obj_restore(&o, 1, text_to_cstring(PG_GETARG_TEXT_PP(2)), true);
 	PG_RETURN_VOID();
 }
 
