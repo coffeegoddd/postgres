@@ -112,9 +112,11 @@ typedef struct WsMergeResult
 /*
  * What a merge has computed, among its merged definitions alone, in a schema it makes
  * the first time one is asked (ws_root_definitions_begin), under its name, as a function's
- * text may say that.  A function reading one of its tables or using one of its sequences is
- * refused, as they hold no rows there and hand out nothing.  Not so what no plan reads: a
- * function reading a catalog, a table's size or catalog_branch is told of that schema.
+ * text may say that.  A function reading one of its tables or taking the next of its
+ * sequences is refused, as they hold no rows there and hand out nothing.  A function is
+ * otherwise as immutable as it says, as Postgres takes it to be for a generated column: what
+ * reads a catalog, a table's size, catalog_branch or a sequence's state is told of that
+ * schema, and a first merge in a backend moves lastval(), in allocating its branch.
  * A value is its output text, as a row
  * holds it.  Each false if it could not be done, with nothing left undone.
  */
