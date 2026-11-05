@@ -2245,6 +2245,28 @@ $node->safe_psql('postgres', q{CREATE TABLE src.stable_print (v varchar(10) CHEC
 $node->safe_psql('postgres', q{SELECT test_ws_schema_create(test_ws_schema_bytes('src', 'stable_print'), 'dst')});
 is( $node->safe_psql('postgres', q{SELECT test_ws_schema_bytes('dst', 'stable_print') = test_ws_schema_bytes('src', 'stable_print')}),
 	't', 'a table\'s expressions are the same bytes restored');
+# an index on its schema's own operator class says it bare, and restores on the other's
+for my $s ('src', 'dst')
+{
+	$node->safe_psql('postgres', qq{CREATE OPERATOR CLASS $s.own_ops FOR TYPE text USING btree AS
+		OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 bttextcmp(text, text)});
+}
+$node->safe_psql('postgres', q{CREATE TABLE src.oclass (a text); CREATE INDEX oclass_a ON src.oclass (a src.own_ops)});
+is($node->safe_psql('postgres', q{SELECT position('own_ops'::bytea in test_ws_schema_bytes('src', 'oclass')) > 0}), 't', 'a table holds its schema\'s operator class, bare');
+is($node->safe_psql('postgres', q{SELECT position('src.'::bytea in test_ws_schema_bytes('src', 'oclass'))}), '0', 'not naming its schema');
+$node->safe_psql('postgres', q{SELECT test_ws_schema_create(test_ws_schema_bytes('src', 'oclass'), 'dst')});
+is( $node->safe_psql('postgres', q{SELECT o.opcnamespace::regnamespace FROM pg_index i JOIN pg_opclass o ON o.oid = i.indclass[0] WHERE i.indexrelid = 'dst.oclass_a'::regclass}),
+	'dst', 'and restores on the class of the schema it arrives in');
+
+# indexes that only read the same if the printing lost a cast must stay apart, so what
+# attaches to what is as it was
+$node->safe_psql('postgres', q{CREATE TABLE src.pattach (v varchar(10)) PARTITION BY LIST (v);
+	CREATE TABLE src.pattach1 PARTITION OF src.pattach FOR VALUES IN ('a');
+	CREATE INDEX pattach_i ON ONLY src.pattach ((ARRAY[v]::varchar[]::text[]));
+	CREATE INDEX pattach1_z ON src.pattach1 ((ARRAY[v]::varchar[]::text[]));
+	ALTER INDEX src.pattach_i ATTACH PARTITION src.pattach1_z;
+	CREATE INDEX pattach1_a ON src.pattach1 ((ARRAY[v]::text[]))});
+is( $node->safe_psql('postgres', q{SELECT position('it has two indexes'::bytea in test_ws_schema_bytes('src', 'pattach1')) = 0}), 't', 'two indexes a cast tells apart are held');
 
 $node->stop;
 done_testing();
