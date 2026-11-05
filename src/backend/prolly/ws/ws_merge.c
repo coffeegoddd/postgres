@@ -1962,19 +1962,26 @@ columns_of_types_differing(RowMerge *rm, const PHash *rv, const TypesDiffering *
 	for (int i = 0; i < rm->shape.nstored; i++)
 	{
 		char	   *name = type_base_name(ws_schema_column(rm->merged, rm->shape.tags[i])->type);
-		char	   *suffix = strlen(name) > 11 ? name + strlen(name) - 11 : NULL;
-		char	   *range = NULL;
+		char	   *ranges[2] = {NULL, NULL};
+		char	   *multi = strstr(name, "multirange");
 
-		/* (a multirange is no object of its own: it is its range's, as Postgres names it) */
-		if (suffix != NULL && strcmp(suffix, "_multirange") == 0)
-			range = pnstrdup(name, suffix - name);
-		for (int k = 0; !differs[i] && k < 3; k++)
+		/*
+		 * A multirange is no object of its own: it is its range's, named by that as
+		 * Postgres names it, range for multirange in it or _multirange after it.
+		 */
+		if (multi != NULL)
+		{
+			ranges[0] = psprintf("%.*srange%s", (int) (multi - name), name, multi + strlen("multirange"));
+			if (strlen(name) > 11 && strcmp(name + strlen(name) - 11, "_multirange") == 0)
+				ranges[1] = pnstrdup(name, strlen(name) - 11);
+		}
+		for (int k = 0; !differs[i] && k < 4; k++)
 		{
 			Buf			key = BUF_INIT;
 
-			if (k == 2 && range == NULL)
-				break;
-			ws_obj_key(k == 1 ? WS_OBJ_DOMAIN : WS_OBJ_TYPE, k == 2 ? range : name, NULL, &key);
+			if (k >= 2 && ranges[k - 2] == NULL)
+				continue;
+			ws_obj_key(k == 1 ? WS_OBJ_DOMAIN : WS_OBJ_TYPE, k >= 2 ? ranges[k - 2] : name, NULL, &key);
 			buf_append_byte(&key, 0);
 			differs[i] = object_needs_differing(m, &objects, (const char *) key.data, td, 0);
 			buf_free(&key);
@@ -2059,6 +2066,13 @@ merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const
 				mo = *ro,
 				mt = *rt,
 				cur;
+
+	/* both adding a column and reaching one set of rows is one change, not two to add up */
+	if (phash_eq(ro, rt) && both_added_columns(sides))
+	{
+		move_map(&ours, ro, out);
+		return;
+	}
 
 	/* a column both added has no base to say which side's rows are the merge's */
 	if (!phash_eq(ro, rt) && both_added_columns(sides) &&

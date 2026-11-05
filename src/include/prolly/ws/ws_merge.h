@@ -46,7 +46,8 @@
  * each row alone.  A retype, a value for each row or a type changed under one name does
  * not, and with rows changed on the side that lacks it is a row conflict; a reshape
  * that does follow is a row conflict too where theirs removes what ours does not have,
- * as a default set after a column was added.  Both sides
+ * as a default set after a column was added, or where a row holds a value in a column
+ * both sides added, unless both reached one set of rows.  Both sides
  * reaching one set of rows add up if the columns did not change; if they changed alike,
  * that is one change.
  *
