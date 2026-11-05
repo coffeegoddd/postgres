@@ -31,6 +31,12 @@ typedef struct PlannedStmt PlannedStmt;
 typedef char *(*DeparseColumnNameHook) (Oid relid, AttrNumber attnum);
 extern PGDLLIMPORT DeparseColumnNameHook deparse_column_name_hook;
 
+/*
+ * Set when a table, function returning a relation's row, or join is printed with an alias list, which goes
+ * by place; never reset here, so whoever reads it clears it before the print.
+ */
+extern PGDLLIMPORT bool deparse_printed_alias_list;
+
 extern char *pg_get_indexdef_string(Oid indexrelid);
 extern char *pg_get_indexdef_columns(Oid indexrelid, bool pretty);
 extern char *pg_get_indexdef_columns_extended(Oid indexrelid,

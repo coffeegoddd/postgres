@@ -96,6 +96,30 @@ typedef struct WsObjectGrant
 	char	   *privileges;		/* aclitem letters, in order by byte */
 } WsObjectGrant;
 
+/*
+ * A column a USING merges.  A USING can only say a name, as each side's column has its own
+ * tag, so the tag it meant is held beside it, and a restore that finds the name is now
+ * another column's refuses, rather than joining on that.
+ */
+typedef struct WsObjectUsing
+{
+	char	   *table;
+	char	   *column;
+	uint64		tag;
+} WsObjectUsing;
+
+/*
+ * A table whose columns an alias list goes by the place of: what prints a list of its, or of a
+ * join over it, or a function returning its row.  Its columns in order are held beside it, and
+ * a restore that finds them otherwise refuses, rather than reading another column.
+ */
+typedef struct WsObjectPlaces
+{
+	char	   *table;
+	char	   *columns;		/* its columns in order, comma-separated: each's tag, or
+								 * quoted name if it has none */
+} WsObjectPlaces;
+
 typedef struct WsObject
 {
 	WsObjectKind kind;
@@ -117,6 +141,10 @@ typedef struct WsObject
 	WsObjectComment *comments;	/* in order: the object's, then by column */
 	int			ngrants;
 	WsObjectGrant *grants;		/* in order: by column, grantee, grant option */
+	int			nusings;
+	WsObjectUsing *usings;		/* in order: by table, column, tag */
+	int			nplaces;
+	WsObjectPlaces *places;		/* in order, by table */
 } WsObject;
 
 /*

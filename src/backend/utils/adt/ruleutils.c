@@ -52,6 +52,7 @@
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_type.h"
 #include "parser/parser.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
@@ -338,6 +339,7 @@ static const char *const query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrit
 /* GUC parameters */
 bool		quote_all_identifiers = false;
 DeparseColumnNameHook deparse_column_name_hook = NULL;
+bool		deparse_printed_alias_list = false;
 
 
 /* ----------
@@ -448,6 +450,7 @@ static void get_window_frame_options(int frameOptions,
 									 deparse_context *context);
 static char *column_name_for_print(Oid relid, AttrNumber attnum, char *name);
 static bool join_input_prints_list(deparse_namespace *dpns, int rti);
+static bool function_returns_a_relations_row(RangeTblEntry *rte);
 static void base_column_of_join(deparse_namespace *dpns, RangeTblEntry *rte, AttrNumber attnum,
 								Oid *relid, AttrNumber *column);
 static char *get_variable(Var *var, int levelsup, bool istoplevel,
@@ -7631,6 +7634,18 @@ get_utility_query_def(Query *query, deparse_context *context)
 	}
 }
 
+/* Whether a FROM item is a function some column of whose result is a relation's, by place. */
+static bool
+function_returns_a_relations_row(RangeTblEntry *rte)
+{
+	if (rte->rtekind != RTE_FUNCTION)
+		return false;
+	foreach_node(RangeTblFunction, rtfunc, rte->functions)
+		if (OidIsValid(typeOrDomainTypeRelid(exprType(rtfunc->funcexpr))))
+			return true;
+	return false;
+}
+
 /*
  * Whether a join, or anything under it, prints an alias list: which then decides what a name
  * of its means, whatever a column of a table is called.
@@ -12904,6 +12919,9 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 		else
 		{
 			/* Else print column aliases as needed */
+			if (colinfo->printaliases &&
+				(rte->rtekind == RTE_RELATION || function_returns_a_relations_row(rte)))
+				deparse_printed_alias_list = true;
 			get_column_alias_list(colinfo, context);
 		}
 
@@ -13023,6 +13041,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 			appendStringInfo(buf, " %s",
 							 quote_identifier(get_rtable_name(j->rtindex,
 															  context)));
+			if (colinfo->printaliases)
+				deparse_printed_alias_list = true;
 			get_column_alias_list(colinfo, context);
 		}
 	}

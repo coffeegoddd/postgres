@@ -145,6 +145,44 @@ for my $f (@followers)
 	$node->safe_psql('postgres', q{DROP SCHEMA fo1 CASCADE; DROP SCHEMA fo2 CASCADE});
 }
 
+# a USING can only say a name: restored where that is now another column, it says so
+$node->safe_psql('postgres', q{CREATE SCHEMA us1 VERSIONED; ALTER SCHEMA us1 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE us1.a (n integer, w integer); CREATE TABLE us1.b (n integer, x integer); CREATE TABLE us1.c (n integer);
+	CREATE VIEW us1.j AS SELECT a.w FROM us1.a JOIN us1.b USING (n);
+	CREATE VIEW us1.nat AS SELECT w FROM us1.a NATURAL JOIN us1.b;
+	CREATE VIEW us1.three AS SELECT a.w FROM us1.a JOIN us1.b USING (n) JOIN us1.c USING (n);
+	CREATE VIEW us1.inner_q AS SELECT w, (SELECT count(*) FROM us1.b JOIN us1.c USING (n)) AS k FROM us1.a;
+	CREATE VIEW us1.listed AS SELECT x.m FROM us1.a x(m) JOIN us1.b y(m) USING (m);
+	CREATE FUNCTION us1.body() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM us1.a JOIN us1.b USING (n); END;
+	CREATE RULE ru AS ON DELETE TO us1.c DO ALSO DELETE FROM us1.b WHERE n IN (SELECT n FROM us1.a JOIN us1.b b2 USING (n));
+	CREATE POLICY po ON us1.c USING (n IN (SELECT n FROM us1.a JOIN us1.b USING (n)))});
+my $us_tag = $node->safe_psql('postgres', q{SELECT attcoltag FROM pg_attribute WHERE attrelid = 'us1.a'::regclass AND attname = 'n'});
+my %us = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('us1')});
+like($us{$_}, qr/\x01b\x01n/, "$_ holds what its USING merges") for ('view/j', 'view/nat', 'view/three', 'view/inner_q', 'function/body()', 'rule/ru(c)', 'policy/po(c)');
+like($us{'view/three'}, qr/\x01c\x01n/, 'of each table');
+unlike($us{'view/listed'}, qr/\x01a\x01m/, 'but not a name an alias list gave, which is by its place');
+my $us_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('us1')});
+my $us_make = sub {
+	my ($rename) = @_;
+	$node->safe_psql('postgres', q{DROP SCHEMA IF EXISTS us2 CASCADE; CREATE SCHEMA us2 VERSIONED; ALTER SCHEMA us2 OWNER TO g_tags});
+	for my $table ('a', 'b', 'c')
+	{
+		my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('us1', '$table'), 'hex')});
+		$node->safe_psql('postgres', qq{SET ROLE g_tags; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'us2'); SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'us2')});
+	}
+	$node->safe_psql('postgres', "SET ROLE g_tags; $rename") if $rename;
+	return $node->psql('postgres', q{SELECT test_ws_obj_copy('us1', 'us2', 'both', true)});
+};
+my ($rcu, $outu, $erru) = $us_make->('');
+is($rcu, 0, 'restored as it was, it is made');
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('us2')}), $us_held, 'and reads as its commit');
+($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a RENAME COLUMN n TO n2});
+like($erru, qr/its USING says "n" of table "a", and that column is now "n2"/, 'a rename under a USING says so');
+($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a RENAME COLUMN n TO n2; ALTER TABLE us2.a RENAME COLUMN w TO n});
+like($erru, qr/its USING says "n" of table "a", and that column is now "n2"/, 'as does another column taking its name, which would join on that');
+($rcu, $outu, $erru) = $us_make->(q{ALTER TABLE us2.a DROP COLUMN n CASCADE});
+like($erru, qr/and that column is gone/, 'and a column gone');
+$node->safe_psql('postgres', q{DROP SCHEMA us1 CASCADE; DROP SCHEMA us2 CASCADE});
 # a merged column of a named join is no one table's, so stays its name
 $node->safe_psql('postgres', q{CREATE SCHEMA mg VERSIONED; ALTER SCHEMA mg OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mg.a (n integer, w integer); CREATE TABLE mg.b (n integer);
 	CREATE VIEW mg.v AS SELECT j.n, j.w FROM (mg.a JOIN mg.b USING (n)) j});
@@ -156,6 +194,98 @@ like($fsout, qr/^function\/up\(\)\t/m, 'a function setting a field of a table\'s
 my %fs = map { my ($k, $v) = split /\t/; $k => pack('H*', $v // '') } split /\n/, $fsout;
 like($fs{'function/up()'} // '', qr/SET \@\{\d+\}\.\@\{\d+\} = 1/, 'saying the field by its tag');
 $node->safe_psql('postgres', q{DROP SCHEMA mg CASCADE});
+
+# an alias list goes by place: restored where a table's columns are otherwise, it says so
+for my $case (
+	[ 'written', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{ALTER TABLE pl2.t DROP COLUMN n; ALTER TABLE pl2.t ADD COLUMN z integer DEFAULT 7} ],
+	[ 'written, added', q{CREATE VIEW pl1.v AS SELECT x.l FROM pl1.t x(l)}, q{ALTER TABLE pl2.t ADD COLUMN z integer} ],
+	[ 'named join, written', q{CREATE VIEW pl1.v AS SELECT j.q FROM (pl1.t JOIN pl1.u ON t.n = u.k) j(a, b, c, d, q)}, q{ALTER TABLE pl2.t ADD COLUMN y integer DEFAULT 99} ],
+	[ 'named join, printed', q{CREATE VIEW pl1.v AS SELECT j.other FROM (pl1.t JOIN pl1.u2 ON t.n = u2.n) j}, q{ALTER TABLE pl2.t ADD COLUMN y text} ],
+	[ 'a function returning its row', q{CREATE FUNCTION pl1.f() RETURNS SETOF pl1.t LANGUAGE sql AS 'SELECT * FROM pl1.t'; CREATE VIEW pl1.v AS SELECT x.l FROM pl1.f() x(l)}, q{ALTER TABLE pl2.t DROP COLUMN n; ALTER TABLE pl2.t ADD COLUMN z integer} ],
+	[ 'its columns in another order', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{DROP TABLE pl2.t; CREATE TABLE pl2.t (w integer, n integer, val text, tv text); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2')} ],
+	[ 'its table gone', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{DROP TABLE pl2.t} ])
+{
+	my ($name, $view, $change) = @$case;
+	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
+		CREATE TABLE pl1.t (val text, n integer, w integer, tv text); CREATE TABLE pl1.u (k integer); CREATE TABLE pl1.u2 (n integer, other text)});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $view");
+	for my $table ('t', 'u', 'u2')
+	{
+		my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('pl1', '$table'), 'hex')});
+		$node->safe_psql('postgres', qq{SET ROLE g_tags; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'pl2'); SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'pl2')});
+	}
+	my $pl_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $change");
+	my ($rcp, $outp, $errp) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	like($errp, qr/goes by the place of the columns of table "t", which have changed/, "$name: a change under it says so");
+	$node->safe_psql('postgres', q{DROP SCHEMA pl2 CASCADE; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags});
+	for my $table ('t', 'u', 'u2')
+	{
+		my $hex = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('pl1', '$table'), 'hex')});
+		$node->safe_psql('postgres', qq{SET ROLE g_tags; SELECT test_ws_schema_create(decode('$hex', 'hex'), 'pl2'); SELECT test_ws_schema_set_tags(decode('$hex', 'hex'), 'pl2')});
+	}
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $pl_held, "$name: with none it reads as its commit");
+	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+}
+# what a commit holds does not hang on what the session printed before
+$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl3 VERSIONED; ALTER SCHEMA pl3 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE pl1.t (a integer, b integer); CREATE VIEW pl1.listed AS SELECT x.c FROM pl1.t x(c);
+	CREATE TABLE pl3.t (a integer); CREATE VIEW pl3.v AS SELECT a FROM pl3.t});
+my $fresh = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl3')});
+my $after_print = $node->safe_psql('postgres', q{SELECT pg_get_viewdef('pl1.listed'::regclass) IS NOT NULL; SELECT test_ws_obj_bytes('pl3')});
+is($after_print, "t\n$fresh", 'an alias list printed before holds nothing for another object');
+# a dropped column of its own, and none on the other side, are the same columns
+$node->safe_psql('postgres', q{CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags; ALTER TABLE pl1.t ADD COLUMN gone integer; ALTER TABLE pl1.t DROP COLUMN gone; ALTER TABLE pl1.t ADD COLUMN last integer;
+	SELECT test_ws_schema_create(test_ws_schema_bytes('pl1', 't'), 'pl2'); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2');
+	SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')}), 'a dropped column on one side only is no change under a list');
+$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE; DROP SCHEMA pl3 CASCADE});
+# a view's columns have no tags: its list holds their names
+$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE pl1.t (a integer, b integer); CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.v0 x(c)});
+my %over_view = map { my ($k, $v) = split /\t/; $k => pack('H*', $v // '') } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
+like($over_view{'view/v'}, qr/v0.b,a/, 'a list over a view holds its columns by name');
+$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE});
+# what a list reads that the restore itself makes is there to compare, as it was
+for my $case (
+	[ 'a view over a view', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.v0 x(c)} ],
+	[ 'a function returning a composite', q{CREATE TYPE pl1.ty AS (p integer, q integer); CREATE FUNCTION pl1.f() RETURNS pl1.ty LANGUAGE sql AS 'SELECT 1, 2'; CREATE VIEW pl1.v AS SELECT x.p FROM pl1.f() x} ],
+	[ 'a function returning a view\'s row', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE FUNCTION pl1.f() RETURNS SETOF pl1.v0 LANGUAGE sql AS 'SELECT * FROM pl1.v0'; CREATE VIEW pl1.v AS SELECT x.b FROM pl1.f() x} ],
+	[ 'a sequence', q{CREATE SEQUENCE pl1.sq; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.sq x(c)} ],
+	[ 'a matview', q{CREATE MATERIALIZED VIEW pl1.mv AS SELECT a, b FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.mv x(c)} ],
+	[ 'a rule on a view with a list', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.v0 x(c); CREATE RULE r AS ON INSERT TO pl1.v DO INSTEAD NOTHING} ],
+	[ 'a body over a view', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE FUNCTION pl1.g() RETURNS SETOF integer LANGUAGE sql BEGIN ATOMIC SELECT x.c FROM pl1.v0 x(c); END} ])
+{
+	my ($name, $made) = @$case;
+	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE pl1.t (a integer, b integer)});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $made");
+	$node->safe_psql('postgres', q{SET ROLE g_tags; SELECT test_ws_schema_create(test_ws_schema_bytes('pl1', 't'), 'pl2'); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2')});
+	my ($rcv, $outv, $errv) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	is($rcv, 0, "$name: restores with nothing changed") or diag($errv);
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')}), "$name: as its commit");
+	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+}
+# a function's list goes by no table's place unless it returns one's row
+for my $case (
+	[ 'a scalar function', q{CREATE VIEW pl1.v AS SELECT t.a, g FROM pl1.t, generate_series(1, 2) g} ],
+	[ 'an array', q{CREATE FUNCTION pl1.g() RETURNS SETOF integer LANGUAGE sql BEGIN ATOMIC SELECT t.a FROM pl1.t, unnest(ARRAY[1]) e; END} ])
+{
+	my ($name, $made) = @$case;
+	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE pl1.t (a integer, b integer)});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $made");
+	$node->safe_psql('postgres', q{SET ROLE g_tags; SELECT test_ws_schema_create(test_ws_schema_bytes('pl1', 't'), 'pl2'); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2'); ALTER TABLE pl2.t ADD COLUMN z integer});
+	my ($rcf, $outf, $errf) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	is($rcf, 0, "$name: a column added makes no difference") or diag($errf);
+	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+}
+# with no list, a column added changes nothing
+$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE pl1.t (a integer); CREATE VIEW pl1.v AS SELECT a FROM pl1.t; CREATE TABLE pl2.t (a integer); ALTER TABLE pl2.t ADD COLUMN b integer});
+my $no_list = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
+my ($rcq, $outq, $errq) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+is($rcq, 0, 'with no list, a column added makes no difference') or diag($errq);
+$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
 
 # a byte that looks like what marks a tag is only that
 $node->safe_psql('postgres', q{CREATE SCHEMA mk VERSIONED; ALTER SCHEMA mk OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mk.t (a text);

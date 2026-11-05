@@ -123,25 +123,37 @@ ENGINE_TEST(test_malformed)
 {
 #define D 1, 'x', 0, 0, 0, 0		/* a definition, no flags, args or owning column */
 #define O 1, 'g'				/* an owner */
-	static const uint8 ok[] = {D, 0, O, 0, 0};
+	static const uint8 ok[] = {D, 0, O, 0, 0, 0, 0};
 	static const uint8 cut[] = {D, 0, O, 0};
-	static const uint8 left[] = {D, 0, O, 0, 0, 0};
-	static const uint8 long_num[] = {D, 0x80, 0x00, O, 0, 0};
-	static const uint8 huge[] = {D, 0xff, 0xff, 0xff, 0xff, 0x0f, O, 0, 0};
-	static const uint8 past[] = {9, 'x', 0, O, 0, 0};
-	static const uint8 nul[] = {2, 'x', 0, 0, O, 0, 0};
-	static const uint8 not_utf8[] = {1, 0xff, 0, O, 0, 0};
-	static const uint8 lone_at[] = {1, '@', 0, O, 0, 0};
-	static const uint8 dep_nothing[] = {D, 1, 1, 'q', O, 0, 0};
-	static const uint8 dep_kindless[] = {D, 1, 3, 'x', '/', 'a', O, 0, 0};
-	static const uint8 dep_self[] = {D, 1, 6, 'v', 'i', 'e', 'w', '/', 'v', O, 0, 0};
-	static const uint8 grant_option[] = {D, 0, O, 0, 1, 0, 0, 2, 1, 'r'};
-	static const uint8 privilege[] = {D, 0, O, 0, 1, 0, 0, 0, 1, 'Z'};
-	static const uint8 order[] = {D, 0, O, 0, 1, 0, 0, 0, 2, 'r', 'a'};
-	static const uint8 predefined[] = {D, 0, 9, 'p', 'g', '_', 'm', 'o', 'n', 'i', 't', 'o', 0, 0};
-	static const uint8 no_owner[] = {D, 0, 0, 0, 0};
+	static const uint8 left[] = {D, 0, O, 0, 0, 0, 0, 0};
+	static const uint8 long_num[] = {D, 0x80, 0x00, O, 0, 0, 0, 0};
+	static const uint8 huge[] = {D, 0xff, 0xff, 0xff, 0xff, 0x0f, O, 0, 0, 0, 0};
+	static const uint8 past[] = {9, 'x', 0, O, 0, 0, 0, 0};
+	static const uint8 nul[] = {2, 'x', 0, 0, O, 0, 0, 0, 0};
+	static const uint8 not_utf8[] = {1, 0xff, 0, O, 0, 0, 0, 0};
+	static const uint8 lone_at[] = {1, '@', 0, O, 0, 0, 0, 0};
+	static const uint8 dep_nothing[] = {D, 1, 1, 'q', O, 0, 0, 0, 0};
+	static const uint8 dep_kindless[] = {D, 1, 3, 'x', '/', 'a', O, 0, 0, 0, 0};
+	static const uint8 dep_self[] = {D, 1, 6, 'v', 'i', 'e', 'w', '/', 'v', O, 0, 0, 0, 0};
+	static const uint8 grant_option[] = {D, 0, O, 0, 1, 0, 0, 2, 1, 'r', 0, 0};
+	static const uint8 privilege[] = {D, 0, O, 0, 1, 0, 0, 0, 1, 'Z', 0, 0};
+	static const uint8 order[] = {D, 0, O, 0, 1, 0, 0, 0, 2, 'r', 'a', 0, 0};
+	static const uint8 predefined[] = {D, 0, 9, 'p', 'g', '_', 'm', 'o', 'n', 'i', 't', 'o', 0, 0, 0, 0};
+	static const uint8 no_owner[] = {D, 0, 0, 0, 0, 0, 0};
+	static const uint8 using_cut[] = {D, 0, O, 0, 0, 1, 1, 't', 1, 'n'};
+	static const uint8 using_no_tag[] = {D, 0, O, 0, 0, 1, 1, 't', 1, 'n', 0, 0};
+	static const uint8 using_no_table[] = {D, 0, O, 0, 0, 1, 0, 1, 'n', 5, 0};
+	static const uint8 using_order[] = {D, 0, O, 0, 0, 2, 1, 't', 1, 'n', 5, 1, 't', 1, 'n', 5, 0};
+	static const uint8 place_no_columns[] = {D, 0, O, 0, 0, 0, 1, 1, 't', 0};
+	static const uint8 place_order[] = {D, 0, O, 0, 0, 0, 2, 1, 't', 1, '1', 1, 't', 1, '1'};
 	Bad			bad[] = {
 		{"view/v", cut, sizeof(cut)},
+		{"view/v", using_cut, sizeof(using_cut)},
+		{"view/v", place_no_columns, sizeof(place_no_columns)},
+		{"view/v", place_order, sizeof(place_order)},
+		{"view/v", using_no_tag, sizeof(using_no_tag)},
+		{"view/v", using_no_table, sizeof(using_no_table)},
+		{"view/v", using_order, sizeof(using_order)},
 		{"view/v", left, sizeof(left)},
 		{"view/v", long_num, sizeof(long_num)},
 		{"view/v", huge, sizeof(huge)},
