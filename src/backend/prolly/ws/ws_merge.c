@@ -16,7 +16,9 @@
 
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
+#include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_schema.h"
@@ -285,6 +287,34 @@ grant_items(const WsTableSchema *s)
 	return l;
 }
 
+static Items
+inherited_col_items(const WsTableSchema *s)
+{
+	Items		l = {palloc0_array(Item, Max(s->ninherited_cols, 1)), s->ninherited_cols};
+
+	for (int i = 0; i < s->ninherited_cols; i++)
+	{
+		Buf			bytes = BUF_INIT;
+
+		item_set(&l.v[i], (const char *) &s->inherited_cols[i], sizeof(uint64), &bytes, &s->inherited_cols[i]);
+	}
+	return l;
+}
+
+static Items
+inherited_con_items(const WsTableSchema *s)
+{
+	Items		l = {palloc0_array(Item, Max(s->ninherited_cons, 1)), s->ninherited_cons};
+
+	for (int i = 0; i < s->ninherited_cons; i++)
+	{
+		Buf			bytes = BUF_INIT;
+
+		item_set(&l.v[i], s->inherited_cons[i], strlen(s->inherited_cons[i]), &bytes, &s->inherited_cons[i]);
+	}
+	return l;
+}
+
 /* ------------------------------------------------------ a merged record */
 
 typedef struct TableMerge
@@ -333,6 +363,12 @@ static int
 index_settings_cmp(const void *a, const void *b)
 {
 	return strcmp(((const WsIndexSettings *) a)->index, ((const WsIndexSettings *) b)->index);
+}
+
+static int
+name_cmp(const void *a, const void *b)
+{
+	return strcmp(*(char *const *) a, *(char *const *) b);
 }
 
 static int
@@ -436,10 +472,6 @@ copy_inherits(WsTableSchema *to, const WsTableSchema *from)
 {
 	to->ninherits = from->ninherits;
 	to->inherits = from->inherits;
-	to->ninherited_cols = from->ninherited_cols;
-	to->inherited_cols = from->inherited_cols;
-	to->ninherited_cons = from->ninherited_cons;
-	to->inherited_cons = from->inherited_cons;
 }
 
 static void
@@ -544,6 +576,65 @@ merge_key_name(TableMerge *tm, const WsTableSchema *b, const WsTableSchema *o, c
 	}
 }
 
+/* Those inherited that are still columns, in the order of the columns. */
+static void
+order_inherited_cols(WsTableSchema *out)
+{
+	uint64	   *in_order = palloc_array(uint64, Max(out->ninherited_cols, 1));
+	int			n = 0;
+
+	for (int c = 0; c < out->ncols; c++)
+		for (int i = 0; i < out->ninherited_cols; i++)
+			if (out->inherited_cols[i] == out->cols[c].tag)
+				in_order[n++] = out->cols[c].tag;
+	out->inherited_cols = in_order;
+	out->ninherited_cols = n;
+}
+
+/*
+ * An index on a column dropped goes with it, with what is said of it: a record of
+ * the merged columns and that index alone says so.
+ */
+static void
+drop_indexes_of_dropped(WsTableSchema *out)
+{
+	WsTableSchema columns_only = {.name = out->name, .ncols = out->ncols, .cols = out->cols,
+		.key_name = out->key_name, .nkey = out->nkey, .key = out->key,
+	.replica_identity = WS_REPLICA_DEFAULT};
+	int			kept = 0;
+
+	if (ws_schema_problem(&columns_only) != NULL)
+		return;
+	for (int i = 0; i < out->nindexes; i++)
+	{
+		WsTableSchema one = columns_only;
+
+		one.indexes = &out->indexes[i];
+		one.nindexes = 1;
+		if (ws_schema_problem(&one) == NULL)
+		{
+			out->indexes[kept++] = out->indexes[i];
+			continue;
+		}
+		for (int s = 0; s < out->nindex_settings; s++)
+			if (strcmp(out->index_settings[s].index, out->indexes[i].name) == 0)
+			{
+				out->index_settings[s] = out->index_settings[--out->nindex_settings];
+				qsort(out->index_settings, out->nindex_settings, sizeof(WsIndexSettings), index_settings_cmp);
+				break;
+			}
+		for (int c = 0; c < out->ncomments; c++)
+			if (out->comments[c].name != NULL && strcmp(out->comments[c].name, out->indexes[i].name) == 0 &&
+				out->comments[c].kind != WS_COMMENT_COLUMN && out->comments[c].kind != WS_COMMENT_SEQUENCE)
+			{
+				memmove(&out->comments[c], &out->comments[c + 1], (out->ncomments - c - 1) * sizeof(WsComment));
+				out->ncomments--;
+				break;
+			}
+	}
+	out->nindexes = kept;
+}
+
 /* A merged record of two sides' and their base's, if there is one; false, in conflict. */
 static bool
 merge_record(Merger *m, const WsTableSchema *b, const WsTableSchema *o, const WsTableSchema *t,
@@ -556,7 +647,7 @@ merge_record(Merger *m, const WsTableSchema *b, const WsTableSchema *o, const Ws
 	memset(out, 0, sizeof(*out));
 	out->name = o->name;
 	out->replica_identity = WS_REPLICA_DEFAULT;
-	if (!same_key_columns(o, t))
+	if (!same_key_columns(o, t) || (b != NULL && !same_key_columns(o, b)))
 	{
 		conflict(m, "key", o->name);
 		return false;
@@ -599,8 +690,20 @@ merge_record(Merger *m, const WsTableSchema *b, const WsTableSchema *o, const Ws
 	merge_group(tm, b, o, t, copy_clustered, out);
 	merge_group(tm, b, o, t, copy_row_security, out);
 	merge_group(tm, b, o, t, copy_owner, out);
+	{
+		Items		lo = inherited_col_items(o);
+		Items		lt = inherited_col_items(t);
+		Items		lb = b != NULL ? inherited_col_items(b) : (Items) {NULL, 0};
+		void	  **what = palloc_array(void *, lo.n + lt.n + 1);
+
+		out->ninherited_cols = merge_items(&lb, &lo, &lt, what, other_clashed, tm);
+		out->inherited_cols = chosen(what, out->ninherited_cols, sizeof(uint64), NULL);
+	}
+	MERGE_LIST(inherited_con_items, ninherited_cons, inherited_cons, char *, name_cmp);
 	if (!tm->ok)
 		return false;
+	order_inherited_cols(out);
+	drop_indexes_of_dropped(out);
 
 	/* what each side's change leaves of the other's: a check of a column dropped */
 	problem = ws_schema_problem(out);
@@ -694,6 +797,36 @@ merge_violations(Merger *m, const PHash *base, const PHash *ours, const PHash *t
 	prolly_merge_result_free(&res);
 }
 
+/* Whether a sequence, as the merged objects hold it, counts down; one with none does not. */
+static bool
+sequence_descends(Merger *m, const PHash *rv, const uint8 *name, size_t nlen)
+{
+	PHash		objects;
+	Buf			key = BUF_INIT;
+	char	   *text = pnstrdup((const char *) name, nlen);
+	const uint8 *v;
+	size_t		vl;
+	WsObject	o;
+	bool		descends = false;
+	int			rc;
+
+	if (!WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &objects))
+		return false;
+	ws_obj_key(WS_OBJ_SEQUENCE, text, NULL, &key);
+	rc = prolly_get(m->ctx, &objects, key.data, key.len, &v, &vl);
+	if (rc < 0)
+		prolly_report(m->ctx);
+	if (rc == PROLLY_OK)
+	{
+		WsObjectCodec->decode(key.data, key.len, v, vl, &o);
+		descends = strstr(o.definition, " INCREMENT BY -") != NULL;
+		ws_obj_free(&o);
+	}
+	buf_free(&key);
+	pfree(text);
+	return descends;
+}
+
 /* A sequence that both moved keeps the further; one either dropped is gone with its object. */
 static void
 merge_sequences(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs, PHash *rv)
@@ -730,10 +863,13 @@ merge_sequences(Merger *m, const PHash *base, const PHash *ours, const PHash *th
 						lt;
 			bool		co,
 						ct;
+			bool		theirs_further;
 
 			ws_seq_decode(c->ours, c->olen, &lo, &co);
 			ws_seq_decode(c->theirs, c->tlen, &lt, &ct);
-			if (lt > lo || (lt == lo && ct && !co))
+			theirs_further = sequence_descends(m, rv, c->key, c->klen) ? lt < lo : lt > lo;
+
+			if (theirs_further || (lt == lo && ct && !co))
 			{
 				edits[i].val = c->theirs;
 				edits[i].vlen = c->tlen;
@@ -755,36 +891,78 @@ merge_sequences(Merger *m, const PHash *base, const PHash *ours, const PHash *th
 
 /* ------------------------------------------------------------------ rows */
 
-/* A map's rows hold what the merged record stores: the same columns, or none at all. */
+/* Whether a side's column holds text as the merged one reads it. */
 static bool
-rows_fit(ProllyCtx *ctx, const WsTableSchema *side, const PHash *rows, const WsTableSchema *merged)
+column_reads_alike(const WsColumn *side, const WsColumn *merged)
 {
-	WsRowShape	a,
-				b;
-	bool		same;
+	if (strcmp(side->type, merged->type) != 0 || side->kind != merged->kind)
+		return false;
+	if (merged->kind == WS_COL_GENERATED_STORED)
+		return strcmp(side->def, merged->def) == 0;
+	return true;
+}
 
-	ws_schema_row_shape(side, &a);
-	ws_schema_row_shape(merged, &b);
-	same = a.nstored == b.nstored;
-	for (int i = 0; same && i < a.nstored; i++)
-		same = ws_row_shape_at(&b, a.tags[i]) >= 0;
-	ws_row_shape_free(&a);
-	ws_row_shape_free(&b);
-	if (!same)
+/*
+ * Whether the rows of a map the holders each hold are as the merged record would have
+ * them: each column it stores held by a side alike, or it empty in every row, and none
+ * stored but it.  A side's own rows meet its own type, so one that holds alike vouches
+ * for that column, though another's retype left the same text unchanged.
+ */
+static bool
+rows_fit(ProllyCtx *ctx, const PHash *rows, const WsTableSchema **holders, int nholders,
+		 const WsTableSchema *merged)
+{
+	WsRowShape	shape;
+	uint64		count;
+	bool		fits = true;
+
+	if (prolly_count(ctx, rows, &count) < 0)
+		prolly_report(ctx);
+	if (count == 0)
+		return true;
+	ws_schema_row_shape(merged, &shape);
+	for (int i = 0; fits && i < shape.nstored; i++)
 	{
-		uint64		count;
+		const WsColumn *col = ws_schema_column(merged, shape.tags[i]);
+		bool		vouched = false;
+		bool		held = false;
 
-		if (prolly_count(ctx, rows, &count) < 0)
-			prolly_report(ctx);
-		same = count == 0;
+		for (int h = 0; h < nholders; h++)
+		{
+			const WsColumn *side = ws_schema_column(holders[h], col->tag);
+
+			held |= side != NULL && side->kind != WS_COL_GENERATED_VIRTUAL;
+			vouched |= side != NULL && column_reads_alike(side, col);
+		}
+		/* (one no side holds has no cell: if so it is null, it reads as that) */
+		fits = vouched || (!held && col->def == NULL && col->kind == WS_COL_STORED);
 	}
-	return same;
+	ws_row_shape_free(&shape);
+
+	/* a cell of a column gone, unless a side holding these same rows has none */
+	for (int h = 0; fits && h < nholders; h++)
+	{
+		ws_schema_row_shape(holders[h], &shape);
+		for (int i = 0; fits && i < shape.nstored; i++)
+			if (ws_schema_column(merged, shape.tags[i]) == NULL)
+			{
+				bool		lacks = false;
+
+				for (int g = 0; g < nholders; g++)
+					lacks |= ws_schema_column(holders[g], shape.tags[i]) == NULL;
+				fits = lacks;
+			}
+		ws_row_shape_free(&shape);
+	}
+	return fits;
 }
 
 static void
-merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *o, const PHash *ro,
-		   const WsTableSchema *t, const PHash *rt, const PHash *rb, PHash *out)
+merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *b, const PHash *rb,
+		   const WsTableSchema *o, const PHash *ro, const WsTableSchema *t, const PHash *rt, PHash *out)
 {
+	const WsTableSchema *holders[3];
+	int			n = 0;
 	const PHash *keep;
 
 	if (phash_eq(ro, rt))
@@ -797,7 +975,11 @@ merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *o, const
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("merging rows both sides of table \"%s\" changed is not done yet", merged->name)));
-	if (!rows_fit(m->ctx, keep == rt ? t : o, keep, merged))
+	if (phash_eq(ro, keep))
+		holders[n++] = o;
+	if (phash_eq(rt, keep))
+		holders[n++] = t;
+	if (!rows_fit(m->ctx, keep, holders, n, merged))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("moving rows of table \"%s\" into its merged columns is not done yet", merged->name)));
@@ -901,6 +1083,11 @@ merge_table(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs
 		conflict(m, "table", name);
 		return;
 	}
+	if (!has_base && !phash_eq(&o->schema, &t->schema))
+	{
+		conflict(m, "table", name);
+		return;
+	}
 	if (has_base && !WsRoot->get_table(m->ctx, base, name, &sb, &rb))
 		elog(ERROR, "a table listed is not there");
 	if (!WsRoot->get_table(m->ctx, ours, name, &so, &ro) ||
@@ -908,13 +1095,163 @@ merge_table(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs
 		elog(ERROR, "a table listed is not there");
 	if (merge_record(m, has_base ? &sb : NULL, &so, &st, &merged))
 	{
-		merge_rows(m, &merged, &so, &ro, &st, &rt, has_base ? &rb : NULL, &rows);
+		merge_rows(m, &merged, has_base ? &sb : NULL, has_base ? &rb : NULL, &so, &ro, &st, &rt, &rows);
 		WsRoot->put_table(m->ctx, rv, &merged, &rows, rv);
 	}
 	if (has_base)
 		ws_schema_free(&sb);
 	ws_schema_free(&so);
 	ws_schema_free(&st);
+}
+
+/* ------------------------------------------- what no one record can say */
+
+/* As Dolt: a foreign key on or to what is gone goes too. */
+static void
+drop_foreign_keys_of_dropped(Merger *m, PHash *rv)
+{
+	PHash		map;
+	WsForeignKey *fks;
+	int			n;
+	ProllyEdit *edits;
+	int			nedits = 0;
+
+	if (!WsRoot->get_map(m->ctx, rv, WS_ROOT_FOREIGN_KEYS, &map))
+		return;
+	ws_fk_list(m->ctx, &map, &fks, &n);
+	edits = palloc0_array(ProllyEdit, Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		WsTableSchema on,
+					to;
+		PHash		rows;
+		bool		has_on = WsRoot->get_table(m->ctx, rv, fks[i].table, &on, &rows);
+		bool		has_to = WsRoot->get_table(m->ctx, rv, fks[i].ref_table, &to, &rows);
+		bool		whole = has_on && has_to;
+
+		for (int k = 0; whole && k < fks[i].ncols; k++)
+			whole = ws_schema_column(&on, fks[i].cols[k]) != NULL &&
+				ws_schema_column(&to, fks[i].ref_cols[k]) != NULL;
+		if (has_on)
+			ws_schema_free(&on);
+		if (has_to)
+			ws_schema_free(&to);
+		if (!whole)
+		{
+			Buf			key = BUF_INIT;
+
+			WsFkCodec->encode_key(&fks[i], &key);
+			edits[nedits].key = key.data;
+			edits[nedits].klen = key.len;
+			edits[nedits].del = true;
+			nedits++;
+		}
+	}
+	if (nedits > 0)
+	{
+		if (prolly_apply(m->ctx, &map, edits, nedits, &map) < 0)
+			prolly_report(m->ctx);
+		WsRoot->put_map(m->ctx, rv, WS_ROOT_FOREIGN_KEYS, &map, rv);
+	}
+}
+
+/* A partition or child has each column its table has, and that table is there. */
+static void
+check_has_its_tables_columns(Merger *m, const PHash *rv, const WsTableSchema *child, const char *parent_name)
+{
+	WsTableSchema parent;
+	PHash		rows;
+
+	if (!WsRoot->get_table(m->ctx, rv, parent_name, &parent, &rows))
+	{
+		conflict(m, "table-ddl", child->name);
+		return;
+	}
+	for (int i = 0; i < parent.ncols; i++)
+	{
+		const WsColumn *c = ws_schema_column_named(child, parent.cols[i].name);
+
+		if (c == NULL || strcmp(c->type, parent.cols[i].type) != 0)
+			conflict(m, "table-ddl", child->name);
+	}
+	ws_schema_free(&parent);
+}
+
+typedef struct NameSeen
+{
+	Merger	   *m;
+	char	  **names;
+	int			n;
+	int			cap;
+} NameSeen;
+
+/* A relation's or type's name, of the one namespace they share. */
+static void
+name_taken(NameSeen *seen, const char *name)
+{
+	if (name == NULL)
+		return;
+	for (int i = 0; i < seen->n; i++)
+		if (strcmp(seen->names[i], name) == 0)
+		{
+			conflict(seen->m, "table-ddl", name);
+			return;
+		}
+	if (seen->n == seen->cap)
+	{
+		seen->cap = Max(64, seen->cap * 2);
+		seen->names = seen->names == NULL ? palloc_array(char *, seen->cap) :
+			repalloc_array(seen->names, char *, seen->cap);
+	}
+	seen->names[seen->n++] = pstrdup(name);
+}
+
+/* What only the merged root as a whole can show: Postgres would refuse to make it. */
+static void
+check_merged_root(Merger *m, const PHash *rv)
+{
+	TableList	tables = {0};
+	NameSeen	seen = {m};
+	PHash		objects;
+
+	WsRoot->tables(m->ctx, rv, list_table, &tables);
+	for (int i = 0; i < tables.n; i++)
+	{
+		WsTableSchema rec;
+		PHash		rows;
+
+		if (!WsRoot->get_table(m->ctx, rv, tables.v[i].name, &rec, &rows))
+			elog(ERROR, "a table listed is not there");
+		if (rec.partition_of != NULL)
+			check_has_its_tables_columns(m, rv, &rec, rec.partition_of);
+		for (int p = 0; p < rec.ninherits; p++)
+			check_has_its_tables_columns(m, rv, &rec, rec.inherits[p]);
+		name_taken(&seen, rec.name);
+		name_taken(&seen, rec.key_name);
+		for (int k = 0; k < rec.nconstraints; k++)
+			if (rec.constraints[k].kind == WS_CONSTRAINT_UNIQUE || rec.constraints[k].kind == WS_CONSTRAINT_EXCLUSION)
+				name_taken(&seen, rec.constraints[k].name);
+		for (int k = 0; k < rec.nindexes; k++)
+			name_taken(&seen, rec.indexes[k].name);
+		for (int c = 0; c < rec.ncols; c++)
+			name_taken(&seen, rec.cols[c].identity_seq);
+		ws_schema_free(&rec);
+	}
+	if (WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &objects))
+	{
+		WsObject   *objs;
+		int			n;
+
+		ws_obj_list(m->ctx, &objects, &objs, &n);
+		for (int i = 0; i < n; i++)
+		{
+			if (objs[i].kind == WS_OBJ_VIEW || objs[i].kind == WS_OBJ_MATVIEW ||
+				objs[i].kind == WS_OBJ_SEQUENCE || objs[i].kind == WS_OBJ_INDEX ||
+				objs[i].kind == WS_OBJ_TYPE || objs[i].kind == WS_OBJ_DOMAIN)
+				name_taken(&seen, objs[i].name);
+			ws_obj_free(&objs[i]);
+		}
+	}
 }
 
 static void
@@ -951,6 +1288,8 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 						entry_of(&lt, name), &rv);
 		}
 	}
+	drop_foreign_keys_of_dropped(&m, &rv);
+	check_merged_root(&m, &rv);
 	out->root = rv;
 	out->nconflicts = m.nconflicts;
 	out->conflicts = m.conflicts;
