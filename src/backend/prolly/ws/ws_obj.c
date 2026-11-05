@@ -31,6 +31,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "parser/parse_target.h"
 #include "parser/parser.h"
 #include "prolly/ws/ws_obj.h"
 #include "storage/lmgr.h"
@@ -1217,9 +1218,9 @@ method_key(bool is_class, Oid oid, Buf *key)
  * all made, or a type that needs one is refused.
  */
 static void
-read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
+read_deps_of(WsObject *o, const char *schema, const char *oid, const char *source, const char *self)
 {
-	const char *params[2] = {oid, schema};
+	const char *params[3] = {oid, schema, self};
 	WsSqlRows	rows;
 	char	   *sql;
 
@@ -1234,9 +1235,9 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 				   "JOIN pg_class q ON q.oid = CASE WHEN d.refclassid = 'pg_class'::regclass THEN d.refobjid "
 				   "    ELSE coalesce(e.typrelid, t.typrelid) END "
 				   /* (an identity's is made with its table, so is no object to need) */
-				   "WHERE q.relkind IN ('v', 'm', 'c', 'S') AND q.oid <> $1::oid "
+				   "WHERE q.relkind IN ('v', 'm', 'c', 'S') AND q.oid <> $3::oid "
 				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_class'::regclass AND i.objid = q.oid AND i.deptype = 'i' AND i.refclassid = 'pg_class'::regclass) "
-				   "  AND q.reltype <> $1::oid AND q.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "  AND q.reltype <> $3::oid AND q.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'L', l.collname::text FROM d JOIN pg_collation l ON d.refclassid = 'pg_collation'::regclass "
 				   "  AND l.oid = d.refobjid WHERE l.collnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'O', o.oid::text FROM d JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass "
@@ -1246,7 +1247,7 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 				   "UNION SELECT 'M', o.oid::text FROM d JOIN pg_opfamily o ON d.refclassid = 'pg_opfamily'::regclass "
 				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.opfnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'F', p.oid::text FROM d JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
-				   "WHERE p.oid <> $1::oid AND p.pronamespace <> 'pg_catalog'::regnamespace "
+				   "WHERE p.oid <> $3::oid AND p.pronamespace <> 'pg_catalog'::regnamespace "
 				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass AND x.objid = p.oid "
 				   "    AND x.deptype = 'i' AND x.refclassid = 'pg_type'::regclass) "
 				   "UNION SELECT CASE b.typtype WHEN 'd' THEN 'D' ELSE 'T' END, b.typname::text FROM ( "
@@ -1259,9 +1260,9 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 				   "LEFT JOIN pg_range r ON r.rngmultitypid = coalesce(e.oid, t.oid) "
 				   "JOIN pg_type b ON b.oid = coalesce(r.rngtypid, e.oid, t.oid) "
 				   "LEFT JOIN pg_class c ON c.oid = b.typrelid "
-				   "WHERE b.oid <> $1::oid AND (c.oid IS NULL OR c.relkind = 'c') "
+				   "WHERE b.oid <> $3::oid AND (c.oid IS NULL OR c.relkind = 'c') "
 				   "  AND b.typnamespace NOT IN ('pg_catalog'::regnamespace)", source);
-	WsSql->read(sql, 2, params, &rows);
+	WsSql->read(sql, 3, params, &rows);
 	pfree(sql);
 	o->deps = zeroed(rows.nrows, sizeof(char *));
 	o->ndeps = rows.nrows;
@@ -1287,6 +1288,13 @@ read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
 	if (o->ndeps > 1)
 		qsort(o->deps, o->ndeps, sizeof(char *), cstr_cmp);
 	ws_sql_rows_free(&rows);
+}
+
+/* What an object needs, itself apart: its oid may be that of a type or function too. */
+static void
+read_deps(WsObject *o, const char *schema, const char *oid, const char *source)
+{
+	read_deps_of(o, schema, oid, source, oid);
 }
 
 /*
@@ -1522,9 +1530,19 @@ static const char *const cast_refusal_sql =
 "  WHEN EXISTS (SELECT 1 FROM pg_type t LEFT JOIN pg_type e ON e.oid = t.typelem AND e.typarray = t.oid "
 "      JOIN pg_class q ON q.oid = coalesce(e.typrelid, t.typrelid) WHERE t.oid IN (k.castsource, k.casttarget) AND q.relkind <> 'c') "
 "    THEN 'it is of a table''s or a view''s row type, and a table may need it' "
+"  WHEN NOT EXISTS (SELECT 1 FROM pg_type t WHERE t.oid IN (k.castsource, k.casttarget) AND t.typnamespace = n.oid) "
+"    THEN 'it is between types in the catalogs, which where it arrives may already be cast' "
 "  WHEN EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype IN ('e', 'x')) "
 "    THEN 'it belongs to an extension' "
-"  END " CASTS_OF_SCHEMA;
+"  END " CASTS_OF_SCHEMA "ORDER BY 1";
+
+/* What comes with a range cannot be said apart from it, nor can its comment. */
+static const char *const range_cast_refusal_sql =
+"SELECT format('(%s AS %s)', k.castsource::regtype, k.casttarget::regtype), "
+"  'it is a range''s own, with a comment, which only what comes with the range could hold' "
+"FROM pg_cast k JOIN pg_description m ON m.classoid = 'pg_cast'::regclass AND m.objoid = k.oid "
+"JOIN pg_depend d ON d.classid = 'pg_cast'::regclass AND d.objid = k.oid AND d.deptype = 'i' AND d.refclassid = 'pg_type'::regclass "
+"JOIN pg_type t ON t.oid = d.refobjid JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name ORDER BY 1";
 
 static void
 refuse_types(const char *schema, const char *sql)
@@ -2010,6 +2028,8 @@ static const char *const collation_refusal_sql =
 "    THEN 'it belongs to an extension' "
 "  WHEN EXISTS (SELECT 1 FROM pg_collation c WHERE c.collname = o.collname AND c.collnamespace = 'pg_catalog'::regnamespace) "
 "    THEN 'it is named as one in the catalogs, which its bare name would mean' "
+"  WHEN o.collencoding NOT IN (-1, pg_char_to_encoding(getdatabaseencoding())) "
+"    THEN 'it is for another encoding than this database''s' "
 "  END FROM pg_collation o JOIN pg_namespace n ON n.oid = o.collnamespace WHERE n.nspname = $1::name ORDER BY 1";
 
 static const char *const conversion_refusal_sql =
@@ -2160,7 +2180,9 @@ read_casts(const char *schema, WsObject *objs, int *n)
 		{
 			Oid			fn = atooid(ws_sql_value(&rows, i, 3));
 
-			appendStringInfo(&s, "WITH FUNCTION %s(%s)", quote_identifier(get_func_name(fn)), function_args(schema, fn, NULL));
+			/* (read under an old snapshot, it may be gone by now) */
+			appendStringInfo(&s, "WITH FUNCTION %s(%s)", quote_identifier(printed_or_retry(schema, get_func_name(fn))),
+							 function_args(schema, fn, NULL));
 		}
 		else
 			appendStringInfoString(&s, method == 'i' ? "WITH INOUT" : "WITHOUT FUNCTION");
@@ -2176,7 +2198,8 @@ read_casts(const char *schema, WsObject *objs, int *n)
 		set_definition(o, s.data);
 		px_free(o->deps);
 		o->deps = NULL;
-		read_deps(o, schema, oid, "SELECT 'pg_cast'::regclass::oid, $1::oid");
+		/* (no cast is a type or function, whatever its oid) */
+		read_deps_of(o, schema, oid, "SELECT 'pg_cast'::regclass::oid, $1::oid", "0");
 		read_owner_and_comments(o, oid, name, NULL, "pg_cast");
 		pfree(name);
 	}
@@ -2949,6 +2972,28 @@ static const char *const function_refusal_sql =
 "  END " FUNCTIONS_OF_SCHEMA "ORDER BY 1";
 
 /* Refuses a qualified name in a function's statement, or a path naming its schema. */
+/*
+ * Whether a body has a column with no name that would be given one if made again: a
+ * constant no AS named prints with the cast that, read back, names it for its type, so
+ * its text would differ.  (What is a column prints as its name, which read back is that.)
+ */
+static bool
+unstable_column_walker(Node *node, void *arg)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, ReturnStmt))
+		return unstable_column_walker(((ReturnStmt *) node)->returnval, arg);
+	if (IsA(node, ResTarget))
+	{
+		ResTarget  *rt = (ResTarget *) node;
+
+		if (rt->name == NULL && rt->val != NULL && !IsA(rt->val, ColumnRef) && strcmp(FigureColname(rt->val), "?column?") != 0)
+			return true;
+	}
+	return raw_expression_tree_walker(node, unstable_column_walker, arg);
+}
+
 static void
 check_function_is_portable(const char *name, const char *schema, const char *tail)
 {
@@ -2968,6 +3013,12 @@ check_function_is_portable(const char *name, const char *schema, const char *tai
 		named = named || names_schema_walker((Node *) p->argType, &n) || names_schema_walker(p->defexpr, &n);
 	}
 	named = named || names_schema_walker((Node *) f->returnType, &n) || names_schema_walker(f->sql_body, &n);
+	if (unstable_column_walker(f->sql_body, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: a column of its body has no name, and made again would be given one",
+						name, schema),
+				 errhint("Name the column with AS.")));
 	foreach(lc, f->options)
 	{
 		DefElem    *d = lfirst_node(DefElem, lc);
@@ -3188,6 +3239,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	refuse_what_cannot_be_held(schema);
 	refuse_types(schema, type_refusal_sql);
 	refuse_types(schema, cast_refusal_sql);
+	refuse_types(schema, range_cast_refusal_sql);
 	refuse_types(schema, function_refusal_sql);
 	refuse_types(schema, sequence_refusal_sql);
 	refuse_types(schema, trigger_refusal_sql);
@@ -4035,6 +4087,36 @@ check_nothing_captures(const char *schema)
 	ws_sql_rows_free(&rows);
 }
 
+/*
+ * Refuses a collation a bare name would not mean: the catalogs come first on the path,
+ * and what collations they hold is each server's, by its locales and library, so what
+ * capture found free may not be free here.
+ */
+static void
+check_collations_are_free(const WsObject *objs, int n, const char *schema)
+{
+	for (int i = 0; i < n; i++)
+	{
+		char	   *here;
+		const char *params[1];
+		WsSqlRows	rows;
+
+		if (objs[i].kind != WS_OBJ_COLLATION)
+			continue;
+		here = name_here(&objs[i], objs[i].name);
+		params[0] = here;
+		WsSql->read("SELECT 1 FROM pg_collation WHERE collname = $1::name AND collnamespace = 'pg_catalog'::regnamespace",
+					1, params, &rows);
+		if (rows.nrows > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("collation \"%s\" of schema \"%s\" is named as one in this server's catalogs, which what uses it would be taken to mean",
+							here, schema)));
+		ws_sql_rows_free(&rows);
+		pfree(here);
+	}
+}
+
 void
 ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tables)
 {
@@ -4051,6 +4133,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		pfree(order);
 		return;
 	}
+	check_collations_are_free(objs, n, schema);
 	for (int i = 0; i < n; i++)
 		if (ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind) &&
 			objs[i].kind != WS_OBJ_CAST && objs[i].kind != WS_OBJ_COLLATION && objs[i].kind != WS_OBJ_CONVERSION &&
