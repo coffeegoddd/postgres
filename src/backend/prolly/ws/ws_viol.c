@@ -266,7 +266,8 @@ operator_sql(Oid op)
 /*
  * What a foreign key compares a referenced column and its own by, y's then x's, as adding
  * it finds that: the referenced type's equality, against this column's type if it has one
- * for that, else against this column cast to its own; in the referenced column's collation.
+ * for that, else against this column cast to its own; in the referenced column's collation,
+ * which its type may say.
  */
 static void
 key_column_match(StringInfo out, const WsColumn *child, const WsColumn *parent, const char *c, const char *p)
@@ -282,6 +283,7 @@ key_column_match(StringInfo out, const WsColumn *child, const WsColumn *parent, 
 
 	(void) parseTypeString(ws_text_from_utf8(parent->type), &ptype, &mod, NULL);
 	(void) parseTypeString(ws_text_from_utf8(child->type), &ctype, &mod, NULL);
+	collation = get_typcollation(ptype);
 	ptype = getBaseType(ptype);
 	ctype = getBaseType(ctype);
 	opclass = GetDefaultOpClass(ptype, BTREE_AM_OID);
@@ -296,12 +298,11 @@ key_column_match(StringInfo out, const WsColumn *child, const WsColumn *parent, 
 		else if (get_typtype(intype) != TYPTYPE_PSEUDO)
 		{
 			op = operator_sql(get_opfamily_member(family, intype, intype, BTEqualStrategyNumber));
-			cast = psprintf("::%s", format_type_be_qualified(intype));
+			/* (of no length: the name alone of char or bit is of one) */
+			cast = psprintf("::%s", format_type_extended(intype, -1, FORMAT_TYPE_FORCE_QUALIFY | FORMAT_TYPE_TYPEMOD_GIVEN));
 		}
 	}
-	collation = get_typcollation(ptype);
-	if (OidIsValid(collation) && !(parent->collation == NULL ? child->collation == NULL :
-								   child->collation != NULL && strcmp(parent->collation, child->collation) == 0))
+	if (OidIsValid(collation))
 		collate = psprintf(" COLLATE %s", parent->collation != NULL ? ws_text_from_utf8(parent->collation) :
 						   generate_collation_name(collation));
 	appendStringInfo(out, "y.%s %s (x.%s%s)%s", p, op, c, cast, collate);
