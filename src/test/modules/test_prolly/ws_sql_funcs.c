@@ -21,6 +21,7 @@
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_obj.h"
 #include "prolly/ws/ws_role.h"
+#include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "utils/array.h"
@@ -50,6 +51,8 @@ PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
 PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
+PG_FUNCTION_INFO_V1(test_ws_rows_hash);
+PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 
 /*
  * test_ws_schema_bytes(schema text, table text) returns bytea: the table's
@@ -766,4 +769,58 @@ test_ws_fk_copy(PG_FUNCTION_ARGS)
 	}
 	WsSql->end(level);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* A table's record, which must be there. */
+static void
+rows_record(const char *schema, const char *table, WsTableSchema *rec)
+{
+	if (!ws_schema_read(schema, table, rec))
+		elog(ERROR, "no table \"%s\" in schema \"%s\"", table, schema);
+}
+
+/* test_ws_rows_hash(schema text, table text) returns text: its row map's root */
+Datum
+test_ws_rows_hash(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ChunkStore *cs = MemoryChunkStoreCreate();
+	ProllyCtx	ctx;
+	WsTableSchema rec;
+	PHash		map;
+	StringInfoData hex;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	rows_record(schema, table, &rec);
+	WsRows->capture(&ctx, schema, &rec, &map);
+	initStringInfo(&hex);
+	for (int i = 0; i < PHASH_LEN; i++)
+		appendStringInfo(&hex, "%02x", map.b[i]);
+	prolly_ctx_free(&ctx);
+	MemoryChunkStoreDestroy(cs);
+	ws_schema_free(&rec);
+	PG_RETURN_TEXT_P(cstring_to_text(hex.data));
+}
+
+/* test_ws_rows_copy(schema text, table text, into text) returns void */
+Datum
+test_ws_rows_copy(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *into = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	ChunkStore *cs = MemoryChunkStoreCreate();
+	ProllyCtx	ctx;
+	WsTableSchema rec;
+	PHash		map;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	rows_record(schema, table, &rec);
+	WsRows->capture(&ctx, schema, &rec, &map);
+	WsRows->restore(&ctx, into, &rec, &map);
+	prolly_ctx_free(&ctx);
+	MemoryChunkStoreDestroy(cs);
+	ws_schema_free(&rec);
+	PG_RETURN_VOID();
 }

@@ -167,6 +167,64 @@ spi_run(const char *sql, int nparams, const char *const *params, WsSqlRows *rows
 	spi_run_in(sql, nparams, params, rows, CurrentMemoryContext, false);
 }
 
+static void
+spi_scan(const char *sql, int nparams, const char *const *params, int batch,
+		 void (*fn) (void *arg, const WsSqlRows *rows), void *arg)
+{
+	Oid		   *types = NULL;
+	Datum	   *values = NULL;
+	char	   *nulls = NULL;
+	Portal		portal;
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext, "ws_sql scan",
+											  ALLOCSET_DEFAULT_SIZES);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (nparams > 0)
+	{
+		types = palloc_array(Oid, nparams);
+		values = palloc_array(Datum, nparams);
+		nulls = palloc_array(char, nparams);
+		for (int i = 0; i < nparams; i++)
+		{
+			if (params[i])
+				(void) pg_verifymbstr(params[i], strlen(params[i]), false);
+			types[i] = TEXTOID;
+			nulls[i] = params[i] ? ' ' : 'n';
+			values[i] = params[i] ? CStringGetTextDatum(params[i]) : (Datum) 0;
+		}
+	}
+	portal = SPI_cursor_open_with_args(NULL, sql, nparams, types, values, nulls, true, 0);
+	if (portal == NULL)
+		elog(ERROR, "\"%s\" failed: %s", sql, SPI_result_code_string(SPI_result));
+	for (;;)
+	{
+		WsSqlRows	rows = {0};
+		MemoryContext old;
+
+		SPI_cursor_fetch(portal, true, batch);
+		if (SPI_processed == 0)
+			break;
+		old = MemoryContextSwitchTo(cxt);
+		rows.nrows = (int) SPI_processed;
+		rows.ncols = SPI_tuptable->tupdesc->natts;
+		rows.processed = SPI_processed;
+		rows.values = palloc0(Max((Size) rows.nrows * rows.ncols, 1) * sizeof(char *));
+		for (int r = 0; r < rows.nrows; r++)
+			for (int c = 0; c < rows.ncols; c++)
+				rows.values[r * rows.ncols + c] = SPI_getvalue(SPI_tuptable->vals[r],
+															   SPI_tuptable->tupdesc, c + 1);
+		fn(arg, &rows);
+		MemoryContextSwitchTo(old);
+		SPI_freetuptable(SPI_tuptable);
+		MemoryContextReset(cxt);
+	}
+	SPI_cursor_close(portal);
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+	MemoryContextDelete(cxt);
+}
+
 /* (as PL/pgSQL's block with an exception clause: a subtransaction) */
 static bool
 spi_attempt_fn(void (*fn) (void *arg), void *arg, WsSqlFailure *failure)
@@ -249,6 +307,7 @@ const WsSqlRoutine SpiWsSql = {
 	.end = spi_end_scope,
 	.run = spi_run,
 	.read = spi_read,
+	.scan = spi_scan,
 	.attempt = spi_attempt,
 	.attempt_fn = spi_attempt_fn,
 };
