@@ -1037,6 +1037,13 @@ $node->safe_psql('postgres', q{DROP COLLATION cf.here_only; SET allow_system_tab
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_restore_collation('here_only', 'cf')});
 like($err, qr/named as one in this server's catalogs/, 'and is refused where the catalogs have it');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_collation WHERE collnamespace = 'cf'::regnamespace}), '0', 'with nothing made');
+# one in the catalogs for another encoding is no name this database can mean
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; UPDATE pg_collation SET collencoding = CASE WHEN getdatabaseencoding() = 'LATIN1' THEN 6 ELSE 8 END
+	WHERE collname = 'here_only' AND collnamespace = 'pg_catalog'::regnamespace});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_restore_collation('here_only', 'cf')});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('cf')}), qr/^collation\/here_only\t/m, 'a name the catalogs have only for another encoding is free');
+$node->safe_psql('postgres', q{DROP COLLATION cf.here_only; SET allow_system_table_mods = on;
+	UPDATE pg_collation SET collencoding = -1 WHERE collname = 'here_only' AND collnamespace = 'pg_catalog'::regnamespace});
 $node->safe_psql('postgres', q{SET allow_system_table_mods = on; DROP COLLATION pg_catalog.here_only; DROP SCHEMA cf});
 
 # every provider's say is the same read back
@@ -1075,6 +1082,7 @@ my @co_refused = (
 	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE CAST (co5."date" AS integer) WITH INOUT}, "say a schema's name" ],
 	[ q{CREATE COLLATION c FROM "C"; SET allow_system_table_mods = on; UPDATE pg_collation SET collencoding = CASE WHEN getdatabaseencoding() = 'LATIN1' THEN 6 ELSE 8 END WHERE collname = 'c' AND collnamespace = 'co5'::regnamespace}, 'another encoding' ],
 	[ q{CREATE FUNCTION f() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a'; END}, 'Name the column with AS' ],
+	[ q{CREATE FUNCTION f() RETURNS text LANGUAGE sql RETURN (SELECT 'a')}, 'Name the column with AS' ],
 	[ q{CREATE COLLATION m FROM "C"; CREATE FUNCTION f() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a' COLLATE m; END}, 'Name the column with AS' ],
 	[ q{CREATE FUNCTION f() RETURNS SETOF text LANGUAGE sql BEGIN ATOMIC SELECT x FROM (SELECT 'a' UNION ALL SELECT 'b') s(x) ; END}, 'Name the column with AS' ],
 	[ q{CREATE COLLATION "C" FROM "POSIX"}, 'named as one in the catalogs' ],
@@ -1092,7 +1100,7 @@ for my $case (@co_refused)
 
 # since a snapshot, one to try again
 for my $change (q{COMMENT ON COLLATION co.mine IS 'later'}, q{COMMENT ON CONVERSION co.conv IS 'later'}, q{ALTER CONVERSION co.conv RENAME TO conv2},
-	q{COMMENT ON CAST (ca.e AS integer) IS 'later'}, q{DROP CAST (ca.e AS integer); CREATE CAST (ca.e AS integer) WITH INOUT AS ASSIGNMENT})
+	q{COMMENT ON CAST (ca.e AS integer) IS 'later'}, q{DROP CAST (ca.e AS bigint); CREATE CAST (ca.e AS bigint) WITH FUNCTION ca.f(ca.e) AS ASSIGNMENT})
 {
 	my $where = $change =~ /ca\.e/ ? 'ca' : 'co';
 	my $old = $node->background_psql('postgres', on_error_stop => 0);
