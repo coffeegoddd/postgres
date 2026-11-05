@@ -356,6 +356,15 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
 extern bool ws_schema_read(const char *schema, const char *table, WsTableSchema *out);
 
 /*
+ * Once a table is wholly restored in schema from s, its tags set, its checks not valid
+ * added and it attached, remembers what each of its expressions now prints as if not as
+ * s holds it, so that a read holds s's while it does (prolly/ws/ws_print.h).  Each
+ * expression has its own, as a change to one leaves the rest.  An expression of s not there
+ * yet is an error.
+ */
+extern void ws_schema_remember(const WsTableSchema *s, const char *schema);
+
+/*
  * Gives the columns of a table just made from a record the tags the record
  * says, in place of those they were given as new.  The caller makes them
  * visible, with CommandCounterIncrement.

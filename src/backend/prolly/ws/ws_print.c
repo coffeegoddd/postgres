@@ -41,14 +41,14 @@ key_hash(const char *key)
 }
 
 static WsPrintEntry *
-catalog_load(const char *schema, int *n)
+catalog_load(const char *schema, const char *prefix, int *n)
 {
-	const char *params[1] = {schema};
+	const char *params[2] = {schema, ws_text_from_utf8(prefix)};
 	WsSqlRows	rows;
 	WsPrintEntry *entries;
 
 	WsSql->read("SELECT p.prtkey, p.prtprinted, p.prtheld FROM pg_ws_print p JOIN pg_namespace n ON n.oid = p.prtnamespace "
-				"WHERE n.nspname = $1::name", 1, params, &rows);
+				"WHERE n.nspname = $1::name AND starts_with(p.prtkey, $2)", 2, params, &rows);
 	entries = palloc0_array(WsPrintEntry, Max(rows.nrows, 1));
 	for (int i = 0; i < rows.nrows; i++)
 	{

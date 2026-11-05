@@ -3893,7 +3893,7 @@ static void
 hold_what_was_restored(const char *schema, WsObject *objs, int n)
 {
 	int			nentries;
-	WsPrintEntry *entries = WsPrints->load(schema, &nentries);
+	WsPrintEntry *entries = WsPrints->load(schema, "", &nentries);
 
 	for (int i = 0; i < nentries; i++)
 	{
