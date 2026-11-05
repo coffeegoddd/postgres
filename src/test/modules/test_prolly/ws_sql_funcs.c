@@ -61,6 +61,7 @@ PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_merge);
 PG_FUNCTION_INFO_V1(test_ws_root_table_bytes);
 PG_FUNCTION_INFO_V1(test_ws_root_rows_restore);
+PG_FUNCTION_INFO_V1(test_ws_root_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy_as);
 
 /*
@@ -1077,4 +1078,18 @@ test_ws_root_rows_restore(PG_FUNCTION_ARGS)
 		elog(ERROR, "no table \"%s\" in that root", table);
 	WsRows->restore(backend_ctx(), dest, &rec, &rows);
 	PG_RETURN_VOID();
+}
+
+/* test_ws_root_rows_hash(root text, tab text) returns text: its row map's root */
+Datum
+test_ws_root_rows_hash(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema rec;
+	PHash		rows;
+
+	if (!WsRoot->get_table(backend_ctx(), &root, table, &rec, &rows))
+		elog(ERROR, "no table \"%s\" in that root", table);
+	PG_RETURN_TEXT_P(hash_text(&rows));
 }

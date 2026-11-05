@@ -761,6 +761,10 @@ CREATE FUNCTION test_ws_root_table_bytes(root text, tab text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_ws_root_rows_hash(root text, tab text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_ws_root_rows_restore(root text, tab text, dest text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

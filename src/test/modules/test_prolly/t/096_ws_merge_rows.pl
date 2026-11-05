@@ -81,8 +81,8 @@ my @scenarios = (
 		q{ALTER TABLE t ALTER COLUMN a TYPE varchar(3)}, q{INSERT INTO t VALUES (2, 'longer')},
 		[ 'row t 2' ], undef ],
 	[ 'a retype changing the text, and the old text', q{CREATE TABLE t (id integer PRIMARY KEY, a integer); INSERT INTO t VALUES (1, 5)},
-		q{ALTER TABLE t ALTER COLUMN a TYPE numeric(10, 2)}, q{UPDATE t SET a = 6 WHERE id = 1},
-		[ 'row t 1' ], undef ],
+		q{ALTER TABLE t ALTER COLUMN a TYPE numeric(10, 2)}, q{UPDATE t SET a = 6 WHERE id = 1}, [],
+		'1|6.00' ],
 	[ 'a domain with a new check, and rows outside it', q{CREATE DOMAIN dm AS integer; CREATE TABLE t (id integer PRIMARY KEY, v dm); INSERT INTO t VALUES (1, 5)},
 		q{ALTER DOMAIN dm ADD CONSTRAINT pos CHECK (VALUE > 0)}, q{INSERT INTO t VALUES (2, -1)},
 		[ 'row t 2' ], undef ],
@@ -92,6 +92,66 @@ my @scenarios = (
 	[ 'an enum value renamed, and rows of the old value', q{CREATE TYPE e AS ENUM ('a', 'b'); CREATE TABLE t (id integer PRIMARY KEY, v e); INSERT INTO t VALUES (1, 'b')},
 		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{INSERT INTO t VALUES (2, 'a')},
 		[ 'row t 2' ], undef ],
+	[ 'a default set after, a row changed the other side', "$T; $ROWS",
+		q{UPDATE t SET a = 'o' WHERE id = 1}, q{ALTER TABLE t ADD COLUMN c integer; ALTER TABLE t ALTER COLUMN c SET DEFAULT 7}, [],
+		"1|o|b1|\n2|a2|b2|\n3|a3|b3|" ],
+	[ 'a default nulled, and the row changed the other side', "$T; $ROWS",
+		q{UPDATE t SET a = 'o' WHERE id = 1}, q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7; UPDATE t SET c = NULL WHERE id = 1}, [],
+		"1|o|b1|\n2|a2|b2|7\n3|a3|b3|7" ],
+	[ 'a default added, and a row deleted the other side', "$T; $ROWS",
+		q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, q{DELETE FROM t WHERE id = 1}, [],
+		"2|a2|b2|7\n3|a3|b3|7" ],
+	[ 'a column dropped, and a row deleted the other side', "$T; $ROWS",
+		q{ALTER TABLE t DROP COLUMN b}, q{DELETE FROM t WHERE id = 1}, [],
+		"2|a2\n3|a3" ],
+	[ 'a generated column added, and a row deleted the other side', q{CREATE TABLE t (id integer PRIMARY KEY, x integer); INSERT INTO t VALUES (1, 1), (2, 2)},
+		q{ALTER TABLE t ADD COLUMN g integer GENERATED ALWAYS AS (x * 2) STORED}, q{DELETE FROM t WHERE id = 1}, [],
+		"2|2|4" ],
+	[ 'one key inserted, a NULL against a value', "$T; $ROWS", q{INSERT INTO t VALUES (4, NULL, 'y')}, q{INSERT INTO t VALUES (4, 't', 'y')},
+		[ 'row t 4' ], undef ],
+	[ 'a retype, and text it prints otherwise', q{CREATE TABLE t (id integer PRIMARY KEY, a integer); INSERT INTO t VALUES (1, 5)},
+		q{ALTER TABLE t ALTER COLUMN a TYPE numeric(10, 2)}, q{INSERT INTO t VALUES (2, 6)}, [],
+		"1|5.00\n2|6.00" ],
+	[ 'a volatile default, and rows new the other side', "$T; $ROWS",
+		q{ALTER TABLE t ADD COLUMN c double precision DEFAULT random()}, q{INSERT INTO t VALUES (4, 't', 't')},
+		[ 'generated t 4' ], undef ],
+	[ 'a serial column, and rows new the other side', "$T; $ROWS",
+		q{ALTER TABLE t ADD COLUMN c serial}, q{INSERT INTO t VALUES (4, 't', 't')},
+		[ 'generated t 4' ], undef ],
+	[ 'an identity column, and rows new the other side', "$T; $ROWS",
+		q{ALTER TABLE t ADD COLUMN c integer GENERATED ALWAYS AS IDENTITY}, q{INSERT INTO t VALUES (4, 't', 't')},
+		[ 'generated t 4' ], undef ],
+	[ 'a serial column, and other rows changed the other side', "$T; $ROWS",
+		q{ALTER TABLE t ADD COLUMN c serial}, q{UPDATE t SET a = 't' WHERE id = 1}, [], undef ],
+	[ 'a default too long for its column', q{CREATE TABLE t (id integer PRIMARY KEY, a varchar(3)); INSERT INTO t VALUES (1, 'x')},
+		q{ALTER TABLE t ADD COLUMN c varchar(3) DEFAULT 'ok'; ALTER TABLE t ALTER COLUMN c SET DEFAULT 'toolong'}, q{INSERT INTO t VALUES (2, 'y')},
+		[ 'generated t 2' ], undef ],
+	[ 'a key column retyped', q{CREATE TABLE t (id integer PRIMARY KEY, a text); INSERT INTO t VALUES (1, 'x')},
+		q{ALTER TABLE t ALTER COLUMN id TYPE numeric(10, 2)}, q{INSERT INTO t VALUES (2, 'y')},
+		[ 'key t' ], undef ],
+	[ 'keyless, a column dropped by both', "$K; INSERT INTO t VALUES (1, 'x'), (2, 'y')", q{ALTER TABLE t DROP COLUMN b}, q{ALTER TABLE t DROP COLUMN b}, [],
+		"1\n2" ],
+	[ 'keyless, one default added by both', "$K; INSERT INTO t VALUES (1, 'x')", q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, [],
+		"1|x|7" ],
+	[ 'keyless, other defaults by each', "$K; INSERT INTO t VALUES (1, 'x')", q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, q{ALTER TABLE t ADD COLUMN d integer DEFAULT 8}, [],
+		"1|x|7|8" ],
+	[ 'keyless, a default added, a row deleted', "$K; INSERT INTO t VALUES (1, 'x'), (2, 'y')", q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, q{DELETE FROM t WHERE a = 1}, [],
+		"2|y|7" ],
+	[ 'keyless, a row deleted, a default added', "$K; INSERT INTO t VALUES (1, 'x'), (2, 'y')", q{DELETE FROM t WHERE a = 1}, q{ALTER TABLE t ADD COLUMN c integer DEFAULT 7}, [],
+		"2|y|7" ],
+	[ 'keyless, a column dropped, a row updated', "$K; INSERT INTO t VALUES (1, 'x'), (2, 'y')", q{ALTER TABLE t DROP COLUMN b}, q{UPDATE t SET a = 9 WHERE a = 1}, [],
+		"2\n9" ],
+	[ 'keyless, a retype by both', "$K; INSERT INTO t VALUES (1, 'x')", q{ALTER TABLE t ALTER COLUMN a TYPE bigint}, q{ALTER TABLE t ALTER COLUMN a TYPE bigint}, [],
+		"1|x" ],
+	[ 'a table only one side changed, an unrelated type the other', "$T; $ROWS",
+		q{CREATE TYPE unrelated AS ENUM ('z')}, q{INSERT INTO t VALUES (4, 't', 't')}, [],
+		"1|a1|b1\n2|a2|b2\n3|a3|b3\n4|t|t" ],
+	[ 'a key added one side, an unrelated type the other', "CREATE TABLE t (id integer, a text); INSERT INTO t VALUES (1, 'x')",
+		q{CREATE TYPE unrelated AS ENUM ('z')}, q{ALTER TABLE t ADD PRIMARY KEY (id)}, [],
+		"1|x" ],
+	[ 'a new table of a type the other side renamed a value of', q{CREATE TYPE e AS ENUM ('a')},
+		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{CREATE TABLE t (id integer PRIMARY KEY, v e); INSERT INTO t VALUES (1, 'a')},
+		[ 'row t 1' ], undef ],
 	[ 'keyless, both insert', "$K; INSERT INTO t VALUES (1, 'x')", q{INSERT INTO t VALUES (1, 'x')}, q{INSERT INTO t VALUES (1, 'x')}, [],
 		"1|x\n1|x\n1|x" ],
 	[ 'keyless, each its own', "$K; INSERT INTO t VALUES (1, 'x')", q{INSERT INTO t VALUES (2, 'o')}, q{INSERT INTO t VALUES (3, 't')}, [],
@@ -166,6 +226,9 @@ for my $case (@scenarios)
 	\\echo =====rows
 	SELECT * FROM d$i.t x ORDER BY x::text COLLATE "C";
 	\\echo =====end
+	\\echo =====same
+	SELECT test_ws_root_rows_hash(:'m', 't') = test_ws_rows_hash('d$i', 't');
+	\\echo =====end
 	} if defined $rows;
 	my ($rc, $out, $err) = $node->psql('postgres', $script);
 	is($rc, 0, "$name: runs") or diag($err);
@@ -178,7 +241,8 @@ for my $case (@scenarios)
 		my ($got) = $out =~ /=====rows\n(.*?)\n?=====end/s;
 		is($got // '', $rows, "$name: its rows");
 		# what restored and captured again is what the merge made: the same map
-		is($node->safe_psql('postgres', qq{SELECT test_ws_rows_hash('d$i', 't')}) ne '', 1, "$name: captures");
+		my ($same) = $out =~ /=====same\n(.*?)\n?=====end/s;
+		is($same // '', 't', "$name: restored, the map the merge made");
 	}
 }
 

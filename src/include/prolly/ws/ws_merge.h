@@ -22,15 +22,20 @@
  * sides reaching one set of a keyless table's rows still add up, as a multiset would,
  * where Dolt, seeing tables the same, keeps one side's.
  *
- * Rows merge by key, and where both sides changed a row, column by column; a keyless
- * table's as a multiset, each side's change in a row's count added.  A row one side
- * changed is moved into the merged columns: a dropped column's value goes, a column
- * the other side added with a default gets it, and a value under a type the other
- * side changed, or changed under one name, must read as that type.  A stored generated column is copied as it is
- * unless a merge makes its row from both sides, or the side wrote it under another
- * expression or without it, when it is computed from the merged values.  Those, a
- * default's value and whether a value reads, are what WsEval is for, and the only user
- * code a merge runs.
+ * Rows merge in the merged record's form: each of the three maps is put in it first,
+ * a dropped column's value gone, a column a map's side lacks given its default, and a
+ * value under another type read as the merged one and written as that type does.  Then
+ * by key, and where both sides changed a row, column by column; a keyless table's as a
+ * multiset, theirs' change in a row's count added to ours'.  A stored generated column
+ * is copied as it is unless its row is made from both sides, or written under another
+ * expression, when it is computed from the merged values.  Those, a default's value
+ * and whether a value reads, are what WsEval is for, and the only user code a merge
+ * runs.
+ *
+ * A default of a value for each row, an identity's or a volatile one's, a merge has
+ * none of: a row with one the side that added it gave stays, and a new one the other
+ * side made has none to get, a generated conflict.  A primary key column of another
+ * type is a key conflict, as a key is its values' text.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
@@ -49,7 +54,8 @@
  *	row <table> <key>			both changed a value differently, one deleted a row
  *								the other changed, or a value does not read as the
  *								type the other side gave its column
- *	generated <table> <key>		a default or generated value could not be computed
+ *	generated <table> <key>		a default or generated value could not be computed, or
+ *								a row has none that a merge can give
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -75,23 +81,22 @@ typedef struct WsMergeResult
 
 /*
  * What a merge has computed, in the schema of arg's choosing that has what the
- * expressions name, and has the types as merged.  A value is its output text, as a row holds it.  Each false if it
- * could not be done, with nothing left undone.
+ * expressions name, and has the types as merged.  A value is its output text, as a row
+ * holds it.  Each false if it could not be done, with nothing left undone.
  */
 typedef struct WsEvalRoutine
 {
 	const char *name;
-	/* An expression, its columns already names, as a value of a type; NULL as null. */
-	bool		(*column_default) (void *arg, const char *expr, const char *type, char **out);
 	/*
-	 * A generated column's value: expr over the columns of names and types,
-	 * values[i] each's text, or NULL.
+	 * An expression, its columns already names, as text; NULL as null.  If it is
+	 * volatile, only that, true: each row would have a value of its own.
 	 */
-	bool		(*generated) (void *arg, const char *expr, const char *type, int n,
-							  const char *const *names, const char *const *types,
-							  const char *const *values, char **out);
-	/* Whether text reads as a value of a type. */
-	bool		(*reads_as) (void *arg, const char *type, const char *text);
+	bool		(*column_default) (void *arg, const char *expr, char **out, bool *is_volatile);
+	/* A generated column's expression over the columns of names, types and values (or NULL). */
+	bool		(*generated) (void *arg, const char *expr, int n, const char *const *names,
+							  const char *const *types, const char *const *values, char **out);
+	/* Whether text reads as a value of a type, not cut to fit, and how it prints as one. */
+	bool		(*reads_as) (void *arg, const char *type, const char *text, char **as);
 } WsEvalRoutine;
 
 /* Through WsSql: arg is a WsEvalSchemas, each schema tried in turn. */
