@@ -15,6 +15,7 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "prolly/ws/ws_diff.h"
+#include "prolly/ws/ws_viol.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_rows.h"
@@ -82,6 +83,15 @@ map_entry(void *arg, const ProllyDiff *x)
 					 errmsg("a foreign key's key has no name: \"%s\"", key)));
 		e.table = key;
 		e.name = (const char *) key + table + 1;
+	}
+	else if (m->what == WS_DIFF_VIOLATION)
+	{
+		WsViolation v;
+
+		ws_viol_key(x->key, x->klen, &v);
+		e.table = v.table;
+		e.name = v.constraint;
+		e.row = v.rowkey;
 	}
 	emit(m->d, &e);
 	pfree(key);
@@ -605,6 +615,7 @@ tags_diff(ProllyCtx *ctx, const PHash *from, const PHash *to, WsDiffFn fn, void 
 	diff_map(&d, from, to, WS_ROOT_ROLES, WS_DIFF_ROLE);
 	diff_map(&d, from, to, WS_ROOT_FOREIGN_KEYS, WS_DIFF_FOREIGN_KEY);
 	diff_map(&d, from, to, WS_ROOT_SEQUENCES, WS_DIFF_SEQUENCE);
+	diff_map(&d, from, to, WS_ROOT_VIOLATIONS, WS_DIFF_VIOLATION);
 	WsRoot->tables(ctx, from, table_name, &a);
 	WsRoot->tables(ctx, to, table_name, &b);
 	while (i < a.n || j < b.n)
@@ -673,6 +684,11 @@ ws_diff_line(const WsDiffEvent *e, Buf *out)
 			break;
 		case WS_DIFF_FOREIGN_KEY:
 			appendStringInfo(&s, "foreign key %s %s/%s", action_word(e->action), e->table, e->name);
+			break;
+		case WS_DIFF_VIOLATION:
+			appendStringInfo(&s, "violation %s %s %s", e->action == WS_DIFF_ADDED ? "added" : "resolved", e->name, e->table);
+			if (e->row != NULL)
+				appendStringInfo(&s, " %s", e->row);
 			break;
 		case WS_DIFF_SEQUENCE:
 			appendStringInfo(&s, "sequence %s %s", action_word(e->action), e->name);

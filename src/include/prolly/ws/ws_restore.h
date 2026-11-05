@@ -55,6 +55,18 @@ typedef struct WsRootIORoutine
 	 * may have changed, or NULL.
 	 */
 	void		(*restore) (ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema);
+
+	/*
+	 * Only what a root's tables are made of and their rows, attached, with no constraint
+	 * but their keys, no unique index and no foreign key to refuse them, in schema, and
+	 * then fn, while the statements' settings hold.
+	 */
+	void		(*restore_rows) (ProllyCtx *ctx, const PHash *root, const char *schema,
+								 void (*fn) (void *arg, const char *schema), void *arg);
+
+	/* All restore makes, each table holding no_rows, an empty map of rows. */
+	void		(*restore_statements) (ProllyCtx *ctx, const PHash *root, const char *schema,
+									   const PHash *no_rows);
 } WsRootIORoutine;
 
 extern PGDLLIMPORT const WsRootIORoutine SchemaWsRootIO;
@@ -68,5 +80,11 @@ extern PGDLLIMPORT const WsRootIORoutine *WsRootIO;
  * something its statements or rows did.  Any other error is raised, as ever.
  */
 extern bool ws_root_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure);
+
+/* The same of restore_rows and fn, and of restore_statements. */
+extern bool ws_root_rows_refused(ProllyCtx *ctx, const PHash *root,
+								 void (*fn) (void *arg, const char *schema), void *arg,
+								 WsSqlFailure *failure);
+extern bool ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, WsSqlFailure *failure);
 
 #endif							/* PROLLY_WS_RESTORE_H */
