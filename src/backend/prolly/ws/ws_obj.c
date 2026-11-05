@@ -2340,17 +2340,41 @@ lost_in_print_walker(Node *node, void *arg)
 		l->why = "it has an ARRAY[] of int2vector or oidvector, which printing loses";
 		return true;
 	}
-	if (IsA(node, Var) && ((Var *) node)->varattno == 0 &&
+	/* (a whole row of a USING's alias is expanded, and prints as ROW() of no names) */
+	if (IsA(node, RowExpr) && ((RowExpr *) node)->row_typeid == RECORDOID)
+	{
+		int			i = 0;
+		ListCell   *lc;
+
+		foreach(lc, ((RowExpr *) node)->colnames)
+			if (strcmp(strVal(lfirst(lc)), psprintf("f%d", ++i)) != 0)
+			{
+				l->why = "it has a whole row of a join's alias, whose names printing loses";
+				return true;
+			}
+	}
+	/* (of a type its names are the type's, whatever the range table says) */
+	if (IsA(node, Var) && ((Var *) node)->varattno == 0 && ((Var *) node)->vartype == RECORDOID &&
 		((Var *) node)->varlevelsup < list_length(l->queries))
 	{
 		Var		   *v = (Var *) node;
 		Query	   *q = list_nth(l->queries, v->varlevelsup);
 
-		if (v->varno >= 1 && v->varno <= list_length(q->rtable) &&
-			duplicate_names(rt_fetch(v->varno, q->rtable)->eref->colnames))
+		if (v->varno >= 1 && v->varno <= list_length(q->rtable))
 		{
-			l->why = "it has a whole row of columns of one name, which printing tells apart";
-			return true;
+			RangeTblEntry *rte = rt_fetch(v->varno, q->rtable);
+
+			/* (printed with no list of columns, read back it is of those there then) */
+			if (rte->rtekind == RTE_JOIN)
+			{
+				l->why = "it has a whole row of a join, which reads back as of the columns then";
+				return true;
+			}
+			if (duplicate_names(rte->eref->colnames))
+			{
+				l->why = "it has a whole row of columns of one name, which printing tells apart";
+				return true;
+			}
 		}
 		return false;
 	}
