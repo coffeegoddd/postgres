@@ -14,6 +14,8 @@
 
 #include "access/xact.h"
 #include "engine_test_util.h"
+#include "access/xact.h"
+#include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_root.h"
 #include "test_prolly.h"
 
@@ -435,6 +437,46 @@ test_seq(void)
 	expect_error(decode_nul, NULL, ERRCODE_DATA_CORRUPTED, NULL);
 }
 
+static void
+diff_line(void *arg, const WsDiffEvent *e)
+{
+	Buf		   *out = arg;
+
+	ws_diff_line(e, out);
+	buf_append_byte(out, '\n');
+}
+
+/* A diff is a read: it runs where nothing can be written, a map on either or both sides. */
+ENGINE_TEST(test_diff_writes_nothing)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx = t_ctx(cs, &prolly_default_policy);
+	PHash		none = vc_root_empty(&ctx);
+	PHash		one,
+				two,
+				map1,
+				map2;
+	ProllyKV	kv1 = {(const uint8 *) "view/a", 6, (const uint8 *) "1", 1};
+	ProllyKV	kv2 = {(const uint8 *) "view/a", 6, (const uint8 *) "2", 1};
+	bool		was = XactReadOnly;
+	Buf			lines = BUF_INIT;
+
+	CHECK_OK(prolly_build(&ctx, 0, &kv1, 1, &map1));
+	CHECK_OK(prolly_build(&ctx, 0, &kv2, 1, &map2));
+	WsRoot->put_map(&ctx, &none, WS_ROOT_OBJECTS, &map1, &one);
+	WsRoot->put_map(&ctx, &none, WS_ROOT_OBJECTS, &map2, &two);
+
+	XactReadOnly = true;
+	WsDiff->diff(&ctx, &none, &one, diff_line, &lines);
+	WsDiff->diff(&ctx, &one, &two, diff_line, &lines);
+	WsDiff->diff(&ctx, &two, &none, diff_line, &lines);
+	XactReadOnly = was;
+	buf_append_byte(&lines, 0);
+	CHECK(strcmp((const char *) lines.data,
+				 "object added view a\nobject changed view a\nobject dropped view a\n") == 0);
+	buf_free(&lines);
+}
+
 static const ProllyUnitTest tests[] = {
 	{"tables", test_tables},
 	{"names_apart", test_names_apart},
@@ -443,6 +485,7 @@ static const ProllyUnitTest tests[] = {
 	{"refused", test_refused},
 	{"read_only", test_read_only},
 	{"seq", test_seq},
+	{"diff_writes_nothing", test_diff_writes_nothing},
 };
 
 const ProllyUnitSuite unit_ws_root_suite = {"ws_root", tests, lengthof(tests)};

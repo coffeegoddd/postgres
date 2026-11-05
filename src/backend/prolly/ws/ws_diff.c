@@ -56,11 +56,8 @@ map_entry(void *arg, const ProllyDiff *x)
 	char	   *key = palloc(x->klen + 1);
 	WsDiffEvent e = {.what = m->what, .name = key};
 
-	/* (a foreign key's is its table and its name, apart by a zero byte) */
-	for (size_t i = 0; i < x->klen; i++)
-		key[i] = x->key[i] == '\0' ? '/' : (char) x->key[i];
+	memcpy(key, x->key, x->klen);
 	key[x->klen] = '\0';
-
 	e.action = x->from == NULL ? WS_DIFF_ADDED : x->to == NULL ? WS_DIFF_DROPPED : WS_DIFF_CHANGED;
 	if (m->what == WS_DIFF_OBJECT)
 	{
@@ -74,26 +71,74 @@ map_entry(void *arg, const ProllyDiff *x)
 		e.kind = key;
 		e.name = slash + 1;
 	}
+	else if (m->what == WS_DIFF_FOREIGN_KEY)
+	{
+		/* (its table, a zero byte, its name) */
+		size_t		table = strlen(key);
+
+		if (table + 1 >= x->klen)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a foreign key's key has no name: \"%s\"", key)));
+		e.table = key;
+		e.name = (const char *) key + table + 1;
+	}
 	emit(m->d, &e);
 	pfree(key);
+}
+
+/* All of a map as added or dropped: its other side has none. */
+static void
+one_sided_map(MapDiff *m, const PHash *map, bool added)
+{
+	ProllyIter *it;
+	const uint8 *k,
+			   *v;
+	size_t		kl,
+				vl;
+	int			rc;
+
+	if (prolly_iter_open(m->d->ctx, map, NULL, 0, &it) < 0)
+		prolly_report(m->d->ctx);
+	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
+	{
+		ProllyDiff	x = {.key = k, .klen = kl};
+
+		if (added)
+		{
+			x.to = v;
+			x.tlen = vl;
+		}
+		else
+		{
+			x.from = v;
+			x.flen = vl;
+		}
+		map_entry(m, &x);
+	}
+	prolly_iter_close(it);
+	if (rc < 0)
+		prolly_report(m->d->ctx);
 }
 
 static void
 diff_map(Differ *d, const PHash *from, const PHash *to, WsRootMap which, WsDiffWhat what)
 {
 	PHash		a,
-				b,
-				empty;
+				b;
 	bool		has_a = WsRoot->get_map(d->ctx, from, which, &a);
 	bool		has_b = WsRoot->get_map(d->ctx, to, which, &b);
 	MapDiff		m = {d, what};
 
-	if (!has_a && !has_b)
-		return;
-	if (prolly_empty(d->ctx, 0, &empty) < 0)
-		prolly_report(d->ctx);
-	if (prolly_diff(d->ctx, has_a ? &a : &empty, has_b ? &b : &empty, map_entry, &m) < 0)
-		prolly_report(d->ctx);
+	if (has_a && has_b)
+	{
+		if (prolly_diff(d->ctx, &a, &b, map_entry, &m) < 0)
+			prolly_report(d->ctx);
+	}
+	else if (has_a)
+		one_sided_map(&m, &a, false);
+	else if (has_b)
+		one_sided_map(&m, &b, true);
 }
 
 /* --------------------------------------------------------- a table's schema */
@@ -266,6 +311,12 @@ diff_schema(Differ *d, const WsTableSchema *a, const WsTableSchema *b)
 	if (!same_key(a, b))
 	{
 		WsDiffEvent e = {.what = WS_DIFF_KEY, .table = b->name};
+
+		emit(d, &e);
+	}
+	if (!same_text(a->key_name, b->key_name) && a->key_name != NULL && b->key_name != NULL)
+	{
+		WsDiffEvent e = {.what = WS_DIFF_KEY_RENAMED, .table = b->name, .from = a->key_name, .to = b->key_name};
 
 		emit(d, &e);
 	}
@@ -621,7 +672,7 @@ ws_diff_line(const WsDiffEvent *e, Buf *out)
 			appendStringInfo(&s, "object %s %s %s", action_word(e->action), e->kind, e->name);
 			break;
 		case WS_DIFF_FOREIGN_KEY:
-			appendStringInfo(&s, "foreign key %s %s", action_word(e->action), e->name);
+			appendStringInfo(&s, "foreign key %s %s/%s", action_word(e->action), e->table, e->name);
 			break;
 		case WS_DIFF_SEQUENCE:
 			appendStringInfo(&s, "sequence %s %s", action_word(e->action), e->name);
@@ -652,6 +703,9 @@ ws_diff_line(const WsDiffEvent *e, Buf *out)
 			break;
 		case WS_DIFF_KEY:
 			appendStringInfo(&s, "key changed %s", e->table);
+			break;
+		case WS_DIFF_KEY_RENAMED:
+			appendStringInfo(&s, "key renamed %s %s %s", e->table, e->from, e->to);
 			break;
 		case WS_DIFF_CONSTRAINT:
 			appendStringInfo(&s, "constraint %s %s %s", action_word(e->action), e->table, e->name);

@@ -16,7 +16,8 @@ $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
 my $branch = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
 $ENV{PGOPTIONS} = "-c catalog_branch=$branch";
 
-# steps: [ name, sql, expected lines, whether the lines are all it says ]
+# steps: [ name, sql, what it says ], all of it but that a table's data is the same
+# and none of its rows changed, unless named
 my @steps = (
 	[ 'rename a column', q{ALTER TABLE s.t RENAME COLUMN v TO w},
 		[ 'column renamed t.v w', 'data t same', 'rows t +0 -0 ~0' ] ],
@@ -47,7 +48,7 @@ my @steps = (
 	[ 'change rows', q{UPDATE s.t SET w = 'x' WHERE id <= 10; DELETE FROM s.t WHERE id > 490; INSERT INTO s.t (id, w, n) VALUES (9001, 'new', 1)},
 		[ 'data t changed', 'rows t +1 -10 ~10' ] ],
 	[ 'drop a column and add it back', q{ALTER TABLE s.t DROP COLUMN extra; ALTER TABLE s.t ADD COLUMN extra text},
-		[ 'data t same', 'rows t +0 -0 ~0' ], 1 ],
+		[ ] ],
 	[ 'set a default', q{ALTER TABLE s.t ALTER COLUMN w SET DEFAULT 'd'},
 		[ 'column default t.w', 'data t same' ] ],
 	[ 'set not null', q{ALTER TABLE s.t ALTER COLUMN w SET NOT NULL},
@@ -60,25 +61,49 @@ my @steps = (
 		[ 'data t same', 'rows t +0 -0 ~0' ] ],
 	[ 'a large value changed', q{UPDATE s.t SET w = repeat('l', 99999) || 'm' WHERE id = 20},
 		[ 'data t changed', 'rows t +0 -0 ~1' ] ],
-	[ 'nothing', q{SELECT 1}, [ 'data k same', 'data t same' ] ],
+	[ 'nothing', q{SELECT 1}, [ ] ],
+	[ 'a column moved', q{ALTER TABLE s.mv DROP COLUMN b; ALTER TABLE s.mv ADD COLUMN b text},
+		[ 'column moved mv', 'data mv changed', 'rows mv +0 -0 ~2' ] ],
+	[ 'a key renamed', q{ALTER TABLE s.mv RENAME CONSTRAINT mv_pkey TO mv_key2},
+		[ 'key renamed mv mv_pkey mv_key2' ] ],
+	[ 'an identity', q{ALTER TABLE s.mv ALTER COLUMN c ADD GENERATED ALWAYS AS IDENTITY},
+		[ 'column changed mv.c', 'sequence added mv_c_seq' ] ],
+	[ 'a collation', q{ALTER TABLE s.mv ALTER COLUMN b TYPE text COLLATE "C"},
+		[ 'column changed mv.b' ] ],
+	[ 'a keyless large value', q{INSERT INTO s.kl VALUES (repeat('a', 5000)), (repeat('a', 5000)); INSERT INTO s.kl VALUES (repeat('b', 5000))},
+		[ 'data kl changed', 'rows kl +3 -0 ~0' ] ],
+	[ 'a keyless large value goes', q{DELETE FROM s.kl WHERE v = repeat('b', 5000)},
+		[ 'data kl changed', 'rows kl +0 -1 ~0' ] ],
+	[ 'rows of no columns', q{INSERT INTO s.nc DEFAULT VALUES; INSERT INTO s.nc DEFAULT VALUES},
+		[ 'data nc changed', 'rows nc +2 -0 ~0' ] ],
+	[ 'no column in common', q{ALTER TABLE s.nc2 ADD COLUMN b integer DEFAULT 1; ALTER TABLE s.nc2 DROP COLUMN a},
+		[ 'column added nc2.b', 'column dropped nc2.a', 'data nc2 changed', 'rows nc2 +0 -0 ~0', 'rewritten nc2 3' ] ],
+	[ 'a name not in ASCII', q{CREATE TABLE s."tàbé" ("cól" integer); INSERT INTO s."tàbé" VALUES (1)},
+		[ 'table added tàbé' ] ],
+	[ 'its column renamed', q{ALTER TABLE s."tàbé" RENAME COLUMN "cól" TO "cöl"},
+		[ 'column renamed tàbé.cól cöl' ] ],
+	[ 'a role', q{RESET ROLE; CREATE ROLE g_other NOLOGIN TRAVELS},
+		[ 'role added g_other' ] ],
+	[ 'a role dropped', q{RESET ROLE; DROP ROLE g_other},
+		[ 'role dropped g_other' ] ],
 	[ 'keyless: add a nullable column', q{ALTER TABLE s.k ADD COLUMN c integer},
 		[ 'column added k.c', 'data k same' ] ],
 	[ 'keyless: rename a column', q{ALTER TABLE s.k RENAME COLUMN b TO bb},
 		[ 'column renamed k.b bb', 'data k same' ] ],
 	[ 'keyless: add a column with a default', q{ALTER TABLE s.k ADD COLUMN d integer DEFAULT 1},
-		[ 'data k changed', 'rows k +0 -0 ~0', 'rewritten k 200' ] ],
+		[ 'column added k.d', 'data k changed', 'rows k +0 -0 ~0', 'rewritten k 200' ] ],
 	[ 'keyless: change rows', q{DELETE FROM s.k WHERE a = 5; INSERT INTO s.k VALUES (500, 'x', NULL, 1), (500, 'x', NULL, 1)},
-		[ 'rows k +2 -2 ~0' ] ],
+		[ 'data k changed', 'rows k +2 -2 ~0' ] ],
 	[ 'keyless: one of many the same goes', q{DELETE FROM s.k WHERE ctid = (SELECT min(ctid) FROM s.k WHERE a = 500)},
-		[ 'rows k +0 -1 ~0' ] ],
+		[ 'data k changed', 'rows k +0 -1 ~0' ] ],
 	[ 'keyless: drop a column, with rows changed too', q{ALTER TABLE s.k DROP COLUMN d; INSERT INTO s.k VALUES (501, 'y', NULL)},
-		[ 'column dropped k.d', 'rows k +1 -0 ~0', 'rewritten k 199' ] ],
+		[ 'column dropped k.d', 'data k changed', 'rows k +1 -0 ~0', 'rewritten k 199' ] ],
 	[ 'a key made, every row other', q{ALTER TABLE s.t2 ADD PRIMARY KEY (a)},
-		[ 'key changed t2', 'rows t2 +5 -5 ~0' ] ],
+		[ 'column changed t2.a', 'key changed t2', 'data t2 changed', 'rows t2 +5 -5 ~0' ] ],
 	[ 'a key changed', q{ALTER TABLE s.t2 DROP CONSTRAINT t2_pkey; ALTER TABLE s.t2 ADD PRIMARY KEY (b)},
-		[ 'key changed t2', 'rows t2 +5 -5 ~0' ] ],
+		[ 'column changed t2.b', 'key changed t2', 'data t2 changed', 'rows t2 +5 -5 ~0' ] ],
 	[ 'a key dropped', q{ALTER TABLE s.t2 DROP CONSTRAINT t2_pkey},
-		[ 'key changed t2', 'rows t2 +5 -5 ~0' ] ],
+		[ 'key changed t2', 'data t2 changed', 'rows t2 +5 -5 ~0' ] ],
 	[ 'a table added', q{CREATE TABLE s.nw (a integer)}, [ 'table added nw' ] ],
 	[ 'a table dropped', q{DROP TABLE s.nw}, [ 'table dropped nw' ] ],
 	[ 'objects', q{CREATE VIEW s.vw AS SELECT id FROM s.t; CREATE FUNCTION s.fn(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'},
@@ -93,6 +118,8 @@ my @steps = (
 		[ 'column renamed t.w w2', 'data t same' ] ],
 	[ 'a foreign key', q{CREATE TABLE s.fkc (a integer REFERENCES s.t (id))},
 		[ 'table added fkc', 'foreign key added fkc/fkc_a_fkey' ] ],
+	[ 'a foreign key changed', q{ALTER TABLE s.fkc DROP CONSTRAINT fkc_a_fkey; ALTER TABLE s.fkc ADD CONSTRAINT fkc_a_fkey FOREIGN KEY (a) REFERENCES s.t (id) ON DELETE CASCADE},
+		[ 'foreign key changed fkc/fkc_a_fkey' ] ],
 	[ 'a foreign key dropped', q{ALTER TABLE s.fkc DROP CONSTRAINT fkc_a_fkey},
 		[ 'foreign key dropped fkc/fkc_a_fkey' ] ],
 	[ 'a sequence', q{CREATE SEQUENCE s.sq},
@@ -114,17 +141,23 @@ my $script = q{
 	INSERT INTO s.k SELECT g % 100, 'b' || g % 7 FROM generate_series(1, 200) g;
 	CREATE TABLE s.t2 (a integer, b integer);
 	INSERT INTO s.t2 SELECT g, g + 100 FROM generate_series(1, 5) g;
+	CREATE TABLE s.mv (id integer PRIMARY KEY, b text, c integer NOT NULL);
+	INSERT INTO s.mv VALUES (1, 'x', 1), (2, 'y', 2);
+	CREATE TABLE s.kl (v text);
+	CREATE TABLE s.nc ();
+	CREATE TABLE s.nc2 (a integer); INSERT INTO s.nc2 VALUES (1), (2), (3);
 	CREATE TABLE s.p (id integer, r integer) PARTITION BY RANGE (r);
 	CREATE TABLE s.pa PARTITION OF s.p FOR VALUES FROM (0) TO (10);
 	CREATE TABLE s.pb PARTITION OF s.p FOR VALUES FROM (10) TO (20);
 	INSERT INTO s.p VALUES (1, 15), (2, 15), (3, 5);
+	RESET ROLE;
 	SELECT test_ws_root_capture('s') AS r0 \gset
 };
 my $i = 0;
 for my $step (@steps)
 {
 	my $from = $i++;
-	$script .= qq{\n\\echo =====$i\n$step->[1];\nSELECT test_ws_root_capture('s') AS r$i \\gset\nSELECT test_ws_diff(:'r$from', :'r$i');\n};
+	$script .= qq{\n\\echo =====$i\nSET ROLE g_diff;\n$step->[1];\nRESET ROLE;\nSELECT test_ws_root_capture('s') AS r$i \\gset\nSELECT test_ws_diff(:'r$from', :'r$i');\n};
 }
 my $out = $node->safe_psql('postgres', $script);
 my %said;
@@ -140,21 +173,19 @@ $i = 0;
 for my $step (@steps)
 {
 	$i++;
-	my ($name, undef, $want, $exact) = @$step;
-	my %has = map { $_ => 1 } @{ $said{$i} };
-	ok($has{$_}, "$name: $_") or diag(join("\n", @{ $said{$i} })) for @$want;
-	if ($exact)
-	{
-		my @other = grep { !/^data |^rows / } @{ $said{$i} };
-		is("@other", '', "$name: and nothing of its schema");
-	}
+	my ($name, undef, $want) = @$step;
+	my @said = sort grep { !/^data \S+ same$/ && !/^rows \S+ \+0 -0 ~0$/ }
+	  grep { /^(object|foreign key|sequence|role|table|column|key|constraint|index|data|rows|rewritten) / } @{ $said{$i} };
+	my @wanted = sort grep { !/^data \S+ same$/ && !/^rows \S+ \+0 -0 ~0$/ } @$want;
+	is_deeply(\@said, \@wanted, $name) or diag(join("\n", 'it said:', @said));
 }
 
-# a root against itself says nothing has changed
+# a root against itself has every table's lines, and nothing changed
 my $self = $node->safe_psql('postgres', q{SELECT test_ws_root_capture('s') AS r \gset
 	SELECT test_ws_diff(:'r', :'r')});
-unlike($self, qr/changed|added|dropped|renamed|retyped/m, 'a root against itself: nothing');
-unlike($self, qr/^rows \S+ \+[1-9]/m, 'and no rows');
+like($self, qr/^data t same$/m, 'a root against itself says what it read');
+my @changed = grep { !/^data \S+ same$/ && !/^rows \S+ \+0 -0 ~0$/ && $_ ne '' } split /\n/, $self;
+is("@changed", '', 'and that nothing changed');
 
 $node->stop;
 done_testing();

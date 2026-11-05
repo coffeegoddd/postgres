@@ -9,7 +9,10 @@
  *	object added|dropped|changed <kind> <name>
  *	foreign key|sequence|role added|dropped|changed <name>
  *	table added|dropped <table>
- *	table changed <table>				its settings: anything else of its record
+ *	table changed <table>				anything else of its record, some of it comes
+ *										with other changes: a column's comment
+ *										goes with the column, and a child's list
+ *										of what it inherits with a parent's
  *	column added|dropped <table>.<name>
  *	column renamed <table>.<old> <new>
  *	column retyped <table>.<name> <old type> -> <new type>
@@ -17,6 +20,7 @@
  *	column changed <table>.<name>		its not-null, identity or collation
  *	column moved <table>				the columns both have, in another order
  *	key changed <table>
+ *	key renamed <table> <old> <new>
  *	constraint|index added|dropped|changed <table> <name>
  *	data <table> same|changed			whether the row map is the same tree
  *	rows <table> +<inserted> -<deleted> ~<updated>
@@ -28,7 +32,7 @@
  * so all are inserted and deleted.  A table's large values compare by what names their
  * tree, which is equal if and only if they are.  Reads of a keyed table's changes
  * take no more memory than a row's; a keyless table's whose columns changed, its
- * changed rows'.
+ * changed rows'.  It writes nothing, as a read must.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -55,6 +59,7 @@ typedef enum WsDiffWhat
 	WS_DIFF_COLUMN_CHANGED,
 	WS_DIFF_COLUMNS_MOVED,
 	WS_DIFF_KEY,
+	WS_DIFF_KEY_RENAMED,
 	WS_DIFF_CONSTRAINT,
 	WS_DIFF_INDEX,
 	WS_DIFF_DATA,
@@ -75,10 +80,10 @@ typedef struct WsDiffEvent
 	WsDiffWhat	what;
 	WsDiffAction action;		/* if it was added, dropped or changed */
 	const char *table;			/* a table's name, UTF8, of what is a table's */
-	const char *name;			/* a column's, constraint's, index's, or object's */
+	const char *name;			/* a column's, constraint's, foreign key's, index's or object's */
 	const char *kind;			/* an object's */
-	const char *from;			/* a column's old type */
-	const char *to;				/* a column's new name or type */
+	const char *from;			/* a column's old type, or a key's old name */
+	const char *to;				/* a column's new name or type, or a key's new name */
 	bool		same;			/* of WS_DIFF_DATA */
 	uint64		inserted;
 	uint64		deleted;
