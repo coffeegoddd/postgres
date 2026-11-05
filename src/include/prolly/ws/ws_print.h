@@ -29,8 +29,8 @@ typedef struct WsPrintEntry
 
 typedef struct WsPrintStore
 {
-	/* The entries of a schema, palloc'd, of *n: at what WsSql reads now. */
-	WsPrintEntry *(*load) (const char *schema, int *n);
+	/* The entries of a schema with keys so beginning, palloc'd, of *n: at what WsSql reads now. */
+	WsPrintEntry *(*load) (const char *schema, const char *prefix, int *n);
 	void		(*remember) (const char *schema, const char *key, const char *printed, const char *held);
 	void		(*forget) (const char *schema, const char *key);
 } WsPrintStore;

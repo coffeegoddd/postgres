@@ -69,6 +69,7 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_obj.h"
+#include "prolly/ws/ws_print.h"
 #include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
@@ -5423,6 +5424,119 @@ constraint_cmp(const void *a, const void *b)
 	return strcmp(((const WsConstraint *) a)->name, ((const WsConstraint *) b)->name);
 }
 
+/* What is called for each expression of a table: its key, and where its text is. */
+typedef void (*ExprVisitor) (const char *key, char **text, void *arg);
+
+static void
+visit_index_exprs(const char *table, const char *what, WsIndex *ix, ExprVisitor visit, void *arg)
+{
+	for (int k = 0; k < ix->nkeys; k++)
+		if (ix->keys[k].expr != NULL)
+			visit(psprintf("table/%s/%s/%s/key/%d", table, what, ix->name, k), &ix->keys[k].expr, arg);
+	if (ix->predicate != NULL)
+		visit(psprintf("table/%s/%s/%s/predicate", table, what, ix->name), &ix->predicate, arg);
+}
+
+/*
+ * Every expression a table's record holds as printed.  A column's is by its tag, which a
+ * rename leaves as it is.
+ */
+static void
+visit_exprs(WsTableSchema *s, ExprVisitor visit, void *arg)
+{
+	for (int i = 0; i < s->ncols; i++)
+		if (s->cols[i].def != NULL)
+			visit(psprintf("table/%s/def/" UINT64_FORMAT, s->name, s->cols[i].tag), &s->cols[i].def, arg);
+	for (int i = 0; i < s->nconstraints; i++)
+	{
+		WsConstraint *c = &s->constraints[i];
+
+		if (c->kind == WS_CONSTRAINT_CHECK)
+			visit(psprintf("table/%s/check/%s", s->name, c->name), &c->expr, arg);
+		else if (c->kind == WS_CONSTRAINT_EXCLUSION)
+			visit_index_exprs(s->name, "exclusion", &c->excl, visit, arg);
+	}
+	for (int i = 0; i < s->nindexes; i++)
+		visit_index_exprs(s->name, "index", &s->indexes[i], visit, arg);
+	for (int k = 0; k < s->npartition; k++)
+		if (s->partition_keys[k].expr != NULL)
+			visit(psprintf("table/%s/partition/%d", s->name, k), &s->partition_keys[k].expr, arg);
+	if (s->partition_bound != NULL)
+		visit(psprintf("table/%s/bound", s->name), &s->partition_bound, arg);
+}
+
+typedef struct HoldExprs
+{
+	WsPrintEntry *entries;
+	int			n;
+} HoldExprs;
+
+static void
+hold_expr(const char *key, char **text, void *arg)
+{
+	HoldExprs  *h = arg;
+
+	for (int i = 0; i < h->n; i++)
+		if (strcmp(h->entries[i].key, key) == 0 && strcmp(h->entries[i].printed, *text) == 0)
+		{
+			px_free(*text);
+			*text = px_memdup(h->entries[i].held, strlen(h->entries[i].held) + 1);
+			return;
+		}
+}
+
+typedef struct ExprList
+{
+	List	   *keys;
+	List	   *texts;
+} ExprList;
+
+static void
+list_expr(const char *key, char **text, void *arg)
+{
+	ExprList   *l = arg;
+
+	l->keys = lappend(l->keys, pstrdup(key));
+	l->texts = lappend(l->texts, *text);
+}
+
+void
+ws_schema_remember(const WsTableSchema *s, const char *schema)
+{
+	ExprList	held = {0};
+	ExprList	now = {0};
+	WsTableSchema read;
+	ListCell   *k;
+	ListCell   *x;
+	char	   *table = ws_name_from_utf8(s->name);
+
+	visit_exprs(unconstify(WsTableSchema *, s), list_expr, &held);
+	foreach(k, held.keys)
+		WsPrints->forget(schema, lfirst(k));
+	CommandCounterIncrement();
+	if (!ws_schema_read(schema, table, &read))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("table \"%s\" was not made", s->name)));
+	visit_exprs(&read, list_expr, &now);
+	forboth(k, held.keys, x, held.texts)
+	{
+		ListCell   *nk;
+		ListCell   *nx;
+
+		forboth(nk, now.keys, nx, now.texts)
+			if (strcmp(lfirst(k), lfirst(nk)) == 0)
+			{
+				if (strcmp(lfirst(x), lfirst(nx)) != 0)
+					WsPrints->remember(schema, lfirst(k), lfirst(nx), lfirst(x));
+				break;
+			}
+	}
+	CommandCounterIncrement();
+	ws_schema_free(&read);
+	pfree(table);
+}
+
 bool
 ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 {
@@ -5769,6 +5883,13 @@ ws_schema_read(const char *schema, const char *table, WsTableSchema *out)
 	ws_sql_rows_free(&idxs);
 	PopActiveSnapshot();
 	check_record_says_no_schema(out, ws_text_to_utf8(schema), schema, table);
+	{
+		HoldExprs	h;
+
+		h.entries = WsPrints->load(schema, psprintf("table/%s/", out->name), &h.n);
+		if (h.n > 0)
+			visit_exprs(out, hold_expr, &h);
+	}
 	WsSql->end(level);
 	return true;
 }

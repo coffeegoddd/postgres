@@ -2250,5 +2250,51 @@ $node->safe_psql('postgres', q{SELECT test_ws_schema_create(test_ws_schema_bytes
 is( $node->safe_psql('postgres', q{SELECT o.opcnamespace::regnamespace FROM pg_index i JOIN pg_opclass o ON o.oid = i.indclass[0] WHERE i.indexrelid = 'dst.oclass_a'::regclass}),
 	'dst', 'and restores on the class of the schema it arrives in');
 
+# a table's expressions read as the commit once restored, each by itself
+$node->safe_psql('postgres', q{CREATE SCHEMA tp_src VERSIONED; CREATE SCHEMA tp_dst VERSIONED;
+	CREATE TABLE tp_src.t (v varchar(10), i integer, w varchar(10) DEFAULT 'a', x boolean GENERATED ALWAYS AS (v IN ('a', 'b')) STORED,
+		d text DEFAULT ('a'::varchar IN ('a', 'b'))::text, e integer DEFAULT -1::int, f integer DEFAULT 5,
+		CONSTRAINT c1 CHECK (v IN ('k1', 'k2')), CONSTRAINT c2 CHECK (i BETWEEN 1 AND 2 AND v = 'a'), CONSTRAINT c3 CHECK (i > 0),
+		CONSTRAINT xc EXCLUDE USING btree (v WITH =) WHERE (v IN ('a', 'b')));
+	CREATE INDEX tp_p ON tp_src.t (v) WHERE v IN ('a', 'b');
+	CREATE INDEX tp_e ON tp_src.t ((v IN ('a', 'b')));
+	CREATE TABLE tp_src.pt (v varchar(10)) PARTITION BY LIST ((v IN ('a', 'b')));});
+my %tp_was;
+for my $table ('t', 'pt')
+{
+	$tp_was{$table} = $node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('tp_src', '$table'), 'hex')});
+	$node->safe_psql('postgres', qq{SELECT test_ws_schema_create(decode('$tp_was{$table}', 'hex'), 'tp_dst');
+		SELECT test_ws_schema_set_tags(decode('$tp_was{$table}', 'hex'), 'tp_dst');
+		SELECT test_ws_schema_remember(decode('$tp_was{$table}', 'hex'), 'tp_dst')});
+	is($node->safe_psql('postgres', qq{SELECT encode(test_ws_schema_bytes('tp_dst', '$table'), 'hex')}), $tp_was{$table}, "$table is the same bytes restored");
+}
+my $tp_rows = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace});
+cmp_ok($tp_rows, '>=', 8, 'what printed otherwise is remembered, by each expression');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/check/c3'}), '0', 'and what did not is not');
+like($node->safe_psql('postgres', q{SELECT string_agg(prtkey, ' ') FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace}), qr{/check/c1 .*/exclusion/.*/index/.*/partition/}, 'of each kind');
+my $tp_held_check = $node->safe_psql('postgres', q{SELECT prtheld FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace AND prtkey LIKE '%/check/c1'});
+my $tp_in_bytes = sub { $node->safe_psql('postgres', qq{SELECT position(convert_to(\$q\$$tp_held_check\$q\$, 'UTF8') in test_ws_schema_bytes('tp_dst', 't')) > 0}) };
+is($tp_in_bytes->(), 't', 'a check reads as held');
+# a change to the table leaves what it does not touch
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t ADD COLUMN z integer});
+is($tp_in_bytes->(), 't', 'adding a column leaves the check as held');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t RENAME COLUMN w TO w2});
+is($tp_in_bytes->(), 't', 'as does renaming another column');
+is($node->safe_psql('postgres', q{SELECT position('''a''::character varying'::bytea in test_ws_schema_bytes('tp_dst', 't')) > 0}), 't', 'and the renamed column keeps its default');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t RENAME COLUMN v TO v2});
+is($tp_in_bytes->(), 't', 'or even a column it uses, which it holds by its tag');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t DROP CONSTRAINT c1; ALTER TABLE tp_dst.t ADD CONSTRAINT c1 CHECK (v2 IN ('k1', 'k3'))});
+is($tp_in_bytes->(), 'f', 'and what a change touches reads as changed');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t DROP CONSTRAINT c1; ALTER TABLE tp_dst.t ADD CONSTRAINT c1 CHECK (v2 IN ('k1', 'k2'));
+	ALTER TABLE tp_dst.t RENAME COLUMN v2 TO v; ALTER TABLE tp_dst.t RENAME COLUMN w2 TO w; ALTER TABLE tp_dst.t DROP COLUMN z});
+isnt($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace}), '0', 'it is still remembered');
+is($tp_in_bytes->(), 't', 'and made as it first was it reads as held again');
+$node->safe_psql('postgres', q{ALTER TABLE tp_dst.t ADD CONSTRAINT c9 CHECK (v IN ('a', 'b'))});
+# lost, what it was for reads as changed, and nothing else
+$node->safe_psql('postgres', q{SET allow_system_table_mods = on; DELETE FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace});
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_ws_print WHERE prtnamespace = 'tp_dst'::regnamespace}), '0', 'none are left');
+is($node->safe_psql('postgres', q{SELECT encode(test_ws_schema_bytes('tp_dst', 'pt'), 'hex')}) ne $tp_was{pt} ? 't' : 'f', 't', 'lost, what it was for reads as printed');
+$node->safe_psql('postgres', q{DROP SCHEMA tp_src CASCADE; DROP SCHEMA tp_dst CASCADE});
+
 $node->stop;
 done_testing();

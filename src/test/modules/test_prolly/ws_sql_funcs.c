@@ -40,6 +40,7 @@ PG_FUNCTION_INFO_V1(test_ws_schema_set_tags);
 PG_FUNCTION_INFO_V1(test_ws_fk_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_bytes);
 PG_FUNCTION_INFO_V1(test_ws_obj_copy);
+PG_FUNCTION_INFO_V1(test_ws_schema_remember);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_collation);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_family);
 PG_FUNCTION_INFO_V1(test_ws_obj_restore_opclass);
@@ -605,6 +606,22 @@ test_ws_obj_restore_named(PG_FUNCTION_ARGS)
 	else
 		o.kind = WS_OBJ_TSCONFIG;
 	ws_obj_restore(&o, 1, text_to_cstring(PG_GETARG_TEXT_PP(2)), true);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_schema_remember(bytes bytea, schema text) returns void: what a restore does of a
+ * table once it is made, remembering what it prints
+ */
+Datum
+test_ws_schema_remember(PG_FUNCTION_ARGS)
+{
+	bytea	   *bytes = PG_GETARG_BYTEA_PP(0);
+	WsTableSchema s;
+
+	WsSchemaCodec->decode((const uint8 *) VARDATA_ANY(bytes), VARSIZE_ANY_EXHDR(bytes), &s);
+	ws_schema_remember(&s, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	ws_schema_free(&s);
 	PG_RETURN_VOID();
 }
 
