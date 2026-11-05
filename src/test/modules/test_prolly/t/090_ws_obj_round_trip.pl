@@ -596,7 +596,6 @@ my @fn_refused = (
 	[ q{CREATE FUNCTION r_inf() RETURNS int LANGUAGE sql COST 1e39 AS 'SELECT 1'}, 'more than a definition can say' ],
 	[ q{CREATE TYPE h AS (r regclass); CREATE FUNCTION r_h(a h DEFAULT '(pg_class)') RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'may hold names' ],
 	[ q{CREATE TABLE z (a int); CREATE FUNCTION r_p(int) RETURNS int LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT count(*)::int FROM z; END; CREATE TABLE zp (a int) PARTITION BY LIST (r_p(a))}, 'a table needs it, and it needs a table' ],
-	[ q{CREATE AGGREGATE r_agg(int) (SFUNC = int4pl, STYPE = int)}, 'an aggregate' ],
 	[ q{CREATE FUNCTION r_c() RETURNS int LANGUAGE internal AS 'int4pl'}, 'a language' ],
 	[ q{CREATE FUNCTION r_sp() RETURNS int LANGUAGE sql SET search_path = fn5 AS 'SELECT 1'}, 'a search path that names its schema' ],
 	[ q{CREATE TYPE public.fn_else AS ENUM ('a'); CREATE FUNCTION r_o(public.fn_else) RETURNS int LANGUAGE sql AS 'SELECT 1'}, 'another schema' ],
@@ -1313,6 +1312,180 @@ $node->safe_psql('oplat', qq{SET client_encoding = 'UTF8'; CREATE ACCESS METHOD 
 	CREATE SCHEMA la; CREATE SCHEMA la2; CREATE OPERATOR FAMILY la.f USING "b\xc3\xa9"; COMMENT ON OPERATOR FAMILY la.f USING "b\xc3\xa9" IS 'x';});
 $node->safe_psql('oplat', q{SELECT test_ws_obj_copy('la', 'la2')});
 is($node->safe_psql('oplat', q{SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily WHERE opfnamespace = 'la2'::regnamespace}), 'x', 'a family of a method not in ASCII has its comment');
+
+# aggregates
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_agowner NOLOGIN; CREATE ROLE g_agread NOLOGIN;
+	CREATE SCHEMA ag AUTHORIZATION g_agowner; CREATE SCHEMA ag2 AUTHORIZATION g_agowner;
+	SET search_path = ag;
+	CREATE FUNCTION sfn(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+	CREATE FUNCTION ffn(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE FUNCTION lt(integer, integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 < $2';
+	CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = lt);
+	CREATE AGGREGATE full_one(integer) (SFUNC = sfn, STYPE = integer, SSPACE = 16, INITCOND = '0', FINALFUNC = ffn, FINALFUNC_MODIFY = READ_WRITE,
+		COMBINEFUNC = sfn, SORTOP = <<<, PARALLEL = SAFE);
+	CREATE AGGREGATE moving(integer) (SFUNC = sfn, STYPE = integer, MSFUNC = sfn, MINVFUNC = sfn, MSTYPE = integer, MSSPACE = 8, MFINALFUNC = ffn, MFINALFUNC_MODIFY = SHAREABLE, MINITCOND = '0', PARALLEL = RESTRICTED);
+	CREATE AGGREGATE quoted(text) (SFUNC = textcat, STYPE = text, INITCOND = 'it''s');
+	CREATE AGGREGATE star(*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '0');
+	CREATE AGGREGATE poly(anycompatible) (SFUNC = array_append, STYPE = anycompatiblearray, INITCOND = '{}');
+	CREATE AGGREGATE ordered(float8 ORDER BY anyelement) (SFUNC = ordered_set_transition, STYPE = internal, FINALFUNC = percentile_disc_final, FINALFUNC_EXTRA, FINALFUNC_MODIFY = READ_WRITE);
+	CREATE AGGREGATE hypo(VARIADIC "any" ORDER BY VARIADIC "any") (SFUNC = ordered_set_transition_multi, STYPE = internal, FINALFUNC = rank_final, FINALFUNC_EXTRA, FINALFUNC_MODIFY = READ_WRITE, HYPOTHETICAL);
+	COMMENT ON AGGREGATE full_one(integer) IS 'an aggregate';
+	COMMENT ON AGGREGATE ordered(float8 ORDER BY anyelement) IS 'ordered';
+	ALTER AGGREGATE full_one(integer) OWNER TO g_agowner;
+	REVOKE ALL ON FUNCTION full_one(integer) FROM PUBLIC;
+	GRANT EXECUTE ON FUNCTION full_one(integer) TO g_agread;
+	CREATE TABLE t (a integer); ALTER TABLE t OWNER TO g_agowner;
+	CREATE VIEW v AS SELECT full_one(a) AS x FROM t; ALTER VIEW v OWNER TO g_agowner;
+	CREATE FUNCTION uses() RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT moving(1) AS y; END;
+});
+my $ag_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ag')});
+my %ag_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $ag_held;
+ok($ag_val{$_}, "$_ is held") for ('aggregate/full_one(integer)', 'aggregate/moving(integer)', 'aggregate/star()', 'aggregate/poly(anycompatible)',
+	'aggregate/ordered(double precision, anyelement)', 'aggregate/hypo("any")');
+like($ag_val{'aggregate/star()'}, qr/\(\*\) \(SFUNC = int8inc/, 'an aggregate of no arguments says so');
+like($ag_val{'aggregate/ordered(double precision, anyelement)'}, qr/ORDER BY anyelement/, 'and one of order');
+like($ag_val{'aggregate/hypo("any")'}, qr/HYPOTHETICAL/, 'and a hypothetical one');
+like($ag_val{'aggregate/full_one(integer)'}, qr/operator\/<<<\(integer, integer\)/, 'it needs its operator');
+like($ag_val{'aggregate/full_one(integer)'}, qr/function\/sfn\(integer, integer\)/, 'and its function');
+like($ag_val{'view/v'}, qr/aggregate\/full_one\(integer\)/, 'a view needs it');
+like($ag_val{'function/uses()'}, qr/aggregate\/moving\(integer\)/, 'as does a function');
+unlike(join('', values %ag_val), qr/\bag\./, 'none names its schema');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ag', 'ag2', 'before'); SET ROLE g_agowner; CREATE TABLE ag2.t (a integer)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ag', 'ag2', 'after')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ag2')}), $ag_held, 'aggregates are the same bytes restored');
+my $ag_cat = sub {
+	my $s = shift;
+	return $node->safe_psql('postgres', qq{SELECT string_agg(format('%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s', p.proname, a.aggkind, a.aggnumdirectargs, a.aggfinalextra, a.aggmfinalextra, a.aggfinalmodify, a.aggmfinalmodify,
+		a.aggtransspace, a.aggmtransspace, a.agginitval, a.aggminitval, p.proparallel, a.aggcombinefn::oid <> 0, a.aggsortop <> 0, a.aggtranstype::regtype::text LIKE '%int%', a.aggminvtransfn::oid <> 0), ', ' ORDER BY p.proname)
+		FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = '$s'::regnamespace});
+};
+is($ag_cat->('ag2'), $ag_cat->('ag'), 'and as they were');
+is($node->safe_psql('postgres', q{SELECT has_function_privilege('g_agread', 'ag2.full_one(integer)', 'EXECUTE') AND NOT has_function_privilege('public', 'ag2.full_one(integer)', 'EXECUTE')}), 't', 'with their grants');
+is($node->safe_psql('postgres', q{SELECT obj_description('ag2.ordered(float8, anyelement)'::regprocedure, 'pg_proc')}), 'ordered', 'and comments');
+
+# text search
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_tsowner NOLOGIN;
+	CREATE SCHEMA ts AUTHORIZATION g_tsowner; CREATE SCHEMA ts2 AUTHORIZATION g_tsowner;
+	SET search_path = ts;
+	CREATE TEXT SEARCH PARSER prs (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype, HEADLINE = prsd_headline);
+	CREATE TEXT SEARCH PARSER "Odd Prs" (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype);
+	CREATE TEXT SEARCH TEMPLATE tmp (INIT = dsimple_init, LEXIZE = dsimple_lexize);
+	CREATE TEXT SEARCH TEMPLATE no_init (LEXIZE = dsimple_lexize);
+	CREATE TEXT SEARCH DICTIONARY dict (TEMPLATE = tmp, stopwords = 'english', accept = false);
+	CREATE TEXT SEARCH DICTIONARY "Odd Dict" (TEMPLATE = snowball, language = 'english');
+	CREATE TEXT SEARCH DICTIONARY bare (TEMPLATE = no_init);
+	ALTER TEXT SEARCH DICTIONARY dict OWNER TO g_tsowner;
+	CREATE TEXT SEARCH CONFIGURATION cfg (PARSER = prs);
+	ALTER TEXT SEARCH CONFIGURATION cfg ADD MAPPING FOR asciiword, word WITH dict, "Odd Dict";
+	ALTER TEXT SEARCH CONFIGURATION cfg ADD MAPPING FOR host WITH simple;
+	ALTER TEXT SEARCH CONFIGURATION cfg OWNER TO g_tsowner;
+	CREATE TEXT SEARCH CONFIGURATION "Odd Cfg" (PARSER = "default");
+	COMMENT ON TEXT SEARCH PARSER prs IS 'p'; COMMENT ON TEXT SEARCH TEMPLATE tmp IS 't';
+	COMMENT ON TEXT SEARCH DICTIONARY dict IS 'd'; COMMENT ON TEXT SEARCH CONFIGURATION cfg IS 'c';
+});
+my $ts_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ts')});
+my %ts_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $ts_held;
+ok($ts_val{$_}, "$_ is held") for ('tsparser/prs', 'tstemplate/tmp', 'tsdict/dict', 'tsconfig/cfg', 'tsmap/cfg(asciiword)', 'tsmap/cfg(host)', 'tsconfig/Odd Cfg');
+like($ts_val{'tsdict/dict'}, qr/TEMPLATE = tmp, stopwords = 'english', accept = 'false'/, 'a dictionary says its options');
+like($ts_val{'tsdict/dict'}, qr/tstemplate\/tmp/, 'and needs its template');
+like($ts_val{'tsconfig/cfg'}, qr/tsparser\/prs/, 'a configuration needs its parser');
+like($ts_val{'tsconfig/cfg'}, qr/tsdict\/dict/, 'and its dictionaries');
+like($ts_val{'tsmap/cfg(asciiword)'}, qr/ADD MAPPING FOR asciiword WITH dict, "Odd Dict"/, 'a mapping says them in order');
+like($ts_val{'tsmap/cfg(host)'}, qr/WITH simple/, 'and those of the catalogs');
+unlike(join('', values %ts_val), qr/\bts\./, 'none names its schema');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('ts', 'ts2')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('ts2')}), $ts_held, 'text search objects are the same bytes restored');
+is( $node->safe_psql('postgres', q{SELECT to_tsvector('ts2.cfg', 'The quick host.example.com') = to_tsvector('ts.cfg', 'The quick host.example.com')}), 't', 'and work as they did');
+is($node->safe_psql('postgres', q{SELECT cfgowner::regrole FROM pg_ts_config WHERE cfgname = 'cfg' AND cfgnamespace = 'ts2'::regnamespace}), 'g_tsowner', 'with their owners');
+is($node->safe_psql('postgres', q{SELECT obj_description(oid, 'pg_ts_parser') FROM pg_ts_parser WHERE prsname = 'prs' AND prsnamespace = 'ts2'::regnamespace}), 'p', 'and comments');
+
+# statistics objects
+$node->safe_psql('postgres', q{
+	CREATE ROLE g_stowner NOLOGIN;
+	CREATE SCHEMA sx AUTHORIZATION g_stowner; CREATE SCHEMA sx2 AUTHORIZATION g_stowner;
+	SET ROLE g_stowner; SET search_path = sx;
+	CREATE TABLE t (a integer, "Odd B" integer, c text);
+	CREATE MATERIALIZED VIEW mv AS SELECT a, c FROM t WITH NO DATA;
+	CREATE STATISTICS st (ndistinct) ON a, "Odd B" FROM t;
+	CREATE STATISTICS "Odd St" ON a, c FROM t;
+	CREATE STATISTICS ex ON (a + 1), ("Odd B" * 2) FROM t;
+	CREATE STATISTICS on_mv (dependencies, mcv) ON a, c FROM mv;
+	COMMENT ON STATISTICS st IS 'a statistics object';
+});
+my $st_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sx')});
+my %st_val = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $st_held;
+ok($st_val{$_}, "$_ is held") for ('statistics/st', 'statistics/Odd St', 'statistics/ex', 'statistics/on_mv');
+like($st_val{'statistics/st'}, qr/\(ndistinct\) ON a, "Odd B" FROM t/, 'it says its table bare');
+like($st_val{'statistics/on_mv'}, qr/matview\/mv/, 'and needs a materialized view');
+like($st_val{'statistics/st'}, qr/g_stowner/, 'and has its owner');
+unlike(join('', values %st_val), qr/\bsx\./, 'none names its schema');
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sx', 'sx2', 'before'); SET ROLE g_stowner; CREATE TABLE sx2.t (a integer, "Odd B" integer, c text)});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('sx', 'sx2', 'after')});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('sx2')}), $st_held, 'statistics objects are the same bytes restored');
+is( $node->safe_psql('postgres', q{SELECT string_agg(stxname || ' ' || stxkind::text, ', ' ORDER BY stxname) FROM pg_statistic_ext WHERE stxnamespace = 'sx2'::regnamespace}),
+	$node->safe_psql('postgres', q{SELECT string_agg(stxname || ' ' || stxkind::text, ', ' ORDER BY stxname) FROM pg_statistic_ext WHERE stxnamespace = 'sx'::regnamespace}), 'and of the same kinds');
+is($node->safe_psql('postgres', q{SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext WHERE stxname = 'st' AND stxnamespace = 'sx2'::regnamespace}), 'a statistics object', 'with a comment');
+
+$node->safe_psql('postgres', q{CREATE FUNCTION public.ag_else(integer, integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE TABLE public.st_else (a integer, b integer);
+	CREATE TEXT SEARCH TEMPLATE public.tmp_else (LEXIZE = dsimple_lexize); CREATE TEXT SEARCH DICTIONARY public.dict_else (TEMPLATE = simple);
+	CREATE FOREIGN DATA WRAPPER fdw_st; CREATE SERVER srv_st FOREIGN DATA WRAPPER fdw_st});
+for my $case (
+	[ q{CREATE AGGREGATE a(integer) (SFUNC = public.ag_else, STYPE = integer)}, 'another schema' ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE AGGREGATE a(ka5."date") (SFUNC = enum_larger, STYPE = ka5."date")}, "say a schema's name" ],
+	[ q{CREATE TEXT SEARCH DICTIONARY simple (TEMPLATE = simple)}, 'as one in the catalogs' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION english (PARSER = "default")}, 'as one in the catalogs' ],
+	[ q{CREATE TEXT SEARCH PARSER "default" (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype)}, 'as one in the catalogs' ],
+	[ q{CREATE TEXT SEARCH TEMPLATE snowball (LEXIZE = dsimple_lexize)}, 'as one in the catalogs' ],
+	[ q{CREATE TEXT SEARCH DICTIONARY d (TEMPLATE = public.tmp_else)}, 'another schema' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION c (PARSER = "default"); ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR word WITH public.dict_else}, 'another schema' ],
+	[ q{CREATE TABLE t (a integer, b integer); CREATE STATISTICS public.st_here ON a, b FROM ka5.t}, 'another schema than its table' ],
+	[ q{CREATE STATISTICS s ON a, b FROM public.st_else}, 'another schema than its table' ],
+	[ q{CREATE TABLE t (a integer, b integer); CREATE STATISTICS s ON a, b FROM t; ALTER STATISTICS s SET STATISTICS 10}, 'a statistics target' ],
+	[ q{CREATE TABLE pg_class (a integer, b integer); CREATE STATISTICS s ON a, b FROM ka5.pg_class}, "say a schema's name" ],
+	[ q{CREATE FOREIGN TABLE ft (a integer, b integer) SERVER srv_st; CREATE STATISTICS s ON a, b FROM ft}, 'what no commit holds' ],
+	[ q{CREATE TYPE "date" AS ENUM ('a'); CREATE TABLE t (a integer, b integer); CREATE STATISTICS s ON (('a'::ka5."date")::text || a), b FROM t}, "say a schema's name" ])
+{
+	my ($sql, $why) = @$case;
+	$node->safe_psql('postgres', qq{DROP STATISTICS IF EXISTS public.st_here; DROP SCHEMA IF EXISTS ka5 CASCADE; DROP STATISTICS IF EXISTS public.s; CREATE SCHEMA ka5; SET search_path = ka5; $sql});
+	my ($rck, $outk, $errk) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('ka5')});
+	isnt($rck, 0, "refused: $sql");
+	like($errk, qr/\Q$why\E/, "for why: $sql");
+}
+$node->safe_psql('postgres', q{DROP STATISTICS IF EXISTS public.st_here; DROP SCHEMA ka5 CASCADE; DROP STATISTICS IF EXISTS public.s; DROP FUNCTION public.ag_else(integer, integer); DROP TABLE public.st_else;
+	DROP TEXT SEARCH DICTIONARY public.dict_else; DROP TEXT SEARCH TEMPLATE public.tmp_else; DROP SERVER srv_st; DROP FOREIGN DATA WRAPPER fdw_st});
+
+for my $x (
+	[ q{CREATE TEXT SEARCH TEMPLATE cx.c (LEXIZE = dsimple_lexize)}, 'TEXT SEARCH TEMPLATE cx.c' ],
+	[ q{CREATE TEXT SEARCH DICTIONARY cx.c (TEMPLATE = simple)}, 'TEXT SEARCH DICTIONARY cx.c' ],
+	[ q{CREATE TEXT SEARCH PARSER cx.c (START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, LEXTYPES = prsd_lextype)}, 'TEXT SEARCH PARSER cx.c' ],
+	[ q{CREATE TEXT SEARCH CONFIGURATION cx.c (PARSER = "default")}, 'TEXT SEARCH CONFIGURATION cx.c' ],
+	[ q{CREATE AGGREGATE cx.c(integer) (SFUNC = int4pl, STYPE = integer)}, 'AGGREGATE cx.c(integer)' ])
+{
+	my ($make, $member) = @$x;
+	$node->safe_psql('postgres', qq{CREATE SCHEMA cx; $make; ALTER EXTENSION test_prolly ADD $member});
+	my ($rcx, $outx, $errx) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('cx')});
+	like($errx, qr/belongs to an extension/, "refused: $member");
+	$node->safe_psql('postgres', qq{ALTER EXTENSION test_prolly DROP $member; DROP SCHEMA cx CASCADE});
+}
+
+# since a snapshot, one to try again
+for my $change ([ 'ts', q{COMMENT ON TEXT SEARCH PARSER ts.prs IS 'later'} ], [ 'ts', q{COMMENT ON TEXT SEARCH TEMPLATE ts.tmp IS 'later'} ],
+	[ 'ts', q{ALTER TEXT SEARCH DICTIONARY ts.dict (accept = true)} ], [ 'ts', q{ALTER TEXT SEARCH CONFIGURATION ts.cfg ALTER MAPPING FOR host WITH ts.dict} ],
+	[ 'ts', q{COMMENT ON TEXT SEARCH CONFIGURATION ts.cfg IS 'later'} ], [ 'sx', q{ALTER STATISTICS sx.ex RENAME TO ex2} ], [ 'sx', q{COMMENT ON STATISTICS sx.st IS 'later'} ],
+	[ 'ag', q{COMMENT ON AGGREGATE ag.star(*) IS 'later'} ])
+{
+	my ($where, $sql) = @$change;
+	my $old = $node->background_psql('postgres', on_error_stop => 0);
+	$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+	$old->query_safe('SELECT count(*) FROM pg_class');
+	$node->safe_psql('postgres', $sql);
+	$old->{stderr} = '';
+	$old->query(qq{SELECT test_ws_obj_bytes('$where')});
+	like($old->{stderr}, qr/has changed since/, "to try again after: $sql");
+	$old->quit;
+}
 
 $node->stop;
 done_testing();
