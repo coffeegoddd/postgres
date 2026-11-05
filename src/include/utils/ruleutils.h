@@ -32,7 +32,7 @@ typedef char *(*DeparseColumnNameHook) (Oid relid, AttrNumber attnum);
 extern PGDLLIMPORT DeparseColumnNameHook deparse_column_name_hook;
 
 /*
- * Set when a table, function or join is printed with an alias list, which goes
+ * Set when a table, function returning a relation's row, or join is printed with an alias list, which goes
  * by place; never reset here, so whoever reads it clears it before the print.
  */
 extern PGDLLIMPORT bool deparse_printed_alias_list;

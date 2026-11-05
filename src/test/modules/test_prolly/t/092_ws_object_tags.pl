@@ -247,6 +247,38 @@ $node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWN
 my %over_view = map { my ($k, $v) = split /\t/; $k => pack('H*', $v // '') } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
 like($over_view{'view/v'}, qr/v0.b,a/, 'a list over a view holds its columns by name');
 $node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE});
+# what a list reads that the restore itself makes is there to compare, as it was
+for my $case (
+	[ 'a view over a view', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.v0 x(c)} ],
+	[ 'a function returning a composite', q{CREATE TYPE pl1.ty AS (p integer, q integer); CREATE FUNCTION pl1.f() RETURNS pl1.ty LANGUAGE sql AS 'SELECT 1, 2'; CREATE VIEW pl1.v AS SELECT x.p FROM pl1.f() x} ],
+	[ 'a function returning a view\'s row', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE FUNCTION pl1.f() RETURNS SETOF pl1.v0 LANGUAGE sql AS 'SELECT * FROM pl1.v0'; CREATE VIEW pl1.v AS SELECT x.b FROM pl1.f() x} ],
+	[ 'a sequence', q{CREATE SEQUENCE pl1.sq; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.sq x(c)} ],
+	[ 'a matview', q{CREATE MATERIALIZED VIEW pl1.mv AS SELECT a, b FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.mv x(c)} ],
+	[ 'a rule on a view with a list', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.v0 x(c); CREATE RULE r AS ON INSERT TO pl1.v DO INSTEAD NOTHING} ],
+	[ 'a body over a view', q{CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE FUNCTION pl1.g() RETURNS SETOF integer LANGUAGE sql BEGIN ATOMIC SELECT x.c FROM pl1.v0 x(c); END} ])
+{
+	my ($name, $made) = @$case;
+	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE pl1.t (a integer, b integer)});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $made");
+	$node->safe_psql('postgres', q{SET ROLE g_tags; SELECT test_ws_schema_create(test_ws_schema_bytes('pl1', 't'), 'pl2'); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2')});
+	my ($rcv, $outv, $errv) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	is($rcv, 0, "$name: restores with nothing changed") or diag($errv);
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')}), "$name: as its commit");
+	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+}
+# a function's list goes by no table's place unless it returns one's row
+for my $case (
+	[ 'a scalar function', q{CREATE VIEW pl1.v AS SELECT t.a, g FROM pl1.t, generate_series(1, 2) g} ],
+	[ 'an array', q{CREATE FUNCTION pl1.g() RETURNS SETOF integer LANGUAGE sql BEGIN ATOMIC SELECT t.a FROM pl1.t, unnest(ARRAY[1]) e; END} ])
+{
+	my ($name, $made) = @$case;
+	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE pl1.t (a integer, b integer)});
+	$node->safe_psql('postgres', "SET ROLE g_tags; $made");
+	$node->safe_psql('postgres', q{SET ROLE g_tags; SELECT test_ws_schema_create(test_ws_schema_bytes('pl1', 't'), 'pl2'); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2'); ALTER TABLE pl2.t ADD COLUMN z integer});
+	my ($rcf, $outf, $errf) = $node->psql('postgres', q{SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+	is($rcf, 0, "$name: a column added makes no difference") or diag($errf);
+	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
+}
 # with no list, a column added changes nothing
 $node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
 	CREATE TABLE pl1.t (a integer); CREATE VIEW pl1.v AS SELECT a FROM pl1.t; CREATE TABLE pl2.t (a integer); ALTER TABLE pl2.t ADD COLUMN b integer});

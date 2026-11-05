@@ -1695,18 +1695,38 @@ places_cmp(const void *a, const void *b)
 	return strcmp(((const WsObjectPlaces *) a)->table, ((const WsObjectPlaces *) b)->table);
 }
 
-/* A relation's columns in order, each its tag or, with none, its name, as UTF-8; NULL if it has none. */
+/*
+ * A relation's columns in order, each its tag or, with none, its name, as UTF-8; NULL if it has
+ * none.  (From the caches: a restore's read-only query does not see what the restore has made.)
+ */
 static char *
-column_tags_of(const char *oid)
+column_tags_of(Oid relid)
 {
-	const char *params[1] = {oid};
-	WsSqlRows	rows;
+	StringInfoData columns;
 	char	   *tags;
 
-	WsSql->read("SELECT string_agg(CASE WHEN a.attcoltag <> 0 THEN a.attcoltag::text ELSE quote_ident(a.attname::text) END, ',' ORDER BY a.attnum) "
-				"FROM pg_attribute a WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped", 1, params, &rows);
-	tags = ws_sql_value(&rows, 0, 0) != NULL ? pstrdup(ws_text_to_utf8(ws_sql_value(&rows, 0, 0))) : NULL;
-	ws_sql_rows_free(&rows);
+	initStringInfo(&columns);
+	for (int i = 1;; i++)
+	{
+		HeapTuple	tuple = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(i));
+		Form_pg_attribute att;
+
+		if (!HeapTupleIsValid(tuple))
+			break;
+		att = (Form_pg_attribute) GETSTRUCT(tuple);
+		if (!att->attisdropped)
+		{
+			if (columns.len > 0)
+				appendStringInfoChar(&columns, ',');
+			if (att->attcoltag != 0)
+				appendStringInfo(&columns, INT64_FORMAT, (int64) att->attcoltag);
+			else
+				appendStringInfoString(&columns, quote_identifier(NameStr(att->attname)));
+		}
+		ReleaseSysCache(tuple);
+	}
+	tags = columns.len > 0 ? pstrdup(ws_text_to_utf8(columns.data)) : NULL;
+	pfree(columns.data);
 	return tags;
 }
 
@@ -1719,8 +1739,7 @@ read_places(WsObject *o, const UsingWalk *w)
 
 	foreach_oid(relid, w->tables)
 	{
-		char	   *oid = psprintf("%u", relid);
-		char	   *tags = column_tags_of(oid);
+		char	   *tags = column_tags_of(relid);
 
 		if (tags != NULL)
 		{
@@ -1728,7 +1747,6 @@ read_places(WsObject *o, const UsingWalk *w)
 			places[n++].columns = px_memdup(tags, strlen(tags) + 1);
 			pfree(tags);
 		}
-		pfree(oid);
 	}
 	if (n > 1)
 		qsort(places, n, sizeof(WsObjectPlaces), places_cmp);
@@ -1781,22 +1799,15 @@ check_usings(const WsObject *o, const char *schema)
 	for (int i = 0; i < o->nplaces; i++)
 	{
 		char	   *table = ws_name_from_utf8(o->places[i].table);
-		char	   *qualified = psprintf("%s.%s", quote_identifier(schema), quote_identifier(table));
-		const char *params[1] = {qualified};
-		WsSqlRows	rows;
-		char	   *now = NULL;
+		Oid			relid = get_relname_relid(table, get_namespace_oid(schema, false));
+		char	   *now = OidIsValid(relid) ? column_tags_of(relid) : NULL;
 
-		WsSql->read("SELECT to_regclass($1)::oid::text", 1, params, &rows);
-		if (ws_sql_value(&rows, 0, 0) != NULL)
-			now = column_tags_of(ws_sql_value(&rows, 0, 0));
-		ws_sql_rows_free(&rows);
 		if (now == NULL || strcmp(now, o->places[i].columns) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("\"%s\" in schema \"%s\" cannot be made: an alias list of it goes by the place of the columns of table \"%s\", which have changed",
 							o->name, schema, table),
 					 errhint("An alias list cannot follow a column added, dropped or moved. Make the object again.")));
-		pfree(qualified);
 		pfree(table);
 	}
 	for (int i = 0; i < o->nusings; i++)
