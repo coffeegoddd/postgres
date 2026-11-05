@@ -3770,6 +3770,8 @@ write_add_exclusion(const WsTableSchema *s, const WsConstraint *con, const char 
 	put_index_columns(s, &con->excl, index_settings_of(s, con->name), out);
 	put_constraint_settings(s, index_settings_of(s, con->name), out);
 	put_index_predicate(s, &con->excl, out);
+	if (con->deferrable)
+		ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
 }
 
 /* One ALTER TABLE, of this table, adding this constraint, and nothing else. */
