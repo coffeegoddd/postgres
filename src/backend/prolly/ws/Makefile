@@ -16,6 +16,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	ws_diff.o \
 	ws_fk.o \
+	ws_merge.o \
 	ws_obj.o \
 	ws_print.o \
 	ws_role.o \
