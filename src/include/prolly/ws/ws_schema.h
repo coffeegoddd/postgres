@@ -321,6 +321,8 @@ extern void ws_schema_row_shape(const WsTableSchema *s, WsRowShape *shape);
  * tag, name, type, kind, not-null, identity, default and collation, and its key,
  * constraints and indexes.
  */
+/* A stored expression with its table's columns' names, in UTF8, appended to out. */
+extern void ws_schema_render_expression(const WsTableSchema *s, const char *stored, Buf *out);
 extern void ws_schema_constraint_bytes(const WsConstraint *con, Buf *out);
 extern void ws_schema_index_bytes(const WsIndex *ix, Buf *out);
 extern void ws_schema_settings_bytes(const WsTableSchema *s, Buf *out);

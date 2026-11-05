@@ -59,6 +59,8 @@ PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
 PG_FUNCTION_INFO_V1(test_ws_diff);
 PG_FUNCTION_INFO_V1(test_ws_merge);
+PG_FUNCTION_INFO_V1(test_ws_root_table_bytes);
+PG_FUNCTION_INFO_V1(test_ws_root_rows_restore);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy_as);
 
 /*
@@ -1021,11 +1023,58 @@ test_ws_merge(PG_FUNCTION_ARGS)
 	PHash		theirs = text_hash(PG_GETARG_TEXT_PP(2));
 	WsMergeResult res;
 	StringInfoData out;
+	Datum	   *names;
+	bool	   *nulls;
+	int			nnames;
+	const char **schemas;
+	WsEvalSchemas in;
 
-	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &res);
+	deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(3), TEXTOID, &names, &nulls, &nnames);
+	schemas = palloc_array(const char *, Max(nnames, 1));
+	for (int i = 0; i < nnames; i++)
+		schemas[i] = TextDatumGetCString(names[i]);
+	in.schemas = schemas;
+	in.n = nnames;
+	WsMerge->merge(backend_ctx(), &base, &ours, &theirs, &SqlWsEval, &in, &res);
 	initStringInfo(&out);
 	appendStringInfoString(&out, text_to_cstring(hash_text(&res.root)));
 	for (int i = 0; i < res.nconflicts; i++)
 		appendStringInfo(&out, "\n%s", res.conflicts[i]);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* test_ws_root_table_bytes(root text, tab text) returns bytea: a table's record in a root */
+Datum
+test_ws_root_table_bytes(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema rec;
+	PHash		rows;
+	Buf			bytes = BUF_INIT;
+	bytea	   *out;
+
+	if (!WsRoot->get_table(backend_ctx(), &root, table, &rec, &rows))
+		elog(ERROR, "no table \"%s\" in that root", table);
+	WsSchemaCodec->encode(&rec, &bytes);
+	out = palloc(VARHDRSZ + bytes.len);
+	SET_VARSIZE(out, VARHDRSZ + bytes.len);
+	memcpy(VARDATA(out), bytes.data, bytes.len);
+	PG_RETURN_BYTEA_P(out);
+}
+
+/* test_ws_root_rows_restore(root text, tab text, dest text) returns void */
+Datum
+test_ws_root_rows_restore(PG_FUNCTION_ARGS)
+{
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *dest = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	WsTableSchema rec;
+	PHash		rows;
+
+	if (!WsRoot->get_table(backend_ctx(), &root, table, &rec, &rows))
+		elog(ERROR, "no table \"%s\" in that root", table);
+	WsRows->restore(backend_ctx(), dest, &rec, &rows);
+	PG_RETURN_VOID();
 }
