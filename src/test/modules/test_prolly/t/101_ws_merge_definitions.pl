@@ -106,6 +106,43 @@ $node->safe_psql('postgres', 'CREATE ROLE g_gone NOLOGIN TRAVELS; GRANT g_gone T
 is(scalar @$c, 1, 'a definer whose owner is gone: one conflict') or diag($e);
 like($c->[0] // '', qr/^unapplied function "who" runs as its owner/, 'it says so');
 
+# the message outlasts the row that first asked for the definitions
+$node->safe_psql('postgres', 'CREATE ROLE g_gone2 NOLOGIN TRAVELS; GRANT g_gone2 TO g_def');
+($c, $r, $e) = scenario(q{CREATE FUNCTION who(integer) RETURNS text IMMUTABLE SECURITY DEFINER LANGUAGE sql AS 'SELECT current_user::text';
+	RESET ROLE; GRANT CREATE ON SCHEMA app TO g_gone2; SET ROLE g_def;
+	ALTER FUNCTION who(integer) OWNER TO g_gone2;
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, n text)},
+	q{ALTER TABLE t ALTER COLUMN a TYPE bigint}, q{INSERT INTO t SELECT g, g, repeat('x', 100) FROM generate_series(1, 3000) g},
+	q{DROP ROLE g_gone2;});
+is(scalar @$c, 1, 'asked for within a row: one conflict') or diag($e);
+like($c->[0] // '', qr/^unapplied function "who" runs as its owner/, 'its message intact');
+
+# someone else's owner being gone is nothing to a definer the merger owns
+$node->safe_psql('postgres', 'CREATE ROLE g_gone3 NOLOGIN TRAVELS; GRANT g_gone3 TO g_def');
+($c, $r, $e) = scenario(q{CREATE TYPE ty AS ENUM ('a');
+	RESET ROLE; GRANT CREATE ON SCHEMA app TO g_gone3; SET ROLE g_def;
+	ALTER TYPE ty OWNER TO g_gone3;
+	CREATE FUNCTION mine(integer) RETURNS integer IMMUTABLE SECURITY DEFINER LANGUAGE sql AS 'SELECT $1 * 2';
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, b integer, g integer GENERATED ALWAYS AS (mine(a)) STORED);
+	INSERT INTO t VALUES (1, 1, 1)}, q{UPDATE t SET a = 10}, q{UPDATE t SET b = 5},
+	q{DROP ROLE g_gone3;});
+is_deeply($c, [], 'a definer of its own, another object with its owner gone: clean') or diag($e);
+
+# a body that names a constraint has it there
+($c, $r, $e) = scenario(q{CREATE TABLE p (id integer PRIMARY KEY, u integer, CONSTRAINT pk UNIQUE (u));
+	CREATE FUNCTION put(integer) RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO p VALUES ($1, $1) ON CONFLICT ON CONSTRAINT pk DO NOTHING; END;
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, b integer, g integer GENERATED ALWAYS AS (a * 2) STORED);
+	INSERT INTO t VALUES (1, 1, 1)}, q{UPDATE t SET a = 10}, q{UPDATE t SET b = 5});
+is_deeply($c, [], 'a body naming a constraint: clean') or diag($e);
+is($r, '1|10|5|20', 'and its value');
+
+# a sequence hands out nothing it held
+($c, $r, $e) = scenario(q{CREATE SEQUENCE s CYCLE;
+	CREATE FUNCTION nv(integer) RETURNS bigint IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN RETURN nextval('app.s'); END $$;
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, b integer, g bigint GENERATED ALWAYS AS (nv(a)) STORED);
+	INSERT INTO t VALUES (1, 1, 1)}, q{UPDATE t SET a = 10}, q{UPDATE t SET b = 5});
+is_deeply($c, [ 'generated t 1' ], 'a value from a sequence conflicts') or diag($e);
+
 # a schema conflict hides what its rows would say
 ($c, $r, $e) = scenario("$T; INSERT INTO t VALUES (1, 1, 1); CREATE TABLE u (id integer PRIMARY KEY, a integer); INSERT INTO u VALUES (1, 1)",
 	q{ALTER TABLE t ALTER COLUMN a TYPE bigint; UPDATE u SET a = 2}, q{ALTER TABLE t ALTER COLUMN a TYPE numeric; UPDATE u SET a = 3});
@@ -119,6 +156,33 @@ my $nothing = $node->safe_psql('postgres', q{SET client_min_messages = warning;
 	SELECT split_part(test_ws_merge(:'r', :'r', :'r'), E'\n', 2);
 	COMMIT;});
 is($nothing, '', 'read only, nothing to work out: clean');
+
+# a merge within a value being worked out comes back
+my $NEST = q{CREATE FUNCTION nest(integer) RETURNS integer IMMUTABLE LANGUAGE plpgsql AS $$
+	DECLARE b text := current_setting('my.ib', true);
+	BEGIN
+		IF b IS NOT NULL AND b <> '' THEN
+			PERFORM set_config('my.ib', '', false);
+			PERFORM public.test_ws_merge(b, current_setting('my.io'), current_setting('my.it'), 'inner');
+		END IF;
+		RETURN $1;
+	END $$;
+	CREATE TABLE t (id integer PRIMARY KEY, a integer, b integer, g integer GENERATED ALWAYS AS (nest(a)) STORED);
+	INSERT INTO t VALUES (1, 1, 1)};
+my ($nest_rc, $nest, $nest_err) = $node->psql('postgres', qq{SET client_min_messages = warning;
+	SET catalog_branch = } . $branch->() . qq{;
+	CREATE SCHEMA nb VERSIONED; CREATE SCHEMA no VERSIONED; CREATE SCHEMA nt VERSIONED;
+	SET search_path = nb; $NEST;
+	SET search_path = no; $NEST; UPDATE t SET a = 9;
+	SET search_path = nt; $NEST; UPDATE t SET b = 5;
+	SET search_path = public;
+	SELECT test_ws_root_capture('nb') AS rb \\gset
+	SELECT test_ws_root_capture('no') AS ro \\gset
+	SELECT test_ws_root_capture('nt') AS rt \\gset
+	SELECT set_config('my.ib', :'rb', false), set_config('my.io', :'ro', false), set_config('my.it', :'rt', false) \\gset
+	SELECT split_part(test_ws_merge(:'rb', :'ro', :'rt', 'outer'), E'\\n', 2);
+	SELECT 1 FROM pg_class LIMIT 1;}, timeout => 60);
+is($nest_rc, 0, 'a merge within a value: comes back') or diag($nest_err);
 
 # two merges in one transaction, as a role with no more rights than its schemas'
 my ($two_rc, $two, $two_err) = $node->psql('postgres', q{SET client_min_messages = warning;

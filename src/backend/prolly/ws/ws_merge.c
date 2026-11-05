@@ -2271,6 +2271,7 @@ typedef struct EvalScope
 	const PHash *root;
 	const char *schema;
 	bool		made;
+	MemoryContext cxt;			/* of what outlasts a row, which the first may be asked in */
 	char	   *refused;		/* why they could not be made */
 } EvalScope;
 
@@ -2282,7 +2283,7 @@ eval_ready(EvalScope *scope)
 	if (!scope->made && scope->refused == NULL)
 	{
 		if (ws_root_definitions_begin(scope->ctx, scope->root, scope->schema, &failure))
-			scope->refused = failure.message != NULL ? failure.message : pstrdup("it was refused");
+			scope->refused = MemoryContextStrdup(scope->cxt, failure.message != NULL ? failure.message : "it was refused");
 		else
 			scope->made = true;
 	}
@@ -2320,6 +2321,8 @@ eval_statement(EvalScope *scope, const char *sql, int nparams, const char *const
 	int			level;
 	int			branch;
 	int			nest;
+	Oid			saved_namespace;
+	ExecutorCheckPerms_hook_type saved_hook;
 	WsSqlRows	rows;
 	WsSqlFailure failure;
 	bool		ok = false;
@@ -2329,8 +2332,13 @@ eval_statement(EvalScope *scope, const char *sql, int nparams, const char *const
 	level = WsSql->begin();
 	branch = CatalogBranchEnter(ws_root_scratch_branch());
 	nest = ws_schema_path_begin(scope->schema);
+	saved_namespace = eval_namespace;
+	saved_hook = ExecutorCheckPerms_hook;
 	eval_namespace = get_namespace_oid(scope->schema, false);
-	eval_prior_hook = ExecutorCheckPerms_hook;
+
+	/* (one that is ours already, a merge within a value, has its prior) */
+	if (saved_hook != eval_reads_no_table)
+		eval_prior_hook = saved_hook;
 	ExecutorCheckPerms_hook = eval_reads_no_table;
 	PG_TRY();
 	{
@@ -2338,7 +2346,8 @@ eval_statement(EvalScope *scope, const char *sql, int nparams, const char *const
 	}
 	PG_FINALLY();
 	{
-		ExecutorCheckPerms_hook = eval_prior_hook;
+		ExecutorCheckPerms_hook = saved_hook;
+		eval_namespace = saved_namespace;
 	}
 	PG_END_TRY();
 
@@ -2868,7 +2877,7 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 	if (m.nconflicts == 0)
 	{
 		PHash		definitions = rv;
-		EvalScope	scope = {ctx, &definitions, schema};
+		EvalScope	scope = {ctx, &definitions, schema, false, CurrentMemoryContext};
 
 		m.eval = eval;
 		m.eval_arg = &scope;

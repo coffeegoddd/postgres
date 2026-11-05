@@ -391,6 +391,21 @@ bare_record(const WsTableSchema *s, WsTableSchema *out)
 	out->ngrants = 0;
 }
 
+/* A table holding nothing, with all that says what it is, and no one's that it would need. */
+static void
+definitions_record(const WsTableSchema *s, WsTableSchema *out)
+{
+	*out = *s;
+	out->owner = NULL;
+	out->ninherits = 0;
+	out->ninherited_cols = 0;
+	out->ninherited_cons = 0;
+	out->row_security = false;
+	out->force_row_security = false;
+	out->ncomments = 0;
+	out->ngrants = 0;
+}
+
 static void
 add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const char *schema)
 {
@@ -424,18 +439,41 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
  * refused, as what it works out could not be what it means.
  */
 static void
-refuse_definers_with_no_owner(const char *schema)
+refuse_definers_with_no_owner(const WsObject *o, const char *schema)
+{
+	const char *params[2] = {schema, ws_name_from_utf8(o->name)};
+	WsSqlRows	rows;
+
+	WsSql->run("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+			   "WHERE n.nspname = $1::name AND p.proname = $2::name AND p.prosecdef LIMIT 1",
+			   2, params, &rows);
+	if (rows.nrows > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("function \"%s\" runs as its owner, a role not here", o->name)));
+	ws_sql_rows_free(&rows);
+}
+
+/* A sequence that hands out nothing, as no one should see it hand out what it held. */
+static void
+exhaust_sequences(const char *schema)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
 
-	WsSql->run("SELECT p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-			   "WHERE n.nspname = $1::name AND p.prosecdef AND p.proowner = current_user::regrole LIMIT 1",
-			   1, params, &rows);
-	if (rows.nrows > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("function \"%s\" runs as its owner, a role not here", ws_sql_value(&rows, 0, 0))));
+	WsSql->run("SELECT format('ALTER SEQUENCE %I.%I NO CYCLE', n.nspname, c.relname), "
+			   "format('SELECT pg_catalog.setval(%L::regclass, %s)', format('%I.%I', n.nspname, c.relname), "
+			   "CASE WHEN s.seqincrement > 0 THEN s.seqmax ELSE s.seqmin END) "
+			   "FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name", 1, params, &rows);
+	for (int i = 0; i < rows.nrows; i++)
+		for (int k = 0; k < 2; k++)
+		{
+			WsSqlRows	done;
+
+			WsSql->run(ws_sql_value(&rows, i, k), 0, NULL, &done);
+			ws_sql_rows_free(&done);
+		}
 	ws_sql_rows_free(&rows);
 }
 
@@ -457,7 +495,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	WsObject   *objs = NULL;
 	int			nobjs = 0;
 	Buf			sql = BUF_INIT;
-	bool		owner_absent = false;
+	bool	   *owner_absent;
 
 	WsSql->run("SELECT (SELECT count(*) FROM pg_namespace n, LATERAL (" \
 			   "SELECT 1 FROM pg_class WHERE relnamespace = n.oid UNION ALL " \
@@ -513,6 +551,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	}
 	if (WsRoot->get_map(ctx, root, WS_ROOT_OBJECTS, &map))
 		ws_obj_list(ctx, &map, &objs, &nobjs);
+	owner_absent = palloc0_array(bool, Max(nobjs, 1));
 	if (definitions_only)
 		for (int i = 0; i < nobjs; i++)
 		{
@@ -526,7 +565,8 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 			if (objs[i].owner != NULL && !OidIsValid(get_role_oid(ws_name_from_utf8(objs[i].owner), true)))
 			{
 				objs[i].owner = NULL;
-				owner_absent = true;
+				if (objs[i].kind == WS_OBJ_FUNCTION)
+					owner_absent[i] = true;
 			}
 		}
 	ws_obj_restore(objs, nobjs, schema, true);
@@ -541,9 +581,10 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 		{
 			WsTableSchema bare;
 
-			bare_record(&tables.recs[i], &bare);
 			if (definitions_only)
-				bare.owner = NULL;
+				definitions_record(&tables.recs[i], &bare);
+			else
+				bare_record(&tables.recs[i], &bare);
 			make_table(ctx, &bare, no_rows != NULL ? no_rows : &tables.rows[i], schema);
 		}
 		else
@@ -561,8 +602,11 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 		CommandCounterIncrement();
 		ws_obj_restore(usable, nusable, schema, false);
 		pfree(usable);
-		if (owner_absent)
-			refuse_definers_with_no_owner(schema);
+		for (int i = 0; i < nobjs; i++)
+			if (owner_absent[i])
+				refuse_definers_with_no_owner(&objs[i], schema);
+		CommandCounterIncrement();
+		exhaust_sequences(schema);
 		goto done;
 	}
 	for (int t = 0; t < tables.n; t++)
