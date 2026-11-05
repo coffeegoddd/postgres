@@ -1189,11 +1189,28 @@ grant_cmp(const void *a, const void *b)
 /*
  * A column of a table of this schema prints as a name no column has, holding its tag: quoted,
  * as any name that needs it is, so that what prints it can be parsed as it stands, and made
- * @{tag} only as it is stored.  (A name with no UTF8 could not hold a tag's other bytes.)
+ * @{tag} only as it is stored.  It holds what no text could be written to look like, as a
+ * string or a name may hold any bytes.
  */
 #define TAG_MARK '\001'
 
 static Oid tagged_namespace = InvalidOid;
+
+static const char *
+tag_mark_nonce(void)
+{
+	static char nonce[17];
+
+	if (nonce[0] == '\0')
+	{
+		uint64		r;
+
+		if (!pg_strong_random(&r, sizeof(r)))
+			elog(ERROR, "could not generate a random number");
+		snprintf(nonce, sizeof(nonce), "%016" PRIx64, r);
+	}
+	return nonce;
+}
 
 static char *
 name_of_tagged_column(Oid relid, AttrNumber attnum)
@@ -1208,7 +1225,7 @@ name_of_tagged_column(Oid relid, AttrNumber attnum)
 		return NULL;
 	tag = (uint64) ((Form_pg_attribute) GETSTRUCT(tup))->attcoltag;
 	ReleaseSysCache(tup);
-	return tag != 0 ? psprintf("%c" UINT64_FORMAT "%c", TAG_MARK, tag, TAG_MARK) : NULL;
+	return tag != 0 ? psprintf("%c%s:" UINT64_FORMAT "%c", TAG_MARK, tag_mark_nonce(), tag, TAG_MARK) : NULL;
 }
 
 static char *
@@ -1265,32 +1282,33 @@ owned_column_as_held(const char *schema, const char *table, const char *column)
 static void
 store_printed(const char *text, Buf *out)
 {
+	char	   *open_mark = psprintf("\"%c%s:", TAG_MARK, tag_mark_nonce());
+	size_t		open_len = strlen(open_mark);
 	const char *p = text;
 
 	for (;;)
 	{
-		const char *open = strchr(p, TAG_MARK);
+		const char *open = strstr(p, open_mark);
 		const char *close;
 		char	   *span;
 
 		if (open == NULL)
 		{
 			ws_tags_escape(p, out);
-			return;
+			break;
 		}
-		close = strchr(open + 1, TAG_MARK);
-		if (close == NULL || open == text || open[-1] != '"' || close[1] != '"')
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("what is printed holds a byte a commit cannot hold")));
-		span = pnstrdup(p, open - 1 - p);
+		close = strchr(open + open_len, TAG_MARK);
+		if (close == NULL || close[1] != '"')
+			elog(ERROR, "what prints a column's tag printed something else");
+		span = pnstrdup(p, open - p);
 		ws_tags_escape(span, out);
 		pfree(span);
 		buf_append(out, "@{", 2);
-		buf_append(out, open + 1, close - open - 1);
+		buf_append(out, open + open_len, close - (open + open_len));
 		buf_append(out, "}", 1);
 		p = close + 2;
 	}
+	pfree(open_mark);
 }
 
 /* A column's name by its tag in a schema, for what is restored there. */
@@ -1317,11 +1335,55 @@ column_of_schema(void *arg, uint64 tag)
 	return name;
 }
 
+typedef struct ColumnOfTable
+{
+	const char *schema;
+	const char *table;
+} ColumnOfTable;
+
+/* A column's name by its tag in a table: within one, a tag is one column's. */
+static const char *
+column_of_table(void *arg, uint64 tag)
+{
+	ColumnOfTable *of = arg;
+	char	   *text = psprintf(INT64_FORMAT, (int64) tag);
+	const char *params[3] = {of->schema, of->table, text};
+	WsSqlRows	rows;
+	char	   *name = NULL;
+
+	WsSql->read("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relname = $2::name "
+				"AND a.attcoltag = $3::bigint AND NOT a.attisdropped", 3, params, &rows);
+	if (rows.nrows == 1)
+		name = pstrdup(ws_sql_value(&rows, 0, 0));
+	ws_sql_rows_free(&rows);
+	pfree(text);
+	return name;
+}
+
 /* (a parse of it, in which any name will do) */
 static const char *
 any_column_name(void *arg, uint64 tag)
 {
 	return "x";
+}
+
+/* Whether stored text has this reference, not an @ that is doubled and reads like one. */
+static bool
+stored_refers_to(const char *stored, const char *reference)
+{
+	size_t		len = strlen(reference);
+
+	for (const char *p = strchr(stored, '@'); p != NULL; p = strchr(p, '@'))
+	{
+		if (p[1] == '@')
+			p += 2;
+		else if (strncmp(p, reference, len) == 0)
+			return true;
+		else
+			p++;
+	}
+	return false;
 }
 
 /* Refuses what refers to a tag two columns of two names in the schema have. */
@@ -1339,7 +1401,7 @@ refuse_ambiguous_tags(const char *schema, const WsObject *objs, int n)
 		char	   *reference = psprintf("@{" UINT64_FORMAT "}", (uint64) strtoi64(ws_sql_value(&rows, r, 0), NULL, 10));
 
 		for (int i = 0; i < n; i++)
-			if (strstr(objs[i].definition, reference) != NULL)
+			if (stored_refers_to(objs[i].definition, reference))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: it refers to a column whose tag another of another name has",
@@ -4918,7 +4980,9 @@ ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out)
 	{
 		uint64		missing;
 
-		if (!ws_tags_render(o->owned_column, column_of_schema, (void *) schema, out, &missing))
+		ColumnOfTable of = {schema, table};
+
+		if (!ws_tags_render(o->owned_column, column_of_table, &of, out, &missing))
 			not_the_object(o, "a reference to a column");
 	}
 	pfree(table);

@@ -104,13 +104,62 @@ $node->safe_psql('postgres', q{DROP SCHEMA at_s CASCADE});
 $node->safe_psql('postgres', q{CREATE SCHEMA amb VERSIONED; ALTER SCHEMA amb OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE amb.t (a integer);
 	ALTER TABLE amb.t RENAME TO t_old; CREATE TABLE amb.t (a integer); ALTER TABLE amb.t_old RENAME COLUMN a TO a2;
 	CREATE VIEW amb.un AS SELECT 1 AS k});
-unlike($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('amb')}), qr/\@\{/, 'nothing refers to it yet, so it is held');
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('amb')}), qr/^view\/un\t/m, 'nothing refers to it yet, so it is held');
 $node->safe_psql('postgres', q{SET ROLE g_tags; CREATE VIEW amb.w AS SELECT a FROM amb.t});
 my ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_obj_bytes('amb')});
 like($err, qr/whose tag another of another name has/, 'what refers to a tag two columns of two names have is refused');
 $node->safe_psql('postgres', q{SET ROLE g_tags; ALTER TABLE amb.t_old RENAME COLUMN a2 TO a});
 like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('amb')}), qr/^view\/w\t/m, 'of one name it is held');
 $node->safe_psql('postgres', q{DROP SCHEMA amb CASCADE});
+
+# what a rename, on another branch, must not make mean something else: each is made on both
+# sides, the rename done on one, and restored there from the other's text
+my @followers = (
+	# an ORDER BY or DISTINCT ON, where the rename takes an output column's name
+	[ 'order_by', q{SELECT w AS val2, n FROM s ORDER BY val}, q{ALTER TABLE %s.s RENAME COLUMN val TO val2} ],
+	[ 'distinct_on', q{SELECT DISTINCT ON (val) w AS val2, n FROM s ORDER BY val, n}, q{ALTER TABLE %s.s RENAME COLUMN val TO val2} ],
+	# under an alias list a column is by its place
+	[ 'alias_list', q{SELECT x.l, x.n FROM s x(l)}, q{ALTER TABLE %s.s RENAME COLUMN n TO l2; ALTER TABLE %s.s RENAME COLUMN val TO n; ALTER TABLE %s.s RENAME COLUMN l2 TO val} ],
+	# another column takes the old name: what it said must not be that
+	[ 'named_join', q{SELECT j.val FROM (s JOIN r USING (n)) j}, q{ALTER TABLE %s.s RENAME COLUMN val TO v2; ALTER TABLE %s.s RENAME COLUMN w TO val} ],
+	[ 'field', q{SELECT (x).val FROM (SELECT s FROM s) y(x)}, q{ALTER TABLE %s.s RENAME COLUMN val TO v2; ALTER TABLE %s.s RENAME COLUMN w TO val} ],
+);
+my $fo_tables = q{SET ROLE g_tags; CREATE TABLE %s.s (val text, n integer, w integer); CREATE TABLE %s.r (n integer);
+	INSERT INTO %s.s VALUES ('a', 2, 1), ('b', 1, 3), ('c', 3, 2); INSERT INTO %s.r VALUES (1), (2), (3)};
+for my $f (@followers)
+{
+	my ($name, $query, $rename) = @$f;
+	$node->safe_psql('postgres', q{CREATE SCHEMA fo1 VERSIONED; ALTER SCHEMA fo1 OWNER TO g_tags; CREATE SCHEMA fo2 VERSIONED; ALTER SCHEMA fo2 OWNER TO g_tags});
+	for my $s ('fo1', 'fo2') { (my $sql = $fo_tables) =~ s/%s/$s/g; $node->safe_psql('postgres', $sql); }
+	$node->safe_psql('postgres', qq{SET ROLE g_tags; SET search_path = fo1; CREATE VIEW $name AS $query});
+	my $fo_held = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('fo1')});
+	my $before = $node->safe_psql('postgres', "SELECT * FROM fo1.$name");
+	(my $sql = $rename) =~ s/%s/fo2/g;
+	$node->safe_psql('postgres', "SET ROLE g_tags; $sql");
+	$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('fo1', 'fo2', 'both', true)});
+	is($node->safe_psql('postgres', "SELECT * FROM fo2.$name"), $before, "$name returns the same once restored over a rename");
+	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('fo2')}), $fo_held, "and reads as its commit");
+	$node->safe_psql('postgres', q{DROP SCHEMA fo1 CASCADE; DROP SCHEMA fo2 CASCADE});
+}
+
+# a byte that looks like what marks a tag is only that
+$node->safe_psql('postgres', q{CREATE SCHEMA mk VERSIONED; ALTER SCHEMA mk OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE mk.t (a text);
+	CREATE VIEW mk.w AS SELECT E'"\0011\001"'::text AS k, E'\001' AS m, a FROM mk.t});
+my %mk = map { my ($k, $v) = split /\t/; $k => pack('H*', $v) } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('mk')});
+like($mk{'view/w'}, qr/"\x011\x01"/, 'text with the byte that marks a tag is left as it is');
+$node->safe_psql('postgres', q{DROP SCHEMA mk CASCADE});
+
+# what a string says is no reference, nor is a shared tag refused for it
+$node->safe_psql('postgres', q{CREATE SCHEMA st VERSIONED; ALTER SCHEMA st OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE st.t (a integer);
+	ALTER TABLE st.t RENAME TO t_old; CREATE TABLE st.t (a integer); ALTER TABLE st.t_old RENAME COLUMN a TO a2});
+my $st_tag = $node->safe_psql('postgres', q{SELECT attcoltag FROM pg_attribute WHERE attrelid = 'st.t'::regclass AND attname = 'a'});
+$node->safe_psql('postgres', qq{SET ROLE g_tags; CREATE VIEW st.w AS SELECT '\@{$st_tag}'::text AS s; CREATE SEQUENCE st.q OWNED BY st.t.a});
+like($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('st')}), qr/^view\/w\t/m, 'a string like a shared tag\'s reference is no reference');
+# owned, within its table a tag is one column's
+$node->safe_psql('postgres', q{CREATE SCHEMA st2 VERSIONED; ALTER SCHEMA st2 OWNER TO g_tags; SET ROLE g_tags; CREATE TABLE st2.t (a integer); ALTER TABLE st2.t RENAME TO t_old; CREATE TABLE st2.t (a integer); ALTER TABLE st2.t_old RENAME COLUMN a TO a2});
+$node->safe_psql('postgres', q{SELECT test_ws_obj_copy('st', 'st2', 'both', true)});
+is($node->safe_psql('postgres', q{SELECT pg_get_serial_sequence('st2.t', 'a')}), 'st2.q', 'a sequence owned by a shared tag\'s column is made, on its table\'s');
+$node->safe_psql('postgres', q{DROP SCHEMA st CASCADE; DROP SCHEMA st2 CASCADE});
 
 $node->stop;
 done_testing();

@@ -447,6 +447,8 @@ static void get_window_frame_options(int frameOptions,
 									 Node *startOffset, Node *endOffset,
 									 deparse_context *context);
 static char *column_name_for_print(Oid relid, AttrNumber attnum, char *name);
+static void base_column_of_join(deparse_namespace *dpns, RangeTblEntry *rte, AttrNumber attnum,
+								Oid *relid, AttrNumber *column);
 static char *get_variable(Var *var, int levelsup, bool istoplevel,
 						  deparse_context *context);
 static void get_special_variable(Node *node, deparse_context *context,
@@ -7629,6 +7631,32 @@ get_utility_query_def(Query *query, deparse_context *context)
 }
 
 /*
+ * The column of a table a join's column is, if it is simply that; a USING's merged column is not.
+ */
+static void
+base_column_of_join(deparse_namespace *dpns, RangeTblEntry *rte, AttrNumber attnum,
+					Oid *relid, AttrNumber *column)
+{
+	while (rte->rtekind == RTE_JOIN)
+	{
+		Var		   *var;
+
+		if (attnum <= rte->joinmergedcols || attnum > list_length(rte->joinaliasvars))
+			return;
+		var = (Var *) list_nth(rte->joinaliasvars, attnum - 1);
+		if (var == NULL || !IsA(var, Var) || var->varlevelsup != 0)
+			return;
+		rte = rt_fetch(var->varno, dpns->rtable);
+		attnum = var->varattno;
+	}
+	if (rte->rtekind == RTE_RELATION && attnum > 0)
+	{
+		*relid = rte->relid;
+		*column = attnum;
+	}
+}
+
+/*
  * What to print of a column of a table: what the hook says, if one is set and says, or its name.
  */
 static char *
@@ -7919,19 +7947,38 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 		}
 	}
 
+	/*
+	 * A hook may print what is another name by the time it is read, one an output column has,
+	 * so what an ORDER BY means must not depend on there being none now.
+	 */
+	if (deparse_column_name_hook && attnum > 0 && context->varInOrderBy && !context->inGroupBy)
+		need_prefix = true;
 	if (refname && need_prefix)
 	{
 		appendStringInfoString(buf, quote_identifier(refname));
 		appendStringInfoChar(buf, '.');
 	}
 
-	/* (not if a FROM item's alias list has renamed it: that is another name) */
-	if (deparse_column_name_hook && attname && attnum > 0 && rte->rtekind == RTE_RELATION)
+	/*
+	 * (Under a FROM item's alias list a column is by its place in the list, which is what
+	 * follows a rename; and a reference to it hides its real name.)
+	 */
+	if (deparse_column_name_hook && attname && attnum > 0 && !colinfo->printaliases)
 	{
-		char	   *real = get_attname(rte->relid, attnum, true);
+		Oid			relid = InvalidOid;
+		AttrNumber	column = attnum;
 
-		if (real != NULL && strcmp(attname, real) == 0)
-			attname = column_name_for_print(rte->relid, attnum, attname);
+		if (rte->rtekind == RTE_RELATION)
+			relid = rte->relid;
+		else if (rte->rtekind == RTE_JOIN)
+			base_column_of_join(dpns, rte, attnum, &relid, &column);
+		if (OidIsValid(relid))
+		{
+			char	   *real = get_attname(relid, column, true);
+
+			if (real != NULL && strcmp(attname, real) == 0)
+				attname = column_name_for_print(relid, column, attname);
+		}
 	}
 	if (attname)
 		appendStringInfoString(buf, quote_identifier(attname));
@@ -9756,6 +9803,14 @@ get_rule_expr(Node *node, deparse_context *context,
 				 */
 				fieldname = get_name_for_var_field((Var *) arg, fno,
 												   0, context);
+				if (deparse_column_name_hook)
+				{
+					Oid			argtype = getBaseType(exprType(arg));
+					Oid			relid = argtype != RECORDOID ? get_typ_typrelid(argtype) : InvalidOid;
+
+					if (OidIsValid(relid))
+						fieldname = column_name_for_print(relid, fno, pstrdup(fieldname));
+				}
 				appendStringInfo(buf, ".%s", quote_identifier(fieldname));
 			}
 			break;
@@ -13260,6 +13315,7 @@ processIndirection(Node *node, deparse_context *context)
 			Assert(list_length(fstore->fieldnums) == 1);
 			fieldname = get_attname(typrelid,
 									linitial_int(fstore->fieldnums), false);
+			fieldname = column_name_for_print(typrelid, linitial_int(fstore->fieldnums), fieldname);
 			appendStringInfo(buf, ".%s", quote_identifier(fieldname));
 
 			/*
