@@ -1241,11 +1241,11 @@ read_deps_of(WsObject *o, const char *schema, const char *oid, const char *sourc
 				   "UNION SELECT 'L', l.collname::text FROM d JOIN pg_collation l ON d.refclassid = 'pg_collation'::regclass "
 				   "  AND l.oid = d.refobjid WHERE l.collnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'O', o.oid::text FROM d JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass "
-				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.oprnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "  AND o.oid = d.refobjid WHERE o.oprnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'P', o.oid::text FROM d JOIN pg_opclass o ON d.refclassid = 'pg_opclass'::regclass "
-				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.opcnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "  AND o.oid = d.refobjid WHERE o.opcnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'M', o.oid::text FROM d JOIN pg_opfamily o ON d.refclassid = 'pg_opfamily'::regclass "
-				   "  AND o.oid = d.refobjid WHERE o.oid <> $1::oid AND o.opfnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
+				   "  AND o.oid = d.refobjid WHERE o.opfnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2::name) "
 				   "UNION SELECT 'F', p.oid::text FROM d JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
 				   "WHERE p.oid <> $3::oid AND p.pronamespace <> 'pg_catalog'::regnamespace "
 				   "  AND NOT EXISTS (SELECT 1 FROM pg_depend x WHERE x.classid = 'pg_proc'::regclass AND x.objid = p.oid "
@@ -2261,6 +2261,13 @@ static const char *const member_refusal_sql =
 "JOIN pg_opfamily f ON f.oid = a.amprocfamily JOIN pg_namespace n ON n.oid = p.pronamespace "
 "WHERE n.nspname = $1::name AND f.opfnamespace <> p.pronamespace ORDER BY 1";
 
+/* A function's name, or one to try again: read under an old snapshot, it may be gone. */
+static const char *
+function_name_or_retry(const char *schema, Oid fn)
+{
+	return quote_identifier(printed_or_retry(schema, get_func_name(fn)));
+}
+
 /* An item of a class or family, to sort by, as nothing else is the same on every server. */
 typedef struct OpItem
 {
@@ -2338,7 +2345,7 @@ op_items(const char *schema, const char *oid, bool is_class)
 		items[n++] = (OpItem) {1, atoi(ws_sql_value(&procs, i, 0)),
 			psprintf("FUNCTION %s (%s) %s(%s)", ws_sql_value(&procs, i, 0),
 					 operator_args(schema, atooid(ws_sql_value(&procs, i, 1)), atooid(ws_sql_value(&procs, i, 2))),
-					 quote_identifier(get_func_name(fn)), function_args(schema, fn, NULL))};
+					 function_name_or_retry(schema, fn), function_args(schema, fn, NULL))};
 	}
 	if (n > 1)
 		qsort(items, n, sizeof(OpItem), op_item_cmp);
@@ -2409,11 +2416,11 @@ read_operators(const char *schema, WsObject *objs, int *n)
 			appendStringInfo(&s, "LEFTARG = %s, ", print_type(schema, left, -1));
 		if (OidIsValid(right))
 			appendStringInfo(&s, "RIGHTARG = %s, ", print_type(schema, right, -1));
-		appendStringInfo(&s, "FUNCTION = %s", quote_identifier(get_func_name(atooid(ws_sql_value(&rows, i, 4)))));
+		appendStringInfo(&s, "FUNCTION = %s", function_name_or_retry(schema, atooid(ws_sql_value(&rows, i, 4))));
 		if (OidIsValid(rest))
-			appendStringInfo(&s, ", RESTRICT = %s", quote_identifier(get_func_name(rest)));
+			appendStringInfo(&s, ", RESTRICT = %s", function_name_or_retry(schema, rest));
 		if (OidIsValid(join))
-			appendStringInfo(&s, ", JOIN = %s", quote_identifier(get_func_name(join)));
+			appendStringInfo(&s, ", JOIN = %s", function_name_or_retry(schema, join));
 		if (ws_sql_value(&rows, i, 7)[0] == 't')
 			appendStringInfoString(&s, ", HASHES");
 		if (ws_sql_value(&rows, i, 8)[0] == 't')
@@ -2426,7 +2433,8 @@ read_operators(const char *schema, WsObject *objs, int *n)
 		set_definition(o, s.data);
 		px_free(o->deps);
 		o->deps = NULL;
-		read_deps(o, schema, oid, "SELECT 'pg_operator'::regclass::oid, $1::oid");
+		/* (no operator, class or member is a type or function, whatever its oid) */
+		read_deps_of(o, schema, oid, "SELECT 'pg_operator'::regclass::oid, $1::oid", "0");
 		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_operator", "oprowner"), "pg_operator");
 		if (OidIsValid(com) || OidIsValid(neg))
 		{
@@ -2511,9 +2519,9 @@ read_opfamilies(const char *schema, WsObject *objs, int *n)
 			set_definition(m, sql);
 			px_free(m->deps);
 			m->deps = NULL;
-			read_deps(m, schema, oid,
-					  "SELECT d.classid, d.objid FROM pg_depend d WHERE d.refclassid = 'pg_opfamily'::regclass AND d.refobjid = $1::oid "
-					  "AND d.deptype = 'a' AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)");
+			read_deps_of(m, schema, oid,
+						 "SELECT d.classid, d.objid FROM pg_depend d WHERE d.refclassid = 'pg_opfamily'::regclass AND d.refobjid = $1::oid "
+						 "AND d.deptype = 'a' AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)", "0");
 			ws_obj_key(WS_OBJ_OPFAMILY, o->name, o->args, &key);
 			add_dep(m, &key);
 		}
@@ -2562,10 +2570,10 @@ read_opclasses(const char *schema, WsObject *objs, int *n)
 		set_definition(o, s.data);
 		px_free(o->deps);
 		o->deps = NULL;
-		read_deps(o, schema, oid,
-				  "SELECT 'pg_opclass'::regclass::oid, $1::oid UNION ALL SELECT d.classid, d.objid FROM pg_depend d "
-				  "WHERE d.refclassid = 'pg_opclass'::regclass AND d.refobjid = $1::oid AND d.deptype = 'i' "
-				  "AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)");
+		read_deps_of(o, schema, oid,
+					 "SELECT 'pg_opclass'::regclass::oid, $1::oid UNION ALL SELECT d.classid, d.objid FROM pg_depend d "
+					 "WHERE d.refclassid = 'pg_opclass'::regclass AND d.refobjid = $1::oid AND d.deptype = 'i' "
+					 "AND d.classid IN ('pg_amop'::regclass, 'pg_amproc'::regclass)", "0");
 		ws_obj_key(WS_OBJ_OPFAMILY, ws_name_to_utf8(ws_sql_value(&rows, i, 6)), o->args, &family);
 		add_dep(o, &family);
 		read_owner_and_comments(o, oid, name, OWNER_IF_IT_CAN_TRAVEL("pg_opclass", "opcowner"), "pg_opclass");
