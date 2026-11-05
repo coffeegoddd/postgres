@@ -32,13 +32,21 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 
+/* The keys of the types and domains that differ between a side's objects and the merged. */
+typedef struct TypesDiffering
+{
+	char	  **keys;
+	int			n;
+} TypesDiffering;
+
 typedef struct Merger
 {
 	ProllyCtx  *ctx;
 	const WsEvalRoutine *eval;
 	void	   *eval_arg;
-	bool		ours_types_differ;	/* a side's type or domain is otherwise merged */
-	bool		theirs_types_differ;
+	TypesDiffering ours_types;	/* its types and domains otherwise than merged */
+	TypesDiffering theirs_types;
+	TypesDiffering base_types;
 	char	  **conflicts;
 	int			nconflicts;
 	int			cap;
@@ -962,7 +970,6 @@ typedef struct RowMerge
 	Merger	   *m;
 	const WsTableSchema *merged;
 	WsRowShape	shape;
-	bool	   *custom_type;	/* of each of shape's: its type is a type of the objects */
 	DefaultValue *defaults;
 	int			ndefaults;
 	MemoryContext cxt;			/* what is for all its rows */
@@ -980,7 +987,7 @@ typedef struct MoveMap
 {
 	RowMerge   *rm;
 	const WsTableSchema *side;
-	bool		types_differ;	/* its types or domains are other than the merged */
+	const bool *type_differs;	/* of each of shape's: its type here is not the merged one */
 } MoveMap;
 
 typedef struct EditList
@@ -1203,7 +1210,7 @@ regenerate(RowMerge *rm, const WsTableSchema *side, WsField *f)
 static bool
 must_read(const MoveMap *mm, int i, const WsColumn *was, const WsColumn *col)
 {
-	return strcmp(was->type, col->type) != 0 || (mm->types_differ && mm->rm->custom_type[i]);
+	return strcmp(was->type, col->type) != 0 || mm->type_differs[i];
 }
 
 /*
@@ -1250,42 +1257,91 @@ move_row(MoveMap *mm, const uint8 *k, size_t kl, const uint8 *v, size_t vl, bool
 	return regenerate(rm, mm->side, f) ? MOVED : MOVE_NOT_COMPUTED;
 }
 
-/* A keyless row's count moved in cur from one key to another. */
+/* Keyless rows' counts to change in a map, by key, a batch at a time. */
+typedef struct KeylessBatch
+{
+	uint8	  **keys;
+	size_t	   *lens;
+	int64	   *changes;
+	int			n;
+	int			cap;
+} KeylessBatch;
+
 static void
-keyless_move(RowMerge *rm, PHash *cur, const uint8 *from, size_t flen, const uint8 *to, size_t tlen, uint64 count)
+keyless_batch_add(KeylessBatch *kb, const uint8 *k, size_t kl, int64 change)
+{
+	if (kb->n == kb->cap)
+	{
+		kb->cap = Max(256, kb->cap * 2);
+		kb->keys = kb->keys == NULL ? palloc_array(uint8 *, kb->cap) : repalloc_array(kb->keys, uint8 *, kb->cap);
+		kb->lens = kb->lens == NULL ? palloc_array(size_t, kb->cap) : repalloc_array(kb->lens, size_t, kb->cap);
+		kb->changes = kb->changes == NULL ? palloc_array(int64, kb->cap) : repalloc_array(kb->changes, int64, kb->cap);
+	}
+	kb->keys[kb->n] = memcpy(palloc(Max(kl, 1)), k, kl);
+	kb->lens[kb->n] = kl;
+	kb->changes[kb->n] = change;
+	kb->n++;
+}
+
+/* Each key's changes added up, and what that leaves of it written. */
+static void
+keyless_batch_apply(RowMerge *rm, KeylessBatch *kb, PHash *cur)
 {
 	ProllyCtx  *ctx = rm->m->ctx;
 	EditList	edits = {0};
-	const uint8 *held;
-	size_t		heldlen;
-	uint64		have;
-	Buf			c = BUF_INIT,
-				v = BUF_INIT;
-	int			rc = prolly_get(ctx, cur, from, flen, &held, &heldlen);
 
-	if (rc < 0)
-		prolly_report(ctx);
-	have = rc == PROLLY_OK ? ws_rows_keyless_count(from, flen, held, heldlen) : 0;
-	if (have <= count)
-		edit_add(&edits, from, flen, NULL, 0, true);
-	else
+	if (kb->n == 0)
+		return;
+
+	/* (a batch is small: a key is found by a pass over those seen) */
+	for (int i = 0; i < kb->n;)
 	{
-		buf_append_uvarint(&c, have - count);
-		WsRowCodec->keyless_value(from, flen, c.data, c.len, &v);
-		edit_add(&edits, from, flen, v.data, v.len, false);
-		c.len = 0;
+		int64		change = 0;
+		const uint8 *held;
+		size_t		heldlen;
+		int			rc;
+		int64		have = 0;
+		const uint8 *key = kb->keys[i];
+		size_t		kl = kb->lens[i];
+		bool		seen = false;
+
+		for (int e = 0; e < edits.n && !seen; e++)
+			seen = edits.v[e].klen == kl && memcmp(edits.v[e].key, key, kl) == 0;
+		if (seen)
+		{
+			i++;
+			continue;
+		}
+		for (int j = i; j < kb->n; j++)
+			if (kb->lens[j] == kl && memcmp(kb->keys[j], key, kl) == 0)
+				change += kb->changes[j];
+		rc = prolly_get(ctx, cur, key, kl, &held, &heldlen);
+		if (rc < 0)
+			prolly_report(ctx);
+		if (rc == PROLLY_OK)
+			have = (int64) ws_rows_keyless_count(key, kl, held, heldlen);
+		if (have + change <= 0)
+		{
+			if (rc == PROLLY_OK)
+				edit_add(&edits, key, kl, NULL, 0, true);
+		}
+		else
+		{
+			Buf			c = BUF_INIT,
+						v = BUF_INIT;
+
+			buf_append_uvarint(&c, (uint64) (have + change));
+			WsRowCodec->keyless_value(key, kl, c.data, c.len, &v);
+			edit_add(&edits, key, kl, v.data, v.len, false);
+			buf_free(&c);
+			buf_free(&v);
+		}
+		i++;
 	}
-	rc = prolly_get(ctx, cur, to, tlen, &held, &heldlen);
-	if (rc < 0)
-		prolly_report(ctx);
-	if (rc == PROLLY_OK)
-		count += ws_rows_keyless_count(to, tlen, held, heldlen);
-	buf_append_uvarint(&c, count);
-	WsRowCodec->keyless_value(to, tlen, c.data, c.len, &v);
-	edit_add(&edits, to, tlen, v.data, v.len, false);
 	edits_apply(rm->m, &edits, cur);
-	buf_free(&c);
-	buf_free(&v);
+	for (int i = 0; i < kb->n; i++)
+		pfree(kb->keys[i]);
+	kb->n = 0;
 }
 
 /* Whether a side's rows could hold anything not as the merged record would have it. */
@@ -1359,6 +1415,7 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 	int			rc;
 	PHash		cur = *map;
 	EditList	edits = {0};
+	KeylessBatch moves = {0};
 	WsField    *f;
 	MemoryContext rowcxt;
 
@@ -1381,16 +1438,19 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 						nv = BUF_INIT;
 
 			WsRowCodec->encode(&rm->shape, f, &nk, &nv);
+			MemoryContextSwitchTo(old);
 			if (rm->shape.nkey == 0)
 			{
 				if (nk.len != kl || memcmp(nk.data, k, kl) != 0)
-					keyless_move(rm, &cur, k, kl, nk.data, nk.len, ws_rows_keyless_count(k, kl, v, vl));
+				{
+					int64		count = (int64) ws_rows_keyless_count(k, kl, v, vl);
+
+					keyless_batch_add(&moves, k, kl, -count);
+					keyless_batch_add(&moves, nk.data, nk.len, count);
+				}
 			}
 			else if (nv.len != vl || memcmp(nv.data, v, vl) != 0)
-			{
-				MemoryContextSwitchTo(old);
 				edit_add(&edits, k, kl, nv.data, nv.len, false);
-			}
 		}
 		else
 		{
@@ -1402,11 +1462,14 @@ move_map(MoveMap *mm, const PHash *map, PHash *out)
 		MemoryContextReset(rowcxt);
 		if (edits.n >= MOVE_BATCH)
 			edits_apply(m, &edits, &cur);
+		if (moves.n >= MOVE_BATCH)
+			keyless_batch_apply(rm, &moves, &cur);
 	}
 	prolly_iter_close(it);
 	if (rc < 0)
 		prolly_report(m->ctx);
 	edits_apply(m, &edits, &cur);
+	keyless_batch_apply(rm, &moves, &cur);
 	MemoryContextDelete(rowcxt);
 	pfree(f);
 	*out = cur;
@@ -1421,7 +1484,23 @@ typedef struct RowSides
 	MoveMap		ours;
 	MoveMap		theirs;
 	const WsTableSchema *base;
+	const bool *base_type_differs;
 } RowSides;
+
+/* Whether both sides added a column their base has not. */
+static bool
+both_added_columns(const RowSides *sides)
+{
+	const WsTableSchema *o = sides->ours.side;
+
+	if (sides->base == NULL)
+		return false;
+	for (int i = 0; i < o->ncols; i++)
+		if (o->cols[i].kind == WS_COL_STORED && ws_schema_column(sides->theirs.side, o->cols[i].tag) != NULL &&
+			ws_schema_column(sides->base, o->cols[i].tag) == NULL)
+			return true;
+	return false;
+}
 
 static bool
 same_type_in(const WsTableSchema *a, const WsTableSchema *b, uint64 tag)
@@ -1543,11 +1622,16 @@ merge_cells(RowMerge *rm, const RowSides *sides, const ProllyConflict *c, WsFiel
 			else
 				return false;
 		}
-		else if (ws_schema_column(o, col->tag) == NULL || ws_schema_column(t, col->tag) == NULL)
+		else if (ws_schema_column(o, col->tag) == NULL)
 		{
-			/* (both inserted the row, and one has no such column: its cell is null) */
-			if (ho || ht)
-				return false;
+			/* (both inserted the row, and one has no such column: the other's value) */
+			from = &sides->theirs;
+			keep = ht ? &ct : NULL;
+		}
+		else if (ws_schema_column(t, col->tag) == NULL)
+		{
+			from = &sides->ours;
+			keep = ho ? &co : NULL;
 		}
 		else
 			return false;
@@ -1619,9 +1703,42 @@ only_reshaped(RowMerge *rm, const WsTableSchema *side, const WsTableSchema *b, c
 typedef struct MoveTaken
 {
 	MoveMap    *from;
+	const WsTableSchema *base;
+	const PHash *other;			/* the other side's map */
 	PHash	   *cur;
 	EditList	edits;
+	MemoryContext rowcxt;
 } MoveTaken;
+
+/*
+ * Whether a side changed a value of a column gone from the merged: the other dropped it,
+ * and that row's bytes did not change there if it held nothing.
+ */
+static bool
+changed_a_dropped_column(const MoveTaken *mt, const ProllyDiff *d)
+{
+	RowMerge   *rm = mt->from->rm;
+
+	if (mt->base == NULL || d->from == NULL)
+		return false;
+	for (int i = 0; i < mt->base->ncols; i++)
+	{
+		const WsColumn *col = &mt->base->cols[i];
+		WsCell		cb,
+					cs;
+		bool		hb,
+					hs;
+
+		if (col->kind != WS_COL_STORED || ws_schema_column(rm->merged, col->tag) != NULL ||
+			ws_schema_column(mt->from->side, col->tag) == NULL)
+			continue;
+		hb = WsRowCodec->cell_get(d->from, d->flen, col->tag, &cb);
+		hs = WsRowCodec->cell_get(d->to, d->tlen, col->tag, &cs);
+		if (!SAME_CELL(hb, cb, hs, cs))
+			return true;
+	}
+	return false;
+}
 
 static void
 move_taken_row(void *arg, const ProllyDiff *d)
@@ -1631,8 +1748,10 @@ move_taken_row(void *arg, const ProllyDiff *d)
 	const uint8 *v;
 	size_t		vl;
 	int			rc;
+	bool		is_new = d->from == NULL;
 	WsField    *f;
 	MoveResult	moved;
+	MemoryContext old;
 
 	CHECK_FOR_INTERRUPTS();
 	if (d->to == NULL)
@@ -1642,34 +1761,56 @@ move_taken_row(void *arg, const ProllyDiff *d)
 		prolly_report(rm->m->ctx);
 	if (rc != PROLLY_OK || vl != d->tlen || memcmp(v, d->to, vl) != 0)
 		return;					/* (merged from both, or the other's) */
+	if (changed_a_dropped_column(mt, d))
+	{
+		row_conflict(rm, "row", d->key, d->klen);
+		return;
+	}
+	if (is_new)
+	{
+		/* (one the other side holds too isn't new to it: what it holds is its own) */
+		rc = prolly_get(rm->m->ctx, mt->other, d->key, d->klen, &v, &vl);
+		if (rc < 0)
+			prolly_report(rm->m->ctx);
+		is_new = rc != PROLLY_OK;
+	}
+	old = MemoryContextSwitchTo(mt->rowcxt);
 	f = palloc_array(WsField, Max(rm->shape.nstored, 1));
-	moved = move_row(mt->from, d->key, d->klen, d->to, d->tlen, d->from == NULL, f);
+	moved = move_row(mt->from, d->key, d->klen, d->to, d->tlen, is_new, f);
 	if (moved == MOVED)
 	{
 		Buf			nk = BUF_INIT,
 					nv = BUF_INIT;
 
 		WsRowCodec->encode(&rm->shape, f, &nk, &nv);
-		if (nv.len != vl || memcmp(nv.data, d->to, vl) != 0)
+		MemoryContextSwitchTo(old);
+		if (nv.len != d->tlen || memcmp(nv.data, d->to, d->tlen) != 0)
 			edit_add(&mt->edits, d->key, d->klen, nv.data, nv.len, false);
-		buf_free(&nk);
-		buf_free(&nv);
 	}
 	else
+	{
+		MemoryContextSwitchTo(old);
 		row_conflict(rm, moved == MOVE_NOT_READ ? "row" : "generated", d->key, d->klen);
-	pfree(f);
+	}
+	MemoryContextReset(mt->rowcxt);
+	if (mt->edits.n >= MOVE_BATCH)
+		edits_apply(rm->m, &mt->edits, mt->cur);
 }
 
 static void
-move_taken_rows(MoveMap *from, const PHash *base, const PHash *side, PHash *cur)
+move_taken_rows(MoveMap *from, const WsTableSchema *b, const PHash *base, const PHash *side, const PHash *other, PHash *cur)
 {
-	MoveTaken	mt = {from, cur};
+	MoveTaken	mt = {from, b, other, cur};
+	Merger	   *m = from->rm->m;
 
+	/* (dropped columns: a side with one still has something to check of its rows) */
 	if (!needs_moving(from))
 		return;
-	if (prolly_diff(from->rm->m->ctx, base, side, move_taken_row, &mt) < 0)
-		prolly_report(from->rm->m->ctx);
-	edits_apply(from->rm->m, &mt.edits, cur);
+	mt.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "ws_merge row", ALLOCSET_DEFAULT_SIZES);
+	if (prolly_diff(m->ctx, base, side, move_taken_row, &mt) < 0)
+		prolly_report(m->ctx);
+	edits_apply(m, &mt.edits, cur);
+	MemoryContextDelete(mt.rowcxt);
 }
 
 typedef struct KeylessMerge
@@ -1719,13 +1860,12 @@ keyless_change(void *arg, const ProllyDiff *d)
 	}
 }
 
-/* Whether a type's name, without an array's brackets or a modifier's, is of an object. */
-static bool
-type_is_an_object(Merger *m, const PHash *objects, const char *type)
+/* A type's name, without an array's brackets or a modifier's, unquoted. */
+static char *
+type_base_name(const char *type)
 {
 	char	   *name = pstrdup(type);
 	char	   *cut = strpbrk(name, "[(");
-	bool		found = false;
 
 	if (cut != NULL)
 		*cut = '\0';
@@ -1742,50 +1882,117 @@ type_is_an_object(Merger *m, const PHash *objects, const char *type)
 		}
 		*to = '\0';
 	}
-	for (int k = 0; !found && k < 2; k++)
-	{
-		Buf			key = BUF_INIT;
-		const uint8 *v;
-		size_t		vl;
-		int			rc;
-
-		ws_obj_key(k == 0 ? WS_OBJ_TYPE : WS_OBJ_DOMAIN, name, NULL, &key);
-		rc = prolly_get(m->ctx, objects, key.data, key.len, &v, &vl);
-		if (rc < 0)
-			prolly_report(m->ctx);
-		found = rc == PROLLY_OK;
-		buf_free(&key);
-	}
-	pfree(name);
-	return found;
+	return name;
 }
 
 static void
-row_merge_init(RowMerge *rm, Merger *m, const WsTableSchema *merged, const PHash *rv)
+type_object_differs(void *arg, const ProllyDiff *d)
 {
-	PHash		objects;
-	bool		has_objects = WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &objects);
+	TypesDiffering *td = arg;
 
+	if ((d->klen > 5 && memcmp(d->key, "type/", 5) == 0) ||
+		(d->klen > 7 && memcmp(d->key, "domain/", 7) == 0))
+	{
+		td->keys = td->keys == NULL ? palloc_array(char *, 1) : repalloc_array(td->keys, char *, td->n + 1);
+		td->keys[td->n++] = pnstrdup((const char *) d->key, d->klen);
+	}
+}
+
+static TypesDiffering
+types_differing(Merger *m, const PHash *side, const PHash *rv)
+{
+	TypesDiffering td = {NULL, 0};
+	PHash		a,
+				b,
+				empty;
+	bool		ha = WsRoot->get_map(m->ctx, side, WS_ROOT_OBJECTS, &a);
+	bool		hb = WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &b);
+
+	if (!ha && !hb)
+		return td;
+	if (prolly_empty(m->ctx, 0, &empty) < 0)
+		prolly_report(m->ctx);
+	if (prolly_diff(m->ctx, ha ? &a : &empty, hb ? &b : &empty, type_object_differs, &td) < 0)
+		prolly_report(m->ctx);
+	return td;
+}
+
+/* Whether an object is one of these, or needs one: a composite of an enum that changed. */
+static bool
+object_needs_differing(Merger *m, const PHash *objects, const char *key, const TypesDiffering *td, int depth)
+{
+	const uint8 *v;
+	size_t		vl;
+	WsObject	o;
+	bool		needs = false;
+	int			rc;
+
+	for (int i = 0; i < td->n; i++)
+		if (strcmp(td->keys[i], key) == 0)
+			return true;
+	if (depth > 64)
+		return true;
+	rc = prolly_get(m->ctx, objects, (const uint8 *) key, strlen(key), &v, &vl);
+	if (rc < 0)
+		prolly_report(m->ctx);
+	if (rc != PROLLY_OK)
+		return false;
+	WsObjectCodec->decode((const uint8 *) key, strlen(key), v, vl, &o);
+	for (int i = 0; !needs && i < o.ndeps; i++)
+		needs = object_needs_differing(m, objects, o.deps[i], td, depth + 1);
+	ws_obj_free(&o);
+	return needs;
+}
+
+/* For each of a shape's columns, whether what its type is differs here from the merged. */
+static const bool *
+columns_of_types_differing(RowMerge *rm, const PHash *rv, const TypesDiffering *td)
+{
+	Merger	   *m = rm->m;
+	bool	   *differs = palloc0_array(bool, Max(rm->shape.nstored, 1));
+	PHash		objects;
+
+	if (td->n == 0 || !WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &objects))
+		return differs;
+	for (int i = 0; i < rm->shape.nstored; i++)
+	{
+		char	   *name = type_base_name(ws_schema_column(rm->merged, rm->shape.tags[i])->type);
+
+		for (int k = 0; !differs[i] && k < 2; k++)
+		{
+			Buf			key = BUF_INIT;
+
+			ws_obj_key(k == 0 ? WS_OBJ_TYPE : WS_OBJ_DOMAIN, name, NULL, &key);
+			buf_append_byte(&key, 0);
+			differs[i] = object_needs_differing(m, &objects, (const char *) key.data, td, 0);
+			buf_free(&key);
+		}
+		pfree(name);
+	}
+	return differs;
+}
+
+static void
+row_merge_init(RowMerge *rm, Merger *m, const WsTableSchema *merged)
+{
 	memset(rm, 0, sizeof(*rm));
 	rm->m = m;
 	rm->merged = merged;
 	rm->cxt = CurrentMemoryContext;
 	ws_schema_row_shape(merged, &rm->shape);
-	rm->custom_type = palloc0_array(bool, Max(rm->shape.nstored, 1));
 	rm->defaults = palloc_array(DefaultValue, Max(merged->ncols, 1));
-	for (int i = 0; has_objects && (m->ours_types_differ || m->theirs_types_differ) && i < rm->shape.nstored; i++)
-		rm->custom_type[i] = type_is_an_object(m, &objects, ws_schema_column(merged, rm->shape.tags[i])->type);
 }
 
 /* Rows one side alone has or changed: only to read, if its types are other than merged. */
 static void
-read_one_side(Merger *m, const WsTableSchema *rec, const PHash *rows, const PHash *rv, PHash *out)
+read_one_side(Merger *m, const WsTableSchema *rec, const PHash *rows, const PHash *rv,
+			  const TypesDiffering *td, PHash *out)
 {
 	RowMerge	rm;
 	MoveMap		mm;
 
-	row_merge_init(&rm, m, rec, rv);
-	mm = (MoveMap) {&rm, rec, true};
+	row_merge_init(&rm, m, rec);
+	mm = (MoveMap) {&rm, rec, columns_of_types_differing(&rm, rv, td)};
 	move_map(&mm, rows, out);
 	ws_row_shape_free(&rm.shape);
 }
@@ -1795,7 +2002,7 @@ static void
 merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt, PHash *out)
 {
 	Merger	   *m = rm->m;
-	MoveMap		from_base = {rm, sides->base, m->ours_types_differ || m->theirs_types_differ};
+	MoveMap		from_base = {rm, sides->base, sides->base_type_differs};
 	MoveMap		ours = sides->ours;
 	MoveMap		theirs = sides->theirs;
 	bool		base_moves = sides->base != NULL && needs_moving(&from_base);
@@ -1806,6 +2013,14 @@ merge_keyless_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const
 				mo = *ro,
 				mt = *rt,
 				cur;
+
+	/* a column both added has no base to say which side's rows are the merge's */
+	if (both_added_columns(sides) && !phash_eq(ro, rt))
+	{
+		row_conflict(rm, "row", NULL, 0);
+		*out = *ro;
+		return;
+	}
 
 	/* one side only, already as merged: its rows are the merge's */
 	if (phash_eq(ro, base) && !theirs_moves)
@@ -1943,8 +2158,8 @@ merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const P
 	edits_apply(m, &edits, &cur);
 	prolly_merge_result_free(&res);
 	pfree(f);
-	move_taken_rows(&ours, base, ro, &cur);
-	move_taken_rows(&theirs, base, rt, &cur);
+	move_taken_rows(&ours, sides->base, base, ro, rt, &cur);
+	move_taken_rows(&theirs, sides->base, base, rt, ro, &cur);
 	*out = cur;
 }
 
@@ -1962,10 +2177,11 @@ merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *b, const
 		prolly_report(m->ctx);
 	if (base == NULL)
 		base = &empty;
-	row_merge_init(&rm, m, merged, rv);
-	sides.ours = (MoveMap) {&rm, o, m->ours_types_differ};
-	sides.theirs = (MoveMap) {&rm, t, m->theirs_types_differ};
+	row_merge_init(&rm, m, merged);
+	sides.ours = (MoveMap) {&rm, o, columns_of_types_differing(&rm, rv, &m->ours_types)};
+	sides.theirs = (MoveMap) {&rm, t, columns_of_types_differing(&rm, rv, &m->theirs_types)};
 	sides.base = b;
+	sides.base_type_differs = columns_of_types_differing(&rm, rv, &m->base_types);
 	if (merged->nkey == 0)
 		merge_keyless_rows(&rm, &sides, base, ro, rt, out);
 	else
@@ -2163,7 +2379,7 @@ keep_table(Merger *m, const PHash *from, const char *name, PHash *rv)
 
 /* A table only one side changed, as it is; its rows read, if its types are not the merged. */
 static void
-keep_one_side(Merger *m, const PHash *from, const char *name, bool types_differ, PHash *rv)
+keep_one_side(Merger *m, const PHash *from, const char *name, const TypesDiffering *td, PHash *rv)
 {
 	WsTableSchema rec;
 	PHash		rows,
@@ -2173,41 +2389,11 @@ keep_one_side(Merger *m, const PHash *from, const char *name, bool types_differ,
 	if (!WsRoot->get_table(m->ctx, from, name, &rec, &rows))
 		elog(ERROR, "a table listed is not there");
 	read = rows;
-	if (types_differ)
-		read_one_side(m, &rec, &rows, rv, &read);
+	if (td->n > 0)
+		read_one_side(m, &rec, &rows, rv, td, &read);
 	if (m->nconflicts == before)
 		WsRoot->put_table(m->ctx, rv, &rec, &read, rv);
 	ws_schema_free(&rec);
-}
-
-static void
-type_object_changed(void *arg, const ProllyDiff *d)
-{
-	bool	   *differ = arg;
-
-	if ((d->klen > 5 && memcmp(d->key, "type/", 5) == 0) ||
-		(d->klen > 7 && memcmp(d->key, "domain/", 7) == 0))
-		*differ = true;
-}
-
-/* Whether a side's types or domains are other than the merged objects' so far. */
-static bool
-type_objects_differ(Merger *m, const PHash *side, const PHash *rv)
-{
-	PHash		a,
-				b,
-				empty;
-	bool		ha = WsRoot->get_map(m->ctx, side, WS_ROOT_OBJECTS, &a);
-	bool		hb = WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &b);
-	bool		differ = false;
-
-	if (!ha && !hb)
-		return false;
-	if (prolly_empty(m->ctx, 0, &empty) < 0)
-		prolly_report(m->ctx);
-	if (prolly_diff(m->ctx, ha ? &a : &empty, hb ? &b : &empty, type_object_changed, &differ) < 0)
-		prolly_report(m->ctx);
-	return differ;
 }
 
 /*
@@ -2215,7 +2401,8 @@ type_objects_differ(Merger *m, const PHash *side, const PHash *rv)
  * inserted one row the same, and so there are two of it more, not one.
  */
 static bool
-keyless_rows_both_changed(Merger *m, const PHash *ours, const char *name, const VcTable *b, const VcTable *o)
+keyless_rows_both_changed(Merger *m, const PHash *ours, const char *name, const VcTable *b, const VcTable *o,
+						  const PHash *rv)
 {
 	WsTableSchema rec;
 	PHash		rows;
@@ -2227,6 +2414,18 @@ keyless_rows_both_changed(Merger *m, const PHash *ours, const char *name, const 
 	if (!WsRoot->get_table(m->ctx, ours, name, &rec, &rows))
 		elog(ERROR, "a table listed is not there");
 	keyless = rec.nkey == 0;
+	if (keyless && m->base_types.n > 0)
+	{
+		/* (a type changed alike, its values with it, is one change too) */
+		RowMerge	rm;
+		const bool *differs;
+
+		row_merge_init(&rm, m, &rec);
+		differs = columns_of_types_differing(&rm, rv, &m->base_types);
+		for (int i = 0; keyless && i < rm.shape.nstored; i++)
+			keyless = !differs[i];
+		ws_row_shape_free(&rm.shape);
+	}
 	ws_schema_free(&rec);
 	return keyless;
 }
@@ -2245,7 +2444,7 @@ merge_table(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs
 				rows;
 	bool		has_base = b != NULL;
 
-	if (same_entry(o, t) && !keyless_rows_both_changed(m, ours, name, b, o))
+	if (same_entry(o, t) && !keyless_rows_both_changed(m, ours, name, b, o, rv))
 	{
 		if (o != NULL)
 			keep_table(m, ours, name, rv);
@@ -2255,13 +2454,13 @@ merge_table(Merger *m, const PHash *base, const PHash *ours, const PHash *theirs
 	if (same_entry(o, b))
 	{
 		if (t != NULL)
-			keep_one_side(m, theirs, name, m->theirs_types_differ, rv);
+			keep_one_side(m, theirs, name, &m->theirs_types, rv);
 		return;
 	}
 	if (same_entry(t, b))
 	{
 		if (o != NULL)
-			keep_one_side(m, ours, name, m->ours_types_differ, rv);
+			keep_one_side(m, ours, name, &m->ours_types, rv);
 		return;
 	}
 	if (o == NULL || t == NULL)
@@ -2468,8 +2667,9 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 	PHash		rv = vc_root_empty(ctx);
 
 	merge_map(&m, base, ours, theirs, WS_ROOT_OBJECTS, "", &rv);
-	m.ours_types_differ = type_objects_differ(&m, ours, &rv);
-	m.theirs_types_differ = type_objects_differ(&m, theirs, &rv);
+	m.ours_types = types_differing(&m, ours, &rv);
+	m.theirs_types = types_differing(&m, theirs, &rv);
+	m.base_types = types_differing(&m, base, &rv);
 	merge_map(&m, base, ours, theirs, WS_ROOT_FOREIGN_KEYS, "foreign-key", &rv);
 	merge_map(&m, base, ours, theirs, WS_ROOT_ROLES, "role", &rv);
 	merge_sequences(&m, base, ours, theirs, &rv);

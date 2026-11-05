@@ -13,7 +13,9 @@
  * goes too, and so does one on or to a table dropped.  Primary keys that differ, a key
  * both sides changed even alike, and a table both added otherwise are conflicts.
  * A column dropped by one side and changed in a row by the other is a conflict, as in
- * Dolt, though only for a row both changed.  Unlike Dolt, whose checks of one column conflict, checks of other names both stay,
+ * Dolt.  Unlike Dolt, a keyless table has no row to say that of, and the value goes;
+ * both inserting one key with values under different types, or a delete against a
+ * retype whose print differs, conflict rather than cast; and whose checks of one column conflict, checks of other names both stay,
  * as both can hold or be found violated; different privileges to one role conflict,
  * as Dolt has no grants to say otherwise.  Partition bounds that overlap are left for
  * ATTACH to refuse, on restore: a commit's bounds are text, not values.  So too what
@@ -44,7 +46,9 @@
  * Computing those values, and whether a value reads, is what WsEval is for, and the only
  * user code a merge runs.  A default that isn't immutable, or an identity, has no one
  * value for a merge to give: a new row needing it is a generated conflict.  A primary
- * key column of another type is a key conflict, as a key is its values' text.
+ * key column of another type is a key conflict, as a key is its values' text.  A value
+ * is read as a type by its text, not cast: boolean to text gives true beside t.  A column
+ * of a table's row type is not read for that table's changing: restoring the merge says.
  *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
