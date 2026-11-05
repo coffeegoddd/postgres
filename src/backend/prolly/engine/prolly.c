@@ -1687,6 +1687,8 @@ value_trees_of_change(void *arg, const ProllyDiff *d)
 			   *from = NULL;
 	uint64		nto,
 				nfrom = 0;
+	bool	   *used;
+	bool	   *new_tree;
 
 	if (d->to == NULL || w->rc != PROLLY_OK)
 		return;
@@ -1697,16 +1699,38 @@ value_trees_of_change(void *arg, const ProllyDiff *d)
 		w->rc = fail(w->ctx, PROLLY_ERR_BAD_VALUE, NULL);
 		return;
 	}
-	for (uint64 i = 0; i < nto && w->rc == PROLLY_OK; i++)
-	{
-		PHash		tree,
-					old = w->empty;
+	used = nfrom > 0 ? palloc0_array(bool, nfrom) : NULL;
+	new_tree = palloc0_array(bool, Max(nto, 1));
 
-		memcpy(tree.b, to + i * PHASH_LEN, PHASH_LEN);
-		if (i < nfrom)
-			memcpy(old.b, from + i * PHASH_LEN, PHASH_LEN);
-		w->rc = prolly_chunk_diff(w->ctx, &tree, &old, value_tree_node, w);
+	/* a tree it had is nothing new, wherever in the row it now is */
+	for (uint64 i = 0; i < nto; i++)
+	{
+		uint64		j = 0;
+
+		while (j < nfrom && (used[j] || memcmp(to + i * PHASH_LEN, from + j * PHASH_LEN, PHASH_LEN) != 0))
+			j++;
+		if (j < nfrom)
+			used[j] = true;
+		else
+			new_tree[i] = true;
 	}
+	/* the others are measured against what it no longer has, in order */
+	for (uint64 i = 0, j = 0; i < nto && w->rc == PROLLY_OK; i++)
+		if (new_tree[i])
+		{
+			PHash		tree,
+						old = w->empty;
+
+			while (j < nfrom && used[j])
+				j++;
+			memcpy(tree.b, to + i * PHASH_LEN, PHASH_LEN);
+			if (j < nfrom)
+				memcpy(old.b, from + j++ * PHASH_LEN, PHASH_LEN);
+			w->rc = prolly_chunk_diff(w->ctx, &tree, &old, value_tree_node, w);
+		}
+	if (used != NULL)
+		pfree(used);
+	pfree(new_tree);
 }
 
 static int

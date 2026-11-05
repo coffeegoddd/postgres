@@ -195,9 +195,10 @@ extern int	prolly_chunk_diff(ProllyCtx *ctx, const PHash *a, const PHash *b,
 
 /*
  * Of a tree of counted references, the nodes of the trees its changed entries
- * name that are not in the tree at the same place of b's entry of that key, each
- * once: the rest of what a has that b lacks, content alone deciding it.  A tree
- * the entries of b name elsewhere counts as new.  Nothing for other trees.
+ * name that b's entry of that key does not, each once: nearly the rest of what a
+ * has that b lacks, content alone deciding it.  A tree new to its entry is
+ * measured against one its old entry no longer names, in order; a tree only
+ * another key's entry names counts as new.  Nothing for other trees.
  */
 extern int	prolly_chunk_diff_values(ProllyCtx *ctx, const PHash *a, const PHash *b,
 									 ProllyChunkFn fn, void *arg);

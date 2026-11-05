@@ -1122,6 +1122,28 @@ ENGINE_TEST(test_large_change_bytes)
 	CHECK_OK(prolly_chunk_diff_values(&ctx, &empty, &one, count_chunk, &nodes));
 	CHECK_EQ(nodes, 0);
 
+	/* a value that comes or goes leaves the others' trees as they were */
+	{
+		uint64		ttags[] = {1, 2, 3};
+		uint8	   *second = large_value(len, 62);
+		WsField		g[3];
+		WsRowShape	three;
+		PHash		both,
+					only;
+
+		ws_row_shape_init(&three, ttags, 3, 1);
+		g[0] = text_field("k");
+		g[1] = bytes_field(big, len);
+		g[2] = bytes_field(second, len);
+		both = map_of_row(&ctx, &three, g);
+		g[1] = text_field("short now");
+		only = map_of_row(&ctx, &three, g);
+		nodes = 0;
+		CHECK_OK(prolly_chunk_diff_values(&ctx, &only, &both, count_chunk, &nodes));
+		CHECK_EQ(nodes, 0);
+		ws_row_shape_free(&three);
+	}
+
 	/* and through a commit: a value's size, then a piece's */
 	rv = vc_root_empty(&ctx);
 	vc_table_put(&ctx, &rv, "t", "x", 1, &one, &rv1);
