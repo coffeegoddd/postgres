@@ -2557,6 +2557,25 @@ duplicate_names(List *names)
 }
 
 /*
+ * Whether name is what printing would make of used for a second USING of it, and so what
+ * would be renamed too: used and a number, used cut short if that would be too long.
+ */
+static bool
+is_suffixed_name(const char *name, const char *used)
+{
+	const char *mark = strrchr(name, '_');
+	size_t		base;
+
+	if (mark == NULL || mark[1] == '\0' || strspn(mark + 1, "0123456789") != strlen(mark + 1))
+		return false;
+	base = mark - name;
+	if (strncmp(name, used, base) != 0)
+		return false;
+	return used[base] == '\0' ||
+		(strlen(name) >= NAMEDATALEN - MAX_MULTIBYTE_CHAR_LEN && strlen(used) > base);
+}
+
+/*
  * Whether printing would rename a column of one of these names in query q.  It keeps USING's
  * columns apart from every other in a query if any join there, of no alias, merges one into
  * what is not simply a column of a table, as a FULL JOIN does, or a join of two types.
@@ -2592,9 +2611,42 @@ named_as_a_kept_using(Query *q, List *names)
 			if (merged++ >= rte->joinmergedcols)
 				break;
 			foreach_node(String, name, names)
-				if (strcmp(strVal(used), strVal(name)) == 0)
+				if (strcmp(strVal(used), strVal(name)) == 0 || is_suffixed_name(strVal(name), strVal(used)))
 					return true;
 		}
+	}
+	return false;
+}
+
+/*
+ * Whether range table entry rtindex is under an aliased join that it, or a join above it,
+ * merges columns at.  Printing takes a USING's name, from the alias or above, down into what
+ * is under the join, so what has that name there is another; and only from under it, as by
+ * LATERAL, can a whole row of it be taken.  above says if a join on the way down merges.
+ */
+static bool
+under_an_aliased_join_with_using(Query *q, Node *node, int rtindex, bool aliased, bool merges)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblRef))
+		return ((RangeTblRef *) node)->rtindex == rtindex && aliased && merges;
+	if (IsA(node, FromExpr))
+	{
+		foreach_ptr(Node, item, ((FromExpr *) node)->fromlist)
+			if (under_an_aliased_join_with_using(q, item, rtindex, aliased, merges))
+				return true;
+		return false;
+	}
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) node;
+		RangeTblEntry *rte = rt_fetch(j->rtindex, q->rtable);
+
+		aliased |= rte->alias != NULL;
+		merges |= rte->joinmergedcols > 0;
+		return under_an_aliased_join_with_using(q, j->larg, rtindex, aliased, merges) ||
+			under_an_aliased_join_with_using(q, j->rarg, rtindex, aliased, merges);
 	}
 	return false;
 }
@@ -2676,7 +2728,8 @@ lost_in_print_walker(Node *node, void *arg)
 				l->why = "it has a whole row of columns of one name, which printing tells apart";
 				return true;
 			}
-			if (named_as_a_kept_using(q, rte->eref->colnames))
+			if (named_as_a_kept_using(q, rte->eref->colnames) ||
+				under_an_aliased_join_with_using(q, (Node *) q->jointree, v->varno, false, false))
 			{
 				l->why = "it has a whole row with a column named as a USING's, which printing renames";
 				return true;
