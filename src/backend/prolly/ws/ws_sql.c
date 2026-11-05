@@ -30,7 +30,8 @@ const WsSqlRoutine *WsSql = &SpiWsSql;
  * catalog_branch_filter: other branches' objects stay out of a commit.
  * row_security: a policy does not quietly leave rows out.
  * default_tablespace, default_table_access_method: what a statement does not
- * say is what a record holds.)
+ * say is what a record holds.
+ * xmloption: a value is read back whichever form it is in.)
  */
 static const struct
 {
@@ -49,6 +50,7 @@ static const struct
 	{"row_security", "off"},
 	{"default_tablespace", ""},
 	{"default_table_access_method", "heap"},
+	{"xmloption", "content"},
 };
 
 /* (as PGC_SUSET: catalog_branch_filter is, and this is no user's choosing) */

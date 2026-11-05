@@ -47,7 +47,8 @@ sub same_rows
 	return;
 }
 
-$node->safe_psql('postgres', q{CREATE SCHEMA s VERSIONED; CREATE SCHEMA d VERSIONED});
+$node->safe_psql('postgres', q{CREATE SCHEMA s VERSIONED; CREATE SCHEMA d VERSIONED; CREATE SCHEMA s2 VERSIONED});
+my ($rc, $out, $err);
 
 # values of many types, NULLs, a dropped column, and a key of two
 $node->safe_psql('postgres', q{
@@ -73,11 +74,9 @@ is($node->safe_psql('postgres', q{SELECT count(*) FROM d.nk}), '7', 'each of the
 # the same rows across batches are one entry, as within one
 $node->safe_psql('postgres', q{
 	CREATE TABLE s.many (a integer, b text);
-	INSERT INTO s.many SELECT i % 7, 'v' FROM generate_series(1, 5000) i;
-	CREATE TABLE s.few (a integer, b text);
-	INSERT INTO s.few SELECT i % 7, 'v' FROM generate_series(1, 5000) i ORDER BY i % 7 DESC});
+	INSERT INTO s.many SELECT i % 7, 'v' FROM generate_series(1, 5000) i;});
 is(hash_of('s', 'many'), do {
-	$node->safe_psql('postgres', q{CREATE SCHEMA s2 VERSIONED; CREATE TABLE s2.many (a integer, b text); INSERT INTO s2.many SELECT i % 7, 'v' FROM generate_series(1, 5000) i ORDER BY i % 7 DESC});
+	$node->safe_psql('postgres', q{CREATE TABLE s2.many (a integer, b text); INSERT INTO s2.many SELECT i % 7, 'v' FROM generate_series(1, 5000) i ORDER BY i % 7 DESC});
 	hash_of('s2', 'many') }, 'a keyless table is one map whichever order, across batches');
 copy_table('many');
 same_rows('many', 'a, b', 'keyless rows over batches');
@@ -87,6 +86,26 @@ is($node->safe_psql('postgres', q{SELECT count(*) FROM d.many}), '5000', 'each r
 $node->safe_psql('postgres', q{CREATE TABLE s.none (a integer PRIMARY KEY, b text)});
 copy_table('none');
 same_rows('none', 'a', 'no rows');
+
+# nothing but a key, and no stored column at all
+$node->safe_psql('postgres', q{
+	CREATE TABLE s.keyonly (a integer PRIMARY KEY); INSERT INTO s.keyonly VALUES (1), (2);
+	CREATE TABLE s.nocols (); INSERT INTO s.nocols DEFAULT VALUES; INSERT INTO s.nocols DEFAULT VALUES});
+copy_table('keyonly');
+same_rows('keyonly', 'a', 'a key alone');
+copy_table('nocols');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM d.nocols}), '2', 'rows of no columns, each there');
+is(hash_of('d', 'nocols'), hash_of('s', 'nocols'), 'and the same map');
+
+# types whose text hangs on settings, or could
+$node->safe_psql('postgres', q{
+	CREATE TYPE s.en AS ENUM ('a', 'b'); CREATE TYPE d.en AS ENUM ('a', 'b');
+	CREATE TABLE s.typed (id integer PRIMARY KEY, m money, e s.en, z double precision);
+	INSERT INTO s.typed VALUES (1, 12.5, 'b', '-0')});
+is($node->safe_psql('postgres', q{SET extra_float_digits = 0; SELECT test_ws_rows_hash('s', 'typed')}),
+	hash_of('s', 'typed'), 'money, an enum and -0 are one map under other settings');
+copy_table('typed');
+is($node->safe_psql('postgres', q{SELECT id, m, e::text, z::text FROM d.typed}), '1|$12.50|b|-0', 'and restored as they were');
 
 # large values, in a key's row and a keyless one
 $node->safe_psql('postgres', q{
@@ -139,8 +158,42 @@ $node->safe_psql('postgres', q{CREATE TRIGGER t BEFORE INSERT ON d.dm FOR EACH R
 $node->safe_psql('postgres', q{SELECT test_ws_rows_copy('s', 'dm', 'd')});
 is($node->safe_psql('postgres', q{SELECT x FROM d.dm ORDER BY id}), "5\n6", 'no trigger fired and no domain checked');
 is($node->safe_psql('postgres', q{SET enable_seqscan = off; SELECT id FROM d.dm WHERE u = 'two'}), '2', 'a later index has them too');
-my ($rc, $out, $err) = $node->psql('postgres', q{ALTER TABLE d.dm DISABLE TRIGGER t; INSERT INTO d.dm VALUES (9, -1, 'one')});
+($rc, $out, $err) = $node->psql('postgres', q{ALTER TABLE d.dm DISABLE TRIGGER t; INSERT INTO d.dm VALUES (9, -1, 'one')});
 like($err, qr/duplicate key/, 'and enforces what it should');
+
+# a domain's checks do not run at any depth: in an array, a composite or a range
+$node->safe_psql('postgres', q{
+	CREATE DOMAIN s.pos AS integer CHECK (VALUE > 0); CREATE DOMAIN d.pos AS integer CHECK (VALUE < 0);
+	CREATE TYPE s.cmp AS (p s.pos); CREATE TYPE d.cmp AS (p d.pos);
+	CREATE TYPE s.rng AS RANGE (subtype = s.pos); CREATE TYPE d.rng AS RANGE (subtype = d.pos);
+	CREATE TABLE s.deep (id integer PRIMARY KEY, a s.pos[], c s.cmp, r s.rng);
+	INSERT INTO s.deep VALUES (1, '{5}', ROW(5), '[1,5)')});
+copy_table('deep');
+is($node->safe_psql('postgres', q{SELECT a, c, r FROM d.deep}), '{5}|(5)|[1,5)', 'no domain checked in an array, composite or range');
+($rc, $out, $err) = $node->psql('postgres', q{SELECT ARRAY[5]::d.pos[]});
+like($err, qr/violates check constraint/, 'and checks are back once restored');
+
+# a key's rows while a deferrable key lets two be: refused, not one row of two
+$node->safe_psql('postgres', q{
+	CREATE TABLE s.dk (id integer PRIMARY KEY DEFERRABLE, v text);
+	INSERT INTO s.dk VALUES (1, 'a'), (2, 'b')});
+copy_table('dk');
+same_rows('dk', 'id', 'a deferrable key');
+($rc, $out, $err) = $node->psql('postgres', q{BEGIN; SET CONSTRAINTS ALL DEFERRED; UPDATE s.dk SET id = 1 WHERE id = 2; SELECT test_ws_rows_hash('s', 'dk'); ROLLBACK});
+like($err, qr/has rows whose keys print alike, 2 rows to 1 keys/, 'capture refuses two rows of a key');
+# and what is restored under a deferrable index is checked now
+$node->safe_psql('postgres', q{CREATE TABLE s.dk2 (id integer, v text, UNIQUE (id) DEFERRABLE);
+	CREATE TABLE s2.dk2 (id integer, v text); INSERT INTO s2.dk2 VALUES (1, 'a'), (1, 'b')});
+make_table('dk2');
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_rows_copy('s2', 'dk2', 'd')});
+like($err, qr/has a key another has, under a deferrable constraint/, 'a deferrable unique index refuses what it would at commit');
+
+# a read-only transaction writes nothing
+$node->safe_psql('postgres', q{CREATE TABLE s.ro (a integer); INSERT INTO s.ro VALUES (1)});
+make_table('ro');
+($rc, $out, $err) = $node->psql('postgres', q{BEGIN READ ONLY; SELECT test_ws_rows_copy('s', 'ro', 'd'); COMMIT});
+like($err, qr/cannot execute restoring rows in a read-only transaction/, 'a read-only transaction is refused');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM d.ro}), '0', 'and nothing written');
 
 # a partitioned table holds none; each leaf its own, whichever way it divides
 $node->safe_psql('postgres', q{
@@ -197,6 +250,8 @@ $node->safe_psql('postgres', q{
 is(hash_of('s', 'par'), hash_of('s2', 'par'), 'a parent\'s map is its own rows');
 
 # refusals
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_rows_copy_as('s', 'p1', 'p', 'd')});
+like($err, qr/partitioned table "p" holds rows of its own/, 'a partitioned table\'s map with rows is refused');
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_ws_rows_copy('s', 'p1', 'd')});
 like($err, qr/cannot be restored into "p1" while it is attached/, 'an attached partition is refused');
 
@@ -231,7 +286,7 @@ $node->safe_psql('l', q{SET client_encoding = 'UTF8'; CREATE SCHEMA s VERSIONED;
 is($node->safe_psql('l', q{SELECT octet_length(t) FROM s.enc}), '1', 'held there in its own encoding');
 is(hash_of('s', 'enc', 'l'), $utf8_hash, 'a value in LATIN1 is the map of it in UTF-8');
 copy_table('enc', 'l');
-is($node->safe_psql('l', q{SELECT octet_length(t) FROM d.enc}), '1', 'and restored there in its own');
+is($node->safe_psql('l', q{SELECT ascii(t) FROM d.enc}), '233', 'and restored there as that character');
 $ENV{PGOPTIONS} = $postgres_options;
 
 $node->stop;

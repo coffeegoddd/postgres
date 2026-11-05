@@ -53,6 +53,7 @@ PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
+PG_FUNCTION_INFO_V1(test_ws_rows_copy_as);
 
 /*
  * test_ws_schema_bytes(schema text, table text) returns bytea: the table's
@@ -822,5 +823,34 @@ test_ws_rows_copy(PG_FUNCTION_ARGS)
 	prolly_ctx_free(&ctx);
 	MemoryChunkStoreDestroy(cs);
 	ws_schema_free(&rec);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_ws_rows_copy_as(schema text, rows_of text, record_of text, dest text) returns
+ * void: one table's rows restored as another's record says
+ */
+Datum
+test_ws_rows_copy_as(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *rows_of = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *record_of = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *dest = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	ChunkStore *cs = MemoryChunkStoreCreate();
+	ProllyCtx	ctx;
+	WsTableSchema from,
+				as;
+	PHash		map;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	rows_record(schema, rows_of, &from);
+	rows_record(schema, record_of, &as);
+	WsRows->capture(&ctx, schema, &from, &map);
+	WsRows->restore(&ctx, dest, &as, &map);
+	prolly_ctx_free(&ctx);
+	MemoryChunkStoreDestroy(cs);
+	ws_schema_free(&from);
+	ws_schema_free(&as);
 	PG_RETURN_VOID();
 }

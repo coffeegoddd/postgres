@@ -44,6 +44,9 @@ static bool domain_check_internal(Datum value, bool isnull, Oid domainType,
 								  void **extra, MemoryContext mcxt,
 								  Node *escontext);
 
+/* Set while values are written as a commit holds them, which runs no user code. */
+bool		domain_checks_suspended = false;
+
 /*
  * structure to cache state across multiple calls
  */
@@ -140,6 +143,9 @@ domain_check_input(Datum value, bool isnull, DomainIOData *my_extra,
 {
 	ExprContext *econtext = my_extra->econtext;
 	ListCell   *l;
+
+	if (domain_checks_suspended)
+		return;
 
 	/* Make sure we have up-to-date constraints */
 	UpdateDomainConstraintRef(&my_extra->constraint_ref);
