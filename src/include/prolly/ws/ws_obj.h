@@ -110,13 +110,14 @@ typedef struct WsObjectUsing
 
 /*
  * A table whose columns an alias list goes by the place of: what prints a list of its, or of a
- * join over it.  The tags of its columns in order are held beside it, and a restore that finds
- * them otherwise refuses, rather than reading another column.
+ * join over it, or a function returning its row.  Its columns in order are held beside it, and
+ * a restore that finds them otherwise refuses, rather than reading another column.
  */
 typedef struct WsObjectPlaces
 {
 	char	   *table;
-	char	   *columns;		/* its columns' tags in order, comma-separated */
+	char	   *columns;		/* its columns in order, comma-separated: each's tag, or
+								 * quoted name if it has none */
 } WsObjectPlaces;
 
 typedef struct WsObject

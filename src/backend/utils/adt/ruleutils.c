@@ -12905,7 +12905,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 		else
 		{
 			/* Else print column aliases as needed */
-			if (colinfo->printaliases && rte->rtekind == RTE_RELATION)
+			if (colinfo->printaliases &&
+				(rte->rtekind == RTE_RELATION || rte->rtekind == RTE_FUNCTION))
 				deparse_printed_alias_list = true;
 			get_column_alias_list(colinfo, context);
 		}

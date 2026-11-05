@@ -200,7 +200,10 @@ for my $case (
 	[ 'written', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{ALTER TABLE pl2.t DROP COLUMN n; ALTER TABLE pl2.t ADD COLUMN z integer DEFAULT 7} ],
 	[ 'written, added', q{CREATE VIEW pl1.v AS SELECT x.l FROM pl1.t x(l)}, q{ALTER TABLE pl2.t ADD COLUMN z integer} ],
 	[ 'named join, written', q{CREATE VIEW pl1.v AS SELECT j.q FROM (pl1.t JOIN pl1.u ON t.n = u.k) j(a, b, c, d, q)}, q{ALTER TABLE pl2.t ADD COLUMN y integer DEFAULT 99} ],
-	[ 'named join, printed', q{CREATE VIEW pl1.v AS SELECT j.other FROM (pl1.t JOIN pl1.u2 ON t.n = u2.n) j}, q{ALTER TABLE pl2.t ADD COLUMN y text} ])
+	[ 'named join, printed', q{CREATE VIEW pl1.v AS SELECT j.other FROM (pl1.t JOIN pl1.u2 ON t.n = u2.n) j}, q{ALTER TABLE pl2.t ADD COLUMN y text} ],
+	[ 'a function returning its row', q{CREATE FUNCTION pl1.f() RETURNS SETOF pl1.t LANGUAGE sql AS 'SELECT * FROM pl1.t'; CREATE VIEW pl1.v AS SELECT x.l FROM pl1.f() x(l)}, q{ALTER TABLE pl2.t DROP COLUMN n; ALTER TABLE pl2.t ADD COLUMN z integer} ],
+	[ 'its columns in another order', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{DROP TABLE pl2.t; CREATE TABLE pl2.t (w integer, n integer, val text, tv text); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2')} ],
+	[ 'its table gone', q{CREATE VIEW pl1.v AS SELECT tv FROM pl1.t x(l, n, w, tv)}, q{DROP TABLE pl2.t} ])
 {
 	my ($name, $view, $change) = @$case;
 	$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
@@ -225,6 +228,25 @@ for my $case (
 	is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $pl_held, "$name: with none it reads as its commit");
 	$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE});
 }
+# what a commit holds does not hang on what the session printed before
+$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl3 VERSIONED; ALTER SCHEMA pl3 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE pl1.t (a integer, b integer); CREATE VIEW pl1.listed AS SELECT x.c FROM pl1.t x(c);
+	CREATE TABLE pl3.t (a integer); CREATE VIEW pl3.v AS SELECT a FROM pl3.t});
+my $fresh = $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl3')});
+my $after_print = $node->safe_psql('postgres', q{SELECT pg_get_viewdef('pl1.listed'::regclass) IS NOT NULL; SELECT test_ws_obj_bytes('pl3')});
+is($after_print, "t\n$fresh", 'an alias list printed before holds nothing for another object');
+# a dropped column of its own, and none on the other side, are the same columns
+$node->safe_psql('postgres', q{CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags; ALTER TABLE pl1.t ADD COLUMN gone integer; ALTER TABLE pl1.t DROP COLUMN gone; ALTER TABLE pl1.t ADD COLUMN last integer;
+	SELECT test_ws_schema_create(test_ws_schema_bytes('pl1', 't'), 'pl2'); SELECT test_ws_schema_set_tags(test_ws_schema_bytes('pl1', 't'), 'pl2');
+	SELECT test_ws_obj_copy('pl1', 'pl2', 'both', true)});
+is($node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl2')}), $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')}), 'a dropped column on one side only is no change under a list');
+$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE; DROP SCHEMA pl2 CASCADE; DROP SCHEMA pl3 CASCADE});
+# a view's columns have no tags: its list holds their names
+$node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; SET ROLE g_tags;
+	CREATE TABLE pl1.t (a integer, b integer); CREATE VIEW pl1.v0 AS SELECT b, a FROM pl1.t; CREATE VIEW pl1.v AS SELECT x.c FROM pl1.v0 x(c)});
+my %over_view = map { my ($k, $v) = split /\t/; $k => pack('H*', $v // '') } split /\n/, $node->safe_psql('postgres', q{SELECT test_ws_obj_bytes('pl1')});
+like($over_view{'view/v'}, qr/v0.b,a/, 'a list over a view holds its columns by name');
+$node->safe_psql('postgres', q{DROP SCHEMA pl1 CASCADE});
 # with no list, a column added changes nothing
 $node->safe_psql('postgres', q{CREATE SCHEMA pl1 VERSIONED; ALTER SCHEMA pl1 OWNER TO g_tags; CREATE SCHEMA pl2 VERSIONED; ALTER SCHEMA pl2 OWNER TO g_tags; SET ROLE g_tags;
 	CREATE TABLE pl1.t (a integer); CREATE VIEW pl1.v AS SELECT a FROM pl1.t; CREATE TABLE pl2.t (a integer); ALTER TABLE pl2.t ADD COLUMN b integer});

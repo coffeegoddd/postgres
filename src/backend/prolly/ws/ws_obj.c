@@ -10,7 +10,7 @@
  * one's column, empty for none, and text; uvarint ngrants and each one's column, empty
  * for none, grantee, empty for PUBLIC, grant option byte, privileges.
  * Then uvarint nusings, and each's table, column and tag.
- * Then uvarint nplaces, and each's table and its columns' tags.
+ * Then uvarint nplaces, and each's table and its columns.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -36,6 +36,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/readfuncs.h"
+#include "parser/parse_type.h"
 #include "parser/parser.h"
 #include "parser/parsetree.h"
 #include "prolly/ws/ws_obj.h"
@@ -1670,8 +1671,18 @@ usings_walker(Node *node, void *arg)
 	if (IsA(node, Query))
 	{
 		foreach_ptr(RangeTblEntry, rte, ((Query *) node)->rtable)
+		{
 			if (rte->rtekind == RTE_RELATION && get_rel_namespace(rte->relid) == w->nspoid)
 				w->tables = list_append_unique_oid(w->tables, rte->relid);
+			else if (rte->rtekind == RTE_FUNCTION)
+				foreach_node(RangeTblFunction, rtf, rte->functions)
+				{
+					Oid			row = typeOrDomainTypeRelid(exprType(rtf->funcexpr));
+
+					if (OidIsValid(row) && get_rel_namespace(row) == w->nspoid)
+						w->tables = list_append_unique_oid(w->tables, row);
+				}
+		}
 		usings_of_jointree(w, (Query *) node, (Node *) ((Query *) node)->jointree);
 		return query_tree_walker((Query *) node, usings_walker, arg, 0);
 	}
@@ -1684,7 +1695,7 @@ places_cmp(const void *a, const void *b)
 	return strcmp(((const WsObjectPlaces *) a)->table, ((const WsObjectPlaces *) b)->table);
 }
 
-/* The tags in order of a table's columns, as text; NULL if none has one. */
+/* A relation's columns in order, each its tag or, with none, its name, as UTF-8; NULL if it has none. */
 static char *
 column_tags_of(const char *oid)
 {
@@ -1692,9 +1703,9 @@ column_tags_of(const char *oid)
 	WsSqlRows	rows;
 	char	   *tags;
 
-	WsSql->read("SELECT string_agg(a.attcoltag::text, ',' ORDER BY a.attnum) FROM pg_attribute a "
-				"WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped AND a.attcoltag <> 0", 1, params, &rows);
-	tags = ws_sql_value(&rows, 0, 0) != NULL ? pstrdup(ws_sql_value(&rows, 0, 0)) : NULL;
+	WsSql->read("SELECT string_agg(CASE WHEN a.attcoltag <> 0 THEN a.attcoltag::text ELSE quote_ident(a.attname::text) END, ',' ORDER BY a.attnum) "
+				"FROM pg_attribute a WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped", 1, params, &rows);
+	tags = ws_sql_value(&rows, 0, 0) != NULL ? pstrdup(ws_text_to_utf8(ws_sql_value(&rows, 0, 0))) : NULL;
 	ws_sql_rows_free(&rows);
 	return tags;
 }
@@ -1732,18 +1743,16 @@ read_usings(WsObject *o, const char *schema, const char *oid, const char *sql)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 	UsingWalk	w = {get_namespace_oid(schema, false), NIL, NIL};
-	bool		printed_a_list = deparse_printed_alias_list;
 	WsObjectUsing *sorted;
 	int			n;
 	int			kept = 0;
 
-	deparse_printed_alias_list = false;
 	WsSql->read(sql, 1, params, &rows);
 	for (int i = 0; i < rows.nrows; i++)
 		if (ws_sql_value(&rows, i, 0) != NULL)
 			usings_walker(stringToNode(ws_sql_value(&rows, i, 0)), &w);
 	ws_sql_rows_free(&rows);
-	if (printed_a_list)
+	if (deparse_printed_alias_list)
 		read_places(o, &w);
 	n = list_length(w.found);
 	if (n == 0)
@@ -1786,7 +1795,7 @@ check_usings(const WsObject *o, const char *schema)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("\"%s\" in schema \"%s\" cannot be made: an alias list of it goes by the place of the columns of table \"%s\", which have changed",
 							o->name, schema, table),
-					 errhint("An alias list cannot follow a column added or dropped. Make the object again.")));
+					 errhint("An alias list cannot follow a column added, dropped or moved. Make the object again.")));
 		pfree(qualified);
 		pfree(table);
 	}
@@ -4063,7 +4072,7 @@ read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 		const char *name = ws_sql_value(&rows, i, 1);
 		const char *table = ws_sql_value(&rows, i, 2);
 		char		relkind = ws_sql_value(&rows, i, 4)[0];
-		char	   *text = of_table_statement(kind, schema, oid, name, table, atooid(ws_sql_value(&rows, i, 3)));
+		char	   *text;
 		Buf			stored = BUF_INIT;
 		char	   *source = psprintf("SELECT '%s'::regclass::oid, $1::oid", catalog);
 		char	   *types = psprintf("SELECT refobjid::text FROM pg_depend WHERE classid = '%s'::regclass AND objid = $1::oid "
@@ -4073,6 +4082,8 @@ read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 		WsSqlRows	said;
 
 		CHECK_FOR_INTERRUPTS();
+		deparse_printed_alias_list = false;
+		text = of_table_statement(kind, schema, oid, name, table, atooid(ws_sql_value(&rows, i, 3)));
 		check_of_table_is_portable(name, schema, text);
 		check_constants_hold_no_names(name, schema, oid, types);
 		o->kind = kind;
@@ -4380,8 +4391,11 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		}
 		else
 		{
-			char	   *printed = printed_or_retry(schema, print_tagged(schema, pg_get_functiondef, 1,
-																		   ObjectIdGetDatum(atooid(oid)), 0, 0));
+			char	   *printed;
+
+			deparse_printed_alias_list = false;
+			printed = printed_or_retry(schema, print_tagged(schema, pg_get_functiondef, 1,
+															ObjectIdGetDatum(atooid(oid)), 0, 0));
 
 			if (strncmp(printed, head, strlen(head)) != 0)
 				elog(ERROR, "function \"%s\" printed as something else", name);
@@ -4606,9 +4620,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		const char *oid = ws_sql_value(&rels, i, 0);
 		bool		matview = ws_sql_value(&rels, i, 1)[0] == 'm';
 		const char *name = ws_sql_value(&rels, i, 2);
-		char	   *viewdef = printed_or_retry(schema, print_tagged(schema, pg_get_viewdef_ext, 2,
-																	   ObjectIdGetDatum(atooid(oid)),
-																	   BoolGetDatum(false), 0));
+		char	   *viewdef;
 		const char *options = ws_sql_value(&rels, i, 4);
 		Buf			text = BUF_INIT;
 		Buf			stored = BUF_INIT;
@@ -4617,6 +4629,10 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		size_t		len;
 
 		CHECK_FOR_INTERRUPTS();
+		deparse_printed_alias_list = false;
+		viewdef = printed_or_retry(schema, print_tagged(schema, pg_get_viewdef_ext, 2,
+														ObjectIdGetDatum(atooid(oid)),
+														BoolGetDatum(false), 0));
 		o->kind = matview ? WS_OBJ_MATVIEW : WS_OBJ_VIEW;
 		o->name = ws_name_to_utf8(name);
 		if (options != NULL)
