@@ -351,38 +351,6 @@ my @indexed = $err =~ /indexed as (\S+)/g;
 ok(@indexed > 0, 'it ran');
 is(scalar(grep { $_ ne 'g_root' } @indexed), 0, 'each time as the table\'s owner') or diag("@indexed");
 
-# nor at ATTACH: a partition's check and its table's partial index, of owners alike or not
-for my $owners ([ 'g_root', 'g_root' ], [ 'g_root', 'g_reader' ])
-{
-	my ($parent, $child) = @$owners;
-	state $at = 0;
-	$at++;
-	($rc, $out, $err) = in_one_session(qq{
-	SET client_min_messages = notice;
-	CREATE SCHEMA at$at VERSIONED; ALTER SCHEMA at$at OWNER TO g_root; GRANT ALL ON SCHEMA at$at TO g_reader;
-	CREATE SCHEMA at_d$at VERSIONED; ALTER SCHEMA at_d$at OWNER TO g_root; GRANT ALL ON SCHEMA at_d$at TO g_reader;
-	SET ROLE g_root;
-	CREATE FUNCTION at$at.who(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS \$\$
-	BEGIN RAISE NOTICE 'attached as %', current_user; RETURN \$1; END \$\$;
-	GRANT EXECUTE ON FUNCTION at$at.who(integer) TO g_reader;
-	CREATE TABLE at$at.p (a integer) PARTITION BY RANGE (a);
-	CREATE TABLE at$at.c (a integer CONSTRAINT k CHECK (at$at.who(1) = 1));
-	ALTER TABLE at$at.p ATTACH PARTITION at$at.c FOR VALUES FROM (0) TO (10);
-	INSERT INTO at$at.c VALUES (1);
-	RESET ROLE;
-	ALTER TABLE at$at.c OWNER TO $child;
-	SELECT test_ws_root_capture('at$at') AS r \\gset
-	\\echo =====run
-	SELECT test_ws_root_restore(:'r', 'at_d$at');
-	\\echo =====end
-	});
-	is($rc, 0, "ATTACH, owned by $parent and $child: restores") or diag($err);
-	my @as = grep { $_ eq $superuser } $err =~ /attached as (\S+)/g;
-	is(scalar(@as), 0, "ATTACH, owned by $parent and $child: never as whoever restores");
-	is($node->safe_psql('postgres', qq{SELECT relowner::regrole, (SELECT relowner::regrole FROM pg_class WHERE oid = 'at_d$at.p'::regclass) FROM pg_class WHERE oid = 'at_d$at.c'::regclass}),
-		"$child|$parent", 'each table its own owner after');
-}
-
 # a restorer who can only SET ROLE to the owner is told so
 ($rc, $out, $err) = in_one_session(q{
 	SET client_min_messages = warning;
