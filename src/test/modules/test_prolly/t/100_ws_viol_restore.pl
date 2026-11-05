@@ -270,6 +270,36 @@ is($s[2], '1', 'one waits');
 is($s[3], 'zc', 'the one that raises, and only it');
 like($err, qr/"zc" of table "z" stays set aside/, 'with a warning of why');
 
+# a branch's copy has what is set aside, of its own tables
+{
+	my $from = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+	my $to = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+	my ($cp_rc, $cp, $cp_err) = $node->psql('postgres', qq{SET client_min_messages = warning;
+		SET catalog_branch = $from;
+		CREATE SCHEMA app VERSIONED; ALTER SCHEMA app OWNER TO g_vr;
+		CREATE SCHEMA ob VERSIONED; ALTER SCHEMA ob OWNER TO g_vr; CREATE SCHEMA ot VERSIONED; ALTER SCHEMA ot OWNER TO g_vr; CREATE SCHEMA oo VERSIONED; ALTER SCHEMA oo OWNER TO g_vr;
+		SET ROLE g_vr;
+		SET search_path = ob; CREATE TABLE p (id integer PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, pid integer REFERENCES p); INSERT INTO p VALUES (1), (2);
+		SET search_path = oo; CREATE TABLE p (id integer PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, pid integer REFERENCES p); INSERT INTO p VALUES (1), (2); DELETE FROM p WHERE id = 1;
+		SET search_path = ot; CREATE TABLE p (id integer PRIMARY KEY); CREATE TABLE c (id integer PRIMARY KEY, pid integer REFERENCES p); INSERT INTO p VALUES (1), (2); INSERT INTO c VALUES (5, 1);
+		RESET ROLE; SET search_path = public;
+		SELECT split_part(test_ws_merge_checked(test_ws_root_capture('ob'), test_ws_root_capture('oo'), test_ws_root_capture('ot'), 'app'), E'\\n', 1) AS m \\gset
+		SELECT test_ws_root_restore(:'m', 'app') IS NULL AS r \\gset
+		DROP SCHEMA ob, oo, ot CASCADE;
+		SELECT pg_branch_catalog_copy($from, $to);
+		SET catalog_branch = $to;
+		\\echo =====step
+		SELECT d.defkind, d.defname, c.relname, r.relname FROM pg_ws_deferred d JOIN pg_class c ON c.oid = d.defrelid JOIN pg_class r ON r.oid = d.defrefrelid WHERE c.relnamespace = 'app'::regnamespace;
+		\\echo =====end
+		\\echo =====step
+		SELECT (SELECT defrelid FROM pg_ws_deferred d JOIN pg_class c ON c.oid = d.defrelid WHERE c.relnamespace = 'app'::regnamespace) = 'app.c'::regclass;
+		\\echo =====end});
+	is($cp_rc, 0, 'a branch copied: runs') or diag($cp_err);
+	my @got = steps($cp);
+	is($got[0], 'f|c_pid_fkey|c|p', 'its copy has what is set aside');
+	is($got[1], 't', 'of its own table');
+}
+
 # capturing what is set aside asks nothing of roles
 ($rc, $out, $err) = merged(q{CREATE TABLE t (id integer PRIMARY KEY, v integer, CONSTRAINT vu UNIQUE (v))},
 	q{INSERT INTO t VALUES (1, 7)}, q{INSERT INTO t VALUES (2, 7)},

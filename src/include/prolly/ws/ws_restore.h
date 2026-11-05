@@ -72,8 +72,9 @@ typedef struct WsRootIORoutine
 	/*
 	 * What a root's values mean and nothing else, for working them out: its objects but
 	 * triggers, rules and policies, no comments or grants, an owner only if that role is
-	 * here, and its tables each holding no_rows, with no owner or constraint and
-	 * unattached.  It names no role and asks for none to be made.
+	 * here, sequences with nothing to hand out, and its tables each holding no_rows, with
+	 * no owner or foreign keys and unattached.  It names no role and asks for none to be
+	 * made.
 	 */
 	void		(*restore_definitions) (ProllyCtx *ctx, const PHash *root, const char *schema,
 										const PHash *no_rows);

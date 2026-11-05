@@ -112,8 +112,10 @@ typedef struct WsMergeResult
 /*
  * What a merge has computed, among its merged definitions alone, in a schema it makes
  * the first time one is asked (ws_root_definitions_begin), under its name, as a function's
- * text may say that.  A function reading one of its tables is refused, as they hold no rows
- * there.  A value is its output text, as a row
+ * text may say that.  A function reading one of its tables or using one of its sequences is
+ * refused, as they hold no rows there and hand out nothing.  Not so what no plan reads: a
+ * function reading a catalog, a table's size or catalog_branch is told of that schema.
+ * A value is its output text, as a row
  * holds it.  Each false if it could not be done, with nothing left undone.
  */
 typedef struct WsEvalRoutine
