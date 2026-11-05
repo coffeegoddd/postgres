@@ -304,6 +304,13 @@ make_table(ProllyCtx *ctx, const WsTableSchema *s, const PHash *rows, const char
 
 	/* (its rows before its indexes, which then build once) */
 	WsRows->restore(ctx, schema, s, rows);
+
+	/*
+	 * Its owner before them: an index runs what it is made of as its table's owner,
+	 * which must not be whoever is restoring this.
+	 */
+	ws_schema_owner(s, schema, &sql);
+	run_statement(&sql);
 	for (int i = 0; i < s->nindexes; i++)
 	{
 		ws_schema_create_index(s, i, schema, &sql);
@@ -472,9 +479,6 @@ schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const c
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
 
-		/* (its owner before what follows: a sequence it owns must have its owner) */
-		ws_schema_owner(s, schema, &sql);
-		run_statement(&sql);
 		for (int i = 0; i < s->ngrants; i++)
 		{
 			ws_schema_grant(s, i, schema, &sql);

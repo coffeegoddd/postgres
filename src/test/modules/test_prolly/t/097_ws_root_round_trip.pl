@@ -328,7 +328,28 @@ like($err, qr/ran as g_small/, 'which fires as who asked');
 my @ran = $err =~ /ran as (\S+)/g;
 my $during = grep { $_ eq 'g_small' } @ran;
 ok($during > 0, 'it fired during the run');
-is(scalar(grep { $_ ne 'g_small' && $_ ne $superuser } @ran), 0, 'as no one else');
+is(scalar(grep { $_ ne 'g_small' } @ran), 0, 'as no one else');
+
+# what a role's index is made of runs as that role, not whoever restores it
+($rc, $out, $err) = in_one_session(q{
+	SET client_min_messages = notice;
+	CREATE SCHEMA ix VERSIONED; ALTER SCHEMA ix OWNER TO g_root; CREATE SCHEMA ix2 VERSIONED; ALTER SCHEMA ix2 OWNER TO g_root;
+	SET ROLE g_root;
+	CREATE FUNCTION ix.who(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $$
+	BEGIN RAISE NOTICE 'indexed as %', current_user; RETURN $1; END $$;
+	CREATE TABLE ix.t (a integer);
+	INSERT INTO ix.t VALUES (1);
+	CREATE INDEX ix_who ON ix.t (ix.who(a));
+	RESET ROLE;
+	SELECT test_ws_root_capture('ix') AS r \gset
+	\echo =====restoring
+	SELECT test_ws_root_restore(:'r', 'ix2');
+	SELECT coalesce(test_ws_root_refused(:'r'), 'nothing');
+});
+is($rc, 0, 'a role\'s index function restores') or diag($err);
+my @indexed = $err =~ /indexed as (\S+)/g;
+ok(@indexed > 0, 'it ran');
+is(scalar(grep { $_ ne 'g_root' } @indexed), 0, 'each time as the table\'s owner') or diag("@indexed");
 
 # a name a schema already has is no refusal of the root
 ($rc, $out, $err) = in_one_session(q{

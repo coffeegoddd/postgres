@@ -12,13 +12,17 @@
  *
  * Restore makes all of it in a schema with nothing in it, in the one order each part
  * needs: the roles; the objects tables use; each table with its tags, then its rows,
- * then its indexes; partitions attached, each table before its own; checks not valid,
+ * then its owner, then its indexes; partitions attached, each table before its own; checks not valid,
  * a partition's before its table's; inheriting, and what is only inherited marked so;
- * foreign keys, each table's last name first; comments; each table's owner and grants;
- * the objects that use tables, which a sequence's owner may be; row security, as forcing
+ * foreign keys, each table's last name first; comments; each table's grants; the
+ * objects that use tables; row security, as forcing
  * it would refuse a role its own rows; the sequences' positions; and what each now
  * prints remembered.  A
  * restored schema captures as the root it came from.
+ *
+ * What it makes runs what a root's indexes are made of as the owner of each table, so a
+ * role's code does not run with the rights of whoever restores it.  Whoever restores it
+ * still runs what ATTACH checks of a partition key's expression, as pg_restore's does.
  *
  * Whether Postgres would have a root at all is more than anything can say of it but
  * Postgres: ws_root_refused restores it and rolls that back.  It is what a merge's
