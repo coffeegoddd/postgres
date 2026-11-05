@@ -78,6 +78,12 @@ typedef struct WsSqlRoutine
 	void		(*read) (const char *sql, int nparams, const char *const *params,
 						 WsSqlRows *rows);
 	/*
+	 * A read as read's, a batch of at most batch rows at a time given to fn, so
+	 * its rows need not all fit in memory.  What fn is given is gone after it.
+	 */
+	void		(*scan) (const char *sql, int nparams, const char *const *params, int batch,
+						 void (*fn) (void *arg, const WsSqlRows *rows), void *arg);
+	/*
 	 * A statement run; if it fails, false, with what it changed undone and
 	 * its failure in *failure.  A failure is the statement's own: its data, a
 	 * constraint, its syntax or what it names, a limit it passed, or an error

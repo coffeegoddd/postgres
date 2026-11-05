@@ -147,7 +147,7 @@ JOIN unnest(test_cs_get_many(:'store', ARRAY(
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))$$);
                                                                     refused                                                                     
 ------------------------------------------------------------------------------------------------------------------------------------------------
- 23503: chunk 20a133d20ec3ec0059bbfc5fb16a07ac3348dca3 references chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5, which the store does not have
+ 23503: chunk cdbc6b5f3d5c22cbe47f0eb0e73975690149fe91 references chunk cb82bb1f9580fcad57f77bdfae079ede97b3a590, which the store does not have
 (1 row)
 
 SELECT pg_temp.has(pg_temp.parent('cs-leaf-a', 'cs-nowhere')) AS refused_there;
@@ -194,13 +194,13 @@ SELECT pg_temp.refs(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p;
 SELECT pg_temp.refused($$SELECT pg_temp.root('cs-nowhere', true)$$);
                                 refused                                 
 ------------------------------------------------------------------------
- 42704: the store has no chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5
+ 42704: the store has no chunk cb82bb1f9580fcad57f77bdfae079ede97b3a590
 (1 row)
 
 SELECT pg_temp.refused($$SELECT pg_temp.root('cs-nowhere', false)$$);
                                 refused                                 
 ------------------------------------------------------------------------
- 42704: the store has no chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5
+ 42704: the store has no chunk cb82bb1f9580fcad57f77bdfae079ede97b3a590
 (1 row)
 
 SELECT pg_temp.refused($$SELECT pg_temp.root('cs-leaf-a', false)$$);
@@ -305,7 +305,7 @@ SELECT test_cs_put_many(:'store', '{}', '{}') AS empty;
 SELECT pg_temp.refused($$SELECT pg_temp.put_pack('cs-pack-c', pg_temp.parent('cs-pack-c', 'cs-nowhere'))$$);
                                                                     refused                                                                     
 ------------------------------------------------------------------------------------------------------------------------------------------------
- 23503: chunk 092d15274ae1d587d44c28e58310cb709d909292 references chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5, which the store does not have
+ 23503: chunk c7de375cc7861ba27caec4a7e79ffae2dcafeaf2 references chunk cb82bb1f9580fcad57f77bdfae079ede97b3a590, which the store does not have
 (1 row)
 
 SELECT pg_temp.has('cs-pack-c') AS c;
@@ -319,7 +319,7 @@ SELECT pg_temp.refused($$SELECT test_cs_put_many(current_setting('test.store'),
 	ARRAY[pg_temp.c('cs-pack-d'), pg_temp.c('cs-pack-y')])$$);
                                        refused                                        
 --------------------------------------------------------------------------------------
- XX001: bytes put as chunk ff224804d527c848aacca1d927a02f698f5987b6 do not hash to it
+ XX001: bytes put as chunk 75761703440ec09f22093ed1f1082c24cf101de2 do not hash to it
 (1 row)
 
 SELECT pg_temp.has('cs-pack-d') AS d;
@@ -452,7 +452,7 @@ BEGIN;
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-e', 'cs-nowhere'))$$);
                                                                     refused                                                                     
 ------------------------------------------------------------------------------------------------------------------------------------------------
- 23503: chunk 03c1e95df75f326f0df52c1c87194b99de92fd50 references chunk 6eb7038072625c83b30036c0780c8b09d8f9a5b5, which the store does not have
+ 23503: chunk c502ad67646ffe9268b44ed60a785e2870d309b7 references chunk cb82bb1f9580fcad57f77bdfae079ede97b3a590, which the store does not have
 (1 row)
 
 SELECT pg_temp.free('cs-leaf-e') AS e_not_held_by_refused_put;

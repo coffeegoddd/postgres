@@ -387,15 +387,21 @@ key_hash64(int level, const uint8 *k, size_t kl)
  * Whether a chunk ends after an item.  Past min_bytes each byte ends the
  * chunk with probability 1 / (target - min), decided by a hash of the key
  * salted with the level, so chunks average target_bytes.  The decision
- * depends only on the item's key and the bytes since the chunk started.
+ * depends only on the item's key and what the chunk holds since it started.
+ * A node above the leaves holds at least PROLLY_MIN_FANOUT, however long its
+ * keys, or a tree of long keys would grow past any height that can be read.
  */
+#define PROLLY_MIN_FANOUT 4
+
 static bool
 policy_boundary(const ChunkPolicy *p, int level, const uint8 *k, size_t kl,
-				size_t item_bytes, size_t chunk_bytes)
+				size_t item_bytes, size_t chunk_bytes, uint32 items)
 {
 	uint64	span,
 				thr;
 
+	if (level > 0 && items < PROLLY_MIN_FANOUT)
+		return false;
 	if (chunk_bytes < p->min_bytes)
 		return false;
 	if (chunk_bytes >= p->max_bytes)
@@ -495,7 +501,7 @@ lc_add(LevelChunker *lc, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 		lc->total += t;
 	}
 	if (policy_boundary(&lc->shape.policy, lc->level, k, kl,
-						lc->items.len - before, lc->items.len))
+						lc->items.len - before, lc->items.len, lc->nitems))
 		return lc_flush(lc);
 	return PROLLY_OK;
 }

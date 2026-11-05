@@ -20,6 +20,7 @@ OBJS = \
 	ws_role.o \
 	ws_root.o \
 	ws_row.o \
+	ws_rows.o \
 	ws_schema.o \
 	ws_sql.o \
 	ws_tags.o

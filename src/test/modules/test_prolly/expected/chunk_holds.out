@@ -97,7 +97,7 @@ SELECT entries AS e1 FROM test_chunk_index_shape('pg_history.chunk_index') \gset
 SELECT test_cs_put_many('pages',
 	ARRAY[hh(test_engine_chunk('\x5202'::bytea || hh(leaf()) || hh(test_engine_chunk('\x0a0799'))))],
 	ARRAY[test_engine_chunk('\x5202'::bytea || hh(leaf()) || hh(test_engine_chunk('\x0a0799')))]);
-ERROR:  chunk 516e7b57ac3e96b75598ddb37bc2f76d91ea1509 references chunk 5188a847822d4304cdf7485c7b8a89dca622ec84, which the store does not have
+ERROR:  chunk a38556cfe463a2fe519d44da13c6471ac6b0d45e references chunk 23f627b6ba2499983607e28455dff1d9e0378422, which the store does not have
 SELECT entries - :e1 AS left_behind FROM test_chunk_index_shape('pg_history.chunk_index');
  left_behind 
 -------------

@@ -749,6 +749,18 @@ CREATE FUNCTION test_ws_schema_set_tags(bytes bytea, schema text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_ws_rows_copy_as(schema text, rows_of text, record_of text, dest text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_ws_rows_hash(schema text, tab text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_ws_rows_copy(schema text, tab text, dest text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- A table's foreign keys' bytes; and those keys added to its copy in another
 -- schema, through their bytes, the statements that did it.
 CREATE FUNCTION test_ws_role_bytes(names text[])

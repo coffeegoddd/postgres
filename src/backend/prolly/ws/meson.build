@@ -7,6 +7,7 @@ backend_sources += files(
   'ws_role.c',
   'ws_root.c',
   'ws_row.c',
+  'ws_rows.c',
   'ws_schema.c',
   'ws_sql.c',
   'ws_tags.c',

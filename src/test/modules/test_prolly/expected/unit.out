@@ -34,6 +34,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  smgr            | md_hooks_do_nothing                  | ok     | 
  branch_filter   | rows_naming_objects                  | ok     | 
  branch_filter   | which_scans_filter                   | ok     | 
+ engine_prolly   | long_keys                            | ok     | 
  engine_prolly   | sha256_vectors                       | ok     | 
  engine_prolly   | empty_map                            | ok     | 
  engine_prolly   | random_edits_small_chunks            | ok     | 
@@ -265,7 +266,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
  ws_tags         | tupdesc                              | ok     | 
-(253 rows)
+(254 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');
