@@ -1,0 +1,12 @@
+-- ours
+ALTER TABLE rt.acct RENAME COLUMN name TO full_name;
+UPDATE rt.acct SET full_name = 'o' WHERE id = 1000;
+-- theirs
+CREATE VIEW rt.top AS SELECT a.id, a.name, i.qty FROM rt.acct a JOIN rt.item i ON i.acct = a.id
+	WHERE a.score > 995;
+CREATE MATERIALIZED VIEW rt.top_names AS SELECT name FROM rt.acct WHERE score > 990;
+-- expect
+clean
+check SELECT string_agg(DISTINCT name, ',') FROM rt.top => n996,n997,n998,n999,o
+check SELECT ispopulated FROM pg_matviews WHERE matviewname = 'top_names' => f
+check REFRESH MATERIALIZED VIEW rt.top_names; SELECT count(*), max(name) FROM rt.top_names => 10|o
