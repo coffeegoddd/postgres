@@ -32,6 +32,7 @@ CATALOG(pg_ws_print,8853,WsPrintRelationId)
 	Oid			prtnamespace BKI_LOOKUP(pg_namespace);	/* the versioned schema */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+	bytea		prtkeyhash BKI_FORCE_NOT_NULL;	/* its SHA-256, as a key may be long */
 	text		prtkey BKI_FORCE_NOT_NULL;	/* the object, as a commit keys it */
 	text		prtprinted BKI_FORCE_NOT_NULL;	/* what it printed once restored */
 	text		prtheld BKI_FORCE_NOT_NULL; /* what the commit held of it */
@@ -44,6 +45,6 @@ typedef FormData_pg_ws_print *Form_pg_ws_print;
 
 DECLARE_TOAST(pg_ws_print, 8854, 8855);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_ws_print_namespace_key_index, 8856, WsPrintNamespaceKeyIndexId, pg_ws_print, btree(prtnamespace oid_ops, prtkey text_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_ws_print_namespace_keyhash_index, 8856, WsPrintNamespaceKeyHashIndexId, pg_ws_print, btree(prtnamespace oid_ops, prtkeyhash bytea_ops));
 
 #endif							/* PG_WS_PRINT_H */

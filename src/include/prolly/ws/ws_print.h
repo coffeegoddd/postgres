@@ -33,11 +33,10 @@ typedef struct WsPrintStore
 	WsPrintEntry *(*load) (const char *schema, int *n);
 	void		(*remember) (const char *schema, const char *key, const char *printed, const char *held);
 	void		(*forget) (const char *schema, const char *key);
+	/* All of a schema's, as it is dropped. */
+	void		(*forget_schema) (Oid nspoid);
 } WsPrintStore;
 
 extern const WsPrintStore *const WsPrints;
-
-/* As a schema is dropped. */
-extern void WsPrintsForgetSchema(Oid nspoid);
 
 #endif							/* WS_PRINT_H */

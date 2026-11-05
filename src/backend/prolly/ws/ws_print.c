@@ -14,6 +14,8 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_ws_print.h"
 #include "prolly/ws/ws_print.h"
@@ -22,6 +24,21 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
+
+static bytea *
+key_hash(const char *key)
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	bytea	   *hash = palloc(VARHDRSZ + PG_SHA256_DIGEST_LENGTH);
+
+	SET_VARSIZE(hash, VARHDRSZ + PG_SHA256_DIGEST_LENGTH);
+	if (pg_cryptohash_init(ctx) < 0 ||
+		pg_cryptohash_update(ctx, (const uint8 *) key, strlen(key)) < 0 ||
+		pg_cryptohash_final(ctx, (uint8 *) VARDATA(hash), PG_SHA256_DIGEST_LENGTH) < 0)
+		elog(ERROR, "could not compute a key's hash: %s", pg_cryptohash_error(ctx));
+	pg_cryptohash_free(ctx);
+	return hash;
+}
 
 static WsPrintEntry *
 catalog_load(const char *schema, int *n)
@@ -53,6 +70,7 @@ catalog_remember(const char *schema, const char *key, const char *printed, const
 	HeapTuple	tup;
 
 	values[Anum_pg_ws_print_prtnamespace - 1] = ObjectIdGetDatum(get_namespace_oid(schema, false));
+	values[Anum_pg_ws_print_prtkeyhash - 1] = PointerGetDatum(key_hash(key));
 	values[Anum_pg_ws_print_prtkey - 1] = CStringGetTextDatum(ws_text_from_utf8(key));
 	values[Anum_pg_ws_print_prtprinted - 1] = CStringGetTextDatum(ws_text_from_utf8(printed));
 	values[Anum_pg_ws_print_prtheld - 1] = CStringGetTextDatum(ws_text_from_utf8(held));
@@ -72,17 +90,17 @@ catalog_forget(const char *schema, const char *key)
 
 	ScanKeyInit(&keys[0], Anum_pg_ws_print_prtnamespace, BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(get_namespace_oid(schema, false)));
-	ScanKeyInit(&keys[1], Anum_pg_ws_print_prtkey, BTEqualStrategyNumber, F_TEXTEQ,
-				CStringGetTextDatum(ws_text_from_utf8(key)));
-	scan = systable_beginscan(rel, WsPrintNamespaceKeyIndexId, true, NULL, 2, keys);
+	ScanKeyInit(&keys[1], Anum_pg_ws_print_prtkeyhash, BTEqualStrategyNumber, F_BYTEAEQ,
+				PointerGetDatum(key_hash(key)));
+	scan = systable_beginscan(rel, WsPrintNamespaceKeyHashIndexId, true, NULL, 2, keys);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		CatalogTupleDelete(rel, &tup->t_self);
 	systable_endscan(scan);
 	table_close(rel, RowExclusiveLock);
 }
 
-void
-WsPrintsForgetSchema(Oid nspoid)
+static void
+catalog_forget_schema(Oid nspoid)
 {
 	Relation	rel = table_open(WsPrintRelationId, RowExclusiveLock);
 	ScanKeyData key;
@@ -90,7 +108,7 @@ WsPrintsForgetSchema(Oid nspoid)
 	HeapTuple	tup;
 
 	ScanKeyInit(&key, Anum_pg_ws_print_prtnamespace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nspoid));
-	scan = systable_beginscan(rel, WsPrintNamespaceKeyIndexId, true, NULL, 1, &key);
+	scan = systable_beginscan(rel, WsPrintNamespaceKeyHashIndexId, true, NULL, 1, &key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		CatalogTupleDelete(rel, &tup->t_self);
 	systable_endscan(scan);
@@ -101,6 +119,7 @@ static const WsPrintStore catalog_store = {
 	.load = catalog_load,
 	.remember = catalog_remember,
 	.forget = catalog_forget,
+	.forget_schema = catalog_forget_schema,
 };
 
 const WsPrintStore *const WsPrints = &catalog_store;
