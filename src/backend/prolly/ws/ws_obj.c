@@ -22,6 +22,7 @@
 #include "access/htup_details.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
@@ -51,6 +52,7 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
+#include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -1184,6 +1186,232 @@ grant_cmp(const void *a, const void *b)
 	return c != 0 ? c : (int) x->grant_option - (int) y->grant_option;
 }
 
+/*
+ * A column of a table of this schema prints as a name no column has, holding its tag: quoted,
+ * as any name that needs it is, so that what prints it can be parsed as it stands, and made
+ * @{tag} only as it is stored.  It holds what no text could be written to look like, as a
+ * string or a name may hold any bytes.
+ */
+#define TAG_MARK '\001'
+
+static Oid tagged_namespace = InvalidOid;
+
+static const char *
+tag_mark_nonce(void)
+{
+	static char nonce[17];
+
+	if (nonce[0] == '\0')
+	{
+		uint64		r;
+
+		if (!pg_strong_random(&r, sizeof(r)))
+			elog(ERROR, "could not generate a random number");
+		snprintf(nonce, sizeof(nonce), "%016" PRIx64, r);
+	}
+	return nonce;
+}
+
+static char *
+name_of_tagged_column(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	tup;
+	uint64		tag;
+
+	if (get_rel_namespace(relid) != tagged_namespace)
+		return NULL;
+	tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attnum));
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	tag = (uint64) ((Form_pg_attribute) GETSTRUCT(tup))->attcoltag;
+	ReleaseSysCache(tup);
+	return tag != 0 ? psprintf("%c%s:" UINT64_FORMAT "%c", TAG_MARK, tag_mark_nonce(), tag, TAG_MARK) : NULL;
+}
+
+static char *
+print_tagged(const char *schema, PGFunction fn, int nargs, Datum a, Datum b, Datum c)
+{
+	DeparseColumnNameHook saved_hook = deparse_column_name_hook;
+	Oid			saved_namespace = tagged_namespace;
+	char	   *printed = NULL;
+
+	tagged_namespace = get_namespace_oid(schema, false);
+	deparse_column_name_hook = name_of_tagged_column;
+	PG_TRY();
+	{
+		printed = ws_schema_print(schema, fn, nargs, a, b, c);
+	}
+	PG_FINALLY();
+	{
+		deparse_column_name_hook = saved_hook;
+		tagged_namespace = saved_namespace;
+	}
+	PG_END_TRY();
+	return printed;
+}
+
+/* What a sequence is owned by: a column's reference, if it has a tag. */
+static char *
+owned_column_as_held(const char *schema, const char *table, const char *column)
+{
+	const char *params[3] = {schema, table, column};
+	WsSqlRows	rows;
+	char	   *held;
+
+	WsSql->read("SELECT a.attcoltag::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE n.nspname = $1::name AND c.relname = $2::name AND a.attname = $3::name AND a.attcoltag <> 0", 3, params, &rows);
+	if (strncmp(column, "@{", 2) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("column \"%s\" of \"%s\" in schema \"%s\" cannot be held in a commit: its name looks like a reference",
+						column, table, schema)));
+	if (rows.nrows == 1)
+	{
+		char	   *reference = psprintf("@{" UINT64_FORMAT "}", (uint64) strtoi64(ws_sql_value(&rows, 0, 0), NULL, 10));
+
+		held = px_memdup(reference, strlen(reference) + 1);
+		pfree(reference);
+	}
+	else
+		held = ws_name_to_utf8(column);
+	ws_sql_rows_free(&rows);
+	return held;
+}
+
+/* What is printed as it is stored: every @ doubled, and a column's mark its reference. */
+static void
+store_printed(const char *text, Buf *out)
+{
+	char	   *open_mark = psprintf("\"%c%s:", TAG_MARK, tag_mark_nonce());
+	size_t		open_len = strlen(open_mark);
+	const char *p = text;
+
+	for (;;)
+	{
+		const char *open = strstr(p, open_mark);
+		const char *close;
+		char	   *span;
+
+		if (open == NULL)
+		{
+			ws_tags_escape(p, out);
+			break;
+		}
+		close = strchr(open + open_len, TAG_MARK);
+		if (close == NULL || close[1] != '"')
+			elog(ERROR, "what prints a column's tag printed something else");
+		span = pnstrdup(p, open - p);
+		ws_tags_escape(span, out);
+		pfree(span);
+		buf_append(out, "@{", 2);
+		buf_append(out, open + open_len, close - (open + open_len));
+		buf_append(out, "}", 1);
+		p = close + 2;
+	}
+	pfree(open_mark);
+}
+
+/* A column's name by its tag in a schema, for what is restored there. */
+static const char *
+column_of_schema(void *arg, uint64 tag)
+{
+	const char *schema = arg;
+	char	   *text = psprintf(INT64_FORMAT, (int64) tag);
+	const char *params[2] = {schema, text};
+	WsSqlRows	rows;
+	char	   *name = NULL;
+
+	WsSql->read("SELECT DISTINCT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND a.attcoltag = $2::bigint "
+				"AND NOT a.attisdropped", 2, params, &rows);
+	if (rows.nrows > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columns of two names in schema \"%s\" have one tag, so what refers to it is not one or the other", schema)));
+	if (rows.nrows == 1)
+		name = pstrdup(ws_sql_value(&rows, 0, 0));
+	ws_sql_rows_free(&rows);
+	pfree(text);
+	return name;
+}
+
+typedef struct ColumnOfTable
+{
+	const char *schema;
+	const char *table;
+} ColumnOfTable;
+
+/* A column's name by its tag in a table: within one, a tag is one column's. */
+static const char *
+column_of_table(void *arg, uint64 tag)
+{
+	ColumnOfTable *of = arg;
+	char	   *text = psprintf(INT64_FORMAT, (int64) tag);
+	const char *params[3] = {of->schema, of->table, text};
+	WsSqlRows	rows;
+	char	   *name = NULL;
+
+	WsSql->read("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND c.relname = $2::name "
+				"AND a.attcoltag = $3::bigint AND NOT a.attisdropped", 3, params, &rows);
+	if (rows.nrows == 1)
+		name = pstrdup(ws_sql_value(&rows, 0, 0));
+	ws_sql_rows_free(&rows);
+	pfree(text);
+	return name;
+}
+
+/* (a parse of it, in which any name will do) */
+static const char *
+any_column_name(void *arg, uint64 tag)
+{
+	return "x";
+}
+
+/* Whether stored text has this reference, not an @ that is doubled and reads like one. */
+static bool
+stored_refers_to(const char *stored, const char *reference)
+{
+	size_t		len = strlen(reference);
+
+	for (const char *p = strchr(stored, '@'); p != NULL; p = strchr(p, '@'))
+	{
+		if (p[1] == '@')
+			p += 2;
+		else if (strncmp(p, reference, len) == 0)
+			return true;
+		else
+			p++;
+	}
+	return false;
+}
+
+/* Refuses what refers to a tag two columns of two names in the schema have. */
+static void
+refuse_ambiguous_tags(const char *schema, const WsObject *objs, int n)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+
+	WsSql->read("SELECT a.attcoltag::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name AND a.attcoltag <> 0 AND NOT a.attisdropped "
+				"AND c.relkind IN ('r', 'p') GROUP BY a.attcoltag HAVING count(DISTINCT a.attname) > 1", 1, params, &rows);
+	for (int r = 0; r < rows.nrows; r++)
+	{
+		char	   *reference = psprintf("@{" UINT64_FORMAT "}", (uint64) strtoi64(ws_sql_value(&rows, r, 0), NULL, 10));
+
+		for (int i = 0; i < n; i++)
+			if (stored_refers_to(objs[i].definition, reference))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("\"%s\" in schema \"%s\" cannot be held in a commit: it refers to a column whose tag another of another name has",
+								objs[i].name, schema),
+						 errhint("A table renamed and made again under its old name has the same tags; rename the column so they agree.")));
+		pfree(reference);
+	}
+	ws_sql_rows_free(&rows);
+}
+
 static char *
 function_args(const char *schema, Oid oid, char *prokind)
 {
@@ -1196,7 +1424,7 @@ function_args(const char *schema, Oid oid, char *prokind)
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("could not read schema \"%s\": it changed while it was being read", schema)));
 	form = (Form_pg_proc) GETSTRUCT(tup);
-	args = ws_schema_print(schema, oidvectortypes, 1, PointerGetDatum(&form->proargtypes), 0, 0);
+	args = print_tagged(schema, oidvectortypes, 1, PointerGetDatum(&form->proargtypes), 0, 0);
 	if (prokind != NULL)
 		*prokind = form->prokind;
 	ReleaseSysCache(tup);
@@ -1714,7 +1942,7 @@ printed_or_retry(const char *schema, char *printed)
 static char *
 print_type(const char *schema, Oid typid, int32 typmod)
 {
-	return printed_or_retry(schema, ws_schema_print(schema, format_type, 2, ObjectIdGetDatum(typid),
+	return printed_or_retry(schema, print_tagged(schema, format_type, 2, ObjectIdGetDatum(typid),
 													Int32GetDatum(typmod), 0));
 }
 
@@ -1796,7 +2024,7 @@ type_definition(const char *schema, char typtype, const char *oid, Buf *text)
 				if (ws_sql_value(&rows, 0, 3) != NULL)
 				{
 					ws_put_text(text, " DEFAULT ");
-					ws_put_text(text, printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2,
+					ws_put_text(text, printed_or_retry(schema, print_tagged(schema, pg_get_expr, 2,
 																			   CStringGetTextDatum(ws_sql_value(&rows, 0, 3)),
 																			   ObjectIdGetDatum(InvalidOid), 0)));
 				}
@@ -1808,7 +2036,7 @@ type_definition(const char *schema, char typtype, const char *oid, Buf *text)
 					ws_put_text(text, ws_sql_value(&cons, i, 0));
 					ws_put_text(text, " ");
 					INJECTION_POINT("ws-obj-print-constraint", NULL);
-					ws_put_text(text, printed_or_retry(schema, ws_schema_print(schema, pg_get_constraintdef, 1,
+					ws_put_text(text, printed_or_retry(schema, print_tagged(schema, pg_get_constraintdef, 1,
 																			   ObjectIdGetDatum(atooid(ws_sql_value(&cons, i, 1))), 0, 0)));
 				}
 				ws_sql_rows_free(&cons);
@@ -1948,7 +2176,7 @@ read_types(const char *schema, WsObject *objs, int *n)
 		type_definition(schema, typtype, oid, &text);
 		buf_append_byte(&text, 0);
 		check_type_is_portable(name, schema, typtype == 'd' ? "CREATE DOMAIN" : "CREATE TYPE", (char *) text.data);
-		ws_tags_escape(ws_text_to_utf8((char *) text.data), &stored);
+		store_printed(ws_text_to_utf8((char *) text.data), &stored);
 		buf_append_byte(&stored, 0);
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
@@ -2025,14 +2253,14 @@ read_sequences(const char *schema, WsObject *objs, int *n)
 						ws_sql_value(&seqs, i, 3), ws_sql_value(&seqs, i, 4), ws_sql_value(&seqs, i, 5),
 						ws_sql_value(&seqs, i, 6), ws_sql_value(&seqs, i, 7),
 						ws_sql_value(&seqs, i, 8)[0] == 't' ? "" : "NO ");
-		ws_tags_escape(text, &stored);
+		store_printed(text, &stored);
 		buf_append_byte(&stored, 0);
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
 		if (ws_sql_value(&seqs, i, 9) != NULL)
 		{
 			o->owned_table = ws_name_to_utf8(ws_sql_value(&seqs, i, 9));
-			o->owned_column = ws_name_to_utf8(ws_sql_value(&seqs, i, 10));
+			o->owned_column = owned_column_as_held(schema, ws_sql_value(&seqs, i, 9), ws_sql_value(&seqs, i, 10));
 		}
 		o->deps = zeroed(0, sizeof(char *));
 		read_comments(o, oid);
@@ -2152,7 +2380,7 @@ set_definition(WsObject *o, const char *text)
 {
 	Buf			stored = BUF_INIT;
 
-	ws_tags_escape(ws_text_to_utf8(text), &stored);
+	store_printed(ws_text_to_utf8(text), &stored);
 	buf_append_byte(&stored, 0);
 	o->definition = px_memdup(stored.data, stored.len);
 	buf_free(&stored);
@@ -3142,7 +3370,7 @@ read_statistics(const char *schema, WsObject *objs, int *n)
 		const char *oid = ws_sql_value(&rows, i, 0);
 		const char *name = ws_sql_value(&rows, i, 1);
 		const char *table = ws_sql_value(&rows, i, 2);
-		char	   *printed = printed_or_retry(schema, ws_schema_print(schema, pg_get_statisticsobjdef, 1,
+		char	   *printed = printed_or_retry(schema, print_tagged(schema, pg_get_statisticsobjdef, 1,
 																	   ObjectIdGetDatum(atooid(oid)), 0, 0));
 		char	   *head = psprintf("CREATE STATISTICS %s ", quote_qualified_identifier(schema, name));
 
@@ -3413,11 +3641,11 @@ policy_statement(const char *schema, const char *oid, const char *name, const ch
 					 ws_sql_value(&rows, 0, 4) != NULL ? ws_sql_value(&rows, 0, 4) : "PUBLIC");
 	if (ws_sql_value(&rows, 0, 2) != NULL)
 		appendStringInfo(&s, " USING (%s)",
-						 printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 2)),
+						 printed_or_retry(schema, print_tagged(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 2)),
 																  ObjectIdGetDatum(relid), 0)));
 	if (ws_sql_value(&rows, 0, 3) != NULL)
 		appendStringInfo(&s, " WITH CHECK (%s)",
-						 printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 3)),
+						 printed_or_retry(schema, print_tagged(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 3)),
 																  ObjectIdGetDatum(relid), 0)));
 	ws_sql_rows_free(&rows);
 	return s.data;
@@ -3441,12 +3669,12 @@ of_table_statement(WsObjectKind kind, const char *schema, const char *oid, const
 		WsSql->read("SELECT adbin::text FROM pg_attrdef WHERE oid = $1::oid", 1, params, &rows);
 		if (rows.nrows != 1)
 			printed_or_retry(schema, NULL);
-		expr = printed_or_retry(schema, ws_schema_print(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 0)),
+		expr = printed_or_retry(schema, print_tagged(schema, pg_get_expr, 2, CStringGetTextDatum(ws_sql_value(&rows, 0, 0)),
 														ObjectIdGetDatum(relid), 0));
 		ws_sql_rows_free(&rows);
 		return psprintf("ALTER VIEW %s ALTER COLUMN %s SET DEFAULT %s", quote_identifier(table), quote_identifier(name), expr);
 	}
-	printed = printed_or_retry(schema, ws_schema_print(schema, kind == WS_OBJ_TRIGGER ? pg_get_triggerdef :
+	printed = printed_or_retry(schema, print_tagged(schema, kind == WS_OBJ_TRIGGER ? pg_get_triggerdef :
 													   kind == WS_OBJ_INDEX ? pg_get_indexdef : pg_get_ruledef, 1,
 													   ObjectIdGetDatum(atooid(oid)), 0, 0));
 	len = strlen(printed);
@@ -3526,7 +3754,7 @@ read_of_table(const char *schema, WsObjectKind kind, WsObject *objs, int *n)
 		o->kind = kind;
 		o->name = ws_name_to_utf8(name);
 		o->args = ws_name_to_utf8(table);
-		ws_tags_escape(ws_text_to_utf8(text), &stored);
+		store_printed(ws_text_to_utf8(text), &stored);
 		buf_append_byte(&stored, 0);
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
@@ -3720,7 +3948,7 @@ aggregate_definition(const char *schema, const char *name, const char *oid)
 	const char *params[1] = {oid};
 	WsSqlRows	rows;
 	StringInfoData s;
-	char	   *args = printed_or_retry(schema, ws_schema_print(schema, pg_get_function_arguments, 1,
+	char	   *args = printed_or_retry(schema, print_tagged(schema, pg_get_function_arguments, 1,
 																ObjectIdGetDatum(atooid(oid)), 0, 0));
 	const char *const modify_words[] = {"READ_ONLY", "SHAREABLE", "READ_WRITE"};
 
@@ -3824,7 +4052,7 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		}
 		else
 		{
-			char	   *printed = printed_or_retry(schema, ws_schema_print(schema, pg_get_functiondef, 1,
+			char	   *printed = printed_or_retry(schema, print_tagged(schema, pg_get_functiondef, 1,
 																		   ObjectIdGetDatum(atooid(oid)), 0, 0));
 
 			if (strncmp(printed, head, strlen(head)) != 0)
@@ -3838,7 +4066,7 @@ read_functions(const char *schema, WsObject *objs, int *n)
 		o->kind = aggregate ? WS_OBJ_AGGREGATE : procedure ? WS_OBJ_PROCEDURE : WS_OBJ_FUNCTION;
 		o->name = ws_name_to_utf8(name);
 		o->args = ws_text_to_utf8(function_args(schema, atooid(oid), NULL));
-		ws_tags_escape(ws_text_to_utf8(tail), &stored);
+		store_printed(ws_text_to_utf8(tail), &stored);
 		buf_append_byte(&stored, 0);
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
@@ -4049,7 +4277,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 		const char *oid = ws_sql_value(&rels, i, 0);
 		bool		matview = ws_sql_value(&rels, i, 1)[0] == 'm';
 		const char *name = ws_sql_value(&rels, i, 2);
-		char	   *viewdef = printed_or_retry(schema, ws_schema_print(schema, pg_get_viewdef_ext, 2,
+		char	   *viewdef = printed_or_retry(schema, print_tagged(schema, pg_get_viewdef_ext, 2,
 																	   ObjectIdGetDatum(atooid(oid)),
 																	   BoolGetDatum(false), 0));
 		const char *options = ws_sql_value(&rels, i, 4);
@@ -4081,7 +4309,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 			ws_put_text(&text, " WITH NO DATA");
 		buf_append_byte(&text, 0);
 		body = ws_text_to_utf8((char *) text.data);
-		ws_tags_escape(body, &stored);
+		store_printed(body, &stored);
 		buf_append_byte(&stored, 0);
 		o->definition = px_memdup(stored.data, stored.len);
 		buf_free(&stored);
@@ -4112,6 +4340,7 @@ ws_obj_read(const char *schema, WsObject **out, int *n)
 	objs = read_of_table(schema, WS_OBJ_DEFAULT, objs, &total);
 	if (total > 1)
 		qsort(objs, total, sizeof(WsObject), object_cmp);
+	refuse_ambiguous_tags(schema, objs, total);
 	hold_what_was_restored(schema, objs, total);
 	settle_phases(schema, objs, total);
 	{
@@ -4302,12 +4531,6 @@ not_the_object(const WsObject *o, const char *what)
 			 errmsg("object \"%s\" does not make that object: %s", o->name, what)));
 }
 
-static const char *
-no_name(void *arg, uint64 tag)
-{
-	return NULL;
-}
-
 /* The text as parse trees, or a refusal: it is the record's fault. */
 static List *
 parse_object_text(const WsObject *o, const char *sql)
@@ -4371,7 +4594,7 @@ ws_obj_create_statement(const WsObject *o, const char *schema, Buf *out)
 			ws_put_identifier(&sql, here);
 		ws_put_text(&sql, " ");
 	}
-	if (!ws_tags_render(definition, no_name, NULL, &sql, &missing))
+	if (!ws_tags_render(definition, column_of_schema, (void *) schema, &sql, &missing))
 		not_the_object(o, "a reference to a column");
 	buf_append_byte(&sql, 0);
 	parsed = parse_object_text(o, (char *) sql.data);
@@ -4766,7 +4989,7 @@ ws_obj_roles(const WsObject *o, char ***names, int *n)
 		CreatePolicyStmt *stmt;
 		ListCell   *lc;
 
-		if (!ws_tags_render(o->definition, no_name, NULL, &sql, &missing))
+		if (!ws_tags_render(o->definition, any_column_name, NULL, &sql, &missing))
 			not_the_object(o, "a reference to a column");
 		buf_append_byte(&sql, 0);
 		parsed = parse_object_text(o, (char *) sql.data);
@@ -4793,7 +5016,7 @@ ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out)
 	if (o->owned_table == NULL)
 		return;
 	table = ws_name_from_utf8(o->owned_table);
-	column = ws_name_from_utf8(o->owned_column);
+	column = strncmp(o->owned_column, "@{", 2) == 0 ? NULL : ws_name_from_utf8(o->owned_column);
 	ws_put_text(out, "ALTER SEQUENCE ");
 	put_object(o, schema, out);
 	ws_put_text(out, " OWNED BY ");
@@ -4801,9 +5024,21 @@ ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out)
 	ws_put_text(out, ".");
 	ws_put_identifier(out, table);
 	ws_put_text(out, ".");
-	ws_put_identifier(out, column);
+	if (column != NULL)
+	{
+		ws_put_identifier(out, column);
+		pfree(column);
+	}
+	else
+	{
+		uint64		missing;
+
+		ColumnOfTable of = {schema, table};
+
+		if (!ws_tags_render(o->owned_column, column_of_table, &of, out, &missing))
+			not_the_object(o, "a reference to a column");
+	}
 	pfree(table);
-	pfree(column);
 }
 
 void
