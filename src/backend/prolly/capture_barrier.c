@@ -116,7 +116,7 @@ static const WsRowsRoutine CapturedWsRows = {
 	.capture = captured_rows,
 };
 
-/* Every relation of the schema that building a root reads, locked; its tables. */
+/* Every relation of the schema that building a root reads, locked; those whose contents it holds. */
 static List *
 lock_schema_relations(Oid nsp, bool wait)
 {
@@ -133,7 +133,8 @@ lock_schema_relations(Oid nsp, bool wait)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE)
+		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
+			c->relkind == RELKIND_SEQUENCE)
 			tables = lappend_oid(tables, c->oid);
 		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
 			c->relkind == RELKIND_VIEW || c->relkind == RELKIND_MATVIEW ||
@@ -156,7 +157,7 @@ lock_schema_relations(Oid nsp, bool wait)
 	return tables;
 }
 
-/* What giving the caller all of a table's rows asks of it. */
+/* What giving the caller all of a table's rows, or a sequence's position, asks of it. */
 static void
 check_may_read(Oid relid)
 {
@@ -215,7 +216,6 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 	Oid			types[1] = {PG_LSNOID};
 	SPIPlanPtr	plan;
 	List	   *tables;
-	PHash		unused;
 	int			nest;
 	char		quickly[32];
 
@@ -236,15 +236,13 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
 
-	/* What it'll read, tried before anything's held or written. */
+	/* (preparing asks for pg_history's schema, which is what guards it, before anything's held or written) */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 	plan = SPI_prepare("SELECT 1 FROM pg_history.capture_barriers WHERE lsn OPERATOR(pg_catalog.=) $1", 1, types);
 	if (plan == NULL)
 		elog(ERROR, "could not read a barrier");
-	(void) barrier_saved(plan, InvalidXLogRecPtr);
 	barrier_refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
-	(void) barrier_refs->routine->get(barrier_refs, CAPTURE_BARRIER_REF_PREFIX, VC_REF_READ, &unused);
 
 	tables = lock_schema_relations(nsp, true);
 	INJECTION_POINT("capture-barrier-locked", NULL);
