@@ -220,6 +220,58 @@ $node->safe_psql('postgres', 'CREATE DATABASE firsts');
 }
 $node->safe_psql('postgres', 'DROP DATABASE firsts');
 
+# a maker that waited to set the mark, and found it set, holds up no one
+$node->safe_psql('postgres', 'CREATE DATABASE waited');
+{
+	my $w_on = $node->safe_psql('waited', 'SELECT pg_branch_id_allocate()');
+	my $w_use = "SET catalog_branch = $w_on;";
+	my $one = $node->background_psql('waited');
+	$one->query_safe("$w_use BEGIN; CREATE SCHEMA a1 VERSIONED");
+	my $two = $node->background_psql('waited');
+	$two->query_safe($w_use);
+	$two->query_until(qr/going/, "BEGIN;\n\\echo going\nCREATE SCHEMA a2 VERSIONED;\n\\echo made\n");
+	$node->poll_query_until('waited', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'CREATE SCHEMA a2%'})
+	  or die 'the second did not wait';
+	$one->query_safe('COMMIT');
+	$one->quit;
+	$node->poll_query_until('waited', q{SELECT count(*) = 0 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'CREATE SCHEMA a2%'})
+	  or die 'the second did not go on';
+	my ($rc, $out, $err) = $node->psql('waited', "$w_use SET lock_timeout = '1s'; CREATE SCHEMA a3 VERSIONED");
+	is($rc, 0, 'a third makes its schema while it is open') or diag($err);
+	$two->query_until(qr/done/, "COMMIT;\n\\echo done\n");
+	$two->quit;
+}
+$node->safe_psql('postgres', 'DROP DATABASE waited');
+
+# a mark cleared while a maker waits for a shared hold: the maker sets it again
+$node->safe_psql('postgres', 'CREATE DATABASE retried');
+{
+	my $retried = $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'retried'});
+	my $r_on = $node->safe_psql('retried', 'SELECT pg_branch_id_allocate()');
+	my $r_use = "SET catalog_branch = $r_on;";
+	$node->safe_psql('retried', "$r_use CREATE SCHEMA r1 VERSIONED");
+	$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = 'prolly_capture_$retried'})
+	  or die 'no worker';
+	my $alter = $node->background_psql('postgres');
+	$alter->query_safe('BEGIN; ALTER DATABASE retried CONNECTION LIMIT 50');
+	$node->safe_psql('retried', "$r_use DROP SCHEMA r1 CASCADE");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND datname = 'retried' AND wait_event_type = 'Lock'})
+	  or die 'the worker did not wait on the row';
+	my $maker = $node->background_psql('retried');
+	$maker->query_until(qr/going/, "$r_use \\echo going\nCREATE SCHEMA m VERSIONED;\n\\echo made\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE datname = 'retried' AND backend_type = 'client backend' AND wait_event_type = 'Lock'})
+	  or die 'the maker did not wait';
+	$alter->query_safe('ROLLBACK');
+	$alter->quit;
+	$node->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_stat_activity WHERE datname = 'retried' AND backend_type = 'client backend' AND wait_event_type = 'Lock'})
+	  or die 'the maker did not go on';
+	$maker->quit;
+	is($node->safe_psql('retried', "$r_use SELECT count(*) FROM pg_namespace WHERE nspname = 'm'"), '1', 'the schema is made');
+	is($node->safe_psql('postgres', q{SELECT datversioned FROM pg_database WHERE datname = 'retried'}), 't', 'it has the mark');
+	ok($node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = 'prolly_capture_$retried'}), 'and a worker');
+}
+$node->safe_psql('postgres', 'DROP DATABASE retried');
+
 # a database that can't be connected to for a while has one worker waiting, not one per look
 $node->safe_psql('postgres', 'CREATE DATABASE lockd');
 {
@@ -299,7 +351,6 @@ $node->safe_psql('postgres', 'CREATE DATABASE lostd');
 
 $node->stop;
 
-# with nothing to decode from, nothing happens
 # no worker free says so, once
 {
 	my $tight = PostgreSQL::Test::Cluster->new('tight');
@@ -319,6 +370,29 @@ $node->stop;
 	$tight->stop;
 }
 
+# a worker that can't stay doesn't keep the one free from another database
+{
+	my $one_free = PostgreSQL::Test::Cluster->new('one_free');
+	$one_free->init(allows_streaming => 'logical');
+	$one_free->append_conf('postgresql.conf', "max_worker_processes = 3\nautovacuum = off");
+	$one_free->start;
+	$one_free->safe_psql('postgres', 'CREATE DATABASE xf');
+	$one_free->safe_psql('postgres', 'CREATE DATABASE yg');
+	my $xf = $one_free->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'xf'});
+	my $yg = $one_free->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'yg'});
+	$one_free->safe_psql('postgres', qq{SELECT pg_create_physical_replication_slot('prolly_capture_$xf')});
+	for my $d ('xf', 'yg')
+	{
+		my $on_d = $one_free->safe_psql($d, 'SELECT pg_branch_id_allocate()');
+		$one_free->safe_psql($d, "SET catalog_branch = $on_d; CREATE SCHEMA s1 VERSIONED");
+	}
+	$one_free->restart;
+	local $PostgreSQL::Test::Utils::timeout_default = 30;
+	ok($one_free->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = 'prolly_capture_$yg'}), 'the other database gets it');
+	$one_free->stop;
+}
+
+# with nothing to decode from, nothing happens
 my $minimal = PostgreSQL::Test::Cluster->new('minimal');
 $minimal->init;
 $minimal->append_conf('postgresql.conf', "wal_level = minimal\nmax_wal_senders = 0");
