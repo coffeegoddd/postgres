@@ -12,6 +12,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use IPC::Run;
 
 my $node = PostgreSQL::Test::Cluster->new('history_dump');
 $node->init;
@@ -177,6 +178,17 @@ like($err, qr/cannot read the version-control history store.*--no-history/,
 	'a role that cannot read the store may not dump the database whole');
 # (one with no history: dumped all the same)
 $node->safe_psql('postgres', 'CREATE DATABASE nohist');
+# (nor one with no rights to the store, nor one that may run the export but can't reach the schema)
+$node->safe_psql('src', 'CREATE ROLE no_rights LOGIN; CREATE ROLE no_schema LOGIN;
+	GRANT SELECT ON ALL TABLES IN SCHEMA public TO no_rights, no_schema;
+	GRANT EXECUTE ON FUNCTION pg_history_export() TO no_schema');
+for my $role (qw(no_rights no_schema))
+{
+	my ($o, $e);
+	IPC::Run::run([ 'pg_dump', '--username' => $role, '--dbname' => $node->connstr('src') ], '>', \$o, '2>', \$e);
+	like($e, qr/cannot read the version-control history store.*--no-history/, "$role is told to leave history out");
+}
+
 $node->safe_psql('nohist', 'CREATE ROLE dumper2 LOGIN; GRANT pg_read_all_data TO dumper2; CREATE TABLE x (i int)');
 $node->command_ok([ 'pg_dump', '--file' => "$dir/nohist_role.sql", $node->connstr('nohist') . ' user=dumper2' ],
 	'a role that cannot read the store dumps a database with no history');

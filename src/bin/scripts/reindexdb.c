@@ -659,9 +659,15 @@ get_parallel_tables_list(PGconn *conn, ReindexType type,
 								 CppAsString2(RELKIND_MATVIEW) ")\n"
 								 "   AND c.relpersistence != "
 								 CppAsString2(RELPERSISTENCE_TEMP) "\n");
-			/* (as REINDEX DATABASE CONCURRENTLY skips it, and naming a table of it is refused) */
+			/*
+			 * (as REINDEX DATABASE CONCURRENTLY skips the history store, and naming a table of it
+			 * is refused; and a role that can't reach it can't name one)
+			 */
 			if (concurrently)
 				appendPQExpBufferStr(&catalog_query, "   AND ns.nspname != 'pg_history'\n");
+			else
+				appendPQExpBufferStr(&catalog_query,
+									 "   AND (ns.nspname != 'pg_history' OR pg_catalog.has_schema_privilege(ns.oid, 'USAGE'))\n");
 			appendPQExpBufferStr(&catalog_query, " ORDER BY c.relpages DESC;");
 			break;
 
