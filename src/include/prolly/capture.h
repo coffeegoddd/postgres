@@ -20,7 +20,9 @@
  * The worker decodes in-process, on a plugin the server has built in, so a change is a tuple
  * and not text.  What decoding finds goes to a CaptureSink, in commit order, a transaction at a
  * time and only once it has committed: what is rolled back is never seen, and a transaction of
- * nothing but DDL is a begin and a commit.  A worker stopped in the middle of telling a transaction
+ * nothing but DDL is a begin and a commit.  A change is told with the branch its table's schema
+ * was on at the time, and one on a shared schema isn't told, which leaves its transaction a begin
+ * and a commit as well.  A transaction can change more than one branch.  A worker stopped in the middle of telling a transaction
  * tells all of it again: a begin means whatever came since the last commit is void.  After a crash
  * a transaction already told whole can be told again, so a sink keeping anything goes by the
  * positions it is given.  Someone with REPLICATION rights could advance or drop the slot in the
@@ -57,6 +59,7 @@ typedef enum CaptureChangeKind
 typedef struct CaptureChange
 {
 	CaptureChangeKind kind;
+	int32		branch;			/* never 0 */
 	Relation	relation;
 	HeapTuple	old_tuple;		/* what replica identity gives of the row, or NULL:
 								 * NULL for a delete if it gives nothing */
@@ -78,8 +81,8 @@ typedef struct CaptureSink
 	void		(*begin) (TransactionId xid, XLogRecPtr final_lsn);
 	void		(*change) (const CaptureChange *change);
 
-	/* Named as they were: a partitioned table, and then its partitions. */
-	void		(*truncate) (Relation *relations, int n, bool restart_seqs, XLogRecPtr lsn);
+	/* A relation at a time, as they were named: a partitioned table, and then its partitions. */
+	void		(*truncate) (int32 branch, Relation relation, bool restart_seqs, XLogRecPtr lsn);
 
 	/*
 	 * A logical message: transactional ones between begin and commit, others at once, once flushed,
