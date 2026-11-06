@@ -9,3 +9,4 @@ INSERT INTO t VALUES ('1', 10, 'same');
 -- expect
 violation unique t unique1 1
 violation unique t unique1 10
+check SELECT string_agg(pk || ':' || col2, ',' ORDER BY pk) FROM rt.t => 0:,1:same,10:same

@@ -12,8 +12,9 @@
  *	unique			rows sharing their key with another
  *	not null		rows with that column NULL
  * and an exclusion constraint, which only Postgres can apply, without its rows.  A check
- * or foreign key not valid has none, and a domain's constraints are not applied to rows
- * restored, so not here.  Unique keys compare by their collation and their type's
+ * or foreign key not valid has none, not even of a row the merge made, as nothing here says
+ * which rows are old; and a domain's constraints, not null among them, are not applied to
+ * rows restored, so not here.  Unique keys compare by their collation and their type's
  * equality, and a foreign key by its referenced type's default operator class, whatever
  * an index's own operator class would say.
  *

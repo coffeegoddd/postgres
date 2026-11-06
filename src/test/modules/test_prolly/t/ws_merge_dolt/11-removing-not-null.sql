@@ -8,4 +8,4 @@ INSERT INTO t VALUES (3, NULL);
 INSERT INTO t VALUES (4, 4);
 -- expect
 clean
-check SELECT count(*), count(col1) FROM rt.t => 4|3
+check SELECT string_agg(pk || ':' || coalesce(col1::text, 'null'), ',' ORDER BY pk) FROM rt.t => 1:1,2:2,3:null,4:4

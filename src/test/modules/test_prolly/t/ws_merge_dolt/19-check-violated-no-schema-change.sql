@@ -7,3 +7,4 @@ UPDATE t SET col2 = 4;
 UPDATE t SET col1 = 4;
 -- expect
 violation check t c1 1
+check SELECT pk, col1, col2 FROM rt.t => 1|4|4

@@ -8,3 +8,4 @@ ALTER TABLE t DROP COLUMN col1;
 UPDATE t SET col3 = 100;
 -- expect
 violation check t c1 1
+check SELECT pk, col2, col3 FROM rt.t => 1|100|100
