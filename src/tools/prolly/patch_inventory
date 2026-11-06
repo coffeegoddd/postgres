@@ -46,7 +46,7 @@ own   src/tools/prolly_bench/
 patch contrib/Makefile         0  builds the fork's extensions under contrib/prolly
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
 patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
-patch doc/src/sgml/catalogs.sgml  4  pg_attribute.attcoltag documented; also (4) pg_authid.roltravels documented; also (4) pg_ws_print; also (4) pg_ws_deferred
+patch doc/src/sgml/catalogs.sgml  4  pg_attribute.attcoltag documented; also (4) pg_authid.roltravels documented; also (4) pg_ws_print; also (4) pg_ws_deferred; also (5) pg_database.datversioned
 patch doc/src/sgml/config.sgml  1b  catalog_branch
 patch doc/src/sgml/libpq.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/protocol.sgml  1b  catalog_branch is reported
@@ -96,7 +96,7 @@ patch src/backend/catalog/pg_subscription.c  1b  a subscription's branch
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers; also (1b) a versioned schema's relations are block-mapped
 patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database; also (1b) pg_subscription.subcatalogbranch readable; also (1b) pg_replication_slots.branch; also (2) the history store's relations (its tier's too) and the pointers' triggers; also (2) pg_history.chunk_restore, a view its dump is restored into; also (4) pg_roles shows roltravels
 patch src/backend/catalog/toasting.c  1b  a TOAST table's storage manager is its table's, its schema being pg_toast
-patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one; also (2) refuses to drop, or copy as a template, a database whose history store tier has packs; also (5) stops a dropped database's capture worker and drops its slot
+patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one; also (2) refuses to drop, or copy as a template, a database whose history store tier has packs; also (5) stops a dropped database's capture worker and drops its slot; also (5) a copied database has its source's mark
 patch src/backend/commands/extension.c  1b  an extension name resolves to a shared extension or the session's branch's; refuses one of the other kind beside it, and moves between kinds
 patch src/backend/commands/functioncmds.c  1b  a procedure that runs on another branch than the caller's is atomic
 patch src/backend/commands/indexcmds.c  2  the version-control history store's relations, and the TOAST tables initdb made, not reindexed concurrently (pg_upgrade carries the store over by OID)
@@ -150,7 +150,7 @@ patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber kee
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format; also (5) capture_in_background
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h; also (5) capture_in_background
-patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
+patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size; also (5) capture
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
 patch src/bin/pg_amcheck/t/002_nonesuch.pl  2  schema exclusion patterns exclude pg_history too, for no relations to check
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
@@ -187,7 +187,7 @@ patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the blo
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/Makefile  4  pg_ws_print; also (4) pg_ws_deferred
 patch src/include/catalog/catalog.h  2  IsHistoryStoreNamespace()
-patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs; also (2) the history store's access methods, relations and functions; also (3) pg_chunk_index_format(); also (4) pg_attribute.attcoltag; also (4) pg_authid.roltravels; also (4) pg_ws_print; also (4) pg_ws_deferred
+patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs; also (2) the history store's access methods, relations and functions; also (3) pg_chunk_index_format(); also (4) pg_attribute.attcoltag; also (4) pg_authid.roltravels; also (4) pg_ws_print; also (4) pg_ws_deferred; also (5) pg_database.datversioned
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/meson.build  4  pg_ws_print; also (4) pg_ws_deferred
 patch src/include/catalog/namespace.h  1b  SearchPathMatcher.branch
@@ -195,6 +195,7 @@ patch src/include/catalog/pg_am.dat  2  the prolly_chunks, prolly_chunk_index an
 patch src/include/catalog/pg_attribute.h  4  attcoltag, a column's identity in version control
 patch src/include/catalog/pg_authid.h  4  roltravels, a role held by commits
 patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced instead of logged need recovery to begin past (syncedSince, syncedCount)
+patch src/include/catalog/pg_database.h  5  datversioned
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.dat  2  pg_history, the history store's schema
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
