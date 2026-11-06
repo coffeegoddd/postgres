@@ -462,7 +462,8 @@ projected_cmp(const void *a, const void *b)
 {
 	const Projected *x = a;
 	const Projected *y = b;
-	int			c = memcmp(x->cells, y->cells, Min(x->len, y->len));
+	/* (a row of no cells has none to compare, and memcmp mustn't be given NULL) */
+	int			c = Min(x->len, y->len) > 0 ? memcmp(x->cells, y->cells, Min(x->len, y->len)) : 0;
 
 	if (c != 0)
 		return c;
