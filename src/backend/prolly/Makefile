@@ -21,6 +21,7 @@ OBJS = \
 	branch_catalog_ops.o \
 	branch_filter.o \
 	capture.o \
+	capture_rows.o \
 	capture_tree.o \
 	chunk_freer.o \
 	chunk_index.o \

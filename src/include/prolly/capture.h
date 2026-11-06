@@ -44,6 +44,18 @@
 #include "replication/output_plugin.h"
 #include "utils/relcache.h"
 
+/*
+ * A logical message of a table's rows, each of whose int32s and the like are as this server keeps
+ * them: its first byte says which.
+ *	CAPTURE_ROWS_BEGIN	int32 branch, relid, nkey, nstored; uint64 tags[nstored]: what's told of the
+ *						table from here on, with what came before it void
+ *	CAPTURE_ROWS_BATCH	int32 branch, relid, nrows; each row nstored fields, each int32 length (-1:
+ *						NULL) and that much of its output text
+ */
+#define CAPTURE_ROWS_PREFIX "prolly.capture.rows"
+#define CAPTURE_ROWS_BEGIN 'R'
+#define CAPTURE_ROWS_BATCH 'D'
+
 /* The output plugin's name, which the server has built in. */
 #define PROLLY_CAPTURE_PLUGIN "prolly_capture"
 
@@ -135,6 +147,10 @@ extern void CaptureDatabaseDropping(Oid dboid);
  * Two layouts alike don't say the rows are: DDL can change a table's rows and tell no change of them.
  */
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
+
+/* A table's rows, or those of each with a column reaching a type, changed with no change told. */
+extern void CaptureTableRowsChanged(Oid relid);
+extern void CaptureTypeRowsChanged(Oid type);
 
 /* What decoding calls. */
 extern void CaptureOutputPluginInit(OutputPluginCallbacks *callbacks);

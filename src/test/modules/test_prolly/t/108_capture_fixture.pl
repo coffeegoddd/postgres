@@ -82,9 +82,7 @@ ok(each_table_same('load') >= 10, 'the fixture has its tables');
 run_file('dml.sql');
 each_table_same('changes');
 
-# DDL that changes a table's rows and tells no change of them, leaving its layout as it was: until
-# DDL says what it did, the map stays as it was, and this says so, so that it fails when that's
-# fixed.  Writing every row again then puts the map right.
+# DDL that changes a table's rows and tells no change of them, leaving its layout as it was
 sub ddl_step
 {
 	my ($name, $table, $setup, $ddl) = @_;
@@ -92,11 +90,6 @@ sub ddl_step
 	each_table_same("before $name");
 	$node->safe_psql('postgres', "$use SET search_path = rt; $ddl");
 	caught_up();
-	isnt($node->safe_psql('postgres',
-			"$use SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 'rt.$table'::regclass::oid"),
-		$node->safe_psql('postgres', "$use $reader SELECT test_ws_rows_hash('rt', '$table')"),
-		"$name: its map has not followed");
-	$node->safe_psql('postgres', "$use UPDATE rt.$table SET a = a");
 	each_table_same("after $name");
 }
 

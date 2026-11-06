@@ -65,6 +65,7 @@
 #include "parser/parse_expr.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
+#include "prolly/capture.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
@@ -1336,6 +1337,7 @@ AlterEnum(AlterEnumStmt *stmt)
 	{
 		/* Rename an existing label */
 		RenameEnumLabel(enum_type_oid, stmt->oldVal, stmt->newVal);
+		CaptureTypeRowsChanged(enum_type_oid);
 	}
 	else
 	{
