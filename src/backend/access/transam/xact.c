@@ -2367,7 +2367,7 @@ CommitTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
-	CaptureRowsAtCommit();
+	CaptureRowsAtCommit(false);
 
 	/*
 	 * Synchronize files that are created and not WAL-logged during this
@@ -2639,7 +2639,7 @@ PrepareTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
-	CaptureRowsAtCommit();
+	CaptureRowsAtCommit(true);
 
 	/*
 	 * Synchronize files that are created and not WAL-logged during this

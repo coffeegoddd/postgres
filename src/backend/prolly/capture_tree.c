@@ -53,6 +53,7 @@
 #include "access/xact.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -72,6 +73,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "varatt.h"
 
 /* A table's layout, for as long as the worker runs. */
@@ -88,6 +90,9 @@ typedef struct TreeChange
 	const WsRowShape *shape;
 	bool		replace;		/* all before this is void: no row of its own */
 	const char *problem;		/* what's wrong with holding it, unless that's voided */
+	char	   *as_of;			/* in a transaction that changed catalogs, its table's fingerprint */
+	Oid			relid;
+	Oid			filenode;
 	int32		branch;
 	XLogRecPtr	commit;
 	char	  **old_row;		/* the key's fields alone: the row to go */
@@ -109,6 +114,9 @@ static List *tree_tables = NIL;
 /* What apply has yet to write; emptied by it. */
 static MemoryContext tree_held_cxt = NULL;
 static List *tree_held = NIL;
+
+/* Those of the transaction being told whose fingerprints are to be checked at its commit. */
+static List *tree_as_of = NIL;
 
 /* Reset for each row. */
 static MemoryContext tree_row_cxt = NULL;
@@ -356,6 +364,13 @@ tree_change(const CaptureChange *change)
 	held->branch = change->branch;
 	held->commit = tree_commit;
 	held->problem = tree_problem_of(change->relation, table);
+	if (change->catalogs_changed)
+	{
+		held->relid = RelationGetRelid(change->relation);
+		held->filenode = change->relation->rd_rel->relfilenode;
+		held->as_of = CaptureRowsFingerprint(held->relid, held->filenode);
+		tree_as_of = lappend(tree_as_of, held);
+	}
 	MemoryContextSwitchTo(old);
 	if (held->problem == NULL)
 	{
@@ -499,9 +514,46 @@ tree_message(const char *prefix, const char *data, Size size, bool transactional
 		elog(ERROR, "a message of a table's rows of unknown kind %d", data[0]);
 }
 
+/*
+ * A row written with catalogs as they weren't at the commit, and no change of a table's fingerprint
+ * by then to have its rows told: an enum's value renamed and renamed back, with a row between.  It
+ * prints as it did then, and is an error, unless voided.
+ */
+static void
+tree_check_as_of_commit(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, tree_as_of)
+	{
+		TreeChange *change = lfirst(lc);
+
+		if (change->problem == NULL)
+		{
+			HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(change->relid));
+
+			if (HeapTupleIsValid(tup))
+			{
+				char	   *now = CaptureRowsFingerprint(change->relid, ((Form_pg_class) GETSTRUCT(tup))->relfilenode);
+
+				ReleaseSysCache(tup);
+
+				/* (one it's still different from at the commit has its rows told, voiding this) */
+				if (strcmp(now, change->as_of) != 0)
+					change->problem = MemoryContextStrdup(tree_held_cxt,
+														  psprintf("capture to trees has a row of relation %u written as catalogs were during its transaction and aren't now",
+																   change->relid));
+				pfree(now);
+			}
+		}
+	}
+	tree_as_of = NIL;
+}
+
 static void
 tree_end(TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn)
 {
+	tree_check_as_of_commit();
 	WsSql->end(tree_scope);
 }
 
@@ -654,6 +706,10 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	char		name[64];
 	PHash		map;
 	ListCell   *lc;
+
+	/* (one that's gone has nothing to hold, whatever was wrong with holding it) */
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(table->relid)))
+		return;
 
 	/* what counts starts at the last told whole, of what's not been applied */
 	foreach(lc, table->held)

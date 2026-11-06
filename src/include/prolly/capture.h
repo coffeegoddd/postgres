@@ -81,6 +81,7 @@ typedef struct CaptureChange
 								 * NULL for a delete if it gives nothing */
 	HeapTuple	new_tuple;		/* an unchanged TOAST value is not in it; NULL for a delete */
 	XLogRecPtr	lsn;
+	bool		catalogs_changed;	/* its transaction changed catalogs */
 } CaptureChange;
 
 /* What decoding finds. */
@@ -151,7 +152,10 @@ extern void CaptureDatabaseDropping(Oid dboid);
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
 
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
-extern void CaptureRowsAtCommit(void);
+extern void CaptureRowsAtCommit(bool prepare);
+
+/* What makes up what a table's rows are, of the catalogs as they are for this reader. */
+extern char *CaptureRowsFingerprint(Oid relid, Oid relfilenode);
 
 /* This is capture's own worker. */
 extern PGDLLIMPORT bool am_capture_worker;

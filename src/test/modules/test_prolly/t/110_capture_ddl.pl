@@ -93,10 +93,12 @@ run('BEGIN; SAVEPOINT p; ALTER TABLE x ALTER COLUMN a TYPE bigint USING a + 1000
 same_map('x', 'rolled back to a savepoint, with a row after');
 run('BEGIN; ALTER TABLE x ADD COLUMN p1 integer DEFAULT 1; ALTER TABLE x ADD COLUMN p2 integer DEFAULT 2; COMMIT');
 same_map('x', 'two statements in one transaction');
-run(q{BEGIN; ALTER TABLE x ALTER COLUMN a TYPE bigint USING a + 5; PREPARE TRANSACTION 'ddl'});
-caught_up();
-$node->safe_psql('postgres', q{COMMIT PREPARED 'ddl'});
-same_map('x', 'a prepared transaction, once committed');
+my ($prc, $pout, $perr) = $node->psql('postgres', "$on1 BEGIN; ALTER TABLE s.x ALTER COLUMN a TYPE bigint USING a + 5; PREPARE TRANSACTION 'ddl'");
+like($perr, qr/can't prepare a transaction that changed catalogs/, 'preparing one is refused');
+same_map('x', 'and nothing came of it');
+run(q{BEGIN; INSERT INTO x (id, a) VALUES (7, 7); PREPARE TRANSACTION 'rows'});
+$node->safe_psql('postgres', q{COMMIT PREPARED 'rows'});
+same_map('x', 'preparing one of nothing but rows isn\'t');
 
 # the last column dropped and added again, so that its place in the row is the same: only its
 # attnum says it isn't the column it was
@@ -323,10 +325,37 @@ $node->safe_psql('postgres', q{SET ROLE evil;
 	CREATE TEMP TABLE trigger_a_compare (a integer)});
 is($node->safe_psql('postgres', q{SELECT rolsuper FROM pg_roles WHERE rolname = 'evil'}), 'f', 'a role can\'t make itself a superuser');
 
-# prepared and rolled back: nothing
-run(q{BEGIN; ALTER TABLE x ALTER COLUMN a TYPE bigint USING a + 11; PREPARE TRANSACTION 'gone'});
-$node->safe_psql('postgres', q{ROLLBACK PREPARED 'gone'});
-same_map('x', 'prepared and rolled back');
+# nor by what planning a query runs of an index's: nothing here is planned
+$node->safe_psql('postgres', qq{$on1 GRANT USAGE, CREATE ON SCHEMA s TO evil});
+$node->safe_psql('postgres', qq{SET ROLE evil; $on1
+	CREATE FUNCTION s.do_it() RETURNS boolean LANGUAGE plpgsql VOLATILE AS \$\$ BEGIN EXECUTE 'ALTER ROLE evil SUPERUSER'; RETURN true; EXCEPTION WHEN insufficient_privilege THEN RETURN true; END \$\$;
+	CREATE FUNCTION s.fold_me() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT s.do_it()';
+	CREATE TABLE s.booby (id integer PRIMARY KEY, a integer);
+	INSERT INTO s.booby VALUES (1, 1);
+	CREATE INDEX booby_partial ON s.booby (a) WHERE s.fold_me();
+	CREATE INDEX booby_expr ON s.booby ((s.fold_me()))});
+$node->safe_psql('postgres', qq{SET ROLE evil; $on1 ALTER TABLE s.booby ALTER COLUMN a TYPE bigint});
+is($node->safe_psql('postgres', q{SELECT rolsuper FROM pg_roles WHERE rolname = 'evil'}), 'f', 'nor by an index\'s expression or predicate');
+same_map('booby', 'and the table is held all the same');
+
+# a read-only transaction may still change what the system records of it
+$node->safe_psql('postgres', qq{$on1 SET default_transaction_read_only = on; ANALYZE s.x});
+pass('a read-only transaction that changes catalogs commits');
+$node->safe_psql('postgres', q{CREATE TEMP TABLE ro_temp (a integer); SET default_transaction_read_only = on});
+ok($node->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_class WHERE relname = 'ro_temp'}), 'and a temporary table goes, with a session in one');
+
+# a virtual column of a table used as a type is in the type's values, though not in the table's rows
+run('CREATE TABLE virt_of (id integer PRIMARY KEY, a integer, v integer GENERATED ALWAYS AS (a + 1) VIRTUAL, b integer);
+	CREATE TABLE uses_virt (id integer PRIMARY KEY, r virt_of);
+	INSERT INTO uses_virt VALUES (1, ROW(1, 2, NULL, 3))');
+caught_up();
+run('ALTER TABLE virt_of DROP COLUMN v');
+same_map('uses_virt', 'a virtual column dropped from a table used as a type');
+
+# a keyless table written and dropped in a transaction, and in two
+$node->safe_psql('postgres', "$on1 BEGIN; CREATE TABLE s.nk (a integer); INSERT INTO s.nk VALUES (1); DROP TABLE s.nk; COMMIT");
+run('CREATE TABLE after_nk (id integer PRIMARY KEY); INSERT INTO after_nk VALUES (1)');
+same_map('after_nk', 'a keyless table written and dropped holds nothing up');
 
 # what's dropped takes columns with it, by no ALTER TABLE
 run(q{CREATE DOMAIN dd AS integer; CREATE TYPE dt AS ENUM ('z'); CREATE TYPE dc AS (x dt);
@@ -445,6 +474,25 @@ SKIP:
 }
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
+$node->stop;
+
+# changed and changed back in one transaction, with a row between: the row prints as it was then,
+# and nothing's left to say so at the commit, so it stops capture rather than leave a map wrong
+$node = PostgreSQL::Test::Cluster->new('ddl_back');
+$node->init(allows_streaming => 'logical');
+$node->append_conf('postgresql.conf', "log_line_prefix = ''\nautovacuum = off\ncapture_to_trees = on\n");
+$node->start;
+$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
+my $b4 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$on1 = "SET catalog_branch = $b4;";
+$node->safe_psql('postgres', "$on1 CREATE SCHEMA s VERSIONED");
+$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_history.capture_positions WHERE branch = 0}) or die 'no worker';
+$slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
+run(q{CREATE TYPE back AS ENUM ('one'); CREATE TABLE s.t (id integer PRIMARY KEY, a back); INSERT INTO s.t VALUES (1, 'one')});
+caught_up();
+my $from = -s $node->logfile;
+run(q{BEGIN; ALTER TYPE back RENAME VALUE 'one' TO 'uno'; INSERT INTO s.t VALUES (2, 'uno'); ALTER TYPE back RENAME VALUE 'uno' TO 'one'; COMMIT});
+ok($node->wait_for_log(qr/written as catalogs were during its transaction/, $from), 'a state changed and changed back around a row stops capture');
 $node->stop;
 
 $node = PostgreSQL::Test::Cluster->new('ddl_before');

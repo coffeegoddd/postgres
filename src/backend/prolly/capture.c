@@ -173,6 +173,7 @@ capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 		default:
 			elog(ERROR, "unexpected change of kind %d decoded", (int) change->action);
 	}
+	out.catalogs_changed = rbtxn_has_catalog_changes(txn);
 	out.old_tuple = change->data.tp.oldtuple;
 	out.new_tuple = change->data.tp.newtuple;
 	CaptureSinkInUse->change(&out);

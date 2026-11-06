@@ -27,9 +27,13 @@
  * them, as any taking of locks late can, and it's an error above READ COMMITTED, as it
  * reads what's committed now.
  *
- * This reads with the system's rights, as one may rename the value of a type of
- * one's own that a table one can't reach has a column of, and under a search path
- * of its own, as any role could otherwise have what's run here be its own.
+ * This runs with the system's rights, as one may rename the value of a type of
+ * one's own that a table one can't reach has a column of.  So what it runs is only its
+ * own SQL on its own table, under a search path of its own, and a table's rows are read
+ * directly: planning a query would run what a table's index expressions call.
+ *
+ * It's an error to prepare such a transaction, as this one's lock would then be held
+ * until it's resolved.
  *
  * Text naming an object, as a regclass column prints a table's name or an aclitem a
  * role's, changes when it's renamed, which no fingerprint here says.  Nor does one say a
@@ -44,6 +48,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/relation.h"
@@ -60,6 +65,7 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -89,52 +95,38 @@
 /* How many rows go in a message. */
 #define CAPTURE_ROWS_BATCH_SIZE 1000
 
-typedef struct RowsOut
-{
-	Oid			relid;
-	int32		branch;
-	int			nstored;
-} RowsOut;
-
 static void
 put_int32(StringInfo out, int32 v)
 {
 	appendBinaryStringInfo(out, &v, sizeof(v));
 }
 
-static void
-rows_batch(void *arg, const WsSqlRows *rows)
+/* What a batch of a table's rows is written in, until it's written. */
+typedef struct RowsOut
 {
-	RowsOut    *o = arg;
+	StringInfoData rows;
+	int			nrows;
+	int32		branch;
+	Oid			relid;
+} RowsOut;
+
+static void
+rows_flush(RowsOut *o)
+{
 	StringInfoData out;
 
-	if (rows->nrows == 0)
+	if (o->nrows == 0)
 		return;
 	initStringInfo(&out);
 	appendStringInfoChar(&out, CAPTURE_ROWS_BATCH);
 	put_int32(&out, o->branch);
 	put_int32(&out, (int32) o->relid);
-	put_int32(&out, rows->nrows);
-	for (int r = 0; r < rows->nrows; r++)
-	{
-		for (int c = 0; c < o->nstored; c++)
-		{
-			const char *text = ws_sql_value(rows, r, c);
-
-			if (text == NULL)
-				put_int32(&out, -1);
-			else
-			{
-				const char *utf8 = ws_text_to_utf8(text);
-				int32		len = (int32) strlen(utf8);
-
-				put_int32(&out, len);
-				appendBinaryStringInfo(&out, utf8, len);
-			}
-		}
-	}
+	put_int32(&out, o->nrows);
+	appendBinaryStringInfo(&out, o->rows.data, o->rows.len);
 	(void) LogLogicalMessage(CAPTURE_ROWS_PREFIX, out.data, out.len, true, false);
 	pfree(out.data);
+	resetStringInfo(&o->rows);
+	o->nrows = 0;
 }
 
 /* A table's rows, the last thing it's told of them. */
@@ -144,11 +136,15 @@ rows_write(Relation rel, int32 branch)
 	Oid			relid = RelationGetRelid(rel);
 	WsRowShape	shape;
 	StringInfoData out;
-	Buf			sql = BUF_INIT;
 	RowsOut		o;
 	TupleDesc	desc = RelationGetDescr(rel);
+	int		   *at;
+	FmgrInfo   *output;
+	MemoryContext row_cxt;
+	Snapshot	snapshot;
+	TupleTableSlot *slot;
+	TableScanDesc scan;
 	int			scope;
-	int			on_branch;
 
 	CaptureRelationShape(rel, &shape);
 	initStringInfo(&out);
@@ -166,7 +162,16 @@ rows_write(Relation rel, int32 branch)
 		return;
 	}
 
-	ws_put_text(&sql, "SELECT ");
+	/*
+	 * Read directly, as nothing is to be planned here: planning a query folds a table's index
+	 * expressions, which are its owner's to write.
+	 */
+	initStringInfo(&o.rows);
+	o.nrows = 0;
+	o.branch = branch;
+	o.relid = relid;
+	at = palloc_array(int, shape.nstored);
+	output = palloc_array(FmgrInfo, shape.nstored);
 	for (int i = 0; i < shape.nstored; i++)
 	{
 		for (int a = 0; a < desc->natts; a++)
@@ -175,28 +180,54 @@ rows_write(Relation rel, int32 branch)
 
 			if (!att->attisdropped && (uint64) att->attcoltag == shape.tags[i])
 			{
-				if (i > 0)
-					ws_put_text(&sql, ", ");
-				ws_put_identifier(&sql, NameStr(att->attname));
+				Oid			out_fn;
+				bool		varlena;
+
+				at[i] = a;
+				getTypeOutputInfo(att->atttypid, &out_fn, &varlena);
+				fmgr_info(out_fn, &output[i]);
 				break;
 			}
 		}
 	}
-	ws_put_text(&sql, " FROM ONLY ");
-	ws_put_identifier(&sql, get_namespace_name(RelationGetNamespace(rel)));
-	ws_put_text(&sql, ".");
-	ws_put_identifier(&sql, RelationGetRelationName(rel));
-	buf_append_byte(&sql, 0);
-
-	o.relid = relid;
-	o.branch = branch;
-	o.nstored = shape.nstored;
-	on_branch = CatalogBranchEnter(branch);
+	row_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture rows", ALLOCSET_DEFAULT_SIZES);
 	scope = WsSql->begin();
-	WsSql->scan((const char *) sql.data, 0, NULL, CAPTURE_ROWS_BATCH_SIZE, rows_batch, &o);
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	slot = table_slot_create(rel, NULL);
+	scan = table_beginscan(rel, snapshot, 0, NULL, SO_NONE);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		MemoryContext old = MemoryContextSwitchTo(row_cxt);
+
+		CHECK_FOR_INTERRUPTS();
+		slot_getallattrs(slot);
+		for (int i = 0; i < shape.nstored; i++)
+		{
+			if (slot->tts_isnull[at[i]])
+				put_int32(&o.rows, -1);
+			else
+			{
+				const char *utf8 = ws_text_to_utf8(OutputFunctionCall(&output[i], slot->tts_values[at[i]]));
+				int32		len = (int32) strlen(utf8);
+
+				put_int32(&o.rows, len);
+				appendBinaryStringInfo(&o.rows, utf8, len);
+			}
+		}
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(row_cxt);
+		if (++o.nrows == CAPTURE_ROWS_BATCH_SIZE)
+			rows_flush(&o);
+	}
+	rows_flush(&o);
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	UnregisterSnapshot(snapshot);
 	WsSql->end(scope);
-	CatalogBranchLeave(on_branch);
-	buf_free(&sql);
+	MemoryContextDelete(row_cxt);
+	pfree(o.rows.data);
+	pfree(at);
+	pfree(output);
 	ws_row_shape_free(&shape);
 }
 
@@ -206,7 +237,7 @@ label_cmp(const ListCell *a, const ListCell *b)
 	return strcmp((const char *) lfirst(a), (const char *) lfirst(b));
 }
 
-static void print_columns(StringInfo out, Oid relid, List **seen);
+static void print_columns(StringInfo out, Oid relid, bool virtuals, List **seen);
 
 /* What makes up what a type's values print as, appended; a type met again is only named. */
 static void
@@ -253,14 +284,17 @@ print_type(StringInfo out, Oid type, int32 typmod, List **seen)
 			appendStringInfo(out, " %s", (char *) lfirst(lc));
 	}
 	else if (t->typtype == TYPTYPE_COMPOSITE)
-		print_columns(out, t->typrelid, seen);
+		print_columns(out, t->typrelid, true, seen);
 	ReleaseSysCache(tup);
 	appendStringInfoChar(out, ')');
 }
 
-/* A relation's live columns' places, tags and types, of the catalogs alone. */
+/*
+ * A relation's live columns' places, tags and types, of the catalogs alone.  A virtual generated
+ * column isn't in a table's rows, but its row type's values have it.
+ */
 static void
-print_columns(StringInfo out, Oid relid, List **seen)
+print_columns(StringInfo out, Oid relid, bool virtuals, List **seen)
 {
 	HeapTuple	class = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	int			natts;
@@ -278,7 +312,7 @@ print_columns(StringInfo out, Oid relid, List **seen)
 		if (!HeapTupleIsValid(tup))
 			continue;
 		att = (Form_pg_attribute) GETSTRUCT(tup);
-		if (att->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL)
+		if (virtuals || att->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL)
 		{
 			appendStringInfo(out, " %d:" INT64_FORMAT, att->attnum, att->attcoltag);
 			print_type(out, att->atttypid, att->atttypmod, seen);
@@ -288,8 +322,8 @@ print_columns(StringInfo out, Oid relid, List **seen)
 }
 
 /* A table's fingerprint, of the catalogs alone: it takes no lock on the table. */
-static char *
-rows_fingerprint(Oid relid, Oid relfilenode)
+char *
+CaptureRowsFingerprint(Oid relid, Oid relfilenode)
 {
 	StringInfoData out;
 	Relation	indexes;
@@ -315,7 +349,7 @@ rows_fingerprint(Oid relid, Oid relfilenode)
 	systable_endscan(scan);
 	table_close(indexes, AccessShareLock);
 	appendStringInfoString(&out, " columns");
-	print_columns(&out, relid, &seen);
+	print_columns(&out, relid, false, &seen);
 	list_free(seen);
 	return out.data;
 }
@@ -365,7 +399,7 @@ rows_compare(void)
 	foreach(lc, tables)
 	{
 		VersionedTable *t = lfirst(lc);
-		char	   *fingerprint = rows_fingerprint(t->relid, t->relfilenode);
+		char	   *fingerprint = CaptureRowsFingerprint(t->relid, t->relfilenode);
 		Datum		values[2] = {ObjectIdGetDatum(t->relid), CStringGetTextDatum(fingerprint)};
 
 		if (SPI_execute_with_args("SELECT 1 FROM pg_history.capture_fingerprints WHERE relid = $1 AND fingerprint = $2",
@@ -391,7 +425,10 @@ rows_compare(void)
 		pfree(fingerprint);
 	}
 	list_free_deep(tables);
-	if (SPI_execute("DELETE FROM pg_history.capture_fingerprints f WHERE NOT EXISTS "
+
+	/* (above READ COMMITTED it'd read what could fail another; one left behind does no harm) */
+	if (!IsolationUsesXactSnapshot() &&
+		SPI_execute("DELETE FROM pg_history.capture_fingerprints f WHERE NOT EXISTS "
 					"(SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = f.relid)", false, 0) != SPI_OK_DELETE)
 		elog(ERROR, "could not forget a table's fingerprint");
 }
@@ -410,13 +447,14 @@ database_is_versioned(void)
 }
 
 void
-CaptureRowsAtCommit(void)
+CaptureRowsAtCommit(bool prepare)
 {
 	SharedInvalidationMessage *msgs;
 	bool		relcache;
 	Oid			saved_user;
 	int			saved_context;
 	int			gucs;
+	bool		saved_read_only = XactReadOnly;
 
 	/* (an error here aborts the transaction, which puts all this back) */
 	if (!capture_to_trees || !XLogLogicalInfoActive() || IsParallelWorker() || am_capture_worker ||
@@ -427,6 +465,14 @@ CaptureRowsAtCommit(void)
 	if (xactGetCommittedInvalidationMessages(&msgs, &relcache) == 0 || !database_is_versioned())
 		return;
 
+	/* (its lock would then be held until it's resolved, by every other such commit's waiting) */
+	if (prepare)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees can't prepare a transaction that changed catalogs")));
+
+	/* (what's recorded here is the system's own, whatever this transaction was to write) */
+	XactReadOnly = false;
 	GetUserIdAndSecContext(&saved_user, &saved_context);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, saved_context | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
 	gucs = NewGUCNestLevel();
@@ -444,4 +490,5 @@ CaptureRowsAtCommit(void)
 	INJECTION_POINT("capture-rows-written", NULL);
 	AtEOXact_GUC(true, gucs);
 	SetUserIdAndSecContext(saved_user, saved_context);
+	XactReadOnly = saved_read_only;
 }
