@@ -761,6 +761,10 @@ CREATE FUNCTION test_ws_merge_checked(base text, ours text, theirs text, schema 
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_ws_viol_resolve(schema text)
+RETURNS integer
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_ws_violations(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

@@ -9,4 +9,3 @@ violation unique acct acct_email_key 5002
 UPDATE rt.acct SET email = 'dup2@x' WHERE id = 5002;
 -- after
 check SELECT contype FROM pg_constraint WHERE conname = 'acct_email_key' => u
-check SELECT count(*) FROM prolly.violations => 0

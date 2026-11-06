@@ -115,6 +115,7 @@
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_ws_deferred.h"
 #include "catalog/pg_ws_print.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
@@ -1658,6 +1659,14 @@ fix_ws_print(CopyState *cs, Datum *values, bool *nulls)
 }
 
 static void
+fix_ws_deferred(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_ws_deferred_defrelid, RelationRelationId);
+	if (OidIsValid(DatumGetObjectId(values[Anum_pg_ws_deferred_defrefrelid - 1])))
+		MAP(Anum_pg_ws_deferred_defrefrelid, RelationRelationId);
+}
+
+static void
 fix_statistic(CopyState *cs, Datum *values, bool *nulls)
 {
 	MAP(Anum_pg_statistic_starelid, RelationRelationId);
@@ -1748,6 +1757,8 @@ copy_all_rows(CopyState *cs)
 							 Anum_pg_class_oid, obj.oid, fix_class);
 				copy_rows_of(cs, AttributeRelationId, AttributeRelidNumIndexId,
 							 Anum_pg_attribute_attrelid, obj.oid, fix_attribute);
+				copy_rows_of(cs, WsDeferredRelationId, WsDeferredRelidKindNameIndexId,
+							 Anum_pg_ws_deferred_defrelid, obj.oid, fix_ws_deferred);
 				if (get_rel_relkind(obj.oid) == RELKIND_INDEX ||
 					get_rel_relkind(obj.oid) == RELKIND_PARTITIONED_INDEX)
 					copy_rows_of(cs, IndexRelationId, IndexRelidIndexId,

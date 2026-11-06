@@ -29,6 +29,7 @@
 #include "prolly/ws/ws_rows.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "prolly/ws/ws_viol.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -108,6 +109,7 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		CHECK_FOR_INTERRUPTS();
 		if (!ws_schema_read(schema, table, &rec))
 			elog(ERROR, "table \"%s\" of schema \"%s\" is gone", table, schema);
+		ws_viol_fold(schema, &rec);
 		WsRows->capture(ctx, schema, &rec, &rows);
 		WsRoot->put_table(ctx, &rv, &rec, &rows, &rv);
 		if (rec.owner != NULL)
@@ -117,6 +119,7 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 				name_add(&roles, &nroles, rec.grants[g].grantee);
 		ws_schema_free(&rec);
 		ws_fk_read(schema, table, &fks, &nfks);
+		ws_viol_fold_keys(schema, table, &fks, &nfks);
 		if (nfks > 0)
 		{
 			all = all == NULL ? palloc_array(WsForeignKey, nfks) : repalloc_array(all, WsForeignKey, nall + nfks);
@@ -156,6 +159,16 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		ws_role_read((const char *const *) roles, nroles, &held, &nheld);
 		ws_role_map(ctx, held, nheld, &map);
 		WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
+	}
+	if (ws_viol_any_deferred(schema))
+	{
+		char	   *why = NULL;
+
+		if (!WsViol->recheck(ctx, &rv, schema, true, &rv, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("schema \"%s\" has constraints set aside and could not be checked: %s", schema, why)));
+		ws_viol_check_restorable(ctx, &rv);
 	}
 	WsSql->end(level);
 	*root = rv;
@@ -343,8 +356,8 @@ make_table(ProllyCtx *ctx, const WsTableSchema *s, const PHash *rows, const char
 }
 
 /*
- * A record of what its rows need, sharing what it keeps: its key's and identities' not
- * null, which a record must have, and indexes that refuse nothing.
+ * A record of what its rows need, sharing what it keeps: its key's not null, which a record
+ * must have, and indexes that refuse nothing.  (An identity is not null, which a plan trusts.)
  */
 static void
 bare_record(const WsTableSchema *s, WsTableSchema *out)
@@ -353,13 +366,19 @@ bare_record(const WsTableSchema *s, WsTableSchema *out)
 	out->cols = palloc_array(WsColumn, Max(s->ncols, 1));
 	for (int i = 0; i < s->ncols; i++)
 	{
-		bool		keep = s->cols[i].identity != WS_IDENTITY_NONE;
+		bool		keep = false;
 
 		for (int k = 0; !keep && k < s->nkey; k++)
 			keep = s->key[k] == s->cols[i].tag;
 		out->cols[i] = s->cols[i];
+		out->cols[i].identity = WS_IDENTITY_NONE;
+		out->cols[i].identity_seq = NULL;
 		if (!keep)
 			out->cols[i].not_null = NULL;
+
+		/* (no row is made by one, and it may name what is not made here) */
+		if (s->cols[i].kind == WS_COL_STORED)
+			out->cols[i].def = NULL;
 	}
 	out->nconstraints = 0;
 	out->indexes = palloc_array(WsIndex, Max(s->nindexes, 1));
@@ -407,7 +426,8 @@ definitions_record(const WsTableSchema *s, WsTableSchema *out)
 }
 
 static void
-add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const char *schema)
+add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const WsDeferrals *deferred,
+				 const char *schema)
 {
 	PHash		map;
 	WsForeignKey *fks;
@@ -423,7 +443,7 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
 
 		/* (a table's last name first: the list is by table, then name) */
 		for (int i = n - 1; i >= 0; i--)
-			if (strcmp(fks[i].table, rec->name) == 0)
+			if (strcmp(fks[i].table, rec->name) == 0 && !ws_viol_key_deferred(deferred, &fks[i]))
 			{
 				const WsTableSchema *to = &tables->recs[table_index(tables, fks[i].ref_table)];
 
@@ -486,7 +506,7 @@ exhaust_sequences(const char *schema)
 static void
 restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
 		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows,
-		   bool definitions_only)
+		   bool definitions_only, bool roles_here)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -497,6 +517,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	WsObject   *objs = NULL;
 	int			nobjs = 0;
 	Buf			sql = BUF_INIT;
+	WsDeferrals deferred = {0};
 	bool	   *owner_absent;
 
 	WsSql->run("SELECT (SELECT count(*) FROM pg_namespace n, LATERAL (" \
@@ -520,7 +541,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 				 errmsg("schema \"%s\" holds something, and a root is restored into one that does not", schema)));
 	ws_sql_rows_free(&rows);
 
-	if (!definitions_only && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
+	if (!definitions_only && !roles_here && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
 	{
 		WsRole	   *held;
 		WsRole	   *was = NULL;
@@ -554,6 +575,12 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	if (WsRoot->get_map(ctx, root, WS_ROOT_OBJECTS, &map))
 		ws_obj_list(ctx, &map, &objs, &nobjs);
 	owner_absent = palloc0_array(bool, Max(nobjs, 1));
+	if (roles_here)
+		for (int i = 0; i < nobjs; i++)
+		{
+			objs[i].owner = NULL;
+			objs[i].ngrants = 0;
+		}
 	if (definitions_only)
 		for (int i = 0; i < nobjs; i++)
 		{
@@ -574,6 +601,8 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	ws_obj_restore(objs, nobjs, schema, true);
 
 	tables_in_order(ctx, root, &tables);
+	if (fn == NULL && no_rows == NULL)
+		ws_viol_defer(ctx, root, tables.recs, tables.nnames, &deferred);
 	for (int t = 0; t < tables.n; t++)
 	{
 		int			i = tables.order[t];
@@ -587,6 +616,10 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 				definitions_record(&tables.recs[i], &bare);
 			else
 				bare_record(&tables.recs[i], &bare);
+
+			/* (it is not to be made as anyone's who may not be whoever asks) */
+			if (roles_here)
+				bare.owner = NULL;
 			make_table(ctx, &bare, no_rows != NULL ? no_rows : &tables.rows[i], schema);
 		}
 		else
@@ -650,7 +683,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	}
 	for (int t = 0; t < tables.n; t++)
 		ws_schema_set_inherited(schema, &tables.recs[tables.order[t]]);
-	add_foreign_keys(ctx, root, &tables, schema);
+	add_foreign_keys(ctx, root, &tables, &deferred, schema);
 	for (int t = 0; t < tables.n; t++)
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
@@ -689,6 +722,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	for (int t = 0; t < tables.n; t++)
 		ws_schema_remember(&tables.recs[tables.order[t]], schema);
 	ws_obj_remember(objs, nobjs, schema);
+	ws_viol_defer_end(schema, &deferred);
 
 done:
 	for (int i = 0; i < nobjs; i++)
@@ -703,26 +737,26 @@ done:
 static void
 schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false);
 }
 
 static void
 schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
-					void (*fn) (void *arg, const char *schema), void *arg)
+					void (*fn) (void *arg, const char *schema), void *arg, bool roles_here)
 {
-	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false);
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here);
 }
 
 static void
 schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false);
 }
 
 static void
 schema_restore_definitions(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false);
 }
 
 const WsRootIORoutine SchemaWsRootIO = {
@@ -744,6 +778,7 @@ typedef struct DryRun
 	const PHash *root;
 	void		(*fn) (void *arg, const char *schema);	/* restore_rows, then this */
 	void	   *arg;
+	bool		roles_here;		/* of those, the root's roles are here already */
 	const PHash *no_rows;		/* restore_statements, with this */
 	const char *schema;			/* what it is named */
 	bool		kept;			/* restore_definitions in a schema that stays */
@@ -798,7 +833,7 @@ dry_run(void *arg)
 		return;
 	}
 	if (d->fn != NULL)
-		WsRootIO->restore_rows(d->ctx, d->root, schema, d->fn, d->arg);
+		WsRootIO->restore_rows(d->ctx, d->root, schema, d->fn, d->arg, d->roles_here);
 	else if (d->no_rows != NULL)
 		WsRootIO->restore_statements(d->ctx, d->root, schema, d->no_rows);
 	else
@@ -867,9 +902,9 @@ ws_root_refused(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFail
 
 bool
 ws_root_rows_refused(ProllyCtx *ctx, const PHash *root, const char *schema, void (*fn) (void *arg, const char *schema),
-					 void *arg, WsSqlFailure *failure)
+					 void *arg, bool roles_here, WsSqlFailure *failure)
 {
-	DryRun		d = {.ctx = ctx, .root = root, .schema = schema, .fn = fn, .arg = arg};
+	DryRun		d = {.ctx = ctx, .root = root, .schema = schema, .fn = fn, .arg = arg, .roles_here = roles_here};
 
 	return dry_run_refused(&d, failure);
 }

@@ -2423,6 +2423,34 @@ put_constraint_settings(const WsTableSchema *s, const WsIndexSettings *set, Buf 
 }
 
 /* The statement, as the record has it. */
+/* What follows a unique or exclusion constraint's name. */
+static void
+put_key_constraint(const WsTableSchema *s, const WsConstraint *con, Buf *out)
+{
+	if (con->kind == WS_CONSTRAINT_EXCLUSION)
+	{
+		ws_put_text(out, " EXCLUDE USING ");
+		ws_put_identifier(out, con->excl.method);
+		put_index_columns(s, &con->excl, index_settings_of(s, con->name), out);
+		put_constraint_settings(s, index_settings_of(s, con->name), out);
+		put_index_predicate(s, &con->excl, out);
+	}
+	else
+	{
+		ws_put_text(out, con->nulls_not_distinct ? " UNIQUE NULLS NOT DISTINCT (" : " UNIQUE (");
+		for (int k = 0; k < con->ncols; k++)
+		{
+			if (k > 0)
+				ws_put_text(out, ", ");
+			ws_put_identifier(out, ws_schema_column(s, con->cols[k])->name);
+		}
+		ws_put_text(out, ")");
+		put_constraint_settings(s, index_settings_of(s, con->name), out);
+	}
+	if (con->deferrable)
+		ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
+}
+
 static void
 write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 {
@@ -2513,28 +2541,7 @@ write_create_table(const WsTableSchema *s, const char *schema, Buf *out)
 			put_check(s, con, out);
 			continue;
 		}
-		if (con->kind == WS_CONSTRAINT_EXCLUSION)
-		{
-			ws_put_text(out, " EXCLUDE USING ");
-			ws_put_identifier(out, con->excl.method);
-			put_index_columns(s, &con->excl, index_settings_of(s, con->name), out);
-			put_constraint_settings(s, index_settings_of(s, con->name), out);
-			put_index_predicate(s, &con->excl, out);
-		}
-		else
-		{
-			ws_put_text(out, con->nulls_not_distinct ? " UNIQUE NULLS NOT DISTINCT (" : " UNIQUE (");
-			for (int k = 0; k < con->ncols; k++)
-			{
-				if (k > 0)
-					ws_put_text(out, ", ");
-				ws_put_identifier(out, ws_schema_column(s, con->cols[k])->name);
-			}
-			ws_put_text(out, ")");
-			put_constraint_settings(s, index_settings_of(s, con->name), out);
-		}
-		if (con->deferrable)
-			ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
+		put_key_constraint(s, con, out);
 	}
 	ws_put_text(out, any ? "\n)" : ")");
 	if (s->noptions > 0 && s->partition == WS_PARTITION_NONE)
@@ -3757,7 +3764,7 @@ write_add_check(const WsTableSchema *s, const WsConstraint *con, const char *sch
 }
 
 static void
-write_add_exclusion(const WsTableSchema *s, const WsConstraint *con, const char *schema, Buf *out)
+write_add_constraint(const WsTableSchema *s, const WsConstraint *con, const char *schema, Buf *out)
 {
 	ws_put_text(out, "ALTER TABLE ");
 	ws_put_identifier(out, schema);
@@ -3765,13 +3772,10 @@ write_add_exclusion(const WsTableSchema *s, const WsConstraint *con, const char 
 	ws_put_identifier(out, s->name);
 	ws_put_text(out, " ADD CONSTRAINT ");
 	ws_put_identifier(out, con->name);
-	ws_put_text(out, " EXCLUDE USING ");
-	ws_put_identifier(out, con->excl.method);
-	put_index_columns(s, &con->excl, index_settings_of(s, con->name), out);
-	put_constraint_settings(s, index_settings_of(s, con->name), out);
-	put_index_predicate(s, &con->excl, out);
-	if (con->deferrable)
-		ws_put_text(out, con->initdeferred ? " DEFERRABLE INITIALLY DEFERRED" : " DEFERRABLE");
+	if (con->kind == WS_CONSTRAINT_CHECK)
+		put_check(s, con, out);
+	else
+		put_key_constraint(s, con, out);
 }
 
 /* One ALTER TABLE, of this table, adding this constraint, and nothing else. */
@@ -4019,7 +4023,7 @@ ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out)
 }
 
 void
-ws_schema_add_exclusion(const WsTableSchema *s, int n, const char *schema, Buf *out)
+ws_schema_add_constraint(const WsTableSchema *s, int n, const char *schema, Buf *out)
 {
 	const char *problem = ws_schema_problem(s);
 	WsTableSchema here;
@@ -4028,14 +4032,31 @@ ws_schema_add_exclusion(const WsTableSchema *s, int n, const char *schema, Buf *
 
 	if (problem != NULL)
 		elog(ERROR, "%s", problem);
-	if (n < 0 || n >= s->nconstraints || s->constraints[n].kind != WS_CONSTRAINT_EXCLUSION)
-		elog(ERROR, "no exclusion constraint at %d", n);
+	if (n < 0 || n >= s->nconstraints || s->constraints[n].not_valid)
+		elog(ERROR, "no constraint to add at %d", n);
 	cxt = statement_begin();
 	schema_in_server_encoding(s, &here);
-	write_add_exclusion(&here, &here.constraints[n], schema, &sql);
+	write_add_constraint(&here, &here.constraints[n], schema, &sql);
 	buf_append_byte(&sql, 0);
 	check_add_check_statement(&here, &here.constraints[n], schema, (char *) sql.data);
 	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_add_not_null(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out)
+{
+	const WsColumn *col = ws_schema_column(s, tag);
+
+	if (col == NULL || col->not_null == NULL)
+		elog(ERROR, "no not-null constraint on a column tagged " UINT64_FORMAT, tag);
+	ws_put_text(out, "ALTER TABLE ");
+	ws_put_identifier(out, schema);
+	ws_put_text(out, ".");
+	ws_put_identifier(out, ws_name_from_utf8(s->name));
+	ws_put_text(out, " ADD CONSTRAINT ");
+	ws_put_identifier(out, ws_name_from_utf8(col->not_null));
+	ws_put_text(out, " NOT NULL ");
+	ws_put_identifier(out, ws_name_from_utf8(col->name));
 }
 
 void

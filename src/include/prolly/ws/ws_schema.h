@@ -434,11 +434,14 @@ extern void ws_schema_create_index(const WsTableSchema *s, int n, const char *sc
 extern void ws_schema_add_check(const WsTableSchema *s, int n, const char *schema, Buf *out);
 
 /*
- * The ALTER TABLE adding the table's nth constraint, an exclusion, in the named schema, to
- * a table made without it, whose rows it is to say of (ws_viol.h), appended to out.
- * Checked as the table's statement is.
+ * The ALTER TABLE adding the table's nth constraint, not one not valid, in the named schema,
+ * to a table made without it (ws_viol.h), appended to out.  Checked as the table's
+ * statement is.
  */
-extern void ws_schema_add_exclusion(const WsTableSchema *s, int n, const char *schema, Buf *out);
+extern void ws_schema_add_constraint(const WsTableSchema *s, int n, const char *schema, Buf *out);
+
+/* The same of the not-null constraint of a column, by its tag. */
+extern void ws_schema_add_not_null(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out);
 
 /*
  * The ALTER TABLE attaching a partition to its partitioned table, in the named

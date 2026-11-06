@@ -59,10 +59,11 @@ typedef struct WsRootIORoutine
 	/*
 	 * Only what a root's tables are made of and their rows, attached, with no constraint
 	 * but their keys, no unique index and no foreign key to refuse them, in schema, and
-	 * then fn, while the statements' settings hold.
+	 * then fn, while the statements' settings hold.  roles_here says the roles it names are
+	 * this database's already, as of a root just captured, so none is to be made or checked.
 	 */
 	void		(*restore_rows) (ProllyCtx *ctx, const PHash *root, const char *schema,
-								 void (*fn) (void *arg, const char *schema), void *arg);
+								 void (*fn) (void *arg, const char *schema), void *arg, bool roles_here);
 
 	/* All restore makes, each table holding no_rows, an empty map of rows. */
 	void		(*restore_statements) (ProllyCtx *ctx, const PHash *root, const char *schema,
@@ -95,7 +96,7 @@ extern bool ws_root_refused(ProllyCtx *ctx, const PHash *root, const char *schem
 
 /* The same of restore_rows and fn, and of restore_statements. */
 extern bool ws_root_rows_refused(ProllyCtx *ctx, const PHash *root, const char *schema,
-								 void (*fn) (void *arg, const char *schema), void *arg,
+								 void (*fn) (void *arg, const char *schema), void *arg, bool roles_here,
 								 WsSqlFailure *failure);
 extern bool ws_root_statements_refused(ProllyCtx *ctx, const PHash *root, const char *schema, WsSqlFailure *failure);
 
