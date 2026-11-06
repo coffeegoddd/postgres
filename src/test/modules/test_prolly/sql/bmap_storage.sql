@@ -41,7 +41,6 @@ SELECT entries > 0 AS drained FROM test_bmap_release_drain();
 -- A dropped table's blocks are reused before the page store grows, with
 -- autovacuum on as off: the extension that needs them drains the release
 -- queue first.
-SHOW autovacuum;
 SET debug_block_mapped_heap = on;
 CREATE TABLE first_t AS SELECT g AS id, repeat('y', 200) AS pad
 FROM generate_series(1, 20000) g;

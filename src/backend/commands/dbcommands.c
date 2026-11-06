@@ -52,6 +52,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "prolly/capture.h"
 #include "postmaster/bgwriter.h"
 #include "prolly/chunk_tier.h"
 #include "replication/slot.h"
@@ -1519,6 +1520,15 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	new_record[Anum_pg_database_datlocprovider - 1] = CharGetDatum(dblocprovider);
 	new_record[Anum_pg_database_datistemplate - 1] = BoolGetDatum(dbistemplate);
 	new_record[Anum_pg_database_datallowconn - 1] = BoolGetDatum(dballowconnections);
+	{
+		HeapTuple	src_tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(src_dboid));
+
+		if (!HeapTupleIsValid(src_tuple))
+			elog(ERROR, "cache lookup failed for database %u", src_dboid);
+		new_record[Anum_pg_database_datversioned - 1] =
+			BoolGetDatum(((Form_pg_database) GETSTRUCT(src_tuple))->datversioned);
+		ReleaseSysCache(src_tuple);
+	}
 	new_record[Anum_pg_database_dathasloginevt - 1] = BoolGetDatum(src_hasloginevt);
 	new_record[Anum_pg_database_datconnlimit - 1] = Int32GetDatum(dbconnlimit);
 	new_record[Anum_pg_database_datfrozenxid - 1] = TransactionIdGetDatum(src_frozenxid);
@@ -1804,6 +1814,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * creation of new slots using the database or existing slots becoming
 	 * active.
 	 */
+	CaptureDatabaseDropping(db_id);
 	(void) ReplicationSlotsCountDBSlots(db_id, &nslots, &nslots_active);
 	if (nslots_active)
 	{

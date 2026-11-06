@@ -20,6 +20,7 @@ OBJS = \
 	branch_catalog_copy.o \
 	branch_catalog_ops.o \
 	branch_filter.o \
+	capture.o \
 	chunk_freer.o \
 	chunk_index.o \
 	chunk_lane.o \

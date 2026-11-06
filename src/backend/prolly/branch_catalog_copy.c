@@ -121,6 +121,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/capture.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
@@ -2238,6 +2239,7 @@ const BranchCatalogCopyRoutine *BranchCatalogCopy = &DependencyBranchCatalogCopy
 Datum
 pg_branch_catalog_copy(PG_FUNCTION_ARGS)
 {
+	CaptureSchemaMade();
 	BranchCatalogCopy->copy(PG_GETARG_INT32(0), PG_GETARG_INT32(1));
 	PG_RETURN_VOID();
 }

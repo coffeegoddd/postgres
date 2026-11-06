@@ -429,6 +429,13 @@
   options => 'bytea_output_options',
 },
 
+{ name => 'capture_in_background', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_SENDING',
+  short_desc => 'Keeps each branch\'s working tree equal to its tables from the WAL.',
+  long_desc => 'One background worker per database with a versioned schema decodes the WAL on one logical slot. Turning this off drops those slots, so they hold no WAL.',
+  variable => 'capture_in_background',
+  boot_val => 'true',
+},
+
 { name => 'catalog_branch', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Sets the branch whose versioned schemas this session sees.',
   long_desc => '0 means no branch: the session sees only shared schemas.',

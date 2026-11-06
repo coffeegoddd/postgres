@@ -31,6 +31,7 @@
 #include "parser/parse_utilcmd.h"
 #include "parser/scansup.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/capture.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -163,6 +164,8 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 	 * Create the schema's namespace: a versioned schema's goes on the
 	 * session's branch
 	 */
+	if (stmt->versioned)
+		CaptureSchemaMade();
 	namespaceId = NamespaceCreateOnBranch(schemaName, owner_uid, false,
 										  stmt->versioned ?
 										  VersionedNamespaceBranch(schemaName) : 0);

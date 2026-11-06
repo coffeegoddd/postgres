@@ -106,6 +106,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
+#include "prolly/capture.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -923,6 +924,7 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+	CaptureLauncherRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

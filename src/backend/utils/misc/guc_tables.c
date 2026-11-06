@@ -74,6 +74,7 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_filter.h"
 #include "prolly/chunk_format.h"
+#include "prolly/capture.h"
 #include "prolly/chunk_freer.h"
 #include "prolly/chunk_tier.h"
 #include "postmaster/walwriter.h"

@@ -21,6 +21,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
 #include "postmaster/postmaster.h"
+#include "prolly/capture.h"
 #include "prolly/chunk_freer.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
@@ -171,6 +172,14 @@ static const struct
 	{
 		.fn_name = "ChunkFreerMain",
 		.fn_addr = ChunkFreerMain
+	},
+	{
+		.fn_name = "CaptureLauncherMain",
+		.fn_addr = CaptureLauncherMain
+	},
+	{
+		.fn_name = "CaptureWorkerMain",
+		.fn_addr = CaptureWorkerMain
 	}
 };
 

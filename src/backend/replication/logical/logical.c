@@ -35,6 +35,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "prolly/capture.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/reorderbuffer.h"
@@ -185,7 +186,12 @@ StartupDecodingContext(List *output_plugin_options,
 		const char *plugin = NameStr(slot->data.plugin);
 		bool		plugin_allowed = false;
 
-		if (strcmp(plugin, "pgrepack") == 0)
+		if (strcmp(plugin, PROLLY_CAPTURE_PLUGIN) == 0)
+		{
+			/* (built in, as the server's own) */
+			plugin_allowed = true;
+		}
+		else if (strcmp(plugin, "pgrepack") == 0)
 		{
 			/*
 			 * REPACK is a special case -- print a more helpful error message
@@ -816,8 +822,12 @@ LoadOutputPlugin(OutputPluginCallbacks *callbacks, const char *plugin)
 {
 	LogicalOutputPluginInit plugin_init;
 
-	plugin_init = (LogicalOutputPluginInit)
-		load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
+	/* (capture's is built in, as a server that needs it may have no library path) */
+	if (strcmp(plugin, PROLLY_CAPTURE_PLUGIN) == 0)
+		plugin_init = CaptureOutputPluginInit;
+	else
+		plugin_init = (LogicalOutputPluginInit)
+			load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
 
 	if (plugin_init == NULL)
 		elog(ERROR, "output plugins have to declare the _PG_output_plugin_init symbol");
