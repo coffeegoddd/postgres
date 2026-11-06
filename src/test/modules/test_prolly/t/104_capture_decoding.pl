@@ -102,13 +102,27 @@ $node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$to'::pg_l
 is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (.*)$/mg), "begin\ninsert t old=no new=yes\ncommit",
 	'a transaction open across a restart of the worker is seen once it commits, and nothing twice');
 
+# Leaves an open transaction with a record only part flushed, that capture has had time to look at.
+# (A running_xacts record can flush the rest, so that needs another try.)
+sub part_flushed
+{
+	my ($session) = @_;
+	for (1 .. 5)
+	{
+		$session->query_safe(q{BEGIN; SELECT pg_logical_emit_message(true, 'p', repeat('x', 160000))});
+		sleep(3);
+		return 1
+		  if $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn() < pg_current_wal_insert_lsn()') eq 't';
+		$session->query_safe('ROLLBACK');
+	}
+	return 0;
+}
+
 # a record part flushed is read whole once the rest is
 {
 	my $whole = $node->background_psql('postgres');
 	my $from = -s $node->logfile;
-	$whole->query_safe(q{BEGIN; SELECT pg_logical_emit_message(true, 'p', repeat('x', 160000))});
-	sleep(3);
-	is($node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn() < pg_current_wal_insert_lsn()'), 't', 'the record is only part flushed');
+	ok(part_flushed($whole), 'the record is only part flushed');
 	$whole->query_safe('COMMIT');
 	$whole->quit;
 	my $end = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
@@ -120,9 +134,7 @@ is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (.*)$/mg), "begin\nin
 # with the rest never coming, the worker waits in its loop, and goes with the postmaster
 my $part = $node->background_psql('postgres');
 my $wpid = $node->safe_psql('postgres', qq{SELECT active_pid FROM pg_replication_slots WHERE slot_name = '$slot'});
-$part->query_safe(q{BEGIN; SELECT pg_logical_emit_message(true, 'p', repeat('x', 160000))});
-sleep(3);
-is($node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn() < pg_current_wal_insert_lsn()'), 't', 'the record is only part flushed');
+ok(part_flushed($part), 'the record is only part flushed');
 $node->kill9;
 my $gone = 0;
 for (1 .. 100)

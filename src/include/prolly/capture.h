@@ -21,7 +21,10 @@
  * and not text.  What decoding finds goes to a CaptureSink, in commit order, a transaction at a
  * time and only once it has committed: what is rolled back is never seen, and a transaction of
  * nothing but DDL is a begin and a commit.  A worker stopped in the middle of telling a transaction
- * tells all of it again: a begin means whatever came since the last commit is void.  A materialized
+ * tells all of it again: a begin means whatever came since the last commit is void.  After a crash
+ * a transaction already told whole can be told again, so a sink keeping anything goes by the
+ * positions it is given.  Someone with REPLICATION rights could advance or drop the slot in the
+ * moment it has no worker, and what that skips isn't told.  A materialized
  * view's rows are never told, nor those of any table's rewrite.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -67,8 +70,9 @@ typedef struct CaptureSink
 	const char *name;
 
 	/*
-	 * Each time a worker starts: all that commits after this position is told.  What committed before
-	 * a slot's first position never is.  With no transaction running.
+	 * Each time a worker starts: all that commits after this position is told, and some before it
+	 * may be again.  What committed before a slot's first position never is.  With no transaction
+	 * running.
 	 */
 	void		(*start) (XLogRecPtr from);
 	void		(*begin) (TransactionId xid, XLogRecPtr final_lsn);
