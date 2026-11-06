@@ -459,8 +459,13 @@ capture_slot_create(const char *name)
 {
 	LogicalDecodingContext *ctx;
 
-	StartTransactionCommand();
+	/*
+	 * (with the name held, so another worker starting too doesn't take this for its own new slot,
+	 * and before it's persisted, as a worker can die just after)
+	 */
 	ReplicationSlotCreate(name, true, RS_EPHEMERAL, false, false, false, false);
+	CaptureSinkInUse->slot_to_be_made();
+	StartTransactionCommand();
 	EnsureLogicalDecodingEnabled();
 	ctx = CreateInitDecodingContext(PROLLY_CAPTURE_PLUGIN, NIL, false, false, InvalidXLogRecPtr,
 									XL_ROUTINE(.page_read = read_local_xlog_page,
@@ -591,7 +596,6 @@ capture_slot_ready(const char *name)
 	}
 	if (!exists)
 	{
-		CaptureSinkInUse->slot_to_be_made();
 		capture_slot_create(name);
 		INJECTION_POINT("capture-slot-made", NULL);
 	}

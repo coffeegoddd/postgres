@@ -18,7 +18,7 @@
  *
  * A row map holds only what decoding was told, so only a table made since capture
  * began can have one.  The branch 0 row of pg_history.capture_positions says capture
- * began, and goes before any new slot is made.  A worker finding none forgets all it
+ * began, and goes before any new slot it makes is kept.  A worker finding none forgets all it
  * holds and marks each table there now in pg_history.capture_tables, and a change to
  * one of those is an error.  So is a table's layout differing from the one recorded
  * there, which outlasts the worker, so capture stays stopped.
@@ -39,7 +39,7 @@
  * every table: so a restore, which writes rows before making keys, or a table made
  * and marked before capture got started, stops it for good.  DDL that leaves the
  * layout as it was and its replica identity giving the key isn't noticed, nor capture
- * to trees being turned off for a while and on again with the same slot, nor an
+ * to trees being turned off for a while and on again, nor an
  * object id used again while its old row map is kept.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
@@ -246,6 +246,12 @@ tree_table_of(Relation relation)
 	TreeTable  *table;
 	MemoryContext old;
 
+	CaptureRelationShape(relation, &shape);
+	if (shape.nkey == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees does not hold \"%s\", which has no primary key",
+						RelationGetRelationName(relation))));
 	/* (each time, as it can change and leave the layout as it was) */
 	if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL &&
 		(relation->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT ||
@@ -254,7 +260,6 @@ tree_table_of(Relation relation)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("capture to trees does not hold \"%s\", whose replica identity does not give its primary key",
 						RelationGetRelationName(relation))));
-	CaptureRelationShape(relation, &shape);
 	foreach(lc, tree_tables)
 	{
 		table = lfirst(lc);
@@ -269,11 +274,6 @@ tree_table_of(Relation relation)
 		ws_row_shape_free(&shape);
 		return table;
 	}
-	if (shape.nkey == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("capture to trees does not hold \"%s\", which has no primary key",
-						RelationGetRelationName(relation))));
 	ws_row_shape_free(&shape);
 	old = MemoryContextSwitchTo(tree_tables_cxt);
 	table = palloc_object(TreeTable);

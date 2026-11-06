@@ -101,8 +101,9 @@ typedef struct CaptureSink
 	void		(*apply) (void);
 
 	/*
-	 * A new slot is about to be made, so what the sink has kept may not join what it is told next.
-	 * With no transaction running, and before the slot is made, as a worker can die just after.
+	 * A new slot is being made, so what the sink has kept may not join what it is told next.  With
+	 * no transaction running and the slot's name held, and before the slot is kept, as a worker can
+	 * die just after.
 	 */
 	void		(*slot_to_be_made) (void);
 } CaptureSink;

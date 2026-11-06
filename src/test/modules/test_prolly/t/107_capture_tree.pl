@@ -244,6 +244,36 @@ for my $case (
 	$node->stop;
 }
 
+# nor is a table with no key, and a truncate and a value it wasn't given stop it too
+$on = fresh_node('keyless');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (a integer)");
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1)");
+ok($node->wait_for_log(qr/which has no primary key/, $from), 'a table with no primary key');
+$node->stop;
+
+$on = fresh_node('truncate');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
+caught_up();
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on TRUNCATE s.t");
+ok($node->wait_for_log(qr/does not follow a truncate of "t"/, $from), 'a truncate');
+$node->stop;
+
+$on = fresh_node('unchanged_toast');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, n integer, v text); ALTER TABLE s.t ALTER v SET STORAGE EXTERNAL; INSERT INTO s.t VALUES (1, 1, repeat('x', 100000))");
+caught_up();
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on UPDATE s.t SET n = 2");
+ok($node->wait_for_log(qr/was not given column "v" of "t"/, $from), 'an unchanged TOASTed value');
+$node->stop;
+
 # rows there before capture began aren't in any map, so that table isn't held
 $on = fresh_node('schema_txn');
 $node->safe_psql('postgres', "$on BEGIN; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1); COMMIT");
