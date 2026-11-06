@@ -436,6 +436,14 @@
   boot_val => 'true',
 },
 
+{ name => 'capture_to_trees', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Applies what capture decodes to each table\'s row map.',
+  long_desc => 'It does not yet follow DDL, truncates or tables with no primary key, and capture stops at any of them.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'capture_to_trees',
+  boot_val => 'false',
+},
+
 { name => 'catalog_branch', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Sets the branch whose versioned schemas this session sees.',
   long_desc => '0 means no branch: the session sees only shared schemas.',

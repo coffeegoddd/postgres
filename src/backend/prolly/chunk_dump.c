@@ -305,7 +305,9 @@ pg_history_export(PG_FUNCTION_ARGS)
 
 	/* the pointers, read under the same snapshot */
 	SPI_connect();
-	if (SPI_execute("SELECT name, hash FROM pg_history.pointers ORDER BY name", true, 0) != SPI_OK_SELECT)
+	/* (not capture's references, which name relations by object id: a restored store begins again) */
+	if (SPI_execute("SELECT name, hash FROM pg_history.pointers WHERE name NOT LIKE 'capture/%' ORDER BY name",
+					true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the history store's pointers");
 	for (uint64 r = 0; r < SPI_processed; r++)
 	{

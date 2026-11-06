@@ -60,17 +60,24 @@ jobs:
           make -s -j4 -C contrib COPT=-Werror
           make -s -j4 -C src/test/modules COPT=-Werror
 
+      # (each with a limit of its own, well short of the job's: a test that hangs
+      # fails its step, and the logs are then uploaded, as they aren't for a job
+      # out of time.  Most of a TAP test's time is waiting, so -j4 shares well.)
       - name: Postgres regression tests
+        timeout-minutes: 10
         run: make check
 
       - name: Engine unit tests and interface conformance (test_prolly)
-        run: make -C src/test/modules/test_prolly check
+        timeout-minutes: 25
+        run: make -C src/test/modules/test_prolly check PROVE_FLAGS='-j4 --timer'
 
       - name: Requirements suite, validated against heap
-        run: make -C src/test/prolly check-heap
+        timeout-minutes: 10
+        run: make -C src/test/prolly check-heap PROVE_FLAGS='-j4 --timer'
 
       - name: Requirements suite on the access method under test
-        run: make -C src/test/prolly check
+        timeout-minutes: 10
+        run: make -C src/test/prolly check PROVE_FLAGS='-j4 --timer'
 
       - name: Upload logs
         if: failure()
@@ -134,9 +141,11 @@ jobs:
           make -s -j4 -C src/test/modules
 
       - name: Isolation tests
+        timeout-minutes: 15
         run: make -C src/test/isolation check
 
       - name: Recovery tests
+        timeout-minutes: 30
         run: make -C src/test/recovery check PROVE_FLAGS='-j4 --timer'
 
       - name: Upload logs
@@ -212,12 +221,15 @@ jobs:
           make -s -j4 -C src/test/modules
 
       - name: Postgres regression tests
+        timeout-minutes: 30
         run: make check
 
       - name: Engine unit tests and interface conformance (test_prolly)
+        timeout-minutes: 80
         run: make -C src/test/modules/test_prolly check
 
       - name: Requirements suite
+        timeout-minutes: 30
         run: make -C src/test/prolly check
 
       - name: Upload logs
@@ -226,6 +238,7 @@ jobs:
         with:
           name: sanitizer-logs
           path: |
+            **/log/postmaster.log
             **/regression.diffs
             **/tmp_check/log/**
             **/output_iso/regression.diffs
@@ -253,6 +266,7 @@ jobs:
           make -s -j4 -C src/test/modules
 
       - name: Upstream suites on block-mapped storage
+        timeout-minutes: 120
         run: make -C src/test/prolly check-upstream-bmap PROVE_FLAGS='-j4 --timer'
 
       - name: Upload logs
@@ -285,6 +299,7 @@ jobs:
           make -s -j4 world-bin
 
       - name: check-world
+        timeout-minutes: 150
         run: make -j4 -Otarget check-world PROVE_FLAGS=--timer
 
       - name: Upload logs
