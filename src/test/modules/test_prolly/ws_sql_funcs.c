@@ -56,6 +56,7 @@ PG_FUNCTION_INFO_V1(test_ws_role_bytes);
 PG_FUNCTION_INFO_V1(test_ws_role_mark);
 PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
+PG_FUNCTION_INFO_V1(test_ws_schema_shape);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
@@ -795,6 +796,28 @@ rows_record(const char *schema, const char *table, WsTableSchema *rec)
 {
 	if (!ws_schema_read(schema, table, rec))
 		elog(ERROR, "no table \"%s\" in schema \"%s\"", table, schema);
+}
+
+/* test_ws_schema_shape(schema text, table text) returns text: what its record says its rows are */
+Datum
+test_ws_schema_shape(PG_FUNCTION_ARGS)
+{
+	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *table = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	WsTableSchema s;
+	WsRowShape	shape;
+	StringInfoData out;
+
+	if (!ws_schema_read(schema, table, &s))
+		PG_RETURN_NULL();
+	ws_schema_row_shape(&s, &shape);
+	initStringInfo(&out);
+	appendStringInfo(&out, "nkey=%d tags=", shape.nkey);
+	for (int i = 0; i < shape.nstored; i++)
+		appendStringInfo(&out, "%s" UINT64_FORMAT, i > 0 ? "," : "", shape.tags[i]);
+	ws_row_shape_free(&shape);
+	ws_schema_free(&s);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 
 /* test_ws_rows_hash(schema text, table text) returns text: its row map's root */
