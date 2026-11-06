@@ -27,8 +27,10 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "prolly/capture.h"
+#include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalctl.h"
+#include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -43,6 +45,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
 
@@ -71,26 +74,68 @@ capture_possible(void)
 
 /* -------------------------------------------------------------- the plugin */
 
+/* Only the worker tells the sink, so a session can't be a second writer behind it. */
+static bool am_capture_worker = false;
+
 static void
 capture_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
 {
+	if (!am_capture_worker)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("output plugin \"%s\" is for capture's background worker alone", PROLLY_CAPTURE_PLUGIN)));
 	opt->output_type = OUTPUT_PLUGIN_BINARY_OUTPUT;
 }
 
 static void
 capture_begin(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
+	CaptureSinkInUse->begin(txn->xid, txn->final_lsn);
 }
 
 static void
 capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation relation,
 			   ReorderBufferChange *change)
 {
+	CaptureChange out = {.relation = relation, .lsn = change->lsn};
+
+	switch (change->action)
+	{
+		case REORDER_BUFFER_CHANGE_INSERT:
+			out.kind = CAPTURE_INSERT;
+			break;
+		case REORDER_BUFFER_CHANGE_UPDATE:
+			out.kind = CAPTURE_UPDATE;
+			break;
+		case REORDER_BUFFER_CHANGE_DELETE:
+			out.kind = CAPTURE_DELETE;
+			break;
+		default:
+			elog(ERROR, "unexpected change of kind %d decoded", (int) change->action);
+	}
+	out.old_tuple = change->data.tp.oldtuple;
+	out.new_tuple = change->data.tp.newtuple;
+	CaptureSinkInUse->change(&out);
+}
+
+static void
+capture_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, int nrelations, Relation relations[],
+				 ReorderBufferChange *change)
+{
+	CaptureSinkInUse->truncate(relations, nrelations, change->data.truncate.restart_seqs, change->lsn);
+}
+
+static void
+capture_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr lsn, bool transactional,
+				const char *prefix, Size size, const char *message)
+{
+	CaptureSinkInUse->message(prefix, message, size, transactional, lsn);
 }
 
 static void
 capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
 {
+	CaptureSinkInUse->commit(txn->xid, commit_lsn, txn->end_lsn);
 }
 
 void
@@ -99,8 +144,65 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 	callbacks->startup_cb = capture_startup;
 	callbacks->begin_cb = capture_begin;
 	callbacks->change_cb = capture_change;
+	callbacks->truncate_cb = capture_truncate;
+	callbacks->message_cb = capture_message;
 	callbacks->commit_cb = capture_commit;
 }
+
+/* ------------------------------------------------------------------ the sink */
+
+static void
+logging_start(XLogRecPtr from)
+{
+	elog(DEBUG1, "capture starts at %X/%X", LSN_FORMAT_ARGS(from));
+}
+
+static void
+logging_begin(TransactionId xid, XLogRecPtr final_lsn)
+{
+	elog(DEBUG1, "capture: begin");
+}
+
+static void
+logging_change(const CaptureChange *change)
+{
+	elog(DEBUG1, "capture: %s %s old=%s new=%s",
+		 change->kind == CAPTURE_INSERT ? "insert" : change->kind == CAPTURE_UPDATE ? "update" : "delete",
+		 RelationGetRelationName(change->relation),
+		 change->old_tuple != NULL ? "yes" : "no", change->new_tuple != NULL ? "yes" : "no");
+}
+
+static void
+logging_truncate(Relation *relations, int n, bool restart_seqs, XLogRecPtr lsn)
+{
+	for (int i = 0; i < n; i++)
+		elog(DEBUG1, "capture: truncate %s restart=%s", RelationGetRelationName(relations[i]),
+			 restart_seqs ? "yes" : "no");
+}
+
+static void
+logging_message(const char *prefix, const char *data, Size size, bool transactional, XLogRecPtr lsn)
+{
+	elog(DEBUG1, "capture: message %s size=%zu transactional=%s", prefix, size, transactional ? "yes" : "no");
+}
+
+static void
+logging_commit(TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn)
+{
+	elog(DEBUG1, "capture: commit");
+}
+
+const CaptureSink LoggingCaptureSink = {
+	.name = "logging",
+	.start = logging_start,
+	.begin = logging_begin,
+	.change = logging_change,
+	.truncate = logging_truncate,
+	.message = logging_message,
+	.commit = logging_commit,
+};
+
+const CaptureSink *CaptureSinkInUse = &LoggingCaptureSink;
 
 /* ---------------------------------------------------------------- starting */
 
@@ -281,17 +383,51 @@ capture_slot_create(const char *name)
 	CommitTransactionCommand();
 }
 
-/* Moves the slot up to what is flushed, so it holds nothing back. */
-static void
-capture_advance(void)
-{
-	XLogRecPtr	to = GetFlushRecPtr(NULL);
+static bool capture_at_end_of_wal = false;
 
-	if (MyReplicationSlot->data.confirmed_flush >= to)
-		return;
-	StartTransactionCommand();
-	(void) LogicalSlotAdvanceAndCheckSnapState(to, NULL);
-	CommitTransactionCommand();
+/*
+ * Reads a page if it is there.  The reader's own private data is the decoding context, which this
+ * isn't to touch, and returning to the worker's loop is how it notices the postmaster going.
+ */
+static int
+capture_page_read(XLogReaderState *state, XLogRecPtr target_page, int req_len, XLogRecPtr target_rec, char *buf)
+{
+	void	   *ctx = state->private_data;
+	ReadLocalXLogPageNoWaitPrivate nowait = {0};
+	int			n;
+
+	state->private_data = &nowait;
+	n = read_local_xlog_page_no_wait(state, target_page, req_len, target_rec, buf);
+	state->private_data = ctx;
+	if (nowait.end_of_wal)
+		capture_at_end_of_wal = true;
+	return n;
+}
+
+/*
+ * Decodes what is flushed now, and says it was.  With a record that goes past what's flushed, it
+ * stops at the one before, to read it whole later.
+ */
+static void
+capture_decode(LogicalDecodingContext *ctx)
+{
+	XLogRecPtr	flushed = GetFlushRecPtr(NULL);
+	XLogRecPtr	from = ctx->reader->EndRecPtr;
+
+	capture_at_end_of_wal = false;
+	while (ctx->reader->EndRecPtr < flushed && !capture_at_end_of_wal)
+	{
+		char	   *errm = NULL;
+		XLogRecord *record = XLogReadRecord(ctx->reader, &errm);
+
+		if (errm != NULL)
+			elog(ERROR, "could not read a record for capture: %s", errm);
+		if (record != NULL)
+			LogicalDecodingProcessRecord(ctx, ctx->reader);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (ctx->reader->EndRecPtr > from)
+		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 }
 
 /*
@@ -369,7 +505,9 @@ CaptureWorkerMain(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
 	char		name[NAMEDATALEN];
+	LogicalDecodingContext *ctx;
 
+	am_capture_worker = true;
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -388,6 +526,14 @@ CaptureWorkerMain(Datum main_arg)
 	if (!capture_slot_ready(name))
 		proc_exit(0);
 	ReplicationSlotAcquire(name, true, true);
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "capture");
+	ctx = CreateDecodingContext(InvalidXLogRecPtr, NIL, false,
+								XL_ROUTINE(.page_read = capture_page_read,
+										   .segment_open = wal_segment_open,
+										   .segment_close = wal_segment_close),
+								NULL, NULL, NULL);
+	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
+	CaptureSinkInUse->start(MyReplicationSlot->data.confirmed_flush);
 
 	for (;;)
 	{
@@ -403,11 +549,12 @@ CaptureWorkerMain(Datum main_arg)
 			break;
 		if (!database_has_versioned_schema() && capture_clear_mark())
 		{
+			FreeDecodingContext(ctx);
 			ReplicationSlotRelease();
 			ReplicationSlotDrop(name, true);
 			break;
 		}
-		capture_advance();
+		capture_decode(ctx);
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 CAPTURE_WORKER_NAPTIME_MS, WAIT_EVENT_CAPTURE_WORKER_MAIN);
 		ResetLatch(MyLatch);

@@ -230,6 +230,7 @@ tests += {
       't/101_ws_merge_definitions.pl',
       't/102_ws_pg_dump_coverage.pl',
       't/103_capture_worker.pl',
+      't/104_capture_decoding.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
