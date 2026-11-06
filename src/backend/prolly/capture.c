@@ -20,9 +20,11 @@
 #include "access/xlogutils.h"
 #include "access/xlog_internal.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
+#include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -46,6 +48,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
@@ -109,6 +112,41 @@ relation_branch(Relation relation)
 	branch = ((Form_pg_namespace) GETSTRUCT(tup))->nspbranch;
 	ReleaseSysCache(tup);
 	return branch;
+}
+
+void
+CaptureRelationShape(Relation relation, WsRowShape *shape)
+{
+	TupleDesc	desc = RelationGetDescr(relation);
+	uint64	   *tags = palloc_array(uint64, Max(desc->natts, 1));
+	Oid			pk = RelationGetPrimaryKeyIndex(relation, true);
+	Relation	index = OidIsValid(pk) ? RelationIdGetRelation(pk) : NULL;
+	int			nkey = index != NULL ? index->rd_index->indnkeyatts : 0;
+	int			n = 0;
+
+	if (OidIsValid(pk) && !RelationIsValid(index))
+		elog(ERROR, "could not open relation with OID %u", pk);
+	for (int k = 0; k < nkey; k++)
+		tags[n++] = (uint64) TupleDescAttr(desc, index->rd_index->indkey.values[k] - 1)->attcoltag;
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool		in_key = false;
+
+		for (int k = 0; k < nkey; k++)
+			in_key |= index->rd_index->indkey.values[k] == att->attnum;
+		if (!att->attisdropped && att->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL && !in_key)
+			tags[n++] = (uint64) att->attcoltag;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		if (tags[i] == 0)
+			elog(ERROR, "a column of \"%s\" has no tag, in a versioned schema", RelationGetRelationName(relation));
+	}
+	if (index != NULL)
+		RelationClose(index);
+	ws_row_shape_init(shape, tags, n, nkey);
+	pfree(tags);
 }
 
 static void
@@ -193,6 +231,20 @@ logging_begin(TransactionId xid, XLogRecPtr final_lsn)
 static void
 logging_change(const CaptureChange *change)
 {
+	if (message_level_is_interesting(DEBUG1))
+	{
+		WsRowShape	shape;
+		StringInfoData tags;
+
+		CaptureRelationShape(change->relation, &shape);
+		initStringInfo(&tags);
+		for (int i = 0; i < shape.nstored; i++)
+			appendStringInfo(&tags, "%s" UINT64_FORMAT, i > 0 ? "," : "", shape.tags[i]);
+		elog(DEBUG1, "capture layout: %s nkey=%d tags=%s", RelationGetRelationName(change->relation),
+			 shape.nkey, tags.data);
+		pfree(tags.data);
+		ws_row_shape_free(&shape);
+	}
 	elog(DEBUG1, "capture: branch %d: %s %s old=%s new=%s", change->branch,
 		 change->kind == CAPTURE_INSERT ? "insert" : change->kind == CAPTURE_UPDATE ? "update" : "delete",
 		 RelationGetRelationName(change->relation),
