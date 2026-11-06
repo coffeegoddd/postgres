@@ -238,6 +238,7 @@ tests += {
       't/109_client_tools_history.pl',
       't/110_capture_ddl.pl',
       't/111_capture_rebuild.pl',
+      't/112_capture_barrier.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

@@ -64,6 +64,7 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
 #include "prolly/chunkstore.h"
 #include "prolly/engine/prolly.h"
@@ -475,11 +476,21 @@ tree_rows_batch(const char *p, const char *end)
 	MemoryContextSwitchTo(old);
 }
 
+/* A barrier's marker just told, to be seen to before the next record is read. */
+static int32 tree_barrier_branch = 0;
+static XLogRecPtr tree_barrier_lsn = InvalidXLogRecPtr;
+
 static void
 tree_message(const char *prefix, const char *data, Size size, bool transactional, XLogRecPtr lsn)
 {
 	const char *end = data + size;
 
+	if (!transactional && strcmp(prefix, CAPTURE_BARRIER_PREFIX) == 0)
+	{
+		tree_barrier_branch = read_int32(&data, end);
+		tree_barrier_lsn = lsn;
+		return;
+	}
 	if (!transactional || strcmp(prefix, CAPTURE_ROWS_PREFIX) != 0)
 		return;
 	if (size < 1)
@@ -1076,6 +1087,64 @@ tree_slot_will_do(void)
 	return began;
 }
 
+/*
+ * A barrier's marker: all that committed before it has been told, and what's held is applied, with
+ * each of the branch's row maps saved as of it, for whoever's waiting.
+ */
+static void
+tree_after_record(void)
+{
+	int32		branch = tree_barrier_branch;
+	XLogRecPtr	lsn = tree_barrier_lsn;
+	ChunkStore *cs;
+	VcRefs	   *refs;
+	List	   *names = NIL;
+	Oid			types[1] = {PG_LSNOID};
+	Datum		values[1] = {LSNGetDatum(lsn)};
+
+	if (XLogRecPtrIsInvalid(lsn))
+		return;
+	tree_barrier_lsn = InvalidXLogRecPtr;
+	tree_apply();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	cs = ChunkStoreOpen("pages");
+	refs = VcRefsOpen("pointers", cs);
+
+	/* (barriers take turns, so any before this was given up on, and left this behind) */
+	refs->routine->list(refs, CAPTURE_BARRIER_REF_PREFIX, tree_forget_ref, &names);
+	foreach_ptr(char, name, names)
+		(void) refs->routine->remove(refs, name);
+	tree_exec("DELETE FROM pg_history.capture_barriers", SPI_OK_DELETE);
+	names = NIL;
+
+	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);
+	foreach_ptr(char, name, names)
+	{
+		Oid			relid = (Oid) strtoul(name + strlen("capture/map/"), NULL, 10);
+		char		saved[128];
+		PHash		map;
+
+		if (NamespaceBranch(get_rel_namespace(relid)) != branch)
+			continue;
+		if (!refs->routine->get(refs, name, VC_REF_READ, &map))
+			elog(ERROR, "a row map went while a barrier was saving it");
+		snprintf(saved, sizeof(saved), CAPTURE_BARRIER_REF_PREFIX "%X/%X/%u", LSN_FORMAT_ARGS(lsn), relid);
+		refs->routine->set(refs, saved, &map);
+	}
+
+	/* (it may be told again, after a crash, of which whoever's waiting has seen nothing) */
+	if (SPI_execute_with_args("INSERT INTO pg_history.capture_barriers VALUES ($1) ON CONFLICT (lsn) DO NOTHING",
+							  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not save a barrier");
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+}
+
 const CaptureSink TreeCaptureSink = {
 	.name = "tree",
 	.reads_at_start = true,
@@ -1086,6 +1155,7 @@ const CaptureSink TreeCaptureSink = {
 	.message = tree_message,
 	.commit = tree_end,
 	.apply = tree_apply,
+	.after_record = tree_after_record,
 	.slot_to_be_made = tree_slot_to_be_made,
 	.slot_made = tree_slot_made,
 	.slot_will_do = tree_slot_will_do,

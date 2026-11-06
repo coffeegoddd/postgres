@@ -18,6 +18,7 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "prolly/capture.h"
 #include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
@@ -57,6 +58,8 @@ PG_FUNCTION_INFO_V1(test_ws_role_mark);
 PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_schema_shape);
+PG_FUNCTION_INFO_V1(test_capture_barrier);
+PG_FUNCTION_INFO_V1(test_capture_commit);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
@@ -921,6 +924,46 @@ test_ws_root_capture(PG_FUNCTION_ARGS)
 
 	WsRootIO->capture(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(0)), &root);
 	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* test_capture_barrier(schema text, timeout_ms integer) returns text: the root as of an exact point */
+Datum
+test_capture_barrier(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	PHash		root;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	CaptureBarrier(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_INT32(1), &root);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/*
+ * test_capture_commit(schema text, msg text, dest text) returns text: a commit of the schema from
+ * capture on "main", its root as that commit holds it restored in a new schema.  Its hash.
+ */
+Datum
+test_capture_commit(PG_FUNCTION_ARGS)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	ProllyCtx	ctx;
+	VcRepo		repo;
+	PHash		root;
+	PHash		commit;
+	VcCommit	made;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	CaptureBarrier(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), 60000, &root);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	commit = vc_commit_root(&repo, &root, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	if (!vc_commit_load(&ctx, &commit, &made))
+		elog(ERROR, "the commit just made is gone");
+	WsRootIO->restore(&ctx, &made.root, NULL, text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	vc_commit_release(&made);
+	vc_repo_free(&repo);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(hash_text(&commit));
 }
 
 /* test_ws_root_restore(root text, dest text) returns void: of a root this backend captured */
