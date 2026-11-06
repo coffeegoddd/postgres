@@ -44,6 +44,27 @@ sub same_root
 	return $from_capture;
 }
 
+# A barrier in another session, that has written its marker, with the worker stopped.
+sub barrier_held
+{
+	my ($on) = @_;
+	my $at = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
+	my $bg = $node->background_psql('postgres');
+	$bg->query_until(qr/started/, "\\echo started\n$on SELECT test_capture_barrier('s') AS root \\gset\n\\echo :root\n\\echo finished\n");
+	$node->poll_query_until('postgres', qq{SELECT pg_current_wal_flush_lsn() > '$at'::pg_lsn}) or die 'no marker';
+	return $bg;
+}
+
+sub barrier_result
+{
+	my ($bg) = @_;
+	$bg->{stdout} = '';
+	$bg->{run}->pump until $bg->{stdout} =~ /finished/ || !$bg->{run}->pumpable;
+	my ($root) = $bg->{stdout} =~ /^([0-9a-f]{40})$/m;
+	$bg->quit;
+	return $root;
+}
+
 same_root('s', $on1, 'a schema with nothing in it');
 $node->safe_psql('postgres', "$on1 CREATE TABLE s.t (id integer PRIMARY KEY, v text)");
 same_root('s', $on1, 'a table with no rows');
@@ -89,24 +110,67 @@ my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHE
 SKIP:
 {
 	skip 'no way to stop a process', 2 if $windows_os;
-	my $marker_at = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
 	kill 'STOP', $worker;
-	my $bg = $node->background_psql('postgres');
-	$bg->query_until(qr/started/, "\\echo started\n$on1 SELECT test_capture_barrier('s') AS root \\gset\n\\echo :root\n\\echo finished\n");
-	$node->poll_query_until('postgres', qq{SELECT pg_current_wal_flush_lsn() > '$marker_at'::pg_lsn}) or die 'no marker';
+	my $bg = barrier_held($on1);
 	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900003, 'after the marker')");
 	kill 'CONT', $worker;
-	my $root = '';
-	$bg->{stdout} = '';
-	$bg->{run}->pump until $bg->{stdout} =~ /finished/ || !$bg->{run}->pumpable;
-	($root) = $bg->{stdout} =~ /^([0-9a-f]{40})$/m;
-	$bg->quit;
+	my $root = barrier_result($bg);
 	ok(defined $root, 'a barrier while the worker was stopped');
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900003");
 	is($root, read_root('s', $on1), 'committed before is in; open, or committed after, is not');
 }
 $open->query_safe('ROLLBACK');
 $open->quit;
+
+# while it waits: rows go on, and a change to the catalogs doesn't commit, even of nothing versioned
+SKIP:
+{
+	skip 'no way to stop a process', 3 if $windows_os;
+	$node->safe_psql('postgres', "CREATE SCHEMA shared_types; CREATE TYPE shared_types.mood AS ENUM ('a')");
+	kill 'STOP', $worker;
+	my $bg = barrier_held($on1);
+	my $ddl = $node->background_psql('postgres');
+	$ddl->query_until(qr/started/, "\\echo started\nALTER TYPE shared_types.mood RENAME VALUE 'a' TO 'b';\n\\echo finished\n");
+	ok( $node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE 'ALTER TYPE shared_types%' AND wait_event_type = 'Lock'}),
+		'a shared enum renamed waits');
+	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900005, 'a row writer')");
+	pass('a row writer does not');
+	kill 'CONT', $worker;
+	ok(defined barrier_result($bg), 'the barrier finishes');
+	$ddl->{stdout} = '';
+	$ddl->{run}->pump until $ddl->{stdout} =~ /finished/ || !$ddl->{run}->pumpable;
+	$ddl->quit;
+	is($node->safe_psql('postgres', q{SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE typname = 'mood'}), 'b', 'and the rename then commits');
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900005");
+}
+
+# a marker told again, after a worker crashed with its maps past it, touches nothing
+SKIP:
+{
+	skip 'injection points not supported by this build', 2 if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	same_root('s', $on1, 'with nothing held');
+	kill 'STOP', $worker;
+	my $bg = barrier_held($on1);
+	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900006, 'past the marker')");
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
+	kill 'CONT', $worker;
+	$node->wait_for_event('capture worker', 'capture-applied');
+	ok(defined barrier_result($bg), 'a barrier, with the worker past it, not confirmed');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
+	  or die 'no worker came back';
+	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900006");
+	my $slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = current_database()});
+	my $to = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
+	$node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'})
+	  or die 'capture did not catch up';
+	is($node->safe_psql('postgres', q{SELECT (SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%') + (SELECT count(*) FROM pg_history.capture_barriers)}),
+		'0', 'it left nothing behind');
+	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
+}
 
 # its own transaction: nothing it's written, and nothing older than now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN; INSERT INTO s.t VALUES (900004, 'x'); SELECT test_capture_barrier('s'); ROLLBACK");
@@ -115,6 +179,10 @@ like($err, qr/can't run in a transaction that has written anything/, 'not in a t
 like($err, qr/can't run above READ COMMITTED/, 'not above READ COMMITTED');
 ($rc, $out, $err) = $node->psql('postgres', q{CREATE SCHEMA pub; SELECT test_capture_barrier('pub')});
 like($err, qr/is not versioned/, 'not of a shared schema');
+
+# a table that can't be logged can't be there to be left out
+($rc, $out, $err) = $node->psql('postgres', "$on1 ALTER TABLE s.t SET UNLOGGED");
+like($err, qr/unlogged/, 'a versioned table can not become unlogged');
 
 # a table it holds no map of, which a commit can't hold yet
 $node->safe_psql('postgres', "$on1 CREATE SCHEMA nokey VERSIONED; CREATE TABLE nokey.t (a integer)");

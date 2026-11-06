@@ -1113,6 +1113,20 @@ tree_after_record(void)
 	cs = ChunkStoreOpen("pages");
 	refs = VcRefsOpen("pointers", cs);
 
+	/*
+	 * Told again after a crash, with the maps past it: whoever was waiting has what was saved the
+	 * first time, which these would overwrite.  (A slot only confirms what's been applied, so this
+	 * can't be a marker that wasn't seen to, past it being applied after it.)
+	 */
+	if (tree_position(branch) > lsn)
+	{
+		if (SPI_finish() != SPI_OK_FINISH)
+			elog(ERROR, "could not finish with SPI");
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
 	/* (barriers take turns, so any before this was given up on, and left this behind) */
 	refs->routine->list(refs, CAPTURE_BARRIER_REF_PREFIX, tree_forget_ref, &names);
 	foreach_ptr(char, name, names)
@@ -1135,7 +1149,7 @@ tree_after_record(void)
 		refs->routine->set(refs, saved, &map);
 	}
 
-	/* (it may be told again, after a crash, of which whoever's waiting has seen nothing) */
+	/* (it may be told again, after a crash before anything past it was applied) */
 	if (SPI_execute_with_args("INSERT INTO pg_history.capture_barriers VALUES ($1) ON CONFLICT (lsn) DO NOTHING",
 							  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not save a barrier");
