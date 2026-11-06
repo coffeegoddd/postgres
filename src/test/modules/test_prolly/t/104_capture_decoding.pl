@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # What capture's decoding finds, in commit order: begin, each change, truncate, messages, commit.
-# The sink in use says what it is told in the log.
+# The sink in use says what it is told in the log.  Which branch it is told is t/105's to check.
 
 use strict;
 use warnings FATAL => 'all';
@@ -37,7 +37,7 @@ sub told
 		qq{SELECT confirmed_flush_lsn >= '$to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'})
 	  or die "capture did not reach $to";
 	my $log = slurp_file($node->logfile, $at);
-	return join("\n", $log =~ /capture: (.*)$/mg);
+	return join("\n", $log =~ /capture: (?:branch \d+: )?(.*)$/mg);
 }
 
 is(told(q{CREATE TABLE s.d (a integer)}), "begin\ncommit", 'a transaction of nothing but DDL has no changes');
@@ -80,7 +80,7 @@ $a->query_safe('COMMIT');
 $a->quit;
 my $to = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
 $node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'});
-is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (.*)$/mg),
+is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (?:branch \d+: )?(.*)$/mg),
 	"begin\ninsert k old=no new=yes\ncommit\nbegin\ninsert t old=no new=yes\ncommit", 'transactions come in commit order');
 
 # a long transaction leaves the slot where it can still be read from
@@ -99,7 +99,7 @@ $held->query_safe('COMMIT');
 $held->quit;
 $to = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
 $node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'});
-is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (.*)$/mg), "begin\ninsert t old=no new=yes\ncommit",
+is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (?:branch \d+: )?(.*)$/mg), "begin\ninsert t old=no new=yes\ncommit",
 	'a transaction open across a restart of the worker is seen once it commits, and nothing twice');
 
 # Leaves an open transaction with a record only part flushed, that capture has had time to look at.
@@ -128,7 +128,7 @@ sub part_flushed
 	my $end = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
 	$node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$end'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'})
 	  or die 'capture did not reach the commit';
-	is(join("\n", slurp_file($node->logfile, $from) =~ /capture: (.*)$/mg), "begin\nmessage p size=160000 transactional=yes\ncommit", 'told once, whole');
+	is(join("\n", slurp_file($node->logfile, $from) =~ /capture: (?:branch \d+: )?(.*)$/mg), "begin\nmessage p size=160000 transactional=yes\ncommit", 'told once, whole');
 }
 
 # with the rest never coming, the worker waits in its loop, and goes with the postmaster

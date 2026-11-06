@@ -20,6 +20,7 @@
 #include "access/xlogutils.h"
 #include "access/xlog_internal.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "libpq/pqsignal.h"
@@ -93,12 +94,32 @@ capture_begin(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 	CaptureSinkInUse->begin(txn->xid, txn->final_lsn);
 }
 
+/*
+ * The branch a relation is on, 0 for a shared schema's.  This is asked in the middle of decoding, so
+ * it is the catalog as it was at the change, whatever has happened to the schema since.
+ */
+static int32
+relation_branch(Relation relation)
+{
+	HeapTuple	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(RelationGetNamespace(relation)));
+	int32		branch;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(relation));
+	branch = ((Form_pg_namespace) GETSTRUCT(tup))->nspbranch;
+	ReleaseSysCache(tup);
+	return branch;
+}
+
 static void
 capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation relation,
 			   ReorderBufferChange *change)
 {
-	CaptureChange out = {.relation = relation, .lsn = change->lsn};
+	CaptureChange out = {.branch = relation_branch(relation), .relation = relation, .lsn = change->lsn};
 
+	/* (a materialized view's rows reach here only from a concurrent refresh) */
+	if (out.branch == 0 || relation->rd_rel->relkind != RELKIND_RELATION)
+		return;
 	switch (change->action)
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
@@ -122,7 +143,13 @@ static void
 capture_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, int nrelations, Relation relations[],
 				 ReorderBufferChange *change)
 {
-	CaptureSinkInUse->truncate(relations, nrelations, change->data.truncate.restart_seqs, change->lsn);
+	for (int i = 0; i < nrelations; i++)
+	{
+		int32		branch = relation_branch(relations[i]);
+
+		if (branch != 0)
+			CaptureSinkInUse->truncate(branch, relations[i], change->data.truncate.restart_seqs, change->lsn);
+	}
 }
 
 static void
@@ -166,18 +193,17 @@ logging_begin(TransactionId xid, XLogRecPtr final_lsn)
 static void
 logging_change(const CaptureChange *change)
 {
-	elog(DEBUG1, "capture: %s %s old=%s new=%s",
+	elog(DEBUG1, "capture: branch %d: %s %s old=%s new=%s", change->branch,
 		 change->kind == CAPTURE_INSERT ? "insert" : change->kind == CAPTURE_UPDATE ? "update" : "delete",
 		 RelationGetRelationName(change->relation),
 		 change->old_tuple != NULL ? "yes" : "no", change->new_tuple != NULL ? "yes" : "no");
 }
 
 static void
-logging_truncate(Relation *relations, int n, bool restart_seqs, XLogRecPtr lsn)
+logging_truncate(int32 branch, Relation relation, bool restart_seqs, XLogRecPtr lsn)
 {
-	for (int i = 0; i < n; i++)
-		elog(DEBUG1, "capture: truncate %s restart=%s", RelationGetRelationName(relations[i]),
-			 restart_seqs ? "yes" : "no");
+	elog(DEBUG1, "capture: branch %d: truncate %s restart=%s", branch, RelationGetRelationName(relation),
+		 restart_seqs ? "yes" : "no");
 }
 
 static void
@@ -513,7 +539,12 @@ CaptureWorkerMain(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, BGWORKER_BYPASS_ALLOWCONN);
 
-	/* (this sees every branch's schemas, not those of the branch it isn't on) */
+	/*
+	 * On no branch, whatever the database's settings say: a slot keeps the branch it was made on,
+	 * and one made on a branch decodes only that branch's changes.  With the filter off, it sees
+	 * every branch's schemas.
+	 */
+	SetConfigOption("catalog_branch", "0", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("catalog_branch_filter", "off", PGC_SUSET, PGC_S_OVERRIDE);
 	slot_name_of(dboid, name);
 
