@@ -940,14 +940,6 @@ tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 	Oid			types[2] = {OIDOID, TEXTOID};
 	Datum		values[2];
 
-	/*
-	 * (a table locked by a transaction waiting to commit would wait for the lock this holds: so this
-	 * gives way, and begins again, rather than have a user's commit be the one a deadlock fails)
-	 */
-	if (!ConditionalLockRelationOid(relid, AccessShareLock))
-		ereport(ERROR,
-				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-				 errmsg("capture can't begin yet, as relation %u is locked", relid)));
 	rel = table_open(relid, NoLock);
 	CaptureRelationShape(rel, &shape);
 	if (shape.nkey > 0)
@@ -995,7 +987,7 @@ tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 		elog(ERROR, "could not record a table's fingerprint");
 	pfree(fingerprint);
 	ws_row_shape_free(&shape);
-	table_close(rel, AccessShareLock);
+	table_close(rel, NoLock);
 }
 
 static void
@@ -1033,7 +1025,25 @@ tree_slot_made(XLogRecPtr from)
 
 		tables = lappend_oid(tables, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
 	}
-	INJECTION_POINT("capture-slot-reading", NULL);
+
+	/*
+	 * Every table locked before any is read, so that DDL starting during the read waits for it,
+	 * rather than have the read give way when it gets there.  (A table locked by a transaction
+	 * waiting to commit would wait for the lock this holds: so this gives way, and begins again,
+	 * rather than have a user's commit be the one a deadlock fails.)
+	 */
+	foreach(lc, tables)
+	{
+		if (!ConditionalLockRelationOid(lfirst_oid(lc), AccessShareLock))
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("capture can't begin yet, as relation %u is locked", lfirst_oid(lc))));
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(lfirst_oid(lc))))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("capture can't begin yet, as relation %u has gone", lfirst_oid(lc))));
+	}
+	INJECTION_POINT("capture-slot-locked", NULL);
 	foreach(lc, tables)
 		tree_rebuild_table(&ctx, refs, lfirst_oid(lc));
 

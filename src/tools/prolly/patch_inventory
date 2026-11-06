@@ -46,6 +46,7 @@ own   src/tools/prolly_bench/
 patch contrib/Makefile         0  builds the fork's extensions under contrib/prolly
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
 patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
+patch doc/src/sgml/bgworker.sgml  5  BGWORKER_SKIP_SETTINGS
 patch doc/src/sgml/catalogs.sgml  4  pg_attribute.attcoltag documented; also (4) pg_authid.roltravels documented; also (4) pg_ws_print; also (4) pg_ws_deferred; also (5) pg_database.datversioned
 patch doc/src/sgml/config.sgml  1b  catalog_branch
 patch doc/src/sgml/libpq.sgml  1b  catalog_branch is reported

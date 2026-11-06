@@ -227,6 +227,10 @@ typedef struct BackgroundWorker
    If <literal>BGWORKER_BYPASS_ROLELOGINCHECK</literal> is specified as
    <varname>flags</varname> it is possible to bypass the login check for the
    role used to connect to databases.
+   If <literal>BGWORKER_SKIP_SETTINGS</literal> is specified as
+   <varname>flags</varname> the settings of the database and the role, those
+   of <command>ALTER DATABASE</command> and <command>ALTER ROLE</command>, are
+   not applied.
    A background worker can only call one of these two functions, and only
    once.  It is not possible to switch databases.
   </para>

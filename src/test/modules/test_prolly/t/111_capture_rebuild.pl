@@ -8,6 +8,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my ($node, $slot);
 
@@ -169,7 +170,6 @@ $node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELE
 $node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
 $node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, v text); INSERT INTO s.t SELECT g, repeat('x', 40) FROM generate_series(1, 30000) g ORDER BY random()");
 my $size = q{SELECT sum(pg_relation_size(c.oid)) FROM pg_class c WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relname ~ '^chunks'};
-my $wal_at = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
 my $size_at = $node->safe_psql('postgres', $size);
 $node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
 began();
@@ -183,7 +183,7 @@ $node->stop;
 # it's not the commit that fails
 SKIP:
 {
-	skip 'injection points not supported by this build', 5 if $ENV{enable_injection_points} ne 'yes';
+	skip 'injection points not supported by this build', 8 if $ENV{enable_injection_points} ne 'yes';
 	$b = new_node('locked');
 	$on = "SET catalog_branch = $b;";
 	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY, a integer); INSERT INTO s.t VALUES (1, 1)");
@@ -206,22 +206,32 @@ SKIP:
 	same_map($on, 't', 'and begins once it is not');
 	unlike(slurp_file($node->logfile), qr/deadlock detected/, 'with no deadlock');
 
-	# a catalog commit during the read waits its turn, not for a row the read is rewriting, which
-	# could leave the read waiting for a table it has locked
+	# during the read, DDL on a table waits for the table, and any other catalog commit its turn, not
+	# for a row the read is rewriting; neither makes the read give way
+	$node->safe_psql('postgres', "$on CREATE TABLE s.other_t (id integer PRIMARY KEY, a integer); INSERT INTO s.other_t VALUES (1, 1)");
 	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELECT pg_reload_conf()');
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
-	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-reading', 'wait')});
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-locked', 'wait')});
 	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
-	$node->wait_for_event('capture worker', 'capture-slot-reading');
+	$node->wait_for_event('capture worker', 'capture-slot-locked');
+	my $read_from = -s $node->logfile;
 	my $during = $node->background_psql('postgres');
 	$during->query_until(qr/started/, "\\echo started\n$on ALTER TABLE s.t ALTER COLUMN a TYPE bigint USING a + 1;\n\\echo finished\n");
 	ok( $node->poll_query_until('postgres',
-			q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE 'ALTER TABLE s.t%' AND wait_event_type = 'Lock' AND wait_event = 'object'}),
-		'a catalog commit during the read waits its turn');
-	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-reading')});
-	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-slot-reading')});
+			q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE 'ALTER TABLE s.t%' AND wait_event_type = 'Lock' AND wait_event = 'relation'}),
+		'DDL during the read waits for the table');
+	my $other = $node->background_psql('postgres');
+	$other->query_until(qr/started/, "\\echo started\nCREATE TEMP TABLE during_read (a integer);\n\\echo finished\n");
+	ok( $node->poll_query_until('postgres',
+			q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE 'CREATE TEMP TABLE during_read%' AND wait_event_type = 'Lock' AND wait_event = 'object'}),
+		'and any other catalog commit waits its turn');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-locked')});
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-slot-locked')});
 	$during->quit;
+	$other->quit;
 	began();
+	unlike(slurp_file($node->logfile, $read_from), qr/capture can't begin yet/, 'the read didn\'t give way');
+	is($node->safe_psql('postgres', "$on SELECT format_type(atttypid, NULL) FROM pg_attribute WHERE attrelid = 's.t'::regclass AND attname = 'a'"), 'bigint', 'the DDL went through');
 	same_map($on, 't', 'and comes after it');
 	$node->stop;
 }
@@ -235,7 +245,16 @@ my $open_db = q{SET default_transaction_read_only = off; SET transaction_timeout
 my $sb = $node->safe_psql('settings_db', qq{$open_db SELECT pg_branch_id_allocate()});
 $sb = (split /\n/, $sb)[-1];
 $node->safe_psql('settings_db', qq{$open_db SET catalog_branch = $sb; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t SELECT generate_series(1, 20000)});
-ok($node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$s_slot'}), 'capture begins, whatever a database\'s settings');
+# (the mark, and not the slot's being there, which it is while it's being made)
+my $began_there = 0;
+for (1 .. 300)
+{
+	my @lines = split /\n/, $node->safe_psql('settings_db', qq{$open_db SELECT count(*) FROM pg_history.capture_positions WHERE branch = 0});
+	$began_there = $lines[-1] eq '1';
+	last if $began_there;
+	usleep(100_000);
+}
+ok($began_there, 'capture begins, whatever a database\'s settings');
 $node->stop;
 
 # capture's worker is a superuser: reading tables as it begins runs nothing of theirs, and a
