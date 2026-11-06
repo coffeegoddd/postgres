@@ -76,10 +76,10 @@ typedef struct CaptureSink
 
 	/*
 	 * Each time a worker starts: all that commits after this position is told, and some before it
-	 * may be again.  What committed before a slot's first position never is, and new_slot says this
-	 * is that first position.  With no transaction running.
+	 * may be again.  What committed before a slot's first position never is.  With no transaction
+	 * running.
 	 */
-	void		(*start) (XLogRecPtr from, bool new_slot);
+	void		(*start) (XLogRecPtr from);
 	void		(*begin) (TransactionId xid, XLogRecPtr final_lsn);
 	void		(*change) (const CaptureChange *change);
 
@@ -99,6 +99,12 @@ typedef struct CaptureSink
 	 * is told again.
 	 */
 	void		(*apply) (void);
+
+	/*
+	 * A new slot is about to be made, so what the sink has kept may not join what it is told next.
+	 * With no transaction running, and before the slot is made, as a worker can die just after.
+	 */
+	void		(*slot_to_be_made) (void);
 } CaptureSink;
 
 /* Says what it is told, at DEBUG1, and does nothing with it. */

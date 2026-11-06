@@ -22,7 +22,7 @@ my $on1 = "SET catalog_branch = $b1;";
 my $on2 = "SET catalog_branch = $b2;";
 $node->safe_psql('postgres', "$on1 CREATE SCHEMA s VERSIONED");
 my $slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
-$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'})
+$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_history.capture_positions WHERE branch = 0})
   or die 'no worker';
 
 sub caught_up
@@ -181,7 +181,7 @@ unlike($dump, qr/COPY pg_history\.capture_/, 'nor its positions or tables');
 my $offset = -s $node->logfile;
 my $relid = $node->safe_psql('postgres', "$on1 SELECT 's.t'::regclass::oid");
 $node->safe_psql('postgres', "$on1 ALTER TABLE s.t ADD COLUMN later integer; INSERT INTO s.t VALUES (50, 'x', 1)");
-ok($node->wait_for_log(qr/capture to trees does not follow the layout of "t" changing|does not follow the layout of relation $relid changing/, $offset), 'a layout changing is an error');
+ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $offset), 'a layout changing is an error');
 $offset = -s $node->logfile;
 $pid = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'}) || 0;
 $node->safe_psql('postgres', "SELECT pg_terminate_backend($pid)") if $pid;
@@ -204,7 +204,8 @@ sub fresh_node
 
 sub slot_active
 {
-	$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'})
+	my ($db) = @_;
+	$node->poll_query_until($db // 'postgres', q{SELECT count(*) = 1 FROM pg_history.capture_positions WHERE branch = 0})
 	  or die 'no worker';
 }
 
@@ -261,12 +262,71 @@ $node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELE
 $node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
 $node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
+$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'no worker';
 slot_active();
 $from = -s $node->logfile;
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (3)");
 ok($node->wait_for_log(qr/there before it began/, $from), 'capture off and on again');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/map/%'}), '0', 'and what it held is forgotten');
 $node->stop;
+
+# a worker dying just after making a new slot leaves the next one knowing it's new
+SKIP:
+{
+	skip 'injection points not supported by this build', 1 if $ENV{enable_injection_points} ne 'yes';
+	$on = fresh_node('slot_made');
+	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+	slot_active();
+	$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
+	caught_up();
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELECT pg_reload_conf()');
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
+	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-made', 'wait')});
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
+	$node->wait_for_event('capture worker', 'capture-slot-made');
+	my $dying = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-made')});
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($dying)");
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $dying})
+	  or die 'no worker came back';
+	slot_active();
+	$from = -s $node->logfile;
+	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (3)");
+	ok($node->wait_for_log(qr/there before it began/, $from), 'a worker dying with its new slot just made');
+	$node->stop;
+}
+
+# replica identity is asked of each change, as it can change and leave the layout as it was
+$on = fresh_node('identity_later');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, v text); INSERT INTO s.t VALUES (1, 'a')");
+caught_up();
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on ALTER TABLE s.t REPLICA IDENTITY NOTHING; UPDATE s.t SET id = 9 WHERE id = 1");
+ok($node->wait_for_log(qr/whose replica identity does not give its primary key/, $from), 'replica identity changed after a table was seen');
+$node->stop;
+
+# a table with two layouts in what one pass reads stops it there, by what the worker saw
+SKIP:
+{
+	skip 'no way to stop a process', 1 if $windows_os;
+	$on = fresh_node('two_layouts');
+	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+	slot_active();
+	$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, v text)");
+	caught_up();
+	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$from = -s $node->logfile;
+	kill 'STOP', $worker;
+	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1, 'a')");
+	$node->safe_psql('postgres', "$on ALTER TABLE s.t ADD COLUMN w integer; INSERT INTO s.t VALUES (2, 'b', 2)");
+	kill 'CONT', $worker;
+	ok($node->wait_for_log(qr/does not follow the layout of "t" changing/, $from), 'two layouts in one pass');
+	$node->stop;
+}
 
 $on = fresh_node('template');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
@@ -276,7 +336,8 @@ caught_up();
 $node->safe_psql('postgres', 'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = \'capture worker\'');
 $node->safe_psql('postgres', 'CREATE DATABASE other TEMPLATE postgres');
 $slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'other'});
-slot_active();
+$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'no worker';
+slot_active('other');
 $from = -s $node->logfile;
 $node->safe_psql('other', "$on INSERT INTO s.t VALUES (2)");
 ok($node->wait_for_log(qr/there before it began/, $from), 'a database copied from one with a map');
@@ -284,7 +345,7 @@ $node->stop;
 
 $on = fresh_node('turned_on', "capture_to_trees = off\n");
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
-slot_active();
+$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'no worker';
 $node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
 caught_up();
 $node->append_conf('postgresql.conf', "capture_to_trees = on\n");

@@ -17,12 +17,16 @@
  * whatever synchronous_commit says, or a crash would leave the slot past what it lost.
  *
  * A row map holds only what decoding was told, so only a table made since capture
- * began can have one.  A new slot, or a store with no record of capture beginning,
- * forgets all it holds and marks each table there now in pg_history.capture_tables,
- * and a change to one of those is an error.  So is a table's layout differing from
- * the one recorded there, which outlasts the worker, so capture stays stopped.  What
- * belongs to a table or a branch that's gone is let go of when a worker starts.
- * Capture's state doesn't go in a dump, and a restored store begins again.
+ * began can have one.  The branch 0 row of pg_history.capture_positions says capture
+ * began, and goes before any new slot is made.  A worker finding none forgets all it
+ * holds and marks each table there now in pg_history.capture_tables, and a change to
+ * one of those is an error.  So is a table's layout differing from the one recorded
+ * there, which outlasts the worker, so capture stays stopped.
+ *
+ * What belongs to a table or a branch that's gone is let go of when a worker starts,
+ * and a change decoded after that brings a table's back until the next start.  The
+ * references and tables here don't go in a dump, so a restored store begins again.
+ * The chunks only they hold are in a dump like any others, until they're freed.
  *
  * All that was decoded since the last apply is held in memory.
  *
@@ -30,9 +34,13 @@
  * (capture_to_trees).  A truncate is an error, as are a table with no primary key
  * and one whose replica identity doesn't give it, as an update changing the key
  * would look like one that didn't, and a value decoding wasn't given.  An error stops
- * capture of the whole database, as the worker starts again at the same row.  DDL
- * that leaves the layout as it was isn't noticed, nor capture to trees being turned
- * off for a while and on again with the same slot.
+ * capture of the whole database, as the worker starts again at the same row, and
+ * the slot keeps its WAL.  Nothing here gets it going again, as a new slot marks
+ * every table: so a restore, which writes rows before making keys, or a table made
+ * and marked before capture got started, stops it for good.  DDL that leaves the
+ * layout as it was and its replica identity giving the key isn't noticed, nor capture
+ * to trees being turned off for a while and on again with the same slot, nor an
+ * object id used again while its old row map is kept.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -167,8 +175,31 @@ tree_let_go(VcRefs *refs)
 			  "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspbranch = p.branch)", SPI_OK_DELETE);
 }
 
+/* (locally: what's kept doesn't wait on a standby, and the slot moves only once it's flushed) */
 static void
-tree_start(XLogRecPtr from, bool new_slot)
+tree_settings(void)
+{
+	SetConfigOption("synchronous_commit", "local", PGC_SUSET, PGC_S_OVERRIDE);
+}
+
+/* A new slot is to be made: there's no going on from what's kept. */
+static void
+tree_slot_to_be_made(void)
+{
+	tree_settings();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	tree_exec("DELETE FROM pg_history.capture_positions WHERE branch = 0", SPI_OK_DELETE);
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+}
+
+static void
+tree_start(XLogRecPtr from)
 {
 	ChunkStore *cs;
 	VcRefs	   *refs;
@@ -180,9 +211,7 @@ tree_start(XLogRecPtr from, bool new_slot)
 		tree_row_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree row", ALLOCSET_DEFAULT_SIZES);
 	}
 
-	/* (locally: what's kept doesn't wait on a standby, and the slot moves only once it's flushed) */
-	SetConfigOption("synchronous_commit", "local", PGC_SUSET, PGC_S_OVERRIDE);
-
+	tree_settings();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -190,7 +219,7 @@ tree_start(XLogRecPtr from, bool new_slot)
 	cs = ChunkStoreOpen("pages");
 	refs = VcRefsOpen("pointers", cs);
 	tree_exec("SELECT 1 FROM pg_history.capture_positions WHERE branch = 0", SPI_OK_SELECT);
-	if (new_slot || SPI_processed == 0)
+	if (SPI_processed == 0)
 		tree_begin_anew(refs, from);
 	else
 		tree_let_go(refs);
@@ -217,6 +246,14 @@ tree_table_of(Relation relation)
 	TreeTable  *table;
 	MemoryContext old;
 
+	/* (each time, as it can change and leave the layout as it was) */
+	if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL &&
+		(relation->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT ||
+		 !OidIsValid(RelationGetPrimaryKeyIndex(relation, false))))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees does not hold \"%s\", whose replica identity does not give its primary key",
+						RelationGetRelationName(relation))));
 	CaptureRelationShape(relation, &shape);
 	foreach(lc, tree_tables)
 	{
@@ -236,13 +273,6 @@ tree_table_of(Relation relation)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("capture to trees does not hold \"%s\", which has no primary key",
-						RelationGetRelationName(relation))));
-	if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL &&
-		(relation->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT ||
-		 !OidIsValid(RelationGetPrimaryKeyIndex(relation, false))))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("capture to trees does not hold \"%s\", whose replica identity does not give its primary key",
 						RelationGetRelationName(relation))));
 	ws_row_shape_free(&shape);
 	old = MemoryContextSwitchTo(tree_tables_cxt);
@@ -572,4 +602,5 @@ const CaptureSink TreeCaptureSink = {
 	.message = tree_message,
 	.commit = tree_end,
 	.apply = tree_apply,
+	.slot_to_be_made = tree_slot_to_be_made,
 };

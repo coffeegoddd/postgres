@@ -218,7 +218,7 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 /* ------------------------------------------------------------------ the sink */
 
 static void
-logging_start(XLogRecPtr from, bool new_slot)
+logging_start(XLogRecPtr from)
 {
 	elog(DEBUG1, "capture starts at %X/%X", LSN_FORMAT_ARGS(from));
 }
@@ -276,6 +276,11 @@ logging_apply(void)
 {
 }
 
+static void
+logging_slot_to_be_made(void)
+{
+}
+
 const CaptureSink LoggingCaptureSink = {
 	.name = "logging",
 	.start = logging_start,
@@ -285,6 +290,7 @@ const CaptureSink LoggingCaptureSink = {
 	.message = logging_message,
 	.commit = logging_commit,
 	.apply = logging_apply,
+	.slot_to_be_made = logging_slot_to_be_made,
 };
 
 const CaptureSink *CaptureSinkInUse = &LoggingCaptureSink;
@@ -542,12 +548,12 @@ capture_clear_mark(void)
 }
 
 /*
- * Makes this database's slot if it has none, and says so.  False, with why, if this worker has nothing to do:
+ * Makes this database's slot if it has none.  False, with why, if this worker has nothing to do:
  * it has a worker, or its name is some other slot's.  An invalidated slot has lost WAL it needs,
  * so it is dropped and made again.
  */
 static bool
-capture_slot_ready(const char *name, bool *made)
+capture_slot_ready(const char *name)
 {
 	ReplicationSlot *slot;
 	bool		exists;
@@ -585,8 +591,9 @@ capture_slot_ready(const char *name, bool *made)
 	}
 	if (!exists)
 	{
+		CaptureSinkInUse->slot_to_be_made();
 		capture_slot_create(name);
-		*made = true;
+		INJECTION_POINT("capture-slot-made", NULL);
 	}
 	return true;
 }
@@ -597,7 +604,6 @@ CaptureWorkerMain(Datum main_arg)
 	Oid			dboid = DatumGetObjectId(main_arg);
 	char		name[NAMEDATALEN];
 	LogicalDecodingContext *ctx;
-	bool		slot_made = false;
 
 	am_capture_worker = true;
 	if (capture_to_trees)
@@ -622,7 +628,7 @@ CaptureWorkerMain(Datum main_arg)
 	/* (a mark with no schema is cleared whatever is wrong with the slot; the launcher takes the slot) */
 	if (!database_has_versioned_schema() && capture_clear_mark())
 		proc_exit(0);
-	if (!capture_slot_ready(name, &slot_made))
+	if (!capture_slot_ready(name))
 		proc_exit(0);
 	ReplicationSlotAcquire(name, true, true);
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "capture");
@@ -632,7 +638,7 @@ CaptureWorkerMain(Datum main_arg)
 										   .segment_close = wal_segment_close),
 								NULL, NULL, NULL);
 	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
-	CaptureSinkInUse->start(MyReplicationSlot->data.confirmed_flush, slot_made);
+	CaptureSinkInUse->start(MyReplicationSlot->data.confirmed_flush);
 
 	for (;;)
 	{
