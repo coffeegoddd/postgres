@@ -41,6 +41,10 @@ sub caught_up
 	  or die "capture did not reach $to";
 }
 
+# (the reader on settings other than the worker's, so that a setting neither fixes shows too)
+my $reader = q{SET TimeZone = 'America/New_York'; SET DateStyle = 'SQL, DMY'; SET IntervalStyle = 'iso_8601';
+	SET extra_float_digits = 0; SET bytea_output = 'hex';};
+
 # A table is as layer 4 reads it; one capture has no map of must have no rows.
 sub table_same
 {
@@ -53,7 +57,7 @@ sub table_same
 	}
 	else
 	{
-		is($map, $node->safe_psql('postgres', "$use SELECT test_ws_rows_hash('rt', '$table')"), "$step: $table");
+		is($map, $node->safe_psql('postgres', "$use $reader SELECT test_ws_rows_hash('rt', '$table')"), "$step: $table");
 	}
 }
 
@@ -90,7 +94,7 @@ sub ddl_step
 	caught_up();
 	isnt($node->safe_psql('postgres',
 			"$use SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 'rt.$table'::regclass::oid"),
-		$node->safe_psql('postgres', "$use SELECT test_ws_rows_hash('rt', '$table')"),
+		$node->safe_psql('postgres', "$use $reader SELECT test_ws_rows_hash('rt', '$table')"),
 		"$name: its map has not followed");
 	$node->safe_psql('postgres', "$use UPDATE rt.$table SET a = a");
 	each_table_same("after $name");
@@ -112,6 +116,6 @@ each_table_same('before a table is made again');
 $node->safe_psql('postgres', "$use DROP TABLE rt.again; CREATE TABLE rt.again (id integer PRIMARY KEY); INSERT INTO rt.again VALUES (2)");
 each_table_same('after a table is made again');
 
-unlike(slurp_file($node->logfile), qr/^(ERROR|PANIC):/m, 'nothing here went wrong, capture\'s worker included');
+unlike(slurp_file($node->logfile), qr/^(ERROR|FATAL|PANIC):|terminated by signal/m, 'nothing here went wrong, capture\'s worker included');
 $node->stop;
 done_testing();
