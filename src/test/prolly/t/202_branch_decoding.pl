@@ -76,7 +76,7 @@ $node->safe_psql('postgres', "SELECT pg_drop_replication_slot('copy_b1')");
 # a branch (a standby's synced copy keeps it: t/208)
 is( $node->safe_psql('postgres',
 		"SELECT string_agg(slot_name || ':' || (branch = CASE slot_name WHEN 'on_b1' THEN $b1 WHEN 'on_b2' THEN $b2 ELSE 0 END), ',' ORDER BY slot_name)
-		 FROM pg_replication_slots"),
+		 FROM pg_replication_slots WHERE slot_name NOT LIKE 'prolly_capture_%'"),
 	'on_b1:true,on_b2:true,on_none:true', 'each slot shows its branch');
 on($b1, "SELECT 1 FROM pg_create_logical_replication_slot('fo', 'test_decoding', false, false, true)");
 is($node->safe_psql('postgres', "SELECT failover AND branch = $b1 FROM pg_replication_slots WHERE slot_name = 'fo'"),

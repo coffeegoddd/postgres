@@ -164,11 +164,11 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 	 * Create the schema's namespace: a versioned schema's goes on the
 	 * session's branch
 	 */
+	if (stmt->versioned)
+		CaptureSchemaMade();
 	namespaceId = NamespaceCreateOnBranch(schemaName, owner_uid, false,
 										  stmt->versioned ?
 										  VersionedNamespaceBranch(schemaName) : 0);
-	if (stmt->versioned)
-		CaptureSchemaMade();
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();

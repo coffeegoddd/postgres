@@ -38,6 +38,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -117,7 +118,6 @@ capture_launch(Oid dboid, BackgroundWorkerHandle **handle)
 	snprintf(bgw.bgw_name, BGW_MAXLEN, "capture for database %u", dboid);
 	snprintf(bgw.bgw_type, BGW_MAXLEN, "capture worker");
 	bgw.bgw_main_arg = ObjectIdGetDatum(dboid);
-	bgw.bgw_notify_pid = MyProcPid;
 	return RegisterDynamicBackgroundWorker(&bgw, handle);
 }
 
@@ -173,6 +173,25 @@ database_mark(bool versioned)
 	table_close(rel, RowExclusiveLock);
 }
 
+static bool
+database_is_marked(void)
+{
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	bool		marked;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	marked = ((Form_pg_database) GETSTRUCT(tup))->datversioned;
+	ReleaseSysCache(tup);
+	return marked;
+}
+
+/*
+ * To be called before the schema is: what it waits for mustn't be waiting for that schema's name.
+ * Held until this commits, the lock keeps a worker that finds no schema from clearing the mark.  A
+ * database already marked needs no more than a shared hold of it, so makers don't wait on each
+ * other; only one that has to set the mark waits, and is waited for.
+ */
 void
 CaptureSchemaMade(void)
 {
@@ -184,9 +203,24 @@ CaptureSchemaMade(void)
 		registered = true;
 	}
 
-	/* (held until this commits: a worker finding no schema mustn't clear the mark under it) */
-	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ExclusiveLock);
-	database_mark(true);
+	for (;;)
+	{
+		bool		marked;
+
+		AcceptInvalidationMessages();
+		marked = database_is_marked();
+		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, marked ? ShareLock : ExclusiveLock);
+		if (!marked)
+		{
+			database_mark(true);
+			break;
+		}
+		if (database_is_marked())
+			break;
+
+		/* (cleared before this got the lock, and so held no earlier in this transaction) */
+		UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ShareLock);
+	}
 	schema_made = true;
 }
 
@@ -344,6 +378,9 @@ CaptureWorkerMain(Datum main_arg)
 	if (!capture_possible())
 		proc_exit(0);
 
+	/* (a mark with no schema is cleared whatever is wrong with the slot; the launcher takes the slot) */
+	if (!database_has_versioned_schema() && capture_clear_mark())
+		proc_exit(0);
 	if (!capture_slot_ready(name))
 		proc_exit(0);
 	ReplicationSlotAcquire(name, true, true);
@@ -381,9 +418,11 @@ CaptureDatabaseDropping(Oid dboid)
 	TimestampTz start = GetCurrentTimestamp();
 
 	slot_name_of(dboid, name);
+
+	/* (another can't start: it waits on the lock held on the database) */
+	TerminateBackgroundWorkersForDatabase(dboid);
 	while (slot_is_held(dboid))
 	{
-		TerminateBackgroundWorkersForDatabase(dboid);
 		CHECK_FOR_INTERRUPTS();
 
 		/* (the count of a database's slots says, if this doesn't get there) */
@@ -464,6 +503,8 @@ CaptureLauncherMain(Datum main_arg)
 	MemoryContext top = AllocSetContextCreate(TopMemoryContext, "capture launcher", ALLOCSET_DEFAULT_SIZES);
 	MemoryContext look = AllocSetContextCreate(top, "capture launcher look", ALLOCSET_DEFAULT_SIZES);
 	List	   *running = NIL;
+	bool		none_free;
+	bool		warned = false;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
@@ -488,49 +529,51 @@ CaptureLauncherMain(Datum main_arg)
 		old = MemoryContextSwitchTo(look);
 		marked = capture_in_background ? databases_marked() : NIL;
 		drop_slots_not_of(marked);
+		foreach(lc, running)
+		{
+			CaptureRunning *one = lfirst(lc);
+			pid_t		pid;
+
+			if (GetBackgroundWorkerPid(one->handle, &pid) == BGWH_STOPPED)
+			{
+				running = foreach_delete_current(running, lc);
+				pfree(one->handle);
+				pfree(one);
+			}
+		}
+		none_free = false;
 		foreach(lc, marked)
 		{
 			Oid			dboid = lfirst_oid(lc);
 			ListCell   *r;
 			bool		have = slot_is_held(dboid);
+			BackgroundWorkerHandle *handle;
 
 			foreach(r, running)
+				have = have || ((CaptureRunning *) lfirst(r))->dboid == dboid;
+			if (have)
+				continue;
+			MemoryContextSwitchTo(top);
+			if (capture_launch(dboid, &handle))
 			{
-				CaptureRunning *one = lfirst(r);
-				pid_t		pid;
+				CaptureRunning *one = palloc_object(CaptureRunning);
 
-				if (one->dboid == dboid && GetBackgroundWorkerPid(one->handle, &pid) != BGWH_STOPPED)
-					have = true;
+				one->dboid = dboid;
+				one->handle = handle;
+				running = lappend(running, one);
 			}
-			if (!have)
-			{
-				BackgroundWorkerHandle *handle;
-
-				MemoryContextSwitchTo(top);
-
-				/* (with none free to start one, the next look tries again) */
-				if (capture_launch(dboid, &handle))
-				{
-					CaptureRunning *one = palloc_object(CaptureRunning);
-
-					one->dboid = dboid;
-					one->handle = handle;
-					foreach(r, running)
-					{
-						CaptureRunning *was = lfirst(r);
-
-						if (was->dboid == dboid)
-						{
-							running = foreach_delete_current(running, r);
-							pfree(was->handle);
-							pfree(was);
-						}
-					}
-					running = lappend(running, one);
-				}
-				MemoryContextSwitchTo(look);
-			}
+			else
+				none_free = true;
+			MemoryContextSwitchTo(look);
 		}
+
+		/* (once, for as long as it lasts; the next look tries again) */
+		if (none_free && !warned)
+			ereport(WARNING,
+					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					 errmsg("no background worker is free for capture, so a database with versioned schemas is not being captured"),
+					 errhint("Each such database takes one.  You might need to increase \"max_worker_processes\".")));
+		warned = none_free;
 		MemoryContextSwitchTo(old);
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 CAPTURE_LAUNCHER_NAPTIME_MS, WAIT_EVENT_CAPTURE_LAUNCHER_MAIN);
