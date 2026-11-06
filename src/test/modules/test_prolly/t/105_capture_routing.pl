@@ -89,7 +89,7 @@ is( told(   "SET catalog_branch = $b1; BEGIN; CREATE SCHEMA gone VERSIONED; CREA
 		  . 'INSERT INTO gone.x VALUES (1); DROP SCHEMA gone CASCADE; COMMIT'),
 	"begin\nbranch $b1: insert x old=no new=yes\ncommit", 'a schema dropped before the commit');
 
-# nor is one dropped by a later transaction, with the catalog rows long gone
+# and so is one dropped by a later transaction, before the worker reads the change
 SKIP:
 {
 	skip 'no way to stop a process', 1 if $windows_os;
