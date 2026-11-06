@@ -19,7 +19,9 @@
  * The worker decodes in-process, on a plugin the server has built in, so a change is a tuple
  * and not text.  What decoding finds goes to a CaptureSink, in commit order, a transaction at a
  * time and only once it has committed: what is rolled back is never seen, and a transaction of
- * nothing but DDL is a begin and a commit.
+ * nothing but DDL is a begin and a commit.  A worker stopped in the middle of telling a transaction
+ * tells all of it again: a begin means whatever came since the last commit is void.  A materialized
+ * view's rows are never told, nor those of any table's rewrite.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -52,7 +54,8 @@ typedef struct CaptureChange
 {
 	CaptureChangeKind kind;
 	Relation	relation;
-	HeapTuple	old_tuple;		/* what replica identity gives of the row, or NULL */
+	HeapTuple	old_tuple;		/* what replica identity gives of the row, or NULL:
+								 * NULL for a delete if it gives nothing */
 	HeapTuple	new_tuple;		/* an unchanged TOAST value is not in it; NULL for a delete */
 	XLogRecPtr	lsn;
 } CaptureChange;
@@ -61,11 +64,22 @@ typedef struct CaptureChange
 typedef struct CaptureSink
 {
 	const char *name;
+
+	/*
+	 * Each time a worker starts: all that commits after this position is told.  What committed before
+	 * a slot's first position never is.  With no transaction running.
+	 */
+	void		(*start) (XLogRecPtr from);
 	void		(*begin) (TransactionId xid, XLogRecPtr final_lsn);
 	void		(*change) (const CaptureChange *change);
+
+	/* Named as they were: a partitioned table, and then its partitions. */
 	void		(*truncate) (Relation *relations, int n, bool restart_seqs, XLogRecPtr lsn);
 
-	/* A logical message: transactional ones between begin and commit, others at once. */
+	/*
+	 * A logical message: transactional ones between begin and commit, others at once, once flushed,
+	 * and with no transaction running.
+	 */
 	void		(*message) (const char *prefix, const char *data, Size size, bool transactional, XLogRecPtr lsn);
 	void		(*commit) (TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn);
 } CaptureSink;

@@ -73,9 +73,16 @@ capture_possible(void)
 
 /* -------------------------------------------------------------- the plugin */
 
+/* Only the worker tells the sink, so a session can't be a second writer behind it. */
+static bool am_capture_worker = false;
+
 static void
 capture_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
 {
+	if (!am_capture_worker)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("output plugin \"%s\" is for capture's background worker alone", PROLLY_CAPTURE_PLUGIN)));
 	opt->output_type = OUTPUT_PLUGIN_BINARY_OUTPUT;
 }
 
@@ -144,6 +151,12 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 /* ------------------------------------------------------------------ the sink */
 
 static void
+logging_start(XLogRecPtr from)
+{
+	elog(DEBUG1, "capture starts at %X/%X", LSN_FORMAT_ARGS(from));
+}
+
+static void
 logging_begin(TransactionId xid, XLogRecPtr final_lsn)
 {
 	elog(DEBUG1, "capture: begin");
@@ -169,8 +182,7 @@ logging_truncate(Relation *relations, int n, bool restart_seqs, XLogRecPtr lsn)
 static void
 logging_message(const char *prefix, const char *data, Size size, bool transactional, XLogRecPtr lsn)
 {
-	elog(DEBUG1, "capture: message %s %.*s transactional=%s", prefix, (int) size, data,
-		 transactional ? "yes" : "no");
+	elog(DEBUG1, "capture: message %s size=%zu transactional=%s", prefix, size, transactional ? "yes" : "no");
 }
 
 static void
@@ -181,6 +193,7 @@ logging_commit(TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn)
 
 const CaptureSink LoggingCaptureSink = {
 	.name = "logging",
+	.start = logging_start,
 	.begin = logging_begin,
 	.change = logging_change,
 	.truncate = logging_truncate,
@@ -332,15 +345,39 @@ capture_slot_create(const char *name)
 	CommitTransactionCommand();
 }
 
-/* Decodes what is flushed, and says it was. */
+static bool capture_at_end_of_wal = false;
+
+/*
+ * Reads a page if it is there.  The reader's own private data is the decoding context, which this
+ * isn't to touch, and returning to the worker's loop is how it notices the postmaster going.
+ */
+static int
+capture_page_read(XLogReaderState *state, XLogRecPtr target_page, int req_len, XLogRecPtr target_rec, char *buf)
+{
+	void	   *ctx = state->private_data;
+	ReadLocalXLogPageNoWaitPrivate nowait = {0};
+	int			n;
+
+	state->private_data = &nowait;
+	n = read_local_xlog_page_no_wait(state, target_page, req_len, target_rec, buf);
+	state->private_data = ctx;
+	if (nowait.end_of_wal)
+		capture_at_end_of_wal = true;
+	return n;
+}
+
+/*
+ * Decodes what is flushed now, and says it was.  With a record that goes past what's flushed, it
+ * stops at the one before, to read it whole later.
+ */
 static void
 capture_decode(LogicalDecodingContext *ctx)
 {
 	XLogRecPtr	flushed = GetFlushRecPtr(NULL);
+	XLogRecPtr	from = ctx->reader->EndRecPtr;
 
-	if (ctx->reader->EndRecPtr >= flushed)
-		return;
-	while (ctx->reader->EndRecPtr < flushed)
+	capture_at_end_of_wal = false;
+	while (ctx->reader->EndRecPtr < flushed && !capture_at_end_of_wal)
 	{
 		char	   *errm = NULL;
 		XLogRecord *record = XLogReadRecord(ctx->reader, &errm);
@@ -351,7 +388,8 @@ capture_decode(LogicalDecodingContext *ctx)
 			LogicalDecodingProcessRecord(ctx, ctx->reader);
 		CHECK_FOR_INTERRUPTS();
 	}
-	LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+	if (ctx->reader->EndRecPtr > from)
+		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 }
 
 /*
@@ -431,6 +469,7 @@ CaptureWorkerMain(Datum main_arg)
 	char		name[NAMEDATALEN];
 	LogicalDecodingContext *ctx;
 
+	am_capture_worker = true;
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -448,11 +487,12 @@ CaptureWorkerMain(Datum main_arg)
 	ReplicationSlotAcquire(name, true, true);
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "capture");
 	ctx = CreateDecodingContext(InvalidXLogRecPtr, NIL, false,
-								XL_ROUTINE(.page_read = read_local_xlog_page,
+								XL_ROUTINE(.page_read = capture_page_read,
 										   .segment_open = wal_segment_open,
 										   .segment_close = wal_segment_close),
 								NULL, NULL, NULL);
 	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
+	CaptureSinkInUse->start(MyReplicationSlot->data.confirmed_flush);
 
 	for (;;)
 	{
