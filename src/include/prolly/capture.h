@@ -114,6 +114,7 @@ extern void CaptureDatabaseDropping(Oid dboid);
  * stored columns' tags, the primary key's first and in key order, the caller's to
  * ws_row_shape_free.  A relation a sink is told of is as the catalog was at that change, so a row
  * goes by the layout it was written under, whatever DDL came after it, in that transaction or not.
+ * Two layouts alike don't say the rows are: DDL can change a table's rows and tell no change of them.
  */
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
 

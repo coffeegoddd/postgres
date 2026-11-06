@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Each change capture decodes goes by its table's layout as the catalog was at that change: the
-# same columns, tags and key that layer 4 reads from the catalogs, with no message saying so.
+# same columns, tags and key that layer 4 reads from the catalogs.
 
 use strict;
 use warnings FATAL => 'all';
@@ -91,6 +91,34 @@ $got = layouts('BEGIN; INSERT INTO s.x VALUES (3, 3, 3); ALTER TABLE s.x DROP CO
 my $keyless = read_now('x');
 like($keyless, qr/nkey=0 /, 'the key is gone');
 is_deeply($got, [ $new, $keyless ], 'a key dropped between two changes');
+
+# a key made from an index already there
+$node->safe_psql('postgres', "$use CREATE TABLE s.ui (a integer NOT NULL, b integer NOT NULL, c integer)");
+$old = read_now('ui');
+$node->safe_psql('postgres', "$use CREATE UNIQUE INDEX ui_b ON s.ui (b); ALTER TABLE s.ui ADD PRIMARY KEY USING INDEX ui_b");
+$new = read_now('ui');
+isnt($new, $old, 'an index made the key');
+is_deeply(layouts('INSERT INTO s.ui VALUES (1, 2, 3)'), [$new], 'a key from an index');
+
+# DDL rolled back to a savepoint never was
+$node->safe_psql('postgres', "$use CREATE TABLE s.sp (id integer PRIMARY KEY, a integer)");
+$old = read_now('sp');
+is_deeply(
+	layouts('BEGIN; SAVEPOINT p; ALTER TABLE s.sp ADD COLUMN b integer; ROLLBACK TO p; INSERT INTO s.sp VALUES (1, 1); COMMIT'),
+	[$old], 'DDL rolled back to a savepoint');
+
+# a change in a transaction that rewrote its table has the layout, whichever heap it is in
+$node->safe_psql('postgres', "$use CREATE TABLE s.rw (id integer PRIMARY KEY, a integer)");
+$got = layouts('BEGIN; ALTER TABLE s.rw ALTER COLUMN a TYPE bigint; INSERT INTO s.rw VALUES (1, 1); COMMIT');
+is_deeply($got, [ read_now('rw') ], 'a change after a rewrite in its transaction');
+
+# a partition's and an inheriting table's rows are their own
+$node->safe_psql('postgres',
+	"$use CREATE TABLE s.par (id integer PRIMARY KEY, a integer) PARTITION BY RANGE (id);"
+	  . 'CREATE TABLE s.par1 PARTITION OF s.par FOR VALUES FROM (0) TO (10);'
+	  . 'CREATE TABLE s.base (id integer PRIMARY KEY, a integer); CREATE TABLE s.kid (b integer) INHERITS (s.base)');
+is_deeply(layouts('INSERT INTO s.par VALUES (1, 1)'), [ read_now('par1') ], 'a partition');
+is_deeply(layouts('INSERT INTO s.kid VALUES (1, 1, 1)'), [ read_now('kid') ], 'an inheriting table');
 
 # committed before DDL but decoded after it, a change still has the layout it was written under
 SKIP:
