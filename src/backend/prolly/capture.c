@@ -35,6 +35,7 @@
 #include "replication/logicalctl.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
+#include "replication/snapbuild.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
@@ -218,6 +219,17 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 
 /* ------------------------------------------------------------------ the sink */
 
+static bool
+logging_slot_will_do(void)
+{
+	return true;
+}
+
+static void
+logging_slot_made(XLogRecPtr from)
+{
+}
+
 static void
 logging_start(XLogRecPtr from)
 {
@@ -292,6 +304,8 @@ const CaptureSink LoggingCaptureSink = {
 	.commit = logging_commit,
 	.apply = logging_apply,
 	.slot_to_be_made = logging_slot_to_be_made,
+	.slot_made = logging_slot_made,
+	.slot_will_do = logging_slot_will_do,
 };
 
 const CaptureSink *CaptureSinkInUse = &LoggingCaptureSink;
@@ -466,18 +480,32 @@ capture_slot_create(const char *name)
 	 */
 	ReplicationSlotCreate(name, true, RS_EPHEMERAL, false, false, false, false);
 	CaptureSinkInUse->slot_to_be_made();
+
+	/* (repeatable read, so that the snapshot this gets is what all it reads is under) */
 	StartTransactionCommand();
+	if (CaptureSinkInUse->reads_at_start)
+		XactIsoLevel = XACT_REPEATABLE_READ;
 	EnsureLogicalDecodingEnabled();
-	ctx = CreateInitDecodingContext(PROLLY_CAPTURE_PLUGIN, NIL, false, false, InvalidXLogRecPtr,
+	ctx = CreateInitDecodingContext(PROLLY_CAPTURE_PLUGIN, NIL, CaptureSinkInUse->reads_at_start, false, InvalidXLogRecPtr,
 									XL_ROUTINE(.page_read = read_local_xlog_page,
 											   .segment_open = wal_segment_open,
 											   .segment_close = wal_segment_close),
 									NULL, NULL, NULL);
 	DecodingContextFindStartpoint(ctx);
+
+	/*
+	 * All that committed before the slot's first position is in this snapshot, and all after it will
+	 * be told: the two are the whole of a table.  The slot's kept only once what the sink makes of
+	 * it has committed, so a worker dying before then leaves no slot, and the next begins again.
+	 */
+	if (CaptureSinkInUse->reads_at_start)
+		RestoreTransactionSnapshot(SnapBuildInitialSnapshot(ctx->snapshot_builder), MyProc);
 	FreeDecodingContext(ctx);
+	INJECTION_POINT("capture-slot-snapshot", NULL);
+	CaptureSinkInUse->slot_made(MyReplicationSlot->data.confirmed_flush);
+	CommitTransactionCommand();
 	ReplicationSlotPersist();
 	ReplicationSlotRelease();
-	CommitTransactionCommand();
 }
 
 static bool capture_at_end_of_wal = false;
@@ -587,6 +615,12 @@ capture_slot_ready(const char *name)
 				 errmsg("replication slot \"%s\" is not capture's, so this database is not being captured", name)));
 		return false;
 	}
+	if (exists && !lost && !CaptureSinkInUse->slot_will_do())
+	{
+		/* (it's been read by another sink, of which this one kept nothing) */
+		ReplicationSlotDrop(name, true);
+		exists = false;
+	}
 	if (lost)
 	{
 		ereport(WARNING,
@@ -616,14 +650,18 @@ CaptureWorkerMain(Datum main_arg)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, BGWORKER_BYPASS_ALLOWCONN);
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, BGWORKER_BYPASS_ALLOWCONN | BGWORKER_SKIP_SETTINGS);
 
 	/*
-	 * On no branch, whatever the database's settings say: a slot keeps the branch it was made on,
+	 * (A database's and its owner's settings aren't this superuser's, whose work is the whole
+	 * cluster's WAL: they're left out above.)  On no branch, whatever the server's settings say: a slot keeps the branch it was made on,
 	 * and one made on a branch decodes only that branch's changes.  With the filter off, it sees
 	 * every branch's schemas.
 	 */
 	SetConfigOption("catalog_branch", "0", PGC_SUSET, PGC_S_OVERRIDE);
+
+	/* (this is a superuser, whose SQL no setting of the server's is to have be someone else's) */
+	SetConfigOption("search_path", "pg_catalog, pg_temp", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("catalog_branch_filter", "off", PGC_SUSET, PGC_S_OVERRIDE);
 	slot_name_of(dboid, name);
 

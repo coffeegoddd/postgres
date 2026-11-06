@@ -165,6 +165,7 @@ extern void BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, ui
  */
 #define BGWORKER_BYPASS_ALLOWCONN 0x0001
 #define BGWORKER_BYPASS_ROLELOGINCHECK 0x0002
+#define BGWORKER_SKIP_SETTINGS 0x0004
 
 
 /* Block/unblock signals in a background worker process */

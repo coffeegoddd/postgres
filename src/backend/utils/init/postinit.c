@@ -688,6 +688,7 @@ BaseInit(void)
  *	  - INIT_PG_LOAD_SESSION_LIBS to honor [session|local]_preload_libraries.
  *	  - INIT_PG_OVERRIDE_ALLOW_CONNS to connect despite !datallowconn.
  *	  - INIT_PG_OVERRIDE_ROLE_LOGIN to connect despite !rolcanlogin.
+ *	  - INIT_PG_SKIP_SETTINGS to leave out the database's and role's settings.
  *	out_dbname: optional output parameter, see below; pass NULL if not used
  *
  * The database can be specified by name, using the in_dbname parameter, or by
@@ -1249,7 +1250,8 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		process_startup_options(MyProcPort, am_superuser);
 
 	/* Process pg_db_role_setting options */
-	process_settings(MyDatabaseId, GetSessionUserId());
+	if ((flags & INIT_PG_SKIP_SETTINGS) == 0)
+		process_settings(MyDatabaseId, GetSessionUserId());
 
 	/* Apply PostAuthDelay as soon as we've read all options */
 	if (PostAuthDelay > 0)

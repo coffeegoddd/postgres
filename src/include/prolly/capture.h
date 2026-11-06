@@ -41,6 +41,7 @@
 #include "access/htup.h"
 #include "access/xlogdefs.h"
 #include "prolly/ws/ws_row.h"
+#include "utils/snapshot.h"
 #include "replication/output_plugin.h"
 #include "utils/relcache.h"
 
@@ -57,6 +58,9 @@
 #define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
+
+/* The sub-id of the lock on a database that has what changes its tables' rows, untold, take turns. */
+#define CAPTURE_ROWS_LOCK 2
 
 /* The output plugin's name, which the server has built in. */
 #define PROLLY_CAPTURE_PLUGIN "prolly_capture"
@@ -88,6 +92,9 @@ typedef struct CaptureChange
 typedef struct CaptureSink
 {
 	const char *name;
+
+	/* Whether it reads tables under a new slot's snapshot, which holds up vacuum cluster-wide. */
+	bool		reads_at_start;
 
 	/*
 	 * Each time a worker starts: all that commits after this position is told, and some before it
@@ -121,6 +128,15 @@ typedef struct CaptureSink
 	 * die just after.
 	 */
 	void		(*slot_to_be_made) (void);
+
+	/*
+	 * The new slot's first position is from: in the transaction running, whose snapshot has all that
+	 * committed before it, and which commits before the slot is kept.
+	 */
+	void		(*slot_made) (XLogRecPtr from);
+
+	/* Whether a slot already there is one this sink began from, with no transaction running. */
+	bool		(*slot_will_do) (void);
 } CaptureSink;
 
 /* Says what it is told, at DEBUG1, and does nothing with it. */
@@ -150,6 +166,15 @@ extern void CaptureDatabaseDropping(Oid dboid);
  * Two layouts alike don't say the rows are: DDL can change a table's rows and tell no change of them.
  */
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
+
+/*
+ * Each of a table's rows in a snapshot, as output text in the shape's order (UTF8, or NULL), under the
+ * settings of a statement's scope.  Read directly: nothing is planned, so what's in a table's index
+ * expressions isn't run, however privileged the caller.
+ */
+typedef void (*CaptureRowFn) (void *arg, const char **fields);
+extern void CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot snapshot,
+								 CaptureRowFn fn, void *arg);
 
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
 extern void CaptureRowsAtCommit(bool prepare);

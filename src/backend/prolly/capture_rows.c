@@ -89,9 +89,6 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
-/* The sub-id of the lock on a database that has transactions rewriting rows take turns. */
-#define CAPTURE_ROWS_LOCK 2
-
 /* How many rows go in a message. */
 #define CAPTURE_ROWS_BATCH_SIZE 1000
 
@@ -106,6 +103,7 @@ typedef struct RowsOut
 {
 	StringInfoData rows;
 	int			nrows;
+	int			nstored;
 	int32		branch;
 	Oid			relid;
 } RowsOut;
@@ -129,6 +127,88 @@ rows_flush(RowsOut *o)
 	o->nrows = 0;
 }
 
+void
+CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot snapshot, CaptureRowFn fn, void *arg)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	int		   *at = palloc_array(int, Max(shape->nstored, 1));
+	FmgrInfo   *output = palloc_array(FmgrInfo, Max(shape->nstored, 1));
+	const char **fields = palloc_array(const char *, Max(shape->nstored, 1));
+	MemoryContext row_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture rows", ALLOCSET_DEFAULT_SIZES);
+	TupleTableSlot *slot;
+	TableScanDesc scan;
+	int			scope;
+
+	for (int i = 0; i < shape->nstored; i++)
+	{
+		bool		found = false;
+
+		for (int a = 0; !found && a < desc->natts; a++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, a);
+
+			if (!att->attisdropped && (uint64) att->attcoltag == shape->tags[i])
+			{
+				Oid			out_fn;
+				bool		varlena;
+
+				at[i] = a;
+				getTypeOutputInfo(att->atttypid, &out_fn, &varlena);
+				fmgr_info(out_fn, &output[i]);
+				found = true;
+			}
+		}
+		if (!found)
+			elog(ERROR, "\"%s\" has no column of tag " UINT64_FORMAT, RelationGetRelationName(rel), shape->tags[i]);
+	}
+	scope = WsSql->begin();
+	slot = table_slot_create(rel, NULL);
+	scan = table_beginscan(rel, snapshot, 0, NULL, SO_NONE);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		MemoryContext old = MemoryContextSwitchTo(row_cxt);
+
+		CHECK_FOR_INTERRUPTS();
+		slot_getallattrs(slot);
+		for (int i = 0; i < shape->nstored; i++)
+			fields[i] = slot->tts_isnull[at[i]] ? NULL :
+				ws_text_to_utf8(OutputFunctionCall(&output[i], slot->tts_values[at[i]]));
+		MemoryContextSwitchTo(old);
+
+		/* (in the caller's context, what it keeps of a row staying when the row's text goes) */
+		fn(arg, fields);
+		MemoryContextReset(row_cxt);
+	}
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	WsSql->end(scope);
+	MemoryContextDelete(row_cxt);
+	pfree(at);
+	pfree(output);
+	pfree(fields);
+}
+
+static void
+rows_write_row(void *arg, const char **fields)
+{
+	RowsOut    *o = arg;
+
+	for (int i = 0; i < o->nstored; i++)
+	{
+		if (fields[i] == NULL)
+			put_int32(&o->rows, -1);
+		else
+		{
+			int32		len = (int32) strlen(fields[i]);
+
+			put_int32(&o->rows, len);
+			appendBinaryStringInfo(&o->rows, fields[i], len);
+		}
+	}
+	if (++o->nrows == CAPTURE_ROWS_BATCH_SIZE)
+		rows_flush(o);
+}
+
 /* A table's rows, the last thing it's told of them. */
 static void
 rows_write(Relation rel, int32 branch)
@@ -137,14 +217,7 @@ rows_write(Relation rel, int32 branch)
 	WsRowShape	shape;
 	StringInfoData out;
 	RowsOut		o;
-	TupleDesc	desc = RelationGetDescr(rel);
-	int		   *at;
-	FmgrInfo   *output;
-	MemoryContext row_cxt;
 	Snapshot	snapshot;
-	TupleTableSlot *slot;
-	TableScanDesc scan;
-	int			scope;
 
 	CaptureRelationShape(rel, &shape);
 	initStringInfo(&out);
@@ -161,73 +234,16 @@ rows_write(Relation rel, int32 branch)
 		ws_row_shape_free(&shape);
 		return;
 	}
-
-	/*
-	 * Read directly, as nothing is to be planned here: planning a query folds a table's index
-	 * expressions, which are its owner's to write.
-	 */
 	initStringInfo(&o.rows);
 	o.nrows = 0;
+	o.nstored = shape.nstored;
 	o.branch = branch;
 	o.relid = relid;
-	at = palloc_array(int, shape.nstored);
-	output = palloc_array(FmgrInfo, shape.nstored);
-	for (int i = 0; i < shape.nstored; i++)
-	{
-		for (int a = 0; a < desc->natts; a++)
-		{
-			Form_pg_attribute att = TupleDescAttr(desc, a);
-
-			if (!att->attisdropped && (uint64) att->attcoltag == shape.tags[i])
-			{
-				Oid			out_fn;
-				bool		varlena;
-
-				at[i] = a;
-				getTypeOutputInfo(att->atttypid, &out_fn, &varlena);
-				fmgr_info(out_fn, &output[i]);
-				break;
-			}
-		}
-	}
-	row_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture rows", ALLOCSET_DEFAULT_SIZES);
-	scope = WsSql->begin();
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
-	slot = table_slot_create(rel, NULL);
-	scan = table_beginscan(rel, snapshot, 0, NULL, SO_NONE);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-	{
-		MemoryContext old = MemoryContextSwitchTo(row_cxt);
-
-		CHECK_FOR_INTERRUPTS();
-		slot_getallattrs(slot);
-		for (int i = 0; i < shape.nstored; i++)
-		{
-			if (slot->tts_isnull[at[i]])
-				put_int32(&o.rows, -1);
-			else
-			{
-				const char *utf8 = ws_text_to_utf8(OutputFunctionCall(&output[i], slot->tts_values[at[i]]));
-				int32		len = (int32) strlen(utf8);
-
-				put_int32(&o.rows, len);
-				appendBinaryStringInfo(&o.rows, utf8, len);
-			}
-		}
-		MemoryContextSwitchTo(old);
-		MemoryContextReset(row_cxt);
-		if (++o.nrows == CAPTURE_ROWS_BATCH_SIZE)
-			rows_flush(&o);
-	}
-	rows_flush(&o);
-	table_endscan(scan);
-	ExecDropSingleTupleTableSlot(slot);
+	CaptureTableRowsRead(rel, &shape, snapshot, rows_write_row, &o);
 	UnregisterSnapshot(snapshot);
-	WsSql->end(scope);
-	MemoryContextDelete(row_cxt);
+	rows_flush(&o);
 	pfree(o.rows.data);
-	pfree(at);
-	pfree(output);
 	ws_row_shape_free(&shape);
 }
 

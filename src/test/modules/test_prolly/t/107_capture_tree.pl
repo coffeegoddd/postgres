@@ -267,13 +267,13 @@ $node->safe_psql('postgres', "$on UPDATE s.t SET n = 2");
 ok($node->wait_for_log(qr/was not given column "v" of "t"/, $from), 'an unchanged TOASTed value');
 $node->stop;
 
-# rows there before capture began aren't in any map, so that table isn't held
+# what's there when capture begins is in its maps
 $on = fresh_node('schema_txn');
 $node->safe_psql('postgres', "$on BEGIN; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1); COMMIT");
 slot_active();
-$from = -s $node->logfile;
+same_map($on, 't', 'a table made with the first schema');
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
-ok($node->wait_for_log(qr/there before it began/, $from), 'a table made with the first schema');
+same_map($on, 't', 'and what comes after');
 $node->stop;
 
 $on = fresh_node('off_on');
@@ -287,10 +287,9 @@ $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
 $node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
 $node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'no worker';
 slot_active();
-$from = -s $node->logfile;
+same_map($on, 't', 'capture off and on again, with rows meanwhile');
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (3)");
-ok($node->wait_for_log(qr/there before it began/, $from), 'capture off and on again');
-is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/map/%'}), '0', 'and what it held is forgotten');
+same_map($on, 't', 'and what comes after');
 $node->stop;
 
 # a worker dying just after making a new slot leaves the next one knowing it's new
@@ -315,9 +314,7 @@ SKIP:
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $dying})
 	  or die 'no worker came back';
 	slot_active();
-	$from = -s $node->logfile;
-	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (3)");
-	ok($node->wait_for_log(qr/there before it began/, $from), 'a worker dying with its new slot just made');
+	same_map($on, 't', 'a worker dying with its new slot just made');
 	$node->stop;
 }
 
@@ -342,9 +339,13 @@ $node->safe_psql('postgres', 'CREATE DATABASE other TEMPLATE postgres');
 $slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'other'});
 $node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'no worker';
 slot_active('other');
-$from = -s $node->logfile;
 $node->safe_psql('other', "$on INSERT INTO s.t VALUES (2)");
-ok($node->wait_for_log(qr/there before it began/, $from), 'a database copied from one with a map');
+my $other_to = $node->safe_psql('other', 'SELECT pg_current_wal_flush_lsn()');
+$node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$other_to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'})
+  or die 'capture of the copy did not reach it';
+is( $node->safe_psql('other', "$on SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid"),
+	$node->safe_psql('other', "$on SELECT test_ws_rows_hash('s', 't')"),
+	'a database copied from one with a map begins with what it holds');
 $node->stop;
 
 $on = fresh_node('turned_on', "capture_to_trees = off\n");
@@ -355,9 +356,9 @@ caught_up();
 $node->append_conf('postgresql.conf', "capture_to_trees = on\n");
 $node->restart;
 slot_active();
-$from = -s $node->logfile;
+same_map($on, 't', 'capture to trees turned on with rows there, by a new slot');
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
-ok($node->wait_for_log(qr/there before it began/, $from), 'capture to trees turned on with rows there');
+same_map($on, 't', 'and what comes after');
 $node->stop;
 
 # a layout changed with capture to trees off, and so nothing told: it stops, and stays stopped
