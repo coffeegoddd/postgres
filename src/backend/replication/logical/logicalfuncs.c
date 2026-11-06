@@ -25,6 +25,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "prolly/capture.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
@@ -375,6 +376,12 @@ pg_logical_emit_message_bytea(PG_FUNCTION_ARGS)
 	bytea	   *data = PG_GETARG_BYTEA_PP(2);
 	bool		flush = PG_GETARG_BOOL(3);
 	XLogRecPtr	lsn;
+
+	if (strncmp(text_to_cstring(PG_GETARG_TEXT_PP(1)), PROLLY_MESSAGE_PREFIX, strlen(PROLLY_MESSAGE_PREFIX)) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("a logical message's prefix may not start with \"%s\"", PROLLY_MESSAGE_PREFIX),
+				 errdetail("Those are the server's own.")));
 
 	lsn = LogLogicalMessage(prefix, VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data),
 							transactional, flush);

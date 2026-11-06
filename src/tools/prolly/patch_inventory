@@ -105,9 +105,8 @@ patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old h
 patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema; also (5) a versioned schema sees to its database's capture worker
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
 patch src/backend/commands/subscriptioncmds.c  1b  the catalog_branch option: the subscriber's branch a subscription replicates into, its tables looked up there
-patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's; also (1b) refuses SET UNLOGGED in a versioned schema; also (2) a tier of the history store is not moved out of pg_history; also (2) ALTER TABLE ALL IN TABLESPACE passes the history store's relations by; also (4) a column added gets its tag, and a rename into a versioned schema's table refuses a name with no UTF8; also (5) an ALTER TABLE that changes rows without telling tells capture
+patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's; also (1b) refuses SET UNLOGGED in a versioned schema; also (2) a tier of the history store is not moved out of pg_history; also (2) ALTER TABLE ALL IN TABLESPACE passes the history store's relations by; also (4) a column added gets its tag, and a rename into a versioned schema's table refuses a name with no UTF8
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
-patch src/backend/commands/typecmds.c  5  an enum value renamed tells capture of the rows it changed
 patch src/backend/commands/user.c  4  the TRAVELS role option
 patch src/backend/commands/vacuum.c  1a  its own pages frozen eagerly for storage that shares pages, the freeze age the normal one (freezes_eagerly); lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances; also (2) VACUUM FULL with no table named leaves the history store's relations out
 patch src/backend/executor/execMain.c  1b  a query runs on the branch it started on (es_catalog_branch, CatalogBranchEnter())
@@ -120,6 +119,7 @@ patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in backgrou
 patch src/backend/postmaster/postmaster.c  5  registers the capture launcher
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/replication/logical/logical.c  5  capture's output plugin is built in
+patch src/backend/replication/logical/logicalfuncs.c  5  pg_logical_emit_message refuses the server's own prefixes
 patch src/backend/replication/logical/reorderbuffer.c  1b  decoding on a branch leaves out other branches' tables
 patch src/backend/replication/logical/slotsync.c  1b  a synced slot keeps the primary's slot's branch
 patch src/backend/replication/logical/worker.c  1b  a subscription's workers run on its branch (catalog_branch)
@@ -149,6 +149,7 @@ patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per
 patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
+patch src/backend/utils/init/postinit.c  5  a backend sees to capture at its commits
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format; also (5) capture_in_background
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h; also (5) capture_in_background
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size; also (5) capture

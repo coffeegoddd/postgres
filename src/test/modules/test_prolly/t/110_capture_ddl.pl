@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# DDL that changes a table's rows and tells no change of them: the statement writes the rows into
-# the WAL, and a table's row map is still, to the byte, the one layer 4 makes by reading it.
+# What changes a table's rows and tells no change of them, however it does: as it commits, its rows
+# go in the WAL, and a table's row map is still, to the byte, the one layer 4 makes by reading it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -98,6 +98,13 @@ caught_up();
 $node->safe_psql('postgres', q{COMMIT PREPARED 'ddl'});
 same_map('x', 'a prepared transaction, once committed');
 
+# the last column dropped and added again, so that its place in the row is the same: only its
+# attnum says it isn't the column it was
+run(q{CREATE TABLE same_place (id integer PRIMARY KEY, a integer); INSERT INTO same_place VALUES (1, 10)});
+caught_up();
+run('ALTER TABLE same_place DROP COLUMN a, ADD COLUMN a integer');
+same_map('same_place', 'the last column dropped and added again');
+
 # partitions and inheritance: each table with rows has its own
 run('CREATE TABLE p (id integer PRIMARY KEY, a integer) PARTITION BY RANGE (id);
 	CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);
@@ -170,9 +177,9 @@ SKIP:
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
 
-# a statement in a transaction with an older snapshot can't read what's committed now
+# one with an older snapshot can't read what's committed now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN ISOLATION LEVEL REPEATABLE READ; ALTER TABLE s.x ADD COLUMN rr integer; COMMIT");
-like($err, qr/can't take this statement in a transaction above READ COMMITTED/, 'REPEATABLE READ is refused');
+like($err, qr/can't commit this above READ COMMITTED/, 'REPEATABLE READ is refused');
 same_map('x', 'and nothing came of it');
 
 # holding writers off: renaming an enum's value locks no table, and a writer committing after the
@@ -180,19 +187,164 @@ same_map('x', 'and nothing came of it');
 my $writer = $node->background_psql('postgres');
 $writer->query_safe("$on1 BEGIN; INSERT INTO s.direct VALUES (80, 'two')");
 my $ddl = $node->background_psql('postgres');
-$ddl->query_safe('BEGIN');
-$ddl->query_until(qr/started/, "\\echo started\nALTER TYPE public.shared_e RENAME VALUE 'two' TO 'dos';\n\\echo finished\n");
-$node->poll_query_until('postgres',
-	q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'ALTER TYPE%'})
-  or die 'the statement did not wait for the writer';
+$ddl->query_safe("BEGIN; ALTER TYPE public.shared_e RENAME VALUE 'two' TO 'dos'");
+$ddl->query_until(qr/started/, "\\echo started\nCOMMIT;\n\\echo finished\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'COMMIT%'})
+  or die 'the commit did not wait for the writer';
 $writer->query_safe('COMMIT');
 $writer->quit;
-$ddl->query_safe('SELECT 1');
-$ddl->query_safe('COMMIT');
 $ddl->quit;
 same_map('direct', 'a writer open across an enum\'s value renamed');
 
-# a table there before capture began is held, once told whole
+# two at once: each is told the other's, whichever commits last
+$node->safe_psql('postgres', q{CREATE TYPE public.e1 AS ENUM ('a'); CREATE TYPE public.e2 AS ENUM ('b')});
+run(q{CREATE TABLE both_e (id integer PRIMARY KEY, x public.e1, y public.e2); INSERT INTO both_e VALUES (1, 'a', 'b')});
+caught_up();
+my $t1 = $node->background_psql('postgres');
+my $t2 = $node->background_psql('postgres');
+$t1->query_safe(q{BEGIN; ALTER TYPE public.e1 RENAME VALUE 'a' TO 'a1'});
+$t2->query_safe(q{BEGIN; ALTER TYPE public.e2 RENAME VALUE 'b' TO 'b2'});
+$t1->query_safe('COMMIT');
+$t2->query_safe('COMMIT');
+$t1->quit;
+$t2->quit;
+same_map('both_e', 'two enums renamed at once');
+
+# a table made, and left open, across a value renamed
+$node->safe_psql('postgres', q{CREATE TYPE public.e3 AS ENUM ('c')});
+my $open = $node->background_psql('postgres');
+$open->query_safe("$on1 BEGIN; CREATE TABLE s.in_flight (id integer PRIMARY KEY, a public.e3); INSERT INTO s.in_flight VALUES (1, 'c')");
+$node->safe_psql('postgres', q{ALTER TYPE public.e3 RENAME VALUE 'c' TO 'c3'});
+$open->query_safe('COMMIT');
+$open->quit;
+same_map('in_flight', 'a table made open across a value renamed');
+
+# types changed with no rewrite, so no new file: only the type says
+for my $case ([ 'cidr', 'inet', q{'10.0.0.0/8'} ], [ 'integer', 'oid', '7' ], [ 'oid', 'regclass', '1259' ], [ 'timestamp', 'timestamptz', q{'2026-01-02 03:04:05'} ])
+{
+	my ($from, $to, $v) = @$case;
+	run("CREATE TABLE ty_$from (id integer PRIMARY KEY, a $from); INSERT INTO ty_$from VALUES (1, $v)");
+	caught_up();
+	run("ALTER TABLE ty_$from ALTER COLUMN a TYPE $to");
+	same_map("ty_$from", "$from retyped to $to");
+}
+
+# a row type that changes, of a table or a composite, used for a column elsewhere
+run(q{CREATE TABLE row_of (id integer PRIMARY KEY, a integer);
+	CREATE TABLE uses_row (id integer PRIMARY KEY, r row_of);
+	INSERT INTO uses_row VALUES (1, ROW(1, 2));
+	CREATE TYPE ca AS (a integer);
+	CREATE TABLE uses_comp (id integer PRIMARY KEY, c ca);
+	INSERT INTO uses_comp VALUES (1, ROW(1))});
+caught_up();
+run('ALTER TABLE row_of ADD COLUMN b integer');
+same_map('uses_row', 'a column added to a table used as a type');
+run('ALTER TABLE row_of DROP COLUMN b');
+same_map('uses_row', 'and dropped');
+run('CREATE TABLE p_of (id integer PRIMARY KEY, a integer) PARTITION BY RANGE (id);
+	CREATE TABLE uses_p (id integer PRIMARY KEY, r p_of);
+	INSERT INTO uses_p VALUES (1, ROW(1, 2))');
+caught_up();
+run('ALTER TABLE p_of ADD COLUMN b integer');
+same_map('uses_p', 'a partitioned table used as a type');
+
+# what's dropped takes columns with it, by no ALTER TABLE
+run(q{CREATE DOMAIN dd AS integer; CREATE TYPE dt AS ENUM ('z'); CREATE TYPE dc AS (x dt);
+	CREATE FUNCTION df(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+	CREATE TABLE dropped (id integer PRIMARY KEY, a dd, b dt, c dc, g integer GENERATED ALWAYS AS (df(id)) STORED);
+	INSERT INTO dropped VALUES (1, 1, 'z', ROW('z'))});
+caught_up();
+run('DROP DOMAIN dd CASCADE');
+same_map('dropped', 'a domain dropped, and a column with it');
+run('DROP FUNCTION df(integer) CASCADE');
+same_map('dropped', 'a function dropped, and a generated column with it');
+run('DROP TYPE dt CASCADE');
+same_map('dropped', 'a type dropped, and a column and an attribute with it');
+
+# a key changed in two statements of one transaction, or by a partitioned table's
+run('CREATE TABLE swap (id integer PRIMARY KEY, a integer NOT NULL); INSERT INTO swap VALUES (1, 2)');
+caught_up();
+run('BEGIN; ALTER TABLE swap DROP CONSTRAINT swap_pkey; INSERT INTO swap VALUES (2, 3); ALTER TABLE swap ADD PRIMARY KEY (a); COMMIT');
+same_map('swap', 'a key swapped in two statements, with a row between');
+run('CREATE TABLE pk (id integer, a integer NOT NULL, PRIMARY KEY (id, a)) PARTITION BY RANGE (id);
+	CREATE TABLE pk1 PARTITION OF pk FOR VALUES FROM (0) TO (10); INSERT INTO pk VALUES (1, 1)');
+caught_up();
+run('ALTER TABLE pk DROP CONSTRAINT pk_pkey; ALTER TABLE pk ADD PRIMARY KEY (a, id)');
+same_map('pk1', 'a partitioned table\'s key changed');
+
+# a table's file changing, with its rows the same
+run('CREATE TABLE same_file (id integer PRIMARY KEY, a integer); INSERT INTO same_file VALUES (1, 1)');
+caught_up();
+$node->safe_psql('postgres', "$on1 VACUUM FULL s.same_file");
+same_map('same_file', 'VACUUM FULL');
+$node->safe_psql('postgres', "$on1 TRUNCATE s.same_file");
+same_map('same_file', 'a truncate');
+
+# a type's owner, renaming a value of it, needn't reach the tables using it
+$node->safe_psql('postgres', q{CREATE ROLE own_e LOGIN; SET ROLE own_e; RESET ROLE; CREATE TYPE public.oe AS ENUM ('o'); ALTER TYPE public.oe OWNER TO own_e});
+run(q{CREATE TABLE owned_e (id integer PRIMARY KEY, a public.oe); INSERT INTO owned_e VALUES (1, 'o')});
+caught_up();
+$node->safe_psql('postgres', q{SET ROLE own_e; ALTER TYPE public.oe RENAME VALUE 'o' TO 'oo'});
+same_map('owned_e', 'a type\'s owner, with no right to the table');
+
+# nobody else can write what only a statement's commit may: not with any rights
+$node->safe_psql('postgres', 'CREATE ROLE forger LOGIN');
+($rc, $out, $err) = $node->psql('postgres', q{SET ROLE forger; SELECT pg_logical_emit_message(true, 'prolly.capture.rows', 'R')});
+like($err, qr/prefix may not start with "prolly\."/, 'a role cannot forge one');
+($rc, $out, $err) = $node->psql('postgres', q{SELECT pg_logical_emit_message(true, 'prolly.capture.rows', 'R')});
+like($err, qr/prefix may not start with "prolly\."/, 'nor a superuser');
+
+# two in the commit at once, the first having read and written and not yet committed: the second
+# waits, and reads what the first did
+SKIP:
+{
+	skip 'injection points not supported by this build', 2 if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	$node->safe_psql('postgres', q{CREATE TYPE public.e4 AS ENUM ('d'); CREATE TYPE public.e5 AS ENUM ('f')});
+	run(q{CREATE TABLE overlap (id integer PRIMARY KEY, x public.e4, y public.e5); INSERT INTO overlap VALUES (1, 'd', 'f')});
+	caught_up();
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-rows-written', 'wait')});
+	my $first = $node->background_psql('postgres');
+	my $second = $node->background_psql('postgres');
+	$first->query_safe(q{BEGIN; ALTER TYPE public.e4 RENAME VALUE 'd' TO 'd4'});
+	$second->query_safe(q{BEGIN; ALTER TYPE public.e5 RENAME VALUE 'f' TO 'f5'});
+	$first->query_until(qr/started/, "\\echo started\nCOMMIT;\n\\echo finished\n");
+	$node->wait_for_event('client backend', 'capture-rows-written');
+	$second->query_until(qr/started/, "\\echo started\nCOMMIT;\n\\echo finished\n");
+	ok( $node->poll_query_until('postgres',
+			q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query = 'COMMIT;' AND wait_event_type = 'Lock' AND wait_event = 'object'}),
+		'the second waits its turn');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-rows-written')});
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-rows-written')});
+	$first->quit;
+	$second->quit;
+	same_map('overlap', 'and has what the first did');
+	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
+}
+
+# a change told again, in a layout before DDL that's told again too, doesn't stop it
+SKIP:
+{
+	skip 'injection points not supported by this build', 1 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	run('CREATE TABLE retold (id integer PRIMARY KEY, a integer); INSERT INTO retold VALUES (1, 1)');
+	caught_up();
+	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
+	kill 'STOP', $worker;
+	run('INSERT INTO retold VALUES (2, 2)');
+	run('ALTER TABLE retold ADD COLUMN b integer DEFAULT 9');
+	kill 'CONT', $worker;
+	$node->wait_for_event('capture worker', 'capture-applied');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
+	  or die 'no worker came back';
+	run('INSERT INTO retold VALUES (3, 3, 3)');
+	same_map('retold', 'told again across a layout changing');
+	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
+}
+
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
 

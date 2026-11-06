@@ -87,7 +87,6 @@
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
-#include "prolly/capture.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_log.h"
 #include "prolly/ws/ws_tags.h"
@@ -493,7 +492,6 @@ static AlterTableCmd *ATParseTransformCmd(List **wqueue, AlteredTableInfo *tab,
 										  bool recurse, LOCKMODE lockmode,
 										  AlterTablePass cur_pass,
 										  AlterTableUtilityContext *context);
-static void ATCaptureRows(List *wqueue);
 static void ATRewriteTables(AlterTableStmt *parsetree,
 							List **wqueue, LOCKMODE lockmode,
 							AlterTableUtilityContext *context);
@@ -4957,65 +4955,6 @@ ATController(AlterTableStmt *parsetree,
 
 	/* Phase 3: scan/rewrite tables as needed, and run afterStmts */
 	ATRewriteTables(parsetree, &wqueue, lockmode, context);
-
-	ATCaptureRows(wqueue);
-}
-
-/*
- * Whether this changed a table's rows and told no change of them: it rewrote them, its columns are
- * others than they were, or its key may be.
- */
-static bool
-ATChangedRows(AlteredTableInfo *tab)
-{
-	Relation	rel;
-	TupleDesc	desc;
-	bool		changed = tab->rewrite > 0;
-
-	for (int pass = 0; !changed && pass < AT_NUM_PASSES; pass++)
-	{
-		ListCell   *lc;
-
-		foreach(lc, tab->subcmds[pass])
-		{
-			AlterTableType type = lfirst_node(AlterTableCmd, lc)->subtype;
-
-			changed |= type == AT_AddConstraint || type == AT_AddIndex || type == AT_AddIndexConstraint ||
-				type == AT_ReAddConstraint || type == AT_ReAddIndex || type == AT_DropConstraint;
-		}
-	}
-	if (changed)
-		return true;
-
-	rel = table_open(tab->relid, NoLock);
-	desc = RelationGetDescr(rel);
-	changed = desc->natts != tab->oldDesc->natts;
-	for (int i = 0; !changed && i < desc->natts; i++)
-	{
-		Form_pg_attribute now = TupleDescAttr(desc, i);
-		Form_pg_attribute was = TupleDescAttr(tab->oldDesc, i);
-
-		changed = now->attisdropped != was->attisdropped || now->attcoltag != was->attcoltag;
-	}
-	table_close(rel, NoLock);
-	return changed;
-}
-
-/* What capture isn't told of otherwise. */
-static void
-ATCaptureRows(List *wqueue)
-{
-	ListCell   *lc;
-
-	if (!capture_to_trees)
-		return;
-	foreach(lc, wqueue)
-	{
-		AlteredTableInfo *tab = (AlteredTableInfo *) lfirst(lc);
-
-		if (tab->relkind == RELKIND_RELATION && ATChangedRows(tab))
-			CaptureTableRowsChanged(tab->relid);
-	}
 }
 
 /*

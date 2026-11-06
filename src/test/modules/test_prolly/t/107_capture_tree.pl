@@ -235,7 +235,7 @@ for my $case (
 	$node->stop;
 }
 
-# nor is a table with no key, and a truncate and a value it wasn't given stop it too
+# nor is a table with no key, and a value it wasn't given stops it too
 $on = fresh_node('keyless');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
 slot_active();
@@ -245,14 +245,16 @@ $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1)");
 ok($node->wait_for_log(qr/which has no primary key/, $from), 'a table with no primary key');
 $node->stop;
 
+# a truncate changes the table's file, so its rows are told whole
 $on = fresh_node('truncate');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
 slot_active();
 $node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
 caught_up();
-$from = -s $node->logfile;
 $node->safe_psql('postgres', "$on TRUNCATE s.t");
-ok($node->wait_for_log(qr/does not follow a truncate of "t"/, $from), 'a truncate');
+same_map($on, 't', 'a truncate');
+$node->safe_psql('postgres', "$on BEGIN; INSERT INTO s.t VALUES (2); TRUNCATE s.t; INSERT INTO s.t VALUES (3); COMMIT");
+same_map($on, 't', 'and with rows around it, in one transaction');
 $node->stop;
 
 $on = fresh_node('unchanged_toast');

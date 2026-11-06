@@ -438,7 +438,7 @@
 
 { name => 'capture_to_trees', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Applies what capture decodes to each table\'s row map.',
-  long_desc => 'It does not yet follow DDL, truncates or tables with no primary key, and capture stops at any of them.',
+  long_desc => 'It does not yet follow truncates or tables with no primary key, and capture stops at either.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'capture_to_trees',
   boot_val => 'false',

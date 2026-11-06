@@ -41,6 +41,7 @@
 #include "port/pg_bitutils.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
+#include "prolly/capture.h"
 #include "replication/slot.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -1282,6 +1283,8 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* fill in the remainder of this entry in the PgBackendStatus array */
 	if (!bootstrap)
 		pgstat_bestart_final();
+
+	CaptureBackendInit();
 
 	/* close the transaction we started above */
 	if (!bootstrap)

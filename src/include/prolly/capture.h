@@ -47,12 +47,14 @@
 /*
  * A logical message of a table's rows, each of whose int32s and the like are as this server keeps
  * them: its first byte says which.
- *	CAPTURE_ROWS_BEGIN	int32 branch, relid, nkey, nstored; uint64 tags[nstored]: what's told of the
- *						table from here on, with what came before it void
+ *	CAPTURE_ROWS_BEGIN	int32 branch, relid, nkey, nstored; uint64 tags[nstored]: all that's been told
+ *						of the table is void, and these are its rows.  With nkey 0 there are none to
+ *						follow, as nothing can hold them
  *	CAPTURE_ROWS_BATCH	int32 branch, relid, nrows; each row nstored fields, each int32 length (-1:
  *						NULL) and that much of its output text
  */
-#define CAPTURE_ROWS_PREFIX "prolly.capture.rows"
+#define PROLLY_MESSAGE_PREFIX "prolly."
+#define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
 
@@ -148,9 +150,8 @@ extern void CaptureDatabaseDropping(Oid dboid);
  */
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
 
-/* A table's rows, or those of each with a column reaching a type, changed with no change told. */
-extern void CaptureTableRowsChanged(Oid relid);
-extern void CaptureTypeRowsChanged(Oid type);
+/* Has this backend see to capture as it commits. */
+extern void CaptureBackendInit(void);
 
 /* What decoding calls. */
 extern void CaptureOutputPluginInit(OutputPluginCallbacks *callbacks);
