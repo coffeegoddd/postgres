@@ -19,6 +19,7 @@
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "access/xlog_internal.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "libpq/pqsignal.h"
@@ -31,11 +32,14 @@
 #include "replication/slot.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
@@ -45,6 +49,9 @@
 /* How often the launcher looks, and how often a worker looks for what is new. */
 #define CAPTURE_LAUNCHER_NAPTIME_MS 5000
 #define CAPTURE_WORKER_NAPTIME_MS 1000
+
+/* The sub-id of the lock on a database that says who may set or clear its mark. */
+#define CAPTURE_MARK_LOCK 1
 
 bool		capture_in_background = true;
 
@@ -96,7 +103,7 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 /* ---------------------------------------------------------------- starting */
 
 static bool
-capture_launch(Oid dboid)
+capture_launch(Oid dboid, BackgroundWorkerHandle **handle)
 {
 	BackgroundWorker bgw;
 
@@ -109,7 +116,24 @@ capture_launch(Oid dboid)
 	snprintf(bgw.bgw_name, BGW_MAXLEN, "capture for database %u", dboid);
 	snprintf(bgw.bgw_type, BGW_MAXLEN, "capture worker");
 	bgw.bgw_main_arg = ObjectIdGetDatum(dboid);
-	return RegisterDynamicBackgroundWorker(&bgw, NULL);
+	bgw.bgw_notify_pid = MyProcPid;
+	return RegisterDynamicBackgroundWorker(&bgw, handle);
+}
+
+/* Whether this database's slot has its worker. */
+static bool
+slot_is_held(Oid dboid)
+{
+	char		name[NAMEDATALEN];
+	ReplicationSlot *slot;
+	bool		held;
+
+	slot_name_of(dboid, name);
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(name, false);
+	held = slot != NULL && slot->active_proc != INVALID_PROC_NUMBER;
+	LWLockRelease(ReplicationSlotControlLock);
+	return held;
 }
 
 static bool schema_made = false;
@@ -118,12 +142,34 @@ static void
 capture_at_xact_end(XactEvent event, void *arg)
 {
 	if (event == XACT_EVENT_COMMIT && schema_made && capture_in_background && capture_possible() &&
-		!IsBinaryUpgrade)
-		(void) capture_launch(MyDatabaseId);
+		!IsBinaryUpgrade && !slot_is_held(MyDatabaseId))
+		(void) capture_launch(MyDatabaseId, NULL);
 	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
 		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT ||
 		event == XACT_EVENT_PREPARE)
 		schema_made = false;
+}
+
+/* Sets or clears this database's mark, with the lock that says who may. */
+static void
+database_mark(bool versioned)
+{
+	Relation	rel = table_open(DatabaseRelationId, RowExclusiveLock);
+	HeapTuple	tup = SearchSysCacheLockedCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	ItemPointerData otid;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	otid = tup->t_self;
+	if (((Form_pg_database) GETSTRUCT(tup))->datversioned != versioned)
+	{
+		((Form_pg_database) GETSTRUCT(tup))->datversioned = versioned;
+		CatalogTupleUpdate(rel, &otid, tup);
+		CommandCounterIncrement();
+	}
+	UnlockTuple(rel, &otid, InplaceUpdateTupleLock);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
 }
 
 void
@@ -136,6 +182,10 @@ CaptureSchemaMade(void)
 		RegisterXactCallback(capture_at_xact_end, NULL);
 		registered = true;
 	}
+
+	/* (held until this commits: a worker finding no schema mustn't clear the mark under it) */
+	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ExclusiveLock);
+	database_mark(true);
 	schema_made = true;
 }
 
@@ -196,6 +246,74 @@ capture_advance(void)
 	CommitTransactionCommand();
 }
 
+/*
+ * Clears the mark of a database with no versioned schema, if no one is making one; false if one
+ * is, or now there is one.
+ */
+static bool
+capture_clear_mark(void)
+{
+	bool		cleared = false;
+
+	StartTransactionCommand();
+	if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ExclusiveLock))
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		database_mark(false);
+		PopActiveSnapshot();
+		cleared = true;
+	}
+	CommitTransactionCommand();
+	return cleared && !database_has_versioned_schema();
+}
+
+/*
+ * Makes this database's slot if it has none.  False, with why, if this worker has nothing to do:
+ * it has a worker, or its name is some other slot's.  An invalidated slot has lost WAL it needs,
+ * so it is dropped and made again.
+ */
+static bool
+capture_slot_ready(const char *name)
+{
+	ReplicationSlot *slot;
+	bool		exists;
+	bool		held = false;
+	bool		ours = true;
+	bool		lost = false;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(name, false);
+	exists = slot != NULL;
+	if (exists)
+	{
+		held = slot->active_proc != INVALID_PROC_NUMBER;
+		ours = slot->data.database == MyDatabaseId &&
+			strcmp(NameStr(slot->data.plugin), PROLLY_CAPTURE_PLUGIN) == 0;
+		lost = slot->data.invalidated != RS_INVAL_NONE;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+	if (held)
+		return false;
+	if (!ours)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("replication slot \"%s\" is not capture's, so this database is not being captured", name)));
+		return false;
+	}
+	if (lost)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("capture's replication slot \"%s\" was invalidated, and is being made again", name)));
+		ReplicationSlotDrop(name, true);
+		exists = false;
+	}
+	if (!exists)
+		capture_slot_create(name);
+	return true;
+}
+
 void
 CaptureWorkerMain(Datum main_arg)
 {
@@ -205,7 +323,7 @@ CaptureWorkerMain(Datum main_arg)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, BGWORKER_BYPASS_ALLOWCONN);
 
 	/* (this sees every branch's schemas, not those of the branch it isn't on) */
 	SetConfigOption("catalog_branch_filter", "off", PGC_SUSET, PGC_S_OVERRIDE);
@@ -213,32 +331,9 @@ CaptureWorkerMain(Datum main_arg)
 
 	if (!capture_possible())
 		proc_exit(0);
-	if (!database_has_versioned_schema())
-	{
-		ReplicationSlot *slot;
 
-		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
-		slot = SearchNamedReplicationSlot(name, false);
-		LWLockRelease(ReplicationSlotControlLock);
-		if (slot != NULL)
-			ReplicationSlotDrop(name, true);
+	if (!capture_slot_ready(name))
 		proc_exit(0);
-	}
-
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
-	{
-		ReplicationSlot *slot = SearchNamedReplicationSlot(name, false);
-		bool		exists = slot != NULL;
-		bool		held = exists && slot->active_proc != INVALID_PROC_NUMBER;
-
-		LWLockRelease(ReplicationSlotControlLock);
-
-		/* (it has its worker) */
-		if (held)
-			proc_exit(0);
-		if (!exists)
-			capture_slot_create(name);
-	}
 	ReplicationSlotAcquire(name, true, true);
 
 	for (;;)
@@ -253,7 +348,7 @@ CaptureWorkerMain(Datum main_arg)
 		/* the launcher drops a slot with no worker, if capture is off */
 		if (!capture_in_background)
 			break;
-		if (!database_has_versioned_schema())
+		if (!database_has_versioned_schema() && capture_clear_mark())
 		{
 			ReplicationSlotRelease();
 			ReplicationSlotDrop(name, true);
@@ -271,23 +366,32 @@ void
 CaptureDatabaseDropping(Oid dboid)
 {
 	char		name[NAMEDATALEN];
-	ReplicationSlot *slot;
+	TimestampTz start = GetCurrentTimestamp();
 
 	slot_name_of(dboid, name);
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
-	slot = SearchNamedReplicationSlot(name, false);
-	LWLockRelease(ReplicationSlotControlLock);
-	if (slot == NULL)
-		return;
-	TerminateBackgroundWorkersForDatabase(dboid);
-	ReplicationSlotDrop(name, false);
+	while (slot_is_held(dboid))
+	{
+		TerminateBackgroundWorkersForDatabase(dboid);
+		CHECK_FOR_INTERRUPTS();
+
+		/* (the count of a database's slots says, if this doesn't get there) */
+		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), 5000))
+			break;
+		pg_usleep(10000);
+	}
 }
 
 /* -------------------------------------------------------------- the launcher */
 
-/* The databases that can be connected to, to look in each once. */
+typedef struct CaptureRunning
+{
+	Oid			dboid;
+	BackgroundWorkerHandle *handle;
+} CaptureRunning;
+
+/* The databases marked as having versioned schemas. */
 static List *
-databases_to_look_in(void)
+databases_marked(void)
 {
 	List	   *dbs = NIL;
 	Relation	rel;
@@ -303,7 +407,7 @@ databases_to_look_in(void)
 	{
 		Form_pg_database db = (Form_pg_database) GETSTRUCT(tup);
 
-		if (db->datallowconn && !db->datistemplate)
+		if (db->datversioned)
 		{
 			MemoryContext old = MemoryContextSwitchTo(cxt);
 
@@ -318,30 +422,36 @@ databases_to_look_in(void)
 	return dbs;
 }
 
-/* This server's capture slots: all of them, or those with no worker. */
-static List *
-slots_to_see_to(bool drop)
+/* Drops capture's slots with no worker, of no database in the list; with none, all of them. */
+static void
+drop_slots_not_of(List *dbs)
 {
-	List	   *found = NIL;
+	List	   *names = NIL;
+	ListCell   *lc;
 
 	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 	for (int i = 0; i < max_replication_slots; i++)
 	{
 		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
-		const char *name = NameStr(s->data.name);
 
 		if (s->in_use && s->active_proc == INVALID_PROC_NUMBER &&
-			strncmp(name, CAPTURE_SLOT_PREFIX, strlen(CAPTURE_SLOT_PREFIX)) == 0)
-			found = lappend(found, drop ? (void *) pstrdup(name) : (void *) (uintptr_t) s->data.database);
+			strcmp(NameStr(s->data.plugin), PROLLY_CAPTURE_PLUGIN) == 0 &&
+			strncmp(NameStr(s->data.name), CAPTURE_SLOT_PREFIX, strlen(CAPTURE_SLOT_PREFIX)) == 0 &&
+			!list_member_oid(dbs, s->data.database))
+			names = lappend(names, pstrdup(NameStr(s->data.name)));
 	}
 	LWLockRelease(ReplicationSlotControlLock);
-	return found;
+	foreach(lc, names)
+		ReplicationSlotDrop(lfirst(lc), true);
 }
 
 void
 CaptureLauncherMain(Datum main_arg)
 {
-	List	   *to_look_in;
+	/* (each a palloc in this, to last from one look to the next) */
+	MemoryContext top = AllocSetContextCreate(TopMemoryContext, "capture launcher", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext look = AllocSetContextCreate(top, "capture launcher look", ALLOCSET_DEFAULT_SIZES);
+	List	   *running = NIL;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
@@ -349,11 +459,12 @@ CaptureLauncherMain(Datum main_arg)
 
 	if (!capture_possible())
 		proc_exit(0);
-	to_look_in = databases_to_look_in();
 
 	for (;;)
 	{
+		List	   *marked;
 		ListCell   *lc;
+		MemoryContext old;
 
 		CHECK_FOR_INTERRUPTS();
 		if (ConfigReloadPending)
@@ -361,19 +472,54 @@ CaptureLauncherMain(Datum main_arg)
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
 		}
-		if (!capture_in_background)
+		MemoryContextReset(look);
+		old = MemoryContextSwitchTo(look);
+		marked = capture_in_background ? databases_marked() : NIL;
+		drop_slots_not_of(marked);
+		foreach(lc, marked)
 		{
-			foreach(lc, slots_to_see_to(true))
-				ReplicationSlotDrop(lfirst(lc), true);
+			Oid			dboid = lfirst_oid(lc);
+			ListCell   *r;
+			bool		have = slot_is_held(dboid);
+
+			foreach(r, running)
+			{
+				CaptureRunning *one = lfirst(r);
+				pid_t		pid;
+
+				if (one->dboid == dboid && GetBackgroundWorkerPid(one->handle, &pid) != BGWH_STOPPED)
+					have = true;
+			}
+			if (!have)
+			{
+				BackgroundWorkerHandle *handle;
+
+				MemoryContextSwitchTo(top);
+
+				/* (with none free to start one, the next look tries again) */
+				if (capture_launch(dboid, &handle))
+				{
+					CaptureRunning *one = palloc_object(CaptureRunning);
+
+					one->dboid = dboid;
+					one->handle = handle;
+					foreach(r, running)
+					{
+						CaptureRunning *was = lfirst(r);
+
+						if (was->dboid == dboid)
+						{
+							running = foreach_delete_current(running, r);
+							pfree(was->handle);
+							pfree(was);
+						}
+					}
+					running = lappend(running, one);
+				}
+				MemoryContextSwitchTo(look);
+			}
 		}
-		else
-		{
-			/* (with none free to start one, the next look tries again) */
-			while (to_look_in != NIL && capture_launch(linitial_oid(to_look_in)))
-				to_look_in = list_delete_first(to_look_in);
-			foreach(lc, slots_to_see_to(false))
-				(void) capture_launch(ObjectIdGetDatum((Oid) (uintptr_t) lfirst(lc)));
-		}
+		MemoryContextSwitchTo(old);
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 CAPTURE_LAUNCHER_NAPTIME_MS, WAIT_EVENT_CAPTURE_LAUNCHER_MAIN);
 		ResetLatch(MyLatch);

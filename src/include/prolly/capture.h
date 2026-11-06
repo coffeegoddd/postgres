@@ -3,14 +3,16 @@
  * capture.h
  *	  Keeping each branch's working tree equal to its tables, from the WAL.
  *
- * One worker per database with a versioned schema reads the WAL on one logical slot.  The
- * slot says which databases those are, as it lasts and needs no catalog of its own: a launcher,
- * started with the server, sees to a worker for each slot with none.  As that leaves a
- * database whose first versioned schema committed before its worker made a slot, the
- * launcher also starts a worker in each database once as it starts, which makes the slot if the
- * database has a versioned schema, and otherwise goes.  A first versioned schema starts its
- * worker as it commits, and a worker whose database has no versioned schema left drops the
- * slot, so that it holds no WAL.  wal_level minimal, or no replication slots, is no capture.
+ * One worker per database with a versioned schema reads the WAL on one logical slot.
+ * pg_database.datversioned says which databases those are: the first versioned schema sets it
+ * in its own transaction, and a database copied from one has it too.  A launcher, started
+ * with the server, sees to a worker for each so marked, and drops a capture slot of any other.  A
+ * worker whose database has no versioned schema left clears the mark and drops the slot, so
+ * that it holds no WAL.  A slot lost to max_slot_wal_keep_size is made again.
+ *
+ * wal_level minimal, or no replication slots, is no capture.  As with any logical slot, a
+ * server with one will not start with those set, and capture's slots count against
+ * max_replication_slots.
  *
  * capture_in_background turns all of this off, and the slots go with it.
  *
@@ -37,7 +39,7 @@ pg_noreturn extern void CaptureWorkerMain(Datum main_arg);
 /* A versioned schema was made here: this database's worker is seen to as this commits. */
 extern void CaptureSchemaMade(void);
 
-/* Stops a database's worker and drops its slot, as the database goes, with its lock held. */
+/* Stops a database's worker, as the database goes, with its lock held; its slot goes with it. */
 extern void CaptureDatabaseDropping(Oid dboid);
 
 /* What decoding calls. */

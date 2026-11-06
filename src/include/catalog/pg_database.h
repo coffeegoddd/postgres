@@ -51,6 +51,9 @@ CATALOG(pg_database,1262,DatabaseRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	/* new connections allowed? */
 	bool		datallowconn;
 
+	/* has it, or has it had, a versioned schema: capture sees to it */
+	bool		datversioned BKI_DEFAULT(f);
+
 	/* database has login event triggers? */
 	bool		dathasloginevt;
 
