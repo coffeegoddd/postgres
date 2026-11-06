@@ -57,8 +57,8 @@ SELECT (test_cs_put('pages', d(nextval('n')))).stored;
 }
 	});
 
-# (a wait's lines, its relation named, shown if there is one.  One's a wait of 100 ms: a shorter one
-# is only a busy machine, as a backend holding a new lane's lock can be descheduled.)
+# (a wait's lines, its relation named, shown if there is one.  One's a wait of 100 ms, as on a busy
+# machine a shorter one was seen, of a lane's lock with its holder running.)
 my $waits = slurp_file($node->logfile, $log_at);
 my %rels = map { $_ => 1 } ($waits =~ /relation (\d+) of database/g);
 my @named = map {
