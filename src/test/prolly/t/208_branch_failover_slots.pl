@@ -12,7 +12,13 @@ use Test::More;
 use ProllyTest;
 
 my $primary = ProllyTest::new_node('primary', allows_streaming => 'logical');
-$primary->append_conf('postgresql.conf', 'autovacuum = off');
+# (no capture worker: nothing here reads the failover slot, and a slot made
+# while capture's is held starts at capture's older catalog xmin, which the
+# standby's copy, starting from its own, would wait for it to pass)
+$primary->append_conf('postgresql.conf', qq{
+autovacuum = off
+capture_in_background = off
+});
 $primary->start;
 $primary->safe_psql('postgres', "SELECT pg_create_physical_replication_slot('sb_slot')");
 $primary->backup('backup');
