@@ -63,6 +63,7 @@
 #define CAPTURE_MARK_LOCK 1
 
 bool		capture_in_background = true;
+bool		capture_to_trees = false;
 
 static void
 slot_name_of(Oid dboid, char *name)
@@ -270,6 +271,11 @@ logging_commit(TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn)
 	elog(DEBUG1, "capture: commit");
 }
 
+static void
+logging_apply(void)
+{
+}
+
 const CaptureSink LoggingCaptureSink = {
 	.name = "logging",
 	.start = logging_start,
@@ -278,6 +284,7 @@ const CaptureSink LoggingCaptureSink = {
 	.truncate = logging_truncate,
 	.message = logging_message,
 	.commit = logging_commit,
+	.apply = logging_apply,
 };
 
 const CaptureSink *CaptureSinkInUse = &LoggingCaptureSink;
@@ -505,7 +512,11 @@ capture_decode(LogicalDecodingContext *ctx)
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (ctx->reader->EndRecPtr > from)
+	{
+		CaptureSinkInUse->apply();
+		INJECTION_POINT("capture-applied", NULL);
 		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+	}
 }
 
 /*
@@ -586,6 +597,8 @@ CaptureWorkerMain(Datum main_arg)
 	LogicalDecodingContext *ctx;
 
 	am_capture_worker = true;
+	if (capture_to_trees)
+		CaptureSinkInUse = &TreeCaptureSink;
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();

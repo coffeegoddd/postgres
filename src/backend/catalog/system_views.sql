@@ -1630,6 +1630,13 @@ ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_no_truncate;
 -- take and let go of roots of any chunk)
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
 
+-- How far capture has applied each branch's changes: changed in the
+-- transaction that changes its row maps.
+CREATE TABLE pg_history.capture_positions (
+	branch integer PRIMARY KEY,
+	lsn pg_lsn NOT NULL
+);
+
 -- The bundles of history pushed to the tier: a row a bundle, which holds
 -- its roots there (pg_history_push and pg_history_release make and delete
 -- them).
