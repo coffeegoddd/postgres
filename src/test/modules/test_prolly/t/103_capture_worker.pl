@@ -134,6 +134,16 @@ my $at = -s $node->logfile;
 $node->safe_psql('named', "SET catalog_branch = $named_on; CREATE SCHEMA ns VERSIONED");
 ok($node->wait_for_log(qr/replication slot "prolly_capture_$named" is not capture's/, $at), 'a slot of its name that is not capture\'s is said');
 is($node->safe_psql('postgres', qq{SELECT slot_type FROM pg_replication_slots WHERE slot_name = 'prolly_capture_$named'}), 'physical', 'and left alone');
+
+# what starts a worker that can't stay is looked at no more often than the launcher looks
+my $from = -s $node->logfile;
+sleep(11);
+my @said = slurp_file($node->logfile, $from) =~ /is not capture's/g;
+cmp_ok(scalar(@said), '<=', 4, 'a worker that cannot stay is not started again at once');
+
+# with no schema left, the mark clears, whatever is wrong with the slot
+$node->safe_psql('named', "SET catalog_branch = $named_on; DROP SCHEMA ns CASCADE");
+ok($node->poll_query_until('postgres', q{SELECT NOT datversioned FROM pg_database WHERE datname = 'named'}), 'a stale mark clears with a slot not capture\'s');
 $node->safe_psql('postgres', qq{SELECT pg_drop_replication_slot('prolly_capture_$named')});
 $node->safe_psql('postgres', 'DROP DATABASE named');
 
@@ -188,6 +198,27 @@ $node->safe_psql('postgres', 'CREATE DATABASE raced');
 	}
 }
 $node->safe_psql('postgres', 'DROP DATABASE raced');
+
+# first schemas of two sessions, the second waiting holds nothing the first needs
+$node->safe_psql('postgres', 'CREATE DATABASE firsts');
+{
+	my $f_on = $node->safe_psql('firsts', 'SELECT pg_branch_id_allocate()');
+	my $f_use = "SET catalog_branch = $f_on;";
+	my $before = -s $node->logfile;
+	my $one = $node->background_psql('firsts');
+	$one->query_safe("$f_use BEGIN; CREATE SCHEMA x VERSIONED");
+	my $two = $node->background_psql('firsts', on_error_stop => 0);
+	$two->query_until(qr/going/, "$f_use \\echo going\nCREATE SCHEMA y VERSIONED;\n");
+	$node->poll_query_until('firsts', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE datname = 'firsts' AND wait_event_type = 'Lock' AND query LIKE 'CREATE SCHEMA y%'})
+	  or die 'the second did not wait';
+	$node->append_conf('postgresql.conf', 'deadlock_timeout = 100ms');
+	$node->reload;
+	$one->query_safe("CREATE SCHEMA y VERSIONED; COMMIT");
+	$one->quit;
+	$two->quit;
+	unlike(slurp_file($node->logfile, $before), qr/deadlock detected/, 'no deadlock');
+}
+$node->safe_psql('postgres', 'DROP DATABASE firsts');
 
 # a database that can't be connected to for a while has one worker waiting, not one per look
 $node->safe_psql('postgres', 'CREATE DATABASE lockd');
@@ -269,6 +300,25 @@ $node->safe_psql('postgres', 'CREATE DATABASE lostd');
 $node->stop;
 
 # with nothing to decode from, nothing happens
+# no worker free says so, once
+{
+	my $tight = PostgreSQL::Test::Cluster->new('tight');
+	$tight->init(allows_streaming => 'logical');
+	$tight->append_conf('postgresql.conf', "max_worker_processes = 5\nautovacuum = off");
+	$tight->start;
+	for my $i (1 .. 6)
+	{
+		$tight->safe_psql('postgres', "CREATE DATABASE t$i");
+		my $t_on = $tight->safe_psql("t$i", 'SELECT pg_branch_id_allocate()');
+		$tight->safe_psql("t$i", "SET catalog_branch = $t_on; CREATE SCHEMA ts VERSIONED");
+	}
+	ok($tight->wait_for_log(qr/no background worker is free for capture/), 'no worker free is said');
+	sleep(6);
+	my @free = slurp_file($tight->logfile) =~ /no background worker is free for capture/g;
+	is(scalar(@free), 1, 'once');
+	$tight->stop;
+}
+
 my $minimal = PostgreSQL::Test::Cluster->new('minimal');
 $minimal->init;
 $minimal->append_conf('postgresql.conf', "wal_level = minimal\nmax_wal_senders = 0");

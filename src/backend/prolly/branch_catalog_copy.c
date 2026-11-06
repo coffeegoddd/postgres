@@ -2239,7 +2239,7 @@ const BranchCatalogCopyRoutine *BranchCatalogCopy = &DependencyBranchCatalogCopy
 Datum
 pg_branch_catalog_copy(PG_FUNCTION_ARGS)
 {
-	BranchCatalogCopy->copy(PG_GETARG_INT32(0), PG_GETARG_INT32(1));
 	CaptureSchemaMade();
+	BranchCatalogCopy->copy(PG_GETARG_INT32(0), PG_GETARG_INT32(1));
 	PG_RETURN_VOID();
 }
