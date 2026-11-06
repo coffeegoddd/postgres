@@ -48,6 +48,7 @@
 #define PROLLY_CAPTURE_PLUGIN "prolly_capture"
 
 extern PGDLLIMPORT bool capture_in_background;
+extern PGDLLIMPORT bool capture_to_trees;
 
 typedef enum CaptureChangeKind
 {
@@ -91,10 +92,27 @@ typedef struct CaptureSink
 	 */
 	void		(*message) (const char *prefix, const char *data, Size size, bool transactional, XLogRecPtr lsn);
 	void		(*commit) (TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn);
+
+	/*
+	 * What it was told is to be kept: with no transaction running, as nothing can be written from
+	 * the others.  The slot says what was told only once this returns, so what's lost before then
+	 * is told again.
+	 */
+	void		(*apply) (void);
+
+	/*
+	 * A new slot is being made, so what the sink has kept may not join what it is told next.  With
+	 * no transaction running and the slot's name held, and before the slot is kept, as a worker can
+	 * die just after.
+	 */
+	void		(*slot_to_be_made) (void);
 } CaptureSink;
 
 /* Says what it is told, at DEBUG1, and does nothing with it. */
 extern PGDLLIMPORT const CaptureSink LoggingCaptureSink;
+
+/* Keeps each table's rows as a row map, as prolly/ws/ws_rows.h's capture makes them. */
+extern PGDLLIMPORT const CaptureSink TreeCaptureSink;
 
 /* The implementation in use. */
 extern PGDLLIMPORT const CaptureSink *CaptureSinkInUse;

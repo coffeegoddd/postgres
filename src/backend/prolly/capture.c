@@ -63,6 +63,7 @@
 #define CAPTURE_MARK_LOCK 1
 
 bool		capture_in_background = true;
+bool		capture_to_trees = false;
 
 static void
 slot_name_of(Oid dboid, char *name)
@@ -270,6 +271,16 @@ logging_commit(TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn)
 	elog(DEBUG1, "capture: commit");
 }
 
+static void
+logging_apply(void)
+{
+}
+
+static void
+logging_slot_to_be_made(void)
+{
+}
+
 const CaptureSink LoggingCaptureSink = {
 	.name = "logging",
 	.start = logging_start,
@@ -278,6 +289,8 @@ const CaptureSink LoggingCaptureSink = {
 	.truncate = logging_truncate,
 	.message = logging_message,
 	.commit = logging_commit,
+	.apply = logging_apply,
+	.slot_to_be_made = logging_slot_to_be_made,
 };
 
 const CaptureSink *CaptureSinkInUse = &LoggingCaptureSink;
@@ -446,8 +459,13 @@ capture_slot_create(const char *name)
 {
 	LogicalDecodingContext *ctx;
 
-	StartTransactionCommand();
+	/*
+	 * (with the name held, so another worker starting too doesn't take this for its own new slot,
+	 * and before it's persisted, as a worker can die just after)
+	 */
 	ReplicationSlotCreate(name, true, RS_EPHEMERAL, false, false, false, false);
+	CaptureSinkInUse->slot_to_be_made();
+	StartTransactionCommand();
 	EnsureLogicalDecodingEnabled();
 	ctx = CreateInitDecodingContext(PROLLY_CAPTURE_PLUGIN, NIL, false, false, InvalidXLogRecPtr,
 									XL_ROUTINE(.page_read = read_local_xlog_page,
@@ -505,7 +523,10 @@ capture_decode(LogicalDecodingContext *ctx)
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (ctx->reader->EndRecPtr > from)
+	{
+		CaptureSinkInUse->apply();
 		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+	}
 }
 
 /*
@@ -574,7 +595,10 @@ capture_slot_ready(const char *name)
 		exists = false;
 	}
 	if (!exists)
+	{
 		capture_slot_create(name);
+		INJECTION_POINT("capture-slot-made", NULL);
+	}
 	return true;
 }
 
@@ -586,6 +610,8 @@ CaptureWorkerMain(Datum main_arg)
 	LogicalDecodingContext *ctx;
 
 	am_capture_worker = true;
+	if (capture_to_trees)
+		CaptureSinkInUse = &TreeCaptureSink;
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
