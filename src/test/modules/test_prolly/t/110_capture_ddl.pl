@@ -525,21 +525,4 @@ run(q{BEGIN; ALTER TYPE back RENAME VALUE 'one' TO 'uno'; INSERT INTO s.t VALUES
 ok($node->wait_for_log(qr/written as catalogs were during its transaction/, $from), 'a state changed and changed back around a row stops capture');
 $node->stop;
 
-$node = PostgreSQL::Test::Cluster->new('ddl_before');
-$node->init(allows_streaming => 'logical');
-$node->append_conf('postgresql.conf', "log_line_prefix = ''\nautovacuum = off\ncapture_to_trees = on\n");
-$node->start;
-$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
-my $b3 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
-$on1 = "SET catalog_branch = $b3;";
-$slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
-$node->safe_psql('postgres', "$on1 BEGIN; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY, a integer); INSERT INTO s.t VALUES (1, 1); COMMIT");
-$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_history.capture_positions WHERE branch = 0}) or die 'no worker';
-is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.capture_tables WHERE nkey IS NULL}), '1', 'a table there before capture began is marked');
-run('ALTER TABLE t ADD COLUMN b integer DEFAULT 2');
-same_map('t', 'told whole, it has a row map');
-is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.capture_tables WHERE nkey IS NULL}), '0', 'and is no longer marked');
-run('INSERT INTO t VALUES (2, 2, 2)');
-same_map('t', 'and goes on from there');
-$node->stop;
 done_testing();

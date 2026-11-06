@@ -16,12 +16,13 @@
  * told again is passed over.  That transaction is flushed before the slot moves,
  * whatever synchronous_commit says, or a crash would leave the slot past what it lost.
  *
- * A row map holds only what decoding was told, so only a table made since capture
- * began can have one.  The branch 0 row of pg_history.capture_positions says capture
- * began, and goes before any new slot it makes is kept.  A worker finding none forgets all it
- * holds and marks each table there now in pg_history.capture_tables, and a change to
- * one of those is an error.  So is a table's layout differing from the one recorded
- * there, which outlasts the worker, so capture stays stopped.
+ * A new slot begins with a row map of every table with a key, read under the snapshot of the slot's
+ * first position, so that map and what's told after it are the whole of the table.  That's one
+ * transaction, which ends with the branch 0 row of pg_history.capture_positions saying capture began,
+ * and that row goes before any new slot is made.  So a slot is kept only once it's all there; a slot
+ * with no such row was made by another sink, and is made again.  A table's layout differing from the
+ * one recorded in pg_history.capture_tables, unless told of whole, is an error, which outlasts the
+ * worker, so capture stays stopped.
  *
  * What belongs to a table or a branch that's gone is let go of when a worker starts,
  * and a change decoded after that brings a table's back until the next start.  The
@@ -50,6 +51,7 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_attribute.h"
@@ -139,32 +141,6 @@ tree_forget_ref(void *arg, const char *name, const PHash *hash)
 	*names = lappend(*names, pstrdup(name));
 }
 
-/*
- * Forgets all it holds, as what comes next is told from a new start, and marks the tables there
- * now.  One made and committed while this runs is marked too, and refused though its rows would
- * be told: an error, never a wrong map.
- */
-static void
-tree_begin_anew(VcRefs *refs, XLogRecPtr from)
-{
-	List	   *names = NIL;
-	ListCell   *lc;
-	Oid			types[1] = {PG_LSNOID};
-	Datum		values[1] = {LSNGetDatum(from)};
-
-	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);
-	foreach(lc, names)
-		refs->routine->remove(refs, lfirst(lc));
-	tree_exec("DELETE FROM pg_history.capture_positions", SPI_OK_DELETE);
-	tree_exec("DELETE FROM pg_history.capture_tables", SPI_OK_DELETE);
-	tree_exec("INSERT INTO pg_history.capture_tables (relid) "
-			  "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-			  "WHERE n.nspbranch <> 0 AND c.relkind = 'r'", SPI_OK_INSERT);
-	if (SPI_execute_with_args("INSERT INTO pg_history.capture_positions VALUES (0, $1)",
-							  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
-		elog(ERROR, "could not save where capture began");
-}
-
 /* Lets go of what belongs to a table or a branch that's gone. */
 static void
 tree_let_go(VcRefs *refs)
@@ -229,11 +205,7 @@ tree_start(XLogRecPtr from)
 		elog(ERROR, "could not connect to SPI");
 	cs = ChunkStoreOpen("pages");
 	refs = VcRefsOpen("pointers", cs);
-	tree_exec("SELECT 1 FROM pg_history.capture_positions WHERE branch = 0", SPI_OK_SELECT);
-	if (SPI_processed == 0)
-		tree_begin_anew(refs, from);
-	else
-		tree_let_go(refs);
+	tree_let_go(refs);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
@@ -631,18 +603,14 @@ tree_check_table(const TreeTable *table, const WsRowShape *shape)
 	values[0] = ObjectIdGetDatum(table->relid);
 	values[1] = Int32GetDatum(shape->nkey);
 	values[2] = PointerGetDatum(array);
-	if (SPI_execute_with_args("SELECT nkey IS NULL, nkey = $2 AND tags = $3 FROM pg_history.capture_tables WHERE relid = $1",
+	if (SPI_execute_with_args("SELECT nkey = $2 AND tags = $3 FROM pg_history.capture_tables WHERE relid = $1",
 							  3, types, values, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read capture's table %u", table->relid);
 	if (SPI_processed == 1)
 	{
 		bool		isnull;
 
-		if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("capture to trees does not hold relation %u, which was there before it began", table->relid)));
-		if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull)))
+		if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
@@ -660,23 +628,23 @@ tree_same_shape(const WsRowShape *a, const WsRowShape *b)
 
 /* Records a table's layout as of what's now applied. */
 static void
-tree_record_table(const TreeTable *table)
+tree_record_shape(Oid relid, const WsRowShape *shape)
 {
 	Oid			types[3] = {OIDOID, INT4OID, INT8ARRAYOID};
 	Datum		values[3];
-	Datum	   *tags = palloc_array(Datum, Max(table->shape->nstored, 1));
+	Datum	   *tags = palloc_array(Datum, Max(shape->nstored, 1));
 	ArrayType  *array;
 
-	for (int i = 0; i < table->shape->nstored; i++)
-		tags[i] = Int64GetDatum((int64) table->shape->tags[i]);
-	array = construct_array_builtin(tags, table->shape->nstored, INT8OID);
-	values[0] = ObjectIdGetDatum(table->relid);
-	values[1] = Int32GetDatum(table->shape->nkey);
+	for (int i = 0; i < shape->nstored; i++)
+		tags[i] = Int64GetDatum((int64) shape->tags[i]);
+	array = construct_array_builtin(tags, shape->nstored, INT8OID);
+	values[0] = ObjectIdGetDatum(relid);
+	values[1] = Int32GetDatum(shape->nkey);
 	values[2] = PointerGetDatum(array);
 	if (SPI_execute_with_args("INSERT INTO pg_history.capture_tables VALUES ($1, $2, $3) "
 							  "ON CONFLICT (relid) DO UPDATE SET nkey = excluded.nkey, tags = excluded.tags",
 							  3, types, values, NULL, false, 0) != SPI_OK_INSERT)
-		elog(ERROR, "could not record capture's table %u", table->relid);
+		elog(ERROR, "could not record capture's table %u", relid);
 	pfree(array);
 	pfree(tags);
 }
@@ -748,7 +716,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	{
 		/* told whole, with no key: nothing can hold it, and what was held is void */
 		(void) refs->routine->remove(refs, name);
-		tree_record_table(table);
+		tree_record_shape(table->relid, table->shape);
 		return;
 	}
 	f = palloc_array(WsField, most);
@@ -784,7 +752,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		if (n > 0 && prolly_apply(ctx, &map, edits, n, &map) < 0)
 			prolly_report(ctx);
 		refs->routine->set(refs, name, &map);
-		tree_record_table(table);
+		tree_record_shape(table->relid, table->shape);
 	}
 	tree_edits_free(edits, n);
 	pfree(edits);
@@ -856,6 +824,158 @@ tree_apply(void)
 	INJECTION_POINT("capture-applied", NULL);
 }
 
+/* A table's rows being made into its map, a batch at a time. */
+typedef struct TreeRebuild
+{
+	ProllyCtx  *ctx;
+	const WsRowShape *shape;
+	PHash		map;
+	ProllyEdit *edits;
+	int			n;
+	WsField    *f;
+} TreeRebuild;
+
+#define TREE_REBUILD_BATCH 1000
+
+static void
+tree_rebuild_flush(TreeRebuild *b)
+{
+	if (b->n > 0 && prolly_apply(b->ctx, &b->map, b->edits, b->n, &b->map) < 0)
+		prolly_report(b->ctx);
+	tree_edits_free(b->edits, b->n);
+	b->n = 0;
+}
+
+static void
+tree_rebuild_row(void *arg, const char **fields)
+{
+	TreeRebuild *b = arg;
+	Buf			k = BUF_INIT,
+				v = BUF_INIT;
+
+	for (int c = 0; c < b->shape->nstored; c++)
+	{
+		b->f[c].p = (const uint8 *) fields[c];
+		b->f[c].len = fields[c] != NULL ? strlen(fields[c]) : 0;
+		b->f[c].null = fields[c] == NULL;
+		b->f[c].large = false;
+	}
+	ws_row_store(b->ctx, b->shape, b->f, &k, &v);
+	b->edits[b->n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len};
+	if (b->n == TREE_REBUILD_BATCH)
+		tree_rebuild_flush(b);
+}
+
+/* A table's row map, of its rows in the transaction's snapshot, with none for one with no key. */
+static void
+tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	WsRowShape	shape;
+	char	   *fingerprint;
+	Oid			types[2] = {OIDOID, TEXTOID};
+	Datum		values[2];
+
+	CaptureRelationShape(rel, &shape);
+	if (shape.nkey > 0)
+	{
+		TreeRebuild b = {.ctx = ctx,.shape = &shape};
+		char		name[64];
+
+		b.f = palloc_array(WsField, Max(shape.nstored, 1));
+		b.edits = palloc_array(ProllyEdit, TREE_REBUILD_BATCH);
+		if (prolly_empty(ctx, WS_ROW_VREFS, &b.map) < 0)
+			prolly_report(ctx);
+		CaptureTableRowsRead(rel, &shape, GetActiveSnapshot(), tree_rebuild_row, &b);
+		tree_rebuild_flush(&b);
+		snprintf(name, sizeof(name), "capture/map/%u", relid);
+		refs->routine->set(refs, name, &b.map);
+		tree_record_shape(relid, &shape);
+		pfree(b.f);
+		pfree(b.edits);
+	}
+
+	/*
+	 * (or the first catalog change would tell all of every table.  One that changed since this
+	 * snapshot recorded its own, which this can't see, and it's a serialization failure: the worker
+	 * starts again, with a later snapshot.)
+	 */
+	fingerprint = CaptureRowsFingerprint(relid, rel->rd_rel->relfilenode);
+	values[0] = ObjectIdGetDatum(relid);
+	values[1] = CStringGetTextDatum(fingerprint);
+	if (SPI_execute_with_args("INSERT INTO pg_history.capture_fingerprints VALUES ($1, $2) ON CONFLICT (relid) DO NOTHING",
+							  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not record a table's fingerprint");
+	pfree(fingerprint);
+	ws_row_shape_free(&shape);
+	table_close(rel, AccessShareLock);
+}
+
+static void
+tree_slot_made(XLogRecPtr from)
+{
+	ChunkStore *cs;
+	VcRefs	   *refs;
+	ProllyCtx	ctx;
+	List	   *names = NIL;
+	List	   *tables = NIL;
+	ListCell   *lc;
+	Oid			types[1] = {PG_LSNOID};
+	Datum		values[1] = {LSNGetDatum(from)};
+
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	cs = ChunkStoreOpen("pages");
+	refs = VcRefsOpen("pointers", cs);
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+
+	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);
+	foreach(lc, names)
+		refs->routine->remove(refs, lfirst(lc));
+	tree_exec("DELETE FROM pg_history.capture_positions", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_tables", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_fingerprints", SPI_OK_DELETE);
+	tree_exec("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+			  "WHERE n.nspbranch <> 0 AND c.relkind = 'r' AND c.relpersistence = 'p'", SPI_OK_SELECT);
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+
+		tables = lappend_oid(tables, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
+	}
+	foreach(lc, tables)
+		tree_rebuild_table(&ctx, refs, lfirst_oid(lc));
+
+	if (SPI_execute_with_args("INSERT INTO pg_history.capture_positions VALUES (0, $1)",
+							  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not save where capture began");
+	elog(DEBUG1, "capture tree: began with %d tables", list_length(tables));
+	prolly_ctx_free(&ctx);
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
+}
+
+static bool
+tree_slot_will_do(void)
+{
+	bool		began;
+
+	tree_settings();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	tree_exec("SELECT 1 FROM pg_history.capture_positions WHERE branch = 0", SPI_OK_SELECT);
+	began = SPI_processed > 0;
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	return began;
+}
+
 const CaptureSink TreeCaptureSink = {
 	.name = "tree",
 	.start = tree_start,
@@ -866,4 +986,6 @@ const CaptureSink TreeCaptureSink = {
 	.commit = tree_end,
 	.apply = tree_apply,
 	.slot_to_be_made = tree_slot_to_be_made,
+	.slot_made = tree_slot_made,
+	.slot_will_do = tree_slot_will_do,
 };
