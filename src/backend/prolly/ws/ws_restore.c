@@ -82,6 +82,15 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 	int			nroles = 0;
 	PHash		map;
 
+	/* (what it would do of tables yet to be made is no table's, and no commit holds it) */
+	WsSql->run("SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace "
+			   "WHERE n.nspname = $1::name LIMIT 1", 1, params, &viewed);
+	if (viewed.nrows > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("schema \"%s\" has default privileges, which a commit cannot hold", schema)));
+	ws_sql_rows_free(&viewed);
+
 	/* (run, not read: a statement may have made these, and it sees what that did) */
 	WsSql->run("SELECT c.relname::text, a.attname::text, r.relname::text FROM pg_class c "
 			   "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid "

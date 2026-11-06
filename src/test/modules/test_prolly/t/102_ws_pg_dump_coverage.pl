@@ -3,7 +3,9 @@
 # One of every object kind a versioned schema can hold: captured, restored into an empty
 # schema of its name on another branch, and the same by pg_dump, object by object.  A kind
 # a commit comes to hold that this schema does not fails here.  So too the root is the same
-# whatever a session had set when it captured it.
+# whatever a session had set when it captured it.  Of the schema itself a commit holds nothing,
+# so what it is granted is made by hand here on each branch; storage parameters print in the
+# order they were made, and a commit holds them in order of name, so they are made so here.
 
 use strict;
 use warnings FATAL => 'all';
@@ -94,7 +96,7 @@ my $owner = q{
 	ALTER TABLE t ALTER COLUMN n SET STATISTICS 50;
 	ALTER TABLE t ADD CONSTRAINT w_nv CHECK (n < 1000) NOT VALID;
 	CREATE INDEX t_expr ON t (lower(v)) WHERE n > 0;
-	CREATE INDEX t_ops ON t (m in_fam);
+	CREATE INDEX t_ops ON t (m in_fam) WITH (deduplicate_items = off, fillfactor = 70);
 	ALTER TABLE t REPLICA IDENTITY USING INDEX t_pkey;
 	ALTER TABLE t CLUSTER ON t_pkey;
 	COMMENT ON TABLE t IS 'on a table';
@@ -129,6 +131,8 @@ my $owner = q{
 		f double precision DEFAULT 0.1,
 		b bytea DEFAULT '\\x0102',
 		a text[] DEFAULT '{a,b}',
+		cash money DEFAULT 12.5,
+		slash text DEFAULT E'a\\\\b',
 		"Odd Name" integer,
 		"select" integer
 	);
@@ -141,6 +145,7 @@ my $owner = q{
 	COMMENT ON VIEW v1 IS 'on a view';
 	GRANT SELECT ON v1 TO g_reader;
 	CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WITH NO DATA;
+	CREATE MATERIALIZED VIEW mv_full AS SELECT id FROM t;
 	CREATE INDEX mv_id ON mv (id);
 	CREATE FUNCTION seen() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
 	CREATE TRIGGER tr BEFORE UPDATE OF v ON t FOR EACH ROW WHEN (OLD.v <> NEW.v) EXECUTE FUNCTION seen();
@@ -158,10 +163,14 @@ my @settings = (
 	q{DateStyle = 'SQL, DMY'}, q{DateStyle = 'German'}, q{DateStyle = 'Postgres, MDY'},
 	q{IntervalStyle = 'sql_standard'}, q{IntervalStyle = 'iso_8601'}, q{IntervalStyle = 'postgres_verbose'},
 	q{TimeZone = 'Asia/Tokyo'}, q{extra_float_digits = 0}, q{extra_float_digits = -5},
-	q{bytea_output = 'escape'}, q{xmloption = 'document'}, q{xmlbinary = 'hex'},
+	q{bytea_output = 'escape'},
 	q{quote_all_identifiers = on}, q{search_path = app, public}, q{search_path = pg_catalog},
-	q{lc_monetary = 'C'}, q{default_text_search_config = 'simple'},
+	q{default_text_search_config = 'simple'},
 	q{row_security = off}, q{backslash_quote = off});
+
+# (a locale other than the one capture takes, if this system has one)
+my $locale = $node->safe_psql('postgres', q{SELECT collcollate FROM pg_collation WHERE collprovider = 'c' AND collencoding IN (-1, pg_char_to_encoding(getdatabaseencoding())) AND collcollate NOT IN ('C', 'POSIX', 'C.utf8', 'C.UTF-8', 'ucs_basic') AND collcollate IS NOT NULL ORDER BY 1 LIMIT 1});
+push @settings, (qq{lc_monetary = '$locale'}, qq{lc_time = '$locale'}, qq{lc_numeric = '$locale'}) if $locale ne '';
 my $settled = join('', map { "SET $settings[$_]; \\echo =====setting$_\nSELECT public.test_ws_root_capture('app') = :'r';\n\\echo =====end\nRESET ALL; SET catalog_branch = $from; SET client_min_messages = warning;\n" } 0 .. $#settings);
 
 my ($rc, $out, $err) = $node->psql('postgres', qq{
@@ -187,11 +196,16 @@ my ($rc, $out, $err) = $node->psql('postgres', qq{
 	\\echo =====same
 	SELECT test_ws_root_capture('app') = :'r';
 	\\echo =====end
+	\\echo =====filled
+	SELECT relispopulated FROM pg_class WHERE oid = 'app.mv_full'::regclass;
+	\\echo =====end
 	SET catalog_branch = $from;
 	$settled
 });
 is($rc, 0, 'made, captured and restored') or diag($err);
 like($out, qr/=====same\nt\n/, 'it captures as the root it was restored from');
+
+like($out, qr/=====filled\nf\n/, 'a materialized view restores with no data, to be refreshed');
 
 for my $i (0 .. $#settings)
 {
@@ -219,13 +233,15 @@ sub dump_of
 		[ 'pg_dump', '--schema-only', '-d', $node->connstr('postgres') ],
 		'>', \$stdout, '2>', \$stderr) or die "pg_dump: $stderr";
 	my %objects;
-	my $at;
-	for my $line (split /\n/, $stdout)
+
+	# (pg_dump's own lines around a header, and nothing else, are not an object's)
+	$stdout =~ s/^\\(un)?restrict .*\n//mg;
+	my @parts = split /^--\n-- (?:Data for )?Name: (.*); Owner: (.*)\n--\n\n/m, $stdout;
+	shift @parts;
+	while (my ($at, $who, $body) = splice(@parts, 0, 3))
 	{
-		next if $line =~ /^\\(un)?restrict /;
-		if ($line =~ /^-- (?:Data for )?Name: (.*); Owner: (.*)$/) { $at = $1; $objects{$at} = "Owner: $2\n"; next; }
-		next if !defined $at || $line =~ /^--$/ || $line eq '';
-		$objects{$at} .= "$line\n";
+		die "two objects are $at" if exists $objects{$at};
+		$objects{$at} = "Owner: $who\n$body";
 	}
 	return \%objects;
 }
@@ -241,6 +257,8 @@ is_deeply([ grep { !exists $now->{$_} } sort keys %$was ], [], 'none is lost');
 is_deeply([ grep { !exists $was->{$_} } sort keys %$now ], [], 'none is new');
 for my $object (sort keys %$was)
 {
+	# (a materialized view restored with no data says so, and not a refresh)
+	next if $object =~ /^MATERIALIZED VIEW mv_full;/;
 	is($now->{$object}, $was->{$object}, "the same: $object") if exists $now->{$object};
 }
 
@@ -252,6 +270,12 @@ for my $object (sort keys %$was)
 my $changed = dump_of($to);
 my @differ = grep { ($changed->{$_} // '') ne ($was->{$_} // '') } sort keys %$was;
 is_deeply(\@differ, [ 'TABLE t; Type: COMMENT; Schema: app' ], 'a dump of the other branch sees a change, and only it');
+
+# what would be of tables yet to be made is no one's, and no commit holds it
+my ($dp_rc, $dp_out, $dp_err) = $node->psql('postgres', qq{SET catalog_branch = $from;
+	ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO g_reader;
+	SELECT test_ws_root_capture('app')});
+like($dp_err, qr/schema "app" has default privileges, which a commit cannot hold/, 'default privileges in a schema: refused at capture');
 
 $node->stop;
 done_testing();

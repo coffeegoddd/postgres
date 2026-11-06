@@ -8,14 +8,17 @@
  * point in time is in REPEATABLE READ, as each read of the catalogs says.  It marks no
  * role: whoever commits does that (ws_role_mark), and a root naming one unmarked is
  * refused in restoring it here.  A column of a view's row type is refused, as views
- * are made after tables.
+ * are made after tables, and so are the schema's default privileges, which are of nothing a
+ * commit holds.  Of the schema itself it holds nothing: its owner, comment and grants are
+ * whoever made it there's.
  *
  * Restore makes all of it in a schema with nothing in it, in the one order each part
  * needs: the roles; the objects tables use; each table with its tags, then its rows,
  * then its owner, then its indexes; partitions attached, each table before its own; checks not valid,
  * a partition's before its table's; inheriting, and what is only inherited marked so;
  * foreign keys, each table's last name first; comments; each table's grants; the
- * objects that use tables; row security, as forcing
+ * objects that use tables, a materialized view with no data, as filling it runs what it is
+ * made of, and it is to be refreshed; row security, as forcing
  * it would refuse a role its own rows; the sequences' positions; and what each now
  * prints remembered.  A
  * restored schema captures as the root it came from.
