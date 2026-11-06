@@ -22,7 +22,7 @@ $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 max_connections = 100
 log_lock_waits = on
-deadlock_timeout = 10ms
+deadlock_timeout = 100ms
 log_line_prefix = '%m [%p] %b %a: '
 log_min_error_statement = log
 });
@@ -57,7 +57,8 @@ SELECT (test_cs_put('pages', d(nextval('n')))).stored;
 }
 	});
 
-# (a wait's lines, its relation named, shown if there is one)
+# (a wait's lines, its relation named, shown if there is one.  One's a wait of 100 ms: a shorter one
+# is only a busy machine, as a backend holding a new lane's lock can be descheduled.)
 my $waits = slurp_file($node->logfile, $log_at);
 my %rels = map { $_ => 1 } ($waits =~ /relation (\d+) of database/g);
 my @named = map {

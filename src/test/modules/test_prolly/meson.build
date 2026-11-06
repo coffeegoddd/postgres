@@ -234,6 +234,7 @@ tests += {
       't/105_capture_routing.pl',
       't/106_capture_layouts.pl',
       't/107_capture_tree.pl',
+      't/108_capture_fixture.pl',
       't/109_client_tools_history.pl',
     ],
     'env': {
