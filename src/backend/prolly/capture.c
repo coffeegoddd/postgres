@@ -80,7 +80,7 @@ capture_possible(void)
 /* -------------------------------------------------------------- the plugin */
 
 /* Only the worker tells the sink, so a session can't be a second writer behind it. */
-static bool am_capture_worker = false;
+bool		am_capture_worker = false;
 
 static void
 capture_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
@@ -173,6 +173,7 @@ capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 		default:
 			elog(ERROR, "unexpected change of kind %d decoded", (int) change->action);
 	}
+	out.catalogs_changed = rbtxn_has_catalog_changes(txn);
 	out.old_tuple = change->data.tp.oldtuple;
 	out.new_tuple = change->data.tp.newtuple;
 	CaptureSinkInUse->change(&out);

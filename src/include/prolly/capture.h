@@ -44,6 +44,20 @@
 #include "replication/output_plugin.h"
 #include "utils/relcache.h"
 
+/*
+ * A logical message of a table's rows, each of whose int32s and the like are as this server keeps
+ * them: its first byte says which.
+ *	CAPTURE_ROWS_BEGIN	int32 branch, relid, nkey, nstored; uint64 tags[nstored]: all that's been told
+ *						of the table is void, and these are its rows.  With nkey 0 there are none to
+ *						follow, as nothing can hold them
+ *	CAPTURE_ROWS_BATCH	int32 branch, relid, nrows; each row nstored fields, each int32 length (-1:
+ *						NULL) and that much of its output text
+ */
+#define PROLLY_MESSAGE_PREFIX "prolly."
+#define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
+#define CAPTURE_ROWS_BEGIN 'R'
+#define CAPTURE_ROWS_BATCH 'D'
+
 /* The output plugin's name, which the server has built in. */
 #define PROLLY_CAPTURE_PLUGIN "prolly_capture"
 
@@ -67,6 +81,7 @@ typedef struct CaptureChange
 								 * NULL for a delete if it gives nothing */
 	HeapTuple	new_tuple;		/* an unchanged TOAST value is not in it; NULL for a delete */
 	XLogRecPtr	lsn;
+	bool		catalogs_changed;	/* its transaction changed catalogs */
 } CaptureChange;
 
 /* What decoding finds. */
@@ -135,6 +150,15 @@ extern void CaptureDatabaseDropping(Oid dboid);
  * Two layouts alike don't say the rows are: DDL can change a table's rows and tell no change of them.
  */
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
+
+/* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
+extern void CaptureRowsAtCommit(bool prepare);
+
+/* What makes up what a table's rows are, of the catalogs as they are for this reader. */
+extern char *CaptureRowsFingerprint(Oid relid, Oid relfilenode);
+
+/* This is capture's own worker. */
+extern PGDLLIMPORT bool am_capture_worker;
 
 /* What decoding calls. */
 extern void CaptureOutputPluginInit(OutputPluginCallbacks *callbacks);

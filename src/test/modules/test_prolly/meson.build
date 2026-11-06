@@ -236,6 +236,7 @@ tests += {
       't/107_capture_tree.pl',
       't/108_capture_fixture.pl',
       't/109_client_tools_history.pl',
+      't/110_capture_ddl.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

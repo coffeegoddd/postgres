@@ -177,15 +177,6 @@ IPC::Run::run([ 'pg_dump', '--dbname', $node->connstr('postgres'), '--no-sync' ]
 unlike($dump, qr/capture\/map\//, 'a dump has no map of capture\'s');
 unlike($dump, qr/COPY pg_history\.capture_/, 'nor its positions or tables');
 
-# what this can't follow stops it, rather than leaving a map wrong, and it stays stopped
-my $offset = -s $node->logfile;
-my $relid = $node->safe_psql('postgres', "$on1 SELECT 's.t'::regclass::oid");
-$node->safe_psql('postgres', "$on1 ALTER TABLE s.t ADD COLUMN later integer; INSERT INTO s.t VALUES (50, 'x', 1)");
-ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $offset), 'a layout changing is an error');
-$offset = -s $node->logfile;
-$pid = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'}) || 0;
-$node->safe_psql('postgres', "SELECT pg_terminate_backend($pid)") if $pid;
-ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $offset), 'and it still is for a worker that never saw the old one');
 $node->stop;
 
 # A node of its own for each of these, as each stops capture for good.
@@ -244,7 +235,7 @@ for my $case (
 	$node->stop;
 }
 
-# nor is a table with no key, and a truncate and a value it wasn't given stop it too
+# nor is a table with no key, and a value it wasn't given stops it too
 $on = fresh_node('keyless');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
 slot_active();
@@ -254,14 +245,16 @@ $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1)");
 ok($node->wait_for_log(qr/which has no primary key/, $from), 'a table with no primary key');
 $node->stop;
 
+# a truncate changes the table's file, so its rows are told whole
 $on = fresh_node('truncate');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
 slot_active();
 $node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
 caught_up();
-$from = -s $node->logfile;
 $node->safe_psql('postgres', "$on TRUNCATE s.t");
-ok($node->wait_for_log(qr/does not follow a truncate of "t"/, $from), 'a truncate');
+same_map($on, 't', 'a truncate');
+$node->safe_psql('postgres', "$on BEGIN; INSERT INTO s.t VALUES (2); TRUNCATE s.t; INSERT INTO s.t VALUES (3); COMMIT");
+same_map($on, 't', 'and with rows around it, in one transaction');
 $node->stop;
 
 $on = fresh_node('unchanged_toast');
@@ -339,25 +332,6 @@ $node->safe_psql('postgres', "$on ALTER TABLE s.t REPLICA IDENTITY NOTHING; UPDA
 ok($node->wait_for_log(qr/whose replica identity does not give its primary key/, $from), 'replica identity changed after a table was seen');
 $node->stop;
 
-# a table with two layouts in what one pass reads stops it there, by what the worker saw
-SKIP:
-{
-	skip 'no way to stop a process', 1 if $windows_os;
-	$on = fresh_node('two_layouts');
-	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
-	slot_active();
-	$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, v text)");
-	caught_up();
-	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
-	$from = -s $node->logfile;
-	kill 'STOP', $worker;
-	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1, 'a')");
-	$node->safe_psql('postgres', "$on ALTER TABLE s.t ADD COLUMN w integer; INSERT INTO s.t VALUES (2, 'b', 2)");
-	kill 'CONT', $worker;
-	ok($node->wait_for_log(qr/does not follow the layout of "t" changing/, $from), 'two layouts in one pass');
-	$node->stop;
-}
-
 $on = fresh_node('template');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
 slot_active();
@@ -384,6 +358,29 @@ slot_active();
 $from = -s $node->logfile;
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
 ok($node->wait_for_log(qr/there before it began/, $from), 'capture to trees turned on with rows there');
+$node->stop;
+
+# a layout changed with capture to trees off, and so nothing told: it stops, and stays stopped
+$on = fresh_node('layout');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
+caught_up();
+my $relid = $node->safe_psql('postgres', "$on SELECT 's.t'::regclass::oid");
+$node->append_conf('postgresql.conf', "capture_to_trees = off\n");
+$node->restart;
+$node->safe_psql('postgres', "$on ALTER TABLE s.t ADD COLUMN later integer");
+$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'no worker';
+caught_up();
+$node->append_conf('postgresql.conf', "capture_to_trees = on\n");
+$node->restart;
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2, 2)");
+ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $from), 'a layout changing and nothing told is an error');
+$from = -s $node->logfile;
+my $stopped = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'}) || 0;
+$node->safe_psql('postgres', "SELECT pg_terminate_backend($stopped)") if $stopped;
+ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $from), 'and it still is for the next worker');
 $node->stop;
 
 done_testing();
