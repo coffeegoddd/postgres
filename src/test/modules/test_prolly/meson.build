@@ -228,6 +228,7 @@ tests += {
       't/099_ws_merge_scenarios.pl',
       't/100_ws_viol_restore.pl',
       't/101_ws_merge_definitions.pl',
+      't/102_ws_pg_dump_coverage.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
