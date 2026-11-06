@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Merge scenarios, each of a file in the directories here: ours and theirs, each from one base, merged
+# Merge scenarios, each of a file in the directories here (ws_merge_dolt's are Dolt's own merge
+# tests, in Postgres's terms, its expected results but where ws_merge.h says): ours and theirs, each from one base, merged
 # and checked.  What each expects is exact: its conflicts, or its violations, or, if it is
 # clean, what its merged root says once restored.  The schema a file calls rt is each
 # side's own here, and what a function's body names is by its path, as a body is the same
@@ -37,21 +38,22 @@ sub sections
 	my (%s, $at);
 	for my $line (split /\n/, slurp_file($file))
 	{
-		if ($line =~ /^-- (ours|theirs|expect|resolve|after)$/) { $at = $1; $s{$at} = ''; next; }
+		if ($line =~ /^-- (base|ours|theirs|expect|resolve|after)$/) { $at = $1; $s{$at} = ''; next; }
 		$s{$at} .= "$line\n" if defined $at;
 	}
 	return \%s;
 }
 
 my $i = 0;
-for my $dir (map { dirname(__FILE__) . "/$_" } qw(ws_merge ws_merge_generated ws_merge_trigger))
+for my $dir (map { dirname(__FILE__) . "/$_" } qw(ws_merge ws_merge_generated ws_merge_trigger ws_merge_dolt))
 {
-my $base = slurp_file("$dir/base.sql");
+my $shared = -e "$dir/base.sql" ? slurp_file("$dir/base.sql") : undef;
 for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 {
 	$i++;
 	my $name = basename($dir) . ' ' . basename($path, '.sql');
 	my $s = sections($path);
+	my $base = $s->{base} // $shared;
 	my @expect = grep { /\S/ } split /\n/, $s->{expect};
 	my (@want_conflicts, @want_violations, @checks);
 	for my $line (@expect)
@@ -155,7 +157,7 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 }
 }
 
-is($i, 36, 'every scenario ran');
+is($i, 137, 'every scenario ran');
 
 $node->stop;
 done_testing();
