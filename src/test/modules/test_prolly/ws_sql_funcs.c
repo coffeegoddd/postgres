@@ -974,7 +974,7 @@ test_ws_diff(PG_FUNCTION_ARGS)
 	Buf			lines = BUF_INIT;
 
 	WsDiff->diff(backend_ctx(), &from, &to, diff_line_to, &lines);
-	PG_RETURN_TEXT_P(cstring_to_text_with_len((const char *) lines.data, (int) lines.len));
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(lines.len > 0 ? (const char *) lines.data : "", (int) lines.len));
 }
 
 /*
