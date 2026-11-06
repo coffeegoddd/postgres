@@ -227,3 +227,13 @@ SELECT c.relname, coalesce(t.spcname, 'pg_default') AS tablespace
 ALTER TABLE ALL IN TABLESPACE history_ts SET TABLESPACE pg_default;
 DROP TABLE moved_with_all;
 DROP TABLESPACE history_ts;
+-- With no table named, VACUUM FULL and REPACK leave the store's tables alone, which they
+-- refuse if named: anything else would stop them on any database.
+VACUUM FULL;
+REPACK;
+SELECT pg_history_has_chunks();
+ pg_history_has_chunks 
+-----------------------
+ t
+(1 row)
+

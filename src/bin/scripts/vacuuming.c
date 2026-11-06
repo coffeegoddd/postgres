@@ -675,6 +675,12 @@ retrieve_objects(PGconn *conn, vacuumingOptions *vacopts,
 								 " AND c.relkind OPERATOR(pg_catalog.=) ANY (array["
 								 CppAsString2(RELKIND_RELATION) ", "
 								 CppAsString2(RELKIND_MATVIEW) "])\n");
+
+		/* (the history store's can't be rewritten, so VACUUM FULL skips them if none is named) */
+		if (vacopts->full)
+			appendPQExpBufferStr(&catalog_query,
+								 " AND c.relam OPERATOR(pg_catalog.<>) ALL (ARRAY(SELECT a.oid FROM pg_catalog.pg_am a"
+								 " WHERE a.amname OPERATOR(pg_catalog.=) ANY (array['prolly_chunks', 'prolly_chunk_index', 'prolly_tier']::pg_catalog.name[])))\n");
 	}
 
 	/*

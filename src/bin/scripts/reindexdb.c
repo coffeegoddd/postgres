@@ -37,6 +37,7 @@ typedef enum ReindexType
 static SimpleStringList *get_parallel_tables_list(PGconn *conn,
 												  ReindexType type,
 												  SimpleStringList *user_list,
+												  bool concurrently,
 												  bool echo);
 static void get_parallel_tabidx_list(PGconn *conn,
 									 SimpleStringList *index_list,
@@ -349,7 +350,7 @@ reindex_one_database(ConnParams *cparams, ReindexType type,
 
 				/* Build a list of relations from the database */
 				process_list = get_parallel_tables_list(conn, process_type,
-														user_list, echo);
+														user_list, concurrently, echo);
 				process_type = REINDEX_TABLE;
 
 				/* Bail out if nothing to process */
@@ -630,7 +631,7 @@ run_reindex_command(PGconn *conn, ReindexType type, const char *name,
  */
 static SimpleStringList *
 get_parallel_tables_list(PGconn *conn, ReindexType type,
-						 SimpleStringList *user_list, bool echo)
+						 SimpleStringList *user_list, bool concurrently, bool echo)
 {
 	PQExpBufferData catalog_query;
 	PGresult   *res;
@@ -657,8 +658,11 @@ get_parallel_tables_list(PGconn *conn, ReindexType type,
 								 CppAsString2(RELKIND_RELATION) ", "
 								 CppAsString2(RELKIND_MATVIEW) ")\n"
 								 "   AND c.relpersistence != "
-								 CppAsString2(RELPERSISTENCE_TEMP) "\n"
-								 " ORDER BY c.relpages DESC;");
+								 CppAsString2(RELPERSISTENCE_TEMP) "\n");
+			/* (as REINDEX DATABASE CONCURRENTLY skips it, and naming a table of it is refused) */
+			if (concurrently)
+				appendPQExpBufferStr(&catalog_query, "   AND ns.nspname != 'pg_history'\n");
+			appendPQExpBufferStr(&catalog_query, " ORDER BY c.relpages DESC;");
 			break;
 
 		case REINDEX_SCHEMA:

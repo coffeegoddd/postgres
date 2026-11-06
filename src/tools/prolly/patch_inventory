@@ -176,6 +176,8 @@ patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource m
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode; also (2) ChunkLog and ChunkIndex in the rmgr list
 patch src/bin/psql/describe.c  4  \du shows TRAVELS
 patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED; also (4) TRAVELS
+patch src/bin/scripts/reindexdb.c  2  a database reindexed concurrently and in parallel leaves out the history store, whose tables refuse it
+patch src/bin/scripts/vacuuming.c  2  vacuumdb -f leaves out the history store's tables, which refuse being rewritten
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly (and prolly/engine)
 patch src/include/access/heapam.h  1b  heap and index scans remember the branch whose catalog rows they see

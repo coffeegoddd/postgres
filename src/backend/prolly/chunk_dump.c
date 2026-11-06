@@ -32,8 +32,11 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/table.h"
+#include "access/tableam.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
@@ -350,13 +353,16 @@ pg_history_has_chunks(PG_FUNCTION_ARGS)
 
 	ChunkIndex->visit_as_of(idx, GetActiveSnapshot(), note_chunk, &any);
 	relation_close(idx, AccessShareLock);
+
+	/* (read directly, as for the index: a role that can't read the store may ask if it has anything) */
 	if (!any)
 	{
-		SPI_connect();
-		if (SPI_execute("SELECT 1 FROM pg_history.bundles LIMIT 1", true, 0) != SPI_OK_SELECT)
-			elog(ERROR, "could not read the history store's bundles");
-		any = SPI_processed > 0;
-		SPI_finish();
+		Relation	bundles = table_open(ChunkStoreBundlesRelid(), AccessShareLock);
+		TableScanDesc scan = table_beginscan(bundles, GetActiveSnapshot(), 0, NULL, SO_NONE);
+
+		any = heap_getnext(scan, ForwardScanDirection) != NULL;
+		table_endscan(scan);
+		table_close(bundles, AccessShareLock);
 	}
 	PG_RETURN_BOOL(any);
 }

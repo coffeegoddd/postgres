@@ -2370,6 +2370,10 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 				!isTempOrTempToastNamespace(class->relnamespace))
 				continue;
 
+			/* (the history store's can't be rewritten, which is refused if they're named) */
+			if (IsHistoryStoreAccessMethod(class->relam))
+				continue;
+
 			/* noisily skip rels which the user can't process */
 			if (!repack_is_permitted_for_relation(cmd, class->oid,
 												  GetUserId(), false))

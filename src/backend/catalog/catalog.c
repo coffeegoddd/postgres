@@ -26,6 +26,7 @@
 #include "access/transam.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
@@ -306,6 +307,21 @@ bool
 IsHistoryStoreNamespace(Oid namespaceId)
 {
 	return namespaceId == PG_HISTORY_NAMESPACE;
+}
+
+/*
+ * IsHistoryStoreAccessMethod
+ *		True iff a table of this access method holds the history store's bytes,
+ *		which are no tuples, so that it cannot be rewritten.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsHistoryStoreAccessMethod(Oid amId)
+{
+	return amId == PROLLY_CHUNKS_TABLE_AM_OID ||
+		amId == PROLLY_CHUNK_INDEX_TABLE_AM_OID ||
+		amId == PROLLY_TIER_TABLE_AM_OID;
 }
 
 /*
