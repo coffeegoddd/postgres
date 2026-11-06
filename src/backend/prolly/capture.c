@@ -37,6 +37,7 @@
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -191,16 +192,15 @@ CaptureSchemaMade(void)
 
 /* ---------------------------------------------------------------- the worker */
 
-/* Whether this database has a versioned schema, on any branch. */
+/* Whether this database has a versioned schema, on any branch, in the transaction running. */
 static bool
-database_has_versioned_schema(void)
+versioned_schema_exists(void)
 {
 	Relation	rel;
 	TableScanDesc scan;
 	HeapTuple	tup;
 	bool		found = false;
 
-	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	rel = table_open(NamespaceRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(rel, 0, NULL);
@@ -209,6 +209,16 @@ database_has_versioned_schema(void)
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
 	PopActiveSnapshot();
+	return found;
+}
+
+static bool
+database_has_versioned_schema(void)
+{
+	bool		found;
+
+	StartTransactionCommand();
+	found = versioned_schema_exists();
 	CommitTransactionCommand();
 	return found;
 }
@@ -247,16 +257,18 @@ capture_advance(void)
 }
 
 /*
- * Clears the mark of a database with no versioned schema, if no one is making one; false if one
- * is, or now there is one.
+ * Clears the mark of a database with no versioned schema; false if one is being made, or there
+ * now is one.  It looks again with the lock held, which whoever makes one holds until they commit.
  */
 static bool
 capture_clear_mark(void)
 {
 	bool		cleared = false;
 
+	INJECTION_POINT("capture-clear-mark", NULL);
 	StartTransactionCommand();
-	if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ExclusiveLock))
+	if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ExclusiveLock) &&
+		!versioned_schema_exists())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		database_mark(false);
@@ -264,7 +276,7 @@ capture_clear_mark(void)
 		cleared = true;
 	}
 	CommitTransactionCommand();
-	return cleared && !database_has_versioned_schema();
+	return cleared;
 }
 
 /*
