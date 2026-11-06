@@ -45,6 +45,7 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "prolly/capture.h"
 #include "pgstat.h"
 #include "replication/logical.h"
 #include "replication/logicallauncher.h"
@@ -2366,6 +2367,7 @@ CommitTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
+	CaptureRowsAtCommit();
 
 	/*
 	 * Synchronize files that are created and not WAL-logged during this
@@ -2637,6 +2639,7 @@ PrepareTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
+	CaptureRowsAtCommit();
 
 	/*
 	 * Synchronize files that are created and not WAL-logged during this

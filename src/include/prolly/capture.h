@@ -150,8 +150,11 @@ extern void CaptureDatabaseDropping(Oid dboid);
  */
 extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
 
-/* Has this backend see to capture as it commits. */
-extern void CaptureBackendInit(void);
+/* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
+extern void CaptureRowsAtCommit(void);
+
+/* This is capture's own worker. */
+extern PGDLLIMPORT bool am_capture_worker;
 
 /* What decoding calls. */
 extern void CaptureOutputPluginInit(OutputPluginCallbacks *callbacks);

@@ -248,6 +248,86 @@ caught_up();
 run('ALTER TABLE p_of ADD COLUMN b integer');
 same_map('uses_p', 'a partitioned table used as a type');
 
+# an attribute dropped and added again, of a composite or a table's row type: the same type, at
+# another place
+run(q{CREATE TYPE c1 AS (a integer, b integer); CREATE TABLE uses_c1 (id integer PRIMARY KEY, c c1); INSERT INTO uses_c1 VALUES (1, ROW(1, 2))});
+caught_up();
+run('ALTER TYPE c1 DROP ATTRIBUTE b; ALTER TYPE c1 ADD ATTRIBUTE b integer');
+same_map('uses_c1', 'a composite\'s attribute dropped and added again');
+run('ALTER TABLE row_of ADD COLUMN z integer');
+run('INSERT INTO uses_row VALUES (5, ROW(5, 5, 5))');
+caught_up();
+run('ALTER TABLE row_of DROP COLUMN z; ALTER TABLE row_of ADD COLUMN z integer');
+same_map('uses_row', 'a table\'s row type\'s column dropped and added again');
+
+# through a range and a multirange, whose values print their subtype's
+run(q{CREATE TYPE re AS ENUM ('r1', 'r2'); CREATE FUNCTION rediff(re, re) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 1::float8';
+	CREATE TYPE re_range AS RANGE (subtype = re, multirange_type_name = re_multi);
+	CREATE TABLE by_range (id integer PRIMARY KEY, r re_range, m re_multi);
+	INSERT INTO by_range VALUES (1, re_range('r1', 'r2'), re_multi(re_range('r1', 'r2')))});
+caught_up();
+run(q{ALTER TYPE re RENAME VALUE 'r1' TO 'r0'});
+same_map('by_range', 'an enum renamed, through a range and a multirange');
+
+# labels that, with no lengths, print the same in a fingerprint: a and "b <o2>=c", then "a <o2>=b" and c
+run(q{CREATE TYPE tricky AS ENUM ('l1', 'l2'); CREATE TABLE by_tricky (id integer PRIMARY KEY, x tricky); INSERT INTO by_tricky VALUES (1, 'l1')});
+caught_up();
+my $o2 = $node->safe_psql('postgres', "$on1 SELECT oid FROM pg_enum WHERE enumtypid = 's.tricky'::regtype AND enumlabel = 'l2'");
+run(qq{BEGIN; ALTER TYPE tricky RENAME VALUE 'l1' TO 'a'; ALTER TYPE tricky RENAME VALUE 'l2' TO 'b $o2=c'; COMMIT});
+same_map('by_tricky', 'a label holding what looks like another');
+run(qq{BEGIN; ALTER TYPE tricky RENAME VALUE 'a' TO 'a $o2=b'; ALTER TYPE tricky RENAME VALUE 'b $o2=c' TO 'c'; COMMIT});
+same_map('by_tricky', 'and labels that would print as the same');
+
+# a catalog changed by hand, as the only command of its transaction
+$node->safe_psql('postgres', q{CREATE TYPE public.eh AS ENUM ('h')});
+run(q{CREATE TABLE by_hand (id integer PRIMARY KEY, a public.eh); INSERT INTO by_hand VALUES (1, 'h')});
+caught_up();
+$node->safe_psql('postgres', q{UPDATE pg_enum SET enumlabel = 'h2' WHERE enumtypid = 'public.eh'::regtype});
+same_map('by_hand', 'a lone UPDATE of a catalog');
+
+# a statement over a replication connection commits through the same place
+$node->safe_psql('postgres', q{CREATE TYPE public.ew AS ENUM ('w')});
+run(q{CREATE TABLE by_walsender (id integer PRIMARY KEY, a public.ew); INSERT INTO by_walsender VALUES (1, 'w')});
+caught_up();
+$node->psql('postgres', q{ALTER TYPE public.ew RENAME VALUE 'w' TO 'w2'}, connstr => $node->connstr('postgres') . ' replication=database');
+is($node->safe_psql('postgres', q{SELECT enumlabel FROM pg_enum WHERE enumtypid = 'public.ew'::regtype}), 'w2', 'a walsender renamed a value');
+same_map('by_walsender', 'a walsender\'s statement');
+
+# dropping a temporary table ON COMMIT takes a column with it, as this is committing
+my $temp = $node->background_psql('postgres');
+$temp->query_safe(qq{$on1 BEGIN; CREATE TEMP TABLE gone_at_commit (a integer) ON COMMIT DROP;
+	CREATE TABLE s.uses_temp (id integer PRIMARY KEY, a integer, t gone_at_commit); INSERT INTO s.uses_temp VALUES (1, 1, ROW(1))});
+$temp->query_safe('COMMIT');
+$temp->quit;
+same_map('uses_temp', 'a column dropped by an ON COMMIT DROP');
+
+# a transaction left open with a table locked doesn't hold up an unrelated commit
+my $idle = $node->background_psql('postgres');
+$idle->query_safe("$on1 BEGIN; LOCK TABLE s.x IN ACCESS EXCLUSIVE MODE");
+$node->safe_psql('postgres', 'SET statement_timeout = 0; CREATE TEMP TABLE unrelated (a integer)', timeout => 60);
+pass('a catalog change commits past a table locked and left open');
+$idle->query_safe('ROLLBACK');
+$idle->quit;
+
+# a role can't have what's run at commit be its own
+$node->safe_psql('postgres', q{CREATE ROLE evil LOGIN; CREATE SCHEMA evil AUTHORIZATION evil;
+	CREATE TABLE evil.owned_by_evil ()});
+$node->safe_psql('postgres', q{SET ROLE evil;
+	CREATE FUNCTION evil.oid_eq(oid, oid) RETURNS boolean LANGUAGE plpgsql AS $$
+		BEGIN EXECUTE 'ALTER ROLE evil SUPERUSER'; RETURN pg_catalog.oideq($1, $2); END $$;
+	CREATE OPERATOR evil.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = evil.oid_eq);
+	CREATE FUNCTION evil.text_eq(text, text) RETURNS boolean LANGUAGE plpgsql AS $$
+		BEGIN EXECUTE 'ALTER ROLE evil SUPERUSER'; RETURN pg_catalog.texteq($1, $2); END $$;
+	CREATE OPERATOR evil.= (LEFTARG = text, RIGHTARG = text, FUNCTION = evil.text_eq);
+	SET search_path = evil, pg_catalog;
+	CREATE TEMP TABLE trigger_a_compare (a integer)});
+is($node->safe_psql('postgres', q{SELECT rolsuper FROM pg_roles WHERE rolname = 'evil'}), 'f', 'a role can\'t make itself a superuser');
+
+# prepared and rolled back: nothing
+run(q{BEGIN; ALTER TABLE x ALTER COLUMN a TYPE bigint USING a + 11; PREPARE TRANSACTION 'gone'});
+$node->safe_psql('postgres', q{ROLLBACK PREPARED 'gone'});
+same_map('x', 'prepared and rolled back');
+
 # what's dropped takes columns with it, by no ALTER TABLE
 run(q{CREATE DOMAIN dd AS integer; CREATE TYPE dt AS ENUM ('z'); CREATE TYPE dc AS (x dt);
 	CREATE FUNCTION df(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
@@ -319,6 +399,25 @@ SKIP:
 	$first->quit;
 	$second->quit;
 	same_map('overlap', 'and has what the first did');
+
+	# and with neither changing a table's fingerprint yet: the second's new table has the first's
+	$node->safe_psql('postgres', q{CREATE TYPE public.e6 AS ENUM ('g')});
+	my $maker = $node->background_psql('postgres');
+	$maker->query_safe("$on1 BEGIN; CREATE TABLE s.made_meanwhile (id integer PRIMARY KEY, a public.e6); INSERT INTO s.made_meanwhile VALUES (1, 'g')");
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-rows-written', 'wait')});
+	my $renamer = $node->background_psql('postgres');
+	$renamer->query_safe(q{BEGIN; ALTER TYPE public.e6 RENAME VALUE 'g' TO 'g6'});
+	$renamer->query_until(qr/started/, "\\echo started\nCOMMIT;\n\\echo finished\n");
+	$node->wait_for_event('client backend', 'capture-rows-written');
+	$maker->query_until(qr/started/, "\\echo started\nCOMMIT;\n\\echo finished\n");
+	$node->poll_query_until('postgres',
+		q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query = 'COMMIT;' AND wait_event_type = 'Lock' AND wait_event = 'object'})
+	  or die 'the second did not wait';
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-rows-written')});
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-rows-written')});
+	$renamer->quit;
+	$maker->quit;
+	same_map('made_meanwhile', 'a table committed while a rename that changed no table was committing');
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
 

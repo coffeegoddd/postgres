@@ -12,21 +12,28 @@
  * the one last recorded (what makes up its file, key, columns and the types of
  * those, whatever they're made of).  A table's differs or has none: its rows go
  * in the WAL, as logical messages (capture.h's CAPTURE_ROWS_*), the last thing
- * in the transaction, so that they void all of it before them, in the same
+ * of it in the transaction, so that they void all of it before them, in the same
  * transaction or not, and its fingerprint is recorded.
  *
- * A lock on the database held from there to the commit has two such
- * transactions take turns, each comparing only once it has it, or each would
- * write rows without the other's change.  ShareLock on each table holds off its
- * writers, or one committing after the read and before this commits would come
- * first and be lost.  So those can deadlock, as any taking of locks late can,
- * and it's an error above READ COMMITTED, as it reads what's committed now.
+ * Every process with a transaction commits through here, once what's done at
+ * commit has been: dropping a table ON COMMIT can drop a column of another.
+ *
+ * In a database with versioned schemas such transactions take turns from there
+ * to the commit, by a lock on the database, each comparing only once it has it:
+ * two at once would each record what it sees without the other's change.  Fingerprints
+ * are of the catalogs alone, so comparing waits for no table.  Writing a table's rows
+ * takes ShareLock on it, which holds off its writers, or one committing after the read
+ * and before this commits would come first and be lost.  So that can deadlock with
+ * them, as any taking of locks late can, and it's an error above READ COMMITTED, as it
+ * reads what's committed now.
  *
  * This reads with the system's rights, as one may rename the value of a type of
- * one's own that a table one can't reach has a column of.
+ * one's own that a table one can't reach has a column of, and under a search path
+ * of its own, as any role could otherwise have what's run here be its own.
  *
- * Text naming an object, as a regclass column prints a table's name, changes
- * when it's renamed, which no fingerprint here says.
+ * Text naming an object, as a regclass column prints a table's name or an aclitem a
+ * role's, changes when it's renamed, which no fingerprint here says.  Nor does one say a
+ * type's output function was replaced, which takes a superuser.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -50,6 +57,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_enum.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -198,6 +206,8 @@ label_cmp(const ListCell *a, const ListCell *b)
 	return strcmp((const char *) lfirst(a), (const char *) lfirst(b));
 }
 
+static void print_columns(StringInfo out, Oid relid, List **seen);
+
 /* What makes up what a type's values print as, appended; a type met again is only named. */
 static void
 print_type(StringInfo out, Oid type, int32 typmod, List **seen)
@@ -235,7 +245,7 @@ print_type(StringInfo out, Oid type, int32 typmod, List **seen)
 		{
 			Form_pg_enum e = (Form_pg_enum) GETSTRUCT(&labels->members[i]->tuple);
 
-			names = lappend(names, psprintf("%u=%s", e->oid, NameStr(e->enumlabel)));
+			names = lappend(names, psprintf("%u=%zu:%s", e->oid, strlen(NameStr(e->enumlabel)), NameStr(e->enumlabel)));
 		}
 		ReleaseSysCacheList(labels);
 		list_sort(names, label_cmp);
@@ -243,51 +253,80 @@ print_type(StringInfo out, Oid type, int32 typmod, List **seen)
 			appendStringInfo(out, " %s", (char *) lfirst(lc));
 	}
 	else if (t->typtype == TYPTYPE_COMPOSITE)
-	{
-		Relation	rel = relation_open(t->typrelid, AccessShareLock);
-		TupleDesc	desc = RelationGetDescr(rel);
-
-		for (int i = 0; i < desc->natts; i++)
-		{
-			Form_pg_attribute att = TupleDescAttr(desc, i);
-
-			if (!att->attisdropped)
-				print_type(out, att->atttypid, att->atttypmod, seen);
-		}
-		relation_close(rel, AccessShareLock);
-	}
+		print_columns(out, t->typrelid, seen);
 	ReleaseSysCache(tup);
 	appendStringInfoChar(out, ')');
 }
 
-static char *
-rows_fingerprint(Relation rel)
+/* A relation's live columns' places, tags and types, of the catalogs alone. */
+static void
+print_columns(StringInfo out, Oid relid, List **seen)
 {
-	TupleDesc	desc = RelationGetDescr(rel);
-	WsRowShape	shape;
+	HeapTuple	class = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	int			natts;
+
+	if (!HeapTupleIsValid(class))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	natts = ((Form_pg_class) GETSTRUCT(class))->relnatts;
+	ReleaseSysCache(class);
+	for (AttrNumber n = 1; n <= natts; n++)
+	{
+		HeapTuple	tup = SearchSysCacheAttNum(relid, n);
+		Form_pg_attribute att;
+
+		/* (a column dropped has none) */
+		if (!HeapTupleIsValid(tup))
+			continue;
+		att = (Form_pg_attribute) GETSTRUCT(tup);
+		if (att->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL)
+		{
+			appendStringInfo(out, " %d:" INT64_FORMAT, att->attnum, att->attcoltag);
+			print_type(out, att->atttypid, att->atttypmod, seen);
+		}
+		ReleaseSysCache(tup);
+	}
+}
+
+/* A table's fingerprint, of the catalogs alone: it takes no lock on the table. */
+static char *
+rows_fingerprint(Oid relid, Oid relfilenode)
+{
 	StringInfoData out;
+	Relation	indexes;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *seen = NIL;
 
 	initStringInfo(&out);
-	appendStringInfo(&out, "file %u key", rel->rd_rel->relfilenode);
-	CaptureRelationShape(rel, &shape);
-	for (int k = 0; k < shape.nkey; k++)
-		appendStringInfo(&out, " " UINT64_FORMAT, shape.tags[k]);
-	ws_row_shape_free(&shape);
-	for (int i = 0; i < desc->natts; i++)
+	appendStringInfo(&out, "file %u key", relfilenode);
+	indexes = table_open(IndexRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(indexes, IndexIndrelidIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
-		List	   *seen = NIL;
+		Form_pg_index index = (Form_pg_index) GETSTRUCT(tup);
 
-		if (att->attisdropped || att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+		if (!index->indisprimary)
 			continue;
-		appendStringInfo(&out, " %d:" INT64_FORMAT, att->attnum, att->attcoltag);
-		print_type(&out, att->atttypid, att->atttypmod, &seen);
-		list_free(seen);
+		for (int k = 0; k < index->indnkeyatts; k++)
+			appendStringInfo(&out, " %d", index->indkey.values[k]);
 	}
+	systable_endscan(scan);
+	table_close(indexes, AccessShareLock);
+	appendStringInfoString(&out, " columns");
+	print_columns(&out, relid, &seen);
+	list_free(seen);
 	return out.data;
 }
 
-/* Each versioned table there is, in the snapshot running, whichever branch this is on. */
+/* Each versioned table there is, with its file, whichever branch this is on. */
+typedef struct VersionedTable
+{
+	Oid			relid;
+	Oid			relfilenode;
+} VersionedTable;
+
 static List *
 versioned_tables(void)
 {
@@ -302,127 +341,107 @@ versioned_tables(void)
 
 		if (c->relkind == RELKIND_RELATION && c->relpersistence == RELPERSISTENCE_PERMANENT &&
 			NamespaceBranch(c->relnamespace) != 0)
-			tables = lappend_oid(tables, c->oid);
+		{
+			VersionedTable *t = palloc_object(VersionedTable);
+
+			t->relid = c->oid;
+			t->relfilenode = c->relfilenode;
+			tables = lappend(tables, t);
+		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 	return tables;
 }
 
-/*
- * Each table whose fingerprint isn't the one recorded, with those of tables gone forgotten; true if
- * any.  If write, their rows are written too, and what's recorded made so.
- */
-static bool
-rows_compare(bool write)
+/* Each table whose fingerprint isn't the one recorded has its rows written, and what's recorded made so. */
+static void
+rows_compare(void)
 {
 	List	   *tables = versioned_tables();
-	bool		any = false;
 	ListCell   *lc;
 	Oid			types[2] = {OIDOID, TEXTOID};
 
 	foreach(lc, tables)
 	{
-		Oid			relid = lfirst_oid(lc);
-		Relation	rel;
-		char	   *fingerprint;
-		bool		same;
-		Datum		values[2];
+		VersionedTable *t = lfirst(lc);
+		char	   *fingerprint = rows_fingerprint(t->relid, t->relfilenode);
+		Datum		values[2] = {ObjectIdGetDatum(t->relid), CStringGetTextDatum(fingerprint)};
 
-		rel = try_table_open(relid, write ? ShareLock : AccessShareLock);
-		if (rel == NULL)
-			continue;
-		fingerprint = rows_fingerprint(rel);
-		values[0] = ObjectIdGetDatum(relid);
-		values[1] = CStringGetTextDatum(fingerprint);
 		if (SPI_execute_with_args("SELECT 1 FROM pg_history.capture_fingerprints WHERE relid = $1 AND fingerprint = $2",
 								  2, types, values, NULL, true, 1) != SPI_OK_SELECT)
 			elog(ERROR, "could not read a table's fingerprint");
-		same = SPI_processed == 1;
-		if (!same)
+		if (SPI_processed == 0)
 		{
-			any = true;
-			if (write)
-			{
-				CommandCounterIncrement();
-				rows_write(rel, NamespaceBranch(RelationGetNamespace(rel)));
-				if (SPI_execute_with_args("INSERT INTO pg_history.capture_fingerprints VALUES ($1, $2) "
-										  "ON CONFLICT (relid) DO UPDATE SET fingerprint = excluded.fingerprint",
-										  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
-					elog(ERROR, "could not record a table's fingerprint");
-			}
+			Relation	rel;
+
+			if (IsolationUsesXactSnapshot())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("capture to trees can't commit this above READ COMMITTED"),
+						 errdetail("It changes a table's rows, which capture then reads as they're committed now.")));
+			rel = table_open(t->relid, ShareLock);
+			rows_write(rel, NamespaceBranch(RelationGetNamespace(rel)));
+			table_close(rel, NoLock);
+			if (SPI_execute_with_args("INSERT INTO pg_history.capture_fingerprints VALUES ($1, $2) "
+									  "ON CONFLICT (relid) DO UPDATE SET fingerprint = excluded.fingerprint",
+									  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
+				elog(ERROR, "could not record a table's fingerprint");
 		}
-		table_close(rel, write ? NoLock : AccessShareLock);
 		pfree(fingerprint);
-		if (any && !write)
-			break;
 	}
-	list_free(tables);
-	return any;
+	list_free_deep(tables);
+	if (SPI_execute("DELETE FROM pg_history.capture_fingerprints f WHERE NOT EXISTS "
+					"(SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = f.relid)", false, 0) != SPI_OK_DELETE)
+		elog(ERROR, "could not forget a table's fingerprint");
 }
 
-/* As a transaction that changed catalogs commits. */
-static void
-rows_at_commit(XactEvent event, void *arg)
+static bool
+database_is_versioned(void)
 {
-	static bool busy = false;
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	bool		versioned;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	versioned = ((Form_pg_database) GETSTRUCT(tup))->datversioned;
+	ReleaseSysCache(tup);
+	return versioned;
+}
+
+void
+CaptureRowsAtCommit(void)
+{
 	SharedInvalidationMessage *msgs;
 	bool		relcache;
 	Oid			saved_user;
 	int			saved_context;
 	int			gucs;
 
-	if ((event != XACT_EVENT_PRE_COMMIT && event != XACT_EVENT_PRE_PREPARE) || busy)
+	/* (an error here aborts the transaction, which puts all this back) */
+	if (!capture_to_trees || !XLogLogicalInfoActive() || IsParallelWorker() || am_capture_worker ||
+		AmAutoVacuumWorkerProcess() || !OidIsValid(MyDatabaseId) || IsBinaryUpgrade || IsBootstrapProcessingMode() ||
+		!TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return;
-	if (!capture_to_trees || !XLogLogicalInfoActive() || IsParallelWorker() || !AmRegularBackendProcess() ||
-		!TransactionIdIsValid(GetTopTransactionIdIfAny()) || IsBinaryUpgrade)
-		return;
-	if (xactGetCommittedInvalidationMessages(&msgs, &relcache) == 0)
+	CommandCounterIncrement();
+	if (xactGetCommittedInvalidationMessages(&msgs, &relcache) == 0 || !database_is_versioned())
 		return;
 
-	busy = true;
-	PG_TRY();
-	{
-		GetUserIdAndSecContext(&saved_user, &saved_context);
-		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, saved_context | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
-		gucs = NewGUCNestLevel();
-		(void) set_config_option("catalog_branch_filter", "off", PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-		PushActiveSnapshot(GetLatestSnapshot());
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "could not connect to SPI");
-		if (rows_compare(false))
-		{
-			if (IsolationUsesXactSnapshot())
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("capture to trees can't commit this above READ COMMITTED"),
-						 errdetail("It changes a table's rows, which capture then reads as they're committed now.")));
-			LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
-			AcceptInvalidationMessages();
-			PopActiveSnapshot();
-			PushActiveSnapshot(GetLatestSnapshot());
-			(void) rows_compare(true);
-			INJECTION_POINT("capture-rows-written", NULL);
-			if (SPI_execute("DELETE FROM pg_history.capture_fingerprints f WHERE NOT EXISTS "
-							"(SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = f.relid)", false, 0) != SPI_OK_DELETE)
-				elog(ERROR, "could not forget a table's fingerprint");
-		}
-		if (SPI_finish() != SPI_OK_FINISH)
-			elog(ERROR, "could not finish with SPI");
-		PopActiveSnapshot();
-		AtEOXact_GUC(true, gucs);
-		SetUserIdAndSecContext(saved_user, saved_context);
-	}
-	PG_FINALLY();
-	{
-		busy = false;
-	}
-	PG_END_TRY();
-}
-
-void
-CaptureBackendInit(void)
-{
-	if (capture_to_trees && AmRegularBackendProcess())
-		RegisterXactCallback(rows_at_commit, NULL);
+	GetUserIdAndSecContext(&saved_user, &saved_context);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, saved_context | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
+	gucs = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog, pg_temp", PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("catalog_branch_filter", "off", PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+	AcceptInvalidationMessages();
+	PushActiveSnapshot(GetLatestSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	rows_compare();
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
+	INJECTION_POINT("capture-rows-written", NULL);
+	AtEOXact_GUC(true, gucs);
+	SetUserIdAndSecContext(saved_user, saved_context);
 }

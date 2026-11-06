@@ -80,7 +80,7 @@ capture_possible(void)
 /* -------------------------------------------------------------- the plugin */
 
 /* Only the worker tells the sink, so a session can't be a second writer behind it. */
-static bool am_capture_worker = false;
+bool		am_capture_worker = false;
 
 static void
 capture_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)

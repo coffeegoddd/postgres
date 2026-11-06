@@ -35,13 +35,12 @@
  * nothing's judged until its transaction has ended: what's wrong with a change only matters if it
  * isn't voided.
  *
- * This is off by default (capture_to_trees), as there's more it doesn't follow.  A truncate is an
- * error, as are a table with no primary key and one whose replica identity doesn't give it, as an
- * update changing the key would look like one that didn't, and a value decoding wasn't given.  An
- * error stops capture of the whole database, as the worker starts again at the same row, and the
- * slot keeps its WAL.  Text that names an object, as a regclass column prints a table's name, isn't
- * followed when the object's renamed.  Nor is capture to trees being turned off for a while and on
- * again, nor an object id used again while its old row map is kept.
+ * This is off by default (capture_to_trees), as there's more it doesn't follow.  A table with no
+ * primary key and one whose replica identity doesn't give it are errors, as an update changing the
+ * key would look like one that didn't, as is a value decoding wasn't given.  An error stops capture
+ * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
+ * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
+ * a while and on again, nor an object id used again while its old row map is kept.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *

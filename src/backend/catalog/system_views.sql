@@ -1641,7 +1641,7 @@ CREATE TABLE pg_history.capture_positions (
 );
 CREATE TABLE pg_history.capture_fingerprints (
 	relid oid PRIMARY KEY,
-	fingerprint text NOT NULL
+	fingerprint text COLLATE "C" NOT NULL
 );
 CREATE TABLE pg_history.capture_tables (
 	relid oid PRIMARY KEY,
