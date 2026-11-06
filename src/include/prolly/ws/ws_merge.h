@@ -69,7 +69,8 @@
  * Where this differs from Dolt, whose merge tests its scenarios follow:
  *	- A column of another type on one side, with rows on the other: Dolt conflicts on the
  *	  schema unless it widens; here each row is read, and only one that doesn't read conflicts.
- *	- A json value both changed: Dolt merges by key; here it is a row conflict.
+ *	- A json value both changed: Dolt merges by key, and here a jsonb value does too, but a
+ *	  json value is a row conflict, as it holds its exact text.
  *	- A keyless row both added or removed: Dolt conflicts; here the counts add up, as a
  *	  multiset.
  *	- A conflict in the schema: Dolt still merges other tables' rows; here no row is looked at.

@@ -34,6 +34,8 @@
 #include "prolly/ws/ws_tags.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
@@ -1565,6 +1567,107 @@ keep_cell(RowMerge *rm, const MoveMap *from, int i, const WsCell *cell, WsField 
 	return true;
 }
 
+static bool
+jsonb_values_alike(const JsonbValue *a, const JsonbValue *b)
+{
+	if (a == NULL || b == NULL)
+		return a == b;
+	return compareJsonbContainers(&JsonbValueToJsonb(unconstify(JsonbValue *, a))->root,
+								  &JsonbValueToJsonb(unconstify(JsonbValue *, b))->root) == 0;
+}
+
+static bool
+jsonb_value_is_object(const JsonbValue *v)
+{
+	return v != NULL && v->type == jbvBinary && JsonContainerIsObject(v->val.binary.data);
+}
+
+/* Adds an object's keys not yet in a list of them. */
+static void
+jsonb_keys_add(JsonbContainer *object, JsonbValue **keys, int *n)
+{
+	JsonbIterator *it = JsonbIteratorInit(object);
+	JsonbValue	v;
+	JsonbIteratorToken tok;
+
+	while ((tok = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
+	{
+		bool		seen = false;
+
+		if (tok != WJB_KEY)
+			continue;
+		for (int i = 0; !seen && i < *n; i++)
+			seen = (*keys)[i].val.string.len == v.val.string.len &&
+				memcmp((*keys)[i].val.string.val, v.val.string.val, v.val.string.len) == 0;
+		if (seen)
+			continue;
+		*keys = *n == 0 ? palloc_array(JsonbValue, 8) : repalloc_array(*keys, JsonbValue, *n + 8);
+		(*keys)[(*n)++] = v;
+	}
+}
+
+/*
+ * Three objects as one, pushed: each key as a cell is, what one side left being the other's,
+ * and two objects both changed in turn.  False if a key cannot be.
+ */
+static bool
+jsonb_objects_merge(JsonbContainer *b, JsonbContainer *o, JsonbContainer *t, JsonbInState *st)
+{
+	JsonbValue *keys = NULL;
+	int			n = 0;
+
+	jsonb_keys_add(b, &keys, &n);
+	jsonb_keys_add(o, &keys, &n);
+	jsonb_keys_add(t, &keys, &n);
+	pushJsonbValue(st, WJB_BEGIN_OBJECT, NULL);
+	for (int i = 0; i < n; i++)
+	{
+		JsonbValue *vb = findJsonbValueFromContainer(b, JB_FOBJECT, &keys[i]);
+		JsonbValue *vo = findJsonbValueFromContainer(o, JB_FOBJECT, &keys[i]);
+		JsonbValue *vt = findJsonbValueFromContainer(t, JB_FOBJECT, &keys[i]);
+		JsonbValue *kept;
+
+		if (jsonb_values_alike(vo, vt) || jsonb_values_alike(vt, vb))
+			kept = vo;
+		else if (jsonb_values_alike(vo, vb))
+			kept = vt;
+		else if (jsonb_value_is_object(vb) && jsonb_value_is_object(vo) && jsonb_value_is_object(vt))
+		{
+			pushJsonbValue(st, WJB_KEY, &keys[i]);
+			if (!jsonb_objects_merge(vb->val.binary.data, vo->val.binary.data, vt->val.binary.data, st))
+				return false;
+			continue;
+		}
+		else
+			return false;
+		if (kept != NULL)
+		{
+			pushJsonbValue(st, WJB_KEY, &keys[i]);
+			pushJsonbValue(st, WJB_VALUE, kept);
+		}
+	}
+	pushJsonbValue(st, WJB_END_OBJECT, NULL);
+	return true;
+}
+
+/* A jsonb value both sides changed, by key as Dolt's are; NULL if that cannot be. */
+static char *
+jsonb_cells_merged(RowMerge *rm, const WsCell *cb, const WsCell *co, const WsCell *ct)
+{
+	WsField		fb = {cb->p, cb->len, false, cb->large};
+	WsField		fo = {co->p, co->len, false, co->large};
+	WsField		ft = {ct->p, ct->len, false, ct->large};
+	Jsonb	   *jb = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(field_text(rm, &fb))));
+	Jsonb	   *jo = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(field_text(rm, &fo))));
+	Jsonb	   *jt = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(field_text(rm, &ft))));
+	JsonbInState st = {0};
+
+	if (!JB_ROOT_IS_OBJECT(jb) || !JB_ROOT_IS_OBJECT(jo) || !JB_ROOT_IS_OBJECT(jt) ||
+		!jsonb_objects_merge(&jb->root, &jo->root, &jt->root, &st))
+		return NULL;
+	return JsonbToCString(NULL, &JsonbValueToJsonb(st.result)->root, 0);
+}
+
 /*
  * A row both sides changed, cell by cell as each wrote it, into fields of the merged
  * record; false, in conflict.  A cell one side left is the other's, and only a cell
@@ -1627,6 +1730,16 @@ merge_cells(RowMerge *rm, const RowSides *sides, const ProllyConflict *c, WsFiel
 			{
 				from = &sides->theirs;
 				keep = ht ? &ct : NULL;
+			}
+			else if (hb && ho && ht && strcmp(col->type, "jsonb") == 0 &&
+					 same_type_in(o, t, col->tag) && same_type_in(b, t, col->tag))
+			{
+				char	   *merged = jsonb_cells_merged(rm, &cb, &co, &ct);
+
+				if (merged == NULL)
+					return false;
+				field_set(rm, &f[i], merged);
+				continue;
 			}
 			else
 				return false;

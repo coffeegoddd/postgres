@@ -6,4 +6,5 @@ UPDATE t SET j = '{"a": 1}';
 -- theirs
 UPDATE t SET j = '{"b": 2}';
 -- expect
-conflict row t 1
+clean
+check SELECT j FROM rt.t => {"a": 1, "b": 2}
