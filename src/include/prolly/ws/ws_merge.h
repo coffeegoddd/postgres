@@ -78,7 +78,9 @@
  *	  retype, with rows on the other side, a row conflict.
  *	- A column replaced through a rename, with values the other side wrote: Dolt moves them
  *	  by name; here it is a column conflict.
- *	- A json value both changed: Dolt merges by key; here it is a row conflict.
+ *	- A json value both changed: Dolt merges by key, and here a jsonb value does too, but a
+ *	  json value is a row conflict, as it holds its exact text, and in a jsonb value 1.0
+ *	  and 1, which Dolt takes as alike, are two values, as they print apart.
  *	- A keyless row both added, removed or changed: Dolt conflicts; here the counts add up, as
  *	  a multiset, so a row both changed differently is two rows.
  *	- A conflict in the schema: Dolt still merges other tables' rows; here no row is looked at,

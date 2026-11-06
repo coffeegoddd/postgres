@@ -35,6 +35,8 @@
 #include "prolly/ws/ws_tags.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
@@ -1569,6 +1571,152 @@ keep_cell(RowMerge *rm, const MoveMap *from, int i, const WsCell *cell, WsField 
 }
 
 /*
+ * Whether two values are the one value, as its bytes say, so with no copying however deep: 1.0
+ * and 1 print apart, so are not, as two cells' text would not be.
+ */
+static bool
+jsonb_values_alike(const JsonbValue *a, const JsonbValue *b)
+{
+	if (a == NULL || b == NULL)
+		return a == b;
+	if (a->type != b->type)
+		return false;
+	switch (a->type)
+	{
+		case jbvNull:
+			return true;
+		case jbvBool:
+			return a->val.boolean == b->val.boolean;
+		case jbvString:
+			return a->val.string.len == b->val.string.len &&
+				memcmp(a->val.string.val, b->val.string.val, a->val.string.len) == 0;
+		case jbvNumeric:
+			return VARSIZE_ANY(a->val.numeric) == VARSIZE_ANY(b->val.numeric) &&
+				memcmp(a->val.numeric, b->val.numeric, VARSIZE_ANY(a->val.numeric)) == 0;
+		case jbvBinary:
+			return a->val.binary.len == b->val.binary.len &&
+				memcmp(a->val.binary.data, b->val.binary.data, a->val.binary.len) == 0;
+		default:
+			elog(ERROR, "unexpected jsonb value of type %d", (int) a->type);
+	}
+	return false;
+}
+
+static bool
+jsonb_value_is_object(const JsonbValue *v)
+{
+	return v != NULL && v->type == jbvBinary && JsonContainerIsObject(v->val.binary.data);
+}
+
+/* An object's keys, in its order. */
+static JsonbValue *
+jsonb_keys_of(JsonbContainer *object, int *n)
+{
+	JsonbValue *keys = palloc_array(JsonbValue, Max(JsonContainerSize(object), 1));
+	JsonbIterator *it = JsonbIteratorInit(object);
+	JsonbValue	v;
+	JsonbIteratorToken tok;
+
+	*n = 0;
+	while ((tok = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
+		if (tok == WJB_KEY)
+			keys[(*n)++] = v;
+	return keys;
+}
+
+/* The order of an object's keys: by length, then bytes. */
+static int
+jsonb_key_cmp(const JsonbValue *a, const JsonbValue *b)
+{
+	if (a->val.string.len != b->val.string.len)
+		return a->val.string.len < b->val.string.len ? -1 : 1;
+	return memcmp(a->val.string.val, b->val.string.val, a->val.string.len);
+}
+
+/*
+ * Three objects as one, pushed: each key as a cell is, what one side left being the other's,
+ * and two objects both changed in turn.  False if a key cannot be.
+ */
+static bool
+jsonb_objects_merge(JsonbContainer *b, JsonbContainer *o, JsonbContainer *t, JsonbInState *st)
+{
+	int			n[3];
+	JsonbValue *keys[3] = {jsonb_keys_of(b, &n[0]), jsonb_keys_of(o, &n[1]), jsonb_keys_of(t, &n[2])};
+	int			at[3] = {0, 0, 0};
+
+	/* (too deep to work out is as a key that cannot be, and no reason to stop the merge) */
+	if (stack_is_too_deep())
+		return false;
+	pushJsonbValue(st, WJB_BEGIN_OBJECT, NULL);
+	for (;;)
+	{
+		const JsonbValue *next = NULL;
+		JsonbValue	key;
+		JsonbValue *found[3] = {NULL, NULL, NULL};
+		JsonbValue *kept;
+
+		CHECK_FOR_INTERRUPTS();
+		for (int s = 0; s < 3; s++)
+			if (at[s] < n[s] && (next == NULL || jsonb_key_cmp(&keys[s][at[s]], next) < 0))
+				next = &keys[s][at[s]];
+		if (next == NULL)
+			break;
+		key = *next;
+		for (int s = 0; s < 3; s++)
+			if (at[s] < n[s] && jsonb_key_cmp(&keys[s][at[s]], &key) == 0)
+			{
+				found[s] = findJsonbValueFromContainer(s == 0 ? b : s == 1 ? o : t, JB_FOBJECT, &key);
+				at[s]++;
+			}
+		if (jsonb_values_alike(found[1], found[2]) || jsonb_values_alike(found[2], found[0]))
+			kept = found[1];
+		else if (jsonb_values_alike(found[1], found[0]))
+			kept = found[2];
+		else if (jsonb_value_is_object(found[0]) && jsonb_value_is_object(found[1]) && jsonb_value_is_object(found[2]))
+		{
+			pushJsonbValue(st, WJB_KEY, &key);
+			if (!jsonb_objects_merge(found[0]->val.binary.data, found[1]->val.binary.data,
+									 found[2]->val.binary.data, st))
+				return false;
+			continue;
+		}
+		else
+			return false;
+		if (kept != NULL)
+		{
+			pushJsonbValue(st, WJB_KEY, &key);
+			pushJsonbValue(st, WJB_VALUE, kept);
+		}
+	}
+	pushJsonbValue(st, WJB_END_OBJECT, NULL);
+	return true;
+}
+
+/* A cell as jsonb, read as the server's encoding reads text, as capture's are. */
+static Jsonb *
+jsonb_of_cell(RowMerge *rm, const WsCell *cell)
+{
+	WsField		f = {cell->p, cell->len, false, cell->large};
+
+	return DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(ws_text_from_utf8(field_text(rm, &f)))));
+}
+
+/* A jsonb value both sides changed, by key as Dolt's are; NULL if that cannot be. */
+static char *
+jsonb_cells_merged(RowMerge *rm, const WsCell *cb, const WsCell *co, const WsCell *ct)
+{
+	Jsonb	   *jb = jsonb_of_cell(rm, cb);
+	Jsonb	   *jo = jsonb_of_cell(rm, co);
+	Jsonb	   *jt = jsonb_of_cell(rm, ct);
+	JsonbInState st = {0};
+
+	if (!JB_ROOT_IS_OBJECT(jb) || !JB_ROOT_IS_OBJECT(jo) || !JB_ROOT_IS_OBJECT(jt) ||
+		!jsonb_objects_merge(&jb->root, &jo->root, &jt->root, &st))
+		return NULL;
+	return ws_text_to_utf8(JsonbToCString(NULL, &JsonbValueToJsonb(st.result)->root, 0));
+}
+
+/*
  * A row both sides changed, cell by cell as each wrote it, into fields of the merged
  * record; false, in conflict.  A cell one side left is the other's, and only a cell
  * kept is read.  With no row of base each cell must be alike, as one side's NULL is no
@@ -1630,6 +1778,16 @@ merge_cells(RowMerge *rm, const RowSides *sides, const ProllyConflict *c, WsFiel
 			{
 				from = &sides->theirs;
 				keep = ht ? &ct : NULL;
+			}
+			else if (hb && ho && ht && strcmp(col->type, "jsonb") == 0 &&
+					 same_type_in(o, t, col->tag) && same_type_in(b, t, col->tag))
+			{
+				char	   *merged = jsonb_cells_merged(rm, &cb, &co, &ct);
+
+				if (merged == NULL)
+					return false;
+				field_set(rm, &f[i], merged);
+				continue;
 			}
 			else
 				return false;
@@ -2312,6 +2470,7 @@ merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const P
 	EditList	edits = {0};
 	WsField    *f = palloc_array(WsField, Max(rm->shape.nstored, 1));
 	PHash		cur;
+	MemoryContext rowcxt;
 
 	if (retype_rewrote(rm, sides, base, ro, rt))
 	{
@@ -2323,6 +2482,7 @@ merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const P
 	if (prolly_merge(m->ctx, base, ro, rt, &res) < 0)
 		prolly_report(m->ctx);
 	cur = res.root;
+	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "ws_merge row", ALLOCSET_DEFAULT_SIZES);
 	for (size_t i = 0; i < res.nconflicts; i++)
 	{
 		const ProllyConflict *c = &res.conflicts[i];
@@ -2341,22 +2501,31 @@ merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const P
 			else
 				row_conflict(rm, "row", c->key, c->klen);
 		}
-		else if (!merge_cells(rm, sides, c, f))
-			row_conflict(rm, "row", c->key, c->klen);
-		else if (!regenerate(rm, NULL, f))
-			row_conflict(rm, "generated", c->key, c->klen);
 		else
 		{
+			/* (what a row's cells take to work out goes with the row) */
+			MemoryContext old = MemoryContextSwitchTo(rowcxt);
+			bool		cells = merge_cells(rm, sides, c, f);
+			bool		computed = cells && regenerate(rm, NULL, f);
 			Buf			nk = BUF_INIT,
 						nv = BUF_INIT;
 
-			WsRowCodec->encode(&rm->shape, f, &nk, &nv);
-			edit_add(&edits, c->key, c->klen, nv.data, nv.len, false);
-			buf_free(&nk);
-			buf_free(&nv);
+			if (computed)
+				WsRowCodec->encode(&rm->shape, f, &nk, &nv);
+			MemoryContextSwitchTo(old);
+			if (!cells)
+				row_conflict(rm, "row", c->key, c->klen);
+			else if (!computed)
+				row_conflict(rm, "generated", c->key, c->klen);
+			else
+				edit_add(&edits, c->key, c->klen, nv.data, nv.len, false);
+			MemoryContextReset(rowcxt);
 		}
+		if (edits.n >= MOVE_BATCH)
+			edits_apply(m, &edits, &cur);
 	}
 	edits_apply(m, &edits, &cur);
+	MemoryContextDelete(rowcxt);
 	prolly_merge_result_free(&res);
 	pfree(f);
 	move_taken_rows(&ours, sides->base, base, ro, rt, &cur);

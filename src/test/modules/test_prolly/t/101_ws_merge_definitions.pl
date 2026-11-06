@@ -205,6 +205,25 @@ my ($nest_rc, $nest, $nest_err) = $node->psql('postgres', qq{SET client_min_mess
 	SELECT 1 FROM pg_class LIMIT 1;}, timeout => 60);
 is($nest_rc, 0, 'a merge within a value: comes back') or diag($nest_err);
 
+# a value merged by key is what capture writes, whatever the database's encoding
+$node->safe_psql('postgres', q{CREATE DATABASE latin TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C'});
+$node->safe_psql('latin', 'CREATE EXTENSION test_prolly');
+{
+	my $on = $node->safe_psql('latin', 'SELECT pg_branch_id_allocate()');
+	my ($l_rc, $l_out, $l_err) = $node->psql('latin', qq{SET client_min_messages = warning;
+		SET client_encoding = 'UTF8';
+		SET catalog_branch = $on;
+		CREATE SCHEMA lb VERSIONED; CREATE SCHEMA lo VERSIONED; CREATE SCHEMA lt VERSIONED; CREATE SCHEMA ld VERSIONED;
+		CREATE TABLE lb.t (id integer PRIMARY KEY, j jsonb); INSERT INTO lb.t VALUES (1, '{"é": 1, "ab": 2, "c": 3}');
+		CREATE TABLE lo.t (id integer PRIMARY KEY, j jsonb); INSERT INTO lo.t VALUES (1, '{"é": 1, "ab": 2, "c": 4}');
+		CREATE TABLE lt.t (id integer PRIMARY KEY, j jsonb); INSERT INTO lt.t VALUES (1, '{"é": 1, "ab": 2, "c": 3, "zz": 5}');
+		SELECT split_part(test_ws_merge(test_ws_root_capture('lb'), test_ws_root_capture('lo'), test_ws_root_capture('lt'), 'ld'), E'\n', 1) AS m \\gset
+		SELECT test_ws_root_restore(:'m', 'ld') IS NULL AS r \\gset
+		SELECT test_ws_root_capture('ld') = :'m', (SELECT j::text FROM ld.t);});
+	is($l_rc, 0, 'a merge by key in LATIN1: runs') or diag($l_err);
+	like($l_out, qr/^t\|\{.*"é": 1.*"zz": 5\}$/m, 'and it captures as the root it made');
+}
+
 # two merges in one transaction, as a role with no more rights than its schemas'
 my ($two_rc, $two, $two_err) = $node->psql('postgres', q{SET client_min_messages = warning;
 	CREATE ROLE merger LOGIN; GRANT g_def TO merger;
