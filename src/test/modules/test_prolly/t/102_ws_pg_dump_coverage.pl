@@ -2,7 +2,8 @@
 
 # One of every object kind a versioned schema can hold: captured, restored into an empty
 # schema of its name on another branch, and the same by pg_dump, object by object.  A kind
-# a commit comes to hold that this schema does not fails here.
+# a commit comes to hold that this schema does not fails here.  So too the root is the same
+# whatever a session had set when it captured it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -120,6 +121,21 @@ my $owner = q{
 	CREATE TABLE keyless (a integer, b text UNIQUE);
 	INSERT INTO keyless VALUES (1, 'x');
 
+	CREATE TABLE printed (
+		id integer PRIMARY KEY,
+		d date DEFAULT '2020-01-02' CONSTRAINT d_after CHECK (d > '2000-01-02'),
+		ts timestamptz DEFAULT '2020-01-02 03:04:05+00',
+		i interval DEFAULT '1 day 2 hours',
+		f double precision DEFAULT 0.1,
+		b bytea DEFAULT '\\x0102',
+		a text[] DEFAULT '{a,b}',
+		"Odd Name" integer,
+		"select" integer
+	);
+	CREATE INDEX printed_d ON printed (d) WHERE d > '2000-01-02';
+	CREATE VIEW printed_v AS SELECT d, i, f, "Odd Name" FROM printed WHERE ts > '2000-01-02 00:00:00+00' AND i > '1 hour';
+	INSERT INTO printed (id, "Odd Name", "select") VALUES (1, 1, 2);
+
 	CREATE VIEW v1 AS SELECT id, v FROM t WHERE n > 0;
 	ALTER VIEW v1 ALTER COLUMN v SET DEFAULT 'x';
 	COMMENT ON VIEW v1 IS 'on a view';
@@ -136,6 +152,17 @@ my $owner = q{
 	CREATE POLICY pl ON child FOR SELECT TO g_reader USING (tid IS NOT NULL);
 	ALTER SEQUENCE seq OWNED BY t.s;
 };
+
+# a commit is the same whatever the session that made it had set
+my @settings = (
+	q{DateStyle = 'SQL, DMY'}, q{DateStyle = 'German'}, q{DateStyle = 'Postgres, MDY'},
+	q{IntervalStyle = 'sql_standard'}, q{IntervalStyle = 'iso_8601'}, q{IntervalStyle = 'postgres_verbose'},
+	q{TimeZone = 'Asia/Tokyo'}, q{extra_float_digits = 0}, q{extra_float_digits = -5},
+	q{bytea_output = 'escape'}, q{xmloption = 'document'}, q{xmlbinary = 'hex'},
+	q{quote_all_identifiers = on}, q{search_path = app, public}, q{search_path = pg_catalog},
+	q{lc_monetary = 'C'}, q{default_text_search_config = 'simple'},
+	q{row_security = off}, q{backslash_quote = off});
+my $settled = join('', map { "SET $settings[$_]; \\echo =====setting$_\nSELECT public.test_ws_root_capture('app') = :'r';\n\\echo =====end\nRESET ALL; SET catalog_branch = $from; SET client_min_messages = warning;\n" } 0 .. $#settings);
 
 my ($rc, $out, $err) = $node->psql('postgres', qq{
 	SET client_min_messages = warning;
@@ -160,9 +187,16 @@ my ($rc, $out, $err) = $node->psql('postgres', qq{
 	\\echo =====same
 	SELECT test_ws_root_capture('app') = :'r';
 	\\echo =====end
+	SET catalog_branch = $from;
+	$settled
 });
 is($rc, 0, 'made, captured and restored') or diag($err);
 like($out, qr/=====same\nt\n/, 'it captures as the root it was restored from');
+
+for my $i (0 .. $#settings)
+{
+	like($out, qr/=====setting$i\nt\n/, "captured under $settings[$i], the same root");
+}
 
 # every kind a commit can hold, by what the code says those are
 my $code = slurp_file(dirname(__FILE__) . '/../../../../backend/prolly/ws/ws_obj.c');
