@@ -14,7 +14,8 @@ my $node = PostgreSQL::Test::Cluster->new('lane_numbers');
 # (the history store holds raw bytes here: initdb makes it with the leaf
 # format, which references no chunk)
 $node->init(extra => ['-c', 'chunk_format=leaf']);
-$node->append_conf('postgresql.conf', "autovacuum = off\nmax_prepared_transactions = 2");
+# (nothing holds the chunks put here, and a freer a VACUUM started frees those in a bucket it marked)
+$node->append_conf('postgresql.conf', "autovacuum = off\nmax_prepared_transactions = 2\nchunk_free_in_background = off");
 $node->start;
 my $ts_dir = PostgreSQL::Test::Utils::tempdir_short();
 $node->safe_psql('postgres', qq{
@@ -128,6 +129,13 @@ is($node->safe_psql('postgres', q{SELECT test_cs_get('pages', h(d(15))) = d(15)}
 $node->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
 	't', "the audit passes after VACUUM: the rolled-back making's entries out, nothing of the reused lane counted dead");
+
+# (a chunk in the reused lane is freed like any other, with no freer's timing to it)
+$node->safe_psql('postgres', q{SELECT test_cs_free_unheld('pages')});
+is($node->safe_psql('postgres', q{SELECT test_cs_get('pages', h(d(15))) IS NULL}),
+	't', 'with nothing holding it, the chunk in the reused lane is freed');
+is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}),
+	't', 'and the audit passes');
 
 # a log truncated truncates its lanes, each keeping its number, and the
 # log the numbers it has given (a lane made after takes the next); a lane

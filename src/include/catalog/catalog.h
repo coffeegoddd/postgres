@@ -35,6 +35,7 @@ extern bool IsCatalogNamespace(Oid namespaceId);
 extern bool IsToastNamespace(Oid namespaceId);
 extern bool IsConflictLogTableNamespace(Oid namespaceId);
 extern bool IsHistoryStoreNamespace(Oid namespaceId);
+extern bool IsHistoryStoreAccessMethod(Oid amId);
 
 extern bool IsReservedName(const char *name);
 

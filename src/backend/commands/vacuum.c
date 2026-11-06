@@ -35,6 +35,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
@@ -1091,6 +1092,10 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 		/* Skip temp relations belonging to other sessions */
 		if (classForm->relpersistence == RELPERSISTENCE_TEMP &&
 			!isTempOrTempToastNamespace(classForm->relnamespace))
+			continue;
+
+		/* (the history store's can't be rewritten, which is refused if they're named) */
+		if ((options & VACOPT_FULL) != 0 && IsHistoryStoreAccessMethod(classForm->relam))
 			continue;
 
 		/* check permissions of relation */

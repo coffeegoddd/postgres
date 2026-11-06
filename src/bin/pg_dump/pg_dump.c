@@ -4313,6 +4313,7 @@ getHistory(Archive *fout)
 		return;
 	res = ExecuteSqlQueryForSingleRow(fout,
 									  "SELECT has_function_privilege('pg_catalog.pg_history_export()', 'EXECUTE') "
+									  "AND has_schema_privilege('pg_history', 'USAGE') "
 									  "AND has_table_privilege('pg_history.pointers', 'SELECT')");
 	has = PQgetvalue(res, 0, 0)[0] == 't';
 	PQclear(res);
