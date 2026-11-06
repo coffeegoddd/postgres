@@ -96,13 +96,13 @@ patch src/backend/catalog/pg_subscription.c  1b  a subscription's branch
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers; also (1b) a versioned schema's relations are block-mapped
 patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database; also (1b) pg_subscription.subcatalogbranch readable; also (1b) pg_replication_slots.branch; also (2) the history store's relations (its tier's too) and the pointers' triggers; also (2) pg_history.chunk_restore, a view its dump is restored into; also (4) pg_roles shows roltravels
 patch src/backend/catalog/toasting.c  1b  a TOAST table's storage manager is its table's, its schema being pg_toast
-patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one; also (2) refuses to drop, or copy as a template, a database whose history store tier has packs
+patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one; also (2) refuses to drop, or copy as a template, a database whose history store tier has packs; also (5) stops a dropped database's capture worker and drops its slot
 patch src/backend/commands/extension.c  1b  an extension name resolves to a shared extension or the session's branch's; refuses one of the other kind beside it, and moves between kinds
 patch src/backend/commands/functioncmds.c  1b  a procedure that runs on another branch than the caller's is atomic
 patch src/backend/commands/indexcmds.c  2  the version-control history store's relations, and the TOAST tables initdb made, not reindexed concurrently (pg_upgrade carries the store over by OID)
 patch src/backend/commands/publicationcmds.c  1b  ALTER PUBLICATION ... SET leaves another branch's tables and schemas
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager; also (2) a chunk log relation, the pages' or a tier's, is never rewritten (make_new_heap)
-patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema
+patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema; also (5) a versioned schema sees to its database's capture worker
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
 patch src/backend/commands/subscriptioncmds.c  1b  the catalog_branch option: the subscriber's branch a subscription replicates into, its tables looked up there
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's; also (1b) refuses SET UNLOGGED in a versioned schema; also (2) a tier of the history store is not moved out of pg_history; also (2) ALTER TABLE ALL IN TABLESPACE passes the history store's relations by; also (4) a column added gets its tag, and a rename into a versioned schema's table refuses a name with no UTF8
@@ -115,8 +115,10 @@ patch src/backend/meson.build  0  links the engine's code in src/backend/prolly 
 patch src/backend/optimizer/util/clauses.c  1b  a function that runs on another branch than the session's is not inlined
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED; also (4) the TRAVELS role option
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
-patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker
+patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker; also (5) the capture launcher and worker
+patch src/backend/postmaster/postmaster.c  5  registers the capture launcher
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
+patch src/backend/replication/logical/logical.c  5  capture's output plugin is built in
 patch src/backend/replication/logical/reorderbuffer.c  1b  decoding on a branch leaves out other branches' tables
 patch src/backend/replication/logical/slotsync.c  1b  a synced slot keeps the primary's slot's branch
 patch src/backend/replication/logical/worker.c  1b  a subscription's workers run on its branch (catalog_branch)
@@ -134,7 +136,7 @@ patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage
 patch src/backend/utils/activity/Makefile  1a  builds the block map's statistics (pgstat_block_map.c)
 patch src/backend/utils/activity/meson.build  1a  builds the block map's statistics (pgstat_block_map.c)
 patch src/backend/utils/activity/pgstat.c  1a  the block map statistics kind (PGSTAT_KIND_BLOCK_MAP)
-patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock
+patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock; also (5) capture's main loops
 patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/adt/ddlutils.c  4  TRAVELS in a role's definition
@@ -146,8 +148,8 @@ patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per
 patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format
-patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format; also (5) capture_in_background
+patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h; also (5) capture_in_background
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
 patch src/bin/pg_amcheck/t/002_nonesuch.pl  2  schema exclusion patterns exclude pg_history too, for no relations to check

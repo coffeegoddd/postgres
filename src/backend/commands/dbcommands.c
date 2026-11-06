@@ -52,6 +52,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "prolly/capture.h"
 #include "postmaster/bgwriter.h"
 #include "prolly/chunk_tier.h"
 #include "replication/slot.h"
@@ -1804,6 +1805,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * creation of new slots using the database or existing slots becoming
 	 * active.
 	 */
+	CaptureDatabaseDropping(db_id);
 	(void) ReplicationSlotsCountDBSlots(db_id, &nslots, &nslots_active);
 	if (nslots_active)
 	{

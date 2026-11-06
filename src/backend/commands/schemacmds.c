@@ -31,6 +31,7 @@
 #include "parser/parse_utilcmd.h"
 #include "parser/scansup.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/capture.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -166,6 +167,8 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 	namespaceId = NamespaceCreateOnBranch(schemaName, owner_uid, false,
 										  stmt->versioned ?
 										  VersionedNamespaceBranch(schemaName) : 0);
+	if (stmt->versioned)
+		CaptureSchemaMade();
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();
