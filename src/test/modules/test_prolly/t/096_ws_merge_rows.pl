@@ -205,6 +205,8 @@ my @scenarios = (
 	[ 'keyless, one column added by both, a value for each row set after by one', "$K; INSERT INTO t VALUES (1, 'x')",
 		q{ALTER TABLE t ADD COLUMN c integer},
 		q{ALTER TABLE t ADD COLUMN c integer; ALTER TABLE t ADD COLUMN d double precision; ALTER TABLE t ALTER COLUMN d SET DEFAULT random()}, [], undef ],
+	[ 'a key as its output says, not as a cast to text would', q{CREATE TABLE t (i inet, b boolean, c character(4), a text, PRIMARY KEY (i, b, c)); INSERT INTO t VALUES ('10.0.0.1', true, 'ab', 'x')},
+		q{UPDATE t SET a = 'o'}, q{UPDATE t SET a = 't'}, [ 'row t 10.0.0.1,t,ab  ' ], undef ],
 	[ 'keyless, one enum value renamed by both', q{CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (v e, x text); INSERT INTO t VALUES ('a', 'x')},
 		q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, q{ALTER TYPE e RENAME VALUE 'a' TO 'z'}, [], 'as ours' ],
 	[ 'keyless, a type changed by one, one row inserted by both', q{CREATE TYPE e AS ENUM ('b'); CREATE TABLE t (v e, w text); INSERT INTO t VALUES ('b', 'x')},

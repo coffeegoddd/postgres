@@ -107,6 +107,23 @@ is($node->safe_psql('postgres', q{SET extra_float_digits = 0; SELECT test_ws_row
 copy_table('typed');
 is($node->safe_psql('postgres', q{SELECT id, m, e::text, z::text FROM d.typed}), '1|$12.50|b|-0', 'and restored as they were');
 
+# a composite value of nulls is no null, and each value reads back as it was
+$node->safe_psql('postgres', q{
+	CREATE TYPE s.pr AS (a integer, b integer); CREATE TYPE d.pr AS (a integer, b integer);
+	CREATE TABLE s.vals (id integer PRIMARY KEY, b boolean, c character(4), i inet, p s.pr, q s.pr);
+	INSERT INTO s.vals VALUES (1, true, 'ab', '10.0.0.1/8', ROW(NULL, NULL), NULL)});
+copy_table('vals');
+same_rows('vals', 'id', 'values whose text a cast would change');
+is($node->safe_psql('postgres', q{SELECT p IS NOT DISTINCT FROM NULL, q IS NOT DISTINCT FROM NULL, p::text FROM d.vals}),
+	'f|t|(,)', 'a composite value of nulls stays a value, and a null a null');
+
+# a table that may lose its rows has none to commit, as none can be made here
+my ($unlogged_rc, $unlogged_out, $unlogged_err) = $node->psql('postgres', q{CREATE UNLOGGED TABLE s.u (id integer)});
+like($unlogged_err, qr/cannot create unlogged relation "u" in versioned schema "s"/, 'an unlogged table cannot be in a versioned schema');
+($unlogged_rc, $unlogged_out, $unlogged_err) = $node->psql('postgres', q{CREATE TABLE s.u2 (id integer); ALTER TABLE s.u2 SET UNLOGGED});
+like($unlogged_err, qr/unlogged/, 'nor can one be made so');
+$node->safe_psql('postgres', q{DROP TABLE s.u2});
+
 # large values, in a key's row and a keyless one
 $node->safe_psql('postgres', q{
 	CREATE TABLE s.big (id integer PRIMARY KEY, v text, w text);
