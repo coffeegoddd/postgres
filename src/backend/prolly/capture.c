@@ -308,20 +308,24 @@ CaptureSchemaMade(void)
 	for (;;)
 	{
 		bool		marked;
+		LOCKMODE	mode;
 
 		AcceptInvalidationMessages();
 		marked = database_is_marked();
-		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, marked ? ShareLock : ExclusiveLock);
-		if (!marked)
+		mode = marked ? ShareLock : ExclusiveLock;
+		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, mode);
+		if (database_is_marked() == marked)
 		{
-			database_mark(true);
+			if (!marked)
+				database_mark(true);
 			break;
 		}
-		if (database_is_marked())
-			break;
 
-		/* (cleared before this got the lock, and so held no earlier in this transaction) */
-		UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, ShareLock);
+		/*
+		 * Set or cleared while it waited, so this mode is the wrong one.  It wasn't held earlier in
+		 * this transaction: a clear can't commit under a hold, nor a set under ExclusiveLock.
+		 */
+		UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_MARK_LOCK, mode);
 	}
 	schema_made = true;
 }
@@ -652,6 +656,7 @@ CaptureLauncherMain(Datum main_arg)
 	List	   *running = NIL;
 	bool		none_free;
 	bool		warned = false;
+	uint32		look_count = 0;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
@@ -689,9 +694,12 @@ CaptureLauncherMain(Datum main_arg)
 			}
 		}
 		none_free = false;
-		foreach(lc, marked)
+
+		/* (from a different one each look: one whose worker can't stay mustn't take the last free) */
+		look_count++;
+		for (int i = 0; i < list_length(marked); i++)
 		{
-			Oid			dboid = lfirst_oid(lc);
+			Oid			dboid = list_nth_oid(marked, (look_count + i) % list_length(marked));
 			ListCell   *r;
 			bool		have = slot_is_held(dboid);
 			BackgroundWorkerHandle *handle;
