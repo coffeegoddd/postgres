@@ -177,6 +177,7 @@ test_row_shape(void)
 {
 	WsTableSchema s = example();
 	WsRowShape	shape;
+	WsColumn	cols[lengthof(example_cols)];
 
 	ws_schema_row_shape(&s, &shape);
 	CHECK(shape.nkey == 1 && shape.nstored == 4);
@@ -187,7 +188,6 @@ test_row_shape(void)
 	/* a key on later attributes, out of their order: the key first, in its order */
 	{
 		uint64		key[] = {11, 300};
-		WsColumn	cols[lengthof(example_cols)];
 
 		memcpy(cols, example_cols, sizeof(cols));
 		s.cols = cols;
