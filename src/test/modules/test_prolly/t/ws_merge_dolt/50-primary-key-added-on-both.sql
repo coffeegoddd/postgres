@@ -1,0 +1,8 @@
+-- base
+CREATE TABLE t1 (i int);
+-- ours
+ALTER TABLE t1 ADD PRIMARY KEY (i); ALTER TABLE t1 DROP CONSTRAINT t1_pkey; ALTER TABLE t1 ADD PRIMARY KEY (i);
+-- theirs
+ALTER TABLE t1 ADD PRIMARY KEY (i);
+-- expect
+clean

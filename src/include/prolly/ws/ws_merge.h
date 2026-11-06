@@ -66,6 +66,17 @@
  * means the other now, keyless rows reaching one set through that too, nor a composite
  * type's attributes reordered.
  *
+ * Where this differs from Dolt, whose merge tests its scenarios follow:
+ *	- A column of another type on one side, with rows on the other: Dolt conflicts on the
+ *	  schema unless it widens; here each row is read, and only one that doesn't read conflicts.
+ *	- A json value both changed: Dolt merges by key; here it is a row conflict.
+ *	- A keyless row both added or removed: Dolt conflicts; here the counts add up, as a
+ *	  multiset.
+ *	- A conflict in the schema: Dolt still merges other tables' rows; here no row is looked at.
+ *	- A table both added, alike but for tags, as one retyped a column: Dolt merges it; here it
+ *	  is a table conflict.
+ *	- Defaults compare as Postgres prints them, so 1.23 and '1.23' differ; Dolt's are alike.
+ *
  * Conflicts, as a line for each, as "<kind> <where>":
  *	object <kind> <name>		both changed an object differently, or one dropped
  *								what the other changed
