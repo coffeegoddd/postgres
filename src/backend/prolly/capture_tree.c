@@ -52,12 +52,16 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
+#include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "prolly/capture.h"
@@ -66,6 +70,7 @@
 #include "prolly/engine/vc_refs.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -76,6 +81,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplesort.h"
 #include "varatt.h"
 
 /* A table's layout, for as long as the worker runs. */
@@ -824,26 +830,30 @@ tree_apply(void)
 	INJECTION_POINT("capture-applied", NULL);
 }
 
-/* A table's rows being made into its map, a batch at a time. */
+/*
+ * A table's rows being made into its map: sorted by key first, as written in a batch at a time as
+ * they lie in the table, every tree between would be written too.
+ */
 typedef struct TreeRebuild
 {
 	ProllyCtx  *ctx;
 	const WsRowShape *shape;
-	PHash		map;
-	ProllyEdit *edits;
-	int			n;
 	WsField    *f;
+	Tuplesortstate *sort;
+	TupleTableSlot *slot;
 } TreeRebuild;
 
-#define TREE_REBUILD_BATCH 1000
+#define TREE_REBUILD_BATCH_ROWS 1000
+#define TREE_REBUILD_BATCH_BYTES (8 * 1024 * 1024)
 
-static void
-tree_rebuild_flush(TreeRebuild *b)
+static bytea *
+tree_bytea(const uint8 *p, size_t len)
 {
-	if (b->n > 0 && prolly_apply(b->ctx, &b->map, b->edits, b->n, &b->map) < 0)
-		prolly_report(b->ctx);
-	tree_edits_free(b->edits, b->n);
-	b->n = 0;
+	bytea	   *b = palloc(VARHDRSZ + len);
+
+	SET_VARSIZE(b, VARHDRSZ + len);
+	memcpy(VARDATA(b), p, len);
+	return b;
 }
 
 static void
@@ -852,6 +862,8 @@ tree_rebuild_row(void *arg, const char **fields)
 	TreeRebuild *b = arg;
 	Buf			k = BUF_INIT,
 				v = BUF_INIT;
+	bytea	   *key;
+	bytea	   *val;
 
 	for (int c = 0; c < b->shape->nstored; c++)
 	{
@@ -861,44 +873,119 @@ tree_rebuild_row(void *arg, const char **fields)
 		b->f[c].large = false;
 	}
 	ws_row_store(b->ctx, b->shape, b->f, &k, &v);
-	b->edits[b->n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len};
-	if (b->n == TREE_REBUILD_BATCH)
-		tree_rebuild_flush(b);
+	key = tree_bytea(k.data, k.len);
+	val = tree_bytea(v.data, v.len);
+	buf_free(&k);
+	buf_free(&v);
+	ExecClearTuple(b->slot);
+	b->slot->tts_values[0] = PointerGetDatum(key);
+	b->slot->tts_values[1] = PointerGetDatum(val);
+	b->slot->tts_isnull[0] = b->slot->tts_isnull[1] = false;
+	ExecStoreVirtualTuple(b->slot);
+	tuplesort_puttupleslot(b->sort, b->slot);
+	pfree(key);
+	pfree(val);
+}
+
+/* What's sorted, in key order, on the map, a bounded batch at a time. */
+static void
+tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
+{
+	MemoryContext batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture rebuild batch", ALLOCSET_DEFAULT_SIZES);
+	ProllyEdit *edits = palloc_array(ProllyEdit, TREE_REBUILD_BATCH_ROWS);
+	int			n = 0;
+	Size		bytes = 0;
+	bool		more;
+
+	tuplesort_performsort(b->sort);
+	do
+	{
+		more = tuplesort_gettupleslot(b->sort, true, false, b->slot, NULL);
+		if (more)
+		{
+			bool		isnull;
+			bytea	   *key = DatumGetByteaPP(slot_getattr(b->slot, 1, &isnull));
+			bytea	   *val = DatumGetByteaPP(slot_getattr(b->slot, 2, &isnull));
+			size_t		klen = VARSIZE_ANY_EXHDR(key);
+			size_t		vlen = VARSIZE_ANY_EXHDR(val);
+			uint8	   *kc = MemoryContextAlloc(batch_cxt, Max(klen, 1));
+			uint8	   *vc = MemoryContextAlloc(batch_cxt, Max(vlen, 1));
+
+			memcpy(kc, VARDATA_ANY(key), klen);
+			memcpy(vc, VARDATA_ANY(val), vlen);
+			edits[n++] = (ProllyEdit) {.key = kc, .klen = klen, .val = vc, .vlen = vlen};
+			bytes += klen + vlen;
+		}
+		if (n > 0 && (!more || n == TREE_REBUILD_BATCH_ROWS || bytes >= TREE_REBUILD_BATCH_BYTES))
+		{
+			if (prolly_apply(ctx, map, edits, n, map) < 0)
+				prolly_report(ctx);
+			n = 0;
+			bytes = 0;
+			MemoryContextReset(batch_cxt);
+		}
+		CHECK_FOR_INTERRUPTS();
+	} while (more);
+	pfree(edits);
+	MemoryContextDelete(batch_cxt);
 }
 
 /* A table's row map, of its rows in the transaction's snapshot, with none for one with no key. */
 static void
 tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 {
-	Relation	rel = table_open(relid, AccessShareLock);
+	Relation	rel;
 	WsRowShape	shape;
 	char	   *fingerprint;
 	Oid			types[2] = {OIDOID, TEXTOID};
 	Datum		values[2];
 
+	/*
+	 * (a table locked by a transaction waiting to commit would wait for the lock this holds: so this
+	 * gives way, and begins again, rather than have a user's commit be the one a deadlock fails)
+	 */
+	if (!ConditionalLockRelationOid(relid, AccessShareLock))
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("capture can't begin yet, as relation %u is locked", relid)));
+	rel = table_open(relid, NoLock);
 	CaptureRelationShape(rel, &shape);
 	if (shape.nkey > 0)
 	{
 		TreeRebuild b = {.ctx = ctx,.shape = &shape};
+		TupleDesc	desc = CreateTemplateTupleDesc(2);
+		AttrNumber	sort_col = 1;
+		Oid			sort_op = ByteaLessOperator;
+		Oid			collation = InvalidOid;
+		bool		nulls_first = false;
 		char		name[64];
+		PHash		map;
 
+		TupleDescInitEntry(desc, 1, "key", BYTEAOID, -1, 0);
+		TupleDescInitEntry(desc, 2, "value", BYTEAOID, -1, 0);
+		TupleDescFinalize(desc);
 		b.f = palloc_array(WsField, Max(shape.nstored, 1));
-		b.edits = palloc_array(ProllyEdit, TREE_REBUILD_BATCH);
-		if (prolly_empty(ctx, WS_ROW_VREFS, &b.map) < 0)
-			prolly_report(ctx);
+		b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+		b.sort = tuplesort_begin_heap(desc, 1, &sort_col, &sort_op, &collation, &nulls_first,
+									  maintenance_work_mem, NULL, TUPLESORT_NONE);
 		CaptureTableRowsRead(rel, &shape, GetActiveSnapshot(), tree_rebuild_row, &b);
-		tree_rebuild_flush(&b);
+		ExecDropSingleTupleTableSlot(b.slot);
+		b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
+		if (prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+			prolly_report(ctx);
+		tree_rebuild_write(ctx, &b, &map);
+		tuplesort_end(b.sort);
+		ExecDropSingleTupleTableSlot(b.slot);
 		snprintf(name, sizeof(name), "capture/map/%u", relid);
-		refs->routine->set(refs, name, &b.map);
+		refs->routine->set(refs, name, &map);
 		tree_record_shape(relid, &shape);
 		pfree(b.f);
-		pfree(b.edits);
 	}
 
 	/*
-	 * (or the first catalog change would tell all of every table.  One that changed since this
-	 * snapshot recorded its own, which this can't see, and it's a serialization failure: the worker
-	 * starts again, with a later snapshot.)
+	 * (or the first catalog change would tell all of every table.  One that changed between the
+	 * snapshot and the lock taken before this recorded its own, which this can't see, and it's a
+	 * serialization failure: the worker starts again, with a later snapshot.)
 	 */
 	fingerprint = CaptureRowsFingerprint(relid, rel->rd_rel->relfilenode);
 	values[0] = ObjectIdGetDatum(relid);
@@ -923,6 +1010,8 @@ tree_slot_made(XLogRecPtr from)
 	Oid			types[1] = {PG_LSNOID};
 	Datum		values[1] = {LSNGetDatum(from)};
 
+	/* (what changes a table's rows, untold, takes turns with this, as it does with its own kind) */
+	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
@@ -944,6 +1033,7 @@ tree_slot_made(XLogRecPtr from)
 
 		tables = lappend_oid(tables, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
 	}
+	INJECTION_POINT("capture-slot-reading", NULL);
 	foreach(lc, tables)
 		tree_rebuild_table(&ctx, refs, lfirst_oid(lc));
 
@@ -978,6 +1068,7 @@ tree_slot_will_do(void)
 
 const CaptureSink TreeCaptureSink = {
 	.name = "tree",
+	.reads_at_start = true,
 	.start = tree_start,
 	.begin = tree_begin,
 	.change = tree_change,

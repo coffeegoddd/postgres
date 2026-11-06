@@ -483,9 +483,10 @@ capture_slot_create(const char *name)
 
 	/* (repeatable read, so that the snapshot this gets is what all it reads is under) */
 	StartTransactionCommand();
-	XactIsoLevel = XACT_REPEATABLE_READ;
+	if (CaptureSinkInUse->reads_at_start)
+		XactIsoLevel = XACT_REPEATABLE_READ;
 	EnsureLogicalDecodingEnabled();
-	ctx = CreateInitDecodingContext(PROLLY_CAPTURE_PLUGIN, NIL, true, false, InvalidXLogRecPtr,
+	ctx = CreateInitDecodingContext(PROLLY_CAPTURE_PLUGIN, NIL, CaptureSinkInUse->reads_at_start, false, InvalidXLogRecPtr,
 									XL_ROUTINE(.page_read = read_local_xlog_page,
 											   .segment_open = wal_segment_open,
 											   .segment_close = wal_segment_close),
@@ -497,7 +498,8 @@ capture_slot_create(const char *name)
 	 * be told: the two are the whole of a table.  The slot's kept only once what the sink makes of
 	 * it has committed, so a worker dying before then leaves no slot, and the next begins again.
 	 */
-	RestoreTransactionSnapshot(SnapBuildInitialSnapshot(ctx->snapshot_builder), MyProc);
+	if (CaptureSinkInUse->reads_at_start)
+		RestoreTransactionSnapshot(SnapBuildInitialSnapshot(ctx->snapshot_builder), MyProc);
 	FreeDecodingContext(ctx);
 	INJECTION_POINT("capture-slot-snapshot", NULL);
 	CaptureSinkInUse->slot_made(MyReplicationSlot->data.confirmed_flush);
@@ -648,16 +650,17 @@ CaptureWorkerMain(Datum main_arg)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, BGWORKER_BYPASS_ALLOWCONN);
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, BGWORKER_BYPASS_ALLOWCONN | BGWORKER_SKIP_SETTINGS);
 
 	/*
-	 * On no branch, whatever the database's settings say: a slot keeps the branch it was made on,
+	 * (A database's and its owner's settings aren't this superuser's, whose work is the whole
+	 * cluster's WAL: they're left out above.)  On no branch, whatever the server's settings say: a slot keeps the branch it was made on,
 	 * and one made on a branch decodes only that branch's changes.  With the filter off, it sees
 	 * every branch's schemas.
 	 */
 	SetConfigOption("catalog_branch", "0", PGC_SUSET, PGC_S_OVERRIDE);
 
-	/* (this is a superuser, whose SQL a database's settings mustn't have be someone else's) */
+	/* (this is a superuser, whose SQL no setting of the server's is to have be someone else's) */
 	SetConfigOption("search_path", "pg_catalog, pg_temp", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("catalog_branch_filter", "off", PGC_SUSET, PGC_S_OVERRIDE);
 	slot_name_of(dboid, name);

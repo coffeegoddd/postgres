@@ -148,17 +148,94 @@ is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.pointers WHERE 
 # it records each table's fingerprint, so that the first catalog change tells only what it changed
 my $tables = $node->safe_psql('postgres', q{SET catalog_branch_filter = off; SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspbranch <> 0 AND c.relkind = 'r'});
 is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_history.capture_fingerprints'), $tables, 'each table has its fingerprint');
-my $msg_from = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+my $recorded = q{SELECT string_agg(relid || ':' || xmin, ',' ORDER BY relid) FROM pg_history.capture_fingerprints};
+my $before = $node->safe_psql('postgres', $recorded);
 $node->safe_psql('postgres', 'CREATE TEMP TABLE first_catalog_change (a integer)');
-my $msg_to = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
-my $bytes = $node->safe_psql('postgres', qq{SELECT '$msg_to'::pg_lsn - '$msg_from'::pg_lsn});
-ok($bytes < 200000, "the first catalog change writes nothing of the tables' rows ($bytes bytes)");
+is($node->safe_psql('postgres', $recorded), $before, 'the first catalog change records no table anew');
 same_map($on, 't', 'rebuilt on one branch');
 same_map($on2, 't', 'and another');
 is($node->safe_psql('postgres', "$on SELECT count(*) FROM pg_history.pointers WHERE name = 'capture/map/' || 's.nokey'::regclass::oid"), '0', 'a table with no key has no map');
 my $from = -s $node->logfile;
 $node->safe_psql('postgres', "$on INSERT INTO s.nokey VALUES (2)");
 ok($node->wait_for_log(qr/which has no primary key/, $from), 'and stops capture only once it is written');
+$node->stop;
+
+# tables whose rows don't lie in key order don't cost what every tree between would
+$b = new_node('order');
+$on = "SET catalog_branch = $b;";
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+began();
+$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELECT pg_reload_conf()');
+$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, v text); INSERT INTO s.t SELECT g, repeat('x', 40) FROM generate_series(1, 30000) g ORDER BY random()");
+my $size = q{SELECT sum(pg_relation_size(c.oid)) FROM pg_class c WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relname ~ '^chunks'};
+my $wal_at = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+my $size_at = $node->safe_psql('postgres', $size);
+$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
+began();
+same_map($on, 't', 'a table in random order');
+my $store = $node->safe_psql('postgres', $size) - $size_at;
+my $table = $node->safe_psql('postgres', "$on SELECT pg_relation_size('s.t')");
+ok($store < 3 * $table, "the store grew by no more than a few times the table ($store bytes for $table)");
+$node->stop;
+
+# a table locked after the slot's snapshot by a transaction yet to commit: capture gives way, and
+# it's not the commit that fails
+SKIP:
+{
+	skip 'injection points not supported by this build', 5 if $ENV{enable_injection_points} ne 'yes';
+	$b = new_node('locked');
+	$on = "SET catalog_branch = $b;";
+	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY, a integer); INSERT INTO s.t VALUES (1, 1)");
+	began();
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELECT pg_reload_conf()');
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-snapshot', 'wait')});
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
+	$node->wait_for_event('capture worker', 'capture-slot-snapshot');
+	my $holder = $node->background_psql('postgres');
+	$holder->query_safe("$on BEGIN; ALTER TABLE s.t ALTER COLUMN a TYPE bigint USING a + 1");
+	my $locked_from = -s $node->logfile;
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-snapshot')});
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-slot-snapshot')});
+	ok($node->wait_for_log(qr/capture can't begin yet, as relation \d+ is locked/, $locked_from), 'a worker gives way to a table locked');
+	$holder->query_safe('COMMIT');
+	$holder->quit;
+	began();
+	same_map($on, 't', 'and begins once it is not');
+	unlike(slurp_file($node->logfile), qr/deadlock detected/, 'with no deadlock');
+
+	# a catalog commit during the read waits its turn, not for a row the read is rewriting, which
+	# could leave the read waiting for a table it has locked
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELECT pg_reload_conf()');
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-reading', 'wait')});
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
+	$node->wait_for_event('capture worker', 'capture-slot-reading');
+	my $during = $node->background_psql('postgres');
+	$during->query_until(qr/started/, "\\echo started\n$on ALTER TABLE s.t ALTER COLUMN a TYPE bigint USING a + 1;\n\\echo finished\n");
+	ok( $node->poll_query_until('postgres',
+			q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE 'ALTER TABLE s.t%' AND wait_event_type = 'Lock' AND wait_event = 'object'}),
+		'a catalog commit during the read waits its turn');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-reading')});
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-slot-reading')});
+	$during->quit;
+	began();
+	same_map($on, 't', 'and comes after it');
+	$node->stop;
+}
+
+# a database's settings don't stop a worker with the whole cluster's WAL behind it
+$b = new_node('settings');
+$node->safe_psql('postgres', q{CREATE DATABASE settings_db; ALTER DATABASE settings_db SET default_transaction_read_only = on;
+	ALTER DATABASE settings_db SET transaction_timeout = '1ms'; ALTER DATABASE settings_db SET statement_timeout = '1ms'});
+my $s_slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'settings_db'});
+my $open_db = q{SET default_transaction_read_only = off; SET transaction_timeout = 0; SET statement_timeout = 0;};
+my $sb = $node->safe_psql('settings_db', qq{$open_db SELECT pg_branch_id_allocate()});
+$sb = (split /\n/, $sb)[-1];
+$node->safe_psql('settings_db', qq{$open_db SET catalog_branch = $sb; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t SELECT generate_series(1, 20000)});
+ok($node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$s_slot'}), 'capture begins, whatever a database\'s settings');
 $node->stop;
 
 # capture's worker is a superuser: reading tables as it begins runs nothing of theirs, and a

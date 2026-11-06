@@ -89,9 +89,6 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
-/* The sub-id of the lock on a database that has transactions rewriting rows take turns. */
-#define CAPTURE_ROWS_LOCK 2
-
 /* How many rows go in a message. */
 #define CAPTURE_ROWS_BATCH_SIZE 1000
 

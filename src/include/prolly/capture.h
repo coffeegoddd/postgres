@@ -54,6 +54,9 @@
  *	CAPTURE_ROWS_BATCH	int32 branch, relid, nrows; each row nstored fields, each int32 length (-1:
  *						NULL) and that much of its output text
  */
+/* The sub-id of the lock on a database that has what changes its tables' rows, untold, take turns. */
+#define CAPTURE_ROWS_LOCK 2
+
 #define PROLLY_MESSAGE_PREFIX "prolly."
 #define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
 #define CAPTURE_ROWS_BEGIN 'R'
@@ -89,6 +92,9 @@ typedef struct CaptureChange
 typedef struct CaptureSink
 {
 	const char *name;
+
+	/* Whether it reads tables under a new slot's snapshot, which holds up vacuum cluster-wide. */
+	bool		reads_at_start;
 
 	/*
 	 * Each time a worker starts: all that commits after this position is told, and some before it

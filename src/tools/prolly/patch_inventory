@@ -115,7 +115,7 @@ patch src/backend/meson.build  0  links the engine's code in src/backend/prolly 
 patch src/backend/optimizer/util/clauses.c  1b  a function that runs on another branch than the session's is not inlined
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED; also (4) the TRAVELS role option
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
-patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker; also (5) the capture launcher and worker
+patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker; also (5) the capture launcher and worker; also (5) BGWORKER_SKIP_SETTINGS
 patch src/backend/postmaster/postmaster.c  5  registers the capture launcher
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/replication/logical/logical.c  5  capture's output plugin is built in
@@ -149,6 +149,7 @@ patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per
 patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
+patch src/backend/utils/init/postinit.c  5  a connection can leave out the database's and role's settings
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format; also (5) capture_in_background
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h; also (5) capture_in_background
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size; also (5) capture
@@ -208,11 +209,13 @@ patch src/include/catalog/storage.h  1a  declares storage creation in a chosen s
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly
 patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
+patch src/include/miscadmin.h  5  INIT_PG_SKIP_SETTINGS
 patch src/include/nodes/execnodes.h  1b  EState.es_catalog_branch
 patch src/include/nodes/parsenodes.h  1b  CreateSchemaStmt.versioned
 patch src/include/parser/kwlist.h  1b  the VERSIONED keyword
 patch src/include/pgstat.h  1a  the block map's statistics: counts, entry, functions; PGSTAT_FILE_FORMAT_ID bumped
 patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_per_pass
+patch src/include/postmaster/bgworker.h  5  BGWORKER_SKIP_SETTINGS
 patch src/include/replication/slot.h  1a  ReplicationSlotPersistentData.recovery_hold, a physical slot's standby's hold; ReplicationSlot.recovery_hold_warned, the hold last said to be let go of; also (1b) a logical slot's branch
 patch src/include/replication/walsender.h  1a  declares WalSndComputeRecoveryHold
 patch src/include/replication/walsender_private.h  1a  WalSnd keeps the standby's reported hold and whether a backup runs on it
