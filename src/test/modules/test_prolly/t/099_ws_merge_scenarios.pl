@@ -157,7 +157,7 @@ for my $path (sort grep { basename($_) ne 'base.sql' } glob("$dir/*.sql"))
 }
 }
 
-is($i, 137, 'every scenario ran');
+is($i, 148, 'every scenario ran');
 
 $node->stop;
 done_testing();

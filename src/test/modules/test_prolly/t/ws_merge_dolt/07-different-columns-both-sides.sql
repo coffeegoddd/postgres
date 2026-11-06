@@ -9,4 +9,4 @@ ALTER TABLE t ADD COLUMN col1 int;
 INSERT INTO t VALUES (5, 50), (6, 60);
 -- expect
 clean
-check SELECT count(*), count(col1), count(col2) FROM rt.t => 6|2|2
+check SELECT string_agg(pk || ':' || coalesce(col1::text, 'null') || ':' || coalesce(col2, 'null'), ',' ORDER BY pk) FROM rt.t => 1:null:null,2:null:null,3:null:300,4:null:400,5:50:null,6:60:null

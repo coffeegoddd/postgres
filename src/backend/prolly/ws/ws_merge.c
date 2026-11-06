@@ -1093,6 +1093,19 @@ field_text(RowMerge *rm, const WsField *f)
 	return pnstrdup((const char *) f->p, f->len);
 }
 
+/*
+ * Whether a value is the same value as another type: it reads as that and prints as it did.  A
+ * value read but changed, rounded or cut, is not one a merge may write with nothing said.
+ */
+static bool
+reads_unchanged(RowMerge *rm, const char *type, const char *text)
+{
+	char	   *as = NULL;
+
+	return rm->m->eval != NULL && rm->m->eval->reads_as(rm->m->eval_arg, type, text, &as) &&
+		as != NULL && strcmp(as, text) == 0;
+}
+
 /* A field of a computed value: in a tree if it is that long. */
 static void
 field_set(RowMerge *rm, WsField *f, const char *text)
@@ -1237,17 +1250,11 @@ move_row(MoveMap *mm, const uint8 *k, size_t kl, const uint8 *v, size_t vl, bool
 	{
 		const WsColumn *col = ws_schema_column(rm->merged, s->tags[i]);
 		const WsColumn *was = ws_schema_column(mm->side, col->tag);
-		char	   *as = NULL;
 
 		if (f[i].null || was == NULL || col->kind == WS_COL_GENERATED_STORED || !must_read(mm, i, was, col))
 			continue;
-		if (rm->m->eval == NULL ||
-			!rm->m->eval->reads_as(rm->m->eval_arg, col->type, field_text(rm, &f[i]), &as))
+		if (!reads_unchanged(rm, col->type, field_text(rm, &f[i])))
 			return MOVE_NOT_READ;
-
-		/* (a key's values stay its own: its type is not changed by merging) */
-		if (i >= s->nkey)
-			field_set(rm, &f[i], as);
 	}
 	for (int i = s->nkey; is_new && i < s->nstored; i++)
 	{
@@ -1555,16 +1562,11 @@ keep_cell(RowMerge *rm, const MoveMap *from, int i, const WsCell *cell, WsField 
 	const WsColumn *col = ws_schema_column(rm->merged, rm->shape.tags[i]);
 	const WsColumn *was = ws_schema_column(from->side, col->tag);
 	WsField		raw = {cell->p, cell->len, false, cell->large};
-	char	   *as = NULL;
 
 	f[i] = raw;
 	if (was == NULL || !must_read(from, i, was, col))
 		return true;
-	if (rm->m->eval == NULL ||
-		!rm->m->eval->reads_as(rm->m->eval_arg, col->type, field_text(rm, &raw), &as))
-		return false;
-	field_set(rm, &f[i], as);
-	return true;
+	return reads_unchanged(rm, col->type, field_text(rm, &raw));
 }
 
 /*
@@ -2336,6 +2338,112 @@ check_both_added(RowMerge *rm, const RowSides *sides, const PHash *ro, const PHa
 	pfree(ba.tags);
 }
 
+typedef struct RewriteSearch
+{
+	uint64		tag;
+	bool		rewrote;		/* a row there before holds another value here */
+	bool		wrote;			/* or so, or a new row holds one */
+} RewriteSearch;
+
+static void
+rewrite_entry(void *arg, const ProllyDiff *x)
+{
+	RewriteSearch *search = arg;
+	WsCell		a;
+	WsCell		b;
+	bool		ha;
+	bool		hb;
+
+	if (x->to == NULL)
+		return;
+	hb = WsRowCodec->cell_get(x->to, x->tlen, search->tag, &b);
+	if (x->from == NULL)
+	{
+		search->wrote |= hb;
+		return;
+	}
+	ha = WsRowCodec->cell_get(x->from, x->flen, search->tag, &a);
+	if (!SAME_CELL(ha, a, hb, b))
+		search->rewrote = search->wrote = true;
+}
+
+/*
+ * Whether a side retyped a column another side wrote values of, and in doing so printed a row
+ * of it otherwise.  A merge can't see the USING that did that, nor so what the other's rows
+ * would have become: they'd read as values, and mean something else.
+ */
+static bool
+retype_rewrote(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt)
+{
+	const WsTableSchema *b = sides->base;
+
+	for (int i = rm->shape.nkey; b != NULL && i < rm->shape.nstored; i++)
+	{
+		uint64		tag = rm->shape.tags[i];
+		const WsColumn *col = ws_schema_column(rm->merged, tag);
+		const WsColumn *was = ws_schema_column(b, tag);
+
+		if (col->kind == WS_COL_GENERATED_STORED || was == NULL || strcmp(col->type, was->type) == 0)
+			continue;
+		for (int s = 0; s < 2; s++)
+		{
+			const WsTableSchema *retyped = s == 0 ? sides->ours.side : sides->theirs.side;
+			const WsTableSchema *other = s == 0 ? sides->theirs.side : sides->ours.side;
+			const PHash *rows = s == 0 ? ro : rt;
+			const PHash *others = s == 0 ? rt : ro;
+			RewriteSearch search = {tag};
+			RewriteSearch written = {tag};
+
+			if (!same_type_in(retyped, rm->merged, tag) || !same_type_in(other, b, tag) || phash_eq(others, base))
+				continue;
+			if (prolly_diff(rm->m->ctx, base, others, rewrite_entry, &written) < 0)
+				prolly_report(rm->m->ctx);
+			if (!written.wrote)
+				continue;
+			if (prolly_diff(rm->m->ctx, base, rows, rewrite_entry, &search) < 0)
+				prolly_report(rm->m->ctx);
+			if (search.rewrote)
+			{
+				char	   *where = psprintf("%s.%s", rm->merged->name, col->name);
+
+				conflict(rm->m, "column", where);
+				pfree(where);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/*
+ * Whether a side replaced a column another side has rows of, with one of another tag and its
+ * name: those rows hold a value in what is gone, and none in what took its place.
+ */
+static bool
+column_replaced(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt)
+{
+	const WsTableSchema *b = sides->base;
+
+	for (int i = 0; b != NULL && i < b->ncols; i++)
+	{
+		const WsColumn *gone = &b->cols[i];
+		const WsColumn *now = ws_schema_column_named(rm->merged, gone->name);
+
+		if (ws_schema_column(rm->merged, gone->tag) != NULL || now == NULL || gone->kind != WS_COL_STORED)
+			continue;
+		if ((ws_schema_column(sides->ours.side, gone->tag) != NULL && !phash_eq(ro, base)) ||
+			(ws_schema_column(sides->theirs.side, gone->tag) != NULL && !phash_eq(rt, base)))
+		{
+			char	   *where = psprintf("%s.%s", rm->merged->name, gone->name);
+
+			conflict(rm->m, "column", where);
+			pfree(where);
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt, PHash *out)
 {
@@ -2348,6 +2456,12 @@ merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const P
 	PHash		cur;
 	MemoryContext rowcxt;
 
+	if (retype_rewrote(rm, sides, base, ro, rt) || column_replaced(rm, sides, base, ro, rt))
+	{
+		*out = *ro;
+		pfree(f);
+		return;
+	}
 	check_both_added(rm, sides, ro, rt);
 	if (prolly_merge(m->ctx, base, ro, rt, &res) < 0)
 		prolly_report(m->ctx);

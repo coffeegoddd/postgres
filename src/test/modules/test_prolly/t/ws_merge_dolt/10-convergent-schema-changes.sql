@@ -17,3 +17,5 @@ ALTER TABLE t ADD CONSTRAINT fk1 FOREIGN KEY (col3) REFERENCES parent (id);
 -- expect
 clean
 check SELECT col1, col3 IS NULL FROM rt.t => -1000|t
+check SELECT attnotnull FROM pg_attribute WHERE attrelid = 'rt.t'::regclass AND attname = 'col1' => t
+check SELECT count(*) FROM pg_constraint WHERE conname = 'fk1' => 1

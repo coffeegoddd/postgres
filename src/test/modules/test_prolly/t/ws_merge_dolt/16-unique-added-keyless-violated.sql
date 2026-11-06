@@ -9,3 +9,4 @@ INSERT INTO t VALUES (2, 1), (3, 1);
 violation unique t t_col1_key (1,1)
 violation unique t t_col1_key (2,1)
 violation unique t t_col1_key (3,1)
+check SELECT count(*) FROM rt.t => 3

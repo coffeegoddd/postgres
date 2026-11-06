@@ -8,3 +8,4 @@ UPDATE t SET b = 6 WHERE id = 1;
 -- expect
 violation unique t ug 1
 violation unique t ug 2
+check SELECT g FROM rt.t WHERE id = 1 => 10

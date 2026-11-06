@@ -7,3 +7,4 @@ UPDATE t SET a = 4 WHERE id = 1;
 UPDATE t SET b = 6 WHERE id = 1;
 -- expect
 violation check t cg 1
+check SELECT g FROM rt.t => 10
