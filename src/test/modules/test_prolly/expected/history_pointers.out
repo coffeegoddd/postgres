@@ -12,12 +12,13 @@ WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1
 -------------------+--------------------
  bundles           | heap
  capture_positions | heap
+ capture_tables    | heap
  chunk_index       | prolly_chunk_index
  chunks            | prolly_chunks
  pointers          | heap
  tier_chunks       | prolly_tier
  tier_index        | prolly_chunk_index
-(7 rows)
+(8 rows)
 
 -- (d as a chunk of the history store's format, the engine's: its hash, and
 -- a put of it)

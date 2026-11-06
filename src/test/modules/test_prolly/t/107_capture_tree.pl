@@ -8,6 +8,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use IPC::Run;
 
 my $node = PostgreSQL::Test::Cluster->new('tree');
 $node->init(allows_streaming => 'logical');
@@ -97,20 +98,22 @@ $node->safe_psql('postgres', "BEGIN; SET LOCAL catalog_branch = $b1; UPDATE s.t 
 same_map($on1, 't', 'one transaction, the first branch');
 same_map($on2, 't', 'one transaction, the second');
 
-# transactions interleaved apply in commit order
+# transactions apply in the order they committed, not began: this one began first, and wrote a key
+# after the other had committed it
 my $first = $node->background_psql('postgres');
-$first->query_safe("$on1 BEGIN; UPDATE s.t SET v = 'first' WHERE id = 1");
-$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (40, 'second')");
-$first->query_safe('COMMIT');
+$first->query_safe("$on1 BEGIN; UPDATE s.t SET v = 'began first' WHERE id = 1");
+$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (40, 'committed first')");
+$first->query_safe("UPDATE s.t SET v = 'committed last' WHERE id = 40; COMMIT");
 $first->quit;
-same_map($on1, 't', 'transactions interleaved');
+is($node->safe_psql('postgres', "$on1 SELECT v FROM s.t WHERE id = 40"), 'committed last', 'the later commit has the row');
+same_map($on1, 't', 'transactions in commit order');
 
 # shared schemas have no row map, and each branch knows how far it is
 $node->safe_psql('postgres', 'CREATE SCHEMA pub; CREATE TABLE pub.u (id integer PRIMARY KEY); INSERT INTO pub.u VALUES (1)');
 caught_up();
 my $maps = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.pointers WHERE name = 'capture/map/' || 'pub.u'::regclass::oid});
 is($maps, '0', 'a shared table has no row map');
-is($node->safe_psql('postgres', "SELECT array_agg(branch ORDER BY branch) = ARRAY[$b1, $b2] FROM pg_history.capture_positions"), 't', 'each branch has a position');
+is($node->safe_psql('postgres', "SELECT array_agg(branch ORDER BY branch) = ARRAY[0, $b1, $b2] FROM pg_history.capture_positions"), 't', 'each branch has a position');
 
 # what a worker writes it then decodes, and that mustn't set it writing again
 caught_up();
@@ -134,6 +137,7 @@ SKIP:
 {
 	skip 'injection points not supported by this build', 3 if $ENV{enable_injection_points} ne 'yes';
 	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	caught_up();
 	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
 	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (42, 'applied, not confirmed')");
 	$node->wait_for_event('capture worker', 'capture-applied');
@@ -149,10 +153,146 @@ SKIP:
 	same_map($on1, 't', 'and on it goes');
 }
 
-# what this can't follow stops it, rather than leaving a map wrong
+# what's gone is let go of when a worker starts, and capture's state doesn't go in a dump
+$node->safe_psql('postgres', "$on1 CREATE TABLE s.dropped (id integer PRIMARY KEY); INSERT INTO s.dropped VALUES (1)");
+caught_up();
+my $dropped = $node->safe_psql('postgres', "$on1 SELECT 's.dropped'::regclass::oid");
+$node->safe_psql('postgres', "$on1 DROP TABLE s.dropped");
+my $b3 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$node->safe_psql('postgres', "SET catalog_branch = $b3; CREATE SCHEMA gone VERSIONED; CREATE TABLE gone.x (id integer PRIMARY KEY); INSERT INTO gone.x VALUES (1)");
+caught_up();
+is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_positions WHERE branch = $b3"), '1', 'a third branch has a position');
+$node->safe_psql('postgres', "SET catalog_branch = $b3; DROP SCHEMA gone CASCADE");
+caught_up();
+is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.pointers WHERE name = 'capture/map/$dropped'"), '1', 'a dropped table\'s map, until a worker starts');
+$pid = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+$node->safe_psql('postgres', "SELECT pg_terminate_backend($pid)");
+$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $pid})
+  or die 'no worker came back';
+ok($node->poll_query_until('postgres', "SELECT count(*) = 0 FROM pg_history.pointers WHERE name = 'capture/map/$dropped'"), 'then it goes');
+ok($node->poll_query_until('postgres', "SELECT count(*) = 0 FROM pg_history.capture_positions WHERE branch = $b3"), 'and a branch\'s position');
+is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_tables WHERE relid = $dropped"), '0', 'and the table\'s record');
+my $dump = '';
+IPC::Run::run([ 'pg_dump', '--dbname', $node->connstr('postgres'), '--no-sync' ], '>', \$dump) or die 'pg_dump failed';
+unlike($dump, qr/capture\/map\//, 'a dump has no map of capture\'s');
+unlike($dump, qr/COPY pg_history\.capture_/, 'nor its positions or tables');
+
+# what this can't follow stops it, rather than leaving a map wrong, and it stays stopped
 my $offset = -s $node->logfile;
+my $relid = $node->safe_psql('postgres', "$on1 SELECT 's.t'::regclass::oid");
 $node->safe_psql('postgres', "$on1 ALTER TABLE s.t ADD COLUMN later integer; INSERT INTO s.t VALUES (50, 'x', 1)");
-ok($node->wait_for_log(qr/capture to trees does not follow the layout of "t" changing/, $offset), 'a layout changing is an error');
+ok($node->wait_for_log(qr/capture to trees does not follow the layout of "t" changing|does not follow the layout of relation $relid changing/, $offset), 'a layout changing is an error');
+$offset = -s $node->logfile;
+$pid = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'}) || 0;
+$node->safe_psql('postgres', "SELECT pg_terminate_backend($pid)") if $pid;
+ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $offset), 'and it still is for a worker that never saw the old one');
+$node->stop;
+
+# A node of its own for each of these, as each stops capture for good.
+sub fresh_node
+{
+	my ($name, $conf) = @_;
+	$node = PostgreSQL::Test::Cluster->new($name);
+	$node->init(allows_streaming => 'logical');
+	$node->append_conf('postgresql.conf', "log_min_messages = debug1\nlog_line_prefix = ''\nautovacuum = off\ncapture_to_trees = on\n" . ($conf // ''));
+	$node->start;
+	$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
+	my $b = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+	$slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
+	return "SET catalog_branch = $b;";
+}
+
+sub slot_active
+{
+	$node->poll_query_until('postgres', qq{SELECT active FROM pg_replication_slots WHERE slot_name = '$slot'})
+	  or die 'no worker';
+}
+
+# a crash with what it applied not flushed, whatever synchronous_commit says, loses nothing
+my $on = fresh_node('sync', "synchronous_commit = off\nwal_writer_delay = 10s\n");
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on SET synchronous_commit = on; CREATE TABLE s.t (id integer PRIMARY KEY, v text)");
+# (a running-transactions record lets the slot's restart point move, which saves it to disk)
+for my $i (1 .. 3)
+{
+	$node->safe_psql('postgres', "SET synchronous_commit = on; SELECT pg_log_standby_snapshot()");
+	$node->safe_psql('postgres', "$on SET synchronous_commit = on; INSERT INTO s.t VALUES ($i, 'kept')");
+	caught_up();
+}
+$node->stop('immediate');
+$node->start;
+same_map($on, 't', 'a crash just after applying');
+$node->stop;
+
+# an update changing the key has to say what the key was: these don't, so they aren't held
+for my $case (
+	[ 'nothing', 'id integer PRIMARY KEY, v text', 'ALTER TABLE s.t REPLICA IDENTITY NOTHING' ],
+	[ 'deferrable', 'id integer PRIMARY KEY DEFERRABLE, v text', undef ],
+	[ 'index', 'id integer PRIMARY KEY, v text NOT NULL UNIQUE', 'ALTER TABLE s.t REPLICA IDENTITY USING INDEX t_v_key' ])
+{
+	my ($name, $columns, $alter) = @$case;
+	$on = fresh_node($name);
+	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+	slot_active();
+	$node->safe_psql('postgres', "$on CREATE TABLE s.t ($columns)");
+	$node->safe_psql('postgres', "$on $alter") if $alter;
+	my $from = -s $node->logfile;
+	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1, 'a')");
+	ok($node->wait_for_log(qr/whose replica identity does not give its primary key/, $from), "replica identity: $name");
+	$node->stop;
+}
+
+# rows there before capture began aren't in any map, so that table isn't held
+$on = fresh_node('schema_txn');
+$node->safe_psql('postgres', "$on BEGIN; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1); COMMIT");
+slot_active();
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
+ok($node->wait_for_log(qr/there before it began/, $from), 'a table made with the first schema');
+$node->stop;
+
+$on = fresh_node('off_on');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
+caught_up();
+$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = off; SELECT pg_reload_conf()');
+$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'slot stayed';
+$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
+$node->safe_psql('postgres', 'ALTER SYSTEM SET capture_in_background = on; SELECT pg_reload_conf()');
+slot_active();
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (3)");
+ok($node->wait_for_log(qr/there before it began/, $from), 'capture off and on again');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/map/%'}), '0', 'and what it held is forgotten');
+$node->stop;
+
+$on = fresh_node('template');
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
+caught_up();
+$node->safe_psql('postgres', 'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type = \'capture worker\'');
+$node->safe_psql('postgres', 'CREATE DATABASE other TEMPLATE postgres');
+$slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'other'});
+slot_active();
+$from = -s $node->logfile;
+$node->safe_psql('other', "$on INSERT INTO s.t VALUES (2)");
+ok($node->wait_for_log(qr/there before it began/, $from), 'a database copied from one with a map');
+$node->stop;
+
+$on = fresh_node('turned_on', "capture_to_trees = off\n");
+$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
+slot_active();
+$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1)");
+caught_up();
+$node->append_conf('postgresql.conf', "capture_to_trees = on\n");
+$node->restart;
+slot_active();
+$from = -s $node->logfile;
+$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
+ok($node->wait_for_log(qr/there before it began/, $from), 'capture to trees turned on with rows there');
 $node->stop;
 
 done_testing();

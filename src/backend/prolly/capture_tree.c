@@ -13,16 +13,26 @@
  * id is one branch's.  Each branch's position is a row of
  * pg_history.capture_positions, changed in the transaction that changes its row
  * maps: a transaction whose commit is at or before it has been applied, and if
- * told again is passed over.
+ * told again is passed over.  That transaction is flushed before the slot moves,
+ * whatever synchronous_commit says, or a crash would leave the slot past what it lost.
+ *
+ * A row map holds only what decoding was told, so only a table made since capture
+ * began can have one.  A new slot, or a store with no record of capture beginning,
+ * forgets all it holds and marks each table there now in pg_history.capture_tables,
+ * and a change to one of those is an error.  So is a table's layout differing from
+ * the one recorded there, which outlasts the worker, so capture stays stopped.  What
+ * belongs to a table or a branch that's gone is let go of when a worker starts.
+ * Capture's state doesn't go in a dump, and a restored store begins again.
  *
  * All that was decoded since the last apply is held in memory.
  *
  * This doesn't yet keep to the tables through DDL, so it is off by default
- * (capture_to_trees).  A table's layout changing while a worker runs is an
- * error, as are a truncate, a table with no primary key, a row with no old key
- * given, and a value decoding wasn't given.  An error stops capture of the whole
- * database, as the worker starts again at the same row.  DDL that leaves the
- * layout as it was, or changes it while no worker runs, isn't noticed.
+ * (capture_to_trees).  A truncate is an error, as are a table with no primary key
+ * and one whose replica identity doesn't give it, as an update changing the key
+ * would look like one that didn't, and a value decoding wasn't given.  An error stops
+ * capture of the whole database, as the worker starts again at the same row.  DDL
+ * that leaves the layout as it was isn't noticed, nor capture to trees being turned
+ * off for a while and on again with the same slot.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -33,6 +43,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
@@ -44,7 +55,10 @@
 #include "prolly/engine/vc_refs.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
@@ -57,15 +71,15 @@ typedef struct TreeTable
 {
 	Oid			relid;
 	WsRowShape	shape;
+	List	   *held;			/* its TreeChanges for apply, in tree_held_cxt */
 } TreeTable;
 
 /* One row's change, as text: the shape's fields, NULL for a null. */
 typedef struct TreeChange
 {
-	const TreeTable *table;
 	int32		branch;
 	XLogRecPtr	commit;
-	char	  **old_row;		/* the key's fields are its key, if it is to go */
+	char	  **old_row;		/* the key's fields alone: the row to go */
 	char	  **new_row;		/* NULL if there is no new row */
 } TreeChange;
 
@@ -92,14 +106,98 @@ static XLogRecPtr tree_commit = InvalidXLogRecPtr;
 static int	tree_scope = 0;
 
 static void
-tree_start(XLogRecPtr from)
+tree_exec(const char *sql, int spi_ok)
 {
+	if (SPI_execute(sql, false, 0) != spi_ok)
+		elog(ERROR, "could not run capture's \"%s\"", sql);
+}
+
+static void
+tree_forget_ref(void *arg, const char *name, const PHash *hash)
+{
+	List	  **names = arg;
+
+	*names = lappend(*names, pstrdup(name));
+}
+
+/*
+ * Forgets all it holds, as what comes next is told from a new start, and marks the tables there
+ * now.  One made and committed while this runs is marked too, and refused though its rows would
+ * be told: an error, never a wrong map.
+ */
+static void
+tree_begin_anew(VcRefs *refs, XLogRecPtr from)
+{
+	List	   *names = NIL;
+	ListCell   *lc;
+	Oid			types[1] = {PG_LSNOID};
+	Datum		values[1] = {LSNGetDatum(from)};
+
+	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);
+	foreach(lc, names)
+		refs->routine->remove(refs, lfirst(lc));
+	tree_exec("DELETE FROM pg_history.capture_positions", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_tables", SPI_OK_DELETE);
+	tree_exec("INSERT INTO pg_history.capture_tables (relid) "
+			  "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+			  "WHERE n.nspbranch <> 0 AND c.relkind = 'r'", SPI_OK_INSERT);
+	if (SPI_execute_with_args("INSERT INTO pg_history.capture_positions VALUES (0, $1)",
+							  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not save where capture began");
+}
+
+/* Lets go of what belongs to a table or a branch that's gone. */
+static void
+tree_let_go(VcRefs *refs)
+{
+	List	   *names = NIL;
+	ListCell   *lc;
+
+	if (SPI_execute("SELECT 'capture/map/' || t.relid FROM pg_history.capture_tables t "
+					"WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = t.relid)",
+					true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read capture's tables");
+	for (uint64 i = 0; i < SPI_processed; i++)
+		names = lappend(names, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
+	foreach(lc, names)
+		(void) refs->routine->remove(refs, lfirst(lc));
+	tree_exec("DELETE FROM pg_history.capture_tables t "
+			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = t.relid)", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_positions p WHERE p.branch <> 0 AND "
+			  "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspbranch = p.branch)", SPI_OK_DELETE);
+}
+
+static void
+tree_start(XLogRecPtr from, bool new_slot)
+{
+	ChunkStore *cs;
+	VcRefs	   *refs;
+
 	if (tree_tables_cxt == NULL)
 	{
 		tree_tables_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree tables", ALLOCSET_DEFAULT_SIZES);
 		tree_held_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree held", ALLOCSET_DEFAULT_SIZES);
 		tree_row_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree row", ALLOCSET_DEFAULT_SIZES);
 	}
+
+	/* (locally: what's kept doesn't wait on a standby, and the slot moves only once it's flushed) */
+	SetConfigOption("synchronous_commit", "local", PGC_SUSET, PGC_S_OVERRIDE);
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	cs = ChunkStoreOpen("pages");
+	refs = VcRefsOpen("pointers", cs);
+	tree_exec("SELECT 1 FROM pg_history.capture_positions WHERE branch = 0", SPI_OK_SELECT);
+	if (new_slot || SPI_processed == 0)
+		tree_begin_anew(refs, from);
+	else
+		tree_let_go(refs);
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
+	CommitTransactionCommand();
 	elog(DEBUG1, "capture tree starts at %X/%X", LSN_FORMAT_ARGS(from));
 }
 
@@ -111,7 +209,7 @@ tree_begin(TransactionId xid, XLogRecPtr final_lsn)
 }
 
 /* The table known by this relation, which must be as it was when first seen. */
-static const TreeTable *
+static TreeTable *
 tree_table_of(Relation relation)
 {
 	WsRowShape	shape;
@@ -139,10 +237,18 @@ tree_table_of(Relation relation)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("capture to trees does not hold \"%s\", which has no primary key",
 						RelationGetRelationName(relation))));
+	if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL &&
+		(relation->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT ||
+		 !OidIsValid(RelationGetPrimaryKeyIndex(relation, false))))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees does not hold \"%s\", whose replica identity does not give its primary key",
+						RelationGetRelationName(relation))));
 	ws_row_shape_free(&shape);
 	old = MemoryContextSwitchTo(tree_tables_cxt);
 	table = palloc_object(TreeTable);
 	table->relid = RelationGetRelid(relation);
+	table->held = NIL;
 	CaptureRelationShape(relation, &table->shape);
 	tree_tables = lappend(tree_tables, table);
 	MemoryContextSwitchTo(old);
@@ -151,7 +257,7 @@ tree_table_of(Relation relation)
 
 /* A tuple's fields by the table's shape, each in the context apply empties. */
 static char **
-tree_row(Relation relation, const TreeTable *table, HeapTuple tuple)
+tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
 	char	  **row = MemoryContextAllocZero(tree_held_cxt, sizeof(char *) * Max(table->shape.nstored, 1));
@@ -170,6 +276,8 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple)
 			continue;
 		at = ws_row_shape_at(&table->shape, (uint64) att->attcoltag);
 		Assert(at >= 0);
+		if (key_only && at >= table->shape.nkey)
+			continue;
 		value = heap_getattr(tuple, att->attnum, desc, &isnull);
 		if (isnull)
 			continue;
@@ -189,23 +297,21 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple)
 static void
 tree_change(const CaptureChange *change)
 {
-	const TreeTable *table = tree_table_of(change->relation);
+	TreeTable  *table = tree_table_of(change->relation);
 	TreeChange *held = MemoryContextAllocZero(tree_held_cxt, sizeof(TreeChange));
 	MemoryContext old;
 
+	/* (the replica identity tree_table_of asked for gives it) */
 	if (change->kind == CAPTURE_DELETE && change->old_tuple == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("capture to trees was not given the key of a row deleted from \"%s\"",
-						RelationGetRelationName(change->relation))));
-	held->table = table;
+		elog(ERROR, "a row deleted from \"%s\" came with no key", RelationGetRelationName(change->relation));
 	held->branch = change->branch;
 	held->commit = tree_commit;
 	if (change->old_tuple != NULL)
-		held->old_row = tree_row(change->relation, table, change->old_tuple);
+		held->old_row = tree_row(change->relation, table, change->old_tuple, true);
 	if (change->new_tuple != NULL)
-		held->new_row = tree_row(change->relation, table, change->new_tuple);
+		held->new_row = tree_row(change->relation, table, change->new_tuple, false);
 	old = MemoryContextSwitchTo(tree_held_cxt);
+	table->held = lappend(table->held, held);
 	tree_held = lappend(tree_held, held);
 	MemoryContextSwitchTo(old);
 }
@@ -288,25 +394,68 @@ tree_fields(const TreeTable *table, char **row, WsField *f)
 	}
 }
 
+/*
+ * Checks a table against what is recorded of it, recording it if it's new: an error if it was there
+ * before capture began, or its layout has changed, whichever worker it was that saw it first.
+ */
+static void
+tree_check_table(const TreeTable *table)
+{
+	Oid			types[3] = {OIDOID, INT4OID, INT8ARRAYOID};
+	Datum		values[3];
+	Datum	   *tags = palloc_array(Datum, Max(table->shape.nstored, 1));
+	ArrayType  *array;
+
+	for (int i = 0; i < table->shape.nstored; i++)
+		tags[i] = Int64GetDatum((int64) table->shape.tags[i]);
+	array = construct_array_builtin(tags, table->shape.nstored, INT8OID);
+	values[0] = ObjectIdGetDatum(table->relid);
+	values[1] = Int32GetDatum(table->shape.nkey);
+	values[2] = PointerGetDatum(array);
+	if (SPI_execute_with_args("SELECT nkey IS NULL, nkey = $2 AND tags = $3 FROM pg_history.capture_tables WHERE relid = $1",
+							  3, types, values, NULL, true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not read capture's table %u", table->relid);
+	if (SPI_processed == 1)
+	{
+		bool		isnull;
+		bool		before = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		bool		same;
+
+		if (before)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("capture to trees does not hold relation %u, which was there before it began", table->relid)));
+		same = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+		if (!same)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
+	}
+	else if (SPI_execute_with_args("INSERT INTO pg_history.capture_tables VALUES ($1, $2, $3)",
+								   3, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not record capture's table %u", table->relid);
+	pfree(array);
+	pfree(tags);
+}
+
 /* The changes held of one table, not yet applied by its branch's position, on its row map. */
 static void
-tree_apply_table(ProllyCtx *ctx, VcRefs *refs, const TreeTable *table, List *positions)
+tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 {
 	WsField    *f = palloc_array(WsField, Max(table->shape.nstored, 1));
-	ProllyEdit *edits = palloc_array(ProllyEdit, 2 * list_length(tree_held));
+	ProllyEdit *edits = palloc_array(ProllyEdit, 2 * list_length(table->held));
 	size_t		n = 0;
 	char		name[64];
 	PHash		map;
 	ListCell   *lc;
 
-	foreach(lc, tree_held)
+	tree_check_table(table);
+	foreach(lc, table->held)
 	{
 		TreeChange *change = lfirst(lc);
 		Buf			k = BUF_INIT,
 					v = BUF_INIT;
 
-		if (change->table != table)
-			continue;
 		CHECK_FOR_INTERRUPTS();
 		if (change->commit <= tree_position_of(positions, change->branch)->before)
 		{
@@ -317,6 +466,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, const TreeTable *table, List *pos
 		{
 			tree_fields(table, change->old_row, f);
 			ws_row_store(ctx, &table->shape, f, &k, &v);
+			buf_free(&v);
 			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .del = true};
 			k = (Buf) BUF_INIT;
 			v = (Buf) BUF_INIT;
@@ -328,15 +478,24 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, const TreeTable *table, List *pos
 			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len};
 		}
 	}
-	if (n == 0)
-		return;
-	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
-	if (!refs->routine->get(refs, name, VC_REF_READ, &map) &&
-		prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
-		prolly_report(ctx);
-	if (prolly_apply(ctx, &map, edits, n, &map) < 0)
-		prolly_report(ctx);
-	refs->routine->set(refs, name, &map);
+	if (n > 0)
+	{
+		snprintf(name, sizeof(name), "capture/map/%u", table->relid);
+		if (!refs->routine->get(refs, name, VC_REF_READ, &map) &&
+			prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+			prolly_report(ctx);
+		if (prolly_apply(ctx, &map, edits, n, &map) < 0)
+			prolly_report(ctx);
+		refs->routine->set(refs, name, &map);
+	}
+	for (size_t i = 0; i < n; i++)
+	{
+		px_free((void *) edits[i].key);
+		if (edits[i].val != NULL)
+			px_free((void *) edits[i].val);
+	}
+	pfree(edits);
+	pfree(f);
 }
 
 static void
@@ -346,7 +505,6 @@ tree_apply(void)
 	VcRefs	   *refs;
 	ProllyCtx	ctx;
 	List	   *positions = NIL;
-	List	   *done = NIL;
 	ListCell   *lc;
 
 	if (tree_held == NIL)
@@ -358,34 +516,36 @@ tree_apply(void)
 	cs = ChunkStoreOpen("pages");
 	refs = VcRefsOpen("pointers", cs);
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
-
 	foreach(lc, tree_held)
 	{
 		TreeChange *change = lfirst(lc);
 		bool		known = false;
 
 		foreach_ptr(TreePosition, position, positions)
-			known |= position->branch == change->branch;
+		{
+			if (position->branch == change->branch)
+			{
+				position->now = Max(position->now, change->commit);
+				known = true;
+			}
+		}
 		if (!known)
 		{
 			TreePosition *position = palloc_object(TreePosition);
 
 			position->branch = change->branch;
-			position->before = position->now = tree_position(change->branch);
+			position->before = tree_position(change->branch);
+			position->now = Max(position->before, change->commit);
 			positions = lappend(positions, position);
 		}
 	}
-	foreach(lc, tree_held)
+	foreach(lc, tree_tables)
 	{
-		TreeChange *change = lfirst(lc);
-		TreePosition *position = tree_position_of(positions, change->branch);
+		TreeTable  *table = lfirst(lc);
 
-		if (!list_member_ptr(done, change->table))
-		{
-			tree_apply_table(&ctx, refs, change->table, positions);
-			done = lappend(done, (void *) change->table);
-		}
-		position->now = Max(position->now, change->commit);
+		if (table->held != NIL)
+			tree_apply_table(&ctx, refs, table, positions);
+		table->held = NIL;
 	}
 	foreach_ptr(TreePosition, position, positions)
 	{
@@ -400,6 +560,7 @@ tree_apply(void)
 	CommitTransactionCommand();
 	tree_held = NIL;
 	MemoryContextReset(tree_held_cxt);
+	INJECTION_POINT("capture-applied", NULL);
 }
 
 const CaptureSink TreeCaptureSink = {
