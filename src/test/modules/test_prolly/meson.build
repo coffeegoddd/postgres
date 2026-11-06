@@ -234,6 +234,7 @@ tests += {
       't/105_capture_routing.pl',
       't/106_capture_layouts.pl',
       't/107_capture_tree.pl',
+      't/108_capture_fixture.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
