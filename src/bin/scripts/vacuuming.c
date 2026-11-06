@@ -676,9 +676,13 @@ retrieve_objects(PGconn *conn, vacuumingOptions *vacopts,
 								 CppAsString2(RELKIND_RELATION) ", "
 								 CppAsString2(RELKIND_MATVIEW) "])\n");
 
-		/* (a role that can't reach the history store can't name a table of it) */
-		appendPQExpBufferStr(&catalog_query,
-							 " AND (ns.nspname OPERATOR(pg_catalog.<>) 'pg_history' OR pg_catalog.has_schema_privilege(ns.oid, 'USAGE'))\n");
+		/*
+		 * (a role that can't reach the history store can't name a table of it, and needn't be told
+		 * unless it named the schema)
+		 */
+		if ((vacopts->objfilter & OBJFILTER_SCHEMA) == 0)
+			appendPQExpBufferStr(&catalog_query,
+								 " AND (ns.nspname OPERATOR(pg_catalog.<>) 'pg_history' OR pg_catalog.has_schema_privilege(ns.oid, 'USAGE'))\n");
 
 		/* (the history store's can't be rewritten, so VACUUM FULL skips them if none is named) */
 		if (vacopts->full)

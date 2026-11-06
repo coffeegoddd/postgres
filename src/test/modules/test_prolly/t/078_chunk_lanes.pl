@@ -22,7 +22,7 @@ $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 max_connections = 100
 log_lock_waits = on
-deadlock_timeout = 100ms
+deadlock_timeout = 10ms
 log_line_prefix = '%m [%p] %b %a: '
 log_min_error_statement = log
 });
@@ -57,8 +57,7 @@ SELECT (test_cs_put('pages', d(nextval('n')))).stored;
 }
 	});
 
-# (a wait's lines, its relation named, shown if there is one.  One's a wait of 100 ms, as on a busy
-# machine a shorter one was seen, of a lane's lock with its holder running.)
+# (a wait's lines, its relation named, shown if there is one)
 my $waits = slurp_file($node->logfile, $log_at);
 my %rels = map { $_ => 1 } ($waits =~ /relation (\d+) of database/g);
 my @named = map {
@@ -74,11 +73,19 @@ my %catalog = map { $_ => 1 } grep {
 		"SELECT coalesce((SELECT relnamespace = 'pg_catalog'::regnamespace FROM pg_class WHERE oid = $_), false)"
 	) eq 't'
 } keys %rels;
+# (a lane being made, whose maker holds it exclusively until just after its commit shows: a backend
+# that finds it in that moment waits to open it, and only until then)
+my %lane = map { $_ => 1 } grep {
+	$node->safe_psql('postgres',
+		"SELECT coalesce((SELECT relname ~ '^chunks_lane_' FROM pg_class WHERE oid = $_), false)"
+	) eq 't'
+} keys %rels;
 my @long = grep {
 	/still waiting/
 	  && !(/on extension of relation (\d+) of database/ && $catalog{$1})
+	  && !(/for AccessShareLock on relation (\d+) of database/ && $lane{$1})
 } @waited;
-is(scalar @long, 0, 'no backend waited on another, but to extend a catalog making a lane')
+is(scalar @long, 0, 'no backend waited on another, but to extend a catalog making a lane, or to open one being made')
   or diag(join("\n", @named, @waited));
 unlike($waits, qr/deadlock detected/, 'no deadlock');
 

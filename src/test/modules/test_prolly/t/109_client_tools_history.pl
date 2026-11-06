@@ -30,6 +30,10 @@ $node->command_ok([ 'reindexdb', '--username' => 'maintainer', '--jobs' => '2', 
 $node->command_ok([ 'reindexdb', '--username' => 'maintainer', '--jobs' => '2', '--concurrently', 'postgres' ],
 	'reindexdb --jobs --concurrently as a maintainer');
 
+# naming the schema, it's told, as for any other it can't reach
+$node->command_fails_like([ 'vacuumdb', '--username' => 'plain', '--schema' => 'pg_history', 'postgres' ],
+	qr/permission denied for schema pg_history/, 'vacuumdb --schema pg_history as a role that can\'t reach it');
+
 # a role that can reach it still has its tables listed
 $node->issues_sql_like([ 'vacuumdb', 'postgres' ], qr/VACUUM .*pg_history\.pointers/, 'vacuumdb as a superuser reaches the store');
 $node->issues_sql_like([ 'vacuumdb', '--full', 'postgres' ], qr/VACUUM .*pg_history\.pointers/, 'vacuumdb --full as a superuser reaches the store\'s rewritable tables');
