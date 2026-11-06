@@ -189,8 +189,9 @@ extern void CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot
 
 /*
  * A versioned schema's root value as of an exact point, every transaction committed before it and
- * none after, its chunks put with ctx; capture_barrier.c says what it holds off and refuses.  An error
- * if capture hasn't got there within timeout_ms.
+ * none after, its chunks put with ctx, to be committed in this transaction; capture_barrier.c says
+ * what it holds off and refuses.  An error if capture hasn't got there within timeout_ms, which is
+ * only of waiting for capture, not of waiting for locks or of building the root.
  */
 extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root);
 

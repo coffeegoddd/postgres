@@ -1115,10 +1115,11 @@ tree_after_record(void)
 
 	/*
 	 * Told again after a crash, with the maps past it: whoever was waiting has what was saved the
-	 * first time, which these would overwrite.  (A slot only confirms what's been applied, so this
-	 * can't be a marker that wasn't seen to, past it being applied after it.)
+	 * first time, which these would overwrite.  (What's saved commits before anything past it is
+	 * applied.  A position is where a commit starts, and lsn where the marker ends: a commit before
+	 * it starts below that, and one right after it there.)
 	 */
-	if (tree_position(branch) > lsn)
+	if (tree_position(branch) >= lsn)
 	{
 		if (SPI_finish() != SPI_OK_FINISH)
 			elog(ERROR, "could not finish with SPI");
@@ -1127,11 +1128,24 @@ tree_after_record(void)
 		return;
 	}
 
-	/* (barriers take turns, so any before this was given up on, and left this behind) */
+	/*
+	 * What's saved for an earlier one has been used, or given up on, as they take turns.  (One
+	 * later can only be there if this is being told again, and may be in use.)
+	 */
 	refs->routine->list(refs, CAPTURE_BARRIER_REF_PREFIX, tree_forget_ref, &names);
 	foreach_ptr(char, name, names)
-		(void) refs->routine->remove(refs, name);
-	tree_exec("DELETE FROM pg_history.capture_barriers", SPI_OK_DELETE);
+	{
+		uint32		hi,
+					lo;
+
+		if (sscanf(name + strlen(CAPTURE_BARRIER_REF_PREFIX), "%X/%X/", &hi, &lo) != 2)
+			elog(ERROR, "a barrier's reference is named \"%s\"", name);
+		if (((XLogRecPtr) hi << 32 | lo) < lsn)
+			(void) refs->routine->remove(refs, name);
+	}
+	if (SPI_execute_with_args("DELETE FROM pg_history.capture_barriers WHERE lsn < $1",
+							  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
+		elog(ERROR, "could not forget a barrier");
 	names = NIL;
 
 	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);

@@ -10,16 +10,26 @@
  * capture makes of the schema, with those for its tables' rows.
  *
  * What the WAL doesn't carry (definitions, sequences' positions) is read as this
- * runs, with catalog changes held off: it holds the lock that has them take turns
- * (capture_rows.c) until the root is built, having locked the schema's tables first,
- * as one of those committing could hold a table and be waiting for that lock.  So
- * DDL and catalog changes wait for this, and for capture to catch up.  Row writers
- * never do.
+ * runs, with catalog changes in this database held off: it holds the lock that has them
+ * take turns (capture_rows.c) until the root is built.  It's every relation of the schema it
+ * locks first, without that lock, as what's committing a catalog change can hold one while
+ * waiting for that lock, and building a root locks them.  What a view depends on elsewhere can
+ * only be locked as it's found, so building gives up on a lock quickly, before a deadlock
+ * could be found and a user's commit be what fails for it: it's this that's an error, to try
+ * again.  So DDL on the schema, and catalog changes, wait for this and for capture to
+ * catch up, and whatever then wants a table queued behind DDL waits too.  Row writers
+ * themselves don't wait for it.  A change of a role from another database isn't held off.
  *
  * It's an error above READ COMMITTED, as it reads what's committed now, and in a
  * transaction that's written anything, which would be neither in it nor clearly out.
- * What can't be held in a commit, or a table capture holds no map of, as one with no
- * primary key, is an error too.
+ * What can't be held in a commit, or a table capture holds no map of, is an error too.
+ * The caller needs what it would to read the tables, as it's given all their rows, so a role
+ * row security applies to is refused.
+ *
+ * It writes nothing of capture's: what was saved stays until the worker sees the next
+ * marker.  So the root is to be committed in the transaction that made it: once the
+ * next marker's let go of them, nothing else holds its chunks, and a pointer to it may then be
+ * refused.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -35,6 +45,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
@@ -53,7 +64,12 @@
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procnumber.h"
+#include "storage/lock.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/injection_point.h"
+#include "utils/rls.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_lsn.h"
@@ -100,10 +116,11 @@ static const WsRowsRoutine CapturedWsRows = {
 	.capture = captured_rows,
 };
 
-/* Every table of the schema, of a kind with rows, locked so that no one's DDL on them is in flight. */
+/* Every relation of the schema that building a root reads, locked; its tables. */
 static List *
-lock_schema_tables(Oid nsp, bool wait)
+lock_schema_relations(Oid nsp, bool wait)
 {
+	List	   *relations = NIL;
 	List	   *tables = NIL;
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
 	ScanKeyData key;
@@ -118,23 +135,44 @@ lock_schema_tables(Oid nsp, bool wait)
 
 		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE)
 			tables = lappend_oid(tables, c->oid);
+		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
+			c->relkind == RELKIND_VIEW || c->relkind == RELKIND_MATVIEW ||
+			c->relkind == RELKIND_SEQUENCE || c->relkind == RELKIND_FOREIGN_TABLE)
+			relations = lappend_oid(relations, c->oid);
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
-	foreach_oid(relid, tables)
+	foreach_oid(relid, relations)
 	{
 		if (wait)
 			LockRelationOid(relid, AccessShareLock);
 		else if (!ConditionalLockRelationOid(relid, AccessShareLock))
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("a table of the schema was made during a commit from capture"),
+					 errmsg("a relation of the schema was made during a commit from capture"),
 					 errhint("Try the commit again.")));
 	}
+	list_free(relations);
 	return tables;
 }
 
-/* The worker reading the slot of this database's capture, woken; an error if there's none. */
+/* What giving the caller all of a table's rows asks of it. */
+static void
+check_may_read(Oid relid)
+{
+	Oid			user = GetUserId();
+
+	if (pg_class_aclcheck(relid, user, ACL_SELECT) != ACLCHECK_OK &&
+		pg_attribute_aclcheck_all(relid, user, ACL_SELECT, ACLMASK_ALL) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, get_relkind_objtype(get_rel_relkind(relid)), get_rel_name(relid));
+	if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("a commit from capture can't be taken by a role row security applies to on table \"%s\"",
+						get_rel_name(relid))));
+}
+
+/* The worker reading the slot of this database's capture, woken, if there is one. */
 static void
 wake_worker(void)
 {
@@ -154,24 +192,16 @@ wake_worker(void)
 
 /* Whether the worker has saved the maps as of the marker. */
 static bool
-barrier_saved(XLogRecPtr lsn)
+barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 {
-	Oid			types[1] = {PG_LSNOID};
 	Datum		values[1] = {LSNGetDatum(lsn)};
+	bool		saved;
 
-	if (SPI_execute_with_args("SELECT 1 FROM pg_history.capture_barriers WHERE lsn = $1",
-							  1, types, values, NULL, false, 1) != SPI_OK_SELECT)
+	if (SPI_execute_plan(plan, values, NULL, false, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read a barrier");
-	return SPI_processed == 1;
-}
-
-/* A reference of a barrier's, gone with it. */
-static void
-note_ref(void *arg, const char *name, const PHash *hash)
-{
-	List	  **names = arg;
-
-	*names = lappend(*names, pstrdup(name));
+	saved = SPI_processed == 1;
+	SPI_freetuptable(SPI_tuptable);
+	return saved;
 }
 
 void
@@ -179,13 +209,15 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 {
 	Oid			nsp = get_namespace_oid(schema, false);
 	int32		branch = NamespaceBranch(nsp);
-	char		prefix[64];
 	XLogRecPtr	lsn;
 	TimestampTz start;
 	const WsRowsRoutine *rows = WsRows;
-	List	   *names = NIL;
 	Oid			types[1] = {PG_LSNOID};
-	Datum		values[1];
+	SPIPlanPtr	plan;
+	List	   *tables;
+	PHash		unused;
+	int			nest;
+	char		quickly[32];
 
 	if (!capture_to_trees)
 		ereport(ERROR,
@@ -204,14 +236,29 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
 
-	/*
-	 * Tables first, as a transaction committing a catalog change can hold one while it waits for the
-	 * lock below; then that lock; then whichever tables were made meanwhile, which this can't wait for.
-	 */
-	(void) lock_schema_tables(nsp, true);
+	/* What it'll read, tried before anything's held or written. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	plan = SPI_prepare("SELECT 1 FROM pg_history.capture_barriers WHERE lsn OPERATOR(pg_catalog.=) $1", 1, types);
+	if (plan == NULL)
+		elog(ERROR, "could not read a barrier");
+	(void) barrier_saved(plan, InvalidXLogRecPtr);
+	barrier_refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
+	(void) barrier_refs->routine->get(barrier_refs, CAPTURE_BARRIER_REF_PREFIX, VC_REF_READ, &unused);
+
+	tables = lock_schema_relations(nsp, true);
+	INJECTION_POINT("capture-barrier-locked", NULL);
 	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
 	AcceptInvalidationMessages();
-	(void) lock_schema_tables(nsp, false);
+	if (get_namespace_oid(schema, true) != nsp)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("schema \"%s\" changed during a commit from capture", schema),
+				 errhint("Try the commit again.")));
+	list_free(tables);
+	tables = lock_schema_relations(nsp, false);
+	foreach_oid(relid, tables)
+		check_may_read(relid);
 
 	{
 		int32		data[1] = {branch};
@@ -220,23 +267,25 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 	}
 	wake_worker();
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "could not connect to SPI");
 	start = GetCurrentTimestamp();
-	while (!barrier_saved(lsn))
+	while (!barrier_saved(plan, lsn))
 	{
 		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("capture did not reach %X/%X in time", LSN_FORMAT_ARGS(lsn))));
-		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 2, WAIT_EVENT_CAPTURE_WORKER_MAIN);
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 2, WAIT_EVENT_CAPTURE_BARRIER);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 		wake_worker();
 	}
 
+	/* (half of what would find a deadlock, as a user's commit must not be what one fails) */
+	nest = NewGUCNestLevel();
+	snprintf(quickly, sizeof(quickly), "%d", Max(DeadlockTimeout / 2, 1));
+	if (LockTimeout == 0 || LockTimeout > Max(DeadlockTimeout / 2, 1))
+		(void) set_config_option("lock_timeout", quickly, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	barrier_lsn = lsn;
-	barrier_refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
 	WsRows = &CapturedWsRows;
 	PG_TRY();
 	{
@@ -247,15 +296,9 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 		WsRows = rows;
 	}
 	PG_END_TRY();
+	AtEOXact_GUC(true, nest);
 
-	snprintf(prefix, sizeof(prefix), CAPTURE_BARRIER_REF_PREFIX "%X/%X/", LSN_FORMAT_ARGS(lsn));
-	barrier_refs->routine->list(barrier_refs, prefix, note_ref, &names);
-	foreach_ptr(char, name, names)
-		(void) barrier_refs->routine->remove(barrier_refs, name);
-	values[0] = LSNGetDatum(lsn);
-	if (SPI_execute_with_args("DELETE FROM pg_history.capture_barriers WHERE lsn = $1",
-							  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
-		elog(ERROR, "could not forget a barrier");
+	list_free(tables);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
 	UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
