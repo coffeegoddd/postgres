@@ -107,9 +107,12 @@ is_deeply(
 	layouts('BEGIN; SAVEPOINT p; ALTER TABLE s.sp ADD COLUMN b integer; ROLLBACK TO p; INSERT INTO s.sp VALUES (1, 1); COMMIT'),
 	[$old], 'DDL rolled back to a savepoint');
 
-# a change in a transaction that rewrote its table has the layout, whichever heap it is in
-$node->safe_psql('postgres', "$use CREATE TABLE s.rw (id integer PRIMARY KEY, a integer)");
-$got = layouts('BEGIN; ALTER TABLE s.rw ALTER COLUMN a TYPE bigint; INSERT INTO s.rw VALUES (1, 1); COMMIT');
+# a change in a transaction that rewrote its table's rows has the layout, in the new heap; the
+# rewrite's own rows aren't told
+$node->safe_psql('postgres', "$use CREATE TABLE s.rw (id integer PRIMARY KEY, a integer); INSERT INTO s.rw VALUES (1, 1)");
+$old = $node->safe_psql('postgres', "$use SELECT pg_relation_filenode('s.rw')");
+$got = layouts('BEGIN; ALTER TABLE s.rw ALTER COLUMN a TYPE bigint; INSERT INTO s.rw VALUES (2, 2); COMMIT');
+isnt($node->safe_psql('postgres', "$use SELECT pg_relation_filenode('s.rw')"), $old, 'the table was rewritten');
 is_deeply($got, [ read_now('rw') ], 'a change after a rewrite in its transaction');
 
 # a partition's and an inheriting table's rows are their own
