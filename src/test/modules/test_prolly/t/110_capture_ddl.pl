@@ -476,6 +476,36 @@ SKIP:
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
 
+# autovacuum commits through the same place: a function an expression index calls, as auto-analyze
+# reads the table, renames a value used by another
+$node = PostgreSQL::Test::Cluster->new('ddl_autovacuum');
+$node->init(allows_streaming => 'logical');
+$node->append_conf('postgresql.conf', "log_line_prefix = ''\nautovacuum = on\nautovacuum_naptime = 1s\ncapture_to_trees = on\n");
+$node->start;
+$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
+my $b5 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+$on1 = "SET catalog_branch = $b5;";
+$node->safe_psql('postgres', "$on1 CREATE SCHEMA s VERSIONED");
+$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_history.capture_positions WHERE branch = 0}) or die 'no worker';
+$slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
+$node->safe_psql('postgres', q{CREATE TYPE public.av AS ENUM ('before');
+	CREATE FUNCTION public.av_rename() RETURNS integer LANGUAGE plpgsql VOLATILE AS $$
+	BEGIN
+		IF EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = pg_backend_pid() AND backend_type = 'autovacuum worker')
+			AND EXISTS (SELECT 1 FROM pg_enum WHERE enumlabel = 'before') THEN
+			EXECUTE $r$ALTER TYPE public.av RENAME VALUE 'before' TO 'after'$r$;
+		END IF;
+		RETURN 1;
+	END $$;
+	CREATE FUNCTION public.av_index() RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT public.av_rename()'});
+run(q{CREATE TABLE by_av (id integer PRIMARY KEY, a public.av); INSERT INTO by_av VALUES (1, 'before')});
+run(q{CREATE TABLE trigger_av (id integer PRIMARY KEY) WITH (autovacuum_analyze_threshold = 1, autovacuum_analyze_scale_factor = 0);
+	CREATE INDEX ON trigger_av ((public.av_index()));
+	INSERT INTO trigger_av SELECT generate_series(1, 100)});
+ok($node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_enum WHERE enumlabel = 'after'}), 'auto-analyze renamed a value');
+same_map('by_av', 'and its commit told of the rows that changed');
+$node->stop;
+
 # changed and changed back in one transaction, with a row between: the row prints as it was then,
 # and nothing's left to say so at the commit, so it stops capture rather than leave a map wrong
 $node = PostgreSQL::Test::Cluster->new('ddl_back');

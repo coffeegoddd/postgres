@@ -36,8 +36,9 @@
  * until it's resolved.
  *
  * Text naming an object, as a regclass column prints a table's name or an aclitem a
- * role's, changes when it's renamed, which no fingerprint here says.  Nor does one say a
- * type's output function was replaced, which takes a superuser.
+ * role's, changes when it's renamed, and depends on who's asking: a temporary table's prints
+ * with its schema to all but its own session.  No fingerprint here says so.  Nor does one say
+ * a type's output function was replaced, which takes a superuser.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -69,7 +70,6 @@
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
-#include "postmaster/autovacuum.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
 #include "prolly/ws/ws_schema.h"
@@ -458,7 +458,7 @@ CaptureRowsAtCommit(bool prepare)
 
 	/* (an error here aborts the transaction, which puts all this back) */
 	if (!capture_to_trees || !XLogLogicalInfoActive() || IsParallelWorker() || am_capture_worker ||
-		AmAutoVacuumWorkerProcess() || !OidIsValid(MyDatabaseId) || IsBinaryUpgrade || IsBootstrapProcessingMode() ||
+		!OidIsValid(MyDatabaseId) || IsBinaryUpgrade || IsBootstrapProcessingMode() ||
 		!TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return;
 	CommandCounterIncrement();
