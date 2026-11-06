@@ -68,22 +68,28 @@
  *
  * Where this differs from Dolt, whose merge tests its scenarios follow:
  *	- A column of another type on one side, with rows on the other: Dolt conflicts on the
- *	  schema unless it widens.  Here each row is read and must print as it did, or it is a row
- *	  conflict, and it is a column conflict if the other side wrote values there and the retype
- *	  printed a row otherwise, as a USING would.  A USING that leaves every
- *	  row there printing as it did, as with none yet, is not seen.
- *	- A column replaced through a rename, with rows on the other side: Dolt moves their values
+ *	  schema unless it widens.  Here, in a table with a key, each row is read and must print as
+ *	  it did, or it is a row conflict.  It is a column conflict if the other side wrote values
+ *	  there and any row there before prints otherwise on the side that retyped, as a USING
+ *	  would have it, and as an UPDATE too, which no row can tell apart: so a widening with
+ *	  rows edited on both sides, which Dolt merges, conflicts here.  What is not seen: a USING
+ *	  that leaves every row printing as it did, as with none yet; both retyping alike by
+ *	  different USINGs; and a type changed under its name by one.  A keyless table has any
+ *	  retype, with rows on the other side, a row conflict.
+ *	- A column replaced through a rename, with values the other side wrote: Dolt moves them
  *	  by name; here it is a column conflict.
  *	- A json value both changed: Dolt merges by key, and here a jsonb value does too, but a
  *	  json value is a row conflict, as it holds its exact text, and in a jsonb value 1.0
  *	  and 1, which Dolt takes as alike, are two values, as they print apart.
  *	- A keyless row both added, removed or changed: Dolt conflicts; here the counts add up, as
  *	  a multiset, so a row both changed differently is two rows.
- *	- A conflict in the schema: Dolt still merges other tables' rows; here no row is looked at.
+ *	- A conflict in the schema: Dolt still merges other tables' rows; here no row is looked at,
+ *	  though a column conflict that rows show is reported beside other tables' row conflicts.
  *	  Nor does a row conflict say what violations there would be.
  *	- A table both added, alike but for tags, as one retyped a column or renamed the table:
  *	  Dolt merges it; here it is a table conflict.
- *	- Defaults compare as Postgres prints them, so 1.23 and '1.23' differ; Dolt's are alike.
+ *	- Defaults compare as Postgres prints them, so 1.23 and '1.23' of a real differ; Dolt's
+ *	  are alike.
  *	- A primary key both changed alike: Dolt merges it; here it is a key conflict.
  *	- A row violating not null: Dolt takes it out of the table into its record; here it stays,
  *	  with the constraint set aside (ws_viol.h).
@@ -99,8 +105,9 @@
  *								column differently, what the merge makes is not a
  *								table a record can be, a partition or child lacks
  *								its table's columns, or its name is another's
- *	column <table>.<name>		both changed a column differently, or one dropped
- *								what the other changed
+ *	column <table>.<name>		both changed a column differently, one dropped what
+ *								the other changed, one retyped it, printing a row
+ *								otherwise, or replaced it, and the other wrote there
  *	column-name <table>.<name>	two different columns took the same name
  *	key <table>					the primary keys' columns differ, or either's do
  *								from their base's
@@ -108,7 +115,8 @@
  *								added it otherwise
  *	row <table> <key>			both changed a value differently, one deleted a row
  *								the other changed, or a value does not read as the
- *								type the other side gave its column
+ *								type the other side gave its column, or prints
+ *								otherwise as that
  *	unapplied <what was said>	Postgres would not have what the merge made
  *	generated <table> <key>		a default or generated value could not be computed, or
  *								a row has none that a merge can give
