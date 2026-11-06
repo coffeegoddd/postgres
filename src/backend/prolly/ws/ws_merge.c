@@ -26,6 +26,7 @@
 #include "prolly/ws/ws_obj.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/ws/ws_restore.h"
+#include "prolly/ws/ws_role.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_row.h"
 #include "prolly/ws/ws_rows.h"
@@ -2260,8 +2261,9 @@ retype_rewrote(RowMerge *rm, const RowSides *sides, const PHash *base, const PHa
 }
 
 /*
- * Whether a side replaced a column another side has rows of, with one of another tag and its
- * name: those rows hold a value in what is gone, and none in what took its place.
+ * Whether a side replaced a column another side wrote values of, with one of another tag and
+ * its name: those values are in what is gone, and none in what took its place.  (A keyless
+ * row is its cells, so there any row of the other's is taken to.)
  */
 static bool
 column_replaced(RowMerge *rm, const RowSides *sides, const PHash *base, const PHash *ro, const PHash *rt)
@@ -2275,14 +2277,26 @@ column_replaced(RowMerge *rm, const RowSides *sides, const PHash *base, const PH
 
 		if (ws_schema_column(rm->merged, gone->tag) != NULL || now == NULL || gone->kind != WS_COL_STORED)
 			continue;
-		if ((ws_schema_column(sides->ours.side, gone->tag) != NULL && !phash_eq(ro, base)) ||
-			(ws_schema_column(sides->theirs.side, gone->tag) != NULL && !phash_eq(rt, base)))
+		for (int s = 0; s < 2; s++)
 		{
-			char	   *where = psprintf("%s.%s", rm->merged->name, gone->name);
+			const WsTableSchema *other = s == 0 ? sides->theirs.side : sides->ours.side;
+			const PHash *others = s == 0 ? rt : ro;
+			RewriteSearch written = {gone->tag};
 
-			conflict(rm->m, "column", where);
-			pfree(where);
-			return true;
+			if (ws_schema_column(other, gone->tag) == NULL || phash_eq(others, base))
+				continue;
+			if (rm->shape.nkey == 0)
+				written.wrote = true;
+			else if (prolly_diff(rm->m->ctx, base, others, rewrite_entry, &written) < 0)
+				prolly_report(rm->m->ctx);
+			if (written.wrote)
+			{
+				char	   *where = psprintf("%s.%s", rm->merged->name, gone->name);
+
+				conflict(rm->m, "column", where);
+				pfree(where);
+				return true;
+			}
 		}
 	}
 	return false;
@@ -2299,7 +2313,7 @@ merge_keyed_rows(RowMerge *rm, const RowSides *sides, const PHash *base, const P
 	WsField    *f = palloc_array(WsField, Max(rm->shape.nstored, 1));
 	PHash		cur;
 
-	if (retype_rewrote(rm, sides, base, ro, rt) || column_replaced(rm, sides, base, ro, rt))
+	if (retype_rewrote(rm, sides, base, ro, rt))
 	{
 		*out = *ro;
 		pfree(f);
@@ -2369,7 +2383,9 @@ merge_rows(Merger *m, const WsTableSchema *merged, const WsTableSchema *b, const
 	sides.theirs = (MoveMap) {&rm, t, columns_of_types_differing(&rm, rv, &m->theirs_types)};
 	sides.base = b;
 	sides.base_type_differs = columns_of_types_differing(&rm, rv, &m->base_types);
-	if (merged->nkey == 0)
+	if (column_replaced(&rm, &sides, base, ro, rt))
+		*out = *ro;
+	else if (merged->nkey == 0)
 		merge_keyless_rows(&rm, &sides, base, ro, rt, out);
 	else
 		merge_keyed_rows(&rm, &sides, base, ro, rt, out);
@@ -2954,6 +2970,97 @@ merge_tables(Merger *m, const PHash *base, const PHash *ours, const PHash *their
 	}
 }
 
+typedef struct RolesNamed
+{
+	ProllyCtx  *ctx;
+	const PHash *root;
+	char	  **names;
+	int			n;
+} RolesNamed;
+
+static void
+role_named(RolesNamed *named, const char *name)
+{
+	named->names = named->names == NULL ? palloc_array(char *, 1) : repalloc_array(named->names, char *, named->n + 1);
+	named->names[named->n++] = pstrdup(name);
+}
+
+static bool
+roles_of_table(void *arg, const char *name, const VcTable *entry)
+{
+	RolesNamed *named = arg;
+	WsTableSchema rec;
+	PHash		rows;
+
+	if (!WsRoot->get_table(named->ctx, named->root, name, &rec, &rows))
+		elog(ERROR, "a table listed is not there");
+	if (rec.owner != NULL)
+		role_named(named, rec.owner);
+	for (int g = 0; g < rec.ngrants; g++)
+		if (rec.grants[g].grantee != NULL)
+			role_named(named, rec.grants[g].grantee);
+	ws_schema_free(&rec);
+	return true;
+}
+
+/*
+ * A side's dropping the last of what a role owned takes the role from its roles.  One the merged
+ * root still names is the merge's still, as what it comes to restore needs it.
+ */
+static void
+keep_roles_named(Merger *m, const PHash *ours, const PHash *theirs, PHash *rv)
+{
+	RolesNamed	named = {m->ctx, rv};
+	PHash		map;
+	WsObject   *objs;
+	int			nobjs = 0;
+	WsRole	   *held = NULL;
+	int			nheld = 0;
+	WsRole	   *all;
+	int			nall = 0;
+	bool		added = false;
+
+	WsRoot->tables(m->ctx, rv, roles_of_table, &named);
+	if (WsRoot->get_map(m->ctx, rv, WS_ROOT_OBJECTS, &map))
+	{
+		ws_obj_list(m->ctx, &map, &objs, &nobjs);
+		for (int i = 0; i < nobjs; i++)
+			ws_obj_roles(&objs[i], &named.names, &named.n);
+	}
+	if (WsRoot->get_map(m->ctx, rv, WS_ROOT_ROLES, &map))
+		ws_role_list(m->ctx, &map, &held, &nheld);
+	all = palloc_array(WsRole, nheld + Max(named.n, 1));
+	for (int i = 0; i < nheld; i++)
+		all[nall++] = held[i];
+	for (int i = 0; i < named.n; i++)
+	{
+		bool		have = false;
+
+		for (int h = 0; !have && h < nall; h++)
+			have = strcmp(all[h].name, named.names[i]) == 0;
+		for (int s = 0; !have && s < 2; s++)
+		{
+			WsRole	   *side;
+			int			nside;
+
+			if (!WsRoot->get_map(m->ctx, s == 0 ? ours : theirs, WS_ROOT_ROLES, &map))
+				continue;
+			ws_role_list(m->ctx, &map, &side, &nside);
+			for (int r = 0; !have && r < nside; r++)
+				if (strcmp(side[r].name, named.names[i]) == 0)
+				{
+					all[nall++] = side[r];
+					have = added = true;
+				}
+		}
+	}
+	if (added)
+	{
+		ws_role_map(m->ctx, all, nall, &map);
+		WsRoot->put_map(m->ctx, rv, WS_ROOT_ROLES, &map, rv);
+	}
+}
+
 static void
 tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs, const char *schema,
 		   const WsEvalRoutine *eval, WsMergeResult *out)
@@ -2999,6 +3106,7 @@ tags_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *th
 		rv = maps;
 		merge_tables(&m, base, ours, theirs, lists, &rv);
 		drop_foreign_keys_of_dropped(&m, &rv);
+		keep_roles_named(&m, ours, theirs, &rv);
 		if (scope.made)
 			ws_root_definitions_end(schema);
 		if (scope.refused != NULL)
