@@ -70,8 +70,8 @@
  *	- A column of another type on one side, with rows on the other: Dolt conflicts on the
  *	  schema unless it widens.  Here each row is read and must print as it did, or it is a row
  *	  conflict, and it is a column conflict if the other side wrote values there and the retype
- *	  printed a row otherwise, as a USING would.  One that changes values and prints them alike, as an integer to a bigint
- *	  USING x * 100 leaves none, is not seen.
+ *	  printed a row otherwise, as a USING would.  A USING that leaves every
+ *	  row there printing as it did, as with none yet, is not seen.
  *	- A column replaced through a rename, with rows on the other side: Dolt moves their values
  *	  by name; here it is a column conflict.
  *	- A json value both changed: Dolt merges by key; here it is a row conflict.
