@@ -44,6 +44,9 @@ sub told
 {
 	my ($sql, $db) = @_;
 	$db //= 'postgres';
+
+	# (the log is every worker's, so none may still be telling what came before)
+	caught_up('postgres');
 	caught_up($db);
 	my $at = -s $node->logfile;
 	$node->safe_psql($db, $sql);
@@ -85,6 +88,41 @@ is( told("SET catalog_branch = $b1; ALTER TABLE s.t ALTER v SET STORAGE EXTERNAL
 is( told(   "SET catalog_branch = $b1; BEGIN; CREATE SCHEMA gone VERSIONED; CREATE TABLE gone.x (a integer) ;"
 		  . 'INSERT INTO gone.x VALUES (1); DROP SCHEMA gone CASCADE; COMMIT'),
 	"begin\nbranch $b1: insert x old=no new=yes\ncommit", 'a schema dropped before the commit');
+
+# nor is one dropped by a later transaction, with the catalog rows long gone
+SKIP:
+{
+	skip 'no way to stop a process', 1 if $windows_os;
+	$node->safe_psql('postgres', "SET catalog_branch = $b1; CREATE SCHEMA later VERSIONED; CREATE TABLE later.x (a integer)");
+	caught_up('postgres');
+	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	my $at = -s $node->logfile;
+	kill 'STOP', $worker;
+	$node->safe_psql('postgres', "SET catalog_branch = $b1; INSERT INTO later.x VALUES (1)");
+	$node->safe_psql('postgres', "SET catalog_branch = $b1; DROP SCHEMA later CASCADE");
+	kill 'CONT', $worker;
+	caught_up('postgres');
+	is(join("\n", slurp_file($node->logfile, $at) =~ /capture: (.*)$/mg),
+		"begin\nbranch $b1: insert x old=no new=yes\ncommit\nbegin\ncommit", 'a schema dropped after the commit');
+}
+
+# a partition is a table of the branch; a partitioned table is named as well as its partitions
+$node->safe_psql('postgres',
+	"SET catalog_branch = $b1; CREATE TABLE s.p (id integer PRIMARY KEY) PARTITION BY RANGE (id);"
+	  . 'CREATE TABLE s.p1 PARTITION OF s.p FOR VALUES FROM (0) TO (10);'
+	  . 'CREATE TABLE s.p2 PARTITION OF s.p FOR VALUES FROM (10) TO (20)');
+is(told("SET catalog_branch = $b1; INSERT INTO s.p VALUES (1), (11)"),
+	"begin\nbranch $b1: insert p1 old=no new=yes\nbranch $b1: insert p2 old=no new=yes\ncommit", 'rows of a partitioned table');
+is(told("SET catalog_branch = $b1; TRUNCATE s.p"),
+	"begin\nbranch $b1: truncate p restart=no\nbranch $b1: truncate p1 restart=no\nbranch $b1: truncate p2 restart=no\ncommit",
+	'a truncate of a partitioned table');
+
+# a materialized view's rows aren't told, even as a concurrent refresh writes them as changes
+$node->safe_psql('postgres',
+	"SET catalog_branch = $b1; CREATE TABLE s.vals (a integer PRIMARY KEY); INSERT INTO s.vals VALUES (1), (2);"
+	  . 'CREATE MATERIALIZED VIEW s.mv2 AS SELECT a FROM s.vals; CREATE UNIQUE INDEX ON s.mv2 (a);'
+	  . 'INSERT INTO s.vals VALUES (3); DELETE FROM s.vals WHERE a = 1');
+is(told("SET catalog_branch = $b1; REFRESH MATERIALIZED VIEW CONCURRENTLY s.mv2"), "begin\ncommit", 'a concurrent refresh');
 
 # a copy of a branch is a branch of its own
 $node->safe_psql('postgres', "SELECT pg_branch_catalog_copy($b1, $b3)");

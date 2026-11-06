@@ -20,6 +20,7 @@
 #include "access/xlogutils.h"
 #include "access/xlog_internal.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "libpq/pqsignal.h"
@@ -116,7 +117,8 @@ capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 {
 	CaptureChange out = {.branch = relation_branch(relation), .relation = relation, .lsn = change->lsn};
 
-	if (out.branch == 0)
+	/* (a materialized view's rows reach here only from a concurrent refresh) */
+	if (out.branch == 0 || relation->rd_rel->relkind != RELKIND_RELATION)
 		return;
 	switch (change->action)
 	{
@@ -539,8 +541,8 @@ CaptureWorkerMain(Datum main_arg)
 
 	/*
 	 * On no branch, whatever the database's settings say: a slot keeps the branch it was made on,
-	 * and one made on a branch decodes only that branch's changes.  And this sees every branch's
-	 * schemas, not those of the branch it isn't on.
+	 * and one made on a branch decodes only that branch's changes.  With the filter off, it sees
+	 * every branch's schemas.
 	 */
 	SetConfigOption("catalog_branch", "0", PGC_SUSET, PGC_S_OVERRIDE);
 	SetConfigOption("catalog_branch_filter", "off", PGC_SUSET, PGC_S_OVERRIDE);

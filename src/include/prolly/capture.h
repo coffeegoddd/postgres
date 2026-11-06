@@ -22,12 +22,12 @@
  * time and only once it has committed: what is rolled back is never seen, and a transaction of
  * nothing but DDL is a begin and a commit.  A change is told with the branch its table's schema
  * was on at the time, and one on a shared schema isn't told, which leaves its transaction a begin
- * and a commit as well.  A transaction can change more than one branch.  A worker stopped in the middle of telling a transaction
- * tells all of it again: a begin means whatever came since the last commit is void.  After a crash
- * a transaction already told whole can be told again, so a sink keeping anything goes by the
- * positions it is given.  Someone with REPLICATION rights could advance or drop the slot in the
- * moment it has no worker, and what that skips isn't told.  A materialized
- * view's rows are never told, nor those of any table's rewrite.
+ * and a commit as well.  A transaction can change more than one branch.  A worker stopped in the
+ * middle of telling a transaction tells all of it again: a begin means whatever came since the
+ * last commit is void.  After a crash a transaction already told whole can be told again, so a
+ * sink keeping anything goes by the positions it is given.  Someone with REPLICATION rights could
+ * advance or drop the slot in the moment it has no worker, and what that skips isn't told.  A
+ * materialized view's rows are never told, nor those of any table's rewrite.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
