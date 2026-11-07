@@ -172,7 +172,11 @@ caught_up();
 my $log_at = -s $node->logfile;
 run('ALTER TABLE named RENAME TO named2; DELETE FROM names');
 ok($node->wait_for_log(qr/fewer of a keyless row than were removed/, $log_at), 'a row whose text changed under it, removed');
-like(slurp_file($node->logfile, $log_at), qr/capture applying changes to table "names"/, 'says which table');
+like(slurp_file($node->logfile, $log_at), qr/capture applying changes to table names of relation \d+/, 'says which table');
+
+# a barrier meanwhile gives up, and its marker doesn't stand in the way of what gets past it
+my ($rcb, $outb, $errb) = $node->psql('postgres', "$on SELECT test_capture_barrier('s', 200)");
+like($errb, qr/capture did not reach/, 'a barrier while capture has stopped');
 run('VACUUM FULL names');
 same_map('names', 'and a rewrite gets past it');
 same_map('t', 'and capture goes on');

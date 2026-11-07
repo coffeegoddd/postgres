@@ -788,7 +788,7 @@ tree_edits_free(ProllyEdit *edits, size_t n)
 static void
 tree_apply_context(void *arg)
 {
-	errcontext("capture applying changes to table \"%s\"", (const char *) arg);
+	errcontext("capture applying changes to table %s", (const char *) arg);
 }
 
 static void
@@ -907,10 +907,11 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	{
 		if (shape->nkey == 0)
 		{
+			char	   *relname = get_rel_name(table->relid);
 			ErrorContextCallback context = {
 				.previous = error_context_stack,
 				.callback = tree_apply_context,
-				.arg = get_rel_name(table->relid),
+				.arg = psprintf("%s of relation %u", relname != NULL ? relname : "(gone)", table->relid),
 			};
 
 			error_context_stack = &context;
@@ -1259,6 +1260,20 @@ tree_after_record(void)
 	if (XLogRecPtrIsInvalid(lsn))
 		return;
 	tree_barrier_lsn = InvalidXLogRecPtr;
+
+	/*
+	 * A barrier holds this lock from before its marker until it has its root.  If it's free, no one's
+	 * waiting for this marker, so it's passed over, rather than apply here what a change later in
+	 * the WAL may be what gets past.  (Someone else having it only means this may be needless.)
+	 */
+	StartTransactionCommand();
+	if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock))
+	{
+		CommitTransactionCommand();
+		return;
+	}
+	CommitTransactionCommand();
+
 	tree_apply();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());

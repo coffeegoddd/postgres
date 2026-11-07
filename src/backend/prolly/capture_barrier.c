@@ -283,6 +283,8 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 		wake_worker();
 	}
 
+	INJECTION_POINT("capture-barrier-saved", NULL);
+
 	/* (half of what would find a deadlock, as a user's commit must not be what one fails) */
 	nest = NewGUCNestLevel();
 	snprintf(quickly, sizeof(quickly), "%d", Max(DeadlockTimeout / 2, 1));

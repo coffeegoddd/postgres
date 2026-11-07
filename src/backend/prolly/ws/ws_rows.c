@@ -104,7 +104,7 @@ ws_rows_keyless_merge(ProllyCtx *ctx, const PHash *map, ProllyEdit *edits, size_
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("a row map holds fewer of a keyless row than were removed"),
-					 errhint("A rewrite of the table, such as VACUUM FULL, has capture told all of its rows.")));
+					 errhint("A rewrite of the table, such as VACUUM FULL, has capture told all of its rows, once no barrier is waiting.")));
 		count -= fewer;
 		if (count > 0)
 		{
