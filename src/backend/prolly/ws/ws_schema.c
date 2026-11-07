@@ -4677,23 +4677,7 @@ type_means_something_else(const char *type)
 static bool
 is_reg_type_oid(Oid typid)
 {
-	switch (typid)
-	{
-		case REGCLASSOID:
-		case REGCOLLATIONOID:
-		case REGCONFIGOID:
-		case REGDATABASEOID:
-		case REGDICTIONARYOID:
-		case REGNAMESPACEOID:
-		case REGOPEROID:
-		case REGOPERATOROID:
-		case REGPROCOID:
-		case REGPROCEDUREOID:
-		case REGROLEOID:
-		case REGTYPEOID:
-			return true;
-	}
-	return false;
+	return typid != ACLITEMOID && BranchTypeNamesObject(typid);
 }
 
 static bool
