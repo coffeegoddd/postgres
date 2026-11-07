@@ -124,11 +124,12 @@ SKIP:
 	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applying', 'wait')");
 	caught_up();
 	my $state = qq{SELECT (SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.keyed'::regclass::oid)
-		|| ' ' || (SELECT string_agg(branch || ':' || lsn, ',' ORDER BY branch) FROM pg_history.capture_positions)};
+		|| ' ' || (SELECT string_agg(branch || ':' || lsn, ',' ORDER BY branch) FROM pg_history.capture_positions)
+		|| ' ' || (SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '$slot')};
 	my $was = $node->safe_psql('postgres', "$on $state");
 	write_many(50);
 	$node->wait_for_event('capture worker', 'capture-applying');
-	is($node->safe_psql('postgres', "$on $state"), $was, 'what it applied, map and positions, is not committed yet');
+	is($node->safe_psql('postgres', "$on $state"), $was, 'what it applied, map and positions, is not committed yet, nor the slot moved');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applying')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
