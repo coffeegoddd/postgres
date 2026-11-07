@@ -11,12 +11,13 @@
  *
  * What the WAL doesn't carry (definitions, sequences' positions) is read as this
  * runs, with catalog changes in this database held off: it holds the lock that has them
- * take turns (capture_rows.c) until the root is built.  It's every relation of the schema it
- * locks first, without that lock, as what's committing a catalog change can hold one while
- * waiting for that lock, and building a root locks them.  What a view depends on elsewhere can
- * only be locked as it's found, so building gives up on a lock quickly, before a deadlock
- * could be found and a user's commit be what fails for it: it's this that's an error, to try
- * again.  So DDL on the schema, and catalog changes, wait for this and for capture to
+ * take turns (capture_rows.c) until the root is built.  It's the schema's relations that building
+ * a root reads that it locks first, without that lock, as what's committing a catalog change can
+ * hold one while waiting for that lock.  What a view depends on elsewhere can only be locked as
+ * it's found, so building gives up on any lock quickly, before a deadlock could be found and a
+ * user's commit be what fails for it: it's this that's an error, to try again.  That goes for
+ * waiting for another transaction too, as for one that's written the same chunk and is still
+ * open, which otherwise would have every catalog change wait for it.  So DDL on the schema, and catalog changes, wait for this and for capture to
  * catch up, and whatever then wants a table queued behind DDL waits too.  Row writers
  * themselves don't wait for it.  A change of a role from another database isn't held off.
  *
@@ -24,12 +25,12 @@
  * transaction that's written anything, which would be neither in it nor clearly out.
  * What can't be held in a commit, or a table capture holds no map of, is an error too.
  * The caller needs what it would to read the tables, as it's given all their rows, so a role
- * row security applies to is refused.
+ * row security applies to is refused.  Those are asked before anything's written; what can't be
+ * held in a commit is only found building the root, after the marker.
  *
  * It writes nothing of capture's: what was saved stays until the worker sees the next
- * marker.  So the root is to be committed in the transaction that made it: once the
- * next marker's let go of them, nothing else holds its chunks, and a pointer to it may then be
- * refused.
+ * marker.  The root's chunks are held by this transaction's having put them, and nothing else,
+ * so it's to be committed in this transaction: a pointer to it after that may be refused.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -48,6 +49,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -137,6 +139,7 @@ lock_schema_relations(Oid nsp, bool wait)
 			tables = lappend_oid(tables, c->oid);
 		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
 			c->relkind == RELKIND_VIEW || c->relkind == RELKIND_MATVIEW ||
+			c->relkind == RELKIND_COMPOSITE_TYPE ||
 			c->relkind == RELKIND_SEQUENCE || c->relkind == RELKIND_FOREIGN_TABLE)
 			relations = lappend_oid(relations, c->oid);
 	}
@@ -234,6 +237,9 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
+
+	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
 
 	/* (preparing asks for pg_history's schema, which is what guards it, before anything's held or written) */
 	if (SPI_connect() != SPI_OK_CONNECT)
