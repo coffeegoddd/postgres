@@ -100,6 +100,13 @@ same_map('keyed', 'one transaction, many batches, with a key');
 run(q{BEGIN; INSERT INTO nokey SELECT 1000, 'same' FROM generate_series(1, 2500); DELETE FROM nokey WHERE a = 1000 AND ctid IN (SELECT ctid FROM nokey WHERE a = 1000 LIMIT 700); COMMIT});
 same_map('nokey', 'and with none, the same row over and over');
 
+# a deferrable key's transaction is written whole, whatever its size, as a batch's edge could be with
+# keys on two rows
+run(q{CREATE TABLE deferred (id integer PRIMARY KEY DEFERRABLE, v text); INSERT INTO deferred SELECT g, 'v' || g FROM generate_series(1, 2500) g});
+same_map('deferred', 'a deferrable key, more than a batch');
+run(q{UPDATE deferred SET id = id + 1});
+same_map('deferred', 'keys moved onto each other, more than a batch');
+
 # what's in a batch already written is in the map, for a value an update left out of line
 run(q{CREATE TABLE out_of_line (id integer PRIMARY KEY, n integer, v text); ALTER TABLE out_of_line ALTER v SET STORAGE EXTERNAL;
 	INSERT INTO out_of_line VALUES (1, 0, repeat('old', 5000))});
