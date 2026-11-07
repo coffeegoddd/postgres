@@ -60,6 +60,8 @@ PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_schema_shape);
 PG_FUNCTION_INFO_V1(test_capture_barrier);
 PG_FUNCTION_INFO_V1(test_capture_commit);
+PG_FUNCTION_INFO_V1(test_capture_commit_on);
+PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
@@ -869,13 +871,25 @@ test_ws_rows_copy(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* A store for the backend's life, so that what one call captures another can read. */
+/* Whether backend_ctx is the history store's, as test_ws_use_history_store asks. */
+static bool on_history_store = false;
+
+/*
+ * A store for the backend's life, so that what one call captures another can read; or the history
+ * store, for roots any backend made, and to make them there.
+ */
 static ProllyCtx *
 backend_ctx(void)
 {
 	static ProllyCtx ctx;
+	static ProllyCtx history;
 	static bool made = false;
 
+	if (on_history_store)
+	{
+		prolly_ctx_init(&history, ChunkStoreOpen("pages"), &prolly_default_policy);
+		return &history;
+	}
 	if (!made)
 	{
 		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
@@ -964,6 +978,44 @@ test_capture_commit(PG_FUNCTION_ARGS)
 	vc_repo_free(&repo);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_TEXT_P(hash_text(&commit));
+}
+
+/*
+ * test_capture_commit_on(schema text, branch text, msg text) returns text: a commit of the schema from
+ * capture on that branch of version control, made from the branch checked out if there's none.  The
+ * root it holds.
+ */
+Datum
+test_capture_commit_on(PG_FUNCTION_ARGS)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	char	   *branch = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ProllyCtx	ctx;
+	VcRepo		repo;
+	VcBranch	found;
+	PHash		root;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	CaptureBarrier(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), 60000, &root);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (vc_branch_get(&repo, branch, &found))
+		vc_branch_free(&found);
+	else if (vc_branch_create(&repo, branch, NULL) != 0)
+		elog(ERROR, "could not make branch \"%s\"", branch);
+	if (vc_checkout(&repo, branch) != 0)
+		elog(ERROR, "could not check out branch \"%s\"", branch);
+	(void) vc_commit_root(&repo, &root, text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	vc_repo_free(&repo);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* test_ws_use_history_store() returns void: this backend's test_ws_ functions use the history store */
+Datum
+test_ws_use_history_store(PG_FUNCTION_ARGS)
+{
+	on_history_store = true;
+	PG_RETURN_VOID();
 }
 
 /* test_ws_root_restore(root text, dest text) returns void: of a root this backend captured */
