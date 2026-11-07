@@ -190,15 +190,33 @@ SKIP:
 	$ddl->quit;
 	is($node->safe_psql('postgres', "$on1 SELECT to_regclass('s.dropped_view') IS NULL"), 't', 'and so does the drop');
 
+	# a type of the schema is locked first too
+	$node->safe_psql('postgres', qq{$on1 SET ROLE objs; CREATE TYPE s.ct AS (a integer); CREATE VIEW s.of_type AS SELECT ROW(1)::s.ct AS c});
+	kill 'STOP', $worker;
+	$bg = barrier_held($on1);
+	$ddl = $node->background_psql('postgres');
+	$ddl->query_until(qr/started/, "\\echo started\n$on1 ALTER TYPE s.ct RENAME TO ct2;\n\\echo finished\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '%ALTER TYPE s.ct RENAME%' AND wait_event_type = 'Lock'}) or die 'DDL did not wait';
+	kill 'CONT', $worker;
+	ok(defined barrier_result($bg), 'a type a view uses changed during a barrier: the barrier finishes');
+	finish($ddl);
+	$ddl->quit;
+	is($node->safe_psql('postgres', "$on1 SELECT to_regtype('s.ct2') IS NOT NULL"), 't', 'and so does the change');
+	$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP VIEW s.of_type; DROP TYPE s.ct2");
+
 	$node->safe_psql('postgres', "CREATE TABLE shared_types.seen (a integer)");
 	$node->safe_psql('postgres', "$on2 CREATE SCHEMA with_view VERSIONED; CREATE VIEW with_view.v AS SELECT a FROM shared_types.seen");
 	kill 'STOP', $worker;
 	$bg = barrier_held($on2, 'with_view');
 	$ddl = $node->background_psql('postgres');
-	$ddl->query_until(qr/started/, "\\echo started\nALTER TABLE shared_types.seen ADD COLUMN b integer;\n\\echo finished\n");
+
+	# (its own deadlock check is put off, so this is the barrier's turn to find it, however slowly this runs)
+	$ddl->query_until(qr/started/, "\\echo started\nSET deadlock_timeout = '10min'; ALTER TABLE shared_types.seen ADD COLUMN b integer;\n\\echo finished\n");
 	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '%ADD COLUMN b integer%' AND wait_event_type = 'Lock'}) or die 'DDL did not wait';
 	kill 'CONT', $worker;
-	is(barrier_result($bg), undef, 'what a view depends on, changing: the barrier gives up');
+	finish($bg);
+	like($bg->{stderr}, qr/lock timeout/, 'what a view depends on, changing: the barrier gives up');
+	$bg->quit;
 	finish($ddl);
 	$ddl->quit;
 	is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'shared_types.seen'::regclass AND attname = 'b'}), '1', 'and the commit goes through');
@@ -225,6 +243,8 @@ SKIP:
 	$node->wait_for_event('capture worker', 'capture-applied');
 	ok(defined barrier_result($bg), 'a barrier, with a commit right after its marker applied, not confirmed');
 	my $before = $node->safe_psql('postgres', "$on1 $saved");
+	ok( $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < (SELECT max(lsn) FROM pg_history.capture_barriers) FROM pg_replication_slots WHERE slot_name LIKE 'prolly_capture_%'}) eq 't',
+		'its marker is to be told again');
 	isnt($before, $node->safe_psql('postgres', qq{$on1 SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid}),
 		'what it saved is not the map now');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
@@ -265,7 +285,10 @@ my $markers = q{SELECT string_agg(lsn::text, ',') FROM pg_history.capture_barrie
 my $markers_were = $node->safe_psql('postgres', $markers);
 my ($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
 like($errr, qr/permission denied for schema pg_history/, 'a role that cannot read what capture saved');
-$node->safe_psql('postgres', 'GRANT USAGE ON SCHEMA pg_history TO nobody_much');
+$node->safe_psql('postgres', "$on1 REVOKE ALL ON SCHEMA s FROM nobody_much; GRANT USAGE ON SCHEMA pg_history TO nobody_much");
+($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
+like($errr, qr/permission denied for schema s/, 'nor one that has no use of the schema');
+$node->safe_psql('postgres', "$on1 GRANT USAGE ON SCHEMA s TO nobody_much");
 ($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
 like($errr, qr/permission denied for (table|view|sequence)/, 'a role that cannot read a table');
 $node->safe_psql('postgres', "$on1 GRANT SELECT ON ALL TABLES IN SCHEMA s TO nobody_much; REVOKE SELECT ON ALL SEQUENCES IN SCHEMA s FROM nobody_much");
@@ -284,6 +307,7 @@ $node->safe_psql('postgres', q{CREATE SCHEMA evil;
 	CREATE OPERATOR evil.= (FUNCTION = evil.same, LEFTARG = pg_lsn, RIGHTARG = pg_lsn)});
 ($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET search_path = evil, pg_catalog, public; SELECT test_capture_barrier('s')");
 unlike($errr, qr/ran as a barrier read/, 'an operator ahead on the search path');
+like($outr, qr/^[0-9a-f]{40}$/m, 'and the barrier gave a root');
 $node->safe_psql('postgres', 'DROP SCHEMA evil CASCADE');
 
 # its own transaction: nothing it's written, and nothing older than now
@@ -309,11 +333,21 @@ same_root('s', $on1, 'one more');
 my $refs = q{SELECT count(DISTINCT split_part(name, '/', 3) || '/' || split_part(name, '/', 4)) FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%'};
 is($node->safe_psql('postgres', $refs), '1', 'only the last has its maps kept');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_history.capture_barriers'), '1', 'and its record');
+
+# one in an open transaction has chunks another may want: that's an error, to try again, and doesn't
+# hold capture up
 my $held_open = $node->background_psql('postgres');
+$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900009, 'new chunks')");
 $held_open->query_safe("$on1 BEGIN; SELECT test_capture_barrier('s')");
-same_root('s', $on1, 'a barrier beside one in an open transaction');
+my ($rco, $outo, $erro) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('s')");
+like($erro, qr/lock timeout/, 'a barrier beside one in an open transaction gives up');
+$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900010, 'capture goes on')");
+caught_up();
+pass('capture does not wait for it');
 $held_open->query_safe('COMMIT');
 $held_open->quit;
+$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id >= 900009");
+same_root('s', $on1, 'and tried again once that has committed');
 
 # all the way: from rows written, to a commit from capture, to a schema restored from that commit
 $node->safe_psql('postgres', qq{$on1 SET ROLE objs; CREATE TABLE s.commit_me (id integer PRIMARY KEY, v text); INSERT INTO s.commit_me VALUES (1, 'committed')});
