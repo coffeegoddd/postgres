@@ -120,11 +120,15 @@ SKIP:
 # killed in the middle of committing what it applied: none of it is, and it's applied again whole
 SKIP:
 {
-	skip 'injection points not supported by this build', 2 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
+	skip 'injection points not supported by this build', 3 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
 	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applying', 'wait')");
 	caught_up();
+	my $state = qq{SELECT (SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.keyed'::regclass::oid)
+		|| ' ' || (SELECT string_agg(branch || ':' || lsn, ',' ORDER BY branch) FROM pg_history.capture_positions)};
+	my $was = $node->safe_psql('postgres', "$on $state");
 	write_many(50);
 	$node->wait_for_event('capture worker', 'capture-applying');
+	is($node->safe_psql('postgres', "$on $state"), $was, 'what it applied, map and positions, is not committed yet');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applying')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
