@@ -254,6 +254,22 @@ rows_write(Relation rel, int32 branch)
 	ws_row_shape_free(&shape);
 }
 
+bool
+CaptureRowsResend(Oid relid)
+{
+	Relation	rel;
+
+	if (!ConditionalLockRelationOid(relid, ShareLock))
+		return false;
+	rel = try_relation_open(relid, NoLock);
+	if (rel == NULL)
+		return true;
+	if (rel->rd_rel->relkind == RELKIND_RELATION && NamespaceBranch(RelationGetNamespace(rel)) != 0)
+		rows_write(rel, NamespaceBranch(RelationGetNamespace(rel)));
+	relation_close(rel, NoLock);
+	return true;
+}
+
 static int
 label_cmp(const ListCell *a, const ListCell *b)
 {

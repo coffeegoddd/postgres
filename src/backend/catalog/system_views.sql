@@ -1639,6 +1639,10 @@ CREATE TABLE pg_history.capture_positions (
 	branch integer PRIMARY KEY,
 	lsn pg_lsn NOT NULL
 );
+CREATE TABLE pg_history.capture_healing (
+	relid oid PRIMARY KEY,
+	reason text COLLATE "C" NOT NULL
+);
 CREATE TABLE pg_history.capture_barriers (
 	lsn pg_lsn PRIMARY KEY
 );
