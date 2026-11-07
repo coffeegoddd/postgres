@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A worker far behind applies what it's read as it goes, rather than hold it all, and a map is written
-# a bounded batch at a time: nothing's lost or counted twice for that, across a crash or otherwise.
+# a bounded batch at a time: nothing's lost or counted twice for that, with the worker killed or otherwise.
 
 use strict;
 use warnings FATAL => 'all';
@@ -76,7 +76,7 @@ SKIP:
 # killed between them: told again from what's confirmed, and passed over what isn't
 SKIP:
 {
-	skip 'injection points not supported by this build', 4 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
+	skip 'injection points not supported by this build', 5 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
 	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applied', 'wait')");
 	caught_up();
 	kill 'STOP', $worker;
@@ -99,7 +99,22 @@ SKIP:
 	same_map('keyed', 'killed between batches, with a key');
 	same_map('nokey', 'and with none');
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
-	pass('and on it goes');
+
+	# a transaction open across what's confirmed is still told, in full, after the worker restarts
+	caught_up();
+	my $open = $node->background_psql('postgres');
+	$open->query_safe("$on BEGIN; INSERT INTO s.keyed VALUES (800001, 'open'); INSERT INTO s.nokey VALUES (800001, 'open')");
+	my $before_open = $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '$slot'});
+	write_many(100);
+	$node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn > '$before_open'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'}) or die 'nothing confirmed';
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
+	  or die 'no worker came back';
+	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$open->query_safe('COMMIT');
+	$open->quit;
+	same_map('keyed', 'a transaction open across what was confirmed');
+	same_map('nokey', 'with no key too');
 }
 
 # one transaction, more than a batch of a table's map, with rows the same over the edge of one
@@ -124,9 +139,69 @@ same_map('out_of_line', 'changed, a batch written, and left');
 run(q{BEGIN; INSERT INTO out_of_line VALUES (2, 0, repeat('two', 5000)); UPDATE out_of_line SET n = 1 WHERE id = 2; UPDATE out_of_line SET id = 3 WHERE id = 2; COMMIT});
 same_map('out_of_line', 'and in the same batch');
 
-# a batch of bytes, not rows
-run(q{CREATE TABLE wide (id integer PRIMARY KEY, v text); BEGIN; INSERT INTO wide SELECT g, repeat(g::text, 400000) FROM generate_series(1, 30) g; COMMIT});
+# a batch of bytes, not rows: cells of their own, as what's in a tree of its own is only its name here
+my @columns = map { "c$_ text" } 1 .. 20;
+my $cell = q{(SELECT string_agg(md5(g::text || s::text), '') FROM generate_series(1, 62) s)};
+run('CREATE TABLE wide (id integer PRIMARY KEY, ' . join(', ', @columns) . ')');
+caught_up();
+my $wide_at = -s $node->logfile;
+run('INSERT INTO wide SELECT g, ' . join(', ', ($cell) x 20) . ' FROM generate_series(1, 300) g');
 same_map('wide', 'batches by size');
+my $wide = $node->safe_psql('postgres', "$on SELECT 's.wide'::regclass::oid");
+my @wrote = slurp_file($node->logfile, $wide_at) =~ /capture tree: wrote (\d+) edits of relation $wide/g;
+cmp_ok(scalar(@wrote), '>', 1, 'in more than one');
+cmp_ok((sort { $b <=> $a } @wrote)[0], '<', 300, 'none of them everything');
+
+# a batch by edits has no more than it says
+my $rows_at = -s $node->logfile;
+run(q{CREATE TABLE narrow (id integer PRIMARY KEY); INSERT INTO narrow SELECT generate_series(1, 2500)});
+same_map('narrow', 'batches by edits');
+my $narrow = $node->safe_psql('postgres', "$on SELECT 's.narrow'::regclass::oid");
+cmp_ok((sort { $b <=> $a } (slurp_file($node->logfile, $rows_at) =~ /capture tree: wrote (\d+) edits of relation $narrow/g))[0], '<=', 1000, 'of a thousand edits');
+
+# a truncate is voided in its transaction, so what's held can still be applied for its size
+SKIP:
+{
+	skip 'no way to stop a process', 2 if $windows_os;
+	caught_up();
+	my $at = -s $node->logfile;
+	kill 'STOP', $worker;
+	run('TRUNCATE narrow');
+	write_many(200);
+	kill 'CONT', $worker;
+	same_map('keyed', 'written after a truncate');
+	cmp_ok(scalar(() = slurp_file($node->logfile, $at) =~ /capture tree: applied \d+ changes/g), '>', 2, 'applied in several goes');
+}
+
+# a key made deferrable with writes on both sides is refused wherever a batch happens to end
+{
+	run(q{CREATE TABLE edge (id integer PRIMARY KEY, n integer)});
+	caught_up();
+	my $at = -s $node->logfile;
+	$node->safe_psql('postgres', qq{$on BEGIN; INSERT INTO s.edge SELECT generate_series(1, 1000), 0;
+		ALTER TABLE s.edge DROP CONSTRAINT edge_pkey; ALTER TABLE s.edge ADD PRIMARY KEY (id) DEFERRABLE; UPDATE s.edge SET n = 1 WHERE id = 1; COMMIT});
+	ok($node->wait_for_log(qr/having its deferrable key changed/, $at), 'with the first side a batch exactly');
+	run('VACUUM FULL edge');
+	same_map('edge', 'which a rewrite gets past');
+}
+
+# a barrier over what's more than a batch
+SKIP:
+{
+	skip 'no way to stop a process', 1 if $windows_os;
+	caught_up();
+	kill 'STOP', $worker;
+	write_many(200);
+	my $bg = $node->background_psql('postgres');
+	$bg->query_until(qr/started/, "\\echo started\n$on SELECT test_capture_barrier('s') AS root \\gset\n\\echo :root\n\\echo finished\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'CaptureBarrier'}) or die 'no marker';
+	kill 'CONT', $worker;
+	$bg->{stdout} = '';
+	$bg->{run}->pump until $bg->{stdout} =~ /finished/ || !$bg->{run}->pumpable;
+	my ($root) = $bg->{stdout} =~ /^([0-9a-f]{40})$/m;
+	$bg->quit;
+	is($root, $node->safe_psql('postgres', "$on SELECT test_ws_root_capture('s')"), 'the same root as reading the tables');
+}
 
 # what's wrong with a change isn't applied for its size, or a worker would never read as far as what
 # gets past it
@@ -145,6 +220,7 @@ SKIP:
 	same_map('keyed', 'and the others');
 }
 
+is($node->safe_psql('postgres', q{SELECT ok FROM test_cs_check('pages')}), 't', 'and the store has all it should');
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
 done_testing();
