@@ -108,8 +108,7 @@ captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash 
 	if (!barrier_refs->routine->get(barrier_refs, name, VC_REF_READ, map))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("capture holds no row map of table \"%s\" of schema \"%s\"", table, schema),
-				 errhint("It may have no primary key, which a commit taken from capture can't hold yet.")));
+				 errmsg("capture holds no row map of table \"%s\" of schema \"%s\"", table, schema)));
 	pfree(table);
 }
 
@@ -283,6 +282,8 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 		CHECK_FOR_INTERRUPTS();
 		wake_worker();
 	}
+
+	INJECTION_POINT("capture-barrier-saved", NULL);
 
 	/* (half of what would find a deadlock, as a user's commit must not be what one fails) */
 	nest = NewGUCNestLevel();

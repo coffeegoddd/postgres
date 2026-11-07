@@ -155,10 +155,9 @@ $node->safe_psql('postgres', 'CREATE TEMP TABLE first_catalog_change (a integer)
 is($node->safe_psql('postgres', $recorded), $before, 'the first catalog change records no table anew');
 same_map($on, 't', 'rebuilt on one branch');
 same_map($on2, 't', 'and another');
-is($node->safe_psql('postgres', "$on SELECT count(*) FROM pg_history.pointers WHERE name = 'capture/map/' || 's.nokey'::regclass::oid"), '0', 'a table with no key has no map');
-my $from = -s $node->logfile;
-$node->safe_psql('postgres', "$on INSERT INTO s.nokey VALUES (2)");
-ok($node->wait_for_log(qr/which has no primary key/, $from), 'and stops capture only once it is written');
+same_map($on, 'nokey', 'a table with no key');
+$node->safe_psql('postgres', "$on INSERT INTO s.nokey VALUES (1), (2)");
+same_map($on, 'nokey', 'and written after');
 $node->stop;
 
 # tables whose rows don't lie in key order don't cost what every tree between would

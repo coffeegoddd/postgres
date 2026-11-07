@@ -223,10 +223,11 @@ SKIP:
 	$node->safe_psql('postgres', "$on2 DROP SCHEMA with_view CASCADE");
 }
 
-# a marker told again, after a worker crashed past it, leaves alone what it saved and what others saved
+# a marker told again while its barrier is still building, by a worker that crashed with a commit right
+# after the marker applied: what it saved, and what others saved, is left, and so the root's right
 SKIP:
 {
-	skip 'injection points not supported by this build', 4 if $ENV{enable_injection_points} ne 'yes';
+	skip 'injection points not supported by this build', 6 if $ENV{enable_injection_points} ne 'yes';
 	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
 	same_root('s', $on1, 'with nothing held');
 	my $saved = qq{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%/' || 's.t'::regclass::oid};
@@ -238,15 +239,16 @@ SKIP:
 	my $bg = barrier_held($on1);
 	$straddles->query_safe('COMMIT');
 	$straddles->quit;
-	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait'); SELECT injection_points_attach('capture-barrier-saved', 'wait')});
 	kill 'CONT', $worker;
 	$node->wait_for_event('capture worker', 'capture-applied');
-	ok(defined barrier_result($bg), 'a barrier, with a commit right after its marker applied, not confirmed');
+	$node->wait_for_event('client backend', 'capture-barrier-saved');
 	my $before = $node->safe_psql('postgres', "$on1 $saved");
-	ok( $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < (SELECT max(lsn) FROM pg_history.capture_barriers) FROM pg_replication_slots WHERE slot_name LIKE 'prolly_capture_%'}) eq 't',
-		'its marker is to be told again');
+	isnt($before, '', 'a barrier has its maps, with a commit right after its marker applied, not confirmed');
 	isnt($before, $node->safe_psql('postgres', qq{$on1 SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid}),
 		'what it saved is not the map now');
+	ok( $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < (SELECT max(lsn) FROM pg_history.capture_barriers) FROM pg_replication_slots WHERE slot_name LIKE 'prolly_capture_%'}) eq 't',
+		'its marker is to be told again');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
@@ -255,6 +257,8 @@ SKIP:
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900006");
 	caught_up();
 	is($node->safe_psql('postgres', "$on1 $saved"), $before, 'and told again, it is left as it was');
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-barrier-saved'); SELECT injection_points_detach('capture-barrier-saved')});
+	is(barrier_result($bg), read_root('s', $on1), 'and the root does not have what came after');
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
 
@@ -322,11 +326,18 @@ like($err, qr/is not versioned/, 'not of a shared schema');
 ($rc, $out, $err) = $node->psql('postgres', "$on1 ALTER TABLE s.t SET UNLOGGED");
 like($err, qr/unlogged/, 'a versioned table can not become unlogged');
 
-# a table it holds no map of, which a commit can't hold yet
-$node->safe_psql('postgres', "$on1 CREATE SCHEMA nokey VERSIONED; CREATE TABLE nokey.t (a integer)");
-($rc, $out, $err) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('nokey')");
-like($err, qr/capture holds no row map of table "t"/, 'a table with no primary key');
-$node->safe_psql('postgres', "$on1 DROP SCHEMA nokey CASCADE");
+# a table with no key, with rows the same as each other
+$node->safe_psql('postgres', "$on1 SET ROLE objs; CREATE TABLE s.nokey (a integer, b text); INSERT INTO s.nokey SELECT g % 3, 'x' FROM generate_series(1, 30) g; DELETE FROM s.nokey WHERE ctid = '(0,1)'");
+same_root('s', $on1, 'a table with no key');
+$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.nokey");
+
+# a table it holds no map of
+$node->safe_psql('postgres', "$on1 CREATE SCHEMA nomap VERSIONED; CREATE TABLE nomap.t (a integer PRIMARY KEY)");
+same_root('nomap', $on1, 'a table it has a map of');
+$node->safe_psql('postgres', "$on1 SET allow_system_table_mods = on; DELETE FROM pg_history.pointers WHERE name = 'capture/map/' || 'nomap.t'::regclass::oid");
+($rc, $out, $err) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('nomap')");
+like($err, qr/capture holds no row map of table "t"/, 'and one it has not');
+$node->safe_psql('postgres', "$on1 DROP SCHEMA nomap CASCADE");
 
 # what it saved stays until the next, in an open transaction or not, and doesn't hold capture up
 same_root('s', $on1, 'one more');

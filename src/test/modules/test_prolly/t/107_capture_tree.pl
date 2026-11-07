@@ -217,34 +217,6 @@ $node->start;
 same_map($on, 't', 'a crash just after applying');
 $node->stop;
 
-# an update changing the key has to say what the key was: these don't, so they aren't held
-for my $case (
-	[ 'nothing', 'id integer PRIMARY KEY, v text', 'ALTER TABLE s.t REPLICA IDENTITY NOTHING' ],
-	[ 'deferrable', 'id integer PRIMARY KEY DEFERRABLE, v text', undef ],
-	[ 'index', 'id integer PRIMARY KEY, v text NOT NULL UNIQUE', 'ALTER TABLE s.t REPLICA IDENTITY USING INDEX t_v_key' ])
-{
-	my ($name, $columns, $alter) = @$case;
-	$on = fresh_node($name);
-	$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
-	slot_active();
-	$node->safe_psql('postgres', "$on CREATE TABLE s.t ($columns)");
-	$node->safe_psql('postgres', "$on $alter") if $alter;
-	my $from = -s $node->logfile;
-	$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1, 'a')");
-	ok($node->wait_for_log(qr/whose replica identity does not give its primary key/, $from), "replica identity: $name");
-	$node->stop;
-}
-
-# nor is a table with no key, and a value it wasn't given stops it too
-$on = fresh_node('keyless');
-$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
-slot_active();
-$node->safe_psql('postgres', "$on CREATE TABLE s.t (a integer)");
-$from = -s $node->logfile;
-$node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1)");
-ok($node->wait_for_log(qr/which has no primary key/, $from), 'a table with no primary key');
-$node->stop;
-
 # a truncate changes the table's file, so its rows are told whole
 $on = fresh_node('truncate');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
@@ -317,17 +289,6 @@ SKIP:
 	same_map($on, 't', 'a worker dying with its new slot just made');
 	$node->stop;
 }
-
-# replica identity is asked of each change, as it can change and leave the layout as it was
-$on = fresh_node('identity_later');
-$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
-slot_active();
-$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, v text); INSERT INTO s.t VALUES (1, 'a')");
-caught_up();
-$from = -s $node->logfile;
-$node->safe_psql('postgres', "$on ALTER TABLE s.t REPLICA IDENTITY NOTHING; UPDATE s.t SET id = 9 WHERE id = 1");
-ok($node->wait_for_log(qr/whose replica identity does not give its primary key/, $from), 'replica identity changed after a table was seen');
-$node->stop;
 
 $on = fresh_node('template');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");

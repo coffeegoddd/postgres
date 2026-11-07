@@ -16,7 +16,7 @@
  * told again is passed over.  That transaction is flushed before the slot moves,
  * whatever synchronous_commit says, or a crash would leave the slot past what it lost.
  *
- * A new slot begins with a row map of every table with a key, read under the snapshot of the slot's
+ * A new slot begins with a row map of every table, read under the snapshot of the slot's
  * first position, so that map and what's told after it are the whole of the table.  That's one
  * transaction, which ends with the branch 0 row of pg_history.capture_positions saying capture began,
  * and that row goes before any new slot is made.  So a slot is kept only once it's all there; a slot
@@ -36,9 +36,11 @@
  * nothing's judged until its transaction has ended: what's wrong with a change only matters if it
  * isn't voided.
  *
- * This is off by default (capture_to_trees), as there's more it doesn't follow.  A table with no
- * primary key and one whose replica identity doesn't give it are errors, as an update changing the
- * key would look like one that didn't, as is a value decoding wasn't given.  An error stops capture
+ * A table with no key holds its rows by the whole row, with how many there are of it, so a change
+ * is one fewer of the old row and one more of the new; CaptureLoggedIdentity has that come whole.
+ *
+ * This is off by default (capture_to_trees), as there's more it doesn't follow.  A value decoding
+ * wasn't given is an error, unless it's in the old row.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
  * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
  * a while and on again, nor an object id used again while its old row map is kept.
@@ -71,6 +73,7 @@
 #include "prolly/engine/vc_refs.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "prolly/ws/ws_rows.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -104,7 +107,7 @@ typedef struct TreeChange
 	Oid			filenode;
 	int32		branch;
 	XLogRecPtr	commit;
-	char	  **old_row;		/* the key's fields alone: the row to go */
+	char	  **old_row;		/* the key's fields, or with no key all of them: the row to go */
 	char	  **new_row;		/* NULL if there is no new row */
 } TreeChange;
 
@@ -274,24 +277,12 @@ tree_table_of(Relation relation)
 	return table;
 }
 
-/* What's wrong with holding a change of this relation, or NULL. */
-static const char *
-tree_problem_of(Relation relation, const TreeTable *table)
-{
-	if (table->shape->nkey == 0)
-		return psprintf("capture to trees does not hold \"%s\", which has no primary key",
-						RelationGetRelationName(relation));
-	if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL &&
-		(relation->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT ||
-		 !OidIsValid(RelationGetPrimaryKeyIndex(relation, false))))
-		return psprintf("capture to trees does not hold \"%s\", whose replica identity does not give its primary key",
-						RelationGetRelationName(relation));
-	return NULL;
-}
-
-/* A tuple's fields by the table's shape, each in the context apply empties. */
+/*
+ * A tuple's fields by the table's shape, each in the context apply empties.  whole is what the old
+ * row had, if that's all of it, for a value an update left where it was.
+ */
 static char **
-tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only, const char **problem)
+tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only, char **whole, const char **problem)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
 	char	  **row = MemoryContextAllocZero(tree_held_cxt, sizeof(char *) * Max(table->shape->nstored, 1));
@@ -318,8 +309,14 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_on
 		getTypeOutputInfo(att->atttypid, &output, &varlena);
 		if (varlena && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
 		{
-			MemoryContext was = MemoryContextSwitchTo(tree_held_cxt);
+			MemoryContext was;
 
+			if (whole != NULL && whole[at] != NULL)
+			{
+				row[at] = whole[at];
+				continue;
+			}
+			was = MemoryContextSwitchTo(tree_held_cxt);
 			*problem = psprintf("capture to trees was not given column \"%s\" of \"%s\", which an update left as it was",
 								NameStr(att->attname), RelationGetRelationName(relation));
 			MemoryContextSwitchTo(was);
@@ -342,7 +339,6 @@ tree_change(const CaptureChange *change)
 	held->shape = table->shape;
 	held->branch = change->branch;
 	held->commit = tree_commit;
-	held->problem = tree_problem_of(change->relation, table);
 	if (change->catalogs_changed)
 	{
 		held->relid = RelationGetRelid(change->relation);
@@ -351,15 +347,14 @@ tree_change(const CaptureChange *change)
 		tree_as_of = lappend(tree_as_of, held);
 	}
 	MemoryContextSwitchTo(old);
-	if (held->problem == NULL)
-	{
-		if (change->kind == CAPTURE_DELETE && change->old_tuple == NULL)
-			elog(ERROR, "a row deleted from \"%s\" came with no key", RelationGetRelationName(change->relation));
-		if (change->old_tuple != NULL)
-			held->old_row = tree_row(change->relation, table, change->old_tuple, true, &held->problem);
-		if (change->new_tuple != NULL)
-			held->new_row = tree_row(change->relation, table, change->new_tuple, false, &held->problem);
-	}
+	if (change->old_tuple == NULL &&
+		(change->kind == CAPTURE_DELETE || (change->kind == CAPTURE_UPDATE && table->shape->nkey == 0)))
+		elog(ERROR, "a change of \"%s\" came with no old row", RelationGetRelationName(change->relation));
+	if (change->old_tuple != NULL)
+		held->old_row = tree_row(change->relation, table, change->old_tuple, table->shape->nkey > 0, NULL, &held->problem);
+	if (change->new_tuple != NULL)
+		held->new_row = tree_row(change->relation, table, change->new_tuple, false,
+								 table->shape->nkey == 0 ? held->old_row : NULL, &held->problem);
 	old = MemoryContextSwitchTo(tree_held_cxt);
 	table->held = lappend(table->held, held);
 	tree_held = lappend(tree_held, held);
@@ -679,6 +674,12 @@ tree_edits_free(ProllyEdit *edits, size_t n)
 }
 
 static void
+tree_apply_context(void *arg)
+{
+	errcontext("capture applying changes to table %s", (const char *) arg);
+}
+
+static void
 tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 {
 	int			most = 1;
@@ -729,13 +730,6 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		tree_check_table(table, shape);
 
 	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
-	if (shape->nkey == 0)
-	{
-		/* told whole, with no key: nothing can hold it, and what was held is void */
-		(void) refs->routine->remove(refs, name);
-		tree_record_shape(table->relid, table->shape);
-		return;
-	}
 	f = palloc_array(WsField, most);
 	edits = palloc_array(ProllyEdit, 2 * (list_length(table->held) - from));
 	for (int i = from; i < list_length(table->held); i++)
@@ -766,6 +760,19 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
 			prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 			prolly_report(ctx);
+		if (shape->nkey == 0)
+		{
+			char	   *relname = get_rel_name(table->relid);
+			ErrorContextCallback context = {
+				.previous = error_context_stack,
+				.callback = tree_apply_context,
+				.arg = psprintf("%s of relation %u", relname != NULL ? relname : "(gone)", table->relid),
+			};
+
+			error_context_stack = &context;
+			n = ws_rows_keyless_merge(ctx, &map, edits, n);
+			error_context_stack = context.previous;
+		}
 		if (n > 0 && prolly_apply(ctx, &map, edits, n, &map) < 0)
 			prolly_report(ctx);
 		refs->routine->set(refs, name, &map);
@@ -929,7 +936,14 @@ tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 		}
 		if (n > 0 && (!more || n == TREE_REBUILD_BATCH_ROWS || bytes >= TREE_REBUILD_BATCH_BYTES))
 		{
-			if (prolly_apply(ctx, map, edits, n, map) < 0)
+			if (b->shape->nkey == 0)
+			{
+				MemoryContext old = MemoryContextSwitchTo(batch_cxt);
+
+				n = ws_rows_keyless_merge(ctx, map, edits, n);
+				MemoryContextSwitchTo(old);
+			}
+			if (n > 0 && prolly_apply(ctx, map, edits, n, map) < 0)
 				prolly_report(ctx);
 			n = 0;
 			bytes = 0;
@@ -941,7 +955,7 @@ tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 	MemoryContextDelete(batch_cxt);
 }
 
-/* A table's row map, of its rows in the transaction's snapshot, with none for one with no key. */
+/* A table's row map, of its rows in the transaction's snapshot. */
 static void
 tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 {
@@ -950,40 +964,36 @@ tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 	char	   *fingerprint;
 	Oid			types[2] = {OIDOID, TEXTOID};
 	Datum		values[2];
+	TreeRebuild b = {.ctx = ctx,.shape = &shape};
+	TupleDesc	desc = CreateTemplateTupleDesc(2);
+	AttrNumber	sort_col = 1;
+	Oid			sort_op = ByteaLessOperator;
+	Oid			collation = InvalidOid;
+	bool		nulls_first = false;
+	char		name[64];
+	PHash		map;
 
 	rel = table_open(relid, NoLock);
 	CaptureRelationShape(rel, &shape);
-	if (shape.nkey > 0)
-	{
-		TreeRebuild b = {.ctx = ctx,.shape = &shape};
-		TupleDesc	desc = CreateTemplateTupleDesc(2);
-		AttrNumber	sort_col = 1;
-		Oid			sort_op = ByteaLessOperator;
-		Oid			collation = InvalidOid;
-		bool		nulls_first = false;
-		char		name[64];
-		PHash		map;
-
-		TupleDescInitEntry(desc, 1, "key", BYTEAOID, -1, 0);
-		TupleDescInitEntry(desc, 2, "value", BYTEAOID, -1, 0);
-		TupleDescFinalize(desc);
-		b.f = palloc_array(WsField, Max(shape.nstored, 1));
-		b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-		b.sort = tuplesort_begin_heap(desc, 1, &sort_col, &sort_op, &collation, &nulls_first,
-									  maintenance_work_mem, NULL, TUPLESORT_NONE);
-		CaptureTableRowsRead(rel, &shape, GetActiveSnapshot(), tree_rebuild_row, &b);
-		ExecDropSingleTupleTableSlot(b.slot);
-		b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
-		if (prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
-			prolly_report(ctx);
-		tree_rebuild_write(ctx, &b, &map);
-		tuplesort_end(b.sort);
-		ExecDropSingleTupleTableSlot(b.slot);
-		snprintf(name, sizeof(name), "capture/map/%u", relid);
-		refs->routine->set(refs, name, &map);
-		tree_record_shape(relid, &shape);
-		pfree(b.f);
-	}
+	TupleDescInitEntry(desc, 1, "key", BYTEAOID, -1, 0);
+	TupleDescInitEntry(desc, 2, "value", BYTEAOID, -1, 0);
+	TupleDescFinalize(desc);
+	b.f = palloc_array(WsField, Max(shape.nstored, 1));
+	b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	b.sort = tuplesort_begin_heap(desc, 1, &sort_col, &sort_op, &collation, &nulls_first,
+								  maintenance_work_mem, NULL, TUPLESORT_NONE);
+	CaptureTableRowsRead(rel, &shape, GetActiveSnapshot(), tree_rebuild_row, &b);
+	ExecDropSingleTupleTableSlot(b.slot);
+	b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
+	if (prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+		prolly_report(ctx);
+	tree_rebuild_write(ctx, &b, &map);
+	tuplesort_end(b.sort);
+	ExecDropSingleTupleTableSlot(b.slot);
+	snprintf(name, sizeof(name), "capture/map/%u", relid);
+	refs->routine->set(refs, name, &map);
+	tree_record_shape(relid, &shape);
+	pfree(b.f);
 
 	/*
 	 * (or the first catalog change would tell all of every table.  One that changed between the
@@ -1105,6 +1115,20 @@ tree_after_record(void)
 	if (XLogRecPtrIsInvalid(lsn))
 		return;
 	tree_barrier_lsn = InvalidXLogRecPtr;
+
+	/*
+	 * A barrier holds this lock from before its marker until it has its root.  If it's free, no one's
+	 * waiting for this marker, so it's passed over, rather than apply here what a change later in
+	 * the WAL may be what gets past.  (Someone else having it only means this may be needless.)
+	 */
+	StartTransactionCommand();
+	if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock))
+	{
+		CommitTransactionCommand();
+		return;
+	}
+	CommitTransactionCommand();
+
 	tree_apply();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());

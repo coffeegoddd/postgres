@@ -63,7 +63,7 @@ patch doc/src/sgml/system-views.sgml  4  pg_roles.roltravels documented
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/common/tupdesc.c  4  a descriptor's entries start with no column tag, and equalTupleDescs compares it
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
-patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time, as of the branch the scan began on
+patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time, as of the branch the scan began on; with capture on, a versioned table with no usable key logs its whole old row
 patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (NewRelationStorageManager(); kept across rewrites); also (1b) bitmap scans and sampling of catalogs hide other branches' rows, as of the branch the scan began on
 patch src/backend/access/heap/heapam_indexscan.c  1b  index and index-only scans of catalogs hide other branches' rows, visiting the heap for each
 patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
