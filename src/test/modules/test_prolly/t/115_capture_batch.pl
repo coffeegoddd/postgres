@@ -183,6 +183,9 @@ SKIP:
 	ok($node->wait_for_log(qr/having its deferrable key changed/, $at), 'with the first side a batch exactly');
 	run('VACUUM FULL edge');
 	same_map('edge', 'which a rewrite gets past');
+
+	# (it stopped the worker, and another's running now)
+	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
 }
 
 # a barrier over what's more than a batch
