@@ -248,6 +248,7 @@ tests += {
       't/119_capture_branches.pl',
       't/120_capture_barrier_busy.pl',
       't/121_ws_snapshot_names.pl',
+      't/122_capture_failover.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

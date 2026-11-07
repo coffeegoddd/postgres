@@ -523,9 +523,11 @@ capture_slot_create(const char *name)
 
 	/*
 	 * (with the name held, so another worker starting too doesn't take this for its own new slot,
-	 * and before it's persisted, as a worker can die just after)
+	 * and before it's persisted, as a worker can die just after; for failover, so that a standby
+	 * syncing slots has it, and capture goes on from it once that's promoted: the maps come over
+	 * by the WAL, and what it tells again that the maps already have is passed over)
 	 */
-	ReplicationSlotCreate(name, true, RS_EPHEMERAL, false, false, false, false);
+	ReplicationSlotCreate(name, true, RS_EPHEMERAL, false, false, true, false);
 	CaptureSinkInUse->slot_to_be_made();
 
 	/* (repeatable read, so that the snapshot this gets is what all it reads is under) */
