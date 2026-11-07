@@ -150,6 +150,40 @@ run('ALTER TABLE p ALTER COLUMN a TYPE bigint USING a + 1');
 same_map('p1', 'a partition, by its partitioned table\'s statement');
 same_map('p2', 'and another');
 
+# a composite type changed under the columns using it, directly, nested in another, and in arrays:
+# no row's bytes change, but every value's text does
+run(q{CREATE TYPE inner_t AS (a integer); CREATE TYPE outer_t AS (i inner_t, n text);
+	CREATE TABLE nest (id integer PRIMARY KEY, d inner_t, o outer_t, arr inner_t[], oarr outer_t[]);
+	INSERT INTO nest VALUES (1, ROW(1), ROW(ROW(2), 'x'), ARRAY[ROW(3)::inner_t], ARRAY[ROW(ROW(4), 'y')::outer_t])});
+same_map('nest', 'composite values, nested and in arrays');
+run(q{ALTER TYPE inner_t ADD ATTRIBUTE b text});
+same_map('nest', 'an attribute added to the inner type');
+# (a composite's text has no names, nor its fingerprint: so nothing's to change)
+run(q{ALTER TYPE inner_t RENAME ATTRIBUTE a TO aa});
+same_map('nest', 'one renamed');
+run(q{ALTER TYPE inner_t DROP ATTRIBUTE b});
+same_map('nest', 'one dropped');
+run(q{ALTER TYPE outer_t ADD ATTRIBUTE m integer; INSERT INTO nest VALUES (2, ROW(5), ROW(ROW(6), 'z', 7), NULL, NULL)});
+same_map('nest', 'and the outer type, and written');
+
+# DDL from extensions: one whose script makes a table, renames its column and writes it; one with a
+# keyed table and types, written after; moving one out of the branch refused; and dropping one
+run("CREATE EXTENSION test_ext3 SCHEMA s");
+same_map('test_ext3_table', "a table an extension's script made, a column renamed and rows written");
+run("CREATE EXTENSION test_ext_set_schema SCHEMA s");
+run(q{INSERT INTO ess_table VALUES (1, 2, 'a'), (3, 4, 'b'); UPDATE ess_table SET f3 = 'c' WHERE f1 = 1; DELETE FROM ess_table WHERE f1 = 3});
+same_map('ess_table', "an extension's table, written");
+my ($rc_xm, $o_xm, $err_xm) = $node->psql('postgres', "$on1 CREATE SCHEMA plain; ALTER EXTENSION test_ext_set_schema SET SCHEMA plain");
+like($err_xm, qr/cannot move extension "test_ext_set_schema" between a versioned schema and another kind or branch of schema/,
+	'an extension moved out of a branch is refused');
+same_map('ess_table', 'and its table where it was');
+run("DROP EXTENSION test_ext_set_schema; DROP EXTENSION test_ext3");
+is(run(q{SELECT count(*) FROM pg_class WHERE relnamespace = 's'::regnamespace AND relname IN ('ess_table', 'test_ext3_table')}), '0',
+	"extensions dropped, and their tables");
+my ($rc_e, $out_e, $err_e) = $node->psql('postgres', "$on1 CREATE EXTENSION test_ext_cine SCHEMA s");
+like($err_e, qr/an object outside a versioned schema cannot depend on extension test_ext_cine/,
+	'one with objects outside the schema is refused');
+
 # rows moving between partitions, a partition detached and attached, and one attached with rows
 run('UPDATE p SET id = 12 WHERE id = 1');
 is(run(q{SELECT tableoid::regclass FROM p WHERE id = 12}), 'p2', 'a row moved by its key from one partition to another');
