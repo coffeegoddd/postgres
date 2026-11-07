@@ -42,6 +42,10 @@
  * An update doesn't send a value it left out of line.  With no key it's in the old row; with one,
  * it's what the row has now, from what's being applied or else the map, in the tree it's already in.
  *
+ * What's held between applying is transactions already committed, so it's applied once it's more
+ * than logical_decoding_work_mem, and each table's map is written a bounded batch at a time.  One
+ * transaction is held whole, as decoding tells it in one call, in which nothing can be written.
+ *
  * This is off by default (capture_to_trees), as there's more it doesn't follow.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
  * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
@@ -617,6 +621,10 @@ tree_fields(const WsRowShape *shape, char **row, WsField *f)
 	}
 }
 
+/* A table's map is written this much at a time. */
+#define TREE_BATCH_ROWS 1000
+#define TREE_BATCH_BYTES (8 * 1024 * 1024)
+
 /* What's being applied to a table, by key: each key's latest edit. */
 typedef struct TreeEditKey
 {
@@ -774,21 +782,25 @@ tree_record_shape(Oid relid, const WsRowShape *shape)
 }
 
 /* The changes held of one table, not yet applied by its branch's position, on its row map. */
+/* Edits on a table's map. */
 static void
-tree_edits_free(ProllyEdit *edits, size_t n)
+tree_apply_edits(ProllyCtx *ctx, const TreeTable *table, const WsRowShape *shape, PHash *map, ProllyEdit *edits, size_t n)
 {
-	for (size_t i = 0; i < n; i++)
+	if (shape->nkey == 0)
 	{
-		px_free((void *) edits[i].key);
-		if (edits[i].val != NULL)
-			px_free((void *) edits[i].val);
-	}
-}
+		char	   *relname = get_rel_name(table->relid);
+		ErrorContextCallback context = {
+			.previous = error_context_stack,
+			.callback = tree_apply_context,
+			.arg = psprintf("%s of relation %u", relname != NULL ? relname : "(gone)", table->relid),
+		};
 
-static void
-tree_apply_context(void *arg)
-{
-	errcontext("capture applying changes to table %s", (const char *) arg);
+		error_context_stack = &context;
+		n = ws_rows_keyless_merge(ctx, map, edits, n);
+		error_context_stack = context.previous;
+	}
+	if (n > 0 && prolly_apply(ctx, map, edits, n, map) < 0)
+		prolly_report(ctx);
 }
 
 static void
@@ -805,6 +817,11 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	PHash		map;
 	ListCell   *lc;
 	HTAB	   *latest = NULL;
+	bool		has_unchanged = false;
+	bool		wrote = false;
+	Size		bytes = 0;
+	MemoryContext batch_cxt;
+	MemoryContext was;
 
 	/* (one that's gone has nothing to hold, whatever was wrong with holding it) */
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(table->relid)))
@@ -846,16 +863,16 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
 		prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 		prolly_report(ctx);
+	batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture apply batch", ALLOCSET_DEFAULT_SIZES);
+	was = MemoryContextSwitchTo(batch_cxt);
 	for (int i = from; i < list_length(table->held); i++)
 	{
-		if (((TreeChange *) list_nth(table->held, i))->unchanged)
-		{
-			latest = tree_latest_edits();
-			break;
-		}
+		has_unchanged |= ((TreeChange *) list_nth(table->held, i))->unchanged;
 	}
-	f = palloc_array(WsField, most);
-	edits = palloc_array(ProllyEdit, 2 * (list_length(table->held) - from));
+	if (has_unchanged)
+		latest = tree_latest_edits();
+	f = MemoryContextAlloc(was, sizeof(WsField) * most);
+	edits = MemoryContextAlloc(was, sizeof(ProllyEdit) * 2 * Min(list_length(table->held) - from, TREE_BATCH_ROWS));
 	for (int i = from; i < list_length(table->held); i++)
 	{
 		TreeChange *change = list_nth(table->held, i);
@@ -868,6 +885,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		{
 			tree_fields(change->shape, change->old_row, f);
 			ws_row_store(ctx, change->shape, f, &k, &v);
+			bytes += k.len;
 			buf_free(&v);
 			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .del = true};
 			k = (Buf) BUF_INIT;
@@ -888,6 +906,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 				}
 			}
 			ws_row_store_kept(ctx, change->shape, f, &k, &v);
+			bytes += k.len + v.len;
 			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len};
 		}
 		if (latest != NULL)
@@ -900,30 +919,31 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 				entry->edit = e;
 			}
 		}
-	}
-	if (latest != NULL)
-		hash_destroy(latest);
-	if (n > 0 || anew)
-	{
-		if (shape->nkey == 0)
+		if (n + 2 > 2 * TREE_BATCH_ROWS || bytes >= TREE_BATCH_BYTES)
 		{
-			char	   *relname = get_rel_name(table->relid);
-			ErrorContextCallback context = {
-				.previous = error_context_stack,
-				.callback = tree_apply_context,
-				.arg = psprintf("%s of relation %u", relname != NULL ? relname : "(gone)", table->relid),
-			};
+			tree_apply_edits(ctx, table, shape, &map, edits, n);
+			wrote = true;
+			n = 0;
+			bytes = 0;
 
-			error_context_stack = &context;
-			n = ws_rows_keyless_merge(ctx, &map, edits, n);
-			error_context_stack = context.previous;
+			/* (what's in the map is found there now, and the keys are about to go) */
+			MemoryContextReset(batch_cxt);
+			if (has_unchanged)
+				latest = tree_latest_edits();
 		}
-		if (n > 0 && prolly_apply(ctx, &map, edits, n, &map) < 0)
-			prolly_report(ctx);
+	}
+	if (n > 0)
+	{
+		tree_apply_edits(ctx, table, shape, &map, edits, n);
+		wrote = true;
+	}
+	if (wrote || anew)
+	{
 		refs->routine->set(refs, name, &map);
 		tree_record_shape(table->relid, table->shape);
 	}
-	tree_edits_free(edits, n);
+	MemoryContextSwitchTo(was);
+	MemoryContextDelete(batch_cxt);
 	pfree(edits);
 	pfree(f);
 }
@@ -1006,9 +1026,6 @@ typedef struct TreeRebuild
 	TupleTableSlot *slot;
 } TreeRebuild;
 
-#define TREE_REBUILD_BATCH_ROWS 1000
-#define TREE_REBUILD_BATCH_BYTES (8 * 1024 * 1024)
-
 static bytea *
 tree_bytea(const uint8 *p, size_t len)
 {
@@ -1055,7 +1072,7 @@ static void
 tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 {
 	MemoryContext batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture rebuild batch", ALLOCSET_DEFAULT_SIZES);
-	ProllyEdit *edits = palloc_array(ProllyEdit, TREE_REBUILD_BATCH_ROWS);
+	ProllyEdit *edits = palloc_array(ProllyEdit, TREE_BATCH_ROWS);
 	int			n = 0;
 	Size		bytes = 0;
 	bool		more;
@@ -1079,7 +1096,7 @@ tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 			edits[n++] = (ProllyEdit) {.key = kc, .klen = klen, .val = vc, .vlen = vlen};
 			bytes += klen + vlen;
 		}
-		if (n > 0 && (!more || n == TREE_REBUILD_BATCH_ROWS || bytes >= TREE_REBUILD_BATCH_BYTES))
+		if (n > 0 && (!more || n == TREE_BATCH_ROWS || bytes >= TREE_BATCH_BYTES))
 		{
 			if (b->shape->nkey == 0)
 			{
@@ -1247,7 +1264,7 @@ tree_slot_will_do(void)
  * each of the branch's row maps saved as of it, for whoever's waiting.
  */
 static void
-tree_after_record(void)
+tree_marker(void)
 {
 	int32		branch = tree_barrier_branch;
 	XLogRecPtr	lsn = tree_barrier_lsn;
@@ -1257,8 +1274,6 @@ tree_after_record(void)
 	Oid			types[1] = {PG_LSNOID};
 	Datum		values[1] = {LSNGetDatum(lsn)};
 
-	if (XLogRecPtrIsInvalid(lsn))
-		return;
 	tree_barrier_lsn = InvalidXLogRecPtr;
 
 	/*
@@ -1340,6 +1355,46 @@ tree_after_record(void)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+}
+
+/*
+ * Whether applying what's held would stop at what's wrong with a change.  That may be what a change
+ * still to come gets past, so what's held isn't applied for its size then, or a worker would stop at
+ * the same place each time it started, and never read that far.
+ */
+static bool
+tree_held_has_problem(void)
+{
+	foreach_ptr(TreeTable, table, tree_tables)
+	{
+		for (int i = list_length(table->held) - 1; i >= 0; i--)
+		{
+			TreeChange *change = list_nth(table->held, i);
+
+			if (change->problem != NULL)
+				return true;
+			if (change->replace)
+				break;
+		}
+	}
+	return false;
+}
+
+/*
+ * A marker told is seen to; and what's held, being all of the transactions told so far, is
+ * applied once it's more than logical_decoding_work_mem, as the worker may be far behind.
+ */
+static bool
+tree_after_record(void)
+{
+	if (!XLogRecPtrIsInvalid(tree_barrier_lsn))
+		tree_marker();
+	if (tree_held == NIL ||
+		MemoryContextMemAllocated(tree_held_cxt, true) <= (Size) logical_decoding_work_mem * 1024 ||
+		tree_held_has_problem())
+		return false;
+	tree_apply();
+	return true;
 }
 
 const CaptureSink TreeCaptureSink = {
