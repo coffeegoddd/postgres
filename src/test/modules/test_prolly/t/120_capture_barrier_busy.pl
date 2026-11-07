@@ -58,9 +58,11 @@ $cols->query_until(qr/started/, "\\echo started\n$on CALL change_columns(400);\n
 
 # commits, one after another, as long as they're going, counted by which were still going; a commit
 # that errs fails here, and a writer that stops early, or takes too long, too
+$node->poll_query_until('postgres', q{SELECT count(*) = 2 FROM pg_stat_activity WHERE state = 'active' AND query LIKE 'CALL %'})
+  or die 'the writers did not start';
 my %during = (rows => 0, columns => 0);
 my $deadline = time + 3 * $PostgreSQL::Test::Utils::timeout_default;
-my $bad = 0;
+my ($bad, $first_bad) = (0, undef);
 while (1)
 {
 	# (a writer's last commit, of its row in s.done, is before its CALL's no longer active: so the
@@ -70,10 +72,15 @@ while (1)
 	last if $done eq 'columns,rows';
 	die 'a writer stopped' if $calls < 2 - scalar(grep { $done =~ /$_/ } 'rows', 'columns');
 	die 'the writers took too long' if time > $deadline;
-	$bad++ unless $node->safe_psql('postgres', "$on SELECT test_capture_barrier('s')") =~ /^[0-9a-f]{40}$/;
+	my $root = $node->safe_psql('postgres', "$on SELECT test_capture_barrier('s')");
+	if ($root !~ /^[0-9a-f]{40}$/)
+	{
+		$bad++;
+		$first_bad //= $root;
+	}
 	$during{$_}++ for grep { $done !~ /$_/ } keys %during;
 }
-is($bad, 0, 'every commit with a root');
+is($bad, 0, 'every commit with a root') or diag("the first without: '$first_bad'");
 ok($during{rows} >= 10, "commits made with rows being written ($during{rows})");
 ok($during{columns} >= 10, "and with columns being changed ($during{columns})");
 for my $bg ([$rows, 'rows-done'], [$cols, 'columns-done'])
