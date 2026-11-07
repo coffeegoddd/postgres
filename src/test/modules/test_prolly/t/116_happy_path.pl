@@ -18,9 +18,7 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('happy');
 $node->init(allows_streaming => 'logical');
 
-# (a merge's root is held by nothing until it's committed, which there's no call for yet)
-$node->append_conf('postgresql.conf',
-	"autovacuum = off\ncapture_to_trees = on\ndebug_block_mapped_heap = on\nchunk_free_in_background = off\n");
+$node->append_conf('postgresql.conf', "autovacuum = off\ncapture_to_trees = on\ndebug_block_mapped_heap = on\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
 
@@ -44,7 +42,7 @@ sub commit_root
 {
 	my ($branch) = @_;
 	$commits{$branch}++;
-	return sql($branch, qq{SELECT test_capture_commit_on('app', '$branch', '$branch $commits{$branch}')});
+	return sql($branch, qq{SELECT test_capture_commit_on('app', '$branch', '$branch-$commits{$branch}')});
 }
 
 # The root reading the branch's tables makes, which capture's must equal.
@@ -81,10 +79,11 @@ is($first, read_root('main'), 'of what the tables hold');
 # catalogs, with capture's maps carried over, not by restoring the root into empty catalogs.
 # (a commit holds nothing of the schema itself, its grants included.  TODO: what making a branch gives
 # the branch's schema)
+ok(sql('feature', q{SELECT test_vc_branch_at('feature', 'main', 'main-1')}), "a branch of history at main's first commit");
 sql('feature', q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner});
 sql('feature', qq{SELECT test_ws_root_restore('$first', 'app')});
 is(sql('feature', q{SELECT string_agg(name, ',' ORDER BY id) FROM app.customers}), 'ada,grace', 'the branch has the rows');
-is(commit_root('feature'), $first, 'and commits as the commit it came from');
+is(commit_root('feature'), $first, 'and commits the same root');
 
 # 4. Write on both branches, and commit both
 sql('main', q{SET ROLE app_owner; SET search_path = app;
@@ -102,7 +101,7 @@ is($on_feature, read_root('feature'), 'and on the branch');
 isnt($on_main, $on_feature, 'and they differ');
 
 # 5. See what changed.  TODO: dolt_diff().
-unlike(sql('main', qq{SELECT test_ws_diff('$first', '$first')}), qr/changed|\+[1-9]|-[1-9]|~[1-9]/, 'nothing changed between a commit and itself');
+unlike(sql('main', qq{SELECT test_ws_diff('$first', '$first')}), qr/changed|\+[1-9]|-[1-9]|~[1-9]/, 'a commit diffed against itself: nothing');
 my $diff = sql('main', qq{SELECT test_ws_diff('$first', '$on_main')});
 like($diff, qr/^rows customers \+0 -0 ~1$/m, 'on main: one customer changed');
 like($diff, qr/^rows notes \+1 -0 ~0$/m, 'and one note added');
@@ -113,26 +112,38 @@ like($feature_diff, qr/^rows customers \+1 -0 ~0$/m, 'on the branch: a customer 
 like($feature_diff, qr/^rows orders \+1 -0 ~0$/m, 'and an order');
 like($feature_diff, qr/^rows notes \+0 -1 ~0$/m, 'and a note taken away');
 
-# 6. Merge the branch into main.  TODO: dolt_merge(), which commits it.
-my ($merged_root, @conflicts) = split /\n/, sql('main', qq{SELECT test_ws_merge('$first', '$on_main', '$on_feature')});
+# 6. Merge the branch into main, and 7. have the merge as a schema with what both did.  The merge's root
+# is held by its transaction alone until it's committed, so it's restored in the same one.  TODO:
+# dolt_merge(), which commits it on main with both parents, and finds the base itself.
+my $merging = $node->safe_psql('postgres', qq{$on{merged} SELECT test_ws_use_history_store() IS NULL AS on_history \\gset
+	BEGIN;
+	CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner;
+	SELECT test_ws_merge('$first', '$on_main', '$on_feature', 'app') AS merge \\gset
+	SELECT split_part(:'merge', E'\\n', 1) AS merged_root \\gset
+	SELECT test_ws_root_restore(:'merged_root', 'app');
+	COMMIT;
+	\\echo :merge});
+my ($merged_root, @conflicts) = grep { $_ ne '' } split /\n/, $merging;
 like($merged_root, qr/^[0-9a-f]{40}$/, 'a merge');
 is(scalar(@conflicts), 0, 'with no conflicts');
-
-# 7. The merge, as a schema, has what both did
-sql('merged', q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner});
-sql('merged', qq{SELECT test_ws_root_restore('$merged_root', 'app')});
 is(sql('merged', q{SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM app.customers}),
 	'1:ada lovelace,2:grace,3:katherine', "customers: main's change and the branch's row");
+is(sql('merged', q{SELECT string_agg(id || ':' || customer || ':' || total, ',' ORDER BY id) FROM app.orders}),
+	'1:1:50.00,2:2:250.00,3:3:120.00', "orders: the branch's added to what was there");
 is(sql('merged', q{SELECT string_agg(id || ':' || total, ',' ORDER BY id) FROM app.big_orders}),
-	'2:250.00,3:120.00', "the view shows the branch's order");
+	'2:250.00,3:120.00', 'a view over them');
+is(sql('merged', q{SELECT conname FROM pg_constraint WHERE conrelid = 'app.orders'::regclass AND contype = 'f'}),
+	'orders_customer_fkey', 'their foreign key');
+is(sql('merged', q{SELECT last_value || ':' || is_called FROM app.order_ids}), '100:true', 'the sequence where it was');
 is(sql('merged', q{SELECT string_agg(body, ',' ORDER BY body) FROM app.notes}), 'first,on main',
 	"a table with no key: main's row added, the branch's one of two taken away");
 is(sql('merged', q{SELECT length(body) FROM app.documents WHERE id = 1}), '34000', 'a value kept out of line');
-is(commit_root('merged'), $merged_root, 'and committed, it is the merge');
+is(commit_root('merged'), $merged_root, "a commit of the merged schema holds the merge's root");
 
-# 8. Each branch's commits are in version control, by name
-is( $node->safe_psql('postgres', q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_history.pointers WHERE name LIKE 'vc/branch/%'}),
-	'vc/branch/feature,vc/branch/main,vc/branch/merged', 'a branch of version control for each');
+# 8. History: each branch's commits, newest first.  TODO: the merge as a commit on main, with both
+# parents, rather than a branch of its own.
+is(sql('main', q{SELECT test_vc_log('main')}), 'main-2 main-1 init', "main's");
+is(sql('feature', q{SELECT test_vc_log('feature')}), 'feature-2 feature-1 main-1 init', "the branch's, from main's first");
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;

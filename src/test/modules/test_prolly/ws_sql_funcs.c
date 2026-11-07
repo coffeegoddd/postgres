@@ -982,8 +982,8 @@ test_capture_commit(PG_FUNCTION_ARGS)
 
 /*
  * test_capture_commit_on(schema text, branch text, msg text) returns text: a commit of the schema from
- * capture on that branch of version control, made from the branch checked out if there's none.  The
- * root it holds.
+ * capture on that branch of version control, made from main's head if there's none.  The root it
+ * holds.
  */
 Datum
 test_capture_commit_on(PG_FUNCTION_ARGS)
@@ -1018,7 +1018,7 @@ test_ws_use_history_store(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* test_ws_root_restore(root text, dest text) returns void: of a root this backend captured */
+/* test_ws_root_restore(root text, dest text) returns void: of a root in this backend's store */
 Datum
 test_ws_root_restore(PG_FUNCTION_ARGS)
 {
@@ -1060,7 +1060,7 @@ diff_line_to(void *arg, const WsDiffEvent *e)
 	buf_append_byte(out, '\n');
 }
 
-/* test_ws_diff(from text, to text) returns text: its lines, of two roots this backend captured */
+/* test_ws_diff(from text, to text) returns text: its lines, of two roots in this backend's store */
 Datum
 test_ws_diff(PG_FUNCTION_ARGS)
 {
@@ -1103,7 +1103,7 @@ test_ws_rows_copy_as(PG_FUNCTION_ARGS)
 
 /*
  * test_ws_merge(base text, ours text, theirs text) returns text: the merged root on
- * its first line, then each conflict's, of roots this backend captured
+ * its first line, then each conflict's, of roots in this backend's store
  */
 Datum
 test_ws_merge(PG_FUNCTION_ARGS)
