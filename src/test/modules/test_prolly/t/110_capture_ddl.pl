@@ -222,7 +222,7 @@ $open->quit;
 same_map('in_flight', 'a table made open across a value renamed');
 
 # types changed with no rewrite, so no new file: only the type says
-for my $case ([ 'cidr', 'inet', q{'10.0.0.0/8'} ], [ 'integer', 'oid', '7' ], [ 'oid', 'regclass', '1259' ], [ 'timestamp', 'timestamptz', q{'2026-01-02 03:04:05'} ])
+for my $case ([ 'cidr', 'inet', q{'10.0.0.0/8'} ], [ 'integer', 'oid', '7' ], [ 'timestamp', 'timestamptz', q{'2026-01-02 03:04:05'} ])
 {
 	my ($from, $to, $v) = @$case;
 	run("CREATE TABLE ty_$from (id integer PRIMARY KEY, a $from); INSERT INTO ty_$from VALUES (1, $v)");
@@ -230,6 +230,12 @@ for my $case ([ 'cidr', 'inet', q{'10.0.0.0/8'} ], [ 'integer', 'oid', '7' ], [ 
 	run("ALTER TABLE ty_$from ALTER COLUMN a TYPE $to");
 	same_map("ty_$from", "$from retyped to $to");
 }
+
+# (a retype that changes what a value prints as with no rewrite, as oid to regclass did, is refused now)
+run('CREATE TABLE ty_named (id integer PRIMARY KEY, a oid); INSERT INTO ty_named VALUES (1, 1259)');
+my ($rc_named, $out_named, $err_named) = $node->psql('postgres', "$on1 ALTER TABLE s.ty_named ALTER COLUMN a TYPE regclass");
+like($err_named, qr/cannot be of type regclass, which names an object/, 'oid retyped to regclass is refused');
+same_map('ty_named', 'and the table is as it was');
 
 # a row type that changes, of a table or a composite, used for a column elsewhere
 run(q{CREATE TABLE row_of (id integer PRIMARY KEY, a integer);

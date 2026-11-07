@@ -45,6 +45,7 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
 #include "pgstat.h"
 #include "replication/logical.h"
@@ -2367,6 +2368,7 @@ CommitTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
+	BranchTablesCheckAtCommit();
 	CaptureRowsAtCommit(false);
 
 	/*
@@ -2639,6 +2641,7 @@ PrepareTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
+	BranchTablesCheckAtCommit();
 	CaptureRowsAtCommit(true);
 
 	/*

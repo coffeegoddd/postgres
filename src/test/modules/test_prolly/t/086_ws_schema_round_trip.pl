@@ -1184,7 +1184,6 @@ for my $t (
 	[ 'ihf', q{CREATE FOREIGN TABLE src.ihfp (a int) SERVER pxs; CREATE TABLE src.ihf () INHERITS (src.ihfp)} ],
 	[ 'ihg', q{CREATE TABLE src.ihg (a int); CREATE FOREIGN TABLE src.ihg1 () INHERITS (src.ihg) SERVER pxs} ],
 	[ 'ihy', q{CREATE TABLE src.ihy (a int); CREATE TABLE ptother.ihy1 () INHERITS (src.ihy)} ],
-	[ 'typed', 'CREATE TABLE src.typed OF src.rowtype' ],
 	[ 'am', 'CREATE TABLE src.am (a int) USING otheram' ],
 	[ 'nv', 'CREATE TABLE src.nv (a int); ALTER TABLE src.nv ADD CONSTRAINT nn NOT NULL a NOT VALID' ],
 	[ 'ni', 'CREATE TABLE src.ni (a int CONSTRAINT nn NOT NULL NO INHERIT)' ],
@@ -2090,9 +2089,9 @@ for my $case (
 	[ q{CREATE COLLATION nm3."C" FROM "POSIX"; CREATE TABLE nm3.r4 (a text COLLATE nm3."C")}, 'r4', 'a collation named as a catalog collation is' ],
 	[ q{CREATE TABLE nm3.r5 (a text); CREATE INDEX ON nm3.r5 (a COLLATE nm3."C")}, 'r5', 'an index key of such a collation' ],
 	[ q{CREATE FUNCTION nm3.round(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1'; CREATE TABLE nm3.r6 (a integer, CHECK (nm3.round(a) = 42))}, 'r6', 'a check of a function a catalog function would be taken for' ],
-	[ q{CREATE TABLE nm3.r7 (a regnamespace DEFAULT 'nm3'::regnamespace)}, 'r7', 'a default naming the schema by regnamespace' ],
+	[ q{CREATE TABLE nm3.r7 (a oid DEFAULT 'nm3'::regnamespace::oid)}, 'r7', 'a default naming the schema by regnamespace' ],
 	[ q{CREATE TABLE nm3.r8 (a oid[] DEFAULT '{nm3.pg_class}'::regclass[]::oid[])}, 'r8', 'a default of an array of reg* names' ],
-	[ q{CREATE FUNCTION nm3.g(nm3."text") RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE TABLE nm3.r9 (a regprocedure DEFAULT 'nm3.g(nm3.text)'::regprocedure)}, 'r9', 'a default of a function by reg* with its schema in its arguments' ],
+	[ q{CREATE FUNCTION nm3.g(nm3."text") RETURNS integer LANGUAGE sql AS 'SELECT 1'; CREATE TABLE nm3.r9 (a oid DEFAULT 'nm3.g(nm3.text)'::regprocedure::oid)}, 'r9', 'a default of a function by reg* with its schema in its arguments' ],
 	[ q{CREATE TYPE nm3.serial AS ENUM ('a'); CREATE TABLE nm3.r10 (a nm3.serial)}, 'r10', 'a type CREATE TABLE would take for a serial' ])
 {
 	my ($sql, $table, $what) = @$case;
@@ -2147,14 +2146,24 @@ for my $table ('parted', 'excl')
 	is($bytes->($node, 'postgres', $table, undef, 'nm6'), $hex, "$table is the same bytes restored");
 }
 
-# more that cannot be held without naming the schema
+# a column whose values name objects is refused as its table is made, however it holds them
+$node->safe_psql('postgres', q{CREATE TYPE nm2.holds_names AS (r regclass)});
 for my $case (
-	[ q{CREATE TABLE nm3.r11 (a nm3.serial[])}, 'r11', 'an array of a type named as a serial is' ],
 	[ q{CREATE TABLE nm3.r12 (a regnamespace) PARTITION BY LIST (a)}, 'r12', 'a partition key whose values are names' ],
 	[ q{CREATE TYPE nm3.holds AS (r regclass); CREATE TABLE nm3.r13 (a nm3.holds DEFAULT '(pg_class)'::nm3.holds)}, 'r13', 'a constant of a composite holding names' ],
 	[ q{CREATE TABLE nm3.r15 (a nm3.holds[] DEFAULT '{}')}, 'r15', 'a default of an array of a composite holding names' ],
 	[ q{CREATE TYPE nm3.holds2 AS (h nm3.holds); CREATE TABLE nm3.r16 (a nm3.holds2 DEFAULT '("(pg_class)")')}, 'r16', 'a default of a composite of one' ],
 	[ q{CREATE DOMAIN nm3.dreg AS regnamespace; CREATE TABLE nm3.r17 (a nm3.dreg) PARTITION BY LIST (a)}, 'r17', 'a partition key of a domain over a reg* type' ],
+	[ q{CREATE TABLE nm2.plain_holds (p nm2.holds_names)}, 'plain_holds', 'a column of a composite holding names, with no constant' ])
+{
+	my ($sql, $table, $what) = @$case;
+	my ($rc, $out, $err) = $node->psql('postgres', $sql);
+	like($err, qr/column "\w+" of versioned table "$table" cannot be of type .*, which names an object/, "refused as made: $what");
+}
+
+# more that cannot be held without naming the schema
+for my $case (
+	[ q{CREATE TABLE nm3.r11 (a nm3.serial[])}, 'r11', 'an array of a type named as a serial is' ],
 	[ q{CREATE TABLE nm3.r18 (a oid) PARTITION BY LIST ((a::regnamespace))}, 'r18', 'a partition key by an expression of a reg* type' ],
 	[ q{CREATE OPERATOR CLASS nm3.int4_ops FOR TYPE integer USING btree AS OPERATOR 3 =, FUNCTION 1 btint4cmp(integer, integer); CREATE TABLE nm3.r14 (a integer); CREATE INDEX ON nm3.r14 (a nm3.int4_ops)}, 'r14', 'an index key of an opclass named as a catalog opclass is' ])
 {
@@ -2182,10 +2191,6 @@ for my $text (q{nextval('NM3.txt'::text)}, q{nextval('nm3 . txt'::text)}, q{pg_s
 	my ($rc_x, $out_x, $err_x) = $node->psql('postgres', q{SELECT test_ws_schema_bytes('nm3', 'rt')});
 	like($err_x, qr/it must say its schema's name/, "refused: $text");
 }
-
-# a column holding names is no constant, with none to say them in
-$node->safe_psql('postgres', q{CREATE TYPE nm2.holds AS (r regclass); CREATE TABLE nm2.plain_holds (p nm2.holds)});
-isnt($bytes->($node, 'postgres', 'plain_holds', undef, 'nm2'), '', 'a column of a composite holding names, with no constant, is held');
 
 # a collation dropped since a snapshot is one to try again
 $node->safe_psql('postgres', q{CREATE COLLATION nm2.gone FROM "C"; CREATE TABLE nm2.coll_gone (a text COLLATE nm2.gone)});

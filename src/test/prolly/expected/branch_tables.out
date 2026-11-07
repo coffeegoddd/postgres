@@ -1,0 +1,143 @@
+-- What a versioned schema's tables can't be: a column of a type naming an object, however it's
+-- made, or a typed table.  Each is refused as its transaction commits.  A shared schema's tables
+-- can be either.
+SELECT pg_branch_id_allocate() AS b1 \gset
+SET catalog_branch = :b1;
+CREATE SCHEMA app VERSIONED;
+CREATE SCHEMA pub;
+SET search_path = app, pub;
+-- a column of each type naming an object
+CREATE TABLE t (id int PRIMARY KEY, r regclass);
+ERROR:  column "r" of versioned table "t" cannot be of type regclass, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regtype);
+ERROR:  column "r" of versioned table "t" cannot be of type regtype, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regproc);
+ERROR:  column "r" of versioned table "t" cannot be of type regproc, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regprocedure);
+ERROR:  column "r" of versioned table "t" cannot be of type regprocedure, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regoper);
+ERROR:  column "r" of versioned table "t" cannot be of type regoper, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regoperator);
+ERROR:  column "r" of versioned table "t" cannot be of type regoperator, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regconfig);
+ERROR:  column "r" of versioned table "t" cannot be of type regconfig, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regdictionary);
+ERROR:  column "r" of versioned table "t" cannot be of type regdictionary, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regnamespace);
+ERROR:  column "r" of versioned table "t" cannot be of type regnamespace, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regrole);
+ERROR:  column "r" of versioned table "t" cannot be of type regrole, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r regcollation);
+ERROR:  column "r" of versioned table "t" cannot be of type regcollation, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t (id int PRIMARY KEY, r aclitem);
+ERROR:  column "r" of versioned table "t" cannot be of type aclitem, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+-- inside an array, a domain, a composite type, and those in each other
+CREATE TABLE t (id int PRIMARY KEY, r regclass[]);
+ERROR:  column "r" of versioned table "t" cannot be of type regclass[], which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE DOMAIN app.names_a_class AS regclass;
+CREATE TABLE t (id int PRIMARY KEY, r app.names_a_class);
+ERROR:  column "r" of versioned table "t" cannot be of type names_a_class, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TYPE app.holds_a_role AS (who regrole, n int);
+CREATE TABLE t (id int PRIMARY KEY, r app.holds_a_role);
+ERROR:  column "r" of versioned table "t" cannot be of type holds_a_role, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TYPE app.holds_holder AS (inner_one app.holds_a_role);
+CREATE TABLE t (id int PRIMARY KEY, r app.holds_holder[]);
+ERROR:  column "r" of versioned table "t" cannot be of type holds_holder[], which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE DOMAIN app.many_names AS app.names_a_class[];
+CREATE TABLE t (id int PRIMARY KEY, r app.many_names);
+ERROR:  column "r" of versioned table "t" cannot be of type many_names, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+-- made any way at all: added, retyped, from a query, or on a partitioned table and so its partitions
+-- (moving a table into a versioned schema is refused already)
+CREATE TABLE t (id int PRIMARY KEY, v text);
+ALTER TABLE t ADD COLUMN r regclass;
+ERROR:  column "r" of versioned table "t" cannot be of type regclass, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+ALTER TABLE t ALTER COLUMN v TYPE regrole USING NULL;
+ERROR:  column "v" of versioned table "t" cannot be of type regrole, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE t2 AS SELECT 'pg_class'::regclass AS r;
+ERROR:  column "r" of versioned table "t2" cannot be of type regclass, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TABLE pub.moved (id int PRIMARY KEY, r regclass);
+ALTER TABLE pub.moved SET SCHEMA app;
+ERROR:  cannot move objects between a versioned schema and another kind or branch of schema
+CREATE TABLE parts (id int PRIMARY KEY, r text) PARTITION BY RANGE (id);
+CREATE TABLE parts1 PARTITION OF parts FOR VALUES FROM (0) TO (10);
+ALTER TABLE parts ADD COLUMN extra regtype;
+ERROR:  column "extra" of versioned table "parts" cannot be of type regtype, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+BEGIN;
+CREATE TABLE in_a_transaction (r regclass);
+SAVEPOINT s;
+CREATE TABLE fine (v text);
+COMMIT;
+ERROR:  column "r" of versioned table "in_a_transaction" cannot be of type regclass, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+SELECT to_regclass('app.fine') IS NULL AS not_made_either;
+ not_made_either 
+-----------------
+ t
+(1 row)
+
+-- one made and gone in the transaction is nothing to refuse
+BEGIN;
+CREATE TABLE gone (r regclass);
+DROP TABLE gone;
+COMMIT;
+-- a typed table
+CREATE TYPE app.row_type AS (id int, v text);
+CREATE TABLE typed OF app.row_type;
+ERROR:  versioned table "typed" cannot be a typed table
+-- on another branch than the session's, too
+SELECT pg_branch_id_allocate() AS b2 \gset
+SET catalog_branch = :b2;
+CREATE SCHEMA app VERSIONED;
+SET catalog_branch = :b1;
+BEGIN;
+SET LOCAL catalog_branch = :b2;
+CREATE TABLE app.on_b2 (r regclass);
+SET LOCAL catalog_branch = :b1;
+COMMIT;
+ERROR:  column "r" of versioned table "on_b2" cannot be of type regclass, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+-- what is fine: a shared schema's, other columns, and what's only like these
+CREATE TABLE pub.anything (id int PRIMARY KEY, r regclass, a aclitem[]);
+CREATE TABLE ok (id int PRIMARY KEY, o oid, n name, t text, j jsonb);
+SELECT count(*) AS tables FROM pg_class WHERE relnamespace = 'app'::regnamespace AND relkind IN ('r', 'p');
+ tables 
+--------
+      4
+(1 row)
+
+DROP TABLE pub.anything;
+DROP SCHEMA pub CASCADE;
+NOTICE:  drop cascades to table moved
+DROP SCHEMA app CASCADE;
+NOTICE:  drop cascades to 8 other objects
+DETAIL:  drop cascades to type names_a_class
+drop cascades to type holds_a_role
+drop cascades to type holds_holder
+drop cascades to type many_names
+drop cascades to table t
+drop cascades to table parts
+drop cascades to type row_type
+drop cascades to table ok
+SET catalog_branch = :b2;
+DROP SCHEMA app CASCADE;

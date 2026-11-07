@@ -10,3 +10,4 @@ test: branch_references
 test: branch_drop
 test: branch_storage
 test: branch_copy
+test: branch_tables
