@@ -179,6 +179,12 @@ static List *tree_tables = NIL;
 /* Tables to be told whole once what's applied is committed: their changes couldn't be. */
 static List *tree_to_heal = NIL;
 
+/*
+ * Set as what's wrong with a table's changes is raised, as they can't be applied: told apart from an
+ * error of anything else, such as the store's, which stops the worker.
+ */
+static bool tree_fault = false;
+
 /* Tables being healed, as pg_history.capture_healing has them: their changes are passed over. */
 static List *tree_healing = NIL;
 static void tree_heal(void);
@@ -1052,9 +1058,12 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 			now = NULL;
 	}
 	if (now == NULL)
+	{
+		tree_fault = true;
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the row map of relation %u has no row for an update that left a value as it was", table->relid)));
+	}
 
 	WsRowCodec->decode(change->shape, key, klen, now, nowlen, had);
 	for (int c = 0; c < change->shape->nstored; c++)
@@ -1062,9 +1071,12 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 		if (change->new_row[c] != tree_unchanged_value)
 			continue;
 		if (had[c].null)
+		{
+			tree_fault = true;
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the row map of relation %u has no value for one an update left as it was", table->relid)));
+		}
 		f[c] = had[c];
 	}
 	pfree(had);
@@ -1117,9 +1129,12 @@ tree_net_edits(Oid relid, ProllyEdit *edits, size_t n)
 			if (net > 0)
 			{
 				if (have || net > 1)
+				{
+					tree_fault = true;
 					ereport(ERROR,
 							(errcode(ERRCODE_DATA_CORRUPTED),
 							 errmsg("a transaction left a deferrable key of relation %u on more than one row", relid)));
+				}
 				have = true;
 				kept = edits[k];
 			}
@@ -1181,9 +1196,12 @@ tree_check_table(const TreeTable *table, const WsRowShape *shape)
 		bool		isnull;
 
 		if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)))
+		{
+			tree_fault = true;
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
+		}
 	}
 	pfree(array);
 	pfree(tags);
@@ -1291,21 +1309,27 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		elog(DEBUG1, "capture tree: passed over a change of %X/%X", LSN_FORMAT_ARGS(table->last_at));
 		return;
 	}
-	if (table->problem_at > before)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("%s", table->problem)));
-	if (table->layout_until > before)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
-	shape = table->last_shape;
-	anew = table->replaced && table->replaced_at > before;
-
 	/* (one being healed has no map: what comes before its rows told whole would make one of part) */
-	if (!anew && list_member_oid(tree_healing, table->relid))
+	if (list_member_oid(tree_healing, table->relid) && !(table->replaced && table->replaced_at > before))
 	{
 		elog(DEBUG1, "capture tree: passed over changes of relation %u, being healed", table->relid);
 		return;
 	}
+	if (table->problem_at > before)
+	{
+		tree_fault = true;
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("%s", table->problem)));
+	}
+	if (table->layout_until > before)
+	{
+		tree_fault = true;
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
+	}
+	shape = table->last_shape;
+	anew = table->replaced && table->replaced_at > before;
+
 	if (!anew)
 		tree_check_table(table, shape);
 
@@ -1473,7 +1497,7 @@ tree_quarantine(VcRefs *refs, TreeTable *table, const char *why, const char *whe
 	Oid			types[2] = {OIDOID, TEXTOID};
 	Datum		values[2] = {ObjectIdGetDatum(table->relid), CStringGetTextDatum(why)};
 	char		name[64];
-	bool		again = table->replaced;
+	bool		again = table->replaced && table->last_at == table->replaced_at;
 	MemoryContext old;
 
 	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
@@ -1483,7 +1507,7 @@ tree_quarantine(VcRefs *refs, TreeTable *table, const char *why, const char *whe
 							  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not record a table to heal");
 
-	/* (told whole and still not to be applied, telling it again would only do the same) */
+	/* (told whole, with nothing after, and still not to be applied: telling it again would do the same) */
 	ereport(WARNING,
 			(errmsg("capture can't apply changes of relation %u: %s", table->relid, why),
 			 again ? errdetail("Its rows were told whole, so it stays out until a change of what they print as tells them again.") :
@@ -1503,6 +1527,7 @@ tree_apply_one(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 	MemoryContext was = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 
+	tree_fault = false;
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(was);
 	PG_TRY();
@@ -1522,7 +1547,8 @@ tree_apply_one(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(was);
 		CurrentResourceOwner = owner;
-		if (e->sqlerrcode != ERRCODE_FEATURE_NOT_SUPPORTED && e->sqlerrcode != ERRCODE_DATA_CORRUPTED)
+		/* (a keyless map out of step is ws_rows_keyless_merge's to say, by its code) */
+		if (!tree_fault && e->sqlerrcode != ERRCODE_DATA_EXCEPTION)
 			ReThrowError(e);
 		ctx->err = 0;
 		tree_quarantine(refs, table, e->message, e->context);

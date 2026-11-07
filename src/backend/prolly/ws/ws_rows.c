@@ -102,7 +102,7 @@ ws_rows_keyless_merge(ProllyCtx *ctx, const PHash *map, ProllyEdit *edits, size_
 			count += ws_rows_keyless_count(edits[i].key, edits[i].klen, held, heldlen);
 		if (fewer > count)
 			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
+					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("a row map holds fewer of a keyless row than were removed"),
 					 errhint("A rewrite of the table, such as VACUUM FULL, has capture told all of its rows, once capture reads that far and no barrier is waiting.  Turning capture_in_background off and on begins again.")));
 		count -= fewer;

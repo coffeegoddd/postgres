@@ -259,14 +259,22 @@ CaptureRowsResend(Oid relid)
 {
 	Relation	rel;
 
+	/*
+	 * (the lock commits telling a table's rows take turns on too, so these aren't told at once with a
+	 * commit's of a change to what they print as, read as the catalogs were before it)
+	 */
+	if (!ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock))
+		return false;
 	if (!ConditionalLockRelationOid(relid, ShareLock))
 		return false;
+	AcceptInvalidationMessages();
 	rel = try_relation_open(relid, NoLock);
 	if (rel == NULL)
 		return true;
 	if (rel->rd_rel->relkind == RELKIND_RELATION && NamespaceBranch(RelationGetNamespace(rel)) != 0)
 		rows_write(rel, NamespaceBranch(RelationGetNamespace(rel)));
 	relation_close(rel, NoLock);
+	INJECTION_POINT("capture-heal-written", NULL);
 	return true;
 }
 

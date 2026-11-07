@@ -129,8 +129,36 @@ SKIP:
 	  or die 'no worker came back';
 	healed('bad');
 	same_map('bad', 'healed by the worker that came after');
+
+	# told whole as a commit changing what its rows print as tells them too: the two take turns,
+	# or the heal's, read as the catalogs were, would come after the commit's and stand
+	run(q{CREATE TYPE mood AS ENUM ('a'); CREATE TABLE moody (n integer, m mood); INSERT INTO moody VALUES (1, 'a'), (2, 'a')});
+	same_map('moody', 'a table of an enum');
+	out_of_step('moody');
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-heal-written', 'wait')});
+	run(q{DELETE FROM moody WHERE n = 2});
+	$node->wait_for_event('capture worker', 'capture-heal-written');
+	my $renaming = $node->background_psql('postgres');
+	$renaming->query_until(qr/started/, "\\echo started\n$on ALTER TYPE s.mood RENAME VALUE 'a' TO 'b';\n\\echo finished\n");
+	ok( $node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '%RENAME VALUE%' AND wait_event_type = 'Lock'}),
+		'a commit changing what its rows print as waits for the heal');
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-heal-written'); SELECT injection_points_detach('capture-heal-written')});
+	$renaming->{stdout} = '';
+	$renaming->{run}->pump until $renaming->{stdout} =~ /finished/ || !$renaming->{run}->pumpable;
+	$renaming->quit;
+	healed('moody');
+	same_map('moody', 'and the map is the rows as they print after it');
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
+
+# an error of the store's isn't a table's: it stops the worker, which no heal would get past
+run(q{CREATE TABLE stored (id integer PRIMARY KEY, v text); INSERT INTO stored VALUES (1, 'one')});
+caught_up();
+$node->safe_psql('postgres', qq{$on SELECT test_chunk_index_remove('pg_history.chunk_index', hash) FROM pg_history.pointers WHERE name = 'capture/map/' || 's.stored'::regclass::oid});
+$log_at = -s $node->logfile;
+run(q{INSERT INTO stored VALUES (2, 'two')});
+ok($node->wait_for_log(qr/ERROR:  chunk [0-9a-f]+ of a tree is not in the store/, $log_at), "a chunk of a table's map gone from the store");
+unlike(slurp_file($node->logfile, $log_at), qr/capture can't apply changes of relation/, 'is not taken for the table, to heal');
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
