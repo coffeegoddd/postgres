@@ -118,8 +118,8 @@ captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash 
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("capture is healing table \"%s\" of schema \"%s\"", table, schema),
-					 errdetail("Its changes couldn't be applied: %s", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1)),
-					 errhint("Try the commit again once its rows have been told whole.")));
+					 errdetail("Its changes couldn't be applied: %s.", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1)),
+					 errhint("Try the commit again once capture has read its rows again.")));
 	}
 	if (!barrier_refs->routine->get(barrier_refs, name, VC_REF_READ, map))
 		ereport(ERROR,
@@ -215,7 +215,8 @@ wake_worker(void)
  * it has changes, so it isn't.  A slot made again, as one invalidated is, reads every table whole
  * as of where it begins, so from there on it has all that was committed before.  A table being
  * healed has had changes passed over, its rows to be told whole: until then capture hasn't got
- * there for it, which is an error, as a commit of its schema is.
+ * there for it, which is an error, as a commit of its schema is.  Any table of the database, as
+ * this is of all of it, and for as long as a writer that keeps it from being healed goes on.
  */
 void
 CaptureWaitFor(XLogRecPtr lsn, int timeout_ms)
@@ -270,12 +271,13 @@ CaptureWaitFor(XLogRecPtr lsn, int timeout_ms)
 	{
 		bool		isnull;
 		Oid			relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		char	   *table = get_rel_name(relid);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("capture is healing table \"%s\"", get_rel_name(relid) ? get_rel_name(relid) : "?"),
-				 errdetail("Its changes couldn't be applied: %s", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2)),
-				 errhint("Try again once its rows have been told whole.")));
+				 errmsg("capture is healing table \"%s\" (OID %u)", table ? table : "?", relid),
+				 errdetail("Its changes couldn't be applied: %s.", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2)),
+				 errhint("Try again once capture has read its rows again.")));
 	}
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
