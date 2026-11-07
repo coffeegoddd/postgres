@@ -51,7 +51,7 @@ TAP_TESTS = 1
 
 EXTRA_INSTALL = src/test/modules/dummy_seclabel contrib/amcheck contrib/pageinspect contrib/pg_buffercache contrib/pg_prewarm contrib/pg_visibility \
 	contrib/pg_walinspect contrib/test_decoding \
-	src/test/modules/injection_points
+	src/test/modules/injection_points src/test/modules/test_extensions
 
 export enable_injection_points
 
