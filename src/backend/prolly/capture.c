@@ -39,6 +39,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
@@ -568,6 +569,21 @@ capture_decode(LogicalDecodingContext *ctx)
 }
 
 /*
+ * A decoding context has this backend announced as only decoding, whose xmin the slot sees to, so
+ * that snapshots and horizons pass it by.  Passing by its xid too would have other backends take a
+ * transaction it's writing in, which has none but this worker's, for one that's over: for one that
+ * aborted, as it hasn't committed, which a hint would then make so for good.  This one writes.
+ */
+static void
+capture_not_decoding_only(void)
+{
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyProc->statusFlags &= ~PROC_IN_LOGICAL_DECODING;
+	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+	LWLockRelease(ProcArrayLock);
+}
+
+/*
  * Clears the mark of a database with no versioned schema; false if one is being made, or there
  * now is one.  It looks again with the lock held, which whoever makes one holds until they commit.
  */
@@ -689,6 +705,7 @@ CaptureWorkerMain(Datum main_arg)
 										   .segment_open = wal_segment_open,
 										   .segment_close = wal_segment_close),
 								NULL, NULL, NULL);
+	capture_not_decoding_only();
 	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
 	CaptureSinkInUse->start(MyReplicationSlot->data.confirmed_flush);
 

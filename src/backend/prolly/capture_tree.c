@@ -1178,6 +1178,7 @@ tree_apply(void)
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
+	INJECTION_POINT("capture-applying", NULL);
 	CommitTransactionCommand();
 	tree_held = NIL;
 	MemoryContextReset(tree_held_cxt);
