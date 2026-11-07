@@ -74,6 +74,36 @@ run('ALTER TABLE t DROP COLUMN d; ALTER TABLE t ADD COLUMN d text');
 same_map('t', 'and in two');
 run(q{ALTER TABLE t ADD COLUMN g integer GENERATED ALWAYS AS (a + 1) STORED});
 same_map('t', 'a stored generated column added');
+
+# generated columns as they change: held as stored, a virtual one not at all, whatever's done to them
+run(q{CREATE TABLE gen (id integer PRIMARY KEY, a integer, s integer GENERATED ALWAYS AS (a * 2) STORED,
+	v integer GENERATED ALWAYS AS (a * 3) VIRTUAL); INSERT INTO gen (id, a) VALUES (1, 1), (2, 2)});
+same_map('gen', 'a stored and a virtual generated column');
+run(q{UPDATE gen SET a = 10 WHERE id = 1});
+same_map('gen', 'what they are made from changed');
+run(q{ALTER TABLE gen ALTER COLUMN s SET EXPRESSION AS (a * 5)});
+same_map('gen', "a stored one's expression changed, its values with it");
+run(q{ALTER TABLE gen ALTER COLUMN v SET EXPRESSION AS (a * 7)});
+same_map('gen', "a virtual one's expression changed, with nothing stored");
+run(q{ALTER TABLE gen ALTER COLUMN s DROP EXPRESSION; UPDATE gen SET s = 99 WHERE id = 2});
+same_map('gen', 'a stored one made an ordinary column, and written');
+run(q{ALTER TABLE gen ADD COLUMN s2 integer GENERATED ALWAYS AS (id + a) STORED; INSERT INTO gen (id, a) VALUES (3, 3)});
+same_map('gen', 'one added, with rows already there, and one written after');
+my ($rc_v, $out_v, $err_v) = $node->psql('postgres', "$on1 ALTER TABLE s.gen ALTER COLUMN v DROP EXPRESSION");
+like($err_v, qr/DROP EXPRESSION is not supported for virtual generated columns/,
+	'a virtual one cannot be made an ordinary column');
+same_map('gen', 'so none becomes stored');
+run(q{CREATE TABLE gen_key (a integer, k integer GENERATED ALWAYS AS (a * 10) STORED PRIMARY KEY, b text);
+	INSERT INTO gen_key (a, b) VALUES (1, 'one'), (2, 'two'); UPDATE gen_key SET a = 3 WHERE a = 2});
+same_map('gen_key', 'a stored generated column as the key, changed by what it is made from');
+run(q{CREATE TABLE gen_big (id integer PRIMARY KEY, n integer, b text, big text GENERATED ALWAYS AS (repeat(b, 5000)) STORED);
+	ALTER TABLE gen_big ALTER COLUMN big SET STORAGE EXTERNAL; INSERT INTO gen_big (id, n, b) VALUES (1, 0, 'x')});
+my $toasted = q{SELECT string_agg(DISTINCT chunk_id::text, ',') FROM pg_toast.pg_toast_} . run(q{SELECT 'gen_big'::regclass::oid});
+my $chunks = run($toasted);
+isnt($chunks, '', 'a stored generated value out of line');
+run(q{UPDATE gen_big SET n = 1});
+is(run($toasted), $chunks, 'left as it was by an update of another column, nothing told out of line again');
+same_map('gen_big', 'a stored generated value out of line, left as it was by an update');
 run(q{ALTER TABLE t ALTER COLUMN g SET EXPRESSION AS (a + 2)});
 same_map('t', 'its expression changed');
 run('ALTER TABLE t RENAME COLUMN v TO w');
