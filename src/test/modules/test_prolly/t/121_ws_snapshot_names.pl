@@ -46,6 +46,7 @@ my %cases = (
 my %unnamed = (
 	'a function it does not use renamed' => ['CREATE FUNCTION public.pf() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY)', 'ALTER FUNCTION public.pf() RENAME TO pf2'],
 	'a function it uses given a cost' => ['CREATE FUNCTION public.pf() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY, a integer DEFAULT public.pf())', 'ALTER FUNCTION public.pf() COST 5'],
+	'a table outside written' => ['CREATE TABLE public.po (a integer); CREATE TABLE s.t (id integer PRIMARY KEY)', 'INSERT INTO public.po VALUES (1)'],
 	'the schema of a function it uses granted on' => ['CREATE SCHEMA other; CREATE FUNCTION other.of() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY, a integer DEFAULT other.of())', 'GRANT USAGE ON SCHEMA other TO PUBLIC'],
 );
 

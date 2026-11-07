@@ -934,7 +934,9 @@ relations_version(const char *schema)
 				 * prints as: its schema's and its own, a column's for a column of it, and an enum's
 				 * labels.  Of what in the schema has a definition of its own; operators, operator
 				 * classes, casts, conversions and text search objects of the schema can't depend on
-				 * anything outside it, as reading refuses them)
+				 * anything outside it, as reading refuses them.  An enum's labels are all of them, so
+				 * one added fails a reader that prints another, which is safe; and a language, in no
+				 * schema, isn't here, as one in use is rarely renamed and one built in can't be)
 				 */
 				"  UNION ALL SELECT 'N' || d.refclassid || '.' || d.refobjid || '.' || d.refobjsubid || ':' || rn.nspname || '.' || "
 				"      coalesce(p.proname, t.typname, q.relname, l.collname, o.oprname, oc.opcname, of.opfname, tc.cfgname, td.dictname) || "
