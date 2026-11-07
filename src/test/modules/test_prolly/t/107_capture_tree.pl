@@ -332,7 +332,7 @@ $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2)");
 same_map($on, 't', 'and what comes after');
 $node->stop;
 
-# a layout changed with capture to trees off, and so nothing told: it stops, and stays stopped
+# a layout changed with capture to trees off, and so nothing told: the table's healed, its rows told whole
 $on = fresh_node('layout');
 $node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
 slot_active();
@@ -349,10 +349,8 @@ $node->restart;
 $from = -s $node->logfile;
 $node->safe_psql('postgres', "$on INSERT INTO s.t VALUES (2, 2)");
 ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $from), 'a layout changing and nothing told is an error');
-$from = -s $node->logfile;
-my $stopped = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'}) || 0;
-$node->safe_psql('postgres', "SELECT pg_terminate_backend($stopped)") if $stopped;
-ok($node->wait_for_log(qr/does not follow the layout of relation $relid changing/, $from), 'and it still is for the next worker');
+$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_history.capture_healing WHERE relid = $relid}) or die 'not healed';
+same_map($on, 't', 'and healed');
 $node->stop;
 
 done_testing();

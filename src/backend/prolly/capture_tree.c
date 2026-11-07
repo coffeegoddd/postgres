@@ -1455,7 +1455,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 
 /* A table whose changes couldn't be applied, let go of until it's told whole. */
 static void
-tree_quarantine(VcRefs *refs, TreeTable *table, const char *why)
+tree_quarantine(VcRefs *refs, TreeTable *table, const char *why, const char *where)
 {
 	Oid			types[2] = {OIDOID, TEXTOID};
 	Datum		values[2] = {ObjectIdGetDatum(table->relid), CStringGetTextDatum(why)};
@@ -1474,7 +1474,8 @@ tree_quarantine(VcRefs *refs, TreeTable *table, const char *why)
 	ereport(WARNING,
 			(errmsg("capture can't apply changes of relation %u: %s", table->relid, why),
 			 again ? errdetail("Its rows were told whole, so it stays out until a change of what they print as tells them again.") :
-			 errdetail("Its rows will be told whole again, holding off its writers while they're read.")));
+			 errdetail("Its rows will be told whole again, holding off its writers while they're read."),
+			 where != NULL ? errcontext("%s", where) : 0));
 	if (!again)
 	{
 		old = MemoryContextSwitchTo(TopMemoryContext);
@@ -1512,7 +1513,7 @@ tree_apply_one(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 		if (e->sqlerrcode != ERRCODE_FEATURE_NOT_SUPPORTED && e->sqlerrcode != ERRCODE_DATA_CORRUPTED)
 			ReThrowError(e);
 		ctx->err = 0;
-		tree_quarantine(refs, table, e->message);
+		tree_quarantine(refs, table, e->message, e->context);
 		FreeErrorData(e);
 	}
 	PG_END_TRY();

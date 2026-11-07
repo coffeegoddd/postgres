@@ -168,8 +168,8 @@ SKIP:
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
 
-# a map out of step with its table (as a value naming an object, now refused, once made one): an
-# error naming the table, which a rewrite gets past
+# a map out of step with its table (as a value naming an object, now refused, once made one): what
+# was wrong logged, naming the table, and the table healed
 run(q{CREATE TABLE names (r text, n integer); INSERT INTO names VALUES ('s.named', 1); CREATE TABLE no_names (r text, n integer)});
 caught_up();
 $node->safe_psql('postgres', qq{$on UPDATE pg_history.pointers SET hash = (SELECT hash FROM pg_history.pointers WHERE name = 'capture/map/' || 's.no_names'::regclass::oid)
@@ -179,11 +179,10 @@ run('DELETE FROM names');
 ok($node->wait_for_log(qr/fewer of a keyless row than were removed/, $log_at), 'a row the map does not have, removed');
 like(slurp_file($node->logfile, $log_at), qr/capture applying changes to table names of relation \d+/, 'says which table');
 
-# a barrier meanwhile gives up, and its marker doesn't stand in the way of what gets past it
-my ($rcb, $outb, $errb) = $node->psql('postgres', "$on SELECT test_capture_barrier('s', 200)");
-like($errb, qr/capture did not reach/, 'a barrier while capture has stopped');
-run('VACUUM FULL names');
-same_map('names', 'and a rewrite gets past it');
+# the table's healed, its rows told whole, with nothing done to it
+my $names = run(q{SELECT 's.names'::regclass::oid});
+$node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM pg_history.capture_healing WHERE relid = $names}) or die 'not healed';
+same_map('names', 'and healed');
 same_map('t', 'and capture goes on');
 
 # only what capture holds logs more, and a shared table's replica identity means what it says
