@@ -52,6 +52,14 @@
  * transaction is told in one call, in which nothing can be written, so what's held is bytes, which go
  * to a file past that same size, with what's asked of them all kept apart.
  *
+ * A table whose changes can't be applied is healed: what's wrong is logged, its map let go of, it's
+ * recorded in pg_history.capture_healing, and once what's applied with it is committed, its rows are
+ * told whole again, which holds off its writers while they're read.  Its changes meanwhile are passed
+ * over, and when its rows come to be applied, it's healed.  The rest goes on.  A commit from capture
+ * of its schema is refused meanwhile.  One that can't be applied as it's told whole stays out until
+ * a change of what its rows print as tells them again.  Other errors, such as the store's, still
+ * stop the worker.
+ *
  * This is off by default (capture_to_trees), as there's more it doesn't follow.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
  * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
@@ -120,7 +128,6 @@ typedef struct TreeTable
 	uint64		nheld;
 	bool		replaced;		/* it was told whole, at replaced_at: what's held is all there is */
 	XLogRecPtr	replaced_at;
-	int			problems;		/* how many have something wrong with them */
 	const char *problem;		/* the last, of the commit problem_at */
 	XLogRecPtr	problem_at;
 	XLogRecPtr	layout_until;	/* the last commit in a layout other than the one now */
@@ -168,6 +175,19 @@ typedef struct TreePosition
 /* What is known of each table; lasts as long as the worker. */
 static MemoryContext tree_tables_cxt = NULL;
 static List *tree_tables = NIL;
+
+/* Tables to be told whole once what's applied is committed: their changes couldn't be. */
+static List *tree_to_heal = NIL;
+
+/*
+ * Set as what's wrong with a table's changes is raised, as they can't be applied: told apart from an
+ * error of anything else, such as the store's, which stops the worker.
+ */
+static bool tree_fault = false;
+
+/* Tables being healed, as pg_history.capture_healing has them: their changes are passed over. */
+static List *tree_healing = NIL;
+static void tree_heal(void);
 
 /* What apply has yet to write; emptied by it. */
 static MemoryContext tree_held_cxt = NULL;
@@ -220,6 +240,23 @@ tree_let_go(VcRefs *refs)
 		(void) refs->routine->remove(refs, lfirst(lc));
 	tree_exec("DELETE FROM pg_history.capture_tables t "
 			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = t.relid)", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_healing h "
+			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = h.relid)", SPI_OK_DELETE);
+
+	/* (one whose telling whole was lost to a crash is told again) */
+	if (SPI_execute("SELECT relid FROM pg_history.capture_healing", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the tables to heal");
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		Oid			relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+
+		tree_to_heal = list_append_unique_oid(tree_to_heal, relid);
+		tree_healing = list_append_unique_oid(tree_healing, relid);
+		MemoryContextSwitchTo(old);
+	}
 	tree_exec("DELETE FROM pg_history.capture_positions p WHERE p.branch <> 0 AND "
 			  "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspbranch = p.branch)", SPI_OK_DELETE);
 }
@@ -274,6 +311,7 @@ tree_start(XLogRecPtr from)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	elog(DEBUG1, "capture tree starts at %X/%X", LSN_FORMAT_ARGS(from));
+	tree_heal();
 }
 
 static void
@@ -483,7 +521,6 @@ tree_held_add(TreeTable *table, const TreeChange *change, const char *problem)
 	table->last_shape = (WsRowShape *) change->shape;
 	if (problem != NULL)
 	{
-		table->problems++;
 		if (table->problem != NULL)
 			pfree((char *) table->problem);
 		table->problem = pstrdup(problem);
@@ -532,7 +569,6 @@ tree_held_forget(TreeTable *table)
 	table->nheld = 0;
 	table->replaced = false;
 	table->replaced_at = InvalidXLogRecPtr;
-	table->problems = 0;
 	if (table->problem != NULL)
 		pfree((char *) table->problem);
 	table->problem = NULL;
@@ -866,8 +902,7 @@ tree_check_as_of_commit(void)
 					pfree((char *) table->problem);
 				table->problem = psprintf("capture to trees has a row of relation %u written as catalogs were during its transaction and aren't now", seen->relid);
 				table->problem_at = tree_commit;
-				table->problems++;
-				MemoryContextSwitchTo(old);
+						MemoryContextSwitchTo(old);
 			}
 			pfree(now);
 		}
@@ -1023,9 +1058,12 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 			now = NULL;
 	}
 	if (now == NULL)
+	{
+		tree_fault = true;
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the row map of relation %u has no row for an update that left a value as it was", table->relid)));
+	}
 
 	WsRowCodec->decode(change->shape, key, klen, now, nowlen, had);
 	for (int c = 0; c < change->shape->nstored; c++)
@@ -1033,9 +1071,12 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 		if (change->new_row[c] != tree_unchanged_value)
 			continue;
 		if (had[c].null)
+		{
+			tree_fault = true;
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the row map of relation %u has no value for one an update left as it was", table->relid)));
+		}
 		f[c] = had[c];
 	}
 	pfree(had);
@@ -1088,9 +1129,12 @@ tree_net_edits(Oid relid, ProllyEdit *edits, size_t n)
 			if (net > 0)
 			{
 				if (have || net > 1)
+				{
+					tree_fault = true;
 					ereport(ERROR,
 							(errcode(ERRCODE_DATA_CORRUPTED),
 							 errmsg("a transaction left a deferrable key of relation %u on more than one row", relid)));
+				}
 				have = true;
 				kept = edits[k];
 			}
@@ -1152,9 +1196,12 @@ tree_check_table(const TreeTable *table, const WsRowShape *shape)
 		bool		isnull;
 
 		if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)))
+		{
+			tree_fault = true;
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
+		}
 	}
 	pfree(array);
 	pfree(tags);
@@ -1262,14 +1309,27 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		elog(DEBUG1, "capture tree: passed over a change of %X/%X", LSN_FORMAT_ARGS(table->last_at));
 		return;
 	}
+	/* (one being healed has no map: what comes before its rows told whole would make one of part) */
+	if (list_member_oid(tree_healing, table->relid) && !(table->replaced && table->replaced_at > before))
+	{
+		elog(DEBUG1, "capture tree: passed over changes of relation %u, being healed", table->relid);
+		return;
+	}
 	if (table->problem_at > before)
+	{
+		tree_fault = true;
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("%s", table->problem)));
+	}
 	if (table->layout_until > before)
+	{
+		tree_fault = true;
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
+	}
 	shape = table->last_shape;
 	anew = table->replaced && table->replaced_at > before;
+
 	if (!anew)
 		tree_check_table(table, shape);
 
@@ -1413,11 +1473,118 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		refs->routine->set(refs, name, &map);
 		tree_record_shape(table->relid, table->shape);
 	}
+	if (anew)
+	{
+		Oid			types[1] = {OIDOID};
+		Datum		values[1] = {ObjectIdGetDatum(table->relid)};
+
+		if (SPI_execute_with_args("DELETE FROM pg_history.capture_healing WHERE relid = $1",
+								  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not record a table healed");
+		tree_healing = list_delete_oid(tree_healing, table->relid);
+	}
 	MemoryContextSwitchTo(was);
 	MemoryContextDelete(batch_cxt);
 	MemoryContextDelete(read_cxt);
 	pfree(edits);
 	pfree(f);
+}
+
+/* A table whose changes couldn't be applied, let go of until it's told whole. */
+static void
+tree_quarantine(VcRefs *refs, TreeTable *table, const char *why, const char *where)
+{
+	Oid			types[2] = {OIDOID, TEXTOID};
+	Datum		values[2] = {ObjectIdGetDatum(table->relid), CStringGetTextDatum(why)};
+	char		name[64];
+	bool		again = table->replaced && table->last_at == table->replaced_at;
+	MemoryContext old;
+
+	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
+	(void) refs->routine->remove(refs, name);
+	if (SPI_execute_with_args("INSERT INTO pg_history.capture_healing VALUES ($1, $2) "
+							  "ON CONFLICT (relid) DO UPDATE SET reason = excluded.reason",
+							  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not record a table to heal");
+
+	/* (told whole, with nothing after, and still not to be applied: telling it again would do the same) */
+	ereport(WARNING,
+			(errmsg("capture can't apply changes of relation %u: %s", table->relid, why),
+			 again ? errdetail("Its rows were told whole, so it stays out until a change of what they print as tells them again.") :
+			 errdetail("Its rows will be told whole again, holding off its writers while they're read."),
+			 where != NULL ? errcontext("%s", where) : 0));
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	tree_healing = list_append_unique_oid(tree_healing, table->relid);
+	if (!again)
+		tree_to_heal = list_append_unique_oid(tree_to_heal, table->relid);
+	MemoryContextSwitchTo(old);
+}
+
+/* An error applying one table's changes is the table's: anything else stops the worker. */
+static void
+tree_apply_one(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
+{
+	MemoryContext was = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+
+	tree_fault = false;
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(was);
+	PG_TRY();
+	{
+		tree_apply_table(ctx, refs, table, positions);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(was);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *e;
+
+		MemoryContextSwitchTo(was);
+		e = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(was);
+		CurrentResourceOwner = owner;
+		/* (a keyless map out of step is ws_rows_keyless_merge's to say, by its code) */
+		if (!tree_fault && e->sqlerrcode != ERRCODE_DATA_EXCEPTION)
+			ReThrowError(e);
+		ctx->err = 0;
+		tree_quarantine(refs, table, e->message, e->context);
+		FreeErrorData(e);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Tables whose changes couldn't be applied, each told whole in a transaction of its own.  One a
+ * writer has is left for the next time, rather than have the worker, and all capture, wait.
+ */
+static void
+tree_heal(void)
+{
+	List	   *later = NIL;
+	MemoryContext old;
+
+	foreach_oid(relid, tree_to_heal)
+	{
+		bool		done;
+
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		done = CaptureRowsResend(relid);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		if (!done)
+		{
+			old = MemoryContextSwitchTo(TopMemoryContext);
+			later = lappend_oid(later, relid);
+			MemoryContextSwitchTo(old);
+		}
+	}
+	list_free(tree_to_heal);
+	tree_to_heal = later;
 }
 
 static void
@@ -1430,7 +1597,10 @@ tree_apply(void)
 	ListCell   *lc;
 
 	if (tree_held_changes == 0)
+	{
+		tree_heal();
 		return;
+	}
 	INJECTION_POINT("capture-apply-begin", NULL);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -1453,7 +1623,7 @@ tree_apply(void)
 		TreeTable  *table = lfirst(lc);
 
 		if (table->nheld > 0 || table->replaced)
-			tree_apply_table(&ctx, refs, table, positions);
+			tree_apply_one(&ctx, refs, table, positions);
 		tree_held_forget(table);
 	}
 	foreach_ptr(TreePosition, position, positions)
@@ -1474,6 +1644,7 @@ tree_apply(void)
 	tree_held_in_memory = 0;
 	MemoryContextReset(tree_held_cxt);
 	INJECTION_POINT("capture-applied", NULL);
+	tree_heal();
 }
 
 /*
@@ -1663,6 +1834,11 @@ tree_slot_made(XLogRecPtr from)
 	tree_exec("DELETE FROM pg_history.capture_positions", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_tables", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_fingerprints", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_healing", SPI_OK_DELETE);
+	list_free(tree_healing);
+	tree_healing = NIL;
+	list_free(tree_to_heal);
+	tree_to_heal = NIL;
 	tree_exec("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
 			  "WHERE n.nspbranch <> 0 AND c.relkind = 'r' AND c.relpersistence = 'p'", SPI_OK_SELECT);
 	for (uint64 i = 0; i < SPI_processed; i++)
@@ -1821,22 +1997,6 @@ tree_marker(void)
 }
 
 /*
- * Whether applying what's held would stop at what's wrong with a change.  That may be what a change
- * still to come gets past, so what's held isn't applied for its size then, or a worker would stop at
- * the same place each time it started, and never read that far.
- */
-static bool
-tree_held_has_problem(void)
-{
-	foreach_ptr(TreeTable, table, tree_tables)
-	{
-		if (table->problems > 0)
-			return true;
-	}
-	return false;
-}
-
-/*
  * A marker told is seen to; and what's held, being all of the transactions told so far, is
  * applied once it's more than logical_decoding_work_mem, as the worker may be far behind.
  */
@@ -1845,9 +2005,7 @@ tree_after_record(void)
 {
 	if (!XLogRecPtrIsInvalid(tree_barrier_lsn))
 		tree_marker();
-	if (tree_held_changes == 0 ||
-		tree_held_bytes <= (Size) logical_decoding_work_mem * 1024 ||
-		tree_held_has_problem())
+	if (tree_held_changes == 0 || tree_held_bytes <= (Size) logical_decoding_work_mem * 1024)
 		return false;
 	tree_apply();
 	return true;

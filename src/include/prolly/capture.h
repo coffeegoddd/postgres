@@ -207,6 +207,13 @@ extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, P
  */
 extern char CaptureLoggedIdentity(Relation relation);
 
+/*
+ * A versioned table's rows told whole, as a commit that changed what they print as tells them, the
+ * table held in ShareLock until this transaction ends; nothing if it's gone.  False, with nothing
+ * done, if a writer has it now.  What heals one whose changes capture couldn't apply.
+ */
+extern bool CaptureRowsResend(Oid relid);
+
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
 extern void CaptureRowsAtCommit(bool prepare);
 

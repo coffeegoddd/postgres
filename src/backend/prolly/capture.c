@@ -565,6 +565,11 @@ capture_decode(LogicalDecodingContext *ctx)
 		CaptureSinkInUse->apply();
 		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 	}
+	else
+	{
+		/* (with nothing read, what a sink has to do later, such as heal a table, is done now) */
+		CaptureSinkInUse->apply();
+	}
 }
 
 /*
