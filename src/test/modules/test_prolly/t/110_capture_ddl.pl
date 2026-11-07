@@ -149,6 +149,35 @@ caught_up();
 run('ALTER TABLE p ALTER COLUMN a TYPE bigint USING a + 1');
 same_map('p1', 'a partition, by its partitioned table\'s statement');
 same_map('p2', 'and another');
+
+# rows moving between partitions, a partition detached and attached, and one attached with rows
+run('UPDATE p SET id = 12 WHERE id = 1');
+same_map('p1', 'a row moved out of a partition by its key');
+same_map('p2', 'and into another');
+run('ALTER TABLE p DETACH PARTITION p2; INSERT INTO p2 VALUES (30, 30)');
+same_map('p2', 'a partition detached, a table of its own, and written');
+run('CREATE TABLE p3 (id integer PRIMARY KEY, a bigint); INSERT INTO p3 VALUES (21, 21), (22, 22);
+	ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (20) TO (30); INSERT INTO p VALUES (23, 23)');
+same_map('p3', 'a table with rows attached, and written through its partitioned table');
+$node->safe_psql('postgres', "$on1\nSET search_path = s, public;\nALTER TABLE p DETACH PARTITION p3 CONCURRENTLY;\nINSERT INTO p3 VALUES (40, 40);");
+same_map('p3', 'detached concurrently, and written');
+run('DELETE FROM p3 WHERE id = 40; ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (20) TO (30); UPDATE p SET id = 25 WHERE id = 11');
+same_map('p3', 'attached again, a row moved into it');
+same_map('p1', 'from where it was');
+
+# what would take a table's rows from one branch to another, or in or out of one, is refused: so a
+# table's map, by its object id, is only ever of one branch's table
+my ($rc_x, $out_x, $err_x) = $node->psql('postgres', "$on1 CREATE TABLE public.px PARTITION OF s.p FOR VALUES FROM (50) TO (60)");
+like($err_x, qr/cannot inherit from, or be a partition of/, 'a partition of a versioned table elsewhere is refused');
+run('CREATE TABLE moving (id integer PRIMARY KEY, a integer); INSERT INTO moving VALUES (1, 1)');
+my ($rc_m, $out_m, $err_m) = $node->psql('postgres', "$on1 ALTER TABLE s.moving SET SCHEMA public");
+like($err_m, qr/cannot move objects between a versioned schema and another kind or branch of schema/, 'a table moved out of a branch is refused');
+my ($rc_n, $out_n, $err_n) = $node->psql('postgres', "$on1 CREATE TABLE public.outside (id integer PRIMARY KEY); ALTER TABLE public.outside SET SCHEMA s");
+like($err_n, qr/cannot move objects between a versioned schema and another kind or branch of schema/, 'and one moved into one');
+$node->safe_psql('postgres', "$on2 CREATE SCHEMA s_two VERSIONED");
+my ($rc_o, $out_o, $err_o) = $node->psql('postgres', "$on1 ALTER TABLE s.moving SET SCHEMA s_two");
+like($err_o, qr/schema "s_two" does not exist/, "another branch's schema can't be named");
+same_map('moving', 'the table where it was');
 run('ALTER TABLE parent ALTER COLUMN a TYPE bigint USING a + 1');
 same_map('parent', 'a parent');
 same_map('kid', 'and what inherits from it');
