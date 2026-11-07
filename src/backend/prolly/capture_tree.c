@@ -29,7 +29,8 @@
  * references and tables here don't go in a dump, so a restored store begins again.
  * The chunks only they hold are in a dump like any others, until they're freed.
  *
- * All that was decoded since the last apply is held in memory.
+ * What's been told since the last apply is held: each table's changes as bytes, which go to a file
+ * of its own once all of them are more than logical_decoding_work_mem.
  *
  * What DDL does to a table's rows reaches here as all of its rows, in logical messages at the end
  * of its transaction (capture_rows.c), which void all that was told of the table before them.  So
@@ -48,7 +49,8 @@
  *
  * What's held between applying is transactions already committed, so it's applied once it's more
  * than logical_decoding_work_mem, and each table's map is written a bounded batch at a time.  One
- * transaction is held whole, as decoding tells it in one call, in which nothing can be written.
+ * transaction is told in one call, in which nothing can be written, so what's held is bytes, which go
+ * to a file past that same size, with what's asked of them all kept apart.
  *
  * This is off by default (capture_to_trees), as there's more it doesn't follow.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
@@ -85,6 +87,7 @@
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_rows.h"
+#include "storage/buffile.h"
 #include "storage/lmgr.h"
 #include "utils/hsearch.h"
 #include "utils/array.h"
@@ -100,26 +103,38 @@
 #include "utils/tuplesort.h"
 #include "varatt.h"
 
-/* A table's layout, for as long as the worker runs. */
+/* A table's layout, for as long as the worker runs; and what's held of it for apply. */
 typedef struct TreeTable
 {
 	Oid			relid;
 	WsRowShape *shape;			/* as of what was last told, in tree_tables_cxt */
-	List	   *held;			/* its TreeChanges for apply, in tree_held_cxt */
-	int			problems;		/* how many of them have one, since the last told whole */
 	XLogRecPtr	by_key;			/* the commit of the last change with its key's fields alone */
 	XLogRecPtr	by_row;			/* and of the last with its whole old row, as of a deferrable key */
+
+	/*
+	 * Its changes since the last told whole, as tree_held_add writes them, in order: in file, then in
+	 * buf, in tree_held_cxt.  The rest is what's asked of them all, in no more room however many they are.
+	 */
+	BufFile    *file;
+	StringInfo	buf;
+	uint64		nheld;
+	bool		replaced;		/* it was told whole, at replaced_at: what's held is all there is */
+	XLogRecPtr	replaced_at;
+	int			problems;		/* how many have something wrong with them */
+	const char *problem;		/* the last, of the commit problem_at */
+	XLogRecPtr	problem_at;
+	XLogRecPtr	layout_until;	/* the last commit in a layout other than the one now */
+	XLogRecPtr	last_at;		/* the last commit held */
+	WsRowShape *last_shape;		/* the layout of the last change held */
+	int32		branch;
+	bool		any_unchanged;
+	Size		held_bytes;		/* of tree_held_bytes */
 } TreeTable;
 
 /* One row's change, as text: the shape's fields, NULL for a null. */
 typedef struct TreeChange
 {
 	const WsRowShape *shape;
-	bool		replace;		/* all before this is void: no row of its own */
-	const char *problem;		/* what's wrong with holding it, unless that's voided */
-	char	   *as_of;			/* in a transaction that changed catalogs, its table's fingerprint */
-	Oid			relid;
-	Oid			filenode;
 	int32		branch;
 	XLogRecPtr	commit;
 	char	  **old_row;		/* the key's fields, or all of them if there's none or it's deferrable */
@@ -127,6 +142,20 @@ typedef struct TreeChange
 	bool		unchanged;		/* new_row has columns an update left where they were */
 	bool		whole_old_row;	/* of a deferrable key: see tree_net_edits */
 } TreeChange;
+
+/* A fingerprint of a table's as a row of a transaction that changed catalogs was told. */
+typedef struct TreeAsOf
+{
+	Oid			relid;
+	char	   *as_of;
+} TreeAsOf;
+
+/* The last commit held of a branch. */
+typedef struct TreeHeldBranch
+{
+	int32		branch;
+	XLogRecPtr	commit;
+} TreeHeldBranch;
 
 /* How far a branch was applied before this apply, and how far it now is. */
 typedef struct TreePosition
@@ -142,12 +171,18 @@ static List *tree_tables = NIL;
 
 /* What apply has yet to write; emptied by it. */
 static MemoryContext tree_held_cxt = NULL;
-static List *tree_held = NIL;
+static List *tree_held_branches = NIL;
+static uint64 tree_held_changes = 0;
+static Size tree_held_bytes = 0;	/* all of it, on file or not */
+static Size tree_held_in_memory = 0;
 
-/* Those of the transaction being told whose fingerprints are to be checked at its commit. */
+/* TreeAsOfs of the transaction being told, to be checked at its commit. */
 static List *tree_as_of = NIL;
 
-/* Reset for each row. */
+/* Reset for each change. */
+static MemoryContext tree_change_cxt = NULL;
+
+/* Reset for each column. */
 static MemoryContext tree_row_cxt = NULL;
 
 static XLogRecPtr tree_commit = InvalidXLogRecPtr;
@@ -222,6 +257,7 @@ tree_start(XLogRecPtr from)
 	{
 		tree_tables_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree tables", ALLOCSET_DEFAULT_SIZES);
 		tree_held_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree held", ALLOCSET_DEFAULT_SIZES);
+		tree_change_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree change", ALLOCSET_DEFAULT_SIZES);
 		tree_row_cxt = AllocSetContextCreate(TopMemoryContext, "capture tree row", ALLOCSET_DEFAULT_SIZES);
 	}
 
@@ -298,7 +334,7 @@ tree_table_of(Relation relation)
 static char tree_unchanged_value[1];
 
 /*
- * A tuple's fields by the table's shape, each in the context apply empties.  A value an update
+ * A tuple's fields by the table's shape, each in tree_change_cxt, reset for each change.  A value an update
  * left where it was is what old_row has of it, if it has it, or else, if unchanged is given, marked.
  */
 static char **
@@ -306,7 +342,7 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_on
 		 const char **problem)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
-	char	  **row = MemoryContextAllocZero(tree_held_cxt, sizeof(char *) * Max(table->shape->nstored, 1));
+	char	  **row = MemoryContextAllocZero(tree_change_cxt, sizeof(char *) * Max(table->shape->nstored, 1));
 	MemoryContext old = MemoryContextSwitchTo(tree_row_cxt);
 
 	for (int i = 0; i < desc->natts; i++)
@@ -343,86 +379,338 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_on
 				*unchanged = true;
 				continue;
 			}
-			was = MemoryContextSwitchTo(tree_held_cxt);
+			was = MemoryContextSwitchTo(tree_change_cxt);
 			*problem = psprintf("capture to trees was not given column \"%s\" of \"%s\", which an update left as it was",
 								NameStr(att->attname), RelationGetRelationName(relation));
 			MemoryContextSwitchTo(was);
 			continue;
 		}
-		row[at] = MemoryContextStrdup(tree_held_cxt, ws_text_to_utf8(OidOutputFunctionCall(output, value)));
+		row[at] = MemoryContextStrdup(tree_change_cxt, ws_text_to_utf8(OidOutputFunctionCall(output, value)));
 		MemoryContextReset(tree_row_cxt);
 	}
 	MemoryContextSwitchTo(old);
 	return row;
 }
 
+static bool tree_same_shape(const WsRowShape *a, const WsRowShape *b);
+
+/* What's in memory of every table's changes held goes to its file. */
+static void
+tree_held_spill(void)
+{
+	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
+
+	foreach_ptr(TreeTable, table, tree_tables)
+	{
+		if (table->buf == NULL || table->buf->len == 0)
+			continue;
+
+		/* (across transactions, as decoding's own only ever aborts) */
+		if (table->file == NULL)
+			table->file = BufFileCreateTemp(true);
+		BufFileWrite(table->file, table->buf->data, table->buf->len);
+
+		/* (its room too, which would otherwise stay what it grew to) */
+		pfree(table->buf->data);
+		pfree(table->buf);
+		table->buf = NULL;
+	}
+	MemoryContextSwitchTo(old);
+	elog(DEBUG1, "capture tree: spilled %zu bytes", tree_held_in_memory);
+	tree_held_in_memory = 0;
+}
+
+static void
+tree_held_note(TreeTable *table, int32 branch, XLogRecPtr commit)
+{
+	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
+	bool		known = false;
+
+	foreach_ptr(TreeHeldBranch, held, tree_held_branches)
+	{
+		if (held->branch == branch)
+		{
+			held->commit = commit;
+			known = true;
+		}
+	}
+	if (!known)
+	{
+		TreeHeldBranch *held = palloc_object(TreeHeldBranch);
+
+		held->branch = branch;
+		held->commit = commit;
+		tree_held_branches = lappend(tree_held_branches, held);
+	}
+	MemoryContextSwitchTo(old);
+	table->branch = branch;
+	table->last_at = commit;
+	tree_held_changes++;
+}
+
+static void
+tree_held_write_row(StringInfo out, char **row, int n)
+{
+	for (int c = 0; c < n; c++)
+	{
+		/* (-2 for a value left where it was, -1 for a null; with its end, so it's read in place) */
+		int32		len = row[c] == tree_unchanged_value ? -2 : row[c] == NULL ? -1 : (int32) strlen(row[c]);
+
+		appendBinaryStringInfo(out, &len, sizeof(len));
+		if (len >= 0)
+			appendBinaryStringInfo(out, row[c], len + 1);
+	}
+}
+
+/*
+ * A change held for apply: a uint32 of the length of the rest, then its commit, whether each row's
+ * there and how it's to be taken, how many fields, and the rows.
+ */
+static void
+tree_held_add(TreeTable *table, const TreeChange *change, const char *problem)
+{
+	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
+	int			start;
+	uint32		len;
+	uint8		flags = (change->old_row != NULL ? 1 : 0) | (change->new_row != NULL ? 2 : 0) |
+		(change->unchanged ? 4 : 0) | (change->whole_old_row ? 8 : 0);
+	int32		nstored = change->shape->nstored;
+
+	if (table->buf == NULL)
+		table->buf = makeStringInfo();
+	if (table->last_shape != NULL && !tree_same_shape(table->last_shape, change->shape))
+		table->layout_until = table->last_at;
+	table->last_shape = (WsRowShape *) change->shape;
+	if (problem != NULL)
+	{
+		table->problems++;
+		if (table->problem != NULL)
+			pfree((char *) table->problem);
+		table->problem = pstrdup(problem);
+		table->problem_at = change->commit;
+	}
+	table->any_unchanged |= change->unchanged;
+	table->nheld++;
+
+	/* (written where it's held, its length filled in once that's known) */
+	start = table->buf->len;
+	len = 0;
+	appendBinaryStringInfo(table->buf, &len, sizeof(len));
+	appendBinaryStringInfo(table->buf, &change->commit, sizeof(change->commit));
+	appendBinaryStringInfo(table->buf, &flags, sizeof(flags));
+	appendBinaryStringInfo(table->buf, &nstored, sizeof(nstored));
+	if (change->old_row != NULL)
+		tree_held_write_row(table->buf, change->old_row, nstored);
+	if (change->new_row != NULL)
+		tree_held_write_row(table->buf, change->new_row, nstored);
+	len = table->buf->len - start - sizeof(len);
+	memcpy(table->buf->data + start, &len, sizeof(len));
+	tree_held_bytes += sizeof(len) + len;
+	tree_held_in_memory += sizeof(len) + len;
+	table->held_bytes += sizeof(len) + len;
+	MemoryContextSwitchTo(old);
+	tree_held_note(table, change->branch, change->commit);
+	if (tree_held_in_memory > (Size) logical_decoding_work_mem * 1024)
+		tree_held_spill();
+}
+
+static void
+tree_held_forget(TreeTable *table)
+{
+	if (table->file != NULL)
+		BufFileClose(table->file);
+	table->file = NULL;
+	if (table->buf != NULL)
+	{
+		tree_held_in_memory -= table->buf->len;
+		pfree(table->buf->data);
+		pfree(table->buf);
+	}
+	table->buf = NULL;
+	tree_held_bytes -= table->held_bytes;
+	table->held_bytes = 0;
+	table->nheld = 0;
+	table->replaced = false;
+	table->replaced_at = InvalidXLogRecPtr;
+	table->problems = 0;
+	if (table->problem != NULL)
+		pfree((char *) table->problem);
+	table->problem = NULL;
+	table->problem_at = InvalidXLogRecPtr;
+	table->layout_until = InvalidXLogRecPtr;
+	table->last_at = InvalidXLogRecPtr;
+	table->last_shape = NULL;
+	table->any_unchanged = false;
+}
+
+/* Reading a table's changes held back, in order, from its file and then what's still in memory. */
+typedef struct TreeHeldReader
+{
+	TreeTable  *table;
+	bool		in_file;
+	int			at;
+} TreeHeldReader;
+
+static void
+tree_held_read_begin(TreeHeldReader *r, TreeTable *table)
+{
+	r->table = table;
+	r->at = 0;
+	r->in_file = table->file != NULL;
+	if (r->in_file && BufFileSeek(table->file, 0, 0, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not rewind what capture spilled: %m")));
+}
+
+/* The next change, in the current memory context; false at the end. */
+static bool
+tree_held_read(TreeHeldReader *r, TreeChange *change)
+{
+	uint32		len;
+	char	   *rec;
+	char	   *p;
+	uint8		flags;
+	int32		nstored;
+
+	if (r->in_file)
+	{
+		if (BufFileReadMaybeEOF(r->table->file, &len, sizeof(len), true) == 0)
+			r->in_file = false;
+		else
+		{
+			rec = palloc_extended(len, MCXT_ALLOC_HUGE);
+			BufFileReadExact(r->table->file, rec, len);
+		}
+	}
+	if (!r->in_file)
+	{
+		if (r->table->buf == NULL || r->at >= r->table->buf->len)
+			return false;
+		memcpy(&len, r->table->buf->data + r->at, sizeof(len));
+		r->at += sizeof(len);
+		rec = r->table->buf->data + r->at;
+		r->at += len;
+	}
+	p = rec;
+	memset(change, 0, sizeof(TreeChange));
+	memcpy(&change->commit, p, sizeof(change->commit));
+	p += sizeof(change->commit);
+	flags = *(uint8 *) p;
+	p += sizeof(flags);
+	memcpy(&nstored, p, sizeof(nstored));
+	p += sizeof(nstored);
+	change->unchanged = (flags & 4) != 0;
+	change->whole_old_row = (flags & 8) != 0;
+	for (int side = 0; side < 2; side++)
+	{
+		char	  **row;
+
+		if (!(flags & (side == 0 ? 1 : 2)))
+			continue;
+		row = palloc0_array(char *, Max(nstored, 1));
+		for (int c = 0; c < nstored; c++)
+		{
+			int32		cell;
+
+			memcpy(&cell, p, sizeof(cell));
+			p += sizeof(cell);
+			if (cell == -2)
+				row[c] = tree_unchanged_value;
+			else if (cell >= 0)
+			{
+				row[c] = p;
+				p += cell + 1;
+			}
+		}
+		if (side == 0)
+			change->old_row = row;
+		else
+			change->new_row = row;
+	}
+	return true;
+}
+
 static void
 tree_change(const CaptureChange *change)
 {
 	TreeTable  *table = tree_table_of(change->relation);
-	TreeChange *held = MemoryContextAllocZero(tree_held_cxt, sizeof(TreeChange));
-	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
+	TreeChange	held = {0};
+	const char *problem = NULL;
+	MemoryContext old;
 
-	held->shape = table->shape;
-	held->branch = change->branch;
-	held->commit = tree_commit;
+	held.shape = table->shape;
+	held.branch = change->branch;
+	held.commit = tree_commit;
 	if (change->catalogs_changed)
 	{
-		held->relid = RelationGetRelid(change->relation);
-		held->filenode = change->relation->rd_rel->relfilenode;
-		held->as_of = CaptureRowsFingerprint(held->relid, held->filenode);
-		tree_as_of = lappend(tree_as_of, held);
+		char	   *as_of;
+		bool		known = false;
+
+		old = MemoryContextSwitchTo(tree_held_cxt);
+		as_of = CaptureRowsFingerprint(RelationGetRelid(change->relation), change->relation->rd_rel->relfilenode);
+		foreach_ptr(TreeAsOf, seen, tree_as_of)
+		{
+			if (seen->relid == RelationGetRelid(change->relation) && strcmp(seen->as_of, as_of) == 0)
+				known = true;
+		}
+		if (known)
+			pfree(as_of);
+		else
+		{
+			TreeAsOf   *seen = palloc_object(TreeAsOf);
+
+			seen->relid = RelationGetRelid(change->relation);
+			seen->as_of = as_of;
+			tree_as_of = lappend(tree_as_of, seen);
+		}
+		MemoryContextSwitchTo(old);
 	}
-	MemoryContextSwitchTo(old);
-	held->whole_old_row = table->shape->nkey > 0 &&
+	held.whole_old_row = table->shape->nkey > 0 &&
 		!OidIsValid(RelationGetPrimaryKeyIndex(change->relation, false)) &&
 		OidIsValid(RelationGetPrimaryKeyIndex(change->relation, true));
 	if (change->old_tuple == NULL &&
 		(change->kind == CAPTURE_DELETE ||
-		 (change->kind == CAPTURE_UPDATE && (table->shape->nkey == 0 || held->whole_old_row))))
+		 (change->kind == CAPTURE_UPDATE && (table->shape->nkey == 0 || held.whole_old_row))))
 		elog(ERROR, "a change of \"%s\" came with no old row", RelationGetRelationName(change->relation));
 	if (change->old_tuple != NULL)
-		held->old_row = tree_row(change->relation, table, change->old_tuple,
-								 table->shape->nkey > 0 && !held->whole_old_row, NULL, NULL, &held->problem);
+		held.old_row = tree_row(change->relation, table, change->old_tuple,
+								table->shape->nkey > 0 && !held.whole_old_row, NULL, NULL, &problem);
 	if (change->new_tuple != NULL)
-		held->new_row = tree_row(change->relation, table, change->new_tuple, false, held->old_row,
-								 table->shape->nkey > 0 && !held->whole_old_row && change->kind == CAPTURE_UPDATE ?
-								 &held->unchanged : NULL, &held->problem);
-	if (held->problem == NULL && table->shape->nkey > 0)
+		held.new_row = tree_row(change->relation, table, change->new_tuple, false, held.old_row,
+								table->shape->nkey > 0 && !held.whole_old_row && change->kind == CAPTURE_UPDATE ?
+								&held.unchanged : NULL, &problem);
+	if (problem == NULL && table->shape->nkey > 0)
 	{
 		/* (both in a transaction can't be worked out, whichever came first) */
-		if (held->whole_old_row)
+		if (held.whole_old_row)
 			table->by_row = tree_commit;
 		else
 			table->by_key = tree_commit;
 		if (table->by_row == tree_commit && table->by_key == tree_commit)
-			held->problem = MemoryContextStrdup(tree_held_cxt,
-												psprintf("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it",
-														 table->relid));
+		{
+			old = MemoryContextSwitchTo(tree_change_cxt);
+			problem = psprintf("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it",
+							   table->relid);
+			MemoryContextSwitchTo(old);
+		}
 	}
-	if (held->problem != NULL)
-		table->problems++;
-	old = MemoryContextSwitchTo(tree_held_cxt);
-	table->held = lappend(table->held, held);
-	tree_held = lappend(tree_held, held);
-	MemoryContextSwitchTo(old);
+	tree_held_add(table, &held, problem);
+	MemoryContextReset(tree_change_cxt);
 }
 
 static void
 tree_truncate(int32 branch, Relation relation, bool restart_seqs, XLogRecPtr lsn)
 {
 	TreeTable  *table = tree_table_of(relation);
-	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
-	TreeChange *held = palloc0_object(TreeChange);
+	TreeChange	held = {0};
+	char	   *problem = psprintf("capture to trees does not follow a truncate of \"%s\"", RelationGetRelationName(relation));
 
-	held->shape = table->shape;
-	held->branch = branch;
-	held->commit = tree_commit;
-	held->problem = psprintf("capture to trees does not follow a truncate of \"%s\"", RelationGetRelationName(relation));
-	table->problems++;
-	table->held = lappend(table->held, held);
-	tree_held = lappend(tree_held, held);
-	MemoryContextSwitchTo(old);
+	held.shape = table->shape;
+	held.branch = branch;
+	held.commit = tree_commit;
+	tree_held_add(table, &held, problem);
+	pfree(problem);
 }
 
 /* Reading a message the server wrote: anything else is damage. */
@@ -457,7 +745,6 @@ tree_rows_begin(const char *p, const char *end)
 	TreeTable  *table = tree_table_by_id(relid);
 	MemoryContext old;
 	uint64	   *tags;
-	TreeChange *held;
 
 	if (nstored < 0 || nstored > WS_MAX_COLS || nkey < 0 || nkey > nstored)
 		elog(ERROR, "a message of a table's rows has a layout of %d columns, %d of them the key", nstored, nkey);
@@ -475,16 +762,19 @@ tree_rows_begin(const char *p, const char *end)
 	memcpy(tags, tree_take(&p, end, sizeof(uint64) * nstored), sizeof(uint64) * nstored);
 	ws_row_shape_init(table->shape, tags, nstored, nkey);
 	pfree(tags);
-	MemoryContextSwitchTo(tree_held_cxt);
-	table->problems = 0;
-	held = palloc0_object(TreeChange);
-	held->shape = table->shape;
-	held->replace = true;
-	held->branch = branch;
-	held->commit = tree_commit;
-	table->held = lappend(table->held, held);
-	tree_held = lappend(tree_held, held);
 	MemoryContextSwitchTo(old);
+	tree_held_forget(table);
+
+	/* (what it's replacing, and so what's to be said of that at the commit, is void) */
+	foreach_ptr(TreeAsOf, seen, tree_as_of)
+	{
+		if (seen->relid == relid)
+			tree_as_of = foreach_delete_current(tree_as_of, seen);
+	}
+	table->replaced = true;
+	table->replaced_at = tree_commit;
+	table->last_shape = table->shape;
+	tree_held_note(table, branch, tree_commit);
 }
 
 static void
@@ -498,24 +788,24 @@ tree_rows_batch(const char *p, const char *end)
 
 	if (table == NULL || table->shape == NULL)
 		elog(ERROR, "rows of relation %u came with nothing before them", relid);
-	old = MemoryContextSwitchTo(tree_held_cxt);
+	old = MemoryContextSwitchTo(tree_change_cxt);
 	for (int r = 0; r < nrows; r++)
 	{
-		TreeChange *held = palloc0_object(TreeChange);
+		TreeChange	held = {0};
 
-		held->shape = table->shape;
-		held->branch = branch;
-		held->commit = tree_commit;
-		held->new_row = palloc0_array(char *, Max(table->shape->nstored, 1));
+		held.shape = table->shape;
+		held.branch = branch;
+		held.commit = tree_commit;
+		held.new_row = palloc0_array(char *, Max(table->shape->nstored, 1));
 		for (int c = 0; c < table->shape->nstored; c++)
 		{
 			int32		len = read_int32(&p, end);
 
 			if (len >= 0)
-				held->new_row[c] = pnstrdup(tree_take(&p, end, len), len);
+				held.new_row[c] = pnstrdup(tree_take(&p, end, len), len);
 		}
-		table->held = lappend(table->held, held);
-		tree_held = lappend(tree_held, held);
+		tree_held_add(table, &held, NULL);
+		MemoryContextReset(tree_change_cxt);
 	}
 	MemoryContextSwitchTo(old);
 }
@@ -555,32 +845,31 @@ tree_message(const char *prefix, const char *data, Size size, bool transactional
 static void
 tree_check_as_of_commit(void)
 {
-	ListCell   *lc;
-
-	foreach(lc, tree_as_of)
+	foreach_ptr(TreeAsOf, seen, tree_as_of)
 	{
-		TreeChange *change = lfirst(lc);
+		TreeTable  *table = tree_table_by_id(seen->relid);
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(seen->relid));
 
-		if (change->problem == NULL)
+		/* (one that's gone has nothing held that this could be of) */
+		if (HeapTupleIsValid(tup))
 		{
-			HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(change->relid));
+			char	   *now = CaptureRowsFingerprint(seen->relid, ((Form_pg_class) GETSTRUCT(tup))->relfilenode);
 
-			if (HeapTupleIsValid(tup))
+			ReleaseSysCache(tup);
+
+			/* (one it's still different from at the commit has its rows told, voiding this) */
+			if (strcmp(now, seen->as_of) != 0)
 			{
-				char	   *now = CaptureRowsFingerprint(change->relid, ((Form_pg_class) GETSTRUCT(tup))->relfilenode);
+				MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
 
-				ReleaseSysCache(tup);
-
-				/* (one it's still different from at the commit has its rows told, voiding this) */
-				if (strcmp(now, change->as_of) != 0)
-				{
-					change->problem = MemoryContextStrdup(tree_held_cxt,
-														  psprintf("capture to trees has a row of relation %u written as catalogs were during its transaction and aren't now",
-																   change->relid));
-					tree_table_by_id(change->relid)->problems++;
-				}
-				pfree(now);
+				if (table->problem != NULL)
+					pfree((char *) table->problem);
+				table->problem = psprintf("capture to trees has a row of relation %u written as catalogs were during its transaction and aren't now", seen->relid);
+				table->problem_at = tree_commit;
+				table->problems++;
+				MemoryContextSwitchTo(old);
 			}
+			pfree(now);
 		}
 	}
 	tree_as_of = NIL;
@@ -942,59 +1231,45 @@ tree_write_edits(ProllyCtx *ctx, const TreeTable *table, const WsRowShape *shape
 static void
 tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 {
-	int			most = 1;
 	WsField    *f;
 	ProllyEdit *edits;
 	size_t		n = 0;
-	int			from = -1;
 	bool		anew = false;
 	const WsRowShape *shape = NULL;
 	char		name[64];
 	PHash		map;
-	ListCell   *lc;
 	HTAB	   *latest = NULL;
 	bool		has_unchanged = false;
-	bool		netting_at_all = false;
 	bool		netting = false;
 	bool		wrote = false;
 	Size		bytes = 0;
 	MemoryContext batch_cxt;
+	MemoryContext read_cxt;
 	MemoryContext was;
 	XLogRecPtr	netted = InvalidXLogRecPtr;
+	XLogRecPtr	before;
+	TreeHeldReader reader;
+	size_t		room;
 
 	/* (one that's gone has nothing to hold, whatever was wrong with holding it) */
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(table->relid)))
 		return;
 
-	/* what counts starts at the last told whole, of what's not been applied */
-	foreach(lc, table->held)
+	/* what's held starts at the last told whole; what's been applied before this is passed over */
+	before = tree_position_of(positions, table->branch)->before;
+	if (table->last_at <= before)
 	{
-		TreeChange *change = lfirst(lc);
-
-		if (change->commit <= tree_position_of(positions, change->branch)->before)
-		{
-			elog(DEBUG1, "capture tree: passed over a change of %X/%X", LSN_FORMAT_ARGS(change->commit));
-			continue;
-		}
-		if (from < 0 || change->replace)
-			from = foreach_current_index(lc);
-		most = Max(most, change->shape->nstored);
-	}
-	if (from < 0)
+		elog(DEBUG1, "capture tree: passed over a change of %X/%X", LSN_FORMAT_ARGS(table->last_at));
 		return;
-	for (int i = from; i < list_length(table->held); i++)
-	{
-		TreeChange *change = list_nth(table->held, i);
-
-		if (change->problem != NULL)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("%s", change->problem)));
-		if (shape != NULL && !tree_same_shape(shape, change->shape))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
-		shape = change->shape;
 	}
-	anew = ((TreeChange *) list_nth(table->held, from))->replace;
+	if (table->problem_at > before)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("%s", table->problem)));
+	if (table->layout_until > before)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
+	shape = table->last_shape;
+	anew = table->replaced && table->replaced_at > before;
 	if (!anew)
 		tree_check_table(table, shape);
 
@@ -1003,25 +1278,45 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 		prolly_report(ctx);
 	batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture apply batch", ALLOCSET_DEFAULT_SIZES);
+	read_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture apply read", ALLOCSET_DEFAULT_SIZES);
 	was = MemoryContextSwitchTo(batch_cxt);
-	for (int i = from; i < list_length(table->held); i++)
-	{
-		has_unchanged |= ((TreeChange *) list_nth(table->held, i))->unchanged;
-		netting_at_all |= ((TreeChange *) list_nth(table->held, i))->whole_old_row;
-	}
+	has_unchanged = table->any_unchanged;
 	if (has_unchanged)
 		latest = tree_latest_edits();
-	f = MemoryContextAlloc(was, sizeof(WsField) * most);
+	f = MemoryContextAlloc(was, sizeof(WsField) * Max(shape->nstored, 1));
 
-	/* (a deferrable key's transaction is written whole, so it can't be limited to a batch's room) */
-	edits = MemoryContextAlloc(was, sizeof(ProllyEdit) * 2 *
-							   (netting_at_all ? list_length(table->held) - from : Min(list_length(table->held) - from, TREE_BATCH_ROWS)));
-	for (int i = from; i < list_length(table->held); i++)
+	/* (a deferrable key's transaction is written whole, so it's more if it needs to be) */
+	room = 2 * TREE_BATCH_ROWS + 2;
+	edits = MemoryContextAlloc(was, sizeof(ProllyEdit) * room);
+	tree_held_read_begin(&reader, table);
+	for (;;)
 	{
-		TreeChange *change = list_nth(table->held, i);
+		TreeChange	read;
+		TreeChange *change = &read;
 		Buf			k = BUF_INIT,
 					v = BUF_INIT;
-		size_t		first = n;
+		size_t		first;
+		bool		more;
+
+		MemoryContextReset(read_cxt);
+		MemoryContextSwitchTo(read_cxt);
+		more = tree_held_read(&reader, &read);
+		MemoryContextSwitchTo(batch_cxt);
+		if (!more)
+			break;
+		if (read.commit <= before)
+		{
+			elog(DEBUG1, "capture tree: passed over a change of %X/%X", LSN_FORMAT_ARGS(read.commit));
+			continue;
+		}
+		read.shape = shape;
+		read.branch = table->branch;
+		if (n + 2 > room)
+		{
+			room *= 2;
+			edits = repalloc_huge(edits, sizeof(ProllyEdit) * room);
+		}
+		first = n;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1120,6 +1415,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	}
 	MemoryContextSwitchTo(was);
 	MemoryContextDelete(batch_cxt);
+	MemoryContextDelete(read_cxt);
 	pfree(edits);
 	pfree(f);
 }
@@ -1133,8 +1429,9 @@ tree_apply(void)
 	List	   *positions = NIL;
 	ListCell   *lc;
 
-	if (tree_held == NIL)
+	if (tree_held_changes == 0)
 		return;
+	INJECTION_POINT("capture-apply-begin", NULL);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -1142,51 +1439,39 @@ tree_apply(void)
 	cs = ChunkStoreOpen("pages");
 	refs = VcRefsOpen("pointers", cs);
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
-	foreach(lc, tree_held)
+	foreach_ptr(TreeHeldBranch, held, tree_held_branches)
 	{
-		TreeChange *change = lfirst(lc);
-		bool		known = false;
+		TreePosition *position = palloc_object(TreePosition);
 
-		foreach_ptr(TreePosition, position, positions)
-		{
-			if (position->branch == change->branch)
-			{
-				position->now = Max(position->now, change->commit);
-				known = true;
-			}
-		}
-		if (!known)
-		{
-			TreePosition *position = palloc_object(TreePosition);
-
-			position->branch = change->branch;
-			position->before = tree_position(change->branch);
-			position->now = Max(position->before, change->commit);
-			positions = lappend(positions, position);
-		}
+		position->branch = held->branch;
+		position->before = tree_position(held->branch);
+		position->now = Max(position->before, held->commit);
+		positions = lappend(positions, position);
 	}
 	foreach(lc, tree_tables)
 	{
 		TreeTable  *table = lfirst(lc);
 
-		if (table->held != NIL)
+		if (table->nheld > 0 || table->replaced)
 			tree_apply_table(&ctx, refs, table, positions);
-		table->held = NIL;
-		table->problems = 0;
+		tree_held_forget(table);
 	}
 	foreach_ptr(TreePosition, position, positions)
 	{
 		if (position->now > position->before)
 			tree_set_position(position->branch, position->now);
 	}
-	elog(DEBUG1, "capture tree: applied %d changes", list_length(tree_held));
+	elog(DEBUG1, "capture tree: applied " UINT64_FORMAT " changes", tree_held_changes);
 	prolly_ctx_free(&ctx);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
 	INJECTION_POINT("capture-applying", NULL);
 	CommitTransactionCommand();
-	tree_held = NIL;
+	tree_held_branches = NIL;
+	tree_held_changes = 0;
+	tree_held_bytes = 0;
+	tree_held_in_memory = 0;
 	MemoryContextReset(tree_held_cxt);
 	INJECTION_POINT("capture-applied", NULL);
 }
@@ -1560,8 +1845,8 @@ tree_after_record(void)
 {
 	if (!XLogRecPtrIsInvalid(tree_barrier_lsn))
 		tree_marker();
-	if (tree_held == NIL ||
-		MemoryContextMemAllocated(tree_held_cxt, true) <= (Size) logical_decoding_work_mem * 1024 ||
+	if (tree_held_changes == 0 ||
+		tree_held_bytes <= (Size) logical_decoding_work_mem * 1024 ||
 		tree_held_has_problem())
 		return false;
 	tree_apply();
