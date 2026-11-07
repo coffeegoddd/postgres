@@ -801,6 +801,16 @@ CREATE FUNCTION test_ws_rows_copy_as(schema text, rows_of text, record_of text, 
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_capture_barrier(schema text, timeout_ms integer DEFAULT 60000)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_capture_commit(schema text, msg text, dest text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_commit(text, text, text) FROM PUBLIC;
+
 CREATE FUNCTION test_ws_schema_shape(schema text, tab text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

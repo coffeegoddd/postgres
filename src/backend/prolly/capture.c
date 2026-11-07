@@ -54,8 +54,6 @@
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
 
-#define CAPTURE_SLOT_PREFIX "prolly_capture_"
-
 /* How often the launcher looks, and how often a worker looks for what is new. */
 #define CAPTURE_LAUNCHER_NAPTIME_MS 5000
 #define CAPTURE_WORKER_NAPTIME_MS 1000
@@ -290,6 +288,11 @@ logging_apply(void)
 }
 
 static void
+logging_after_record(void)
+{
+}
+
+static void
 logging_slot_to_be_made(void)
 {
 }
@@ -303,6 +306,7 @@ const CaptureSink LoggingCaptureSink = {
 	.message = logging_message,
 	.commit = logging_commit,
 	.apply = logging_apply,
+	.after_record = logging_after_record,
 	.slot_to_be_made = logging_slot_to_be_made,
 	.slot_made = logging_slot_made,
 	.slot_will_do = logging_slot_will_do,
@@ -548,7 +552,10 @@ capture_decode(LogicalDecodingContext *ctx)
 		if (errm != NULL)
 			elog(ERROR, "could not read a record for capture: %s", errm);
 		if (record != NULL)
+		{
 			LogicalDecodingProcessRecord(ctx, ctx->reader);
+			CaptureSinkInUse->after_record();
+		}
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (ctx->reader->EndRecPtr > from)

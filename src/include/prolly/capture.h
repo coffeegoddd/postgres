@@ -40,6 +40,7 @@
 
 #include "access/htup.h"
 #include "access/xlogdefs.h"
+#include "prolly/engine/prolly.h"
 #include "prolly/ws/ws_row.h"
 #include "utils/snapshot.h"
 #include "replication/output_plugin.h"
@@ -55,6 +56,12 @@
  *						NULL) and that much of its output text
  */
 #define PROLLY_MESSAGE_PREFIX "prolly."
+
+/* A barrier's marker, and where a branch's row maps are saved as of it: <lsn>/<relid>. */
+#define CAPTURE_BARRIER_PREFIX PROLLY_MESSAGE_PREFIX "capture.barrier"
+#define CAPTURE_BARRIER_REF_PREFIX "capture/barrier/"
+
+#define CAPTURE_SLOT_PREFIX "prolly_capture_"
 #define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
@@ -110,7 +117,8 @@ typedef struct CaptureSink
 
 	/*
 	 * A logical message: transactional ones between begin and commit, others at once, once flushed,
-	 * and with no transaction running.
+	 * outside any transaction told, though as decoding's other callbacks are, so nothing can be
+	 * written from it.
 	 */
 	void		(*message) (const char *prefix, const char *data, Size size, bool transactional, XLogRecPtr lsn);
 	void		(*commit) (TransactionId xid, XLogRecPtr commit_lsn, XLogRecPtr end_lsn);
@@ -121,6 +129,9 @@ typedef struct CaptureSink
 	 * is told again.
 	 */
 	void		(*apply) (void);
+
+	/* Once a record's been decoded, before the next is read, with no transaction running. */
+	void		(*after_record) (void);
 
 	/*
 	 * A new slot is being made, so what the sink has kept may not join what it is told next.  With
@@ -175,6 +186,14 @@ extern void CaptureRelationShape(Relation relation, WsRowShape *shape);
 typedef void (*CaptureRowFn) (void *arg, const char **fields);
 extern void CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot snapshot,
 								 CaptureRowFn fn, void *arg);
+
+/*
+ * A versioned schema's root value as of an exact point, every transaction committed before it and
+ * none after, its chunks put with ctx, to be committed in this transaction; capture_barrier.c says
+ * what it holds off and refuses.  An error if capture hasn't got there within timeout_ms, which is
+ * only of waiting for capture, not of waiting for locks or of building the root.
+ */
+extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root);
 
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
 extern void CaptureRowsAtCommit(bool prepare);
