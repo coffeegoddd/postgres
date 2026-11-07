@@ -45,14 +45,15 @@ sub same_map
 # Many transactions of about a kilobyte each, on a table of each kind.
 sub write_many
 {
-	my ($n) = @_;
+	my ($n, $after_first) = @_;
 	my @script;
 	for my $i (1 .. $n)
 	{
 		push @script, "INSERT INTO keyed VALUES ($i + (SELECT coalesce(max(id), 0) FROM keyed), repeat('k', 800));",
 		  "INSERT INTO nokey VALUES ($i % 7, repeat('n', 800));";
+		push @script, $after_first if $i == 1 && defined $after_first;
 	}
-	run(join("\n", @script));
+	return run(join("\n", @script));
 }
 
 run(q{CREATE TABLE keyed (id integer PRIMARY KEY, v text); CREATE TABLE nokey (a integer, v text)});
@@ -120,15 +121,27 @@ SKIP:
 # killed in the middle of committing what it applied: none of it is, and it's applied again whole
 SKIP:
 {
-	skip 'injection points not supported by this build', 3 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
+	skip 'injection points not supported by this build', 5 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
 	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applying', 'wait')");
 	caught_up();
 	my $state = qq{SELECT (SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.keyed'::regclass::oid)
 		|| ' ' || (SELECT string_agg(branch || ':' || lsn, ',' ORDER BY branch) FROM pg_history.capture_positions)};
 	my $was = $node->safe_psql('postgres', "$on $state");
-	write_many(50);
+	# (what's flushed after the first transaction's commit: the first apply with anything in it waits,
+	# so every pass before it read less than that commit, and the slot is before it)
+	my $first = write_many(50, 'SELECT pg_current_wal_insert_lsn();');
 	$node->wait_for_event('capture worker', 'capture-applying');
 	is($node->safe_psql('postgres', "$on $state"), $was, 'what it applied, map and positions, is not committed yet');
+	is($node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < '$first'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'}),
+		't', 'nor the slot moved past the first of what it applied');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applying'); SELECT injection_points_wakeup('capture-applying')});
+	caught_up();
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applying', 'wait')});
+	# and applied at the end of what it read, rather than as a batch past logical_decoding_work_mem
+	$first = run(q{INSERT INTO keyed VALUES (-1, 'small'); SELECT pg_current_wal_insert_lsn()});
+	$node->wait_for_event('capture worker', 'capture-applying');
+	is($node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < '$first'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'}),
+		't', 'nor for a small write, applied at the end of what was read');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applying')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
