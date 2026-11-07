@@ -41,8 +41,8 @@ sub caught_up
 # Every branch written at once: a session each, with a transaction open in every one at the same
 # time, each statement of each going in between the others' of the same round, and the commits in
 # an order the beginnings weren't, so that the WAL has every branch's changes interleaved within
-# transactions still running; each more than logical_decoding_work_mem, so that they're held on
-# file together.
+# transactions still running; and more than logical_decoding_work_mem of them, so that decoding
+# holds some on file.
 my $began = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
 my @s = map { $node->background_psql('postgres', on_error_stop => 1) } 0 .. $n - 1;
 $s[$_]->query_safe("$on[$_] SET search_path = app") for 0 .. $n - 1;
@@ -60,7 +60,7 @@ $_->quit for @s;
 caught_up();
 $node->poll_query_until('postgres', qq{SELECT spill_txns > 1 FROM pg_stat_replication_slots WHERE slot_name = '$slot'})
   or die 'no transactions held on file';
-pass('transactions held on file together, as decoding read them');
+pass('transactions held on file as decoding read them');
 
 for my $i (0 .. $n - 1)
 {
