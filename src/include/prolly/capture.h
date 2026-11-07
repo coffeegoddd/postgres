@@ -130,8 +130,11 @@ typedef struct CaptureSink
 	 */
 	void		(*apply) (void);
 
-	/* Once a record's been decoded, before the next is read, with no transaction running. */
-	void		(*after_record) (void);
+	/*
+	 * Once a record's been decoded, before the next is read, with no transaction running.  True if
+	 * all that's been told has been applied, so that the slot can be told of it.
+	 */
+	bool		(*after_record) (void);
 
 	/*
 	 * A new slot is being made, so what the sink has kept may not join what it is told next.  With

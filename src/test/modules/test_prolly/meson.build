@@ -241,6 +241,7 @@ tests += {
       't/112_capture_barrier.pl',
       't/113_capture_keyless.pl',
       't/114_capture_toast.pl',
+      't/115_capture_batch.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

@@ -287,9 +287,10 @@ logging_apply(void)
 {
 }
 
-static void
+static bool
 logging_after_record(void)
 {
+	return false;
 }
 
 static void
@@ -554,7 +555,8 @@ capture_decode(LogicalDecodingContext *ctx)
 		if (record != NULL)
 		{
 			LogicalDecodingProcessRecord(ctx, ctx->reader);
-			CaptureSinkInUse->after_record();
+			if (CaptureSinkInUse->after_record())
+				LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 		}
 		CHECK_FOR_INTERRUPTS();
 	}

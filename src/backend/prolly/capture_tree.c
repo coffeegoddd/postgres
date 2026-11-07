@@ -46,6 +46,10 @@
  * An update doesn't send a value it left out of line.  With no key, or a deferrable one, it's in the
  * old row; with any other key, it's what the row has now, from what's being applied or else the map, in the tree it's already in.
  *
+ * What's held between applying is transactions already committed, so it's applied once it's more
+ * than logical_decoding_work_mem, and each table's map is written a bounded batch at a time.  One
+ * transaction is held whole, as decoding tells it in one call, in which nothing can be written.
+ *
  * This is off by default (capture_to_trees), as there's more it doesn't follow.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
  * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
@@ -102,6 +106,9 @@ typedef struct TreeTable
 	Oid			relid;
 	WsRowShape *shape;			/* as of what was last told, in tree_tables_cxt */
 	List	   *held;			/* its TreeChanges for apply, in tree_held_cxt */
+	int			problems;		/* how many of them have one, since the last told whole */
+	XLogRecPtr	by_key;			/* the commit of the last change with its key's fields alone */
+	XLogRecPtr	by_row;			/* and of the last with its whole old row, as of a deferrable key */
 } TreeTable;
 
 /* One row's change, as text: the shape's fields, NULL for a null. */
@@ -381,6 +388,20 @@ tree_change(const CaptureChange *change)
 		held->new_row = tree_row(change->relation, table, change->new_tuple, false, held->old_row,
 								 table->shape->nkey > 0 && !held->whole_old_row && change->kind == CAPTURE_UPDATE ?
 								 &held->unchanged : NULL, &held->problem);
+	if (held->problem == NULL && table->shape->nkey > 0)
+	{
+		/* (both in a transaction can't be worked out, whichever came first) */
+		if (held->whole_old_row)
+			table->by_row = tree_commit;
+		else
+			table->by_key = tree_commit;
+		if (table->by_row == tree_commit && table->by_key == tree_commit)
+			held->problem = MemoryContextStrdup(tree_held_cxt,
+												psprintf("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it",
+														 table->relid));
+	}
+	if (held->problem != NULL)
+		table->problems++;
 	old = MemoryContextSwitchTo(tree_held_cxt);
 	table->held = lappend(table->held, held);
 	tree_held = lappend(tree_held, held);
@@ -398,6 +419,7 @@ tree_truncate(int32 branch, Relation relation, bool restart_seqs, XLogRecPtr lsn
 	held->branch = branch;
 	held->commit = tree_commit;
 	held->problem = psprintf("capture to trees does not follow a truncate of \"%s\"", RelationGetRelationName(relation));
+	table->problems++;
 	table->held = lappend(table->held, held);
 	tree_held = lappend(tree_held, held);
 	MemoryContextSwitchTo(old);
@@ -454,6 +476,7 @@ tree_rows_begin(const char *p, const char *end)
 	ws_row_shape_init(table->shape, tags, nstored, nkey);
 	pfree(tags);
 	MemoryContextSwitchTo(tree_held_cxt);
+	table->problems = 0;
 	held = palloc0_object(TreeChange);
 	held->shape = table->shape;
 	held->replace = true;
@@ -550,9 +573,12 @@ tree_check_as_of_commit(void)
 
 				/* (one it's still different from at the commit has its rows told, voiding this) */
 				if (strcmp(now, change->as_of) != 0)
+				{
 					change->problem = MemoryContextStrdup(tree_held_cxt,
 														  psprintf("capture to trees has a row of relation %u written as catalogs were during its transaction and aren't now",
 																   change->relid));
+					tree_table_by_id(change->relid)->problems++;
+				}
 				pfree(now);
 			}
 		}
@@ -628,6 +654,10 @@ tree_fields(const WsRowShape *shape, char **row, WsField *f)
 	}
 }
 
+/* A table's map is written this much at a time. */
+#define TREE_BATCH_ROWS 1000
+#define TREE_BATCH_BYTES (8 * 1024 * 1024)
+
 /* What's being applied to a table, by key: each key's latest edit. */
 typedef struct TreeEditKey
 {
@@ -674,9 +704,9 @@ tree_latest_edits(void)
 
 /*
  * A new row's fields, with what an update left where it was from the row it has now, under key.
- * They point into what's returned, to be freed once they've been stored.
+ * They point into that, which is the batch's.
  */
-static uint8 *
+static void
 tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *change, const PHash *map,
 					HTAB *latest, const ProllyEdit *edits, const uint8 *key, size_t klen, WsField *f)
 {
@@ -684,7 +714,6 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 	TreeLatestEdit *found = hash_search(latest, &look, HASH_FIND, NULL);
 	const uint8 *now = NULL;
 	size_t		nowlen = 0;
-	uint8	   *copy;
 	WsField    *had = palloc_array(WsField, Max(change->shape->nstored, 1));
 
 	if (found != NULL)
@@ -709,10 +738,7 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the row map of relation %u has no row for an update that left a value as it was", table->relid)));
 
-	/* (what prolly_get gives lasts until the next it's asked, and these go on to be stored) */
-	copy = palloc(Max(nowlen, 1));
-	memcpy(copy, now, nowlen);
-	WsRowCodec->decode(change->shape, key, klen, copy, nowlen, had);
+	WsRowCodec->decode(change->shape, key, klen, now, nowlen, had);
 	for (int c = 0; c < change->shape->nstored; c++)
 	{
 		if (change->new_row[c] != tree_unchanged_value)
@@ -724,7 +750,6 @@ tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *ch
 		f[c] = had[c];
 	}
 	pfree(had);
-	return copy;
 }
 
 static int
@@ -876,39 +901,44 @@ tree_record_shape(Oid relid, const WsRowShape *shape)
 	pfree(tags);
 }
 
-/* The changes held of one table, not yet applied by its branch's position, on its row map. */
-static void
-tree_edits_free(ProllyEdit *edits, size_t n)
-{
-	for (size_t i = 0; i < n; i++)
-	{
-		px_free((void *) edits[i].key);
-		if (edits[i].val != NULL)
-			px_free((void *) edits[i].val);
-	}
-}
-
 static void
 tree_apply_context(void *arg)
 {
 	errcontext("capture applying changes to table %s", (const char *) arg);
 }
 
-/* Edits written on a table's map, so that what's looked for from here is found there. */
+/*
+ * Edits written on a table's map, so that what's looked for from here is found there.  All of what
+ * they point to, and what's found by key, goes with batch_cxt, which is current.
+ */
 static void
-tree_write_edits(ProllyCtx *ctx, PHash *map, ProllyEdit *edits, size_t *n, HTAB **latest, bool has_unchanged)
+tree_write_edits(ProllyCtx *ctx, const TreeTable *table, const WsRowShape *shape, PHash *map, ProllyEdit *edits, size_t *n,
+				 HTAB **latest, bool has_unchanged, MemoryContext batch_cxt)
 {
-	if (*n > 0 && prolly_apply(ctx, map, edits, *n, map) < 0)
-		prolly_report(ctx);
-	if (has_unchanged)
+	size_t		count = *n;
+
+	if (shape->nkey == 0)
 	{
-		hash_destroy(*latest);
-		*latest = tree_latest_edits();
+		char	   *relname = get_rel_name(table->relid);
+		ErrorContextCallback context = {
+			.previous = error_context_stack,
+			.callback = tree_apply_context,
+			.arg = psprintf("%s of relation %u", relname != NULL ? relname : "(gone)", table->relid),
+		};
+
+		error_context_stack = &context;
+		count = ws_rows_keyless_merge(ctx, map, edits, count);
+		error_context_stack = context.previous;
 	}
-	tree_edits_free(edits, *n);
+	if (count > 0 && prolly_apply(ctx, map, edits, count, map) < 0)
+		prolly_report(ctx);
+	elog(DEBUG1, "capture tree: wrote %zu edits of relation %u", count, table->relid);
+	MemoryContextReset(batch_cxt);
+	*latest = has_unchanged ? tree_latest_edits() : NULL;
 	*n = 0;
 }
 
+/* The changes held of one table, not yet applied by its branch's position, on its row map. */
 static void
 tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 {
@@ -924,10 +954,13 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	ListCell   *lc;
 	HTAB	   *latest = NULL;
 	bool		has_unchanged = false;
+	bool		netting_at_all = false;
 	bool		netting = false;
 	bool		wrote = false;
+	Size		bytes = 0;
+	MemoryContext batch_cxt;
+	MemoryContext was;
 	XLogRecPtr	netted = InvalidXLogRecPtr;
-	XLogRecPtr	last_commit = InvalidXLogRecPtr;
 
 	/* (one that's gone has nothing to hold, whatever was wrong with holding it) */
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(table->relid)))
@@ -969,24 +1002,26 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
 		prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 		prolly_report(ctx);
+	batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture apply batch", ALLOCSET_DEFAULT_SIZES);
+	was = MemoryContextSwitchTo(batch_cxt);
 	for (int i = from; i < list_length(table->held); i++)
 	{
-		if (((TreeChange *) list_nth(table->held, i))->unchanged)
-		{
-			latest = tree_latest_edits();
-			has_unchanged = true;
-			break;
-		}
+		has_unchanged |= ((TreeChange *) list_nth(table->held, i))->unchanged;
+		netting_at_all |= ((TreeChange *) list_nth(table->held, i))->whole_old_row;
 	}
-	f = palloc_array(WsField, most);
-	edits = palloc_array(ProllyEdit, 2 * (list_length(table->held) - from));
+	if (has_unchanged)
+		latest = tree_latest_edits();
+	f = MemoryContextAlloc(was, sizeof(WsField) * most);
+
+	/* (a deferrable key's transaction is written whole, so it can't be limited to a batch's room) */
+	edits = MemoryContextAlloc(was, sizeof(ProllyEdit) * 2 *
+							   (netting_at_all ? list_length(table->held) - from : Min(list_length(table->held) - from, TREE_BATCH_ROWS)));
 	for (int i = from; i < list_length(table->held); i++)
 	{
 		TreeChange *change = list_nth(table->held, i);
 		Buf			k = BUF_INIT,
 					v = BUF_INIT;
 		size_t		first = n;
-		uint8	   *kept = NULL;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -996,36 +1031,30 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		 */
 		if (netting && (!change->whole_old_row || change->commit != netted))
 		{
-			if (!change->whole_old_row && change->commit == netted)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it", table->relid)));
 			n = tree_net_edits(table->relid, edits, n);
 			netting = false;
-			tree_write_edits(ctx, &map, edits, &n, &latest, has_unchanged);
+			tree_write_edits(ctx, table, shape, &map, edits, &n, &latest, has_unchanged, batch_cxt);
 			wrote = true;
+			bytes = 0;
 			first = 0;
 		}
 		if (change->whole_old_row && !netting)
 		{
-			if (n > 0 && change->commit == last_commit)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it", table->relid)));
 			if (n > 0)
 			{
-				tree_write_edits(ctx, &map, edits, &n, &latest, has_unchanged);
+				tree_write_edits(ctx, table, shape, &map, edits, &n, &latest, has_unchanged, batch_cxt);
 				wrote = true;
+				bytes = 0;
 			}
 			first = 0;
 			netting = true;
 			netted = change->commit;
 		}
-		last_commit = change->commit;
 		if (change->old_row != NULL)
 		{
 			tree_fields(change->shape, change->old_row, f);
 			ws_row_store(ctx, change->shape, f, &k, &v);
+			bytes += k.len;
 			if (change->whole_old_row)
 				edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len, .del = true};
 			else
@@ -1043,7 +1072,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 			{
 				/* (the row is found by the key it had, which a key that changed isn't) */
 				if (change->old_row != NULL)
-					kept = tree_fill_unchanged(ctx, table, change, &map, latest, edits, edits[n - 1].key, edits[n - 1].klen, f);
+					tree_fill_unchanged(ctx, table, change, &map, latest, edits, edits[n - 1].key, edits[n - 1].klen, f);
 				else
 				{
 					/* (its key alone, so no value's put in a tree for it) */
@@ -1053,12 +1082,11 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 						key_alone[c] = c < change->shape->nkey ? f[c] : (WsField) {.null = true};
 					WsRowCodec->encode(change->shape, key_alone, &k, &v);
 					pfree(key_alone);
-					kept = tree_fill_unchanged(ctx, table, change, &map, latest, edits, k.data, k.len, f);
+					tree_fill_unchanged(ctx, table, change, &map, latest, edits, k.data, k.len, f);
 				}
 			}
 			ws_row_store_kept(ctx, change->shape, f, &k, &v);
-			if (kept != NULL)
-				pfree(kept);
+			bytes += k.len + v.len;
 			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len};
 		}
 		if (latest != NULL && !change->whole_old_row)
@@ -1071,32 +1099,27 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 				entry->edit = e;
 			}
 		}
+		if (!netting && (n >= TREE_BATCH_ROWS || bytes >= TREE_BATCH_BYTES))
+		{
+			tree_write_edits(ctx, table, shape, &map, edits, &n, &latest, has_unchanged, batch_cxt);
+			wrote = true;
+			bytes = 0;
+		}
 	}
 	if (netting)
 		n = tree_net_edits(table->relid, edits, n);
-	if (latest != NULL)
-		hash_destroy(latest);
-	if (n > 0 || anew || wrote)
+	if (n > 0)
 	{
-		if (shape->nkey == 0)
-		{
-			char	   *relname = get_rel_name(table->relid);
-			ErrorContextCallback context = {
-				.previous = error_context_stack,
-				.callback = tree_apply_context,
-				.arg = psprintf("%s of relation %u", relname != NULL ? relname : "(gone)", table->relid),
-			};
-
-			error_context_stack = &context;
-			n = ws_rows_keyless_merge(ctx, &map, edits, n);
-			error_context_stack = context.previous;
-		}
-		if (n > 0 && prolly_apply(ctx, &map, edits, n, &map) < 0)
-			prolly_report(ctx);
+		tree_write_edits(ctx, table, shape, &map, edits, &n, &latest, has_unchanged, batch_cxt);
+		wrote = true;
+	}
+	if (wrote || anew)
+	{
 		refs->routine->set(refs, name, &map);
 		tree_record_shape(table->relid, table->shape);
 	}
-	tree_edits_free(edits, n);
+	MemoryContextSwitchTo(was);
+	MemoryContextDelete(batch_cxt);
 	pfree(edits);
 	pfree(f);
 }
@@ -1149,6 +1172,7 @@ tree_apply(void)
 		if (table->held != NIL)
 			tree_apply_table(&ctx, refs, table, positions);
 		table->held = NIL;
+		table->problems = 0;
 	}
 	foreach_ptr(TreePosition, position, positions)
 	{
@@ -1179,9 +1203,6 @@ typedef struct TreeRebuild
 	Tuplesortstate *sort;
 	TupleTableSlot *slot;
 } TreeRebuild;
-
-#define TREE_REBUILD_BATCH_ROWS 1000
-#define TREE_REBUILD_BATCH_BYTES (8 * 1024 * 1024)
 
 static bytea *
 tree_bytea(const uint8 *p, size_t len)
@@ -1229,7 +1250,7 @@ static void
 tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 {
 	MemoryContext batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture rebuild batch", ALLOCSET_DEFAULT_SIZES);
-	ProllyEdit *edits = palloc_array(ProllyEdit, TREE_REBUILD_BATCH_ROWS);
+	ProllyEdit *edits = palloc_array(ProllyEdit, TREE_BATCH_ROWS);
 	int			n = 0;
 	Size		bytes = 0;
 	bool		more;
@@ -1253,7 +1274,7 @@ tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 			edits[n++] = (ProllyEdit) {.key = kc, .klen = klen, .val = vc, .vlen = vlen};
 			bytes += klen + vlen;
 		}
-		if (n > 0 && (!more || n == TREE_REBUILD_BATCH_ROWS || bytes >= TREE_REBUILD_BATCH_BYTES))
+		if (n > 0 && (!more || n == TREE_BATCH_ROWS || bytes >= TREE_BATCH_BYTES))
 		{
 			if (b->shape->nkey == 0)
 			{
@@ -1421,7 +1442,7 @@ tree_slot_will_do(void)
  * each of the branch's row maps saved as of it, for whoever's waiting.
  */
 static void
-tree_after_record(void)
+tree_marker(void)
 {
 	int32		branch = tree_barrier_branch;
 	XLogRecPtr	lsn = tree_barrier_lsn;
@@ -1431,8 +1452,6 @@ tree_after_record(void)
 	Oid			types[1] = {PG_LSNOID};
 	Datum		values[1] = {LSNGetDatum(lsn)};
 
-	if (XLogRecPtrIsInvalid(lsn))
-		return;
 	tree_barrier_lsn = InvalidXLogRecPtr;
 
 	/*
@@ -1514,6 +1533,39 @@ tree_after_record(void)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+}
+
+/*
+ * Whether applying what's held would stop at what's wrong with a change.  That may be what a change
+ * still to come gets past, so what's held isn't applied for its size then, or a worker would stop at
+ * the same place each time it started, and never read that far.
+ */
+static bool
+tree_held_has_problem(void)
+{
+	foreach_ptr(TreeTable, table, tree_tables)
+	{
+		if (table->problems > 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A marker told is seen to; and what's held, being all of the transactions told so far, is
+ * applied once it's more than logical_decoding_work_mem, as the worker may be far behind.
+ */
+static bool
+tree_after_record(void)
+{
+	if (!XLogRecPtrIsInvalid(tree_barrier_lsn))
+		tree_marker();
+	if (tree_held == NIL ||
+		MemoryContextMemAllocated(tree_held_cxt, true) <= (Size) logical_decoding_work_mem * 1024 ||
+		tree_held_has_problem())
+		return false;
+	tree_apply();
+	return true;
 }
 
 const CaptureSink TreeCaptureSink = {
