@@ -39,7 +39,6 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
-#include "storage/procarray.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
