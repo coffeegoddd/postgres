@@ -168,13 +168,15 @@ SKIP:
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
 
-# text naming an object isn't followed, so a row's identity changes under it: an error naming the
-# table, which a rewrite gets past
-run(q{CREATE TABLE named (a integer); CREATE TABLE names (r regclass, n integer); INSERT INTO names VALUES ('s.named', 1)});
+# a map out of step with its table (as a value naming an object, now refused, once made one): an
+# error naming the table, which a rewrite gets past
+run(q{CREATE TABLE names (r text, n integer); INSERT INTO names VALUES ('s.named', 1); CREATE TABLE no_names (r text, n integer)});
 caught_up();
+$node->safe_psql('postgres', qq{$on UPDATE pg_history.pointers SET hash = (SELECT hash FROM pg_history.pointers WHERE name = 'capture/map/' || 's.no_names'::regclass::oid)
+	WHERE name = 'capture/map/' || 's.names'::regclass::oid});
 my $log_at = -s $node->logfile;
-run('ALTER TABLE named RENAME TO named2; DELETE FROM names');
-ok($node->wait_for_log(qr/fewer of a keyless row than were removed/, $log_at), 'a row whose text changed under it, removed');
+run('DELETE FROM names');
+ok($node->wait_for_log(qr/fewer of a keyless row than were removed/, $log_at), 'a row the map does not have, removed');
 like(slurp_file($node->logfile, $log_at), qr/capture applying changes to table names of relation \d+/, 'says which table');
 
 # a barrier meanwhile gives up, and its marker doesn't stand in the way of what gets past it
