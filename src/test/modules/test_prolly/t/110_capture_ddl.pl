@@ -74,6 +74,21 @@ run('ALTER TABLE t DROP COLUMN d; ALTER TABLE t ADD COLUMN d text');
 same_map('t', 'and in two');
 run(q{ALTER TABLE t ADD COLUMN g integer GENERATED ALWAYS AS (a + 1) STORED});
 same_map('t', 'a stored generated column added');
+
+# generated columns as they change: held as stored, a virtual one not at all, whatever's done to them
+run(q{CREATE TABLE gen (id integer PRIMARY KEY, a integer, s integer GENERATED ALWAYS AS (a * 2) STORED,
+	v integer GENERATED ALWAYS AS (a * 3) VIRTUAL); INSERT INTO gen (id, a) VALUES (1, 1), (2, 2)});
+same_map('gen', 'a stored and a virtual generated column');
+run(q{UPDATE gen SET a = 10 WHERE id = 1});
+same_map('gen', 'what they are made from changed');
+run(q{ALTER TABLE gen ALTER COLUMN s SET EXPRESSION AS (a * 5)});
+same_map('gen', "a stored one's expression changed, its values with it");
+run(q{ALTER TABLE gen ALTER COLUMN v SET EXPRESSION AS (a * 7)});
+same_map('gen', "a virtual one's expression changed, with nothing stored");
+run(q{ALTER TABLE gen ALTER COLUMN s DROP EXPRESSION; UPDATE gen SET s = 99 WHERE id = 2});
+same_map('gen', 'a stored one made an ordinary column, and written');
+run(q{ALTER TABLE gen ADD COLUMN s2 integer GENERATED ALWAYS AS (id + a) STORED; INSERT INTO gen (id, a) VALUES (3, 3)});
+same_map('gen', 'one added, with rows already there, and one written after');
 run(q{ALTER TABLE t ALTER COLUMN g SET EXPRESSION AS (a + 2)});
 same_map('t', 'its expression changed');
 run('ALTER TABLE t RENAME COLUMN v TO w');
