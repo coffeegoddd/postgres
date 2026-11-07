@@ -97,6 +97,7 @@
 #include "prolly/ws/ws_rows.h"
 #include "storage/buffile.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "utils/hsearch.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -184,6 +185,15 @@ static List *tree_to_heal = NIL;
  * error of anything else, such as the store's, which stops the worker.
  */
 static bool tree_fault = false;
+
+/* How many times a table to heal has been left, a writer having it. */
+typedef struct TreeHealTry
+{
+	Oid			relid;
+	int			tries;
+} TreeHealTry;
+
+static List *tree_heal_tries = NIL;
 
 /* Tables being healed, as pg_history.capture_healing has them: their changes are passed over. */
 static List *tree_healing = NIL;
@@ -1558,8 +1568,56 @@ tree_apply_one(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 }
 
 /*
+ * Tries of the locks for a table a writer had, after which a heal waits a little for them: no more
+ * than half of what would find a deadlock, as a user's commit at the other end of one must not be
+ * what it fails, nor the worker.
+ */
+#define TREE_HEAL_TRIES 5
+#define TREE_HEAL_WAIT_MS Min(200, Max(DeadlockTimeout / 2, 1))
+
+/* While applying at a marker, whose barrier holds the lock a heal takes until it's done. */
+static bool tree_at_marker = false;
+
+/* A table told whole in a transaction of its own; false if a writer has it, waited for or not. */
+static bool
+tree_heal_one(Oid relid, int wait_ms)
+{
+	MemoryContext was = CurrentMemoryContext;
+	volatile bool done = false;
+
+	StartTransactionCommand();
+	PG_TRY();
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		done = CaptureRowsResend(relid, wait_ms);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *e;
+
+		MemoryContextSwitchTo(was);
+		e = CopyErrorData();
+		if (e->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+			PG_RE_THROW();
+		FlushErrorState();
+		AbortCurrentTransaction();
+		MemoryContextSwitchTo(was);
+		FreeErrorData(e);
+		done = false;
+	}
+	PG_END_TRY();
+	return done;
+}
+
+/*
  * Tables whose changes couldn't be applied, each told whole in a transaction of its own.  One a
- * writer has is left for the next time, rather than have the worker, and all capture, wait.
+ * writer has is left for the next time, rather than have the worker, and all capture, wait: but once
+ * it's been left TREE_HEAL_TRIES times, the worker waits up to TREE_HEAL_WAIT_MS for each of its
+ * locks, so that a table always being written to is healed too.  That holds up capture, the table's
+ * writers, and commits changing catalogs, which take the first lock too, that long at most a lock.
+ * Not at a marker, whose barrier holds that lock waiting for the worker: it'd wait for nothing.
  */
 static void
 tree_heal(void)
@@ -1567,21 +1625,52 @@ tree_heal(void)
 	List	   *later = NIL;
 	MemoryContext old;
 
+	if (tree_at_marker)
+		return;
+
 	foreach_oid(relid, tree_to_heal)
 	{
 		bool		done;
+		int			tries = 0;
 
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		done = CaptureRowsResend(relid);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		if (!done)
+		foreach_ptr(TreeHealTry, t, tree_heal_tries)
 		{
-			old = MemoryContextSwitchTo(TopMemoryContext);
-			later = lappend_oid(later, relid);
-			MemoryContextSwitchTo(old);
+			if (t->relid == relid)
+				tries = t->tries;
 		}
+		done = tree_heal_one(relid, tries >= TREE_HEAL_TRIES ? TREE_HEAL_WAIT_MS : 0);
+		old = MemoryContextSwitchTo(TopMemoryContext);
+		if (done)
+		{
+			foreach_ptr(TreeHealTry, t, tree_heal_tries)
+			{
+				if (t->relid == relid)
+					tree_heal_tries = foreach_delete_current(tree_heal_tries, t);
+			}
+		}
+		else
+		{
+			bool		known = false;
+
+			foreach_ptr(TreeHealTry, t, tree_heal_tries)
+			{
+				if (t->relid == relid)
+				{
+					t->tries++;
+					known = true;
+				}
+			}
+			if (!known)
+			{
+				TreeHealTry *t = palloc_object(TreeHealTry);
+
+				t->relid = relid;
+				t->tries = 1;
+				tree_heal_tries = lappend(tree_heal_tries, t);
+			}
+			later = lappend_oid(later, relid);
+		}
+		MemoryContextSwitchTo(old);
 	}
 	list_free(tree_to_heal);
 	tree_to_heal = later;
@@ -1839,6 +1928,8 @@ tree_slot_made(XLogRecPtr from)
 	tree_healing = NIL;
 	list_free(tree_to_heal);
 	tree_to_heal = NIL;
+	list_free_deep(tree_heal_tries);
+	tree_heal_tries = NIL;
 	tree_exec("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
 			  "WHERE n.nspbranch <> 0 AND c.relkind = 'r' AND c.relpersistence = 'p'", SPI_OK_SELECT);
 	for (uint64 i = 0; i < SPI_processed; i++)
@@ -1928,7 +2019,9 @@ tree_marker(void)
 	}
 	CommitTransactionCommand();
 
+	tree_at_marker = true;
 	tree_apply();
+	tree_at_marker = false;
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)

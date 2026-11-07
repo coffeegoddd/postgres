@@ -209,10 +209,11 @@ extern char CaptureLoggedIdentity(Relation relation);
 
 /*
  * A versioned table's rows told whole, as a commit that changed what they print as tells them, the
- * table held in ShareLock until this transaction ends; nothing if it's gone.  False, with nothing
- * done, if a writer has it now.  What heals one whose changes capture couldn't apply.
+ * table held in ShareLock until this transaction ends; nothing if it's gone.  If a writer has it
+ * now: with wait_ms 0, false, with nothing done; else waited for that long, and an error after.
+ * What heals one whose changes capture couldn't apply.
  */
-extern bool CaptureRowsResend(Oid relid);
+extern bool CaptureRowsResend(Oid relid, int wait_ms);
 
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
 extern void CaptureRowsAtCommit(bool prepare);
