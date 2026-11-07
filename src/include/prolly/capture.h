@@ -207,6 +207,12 @@ extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, P
 extern void CaptureWaitFor(XLogRecPtr lsn, int timeout_ms);
 
 /*
+ * Leaves the whole of this transaction's writes out of capture, for version control's own, which
+ * make the tables what it has made the branch's trees; it's for the caller to have made them so.
+ */
+extern void CaptureLeaveOut(void);
+
+/*
  * The replica identity a change of this table logs by, in place of its own.  With capture on, a
  * versioned table logs its whole old row unless it has a primary key that identifies a row by
  * itself, so that a table with no key, one whose key is deferrable and one set to log nothing or

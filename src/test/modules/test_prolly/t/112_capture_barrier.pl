@@ -477,6 +477,27 @@ $node->safe_psql('uncaptured', 'CREATE EXTENSION test_prolly');
 my ($rc_u, $o_u, $err_u) = $node->psql('uncaptured', "SELECT test_capture_wait('0/1')");
 like($err_u, qr/database "uncaptured" is not being captured/, 'waiting in a database with nothing captured, an error');
 
+# a transaction left out of capture, as version control's own writes are: all of it, even what it
+# wrote before saying so, and only it, the session's next ones captured as ever, after a commit and
+# after a rollback
+{
+	my $map_s = q{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid};
+	my $rows_s = q{SELECT test_ws_rows_hash('s', 't')};
+	my $vc = $node->background_psql('postgres');
+	$vc->query_safe("$on1 BEGIN; INSERT INTO s.t VALUES (900041, 'left out'); SELECT test_capture_leave_out(); COMMIT");
+	caught_up();
+	isnt($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"), 'a transaction left out of capture');
+	$vc->query_safe("INSERT INTO s.t VALUES (900042, 'captured after a commit')");
+	$vc->query_safe("BEGIN; SELECT test_capture_leave_out(); ROLLBACK");
+	$vc->query_safe("INSERT INTO s.t VALUES (900043, 'captured after a rollback')");
+	$vc->query_safe("BEGIN; SELECT test_capture_leave_out(); DELETE FROM s.t WHERE id = 900041; COMMIT");
+	$vc->quit;
+	caught_up();
+	is($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"),
+		"and only it: the session's next ones captured, and the row left out again on its way out");
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id IN (900042, 900043)");
+}
+
 # a crash between a commit's marker and capture reaching it: the commit is lost, and nothing of it is
 # seen; the next commit has what the lost one would have had
 SKIP:

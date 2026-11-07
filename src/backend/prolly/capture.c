@@ -33,6 +33,7 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalctl.h"
+#include "replication/origin.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"
@@ -204,6 +205,51 @@ capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr co
 	CaptureSinkInUse->commit(txn->xid, commit_lsn, txn->end_lsn);
 }
 
+/* A transaction version control left out of capture: the whole of it, as decoding goes by its commit. */
+static bool
+capture_filter_origin(LogicalDecodingContext *ctx, ReplOriginId origin_id)
+{
+	return origin_id == DoNotReplicateId;
+}
+
+static void
+capture_left_out_end(XactEvent event, void *arg)
+{
+	if ((event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
+		 event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT) &&
+		replorigin_xact_state.origin == DoNotReplicateId)
+		replorigin_xact_state.origin = InvalidReplOriginId;
+}
+
+/*
+ * The writes of this transaction, those before as well as after, are left out of capture: its
+ * WAL is marked as of no origin to be replicated, which capture's decoding passes over, and which
+ * a commit records no progress for.  Until the transaction ends.  For version control's own
+ * writes, which make the tables what it has made the branch's trees, such as a hard reset's.  A
+ * session with an origin of its own, as a subscription's apply worker has, can't.
+ */
+void
+CaptureLeaveOut(void)
+{
+	static bool registered = false;
+
+	if (!IsTransactionState())
+		elog(ERROR, "capture can only leave out a transaction");
+	if (replorigin_xact_state.origin == DoNotReplicateId)
+		return;
+	if (replorigin_xact_state.origin != InvalidReplOriginId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot leave this transaction out of capture"),
+				 errdetail("The session has a replication origin of its own.")));
+	if (!registered)
+	{
+		RegisterXactCallback(capture_left_out_end, NULL);
+		registered = true;
+	}
+	replorigin_xact_state.origin = DoNotReplicateId;
+}
+
 void
 CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 {
@@ -213,6 +259,7 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 	callbacks->truncate_cb = capture_truncate;
 	callbacks->message_cb = capture_message;
 	callbacks->commit_cb = capture_commit;
+	callbacks->filter_by_origin_cb = capture_filter_origin;
 }
 
 /* ------------------------------------------------------------------ the sink */

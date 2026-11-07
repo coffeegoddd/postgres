@@ -61,6 +61,7 @@ PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_schema_shape);
 PG_FUNCTION_INFO_V1(test_capture_barrier);
 PG_FUNCTION_INFO_V1(test_capture_wait);
+PG_FUNCTION_INFO_V1(test_capture_leave_out);
 PG_FUNCTION_INFO_V1(test_capture_commit);
 PG_FUNCTION_INFO_V1(test_capture_commit_on);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
@@ -960,6 +961,14 @@ Datum
 test_capture_wait(PG_FUNCTION_ARGS)
 {
 	CaptureWaitFor(PG_GETARG_LSN(0), PG_GETARG_INT32(1));
+	PG_RETURN_VOID();
+}
+
+/* test_capture_leave_out(): this transaction's writes left out of capture */
+Datum
+test_capture_leave_out(PG_FUNCTION_ARGS)
+{
+	CaptureLeaveOut();
 	PG_RETURN_VOID();
 }
 
