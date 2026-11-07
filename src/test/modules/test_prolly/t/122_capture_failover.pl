@@ -51,8 +51,6 @@ same_map($primary, 'on the primary');
 
 # a standby syncing slots
 $primary->safe_psql('postgres', q{SELECT pg_create_physical_replication_slot('standby_slot')});
-$primary->append_conf('postgresql.conf', "synchronized_standby_slots = 'standby_slot'");
-$primary->reload;
 $primary->backup('backup');
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($primary, 'backup', has_streaming => 1);
@@ -66,7 +64,7 @@ $primary->safe_psql('postgres', "$on UPDATE s.t SET v = 'before the sync' WHERE 
 caught_up($primary);
 $primary->wait_for_replay_catchup($standby);
 $standby->safe_psql('postgres', 'SELECT pg_sync_replication_slots()');
-is($standby->safe_psql('postgres', "SELECT synced FROM pg_replication_slots WHERE slot_name = '$slot'"), 't', 'synced to the standby');
+is($standby->safe_psql('postgres', "SELECT synced AND NOT temporary FROM pg_replication_slots WHERE slot_name = '$slot'"), 't', 'synced to the standby');
 
 # written after the slot last synced, and captured on the primary, then the standby promoted
 $primary->safe_psql('postgres', "$on UPDATE s.t SET v = 'after the sync' WHERE id BETWEEN 11 AND 20; DELETE FROM s.t WHERE id > 90;
@@ -76,6 +74,7 @@ my $primary_at = $primary->safe_psql('postgres', "SELECT confirmed_flush_lsn FRO
 is($standby->safe_psql('postgres', "SELECT confirmed_flush_lsn < '$primary_at' FROM pg_replication_slots WHERE slot_name = '$slot'"), 't',
 	"the standby's slot behind the primary's, so the promoted one is told again what the maps have");
 $primary->wait_for_replay_catchup($standby);
+my $synced_from = $standby->safe_psql('postgres', "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = '$slot'");
 $primary->stop;
 $standby->promote;
 $standby->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker'})
@@ -85,8 +84,9 @@ $standby->safe_psql('postgres', "$on INSERT INTO s.t VALUES (1000, 'on the new p
 same_map($standby, 'and capture goes on from the slot');
 my $root = $standby->safe_psql('postgres', "$on SELECT test_capture_barrier('s')");
 is($root, $standby->safe_psql('postgres', "$on SELECT test_ws_root_capture('s')"), 'a commit from capture there is the tables');
-unlike(slurp_file($standby->logfile), qr/^(PANIC|FATAL):.*capture|was invalidated, and is being made again/m,
-	'from the slot it had, not one made again');
+is($standby->safe_psql('postgres', "SELECT synced AND restart_lsn >= '$synced_from' FROM pg_replication_slots WHERE slot_name = '$slot'"), 't',
+	'from the slot it had, synced, not one made again');
+unlike(slurp_file($standby->logfile), qr/^(PANIC|FATAL):.*capture|was invalidated, and is being made again/m, 'nor anything gone wrong');
 
 $standby->stop;
 done_testing();
