@@ -46,7 +46,7 @@ run(q{CREATE TABLE t (id integer PRIMARY KEY, n integer, v text, w text, x text)
 	ALTER TABLE t ALTER v SET STORAGE EXTERNAL, ALTER w SET STORAGE EXTERNAL, ALTER x SET STORAGE EXTERNAL;
 	INSERT INTO t SELECT g, 0, repeat('v' || g, 5000), repeat('w', 1200), repeat('x', 1200) FROM generate_series(1, 5) g});
 same_map('t', 'values out of line');
-is(run(q{SELECT pg_column_size(w) < 1300 AND pg_column_size(v) > 5000 FROM t WHERE id = 1}), 't', 'of both lengths');
+is(run(q{SELECT pg_column_toast_chunk_id(w) IS NOT NULL AND pg_column_size(w) < 1300 AND pg_column_toast_chunk_id(v) IS NOT NULL AND pg_column_size(v) > 5000 FROM t WHERE id = 1}), 't', 'of both lengths');
 run('UPDATE t SET n = 1');
 same_map('t', 'an update leaving them');
 run(q{UPDATE t SET n = 2 WHERE id = 1; UPDATE t SET n = 3 WHERE id = 1});
@@ -120,15 +120,67 @@ same_map('t', 'a new slot');
 run(q{UPDATE t SET n = 18 WHERE id = 1});
 same_map('t', 'and left after it');
 
-# a value left as it was stays in the tree it's in: nothing's written for it
-run(q{CREATE TABLE same_tree (id integer PRIMARY KEY, n integer, v text); ALTER TABLE same_tree ALTER v SET STORAGE EXTERNAL;
-	INSERT INTO same_tree VALUES (1, 0, (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 200000) g))});
+# other ways an update comes about, and a value that looks left but isn't
+run(q{CREATE TABLE ways (id integer PRIMARY KEY, n integer, v text, w text); ALTER TABLE ways ALTER v SET STORAGE EXTERNAL, ALTER w SET STORAGE EXTERNAL;
+	INSERT INTO ways SELECT g, 0, repeat('v' || g, 5000), repeat('w' || g, 5000) FROM generate_series(1, 6) g});
 caught_up();
-my $chunks = q{SELECT count(*) FROM pg_history.chunks};
-my $before = $node->safe_psql('postgres', $chunks);
-run(q{UPDATE same_tree SET n = 1});
-same_map('same_tree', 'a value of 6 MB left as it was');
-cmp_ok($node->safe_psql('postgres', $chunks) - $before, '<', 20, 'writes no tree for it');
+run(q{INSERT INTO ways VALUES (1, 0, 'ignored', 'ignored') ON CONFLICT (id) DO UPDATE SET n = 1});
+same_map('ways', 'ON CONFLICT');
+run(q{MERGE INTO ways USING (VALUES (2)) x(i) ON id = i WHEN MATCHED THEN UPDATE SET n = 2; MERGE INTO ways USING (VALUES (3)) x(i) ON id = i WHEN MATCHED THEN UPDATE SET id = 30});
+same_map('ways', 'MERGE');
+run(q{UPDATE ways SET w = v WHERE id = 4; UPDATE ways SET v = w, w = v WHERE id = 5});
+same_map('ways', 'a column copied, and two swapped');
+run(q{UPDATE ways a SET v = b.v FROM ways b WHERE a.id = 6 AND b.id = 1});
+same_map('ways', 'a value from another row');
+run(q{CREATE TABLE moved (id integer PRIMARY KEY, n integer, v text) PARTITION BY RANGE (id); CREATE TABLE moved1 PARTITION OF moved FOR VALUES FROM (0) TO (10); CREATE TABLE moved2 PARTITION OF moved FOR VALUES FROM (10) TO (20);
+	ALTER TABLE moved ALTER v SET STORAGE EXTERNAL; INSERT INTO moved VALUES (1, 0, repeat('m', 9000)); UPDATE moved SET id = 11 WHERE id = 1; UPDATE moved SET n = 1 WHERE id = 11});
+same_map('moved2', 'a row moved between partitions, and left');
+
+# from rows told whole in the same apply, and told again over a map already past it
+SKIP:
+{
+	skip 'no way to stop a process', 2 if $windows_os || $ENV{enable_injection_points} ne 'yes';
+	caught_up();
+	kill 'STOP', $worker;
+	run(q{ALTER TABLE ways ADD COLUMN extra integer DEFAULT 1});
+	run(q{UPDATE ways SET n = 10 WHERE id = 1});
+	kill 'CONT', $worker;
+	same_map('ways', 'told whole, then left, applied together');
+	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applied', 'wait')");
+	run(q{UPDATE ways SET v = repeat('later', 5000) WHERE id = 1; UPDATE ways SET n = 11 WHERE id = 1});
+	$node->wait_for_event('capture worker', 'capture-applied');
+	my $held = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($held)");
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $held})
+	  or die 'no worker came back';
+	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	same_map('ways', 'told again, over a map past it');
+	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
+}
+
+# a deferrable key can be on two rows for a while
+run(q{CREATE TABLE d (id integer PRIMARY KEY DEFERRABLE, n integer, v text); INSERT INTO d SELECT g, g, 'v' || g FROM generate_series(1, 4) g});
+same_map('d', 'a deferrable key');
+run(q{UPDATE d SET id = id + 1});
+same_map('d', 'keys moved onto each other');
+run(q{BEGIN; SET CONSTRAINTS ALL DEFERRED; UPDATE d SET id = 100 WHERE id = 2; UPDATE d SET id = 2 WHERE id = 3; UPDATE d SET id = 3 WHERE id = 100; COMMIT});
+same_map('d', 'two swapped');
+run(q{BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO d VALUES (50, 0, 'a'); DELETE FROM d WHERE id = 50; INSERT INTO d VALUES (51, 0, 'b'); UPDATE d SET n = 1 WHERE id = 51; DELETE FROM d WHERE id = 51; COMMIT});
+same_map('d', 'rows come and gone');
+run(q{BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO d VALUES (60, 1, 'same'), (61, 1, 'same'); COMMIT; BEGIN; SET CONSTRAINTS ALL DEFERRED; UPDATE d SET id = 61 WHERE id = 60; DELETE FROM d WHERE id = 61 AND ctid = (SELECT max(ctid) FROM d WHERE id = 61); COMMIT});
+same_map('d', 'a row moved onto one with the same value, and one of them deleted');
+run(q{ALTER TABLE d ALTER v SET STORAGE EXTERNAL; UPDATE d SET v = repeat(id::text, 9000)});
+same_map('d', 'out of line');
+run(q{UPDATE d SET id = id + 1; UPDATE d SET n = n + 1});
+same_map('d', 'moved onto each other and left, the old row having them');
+run(q{CREATE TABLE d2 (id integer PRIMARY KEY DEFERRABLE, n integer); INSERT INTO d2 VALUES (1, 1)});
+same_map('d2', 'before its key is made immediate');
+my $log_at = -s $node->logfile;
+$node->safe_psql('postgres', "$on BEGIN; UPDATE s.d2 SET n = 2; ALTER TABLE s.d2 DROP CONSTRAINT d2_pkey; ALTER TABLE s.d2 ADD PRIMARY KEY (id); UPDATE s.d2 SET n = 3; COMMIT");
+ok($node->wait_for_log(qr/does not follow relation \d+ having its deferrable key changed/, $log_at), 'made immediate in a transaction that writes it: an error');
+run('VACUUM FULL d2');
+same_map('d2', 'which a rewrite gets past');
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
