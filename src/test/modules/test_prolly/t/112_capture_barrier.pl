@@ -314,6 +314,23 @@ unlike($errr, qr/ran as a barrier read/, 'an operator ahead on the search path')
 like($outr, qr/^[0-9a-f]{40}$/m, 'and the barrier gave a root');
 $node->safe_psql('postgres', 'DROP SCHEMA evil CASCADE');
 
+# a session's own changes, committed, are in the root its next commit is made of, made at once after
+# them: with the worker stopped, so that the barrier has to wait for them
+SKIP:
+{
+	skip 'no way to stop a process', 1 if $windows_os;
+	my $own = $node->background_psql('postgres');
+	kill 'STOP', $worker;
+	$own->query_safe("$on1 INSERT INTO s.t VALUES (900011, 'my own')");
+	$own->query_until(qr/started/, "\\echo started\n$on1 SELECT test_capture_barrier('s') AS root \\gset\n\\echo :root\n\\echo finished\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'CaptureBarrier'}) or die 'no marker';
+	kill 'CONT', $worker;
+	my ($root) = finish($own)->{stdout} =~ /^([0-9a-f]{40})$/m;
+	$own->quit;
+	is($root, read_root('s', $on1), "a session's own committed change is in the root of its commit");
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900011");
+}
+
 # its own transaction: nothing it's written, and nothing older than now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN; INSERT INTO s.t VALUES (900004, 'x'); SELECT test_capture_barrier('s'); ROLLBACK");
 like($err, qr/can't run in a transaction that has written anything/, 'not in a transaction that has written');
