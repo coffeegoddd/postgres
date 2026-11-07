@@ -805,6 +805,10 @@ CREATE FUNCTION test_capture_barrier(schema text, timeout_ms integer DEFAULT 600
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_capture_wait(lsn pg_lsn, timeout_ms integer DEFAULT 60000)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_capture_commit(schema text, msg text, dest text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
@@ -817,7 +821,7 @@ CREATE FUNCTION test_ws_use_history_store()
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_commit(text, text, text),
+REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_wait(pg_lsn, integer), test_capture_commit(text, text, text),
 	test_capture_commit_on(text, text, text), test_ws_use_history_store() FROM PUBLIC;
 
 CREATE FUNCTION test_ws_schema_shape(schema text, tab text)
