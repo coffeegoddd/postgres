@@ -244,6 +244,7 @@ tests += {
       't/115_capture_batch.pl',
       't/116_happy_path.pl',
       't/117_capture_heal.pl',
+      't/118_capture_behind.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

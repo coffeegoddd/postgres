@@ -534,6 +534,47 @@ capture_page_read(XLogReaderState *state, XLogRecPtr target_page, int req_len, X
 	return n;
 }
 
+/* Whether capture has said it's past half of what its slot may hold, since it was last below. */
+static bool capture_behind_warned = false;
+
+/*
+ * Warns, once each time it passes it, that the WAL capture's slot holds is past half of
+ * max_slot_wal_keep_size: past all of it, the slot is invalidated at a checkpoint and every table
+ * read again, so that's while something can still be done.  How far behind each branch is shows as
+ * ever, by pg_replication_slots and pg_history.capture_positions.
+ */
+static void
+capture_check_behind(void)
+{
+	XLogRecPtr	restart;
+	uint64		held;
+	uint64		limit;
+
+	if (max_slot_wal_keep_size_mb < 0)
+		return;
+	SpinLockAcquire(&MyReplicationSlot->mutex);
+	restart = MyReplicationSlot->data.restart_lsn;
+	SpinLockRelease(&MyReplicationSlot->mutex);
+	if (XLogRecPtrIsInvalid(restart))
+		return;
+	held = GetXLogInsertRecPtr() - restart;
+	limit = (uint64) max_slot_wal_keep_size_mb * 1024 * 1024;
+	if (held <= limit / 2)
+	{
+		capture_behind_warned = false;
+		return;
+	}
+	if (capture_behind_warned)
+		return;
+	capture_behind_warned = true;
+	ereport(WARNING,
+			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+			 errmsg("capture is behind: its replication slot holds %llu MB of WAL, past half of \"max_slot_wal_keep_size\" (%d MB)",
+					(unsigned long long) (held / (1024 * 1024)), max_slot_wal_keep_size_mb),
+			 errdetail("Past all of it, the slot is invalidated at a checkpoint, and every versioned table is read again."),
+			 errhint("Raise \"max_slot_wal_keep_size\", or write less until capture catches up.")));
+}
+
 /*
  * Decodes what is flushed now, and says it was.  With a record that goes past what's flushed, it
  * stops at the one before, to read it whole later.
@@ -544,6 +585,7 @@ capture_decode(LogicalDecodingContext *ctx)
 	XLogRecPtr	flushed = GetFlushRecPtr(NULL);
 	XLogRecPtr	from = ctx->reader->EndRecPtr;
 
+	capture_check_behind();
 	capture_at_end_of_wal = false;
 	while (ctx->reader->EndRecPtr < flushed && !capture_at_end_of_wal)
 	{
