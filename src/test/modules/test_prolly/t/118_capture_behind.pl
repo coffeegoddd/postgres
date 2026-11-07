@@ -86,14 +86,18 @@ my $log = -s $node->logfile;
 $node->safe_psql('postgres', 'CREATE TABLE public.held (a integer); CREATE TABLE public.filler (v text)');
 my $open = $node->background_psql('postgres');
 $open->query_safe('BEGIN; INSERT INTO public.held VALUES (1)');
+# (a step of about 250 kB: a pass then begins no more than that behind, so that when the warning's
+# given, what's held back is past 2 MB less a step, well over the 1.5 MB checked; and the steps stop
+# at the warning, short of all 4 MB, which a checkpoint would invalidate the slot for)
+my $warning = qr/retains \d+ MB of WAL.*\nDETAIL:  .* capture has read up to ([0-9A-F]+\/[0-9A-F]+), and the slot keeps it from ([0-9A-F]+\/[0-9A-F]+)/;
 for (1 .. 14)
 {
 	$node->safe_psql('postgres', q{INSERT INTO public.filler SELECT repeat('x', 100) FROM generate_series(1, 1500)});
 	caught_up();
+	last if slurp_file($node->logfile, $log) =~ $warning;
 }
 warned($log, 'a slot held back by a transaction still running is warned of');
-my ($read, $keeps) = slurp_file($node->logfile, $log) =~
-  /retains \d+ MB of WAL.*\nDETAIL:  .* capture has read up to ([0-9A-F]+\/[0-9A-F]+), and the slot keeps it from ([0-9A-F]+\/[0-9A-F]+)/;
+my ($read, $keeps) = slurp_file($node->logfile, $log) =~ $warning;
 is($node->safe_psql('postgres', "SELECT '$read'::pg_lsn - '$keeps'::pg_lsn > 1.5 * 1024 * 1024"), 't',
 	'as what capture has read is well past where the slot keeps WAL from');
 $open->query_safe('COMMIT');
