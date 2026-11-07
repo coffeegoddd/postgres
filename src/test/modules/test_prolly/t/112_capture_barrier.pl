@@ -314,6 +314,17 @@ unlike($errr, qr/ran as a barrier read/, 'an operator ahead on the search path')
 like($outr, qr/^[0-9a-f]{40}$/m, 'and the barrier gave a root');
 $node->safe_psql('postgres', 'DROP SCHEMA evil CASCADE');
 
+# a session's own changes, committed, are in its next commit, made at once after them
+{
+	my $own = $node->background_psql('postgres');
+	$own->query_safe("$on1 INSERT INTO s.t VALUES (900011, 'my own')");
+	my $root = $own->query_safe("$on1 SELECT test_capture_barrier('s')");
+	$own->quit;
+	($root) = $root =~ /([0-9a-f]{40})/;
+	is($root, read_root('s', $on1), "a session's own committed change is in its commit");
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900011");
+}
+
 # its own transaction: nothing it's written, and nothing older than now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN; INSERT INTO s.t VALUES (900004, 'x'); SELECT test_capture_barrier('s'); ROLLBACK");
 like($err, qr/can't run in a transaction that has written anything/, 'not in a transaction that has written');
