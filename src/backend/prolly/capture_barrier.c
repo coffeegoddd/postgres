@@ -209,20 +209,20 @@ wake_worker(void)
 		SetLatch(&GetPGProcByNumber(proc)->procLatch);
 }
 
-/* Whether the worker has saved the maps as of the marker. */
 /*
  * Every branch's changes are applied together, and the slot moves only once they're committed, so
- * the slot's position is how far each branch's capture has got; a branch's own position moves only
- * when it has changes, so it isn't.  (Applying branches apart would have the slot at the least of
- * theirs, and this wait on the branch's.)
+ * the slot's position is how far capture has got for each; a branch's own position moves only when
+ * it has changes, so it isn't.  A slot made again, as one invalidated is, reads every table whole
+ * as of where it begins, so from there on it has all that was committed before.  A table being
+ * healed has had changes passed over, its rows to be told whole: until then capture hasn't got
+ * there for it, which is an error, as a commit of its schema is.
  */
 void
-CaptureWaitFor(int32 branch, XLogRecPtr lsn, int timeout_ms)
+CaptureWaitFor(XLogRecPtr lsn, int timeout_ms)
 {
 	char		name[NAMEDATALEN];
 	TimestampTz start = GetCurrentTimestamp();
 
-	(void) branch;
 	snprintf(name, NAMEDATALEN, CAPTURE_SLOT_PREFIX "%u", MyDatabaseId);
 	for (;;)
 	{
@@ -247,20 +247,41 @@ CaptureWaitFor(int32 branch, XLogRecPtr lsn, int timeout_ms)
 		if (lost)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("capture's replication slot \"%s\" was invalidated, and what it hadn't applied is read again", name)));
+					 errmsg("capture's replication slot \"%s\" was invalidated", name),
+					 errdetail("What it hadn't applied is read again from the tables, once the slot is made again.")));
 		if (reached >= lsn)
-			return;
+			break;
 		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
-					 errmsg("capture did not reach %X/%X in time", LSN_FORMAT_ARGS(lsn))));
+					 errmsg("capture did not reach %X/%X in time", LSN_FORMAT_ARGS(lsn)),
+					 errdetail("It has reached %X/%X.", LSN_FORMAT_ARGS(reached))));
 		wake_worker();
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 2, WAIT_EVENT_CAPTURE_WAIT);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	if (SPI_execute("SELECT relid, reason FROM pg_history.capture_healing ORDER BY relid LIMIT 1", true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the tables capture is healing");
+	if (SPI_processed == 1)
+	{
+		bool		isnull;
+		Oid			relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("capture is healing table \"%s\"", get_rel_name(relid) ? get_rel_name(relid) : "?"),
+				 errdetail("Its changes couldn't be applied: %s", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2)),
+				 errhint("Try again once its rows have been told whole.")));
+	}
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
 }
 
+/* Whether the worker has saved the maps as of the marker. */
 static bool
 barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 {

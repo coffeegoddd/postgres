@@ -955,11 +955,11 @@ test_capture_barrier(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&root));
 }
 
-/* test_capture_wait(branch integer, lsn pg_lsn, timeout_ms integer): capture up to lsn for the branch */
+/* test_capture_wait(lsn pg_lsn, timeout_ms integer): capture up to lsn */
 Datum
 test_capture_wait(PG_FUNCTION_ARGS)
 {
-	CaptureWaitFor(PG_GETARG_INT32(0), PG_GETARG_LSN(1), PG_GETARG_INT32(2));
+	CaptureWaitFor(PG_GETARG_LSN(0), PG_GETARG_INT32(1));
 	PG_RETURN_VOID();
 }
 
