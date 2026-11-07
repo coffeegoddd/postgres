@@ -152,6 +152,7 @@ same_map('p2', 'and another');
 
 # rows moving between partitions, a partition detached and attached, and one attached with rows
 run('UPDATE p SET id = 12 WHERE id = 1');
+is(run(q{SELECT tableoid::regclass FROM p WHERE id = 12}), 'p2', 'a row moved by its key from one partition to another');
 same_map('p1', 'a row moved out of a partition by its key');
 same_map('p2', 'and into another');
 run('ALTER TABLE p DETACH PARTITION p2; INSERT INTO p2 VALUES (30, 30)');
@@ -161,9 +162,16 @@ run('CREATE TABLE p3 (id integer PRIMARY KEY, a bigint); INSERT INTO p3 VALUES (
 same_map('p3', 'a table with rows attached, and written through its partitioned table');
 $node->safe_psql('postgres', "$on1\nSET search_path = s, public;\nALTER TABLE p DETACH PARTITION p3 CONCURRENTLY;\nINSERT INTO p3 VALUES (40, 40);");
 same_map('p3', 'detached concurrently, and written');
-run('DELETE FROM p3 WHERE id = 40; ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (20) TO (30); UPDATE p SET id = 25 WHERE id = 11');
+run('DELETE FROM p3 WHERE id = 40; ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (20) TO (30); INSERT INTO p VALUES (5, 5)');
+caught_up();
+run('UPDATE p SET id = 25 WHERE id = 5');
+is(run(q{SELECT tableoid::regclass FROM p WHERE id = 25}), 'p3', 'a row moved from one partition into the one attached again');
 same_map('p3', 'attached again, a row moved into it');
 same_map('p1', 'from where it was');
+is(run(q{SELECT count(*) FROM pg_history.pointers WHERE name = 'capture/map/' || 'p'::regclass::oid}), '0', 'a partitioned table has no map of its own');
+run('CREATE TABLE no_rows (id integer PRIMARY KEY)');
+is(run(q{SELECT test_ws_rows_hash('s', 'p') = test_ws_rows_hash('s', 'no_rows')}), 't', 'and holds no rows, as layer 4 reads it');
+run('DROP TABLE no_rows');
 
 # what would take a table's rows from one branch to another, or in or out of one, is refused: so a
 # table's map, by its object id, is only ever of one branch's table
@@ -176,7 +184,7 @@ my ($rc_n, $out_n, $err_n) = $node->psql('postgres', "$on1 CREATE TABLE public.o
 like($err_n, qr/cannot move objects between a versioned schema and another kind or branch of schema/, 'and one moved into one');
 $node->safe_psql('postgres', "$on2 CREATE SCHEMA s_two VERSIONED");
 my ($rc_o, $out_o, $err_o) = $node->psql('postgres', "$on1 ALTER TABLE s.moving SET SCHEMA s_two");
-like($err_o, qr/schema "s_two" does not exist/, "another branch's schema can't be named");
+like($err_o, qr/schema "s_two" does not exist/, "another branch's schema isn't seen from this one");
 same_map('moving', 'the table where it was');
 run('ALTER TABLE parent ALTER COLUMN a TYPE bigint USING a + 1');
 same_map('parent', 'a parent');
