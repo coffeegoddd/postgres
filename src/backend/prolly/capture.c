@@ -225,7 +225,8 @@ capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr co
  * and in a subtransaction, it's left out with what that rolls back.  For version control's own
  * writes, which make the tables what it has made the branch's trees, such as a hard reset's: what
  * the transaction does to any versioned table, its rows and its shape, is the caller's to have made
- * the trees of.  As it has written, a commit from capture refuses it.
+ * the trees of.  As it has written, a commit from capture refuses it.  (Written is having an xid,
+ * which a subtransaction's write rolled back still leaves the transaction: that refuses too.)
  */
 void
 CaptureLeaveOut(void)

@@ -486,7 +486,7 @@ like($err_u, qr/database "uncaptured" is not being captured/, 'waiting in a data
 	caught_up();
 	my $was = $node->safe_psql('postgres', "$on1 $map_s");
 	my $vc = $node->background_psql('postgres', on_error_stop => 0);
-	$vc->query_safe("$on1 BEGIN; SELECT test_capture_leave_out(); INSERT INTO s.t VALUES (900041, 'left out'); COMMIT");
+	$vc->query_safe("$on1 BEGIN; SELECT test_capture_leave_out(); INSERT INTO s.t VALUES (900041, 'left out'); SELECT test_capture_leave_out(); COMMIT");
 	caught_up();
 	is($node->safe_psql('postgres', "$on1 $map_s"), $was, 'a transaction left out of capture leaves the map as it was');
 	$vc->query_safe("INSERT INTO s.t VALUES (900042, 'captured after one left out')");
@@ -502,10 +502,16 @@ like($err_u, qr/database "uncaptured" is not being captured/, 'waiting in a data
 	$vc->{stderr} = '';
 	$vc->query_safe('ROLLBACK');
 	$vc->query_safe("BEGIN; SELECT test_capture_leave_out(); DELETE FROM s.t WHERE id = 900041; COMMIT");
-	$vc->quit;
 	caught_up();
 	is($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"),
 		"and only it: the session's next ones captured, a subtransaction's rolled back, and the row left out again on its way out");
+	$vc->query_safe("BEGIN; SELECT test_capture_leave_out(); DELETE FROM s.t WHERE id = 900042; COMMIT");
+	caught_up();
+	isnt($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"), 'a delete of a row captured, left out');
+	$vc->query_safe("INSERT INTO s.t VALUES (900042, 'captured after one left out')");
+	$vc->quit;
+	caught_up();
+	is($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"), 'and the row put back as it was');
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id IN (900042, 900043)");
 }
 
