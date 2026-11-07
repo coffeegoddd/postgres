@@ -445,6 +445,31 @@ SKIP:
 }
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
+# a crash between a commit's marker and capture reaching it: the commit is lost, and nothing of it is
+# seen; the next commit has what the lost one would have had
+SKIP:
+{
+	skip 'no way to stop a process', 4 if $windows_os;
+	$node->safe_psql('postgres', 'ALTER SYSTEM SET restart_after_crash = on; SELECT pg_reload_conf()');
+	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900021, 'before the marker')");
+	my $prev = $node->safe_psql('postgres', q{SELECT coalesce(max(lsn), '0/0') FROM pg_history.capture_barriers});
+	kill 'STOP', $worker;
+	my $bg = barrier_held($on1);
+	kill 'KILL', $worker;
+	eval { $bg->quit };
+	$node->poll_query_until('postgres', 'SELECT true') or die 'the server did not come back';
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker'})
+	  or die 'no worker came back';
+	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_barriers WHERE lsn > '$prev'"), '0',
+		"a commit whose marker capture hadn't reached, lost in a crash, isn't seen");
+	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900022, 'after the crash')");
+	is( $node->safe_psql('postgres', "$on1 SELECT count(*) FROM s.t WHERE id IN (900021, 900022)"), '2',
+		'what was committed before the marker is still there');
+	same_root('s', $on1, 'and the next commit has it');
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id IN (900021, 900022)");
+}
+
 $node->stop;
 done_testing();
 
