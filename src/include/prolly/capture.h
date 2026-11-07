@@ -63,6 +63,9 @@
 
 #define CAPTURE_SLOT_PREFIX "prolly_capture_"
 #define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
+
+/* A transaction's first message, if it's left out of capture. */
+#define CAPTURE_LEAVE_OUT_PREFIX PROLLY_MESSAGE_PREFIX "capture.leave_out"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
 
@@ -205,6 +208,13 @@ extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, P
  * which loses what it hadn't applied, or if a table's being healed, whose tree isn't there yet.
  */
 extern void CaptureWaitFor(XLogRecPtr lsn, int timeout_ms);
+
+/*
+ * Leaves the whole of this transaction's writes out of capture, for version control's own, which
+ * make the tables what it has made the branch's trees; it's for the caller to have made them so.
+ * Before the transaction writes anything.
+ */
+extern void CaptureLeaveOut(void);
 
 /*
  * The replica identity a change of this table logs by, in place of its own.  With capture on, a

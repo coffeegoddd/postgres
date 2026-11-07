@@ -33,6 +33,7 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalctl.h"
+#include "replication/message.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"
@@ -91,9 +92,13 @@ capture_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 	opt->output_type = OUTPUT_PLUGIN_BINARY_OUTPUT;
 }
 
+/* Whether the transaction being told was left out of capture, from its first message on. */
+static bool capture_left_out = false;
+
 static void
 capture_begin(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
+	capture_left_out = false;
 	CaptureSinkInUse->begin(txn->xid, txn->final_lsn);
 }
 
@@ -156,7 +161,7 @@ capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 	CaptureChange out = {.branch = relation_branch(relation), .relation = relation, .lsn = change->lsn};
 
 	/* (a materialized view's rows reach here only from a concurrent refresh) */
-	if (out.branch == 0 || relation->rd_rel->relkind != RELKIND_RELATION)
+	if (capture_left_out || out.branch == 0 || relation->rd_rel->relkind != RELKIND_RELATION)
 		return;
 	switch (change->action)
 	{
@@ -182,6 +187,8 @@ static void
 capture_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, int nrelations, Relation relations[],
 				 ReorderBufferChange *change)
 {
+	if (capture_left_out)
+		return;
 	for (int i = 0; i < nrelations; i++)
 	{
 		int32		branch = relation_branch(relations[i]);
@@ -195,6 +202,13 @@ static void
 capture_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr lsn, bool transactional,
 				const char *prefix, Size size, const char *message)
 {
+	if (transactional && strcmp(prefix, CAPTURE_LEAVE_OUT_PREFIX) == 0)
+	{
+		capture_left_out = true;
+		return;
+	}
+	if (transactional && capture_left_out)
+		return;
 	CaptureSinkInUse->message(prefix, message, size, transactional, lsn);
 }
 
@@ -202,6 +216,34 @@ static void
 capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
 {
 	CaptureSinkInUse->commit(txn->xid, commit_lsn, txn->end_lsn);
+}
+
+/*
+ * The writes of this transaction are left out of capture: a message saying so goes first, before
+ * the transaction has written anything, and decoding tells the sink nothing more of it than that it
+ * began and committed.  So it's the whole of it, as a prepared transaction's when it's committed;
+ * and in a subtransaction, it's left out with what that rolls back.  For version control's own
+ * writes, which make the tables what it has made the branch's trees, such as a hard reset's: what
+ * the transaction does to any versioned table, its rows and its shape, is the caller's to have made
+ * the trees of.  As it has written, a commit from capture refuses it.  (Written is having an xid,
+ * which a subtransaction's write rolled back still leaves the transaction: that refuses too.)
+ */
+void
+CaptureLeaveOut(void)
+{
+	static TransactionId left_out = InvalidTransactionId;
+
+	if (!IsTransactionState() || IsInParallelMode())
+		elog(ERROR, "capture can only leave out a transaction, and not in parallel");
+	if (TransactionIdIsValid(left_out) && TransactionIdIsCurrentTransactionId(left_out))
+		return;
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot leave this transaction out of capture"),
+				 errdetail("It has written already.")));
+	(void) LogLogicalMessage(CAPTURE_LEAVE_OUT_PREFIX, "", 0, true, false);
+	left_out = GetCurrentTransactionId();
 }
 
 void
