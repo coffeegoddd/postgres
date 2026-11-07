@@ -49,7 +49,7 @@ my @scenarios = (
 	[ 'a key of two columns', q{CREATE TABLE t (k1 integer, k2 text, v text, PRIMARY KEY (k1, k2)); INSERT INTO t VALUES (1, 'x', 'b')},
 		q{UPDATE t SET v = 'o'}, q{UPDATE t SET v = 't'}, [ 'row t 1,x' ], undef ],
 	# (a column dropped and added back with the same name and type is the one it was, as in Dolt)
-	[ 'a column dropped and added again, the old one changed the other side', "$T; $ROWS",
+	[ 'a column dropped and added again, and an update of it', "$T; $ROWS",
 		q{ALTER TABLE t DROP COLUMN b; ALTER TABLE t ADD COLUMN b text},
 		q{UPDATE t SET b = 'changed' WHERE id = 1}, [ 'row t 1' ], undef ],
 	[ 'a column dropped and added again, a row inserted the other side', "$T; $ROWS",
