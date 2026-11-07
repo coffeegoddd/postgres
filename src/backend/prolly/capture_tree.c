@@ -43,8 +43,8 @@
  * one at a time could take off what another's just put.  Its whole old rows are logged, so what a
  * transaction did comes down to what's left of each row: see tree_net_edits.
  *
- * An update doesn't send a value it left out of line.  With no key it's in the old row; with one,
- * it's what the row has now, from what's being applied or else the map, in the tree it's already in.
+ * An update doesn't send a value it left out of line.  With no key, or a deferrable one, it's in the
+ * old row; with any other key, it's what the row has now, from what's being applied or else the map, in the tree it's already in.
  *
  * This is off by default (capture_to_trees), as there's more it doesn't follow.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
@@ -367,12 +367,13 @@ tree_change(const CaptureChange *change)
 		tree_as_of = lappend(tree_as_of, held);
 	}
 	MemoryContextSwitchTo(old);
-	if (change->old_tuple == NULL &&
-		(change->kind == CAPTURE_DELETE || (change->kind == CAPTURE_UPDATE && table->shape->nkey == 0)))
-		elog(ERROR, "a change of \"%s\" came with no old row", RelationGetRelationName(change->relation));
 	held->whole_old_row = table->shape->nkey > 0 &&
 		!OidIsValid(RelationGetPrimaryKeyIndex(change->relation, false)) &&
 		OidIsValid(RelationGetPrimaryKeyIndex(change->relation, true));
+	if (change->old_tuple == NULL &&
+		(change->kind == CAPTURE_DELETE ||
+		 (change->kind == CAPTURE_UPDATE && (table->shape->nkey == 0 || held->whole_old_row))))
+		elog(ERROR, "a change of \"%s\" came with no old row", RelationGetRelationName(change->relation));
 	if (change->old_tuple != NULL)
 		held->old_row = tree_row(change->relation, table, change->old_tuple,
 								 table->shape->nkey > 0 && !held->whole_old_row, NULL, NULL, &held->problem);
@@ -748,7 +749,7 @@ tree_edit_row_cmp(const void *a, const void *b)
  * most one, which is the edit; or none, and if it lost one, it's gone.  How many edits there now are.
  */
 static size_t
-tree_net_edits(ProllyEdit *edits, size_t n)
+tree_net_edits(Oid relid, ProllyEdit *edits, size_t n)
 {
 	size_t		out = 0;
 
@@ -775,17 +776,39 @@ tree_net_edits(ProllyEdit *edits, size_t n)
 				if (have || net > 1)
 					ereport(ERROR,
 							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("a transaction left a deferrable key on more than one row")));
+							 errmsg("a transaction left a deferrable key of relation %u on more than one row", relid)));
 				have = true;
 				kept = edits[k];
 			}
 			k = r;
 		}
+
+		/* (all but the row that's left go now, as what's kept is all that's freed later) */
+		for (size_t e = i; e < k; e++)
+		{
+			if (have && edits[e].key == kept.key)
+				continue;
+			if (!have && e == i)
+				continue;
+			px_free((void *) edits[e].key);
+			px_free((void *) edits[e].val);
+		}
 		if (have || lost)
 		{
+			if (!have)
+			{
+				px_free((void *) kept.val);
+				kept.val = NULL;
+				kept.vlen = 0;
+			}
 			edits[out] = kept;
 			edits[out].del = !have;
 			out++;
+		}
+		else
+		{
+			px_free((void *) kept.key);
+			px_free((void *) kept.val);
 		}
 		i = k;
 	}
@@ -977,7 +1000,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it", table->relid)));
-			n = tree_net_edits(edits, n);
+			n = tree_net_edits(table->relid, edits, n);
 			netting = false;
 			tree_write_edits(ctx, &map, edits, &n, &latest, has_unchanged);
 			wrote = true;
@@ -1050,7 +1073,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		}
 	}
 	if (netting)
-		n = tree_net_edits(edits, n);
+		n = tree_net_edits(table->relid, edits, n);
 	if (latest != NULL)
 		hash_destroy(latest);
 	if (n > 0 || anew || wrote)

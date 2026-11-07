@@ -146,8 +146,12 @@ SKIP:
 	run(q{UPDATE ways SET n = 10 WHERE id = 1});
 	kill 'CONT', $worker;
 	same_map('ways', 'told whole, then left, applied together');
+	caught_up();
+	kill 'STOP', $worker;
+	run(q{UPDATE ways SET n = 11 WHERE id = 6});
+	run(q{DELETE FROM ways WHERE id = 6});
 	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applied', 'wait')");
-	run(q{UPDATE ways SET v = repeat('later', 5000) WHERE id = 1; UPDATE ways SET n = 11 WHERE id = 1});
+	kill 'CONT', $worker;
 	$node->wait_for_event('capture worker', 'capture-applied');
 	my $held = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
@@ -181,6 +185,42 @@ $node->safe_psql('postgres', "$on BEGIN; UPDATE s.d2 SET n = 2; ALTER TABLE s.d2
 ok($node->wait_for_log(qr/does not follow relation \d+ having its deferrable key changed/, $log_at), 'made immediate in a transaction that writes it: an error');
 run('VACUUM FULL d2');
 same_map('d2', 'which a rewrite gets past');
+
+# several of a table's transactions in one apply, its key deferrable for some of them
+SKIP:
+{
+	skip 'no way to stop a process', 3 if $windows_os;
+	run(q{CREATE TABLE e (id integer PRIMARY KEY, n integer, v text); ALTER TABLE e ALTER v SET STORAGE EXTERNAL;
+		INSERT INTO e SELECT g, 0, repeat(g::text, 9000) FROM generate_series(1, 4) g});
+	caught_up();
+	kill 'STOP', $worker;
+	run(q{UPDATE e SET v = repeat('first', 5000) WHERE id = 3});
+	run(q{INSERT INTO e VALUES (50, 0, 'gone')});
+	run(q{DELETE FROM e WHERE id = 50});
+
+	# (in a transaction of their own, or the rows would be told whole, leaving nothing to get wrong)
+	run(q{BEGIN; ALTER TABLE e DROP CONSTRAINT e_pkey; ALTER TABLE e ADD PRIMARY KEY (id) DEFERRABLE; COMMIT});
+	run(q{UPDATE e SET id = id + 1});
+	run(q{UPDATE e SET id = id + 1});
+	run(q{BEGIN; ALTER TABLE e DROP CONSTRAINT e_pkey; ALTER TABLE e ADD PRIMARY KEY (id); COMMIT});
+	run(q{UPDATE e SET n = 1 WHERE id = 3});
+	run(q{UPDATE e SET v = repeat('second', 5000) WHERE id = 4});
+	run(q{UPDATE e SET n = 2 WHERE id = 4});
+	kill 'CONT', $worker;
+	same_map('e', 'immediate, deferrable twice, and immediate, in one apply');
+
+	kill 'STOP', $worker;
+	run(q{VACUUM FULL d});
+	run(q{UPDATE d SET id = id + 1});
+	kill 'CONT', $worker;
+	same_map('d', 'told whole, then deferrable, in one apply');
+
+	my $from = -s $node->logfile;
+	$node->safe_psql('postgres', "$on BEGIN; UPDATE s.e SET n = 3; ALTER TABLE s.e DROP CONSTRAINT e_pkey; ALTER TABLE s.e ADD PRIMARY KEY (id) DEFERRABLE; UPDATE s.e SET n = 4; COMMIT");
+	ok($node->wait_for_log(qr/does not follow relation \d+ having its deferrable key changed/, $from), 'made deferrable in a transaction that writes it: an error');
+	run('VACUUM FULL e');
+	same_map('e', 'which a rewrite gets past');
+}
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
