@@ -82,6 +82,8 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 	int			nroles = 0;
 	PHash		map;
 
+	ws_obj_check_current(schema);
+
 	/* (what it would do of tables yet to be made is no table's, and no commit holds it) */
 	WsSql->run("SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace "
 			   "WHERE n.nspname = $1::name LIMIT 1", 1, params, &viewed);

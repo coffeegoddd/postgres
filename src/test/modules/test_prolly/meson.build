@@ -246,6 +246,7 @@ tests += {
       't/117_capture_heal.pl',
       't/118_capture_behind.pl',
       't/119_capture_branches.pl',
+      't/121_ws_snapshot_names.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
