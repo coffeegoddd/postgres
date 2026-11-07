@@ -19,6 +19,7 @@ CREATE TABLE t (id int PRIMARY KEY, r regdictionary);
 CREATE TABLE t (id int PRIMARY KEY, r regnamespace);
 CREATE TABLE t (id int PRIMARY KEY, r regrole);
 CREATE TABLE t (id int PRIMARY KEY, r regcollation);
+CREATE TABLE t (id int PRIMARY KEY, r regdatabase);
 CREATE TABLE t (id int PRIMARY KEY, r aclitem);
 
 -- inside an array, a domain, a composite type, and those in each other
@@ -31,6 +32,9 @@ CREATE TYPE app.holds_holder AS (inner_one app.holds_a_role);
 CREATE TABLE t (id int PRIMARY KEY, r app.holds_holder[]);
 CREATE DOMAIN app.many_names AS app.names_a_class[];
 CREATE TABLE t (id int PRIMARY KEY, r app.many_names);
+CREATE TYPE app.class_range AS RANGE (SUBTYPE = regclass, SUBTYPE_OPCLASS = oid_ops);
+CREATE TABLE t (id int PRIMARY KEY, r app.class_range);
+CREATE TABLE t (id int PRIMARY KEY, r app.class_multirange);
 
 -- made any way at all: added, retyped, from a query, or on a partitioned table and so its partitions
 -- (moving a table into a versioned schema is refused already)
@@ -50,11 +54,45 @@ CREATE TABLE fine (v text);
 COMMIT;
 SELECT to_regclass('app.fine') IS NULL AS not_made_either;
 
+-- in a savepoint released, and in one rolled back
+BEGIN;
+SAVEPOINT s;
+CREATE TABLE in_savepoint (r regclass);
+RELEASE s;
+COMMIT;
+BEGIN;
+SAVEPOINT s;
+CREATE TABLE rolled_back (r regclass);
+ROLLBACK TO s;
+COMMIT;
+
 -- one made and gone in the transaction is nothing to refuse
 BEGIN;
 CREATE TABLE gone (r regclass);
 DROP TABLE gone;
 COMMIT;
+
+-- a type changed under a versioned table's column: a composite, its own or a shared one, through a
+-- domain, a shared table's row type, and a view's
+CREATE TYPE app.later AS (n int);
+CREATE TABLE uses_later (id int PRIMARY KEY, c app.later);
+ALTER TYPE app.later ADD ATTRIBUTE r regclass;
+CREATE TYPE pub.shared_later AS (n int);
+CREATE TABLE uses_shared (id int PRIMARY KEY, c pub.shared_later[]);
+ALTER TYPE pub.shared_later ADD ATTRIBUTE r regclass CASCADE;
+CREATE TYPE pub.under_domain AS (n int);
+CREATE DOMAIN pub.over_it AS pub.under_domain;
+CREATE TABLE uses_domain (id int PRIMARY KEY, c pub.over_it);
+ALTER TYPE pub.under_domain ADD ATTRIBUTE r regrole;
+CREATE TYPE app.outer_one AS (inner_one pub.under_domain);
+CREATE TABLE pub.its_row (n int);
+CREATE TABLE uses_row (id int PRIMARY KEY, c pub.its_row);
+ALTER TABLE pub.its_row ADD COLUMN r regclass;
+CREATE VIEW pub.its_view AS SELECT 1 AS n;
+CREATE TABLE uses_view (id int PRIMARY KEY, c pub.its_view);
+CREATE OR REPLACE VIEW pub.its_view AS SELECT 1 AS n, 'pg_class'::regclass AS r;
+SELECT string_agg(relname, ',' ORDER BY relname) AS still_fine FROM pg_class
+WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'uses_%';
 
 -- a typed table
 CREATE TYPE app.row_type AS (id int, v text);

@@ -2158,7 +2158,7 @@ for my $case (
 {
 	my ($sql, $table, $what) = @$case;
 	my ($rc, $out, $err) = $node->psql('postgres', $sql);
-	like($err, qr/column "\w+" of versioned table "$table" cannot be of type .*, which names an object/, "refused as made: $what");
+	like($err, qr/column "\w+" of versioned table "\w+\.$table" cannot be of type .*, which names an object/, "refused as made: $what");
 }
 
 # more that cannot be held without naming the schema

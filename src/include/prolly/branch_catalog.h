@@ -207,6 +207,9 @@ extern void CatalogBranchCheckInheritance(Oid childid, Oid parentid);
  */
 extern void BranchTablesCheckAtCommit(void);
 
+/* Whether a type's values name objects: the reg* types, and aclitem. */
+extern bool BranchTypeNamesObject(Oid typid);
+
 /*
  * Resolves schema names as on the branch of namespace nspid (no branch, if
  * it is a shared schema) until CatalogBranchResolveRestore is given what
