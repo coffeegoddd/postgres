@@ -37,13 +37,16 @@ my %cases = (
 	'a collation of a column' => ['CREATE COLLATION s.c (locale = \'C\'); CREATE TABLE s.t (id integer PRIMARY KEY, a text COLLATE s.c)', 'ALTER COLLATION s.c RENAME TO c2'],
 	'a function outside in a default' => ['CREATE FUNCTION public.pf() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY, a integer DEFAULT public.pf())', 'ALTER FUNCTION public.pf() RENAME TO pf2'],
 	'a type outside of a column' => [q{CREATE TYPE public.pe AS ENUM ('x'); CREATE TABLE s.t (id integer PRIMARY KEY, a public.pe)}, 'ALTER TYPE public.pe RENAME TO pe2'],
+	'an enum value outside in a default' => [q{CREATE TYPE public.pe AS ENUM ('x'); CREATE TABLE s.t (id integer PRIMARY KEY, a public.pe DEFAULT 'x')}, q{ALTER TYPE public.pe RENAME VALUE 'x' TO 'y'}],
+	'an operator class outside of an index' => ['RESET ROLE; CREATE OPERATOR CLASS public.my_ops FOR TYPE integer USING btree AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 btint4cmp(integer, integer); SET ROLE objs; CREATE TABLE s.t (id integer PRIMARY KEY, a integer); CREATE INDEX ON s.t (a public.my_ops)', 'RESET ROLE; ALTER OPERATOR CLASS public.my_ops USING btree RENAME TO my_ops2'],
 	'the schema of a function outside' => ['CREATE SCHEMA other; CREATE FUNCTION other.of() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY, a integer DEFAULT other.of())', 'ALTER SCHEMA other RENAME TO other2'],
 );
 
 # what changes outside the schema that it doesn't name
 my %unnamed = (
 	'a function it does not use renamed' => ['CREATE FUNCTION public.pf() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY)', 'ALTER FUNCTION public.pf() RENAME TO pf2'],
-	'a table outside written' => ['CREATE TABLE public.po (a integer); CREATE TABLE s.t (id integer PRIMARY KEY)', 'INSERT INTO public.po VALUES (1)'],
+	'a function it uses given a cost' => ['CREATE FUNCTION public.pf() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY, a integer DEFAULT public.pf())', 'ALTER FUNCTION public.pf() COST 5'],
+	'the schema of a function it uses granted on' => ['CREATE SCHEMA other; CREATE FUNCTION other.of() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1; CREATE TABLE s.t (id integer PRIMARY KEY, a integer DEFAULT other.of())', 'GRANT USAGE ON SCHEMA other TO PUBLIC'],
 );
 
 # A root read at a snapshot taken before $change, and one read before it.
@@ -52,7 +55,8 @@ sub read_old
 	my ($setup, $change) = @_;
 	$node->safe_psql('postgres', "$on DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA IF EXISTS other CASCADE; DROP SCHEMA IF EXISTS other2 CASCADE;
 		DROP FUNCTION IF EXISTS public.pf(); DROP FUNCTION IF EXISTS public.pf2(); DROP TYPE IF EXISTS public.pe; DROP TYPE IF EXISTS public.pe2;
-		DROP TABLE IF EXISTS public.po; CREATE SCHEMA s VERSIONED; GRANT ALL ON SCHEMA s TO objs; SET ROLE objs; $setup");
+		DROP TYPE IF EXISTS public.ct; DROP OPERATOR FAMILY IF EXISTS public.my_ops USING btree CASCADE;
+		DROP OPERATOR FAMILY IF EXISTS public.my_ops2 USING btree CASCADE; CREATE SCHEMA s VERSIONED; GRANT ALL ON SCHEMA s TO objs; SET ROLE objs; $setup");
 	my $before = $node->safe_psql('postgres', "$on SELECT test_ws_root_capture('s')");
 	my $old = $node->background_psql('postgres', on_error_stop => 0);
 	$old->query_safe("$on BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1");
