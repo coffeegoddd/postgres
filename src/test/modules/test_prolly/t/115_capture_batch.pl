@@ -206,6 +206,53 @@ SKIP:
 	is($root, $node->safe_psql('postgres', "$on SELECT test_ws_root_capture('s')"), 'the same root as reading the tables');
 }
 
+# one transaction, which is told in one call, past what's held in memory
+SKIP:
+{
+	skip 'injection points not supported by this build', 9 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
+	run(q{CREATE TABLE huge (id integer PRIMARY KEY, v text); CREATE TABLE huge_nokey (a integer, v text);
+		CREATE TABLE huge_left (id integer PRIMARY KEY, n integer, v text); ALTER TABLE huge_left ALTER v SET STORAGE EXTERNAL;
+		CREATE TABLE huge_deferred (id integer PRIMARY KEY DEFERRABLE, v text);
+		INSERT INTO huge_left VALUES (1, 0, repeat('left', 5000));
+		INSERT INTO huge_deferred SELECT g, repeat('d', 200) FROM generate_series(1, 300) g});
+	caught_up();
+	my $at = -s $node->logfile;
+	$node->safe_psql('postgres', qq{CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applying', 'wait')});
+	run(q{BEGIN;
+		INSERT INTO huge SELECT g, repeat('h', 800) FROM generate_series(1, 20000) g;
+		UPDATE huge SET v = 'changed' WHERE id % 3 = 0;
+		DELETE FROM huge WHERE id % 5 = 0;
+		INSERT INTO huge_nokey SELECT g % 10, repeat('n', 800) FROM generate_series(1, 20000) g;
+		DELETE FROM huge_nokey WHERE a = 3;
+		UPDATE huge_left SET v = repeat('newer', 5000);
+		UPDATE huge_left SET n = 1;
+		UPDATE huge_deferred SET id = id + 1;
+		COMMIT});
+	$node->wait_for_event('capture worker', 'capture-applying');
+	like(slurp_file($node->logfile, $at), qr/capture tree: spilled \d+ bytes/, 'one transaction goes to a file');
+
+	# (what's in memory, with the worker about to commit it: the rows were on file)
+	my $memory_at = -s $node->logfile;
+	my $pid = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->safe_psql('postgres', "SELECT pg_log_backend_memory_contexts($pid)");
+	ok($node->wait_for_log(qr/capture tree held: \d+ total/, $memory_at), 'what it holds in memory is logged');
+	my ($held) = slurp_file($node->logfile, $memory_at) =~ /capture tree held: (\d+) total/;
+	cmp_ok($held, '<', 1024 * 1024, 'and is little, for one of 16 MB and more');
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-applying'); SELECT injection_points_detach('capture-applying')});
+	same_map('huge', 'with a key');
+	same_map('huge_nokey', 'with none');
+	same_map('huge_left', 'a value left out of line');
+	same_map('huge_deferred', 'a deferrable key');
+
+	# told whole, what's on file goes
+	$at = -s $node->logfile;
+	run(q{BEGIN; INSERT INTO huge SELECT g + 100000, repeat('h', 800) FROM generate_series(1, 5000) g; ALTER TABLE huge ALTER v TYPE varchar(1000); COMMIT});
+	same_map('huge', 'on file, then told whole');
+	run(q{UPDATE huge SET v = 'after' WHERE id = 1});
+	same_map('huge', 'and written after');
+	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
+}
+
 # what's wrong with a change isn't applied for its size, or a worker would never read as far as what
 # gets past it
 SKIP:
