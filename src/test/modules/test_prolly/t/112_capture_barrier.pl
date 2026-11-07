@@ -445,6 +445,38 @@ SKIP:
 }
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
+# waiting for capture to reach a point: once it returns, the map has what was committed before it
+my $map_t = q{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid};
+$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900031, 'waited for')");
+my $at = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+$node->safe_psql('postgres', "SELECT test_capture_wait($b1, '$at')");
+is($node->safe_psql('postgres', "$on1 $map_t"), $node->safe_psql('postgres', "$on1 SELECT test_ws_rows_hash('s', 't')"),
+	'waited for capture, the map has what was committed before');
+SKIP:
+{
+	skip 'no way to stop a process', 4 if $windows_os;
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900031");
+	$at = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+	kill 'STOP', $worker;
+	my ($rc_w, $o_w, $err_w) = $node->psql('postgres', "SELECT test_capture_wait($b1, '$at', 300)");
+	like($err_w, qr/capture did not reach [0-9A-F]+\/[0-9A-F]+ in time/, 'not reached in time, an error');
+	my $bg = $node->background_psql('postgres');
+	$bg->query_until(qr/started/, "\\echo started\nSELECT test_capture_wait($b1, '$at');\n\\echo waited\n");
+	ok($node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'CaptureWait'}),
+		'waiting for capture, as it is stopped');
+	kill 'CONT', $worker;
+	$bg->{stdout} = '';
+	$bg->{run}->pump until $bg->{stdout} =~ /waited/ || !$bg->{run}->pumpable;
+	like($bg->{stdout}, qr/waited/, 'and done once it goes on');
+	$bg->quit;
+	is($node->safe_psql('postgres', "$on1 $map_t"), $node->safe_psql('postgres', "$on1 SELECT test_ws_rows_hash('s', 't')"),
+		'with what was committed before in the map');
+}
+$node->safe_psql('postgres', 'CREATE DATABASE uncaptured');
+$node->safe_psql('uncaptured', 'CREATE EXTENSION test_prolly');
+my ($rc_u, $o_u, $err_u) = $node->psql('uncaptured', "SELECT test_capture_wait($b1, '0/1')");
+like($err_u, qr/database "uncaptured" is not being captured/, 'waiting in a database with nothing captured, an error');
+
 # a crash between a commit's marker and capture reaching it: the commit is lost, and nothing of it is
 # seen; the next commit has what the lost one would have had
 SKIP:

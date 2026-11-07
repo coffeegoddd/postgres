@@ -199,6 +199,13 @@ extern void CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot
 extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root);
 
 /*
+ * Waits until capture has applied to a branch's working trees what this database's transactions
+ * committed up to lsn, and returns; an error if it hasn't within timeout_ms, if the database isn't
+ * being captured, or if its slot's been invalidated, which loses what it hadn't applied.
+ */
+extern void CaptureWaitFor(int32 branch, XLogRecPtr lsn, int timeout_ms);
+
+/*
  * The replica identity a change of this table logs by, in place of its own.  With capture on, a
  * versioned table logs its whole old row unless it has a primary key that identifies a row by
  * itself, so that a table with no key, one whose key is deferrable and one set to log nothing or

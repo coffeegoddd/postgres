@@ -32,6 +32,7 @@
 #include "prolly/ws/ws_viol.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 #include "varatt.h"
 
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
@@ -59,6 +60,7 @@ PG_FUNCTION_INFO_V1(test_ws_role_restore);
 PG_FUNCTION_INFO_V1(test_ws_fk_copy);
 PG_FUNCTION_INFO_V1(test_ws_schema_shape);
 PG_FUNCTION_INFO_V1(test_capture_barrier);
+PG_FUNCTION_INFO_V1(test_capture_wait);
 PG_FUNCTION_INFO_V1(test_capture_commit);
 PG_FUNCTION_INFO_V1(test_capture_commit_on);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
@@ -951,6 +953,14 @@ test_capture_barrier(PG_FUNCTION_ARGS)
 	CaptureBarrier(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_INT32(1), &root);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* test_capture_wait(branch integer, lsn pg_lsn, timeout_ms integer): capture up to lsn for the branch */
+Datum
+test_capture_wait(PG_FUNCTION_ARGS)
+{
+	CaptureWaitFor(PG_GETARG_INT32(0), PG_GETARG_LSN(1), PG_GETARG_INT32(2));
+	PG_RETURN_VOID();
 }
 
 /*

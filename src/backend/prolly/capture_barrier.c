@@ -51,6 +51,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
@@ -209,6 +210,57 @@ wake_worker(void)
 }
 
 /* Whether the worker has saved the maps as of the marker. */
+/*
+ * Every branch's changes are applied together, and the slot moves only once they're committed, so
+ * the slot's position is how far each branch's capture has got; a branch's own position moves only
+ * when it has changes, so it isn't.  (Applying branches apart would have the slot at the least of
+ * theirs, and this wait on the branch's.)
+ */
+void
+CaptureWaitFor(int32 branch, XLogRecPtr lsn, int timeout_ms)
+{
+	char		name[NAMEDATALEN];
+	TimestampTz start = GetCurrentTimestamp();
+
+	(void) branch;
+	snprintf(name, NAMEDATALEN, CAPTURE_SLOT_PREFIX "%u", MyDatabaseId);
+	for (;;)
+	{
+		ReplicationSlot *slot;
+		XLogRecPtr	reached = InvalidXLogRecPtr;
+		bool		lost = false;
+
+		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+		slot = SearchNamedReplicationSlot(name, false);
+		if (slot != NULL)
+		{
+			SpinLockAcquire(&slot->mutex);
+			reached = slot->data.confirmed_flush;
+			lost = slot->data.invalidated != RS_INVAL_NONE;
+			SpinLockRelease(&slot->mutex);
+		}
+		LWLockRelease(ReplicationSlotControlLock);
+		if (slot == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("database \"%s\" is not being captured", get_database_name(MyDatabaseId))));
+		if (lost)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("capture's replication slot \"%s\" was invalidated, and what it hadn't applied is read again", name)));
+		if (reached >= lsn)
+			return;
+		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_QUERY_CANCELED),
+					 errmsg("capture did not reach %X/%X in time", LSN_FORMAT_ARGS(lsn))));
+		wake_worker();
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 2, WAIT_EVENT_CAPTURE_WAIT);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
 static bool
 barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 {
