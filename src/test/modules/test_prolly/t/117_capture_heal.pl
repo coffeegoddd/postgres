@@ -96,6 +96,11 @@ same_map('bad', 'and written after');
 		'its changes meanwhile make no map of part of it');
 	my ($rc, $out, $err) = $node->psql('postgres', "$on SELECT test_capture_barrier('s', 30000)");
 	like($err, qr/capture is healing table "bad" of schema "s"/, 'a commit of its schema is refused meanwhile');
+
+	# (left so many times, the worker waits a little for it, which it shows as waiting for a lock)
+	ok( $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND wait_event_type = 'Lock'}),
+		'left a few times, the worker waits a little for the writer');
+	is(run(q{SELECT count(*) FROM pg_history.capture_healing WHERE relid = 's.bad'::regclass}), '1', 'and gives up again for now');
 	$writer->query_safe('COMMIT');
 	$writer->quit;
 	healed('bad');

@@ -255,7 +255,7 @@ rows_write(Relation rel, int32 branch)
 }
 
 bool
-CaptureRowsResend(Oid relid)
+CaptureRowsResend(Oid relid, int wait_ms)
 {
 	Relation	rel;
 
@@ -263,9 +263,19 @@ CaptureRowsResend(Oid relid)
 	 * (the lock commits telling a table's rows take turns on too, so these aren't told at once with a
 	 * commit's of a change to what they print as, read as the catalogs were before it)
 	 */
-	if (!ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock))
-		return false;
-	if (!ConditionalLockRelationOid(relid, ShareLock))
+	if (wait_ms > 0)
+	{
+		char		timeout[32];
+		int			gucs = NewGUCNestLevel();
+
+		snprintf(timeout, sizeof(timeout), "%d", wait_ms);
+		(void) set_config_option("lock_timeout", timeout, PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+		LockRelationOid(relid, ShareLock);
+		AtEOXact_GUC(true, gucs);
+	}
+	else if (!ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock) ||
+			 !ConditionalLockRelationOid(relid, ShareLock))
 		return false;
 	AcceptInvalidationMessages();
 	rel = try_relation_open(relid, NoLock);

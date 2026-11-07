@@ -185,6 +185,15 @@ static List *tree_to_heal = NIL;
  */
 static bool tree_fault = false;
 
+/* How many times a table to heal has been left, a writer having it. */
+typedef struct TreeHealTry
+{
+	Oid			relid;
+	int			tries;
+} TreeHealTry;
+
+static List *tree_heal_tries = NIL;
+
 /* Tables being healed, as pg_history.capture_healing has them: their changes are passed over. */
 static List *tree_healing = NIL;
 static void tree_heal(void);
@@ -1557,9 +1566,49 @@ tree_apply_one(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 	PG_END_TRY();
 }
 
+/* Tries of the locks for a table a writer had, after which a heal waits a little for them. */
+#define TREE_HEAL_TRIES 5
+#define TREE_HEAL_WAIT_MS 200
+
+/* A table told whole in a transaction of its own; false if a writer has it, waited for or not. */
+static bool
+tree_heal_one(Oid relid, int wait_ms)
+{
+	MemoryContext was = CurrentMemoryContext;
+	volatile bool done = false;
+
+	StartTransactionCommand();
+	PG_TRY();
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		done = CaptureRowsResend(relid, wait_ms);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *e;
+
+		MemoryContextSwitchTo(was);
+		e = CopyErrorData();
+		if (e->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+			PG_RE_THROW();
+		FlushErrorState();
+		AbortCurrentTransaction();
+		MemoryContextSwitchTo(was);
+		FreeErrorData(e);
+		done = false;
+	}
+	PG_END_TRY();
+	return done;
+}
+
 /*
  * Tables whose changes couldn't be applied, each told whole in a transaction of its own.  One a
- * writer has is left for the next time, rather than have the worker, and all capture, wait.
+ * writer has is left for the next time, rather than have the worker, and all capture, wait: but once
+ * it's been left TREE_HEAL_TRIES times, the worker waits up to TREE_HEAL_WAIT_MS for it, so that a
+ * table always being written to is healed too, holding capture up that long at most, and the
+ * table's writers behind it.
  */
 static void
 tree_heal(void)
@@ -1570,18 +1619,46 @@ tree_heal(void)
 	foreach_oid(relid, tree_to_heal)
 	{
 		bool		done;
+		int			tries = 0;
 
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		done = CaptureRowsResend(relid);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		if (!done)
+		foreach_ptr(TreeHealTry, t, tree_heal_tries)
 		{
-			old = MemoryContextSwitchTo(TopMemoryContext);
-			later = lappend_oid(later, relid);
-			MemoryContextSwitchTo(old);
+			if (t->relid == relid)
+				tries = t->tries;
 		}
+		done = tree_heal_one(relid, tries >= TREE_HEAL_TRIES ? TREE_HEAL_WAIT_MS : 0);
+		old = MemoryContextSwitchTo(TopMemoryContext);
+		if (done)
+		{
+			foreach_ptr(TreeHealTry, t, tree_heal_tries)
+			{
+				if (t->relid == relid)
+					tree_heal_tries = foreach_delete_current(tree_heal_tries, t);
+			}
+		}
+		else
+		{
+			bool		known = false;
+
+			foreach_ptr(TreeHealTry, t, tree_heal_tries)
+			{
+				if (t->relid == relid)
+				{
+					t->tries++;
+					known = true;
+				}
+			}
+			if (!known)
+			{
+				TreeHealTry *t = palloc_object(TreeHealTry);
+
+				t->relid = relid;
+				t->tries = 1;
+				tree_heal_tries = lappend(tree_heal_tries, t);
+			}
+			later = lappend_oid(later, relid);
+		}
+		MemoryContextSwitchTo(old);
 	}
 	list_free(tree_to_heal);
 	tree_to_heal = later;
