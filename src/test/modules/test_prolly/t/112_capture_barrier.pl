@@ -346,7 +346,7 @@ is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_fingerp
 # waits is past its marker
 SKIP:
 {
-	skip 'no way to stop a process', 1 if $windows_os;
+	skip 'no way to stop a process', 2 if $windows_os;
 	kill 'STOP', $worker;
 	my $bg = barrier_held($on1);
 	my $flushed = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
