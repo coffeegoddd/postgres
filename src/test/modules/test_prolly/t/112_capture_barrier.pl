@@ -333,7 +333,14 @@ is($node->safe_psql('postgres', "$on1 SELECT string_agg(v, ',' ORDER BY id) FROM
 # a table dropped and another made, which may have its object id: the new one's rows are told whole
 $node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.swap_b; CREATE TABLE s.swap_b (id integer PRIMARY KEY, v text); INSERT INTO s.swap_b VALUES (9, 'new')");
 same_root('s', $on1, 'a table dropped and one made in its name');
-$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.swap_a; DROP TABLE s.swap_b");
+$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.swap_a");
+
+# a table dropped above READ COMMITTED has its fingerprint forgotten too, or another made later with
+# its object id, and the same columns, would be taken for it, its rows never told
+my $dropped = $node->safe_psql('postgres', "$on1 SELECT 's.swap_b'::regclass::oid");
+$node->safe_psql('postgres', "$on1 SET ROLE objs; BEGIN ISOLATION LEVEL REPEATABLE READ; DROP TABLE s.swap_b; COMMIT");
+is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_fingerprints WHERE relid = $dropped"), '0',
+	'dropped in REPEATABLE READ, its fingerprint is forgotten');
 
 # its own transaction: nothing it's written, and nothing older than now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN; INSERT INTO s.t VALUES (900004, 'x'); SELECT test_capture_barrier('s'); ROLLBACK");

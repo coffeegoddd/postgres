@@ -447,7 +447,7 @@ versioned_tables(void)
 
 /* Each table whose fingerprint isn't the one recorded has its rows written, and what's recorded made so. */
 static void
-rows_compare(void)
+rows_compare(SharedInvalidationMessage *msgs, int nmsgs)
 {
 	List	   *tables = versioned_tables();
 	ListCell   *lc;
@@ -483,7 +483,25 @@ rows_compare(void)
 	}
 	list_free_deep(tables);
 
-	/* (above READ COMMITTED it'd read what could fail another; one left behind does no harm) */
+	/*
+	 * A table this transaction dropped has its fingerprint forgotten, or one made later with its
+	 * object id, of the same columns and so the same fingerprint, would be taken for it, and its
+	 * rows never told.  (By the tables it invalidated, at any level of isolation: what's gone of
+	 * others' is let go of below, but not above READ COMMITTED, as it'd read what could fail another.)
+	 */
+	for (int i = 0; i < nmsgs; i++)
+	{
+		Datum		values[1];
+		Oid			ftypes[1] = {OIDOID};
+
+		if (msgs[i].id != SHAREDINVALRELCACHE_ID || msgs[i].rc.dbId != MyDatabaseId ||
+			!OidIsValid(msgs[i].rc.relId) || SearchSysCacheExists1(RELOID, ObjectIdGetDatum(msgs[i].rc.relId)))
+			continue;
+		values[0] = ObjectIdGetDatum(msgs[i].rc.relId);
+		if (SPI_execute_with_args("DELETE FROM pg_history.capture_fingerprints WHERE relid = $1",
+								  1, ftypes, values, NULL, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not forget a table's fingerprint");
+	}
 	if (!IsolationUsesXactSnapshot() &&
 		SPI_execute("DELETE FROM pg_history.capture_fingerprints f WHERE NOT EXISTS "
 					"(SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = f.relid)", false, 0) != SPI_OK_DELETE)
@@ -507,6 +525,7 @@ void
 CaptureRowsAtCommit(bool prepare)
 {
 	SharedInvalidationMessage *msgs;
+	int			nmsgs;
 	bool		relcache;
 	Oid			saved_user;
 	int			saved_context;
@@ -519,7 +538,8 @@ CaptureRowsAtCommit(bool prepare)
 		!TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return;
 	CommandCounterIncrement();
-	if (xactGetCommittedInvalidationMessages(&msgs, &relcache) == 0 || !database_is_versioned())
+	nmsgs = xactGetCommittedInvalidationMessages(&msgs, &relcache);
+	if (nmsgs == 0 || !database_is_versioned())
 		return;
 
 	/* (its lock would then be held until it's resolved, by every other such commit's waiting) */
@@ -540,7 +560,7 @@ CaptureRowsAtCommit(bool prepare)
 	PushActiveSnapshot(GetLatestSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
-	rows_compare();
+	rows_compare(msgs, nmsgs);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
