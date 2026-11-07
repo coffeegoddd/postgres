@@ -76,12 +76,20 @@ SKIP:
 # killed between them: told again from what's confirmed, and passed over what isn't
 SKIP:
 {
-	skip 'injection points not supported by this build', 3 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
+	skip 'injection points not supported by this build', 4 if $ENV{enable_injection_points} ne 'yes' || $windows_os;
 	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applied', 'wait')");
 	caught_up();
 	kill 'STOP', $worker;
 	write_many(300);
 	kill 'CONT', $worker;
+	$node->wait_for_event('capture worker', 'capture-applied');
+
+	# (the slot's told of each batch, so the WAL behind it can go while the worker's still far behind)
+	my $was_at = $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '$slot'});
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-applied')});
+	ok( $node->poll_query_until('postgres',
+			qq{SELECT confirmed_flush_lsn > '$was_at'::pg_lsn AND confirmed_flush_lsn < pg_current_wal_flush_lsn() FROM pg_replication_slots WHERE slot_name = '$slot'}),
+		'the slot moves on after a batch, before the end');
 	$node->wait_for_event('capture worker', 'capture-applied');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
