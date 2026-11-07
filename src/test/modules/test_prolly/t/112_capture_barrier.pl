@@ -477,24 +477,35 @@ $node->safe_psql('uncaptured', 'CREATE EXTENSION test_prolly');
 my ($rc_u, $o_u, $err_u) = $node->psql('uncaptured', "SELECT test_capture_wait('0/1')");
 like($err_u, qr/database "uncaptured" is not being captured/, 'waiting in a database with nothing captured, an error');
 
-# a transaction left out of capture, as version control's own writes are: all of it, even what it
-# wrote before saying so, and only it, the session's next ones captured as ever, after a commit and
-# after a rollback
+# a transaction left out of capture, as version control's own writes are: said before it writes,
+# all of it, and only it; the session's next ones captured as ever, and one left out in a
+# subtransaction rolled back is captured
 {
 	my $map_s = q{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid};
 	my $rows_s = q{SELECT test_ws_rows_hash('s', 't')};
-	my $vc = $node->background_psql('postgres');
-	$vc->query_safe("$on1 BEGIN; INSERT INTO s.t VALUES (900041, 'left out'); SELECT test_capture_leave_out(); COMMIT");
 	caught_up();
-	isnt($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"), 'a transaction left out of capture');
-	$vc->query_safe("INSERT INTO s.t VALUES (900042, 'captured after a commit')");
-	$vc->query_safe("BEGIN; SELECT test_capture_leave_out(); ROLLBACK");
-	$vc->query_safe("INSERT INTO s.t VALUES (900043, 'captured after a rollback')");
+	my $was = $node->safe_psql('postgres', "$on1 $map_s");
+	my $vc = $node->background_psql('postgres', on_error_stop => 0);
+	$vc->query_safe("$on1 BEGIN; SELECT test_capture_leave_out(); INSERT INTO s.t VALUES (900041, 'left out'); COMMIT");
+	caught_up();
+	is($node->safe_psql('postgres', "$on1 $map_s"), $was, 'a transaction left out of capture leaves the map as it was');
+	$vc->query_safe("INSERT INTO s.t VALUES (900042, 'captured after one left out')");
+	$vc->query_safe("BEGIN; SAVEPOINT a; SELECT test_capture_leave_out(); ROLLBACK TO a; INSERT INTO s.t VALUES (900043, 'left out, rolled back'); COMMIT");
+	$vc->{stderr} = '';
+	$vc->query("BEGIN; INSERT INTO s.t VALUES (900044, 'written first'); SELECT test_capture_leave_out()");
+	like($vc->{stderr}, qr/cannot leave this transaction out of capture\nDETAIL:  It has written already\./, 'not once it has written');
+	$vc->{stderr} = '';
+	$vc->query_safe('ROLLBACK');
+	$vc->{stderr} = '';
+	$vc->query("BEGIN; SELECT test_capture_leave_out(); SELECT test_capture_barrier('s')");
+	like($vc->{stderr}, qr/a commit from capture can't run in a transaction that has written anything/, 'nor a commit from capture in one left out');
+	$vc->{stderr} = '';
+	$vc->query_safe('ROLLBACK');
 	$vc->query_safe("BEGIN; SELECT test_capture_leave_out(); DELETE FROM s.t WHERE id = 900041; COMMIT");
 	$vc->quit;
 	caught_up();
 	is($node->safe_psql('postgres', "$on1 $map_s"), $node->safe_psql('postgres', "$on1 $rows_s"),
-		"and only it: the session's next ones captured, and the row left out again on its way out");
+		"and only it: the session's next ones captured, a subtransaction's rolled back, and the row left out again on its way out");
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id IN (900042, 900043)");
 }
 

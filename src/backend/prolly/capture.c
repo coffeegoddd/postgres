@@ -33,7 +33,7 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalctl.h"
-#include "replication/origin.h"
+#include "replication/message.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"
@@ -92,9 +92,13 @@ capture_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 	opt->output_type = OUTPUT_PLUGIN_BINARY_OUTPUT;
 }
 
+/* Whether the transaction being told was left out of capture, from its first message on. */
+static bool capture_left_out = false;
+
 static void
 capture_begin(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
+	capture_left_out = false;
 	CaptureSinkInUse->begin(txn->xid, txn->final_lsn);
 }
 
@@ -157,7 +161,7 @@ capture_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 	CaptureChange out = {.branch = relation_branch(relation), .relation = relation, .lsn = change->lsn};
 
 	/* (a materialized view's rows reach here only from a concurrent refresh) */
-	if (out.branch == 0 || relation->rd_rel->relkind != RELKIND_RELATION)
+	if (capture_left_out || out.branch == 0 || relation->rd_rel->relkind != RELKIND_RELATION)
 		return;
 	switch (change->action)
 	{
@@ -183,6 +187,8 @@ static void
 capture_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, int nrelations, Relation relations[],
 				 ReorderBufferChange *change)
 {
+	if (capture_left_out)
+		return;
 	for (int i = 0; i < nrelations; i++)
 	{
 		int32		branch = relation_branch(relations[i]);
@@ -196,6 +202,13 @@ static void
 capture_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr lsn, bool transactional,
 				const char *prefix, Size size, const char *message)
 {
+	if (transactional && strcmp(prefix, CAPTURE_LEAVE_OUT_PREFIX) == 0)
+	{
+		capture_left_out = true;
+		return;
+	}
+	if (transactional && capture_left_out)
+		return;
 	CaptureSinkInUse->message(prefix, message, size, transactional, lsn);
 }
 
@@ -205,49 +218,31 @@ capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr co
 	CaptureSinkInUse->commit(txn->xid, commit_lsn, txn->end_lsn);
 }
 
-/* A transaction version control left out of capture: the whole of it, as decoding goes by its commit. */
-static bool
-capture_filter_origin(LogicalDecodingContext *ctx, ReplOriginId origin_id)
-{
-	return origin_id == DoNotReplicateId;
-}
-
-static void
-capture_left_out_end(XactEvent event, void *arg)
-{
-	if ((event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
-		 event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT) &&
-		replorigin_xact_state.origin == DoNotReplicateId)
-		replorigin_xact_state.origin = InvalidReplOriginId;
-}
-
 /*
- * The writes of this transaction, those before as well as after, are left out of capture: its
- * WAL is marked as of no origin to be replicated, which capture's decoding passes over, and which
- * a commit records no progress for.  Until the transaction ends.  For version control's own
- * writes, which make the tables what it has made the branch's trees, such as a hard reset's.  A
- * session with an origin of its own, as a subscription's apply worker has, can't.
+ * The writes of this transaction are left out of capture: a message saying so goes first, before
+ * the transaction has written anything, and decoding tells the sink nothing more of it than that it
+ * began and committed.  So it's the whole of it, as a prepared transaction's when it's committed;
+ * and in a subtransaction, it's left out with what that rolls back.  For version control's own
+ * writes, which make the tables what it has made the branch's trees, such as a hard reset's: what
+ * the transaction does to any versioned table, its rows and its shape, is the caller's to have made
+ * the trees of.  As it has written, a commit from capture refuses it.
  */
 void
 CaptureLeaveOut(void)
 {
-	static bool registered = false;
+	static TransactionId left_out = InvalidTransactionId;
 
-	if (!IsTransactionState())
-		elog(ERROR, "capture can only leave out a transaction");
-	if (replorigin_xact_state.origin == DoNotReplicateId)
+	if (!IsTransactionState() || IsInParallelMode())
+		elog(ERROR, "capture can only leave out a transaction, and not in parallel");
+	if (TransactionIdIsValid(left_out) && TransactionIdIsCurrentTransactionId(left_out))
 		return;
-	if (replorigin_xact_state.origin != InvalidReplOriginId)
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("cannot leave this transaction out of capture"),
-				 errdetail("The session has a replication origin of its own.")));
-	if (!registered)
-	{
-		RegisterXactCallback(capture_left_out_end, NULL);
-		registered = true;
-	}
-	replorigin_xact_state.origin = DoNotReplicateId;
+				 errdetail("It has written already.")));
+	(void) LogLogicalMessage(CAPTURE_LEAVE_OUT_PREFIX, "", 0, true, false);
+	left_out = GetCurrentTransactionId();
 }
 
 void
@@ -259,7 +254,6 @@ CaptureOutputPluginInit(OutputPluginCallbacks *callbacks)
 	callbacks->truncate_cb = capture_truncate;
 	callbacks->message_cb = capture_message;
 	callbacks->commit_cb = capture_commit;
-	callbacks->filter_by_origin_cb = capture_filter_origin;
 }
 
 /* ------------------------------------------------------------------ the sink */

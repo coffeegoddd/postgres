@@ -63,6 +63,9 @@
 
 #define CAPTURE_SLOT_PREFIX "prolly_capture_"
 #define CAPTURE_ROWS_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows"
+
+/* A transaction's first message, if it's left out of capture. */
+#define CAPTURE_LEAVE_OUT_PREFIX PROLLY_MESSAGE_PREFIX "capture.leave_out"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
 
@@ -209,6 +212,7 @@ extern void CaptureWaitFor(XLogRecPtr lsn, int timeout_ms);
 /*
  * Leaves the whole of this transaction's writes out of capture, for version control's own, which
  * make the tables what it has made the branch's trees; it's for the caller to have made them so.
+ * Before the transaction writes anything.
  */
 extern void CaptureLeaveOut(void);
 
