@@ -806,7 +806,8 @@ static const char *const refusal_sql =
 /*
  * (what the active snapshot sees of each relation that a definition or a record would
  * hold, with its owner's and grantees' names: not its row's version, which a TRUNCATE
- * or a VACUUM FULL changes with nothing held changed)
+ * or a VACUUM FULL changes with nothing held changed; and of what outside the schema
+ * they name, the names it prints as)
  */
 static char *
 relations_version(const char *schema)
@@ -927,10 +928,103 @@ relations_version(const char *schema)
 				"  UNION ALL SELECT 'e' || e.oid || ':' || e.xmin FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
 				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
 				"  UNION ALL SELECT 'k' || k.oid || ':' || k.xmin FROM pg_constraint k JOIN pg_type t ON t.oid = k.contypid "
-				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name) v", 1, params, &rows);
+				"    JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name "
+				/*
+				 * (what's outside the schema that something in it depends on, by the names it
+				 * prints as: its schema's and its own, a column's for a column of it, and an enum's
+				 * labels.  Of what in the schema has a definition of its own; operators, operator
+				 * classes, casts, conversions and text search objects of the schema can't depend on
+				 * anything outside it, as reading refuses them.  An enum's labels are all of them, so
+				 * one added fails a reader that prints another, which is safe; and a language, in no
+				 * schema, isn't here, as one in use is rarely renamed and one built in can't be)
+				 */
+				"  UNION ALL SELECT 'N' || d.refclassid || '.' || d.refobjid || '.' || d.refobjsubid || ':' || rn.nspname || '.' || "
+				"      coalesce(p.proname, t.typname, q.relname, l.collname, o.oprname, oc.opcname, of.opfname, tc.cfgname, td.dictname) || "
+				"      coalesce('.' || a.attname, '') || coalesce(':' || (SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) "
+				"        FROM pg_enum e WHERE e.enumtypid = t.oid), '') "
+				"    FROM ( "
+				"        SELECT 'pg_class'::regclass::oid AS classid, c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_type'::regclass::oid, y.oid FROM pg_type y JOIN pg_namespace n ON n.oid = y.typnamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_proc'::regclass::oid, f.oid FROM pg_proc f JOIN pg_namespace n ON n.oid = f.pronamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_attrdef'::regclass::oid, w.oid FROM pg_attrdef w JOIN pg_class c ON c.oid = w.adrelid "
+				"          JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace "
+				"          WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_trigger'::regclass::oid, g.oid FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid "
+				"          JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_rewrite'::regclass::oid, w.oid FROM pg_rewrite w JOIN pg_class c ON c.oid = w.ev_class "
+				"          JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_policy'::regclass::oid, y.oid FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid "
+				"          JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name "
+				"        UNION ALL SELECT 'pg_statistic_ext'::regclass::oid, x.oid FROM pg_statistic_ext x JOIN pg_namespace n ON n.oid = x.stxnamespace "
+				"          WHERE n.nspname = $1::name) m "
+				"    JOIN pg_depend d ON d.classid = m.classid AND d.objid = m.oid "
+				"    LEFT JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid "
+				"    LEFT JOIN pg_type t ON d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid "
+				"    LEFT JOIN pg_class q ON d.refclassid = 'pg_class'::regclass AND q.oid = d.refobjid "
+				"    LEFT JOIN pg_attribute a ON d.refclassid = 'pg_class'::regclass AND a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
+				"      AND d.refobjsubid <> 0 "
+				"    LEFT JOIN pg_collation l ON d.refclassid = 'pg_collation'::regclass AND l.oid = d.refobjid "
+				"    LEFT JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid "
+				"    LEFT JOIN pg_opclass oc ON d.refclassid = 'pg_opclass'::regclass AND oc.oid = d.refobjid "
+				"    LEFT JOIN pg_opfamily of ON d.refclassid = 'pg_opfamily'::regclass AND of.oid = d.refobjid "
+				"    LEFT JOIN pg_ts_config tc ON d.refclassid = 'pg_ts_config'::regclass AND tc.oid = d.refobjid "
+				"    LEFT JOIN pg_ts_dict td ON d.refclassid = 'pg_ts_dict'::regclass AND td.oid = d.refobjid "
+				"    JOIN pg_namespace rn ON rn.oid = coalesce(p.pronamespace, t.typnamespace, q.relnamespace, l.collnamespace, "
+				"      o.oprnamespace, oc.opcnamespace, of.opfnamespace, tc.cfgnamespace, td.dictnamespace) "
+				"    WHERE rn.nspname <> $1::name AND rn.nspname NOT IN ('pg_catalog', 'information_schema')) v", 1, params, &rows);
 	version = pstrdup(ws_sql_value(&rows, 0, 0));
 	ws_sql_rows_free(&rows);
 	return version;
+}
+
+/*
+ * At a transaction's older snapshot, a schema read as it is now, to go with what's read of its
+ * tables then: its tables and sequences locked, which keeps them from being renamed until the transaction ends,
+ * and then raises ERRCODE_T_R_SERIALIZATION_FAILURE if anything of the schema, or outside it that
+ * it names, differs from the snapshot.  Before reading a table, which is by its name as the
+ * snapshot has it.  (ws_obj_read checks again, as a type or a function's rename takes no lock.)
+ */
+void
+ws_obj_check_current(const char *schema)
+{
+	const char *params[1] = {schema};
+	int			level;
+	WsSqlRows	rels;
+	char	   *now;
+	char	   *then;
+
+	if (!IsolationUsesXactSnapshot())
+		return;
+	ws_schema_check_usage(schema);
+	level = WsSql->begin();
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetLatestSnapshot());
+	UpdateActiveSnapshotCommandId();
+	WsSql->read("SELECT c.oid::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p', 'S')", 1, params, &rels);
+	for (int i = 0; i < rels.nrows; i++)
+		LockRelationOid(atooid(ws_sql_value(&rels, i, 0)), AccessShareLock);
+	ws_sql_rows_free(&rels);
+	PopActiveSnapshot();
+
+	/* (a rename that committed as these were locked is seen now) */
+	PushActiveSnapshot(GetLatestSnapshot());
+	UpdateActiveSnapshotCommandId();
+	now = relations_version(schema);
+	PopActiveSnapshot();
+	PushCopiedSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
+	then = relations_version(schema);
+	PopActiveSnapshot();
+	if (strcmp(now, then) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not read schema \"%s\": it has changed since this transaction's snapshot", schema),
+				 errhint("Try the transaction again.")));
+	pfree(now);
+	pfree(then);
+	WsSql->end(level);
 }
 
 /*

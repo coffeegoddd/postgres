@@ -194,6 +194,12 @@ extern void ws_obj_key(WsObjectKind kind, const char *name, const char *args, Bu
 extern void ws_obj_read(const char *schema, WsObject **out, int *n);
 
 /*
+ * At a transaction's older snapshot, an error if the schema, or what outside it it names, has
+ * changed since: to call before reading its tables, whose names are the snapshot's.
+ */
+extern void ws_obj_check_current(const char *schema);
+
+/*
  * Where each of a schema's sequences is, an identity's too, as ~seq holds it (a
  * sequence's position is state, not its definition): by name in UTF8's order, in *out,
  * palloc'd.  It runs no user code to read or set them, and neither reads by a snapshot,
