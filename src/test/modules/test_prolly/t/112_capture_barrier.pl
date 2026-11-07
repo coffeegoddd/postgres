@@ -461,8 +461,11 @@ SKIP:
 	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker'})
 	  or die 'no worker came back';
 	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
-	is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_barriers WHERE lsn > '$prev'"), '0',
-		"a commit whose marker capture hadn't reached, lost in a crash, isn't seen");
+	caught_up();
+	is( $node->safe_psql('postgres', "SELECT (SELECT count(*) FROM pg_history.capture_barriers WHERE lsn > '$prev')
+			+ (SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%'
+				AND (split_part(name, '/', 3) || '/' || split_part(name, '/', 4))::pg_lsn > '$prev')"), '0',
+		"a commit whose marker capture hadn't reached, lost in a crash, isn't seen, capture past its marker");
 	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900022, 'after the crash')");
 	is( $node->safe_psql('postgres', "$on1 SELECT count(*) FROM s.t WHERE id IN (900021, 900022)"), '2',
 		'what was committed before the marker is still there');
