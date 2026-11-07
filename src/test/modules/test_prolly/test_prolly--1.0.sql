@@ -809,6 +809,8 @@ CREATE FUNCTION test_capture_commit(schema text, msg text, dest text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_commit(text, text, text) FROM PUBLIC;
+
 CREATE FUNCTION test_ws_schema_shape(schema text, tab text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

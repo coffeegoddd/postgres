@@ -47,19 +47,34 @@ sub same_root
 # A barrier in another session, that has written its marker, with the worker stopped.
 sub barrier_held
 {
-	my ($on) = @_;
-	my $at = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
+	my ($on, $schema) = @_;
+	$schema //= 's';
 	my $bg = $node->background_psql('postgres');
-	$bg->query_until(qr/started/, "\\echo started\n$on SELECT test_capture_barrier('s') AS root \\gset\n\\echo :root\n\\echo finished\n");
-	$node->poll_query_until('postgres', qq{SELECT pg_current_wal_flush_lsn() > '$at'::pg_lsn}) or die 'no marker';
+	$bg->query_until(qr/started/, "\\echo started\n$on SELECT test_capture_barrier('$schema') AS root \\gset\n\\echo :root\n\\echo finished\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'CaptureBarrier'}) or die 'no marker';
 	return $bg;
+}
+
+sub finish
+{
+	my ($bg) = @_;
+	$bg->{stdout} = '';
+	$bg->{run}->pump until $bg->{stdout} =~ /finished/ || !$bg->{run}->pumpable;
+	return $bg;
+}
+
+sub caught_up
+{
+	my $slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = current_database()});
+	my $to = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
+	$node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'})
+	  or die 'capture did not catch up';
 }
 
 sub barrier_result
 {
 	my ($bg) = @_;
-	$bg->{stdout} = '';
-	$bg->{run}->pump until $bg->{stdout} =~ /finished/ || !$bg->{run}->pumpable;
+	finish($bg);
 	my ($root) = $bg->{stdout} =~ /^([0-9a-f]{40})$/m;
 	$bg->quit;
 	return $root;
@@ -118,11 +133,25 @@ SKIP:
 	ok(defined $root, 'a barrier while the worker was stopped');
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900003");
 	is($root, read_root('s', $on1), 'committed before is in; open, or committed after, is not');
+
+	# written before the marker, committed after it, is not; committed with the worker behind, is
+	my $straddles = $node->background_psql('postgres');
+	$straddles->query_safe("$on1 BEGIN; INSERT INTO s.t VALUES (900007, 'straddles')");
+	kill 'STOP', $worker;
+	$node->safe_psql('postgres', "$on1 ALTER TABLE s.child ADD COLUMN behind integer DEFAULT 3; INSERT INTO s.t VALUES (900008, 'behind')");
+	$bg = barrier_held($on1);
+	$straddles->query_safe('COMMIT');
+	$straddles->quit;
+	kill 'CONT', $worker;
+	$root = barrier_result($bg);
+	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900007");
+	is($root, read_root('s', $on1), 'DDL committed before, with the worker behind, is in; a row committed after is not');
 }
 $open->query_safe('ROLLBACK');
 $open->quit;
 
-# while it waits: rows go on, and a change to the catalogs doesn't commit, even of nothing versioned
+# while it waits: rows go on, a change to the catalogs doesn't commit, even of nothing versioned, and
+# neither fails
 SKIP:
 {
 	skip 'no way to stop a process', 3 if $windows_os;
@@ -144,33 +173,118 @@ SKIP:
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900005");
 }
 
-# a marker told again, after a worker crashed with its maps past it, touches nothing
+# DDL of the schema waits to begin; DDL of what a view depends on elsewhere has it locked, so the
+# barrier is what gives up, not whoever's committing
 SKIP:
 {
-	skip 'injection points not supported by this build', 2 if $ENV{enable_injection_points} ne 'yes';
-	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
-	same_root('s', $on1, 'with nothing held');
+	skip 'no way to stop a process', 4 if $windows_os;
+	$node->safe_psql('postgres', "$on1 SET ROLE objs; CREATE VIEW s.dropped_view AS SELECT 1 AS a");
 	kill 'STOP', $worker;
 	my $bg = barrier_held($on1);
-	$node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900006, 'past the marker')");
+	my $ddl = $node->background_psql('postgres');
+	$ddl->query_until(qr/started/, "\\echo started\n$on1 BEGIN; DROP VIEW s.dropped_view; COMMIT;\n\\echo finished\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '%DROP VIEW s.dropped_view%' AND wait_event_type = 'Lock'}) or die 'DDL did not wait';
+	kill 'CONT', $worker;
+	ok(defined barrier_result($bg), 'a view dropped during a barrier: the barrier finishes');
+	finish($ddl);
+	$ddl->quit;
+	is($node->safe_psql('postgres', "$on1 SELECT to_regclass('s.dropped_view') IS NULL"), 't', 'and so does the drop');
+
+	$node->safe_psql('postgres', "CREATE TABLE shared_types.seen (a integer)");
+	$node->safe_psql('postgres', "$on2 CREATE SCHEMA with_view VERSIONED; CREATE VIEW with_view.v AS SELECT a FROM shared_types.seen");
+	kill 'STOP', $worker;
+	$bg = barrier_held($on2, 'with_view');
+	$ddl = $node->background_psql('postgres');
+	$ddl->query_until(qr/started/, "\\echo started\nALTER TABLE shared_types.seen ADD COLUMN b integer;\n\\echo finished\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '%ADD COLUMN b integer%' AND wait_event_type = 'Lock'}) or die 'DDL did not wait';
+	kill 'CONT', $worker;
+	is(barrier_result($bg), undef, 'what a view depends on, changing: the barrier gives up');
+	finish($ddl);
+	$ddl->quit;
+	is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'shared_types.seen'::regclass AND attname = 'b'}), '1', 'and the commit goes through');
+	$node->safe_psql('postgres', "$on2 DROP SCHEMA with_view CASCADE");
+}
+
+# a marker told again, after a worker crashed past it, leaves alone what it saved and what others saved
+SKIP:
+{
+	skip 'injection points not supported by this build', 4 if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	same_root('s', $on1, 'with nothing held');
+	my $saved = qq{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%/' || 's.t'::regclass::oid};
+	my $straddles = $node->background_psql('postgres');
+	$straddles->query_safe("$on1 BEGIN; INSERT INTO s.t VALUES (900006, 'right after the marker')");
+	kill 'STOP', $worker;
+	my ($rc1, $out1, $err1) = $node->psql('postgres', "$on2 SELECT test_capture_barrier('s', 100)");
+	like($err1, qr/capture did not reach/, 'one barrier gives up, on another branch');
+	my $bg = barrier_held($on1);
+	$straddles->query_safe('COMMIT');
+	$straddles->quit;
 	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
 	kill 'CONT', $worker;
 	$node->wait_for_event('capture worker', 'capture-applied');
-	ok(defined barrier_result($bg), 'a barrier, with the worker past it, not confirmed');
+	ok(defined barrier_result($bg), 'a barrier, with a commit right after its marker applied, not confirmed');
+	my $before = $node->safe_psql('postgres', "$on1 $saved");
+	isnt($before, $node->safe_psql('postgres', qq{$on1 SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid}),
+		'what it saved is not the map now');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
 	  or die 'no worker came back';
 	$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900006");
-	my $slot = 'prolly_capture_' . $node->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = current_database()});
-	my $to = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
-	$node->poll_query_until('postgres', qq{SELECT confirmed_flush_lsn >= '$to'::pg_lsn FROM pg_replication_slots WHERE slot_name = '$slot'})
-	  or die 'capture did not catch up';
-	is($node->safe_psql('postgres', q{SELECT (SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%') + (SELECT count(*) FROM pg_history.capture_barriers)}),
-		'0', 'it left nothing behind');
+	caught_up();
+	is($node->safe_psql('postgres', "$on1 $saved"), $before, 'and told again, it is left as it was');
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
+
+# a schema that's another by the time its relations are locked
+SKIP:
+{
+	skip 'injection points not supported by this build', 1 if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-barrier-locked', 'wait')");
+	$node->safe_psql('postgres', "$on1 CREATE SCHEMA renames VERSIONED");
+	my $bg = $node->background_psql('postgres', on_error_stop => 0);
+	$bg->query_until(qr/started/, "\\echo started\n$on1 SELECT test_capture_barrier('renames');\n\\echo finished\n");
+	$node->wait_for_event('client backend', 'capture-barrier-locked');
+	$node->safe_psql('postgres', "$on1 ALTER SCHEMA renames RENAME TO renamed; CREATE SCHEMA renames VERSIONED");
+	$node->safe_psql('postgres', "SELECT injection_points_wakeup('capture-barrier-locked'); SELECT injection_points_detach('capture-barrier-locked')");
+	finish($bg);
+	like($bg->{stderr}, qr/schema "renames" changed during a commit from capture/, 'a schema renamed under a barrier');
+	$bg->quit;
+	$node->safe_psql('postgres', "$on1 DROP SCHEMA renames; DROP SCHEMA renamed; DROP EXTENSION injection_points");
+}
+
+# what it takes: rights tried before anything is written, its own reads on a pinned path, rows no
+# role can have some of
+$node->safe_psql('postgres', qq{$on1 CREATE ROLE nobody_much;
+	GRANT EXECUTE ON FUNCTION test_capture_barrier(text, integer) TO nobody_much;
+	GRANT USAGE ON SCHEMA s TO nobody_much});
+caught_up();
+my $markers = q{SELECT string_agg(lsn::text, ',') FROM pg_history.capture_barriers};
+my $markers_were = $node->safe_psql('postgres', $markers);
+my ($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
+like($errr, qr/permission denied for schema pg_history/, 'a role that cannot read what capture saved');
+$node->safe_psql('postgres', 'GRANT USAGE ON SCHEMA pg_history TO nobody_much');
+($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
+like($errr, qr/permission denied for (table|view|sequence)/, 'a role that cannot read a table');
+$node->safe_psql('postgres', "$on1 GRANT SELECT ON ALL TABLES IN SCHEMA s TO nobody_much; REVOKE SELECT ON ALL SEQUENCES IN SCHEMA s FROM nobody_much");
+($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
+like($errr, qr/permission denied for sequence/, 'nor a sequence');
+$node->safe_psql('postgres', qq{$on1 SET ROLE objs; CREATE TABLE s.guarded (id integer PRIMARY KEY); ALTER TABLE s.guarded ENABLE ROW LEVEL SECURITY; RESET ROLE; GRANT SELECT ON ALL TABLES IN SCHEMA s TO nobody_much; GRANT SELECT ON ALL SEQUENCES IN SCHEMA s TO nobody_much});
+($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET ROLE nobody_much; SELECT test_capture_barrier('s')");
+like($errr, qr/role row security applies to/, 'a role row security applies to');
+$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.guarded");
+caught_up();
+is($node->safe_psql('postgres', $markers), $markers_were, 'none of them wrote a marker');
+$node->safe_psql('postgres', "$on1 REVOKE ALL ON ALL TABLES IN SCHEMA s FROM nobody_much; REVOKE ALL ON ALL SEQUENCES IN SCHEMA s FROM nobody_much; REVOKE ALL ON SCHEMA s FROM nobody_much");
+
+$node->safe_psql('postgres', q{CREATE SCHEMA evil;
+	CREATE FUNCTION evil.same(pg_lsn, pg_lsn) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN RAISE WARNING 'ran as a barrier read'; RETURN true; END$$;
+	CREATE OPERATOR evil.= (FUNCTION = evil.same, LEFTARG = pg_lsn, RIGHTARG = pg_lsn)});
+($rcr, $outr, $errr) = $node->psql('postgres', "$on1 SET search_path = evil, pg_catalog, public; SELECT test_capture_barrier('s')");
+unlike($errr, qr/ran as a barrier read/, 'an operator ahead on the search path');
+$node->safe_psql('postgres', 'DROP SCHEMA evil CASCADE');
 
 # its own transaction: nothing it's written, and nothing older than now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN; INSERT INTO s.t VALUES (900004, 'x'); SELECT test_capture_barrier('s'); ROLLBACK");
@@ -197,11 +311,16 @@ $node->safe_psql('postgres', "$on1 SET allow_system_table_mods = on; DELETE FROM
 like($err, qr/capture holds no row map of table "t"/, 'and one it has not');
 $node->safe_psql('postgres', "$on1 DROP SCHEMA nomap CASCADE");
 
-# what it saved goes with it, and one given up on is gone at the next
+# what it saved stays until the next, in an open transaction or not, and doesn't hold capture up
 same_root('s', $on1, 'one more');
-is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%'}), '0', 'nothing left of them');
-is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_history.capture_barriers'), '0', 'nor their records');
-
+my $refs = q{SELECT count(DISTINCT split_part(name, '/', 3) || '/' || split_part(name, '/', 4)) FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%'};
+is($node->safe_psql('postgres', $refs), '1', 'only the last has its maps kept');
+is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_history.capture_barriers'), '1', 'and its record');
+my $held_open = $node->background_psql('postgres');
+$held_open->query_safe("$on1 BEGIN; SELECT test_capture_barrier('s')");
+same_root('s', $on1, 'a barrier beside one in an open transaction');
+$held_open->query_safe('COMMIT');
+$held_open->quit;
 
 # all the way: from rows written, to a commit from capture, to a schema restored from that commit
 $node->safe_psql('postgres', qq{$on1 SET ROLE objs; CREATE TABLE s.commit_me (id integer PRIMARY KEY, v text); INSERT INTO s.commit_me VALUES (1, 'committed')});
@@ -222,6 +341,7 @@ SKIP:
 	kill 'STOP', $worker;
 	($rc, $out, $err) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('s', 500)");
 	like($err, qr/capture did not reach/, 'a barrier gives up in time');
+	is($node->safe_psql('postgres', q{SELECT locktype FROM pg_locks WHERE locktype = 'object' AND objsubid = 2 AND mode = 'ExclusiveLock'}), '', 'and holds nothing');
 	kill 'CONT', $worker;
 	$node->safe_psql('postgres', "$on1 CREATE TABLE s.after_give_up (id integer PRIMARY KEY)");
 	same_root('s', $on1, 'and catalog changes and barriers go on');
@@ -230,3 +350,9 @@ SKIP:
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal/m, 'nothing crashed');
 $node->stop;
 done_testing();
+
+# (a failure with the worker stopped would leave the server unable to stop)
+END
+{
+	kill 'CONT', $worker if $worker && !$windows_os;
+}
