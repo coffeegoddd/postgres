@@ -103,7 +103,8 @@ ws_rows_keyless_merge(ProllyCtx *ctx, const PHash *map, ProllyEdit *edits, size_
 		if (fewer > count)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("a row map holds fewer of a keyless row than were removed")));
+					 errmsg("a row map holds fewer of a keyless row than were removed"),
+					 errhint("A rewrite of the table, such as VACUUM FULL, has capture told all of its rows.")));
 		count -= fewer;
 		if (count > 0)
 		{

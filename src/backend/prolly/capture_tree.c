@@ -16,7 +16,7 @@
  * told again is passed over.  That transaction is flushed before the slot moves,
  * whatever synchronous_commit says, or a crash would leave the slot past what it lost.
  *
- * A new slot begins with a row map of every table with a key, read under the snapshot of the slot's
+ * A new slot begins with a row map of every table, read under the snapshot of the slot's
  * first position, so that map and what's told after it are the whole of the table.  That's one
  * transaction, which ends with the branch 0 row of pg_history.capture_positions saying capture began,
  * and that row goes before any new slot is made.  So a slot is kept only once it's all there; a slot
@@ -107,7 +107,7 @@ typedef struct TreeChange
 	Oid			filenode;
 	int32		branch;
 	XLogRecPtr	commit;
-	char	  **old_row;		/* the key's fields alone: the row to go */
+	char	  **old_row;		/* the key's fields, or with no key all of them: the row to go */
 	char	  **new_row;		/* NULL if there is no new row */
 } TreeChange;
 
@@ -674,6 +674,12 @@ tree_edits_free(ProllyEdit *edits, size_t n)
 }
 
 static void
+tree_apply_context(void *arg)
+{
+	errcontext("capture applying changes to table \"%s\"", (const char *) arg);
+}
+
+static void
 tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 {
 	int			most = 1;
@@ -755,7 +761,17 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 			prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 			prolly_report(ctx);
 		if (shape->nkey == 0)
+		{
+			ErrorContextCallback context = {
+				.previous = error_context_stack,
+				.callback = tree_apply_context,
+				.arg = get_rel_name(table->relid),
+			};
+
+			error_context_stack = &context;
 			n = ws_rows_keyless_merge(ctx, &map, edits, n);
+			error_context_stack = context.previous;
+		}
 		if (n > 0 && prolly_apply(ctx, &map, edits, n, &map) < 0)
 			prolly_report(ctx);
 		refs->routine->set(refs, name, &map);
@@ -947,39 +963,36 @@ tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 	char	   *fingerprint;
 	Oid			types[2] = {OIDOID, TEXTOID};
 	Datum		values[2];
+	TreeRebuild b = {.ctx = ctx,.shape = &shape};
+	TupleDesc	desc = CreateTemplateTupleDesc(2);
+	AttrNumber	sort_col = 1;
+	Oid			sort_op = ByteaLessOperator;
+	Oid			collation = InvalidOid;
+	bool		nulls_first = false;
+	char		name[64];
+	PHash		map;
 
 	rel = table_open(relid, NoLock);
 	CaptureRelationShape(rel, &shape);
-	{
-		TreeRebuild b = {.ctx = ctx,.shape = &shape};
-		TupleDesc	desc = CreateTemplateTupleDesc(2);
-		AttrNumber	sort_col = 1;
-		Oid			sort_op = ByteaLessOperator;
-		Oid			collation = InvalidOid;
-		bool		nulls_first = false;
-		char		name[64];
-		PHash		map;
-
-		TupleDescInitEntry(desc, 1, "key", BYTEAOID, -1, 0);
-		TupleDescInitEntry(desc, 2, "value", BYTEAOID, -1, 0);
-		TupleDescFinalize(desc);
-		b.f = palloc_array(WsField, Max(shape.nstored, 1));
-		b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-		b.sort = tuplesort_begin_heap(desc, 1, &sort_col, &sort_op, &collation, &nulls_first,
-									  maintenance_work_mem, NULL, TUPLESORT_NONE);
-		CaptureTableRowsRead(rel, &shape, GetActiveSnapshot(), tree_rebuild_row, &b);
-		ExecDropSingleTupleTableSlot(b.slot);
-		b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
-		if (prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
-			prolly_report(ctx);
-		tree_rebuild_write(ctx, &b, &map);
-		tuplesort_end(b.sort);
-		ExecDropSingleTupleTableSlot(b.slot);
-		snprintf(name, sizeof(name), "capture/map/%u", relid);
-		refs->routine->set(refs, name, &map);
-		tree_record_shape(relid, &shape);
-		pfree(b.f);
-	}
+	TupleDescInitEntry(desc, 1, "key", BYTEAOID, -1, 0);
+	TupleDescInitEntry(desc, 2, "value", BYTEAOID, -1, 0);
+	TupleDescFinalize(desc);
+	b.f = palloc_array(WsField, Max(shape.nstored, 1));
+	b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	b.sort = tuplesort_begin_heap(desc, 1, &sort_col, &sort_op, &collation, &nulls_first,
+								  maintenance_work_mem, NULL, TUPLESORT_NONE);
+	CaptureTableRowsRead(rel, &shape, GetActiveSnapshot(), tree_rebuild_row, &b);
+	ExecDropSingleTupleTableSlot(b.slot);
+	b.slot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
+	if (prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+		prolly_report(ctx);
+	tree_rebuild_write(ctx, &b, &map);
+	tuplesort_end(b.sort);
+	ExecDropSingleTupleTableSlot(b.slot);
+	snprintf(name, sizeof(name), "capture/map/%u", relid);
+	refs->routine->set(refs, name, &map);
+	tree_record_shape(relid, &shape);
+	pfree(b.f);
 
 	/*
 	 * (or the first catalog change would tell all of every table.  One that changed between the

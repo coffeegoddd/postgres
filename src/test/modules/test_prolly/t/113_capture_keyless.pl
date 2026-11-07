@@ -136,12 +136,54 @@ same_map('t', 'and a table it was following');
 run(q{DELETE FROM across WHERE ctid = (SELECT min(ctid) FROM across WHERE a = 1)});
 same_map('across', 'which goes on');
 
+# a count isn't taken twice, as a key's value could be: applied, not confirmed, and told again
+SKIP:
+{
+	skip 'injection points not supported by this build', 3 if $ENV{enable_injection_points} ne 'yes';
+	my $other = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+	my $on_other = "SET catalog_branch = $other;";
+	$node->safe_psql('postgres', "$on_other CREATE SCHEMA s VERSIONED; CREATE TABLE s.again (a integer)");
+	run('CREATE TABLE again (a integer); INSERT INTO again VALUES (1)');
+	caught_up();
+	$node->safe_psql('postgres', "CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applied', 'wait')");
+	$node->safe_psql('postgres',
+		    "BEGIN; SET LOCAL catalog_branch = $branch; INSERT INTO s.again VALUES (1), (1), (2);"
+		  . "SET LOCAL catalog_branch = $other; INSERT INTO s.again VALUES (1), (3); COMMIT");
+	$node->wait_for_event('capture worker', 'capture-applied');
+	my $held = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
+	$node->safe_psql('postgres', "SELECT pg_terminate_backend($held)");
+	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $held})
+	  or die 'no worker came back';
+	same_map('again', 'a transaction applied and told again');
+	my $was = $on;
+	$on = $on_other;
+	same_map('again', 'on each of its branches');
+	$on = $was;
+	run('DELETE FROM again WHERE ctid = (SELECT min(ctid) FROM again WHERE a = 1)');
+	same_map('again', 'and removing one goes on from the right count');
+	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
+}
+
+# text naming an object isn't followed, so a row's identity changes under it: an error naming the
+# table, which a rewrite gets past
+run(q{CREATE TABLE named (a integer); CREATE TABLE names (r regclass, n integer); INSERT INTO names VALUES ('s.named', 1)});
+caught_up();
+my $log_at = -s $node->logfile;
+run('ALTER TABLE named RENAME TO named2; DELETE FROM names');
+ok($node->wait_for_log(qr/fewer of a keyless row than were removed/, $log_at), 'a row whose text changed under it, removed');
+like(slurp_file($node->logfile, $log_at), qr/capture applying changes to table "names"/, 'says which table');
+run('VACUUM FULL names');
+same_map('names', 'and a rewrite gets past it');
+same_map('t', 'and capture goes on');
+
 # only what capture holds logs more, and a shared table's replica identity means what it says
 sub delete_wal
 {
 	my ($table, $on_branch) = @_;
 	my $set = $on_branch ? $on : '';
 	$node->safe_psql('postgres', qq{$set INSERT INTO $table VALUES (1, (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 60) g))});
+	caught_up();
 	my $at = $node->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
 	$node->safe_psql('postgres', "$set DELETE FROM $table");
 	return $node->safe_psql('postgres', qq{SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '$at')});

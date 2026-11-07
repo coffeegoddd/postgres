@@ -200,7 +200,7 @@ extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, P
  * versioned table logs its whole old row unless it has a primary key that identifies a row by
  * itself, so that a table with no key, one whose key is deferrable and one set to log nothing or
  * another index all say what a change was of.  What the table says is left as it is, being the
- * user's, and what a commit holds.  It's not for a critical section, as it reads catalogs.
+ * user's, and what a commit holds.  It reads catalogs, so it's not for when a page is locked.
  */
 extern char CaptureLoggedIdentity(Relation relation);
 

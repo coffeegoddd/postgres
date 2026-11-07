@@ -209,19 +209,19 @@ rows_write_row(void *arg, const char **fields)
 		rows_flush(o);
 }
 
-/* A table's rows, the last thing it's told of them. */
 char
 CaptureLoggedIdentity(Relation relation)
 {
 	char		identity = relation->rd_rel->relreplident;
 
-	if (!capture_to_trees || identity == REPLICA_IDENTITY_FULL)
+	if (!capture_to_trees || identity == REPLICA_IDENTITY_FULL || !RelationIsLogicallyLogged(relation))
 		return identity;
 	if (identity == REPLICA_IDENTITY_DEFAULT && OidIsValid(RelationGetPrimaryKeyIndex(relation, false)))
 		return identity;
 	return NamespaceBranch(RelationGetNamespace(relation)) != 0 ? REPLICA_IDENTITY_FULL : identity;
 }
 
+/* A table's rows, the last thing it's told of them. */
 static void
 rows_write(Relation rel, int32 branch)
 {

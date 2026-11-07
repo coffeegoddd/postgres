@@ -56,7 +56,8 @@ extern uint64 ws_rows_keyless_count(const uint8 *k, size_t kl, const uint8 *v, s
 /*
  * Edits of keyless rows (one more of a row, or with del, one fewer) as edits of map: an entry for
  * each row changed, with its count, or gone at none.  Sorts edits and returns how many there now are.
- * Fewer of a row than the map holds is an error, as the map isn't what's been told.  What the edits
+ * Removing more of a row than the map holds, net of what's added in the same call, is an error, as
+ * the map isn't what's been told.  What the edits
  * given pointed to is left to the caller's memory context; new values are allocated in it.
  */
 extern size_t ws_rows_keyless_merge(ProllyCtx *ctx, const PHash *map, ProllyEdit *edits, size_t n);

@@ -64,7 +64,7 @@ static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  Buffer vmbuffer_old, Buffer newbuf,
 								  Buffer vmbuffer_new, HeapTuple oldtup,
-								  HeapTuple newtup, HeapTuple old_key_tuple, bool old_whole,
+								  HeapTuple newtup, HeapTuple old_key_tuple, char identity,
 								  bool all_visible_cleared, bool new_all_visible_cleared,
 								  bool walLogical);
 #ifdef USE_ASSERT_CHECKING
@@ -112,8 +112,8 @@ static bool ConditionalMultiXactIdWait(MultiXactId multi, MultiXactStatus status
 static void index_delete_sort(TM_IndexDeleteOp *delstate);
 static int	bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
-static HeapTuple ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
-										bool *copy, bool *whole);
+static HeapTuple ExtractReplicaIdentity(Relation relation, char identity, HeapTuple tp, bool key_required,
+										bool *copy);
 
 
 /*
@@ -2811,7 +2811,7 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	bool		clear_all_visible = false;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
-	bool		old_whole = false;
+	char		identity;
 
 	Assert(ItemPointerIsValid(tid));
 
@@ -2828,6 +2828,9 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 				 errmsg("cannot delete tuples during a parallel operation")));
 
 	block = ItemPointerGetBlockNumber(tid);
+	/* (it reads catalogs, which isn't for when the page is locked) */
+	identity = CaptureLoggedIdentity(relation);
+
 	buffer = ReadBuffer(relation, block);
 	page = BufferGetPage(buffer);
 
@@ -3042,7 +3045,7 @@ l1:
 	 * we don't PANIC upon a memory allocation failure.
 	 */
 	old_key_tuple = walLogical ?
-		ExtractReplicaIdentity(relation, &tp, true, &old_key_copied, &old_whole) : NULL;
+		ExtractReplicaIdentity(relation, identity, &tp, true, &old_key_copied) : NULL;
 
 	/*
 	 * If this is the first possibly-multixact-able operation in the current
@@ -3135,7 +3138,7 @@ l1:
 
 		if (old_key_tuple != NULL)
 		{
-			if (old_whole)
+			if (identity == REPLICA_IDENTITY_FULL)
 				xlrec.flags |= XLH_DELETE_CONTAINS_OLD_TUPLE;
 			else
 				xlrec.flags |= XLH_DELETE_CONTAINS_OLD_KEY;
@@ -3315,7 +3318,7 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 	HeapTuple	heaptup;
 	HeapTuple	old_key_tuple = NULL;
 	bool		old_key_copied = false;
-	bool		old_whole = false;
+	char		identity;
 	bool		walLogical = (options & TABLE_UPDATE_NO_LOGICAL) == 0;
 	Page		page,
 				newpage;
@@ -3392,6 +3395,7 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 	sum_attrs = RelationGetIndexAttrBitmap(relation,
 										   INDEX_ATTR_BITMAP_SUMMARIZED);
 	key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
+	identity = CaptureLoggedIdentity(relation);
 	id_attrs = RelationGetIndexAttrBitmap(relation,
 										  INDEX_ATTR_BITMAP_IDENTITY_KEY);
 	interesting_attrs = NULL;
@@ -4144,10 +4148,10 @@ l2:
 	 * logged.  Pass old key required as true only if the replica identity key
 	 * columns are modified or it has external data.
 	 */
-	old_key_tuple = ExtractReplicaIdentity(relation, &oldtup,
+	old_key_tuple = ExtractReplicaIdentity(relation, identity, &oldtup,
 										   bms_overlap(modified_attrs, id_attrs) ||
 										   id_has_external,
-										   &old_key_copied, &old_whole);
+										   &old_key_copied);
 
 	clear_all_visible = PageIsAllVisible(page);
 	clear_all_visible_new = newbuf != buffer && PageIsAllVisible(newpage);
@@ -4324,7 +4328,7 @@ l2:
 								 newbuf,
 								 vmbuffer_new_modified ? vmbuffer_new : InvalidBuffer,
 								 &oldtup, heaptup,
-								 old_key_tuple, old_whole,
+								 old_key_tuple, identity,
 								 clear_all_visible,
 								 clear_all_visible_new,
 								 walLogical);
@@ -9066,7 +9070,7 @@ static XLogRecPtr
 log_heap_update(Relation reln, Buffer oldbuf, Buffer vmbuffer_old,
 				Buffer newbuf, Buffer vmbuffer_new,
 				HeapTuple oldtup, HeapTuple newtup,
-				HeapTuple old_key_tuple, bool old_whole,
+				HeapTuple old_key_tuple, char identity,
 				bool all_visible_cleared, bool new_all_visible_cleared,
 				bool walLogical)
 {
@@ -9160,7 +9164,7 @@ log_heap_update(Relation reln, Buffer oldbuf, Buffer vmbuffer_old,
 		xlrec.flags |= XLH_UPDATE_CONTAINS_NEW_TUPLE;
 		if (old_key_tuple)
 		{
-			if (old_whole)
+			if (identity == REPLICA_IDENTITY_FULL)
 				xlrec.flags |= XLH_UPDATE_CONTAINS_OLD_TUPLE;
 			else
 				xlrec.flags |= XLH_UPDATE_CONTAINS_OLD_KEY;
@@ -9386,24 +9390,20 @@ log_heap_new_cid(Relation relation, HeapTuple tup)
  * the same tuple that was passed in.
  */
 static HeapTuple
-ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
-					   bool *copy, bool *whole)
+ExtractReplicaIdentity(Relation relation, char identity, HeapTuple tp, bool key_required,
+					   bool *copy)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
-	char		replident;
+	char		replident = identity;
 	Bitmapset  *idattrs;
 	HeapTuple	key_tuple;
 	bool		nulls[MaxHeapAttributeNumber];
 	Datum		values[MaxHeapAttributeNumber];
 
 	*copy = false;
-	*whole = false;
 
 	if (!RelationIsLogicallyLogged(relation))
 		return NULL;
-
-	replident = CaptureLoggedIdentity(relation);
-	*whole = replident == REPLICA_IDENTITY_FULL;
 
 	if (replident == REPLICA_IDENTITY_NOTHING)
 		return NULL;
