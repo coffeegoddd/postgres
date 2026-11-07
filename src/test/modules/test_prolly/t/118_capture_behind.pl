@@ -70,6 +70,8 @@ sub warned
 sub below_half
 {
 	$node->safe_psql('postgres', 'CHECKPOINT');
+	run(q{INSERT INTO t VALUES (-1, 'a pass'); DELETE FROM t WHERE id = -1});
+	caught_up();
 	$node->poll_query_until('postgres',
 		qq{SELECT pg_current_wal_insert_lsn() - restart_lsn < 2 * 1024 * 1024 FROM pg_replication_slots WHERE slot_name = '$slot'})
 	  or die 'the slot retains what it did';
@@ -77,15 +79,26 @@ sub below_half
 	caught_up();
 }
 
-# retained by a transaction still running, capture caught up: a warning, with where capture has read
-# and where the slot keeps WAL from
+# retained by a transaction still running, which has written, with capture caught up all along: the
+# WAL written a little at a time, so that no pass begins far behind, and the warning's what the slot
+# keeps from being well before where capture has read
 my $log = -s $node->logfile;
+$node->safe_psql('postgres', 'CREATE TABLE public.held (a integer); CREATE TABLE public.filler (v text)');
 my $open = $node->background_psql('postgres');
-$open->query_safe('BEGIN; SELECT pg_current_xact_id()');
-$node->advance_wal(3);
+$open->query_safe('BEGIN; INSERT INTO public.held VALUES (1)');
+for (1 .. 14)
+{
+	$node->safe_psql('postgres', q{INSERT INTO public.filler SELECT repeat('x', 100) FROM generate_series(1, 1500)});
+	caught_up();
+}
 warned($log, 'a slot held back by a transaction still running is warned of');
+my ($read, $keeps) = slurp_file($node->logfile, $log) =~
+  /retains \d+ MB of WAL.*\nDETAIL:  .* capture has read up to ([0-9A-F]+\/[0-9A-F]+), and the slot keeps it from ([0-9A-F]+\/[0-9A-F]+)/;
+is($node->safe_psql('postgres', "SELECT '$read'::pg_lsn - '$keeps'::pg_lsn > 1.5 * 1024 * 1024"), 't',
+	'as what capture has read is well past where the slot keeps WAL from');
 $open->query_safe('COMMIT');
 $open->quit;
+$node->safe_psql('postgres', 'DROP TABLE public.filler');
 below_half();
 
 # retained as capture's far behind: a warning, once
