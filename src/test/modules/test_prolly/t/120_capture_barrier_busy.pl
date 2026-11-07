@@ -56,15 +56,23 @@ $rows->query_until(qr/started/, "\\echo started\n$on CALL write_rows(20000);\n\\
 my $cols = $node->background_psql('postgres');
 $cols->query_until(qr/started/, "\\echo started\n$on CALL change_columns(400);\n\\echo columns-done\n");
 
-# commits, one after another, as long as they're going
-my ($made, $empty) = (0, 0);
-while ($node->safe_psql('postgres', "$on SELECT count(*) FROM s.done") < 2)
+# commits, one after another, as long as they're going, counted by which were still going; a commit
+# that errs fails here, and a writer that stops early, or takes too long, too
+my %during = (rows => 0, columns => 0);
+my $deadline = time + $PostgreSQL::Test::Utils::timeout_default;
+while (1)
 {
-	my $root = $node->safe_psql('postgres', "$on SELECT test_capture_barrier('s')");
-	$root =~ /^[0-9a-f]{40}$/ ? $made++ : $empty++;
+	# (a writer's last commit, of its row in s.done, is before its CALL's no longer active)
+	my ($done, $calls) = split /\|/, $node->safe_psql('postgres',
+		"$on SELECT coalesce(string_agg(who, ',' ORDER BY who), ''), (SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE 'CALL %') FROM s.done");
+	last if $done eq 'columns,rows';
+	die 'a writer stopped' if $calls < 2 - scalar(grep { $done =~ /$_/ } 'rows', 'columns');
+	die 'the writers took too long' if time > $deadline;
+	like($node->safe_psql('postgres', "$on SELECT test_capture_barrier('s')"), qr/^[0-9a-f]{40}$/, 'a commit, with a root');
+	$during{$_}++ for grep { $done !~ /$_/ } keys %during;
 }
-ok($made >= 10, "commits made with writers going on ($made)");
-is($empty, 0, 'each with a root');
+ok($during{rows} >= 10, "commits made with rows being written ($during{rows})");
+ok($during{columns} >= 10, "and with columns being changed ($during{columns})");
 for my $bg ([$rows, 'rows-done'], [$cols, 'columns-done'])
 {
 	$bg->[0]{stdout} = '';
