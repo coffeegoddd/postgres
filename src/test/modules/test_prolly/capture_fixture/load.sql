@@ -1,5 +1,5 @@
--- Tables from the fixture rebuilds are checked against, with what capture to
--- trees can't yet follow left out: DDL once rows have been written.  Fewer rows.
+-- Tables from the fixture rebuilds are checked against, with fewer rows; ddl.sql and dml_after.sql
+-- change them after.
 -- Extensions' types and the collation needing ICU are out, as this runs on any build.
 SET search_path = rt;
 
