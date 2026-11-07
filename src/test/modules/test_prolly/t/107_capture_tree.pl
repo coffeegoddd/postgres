@@ -135,7 +135,7 @@ same_map($on1, 't', 'after a restart');
 # stopped having applied, and before saying so, it is told again and passes over what is done
 SKIP:
 {
-	skip 'injection points not supported by this build', 6 if $ENV{enable_injection_points} ne 'yes';
+	skip 'injection points not supported by this build', 8 if $ENV{enable_injection_points} ne 'yes';
 	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
 	caught_up();
 	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
@@ -163,8 +163,11 @@ SKIP:
 	is($node->safe_psql('postgres', qq{SELECT count(*) FROM pg_snapshot_xip(pg_current_snapshot()) x WHERE x::text = '$xid'}),
 		'1', 'and a snapshot has that as running');
 	$node->safe_psql('postgres', 'SELECT count(*) FROM pg_history.pointers; SELECT count(*) FROM pg_history.capture_positions');
+	my $writing = $node->safe_psql('postgres', "$on1 SELECT test_ws_rows_hash('s', 't')");
+	is($node->safe_psql('postgres', qq{SELECT test_cs_get('pages', decode('$writing', 'hex')) IS NULL}), 't', 'a chunk it is writing, not there yet');
 	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-applying'); SELECT injection_points_detach('capture-applying')});
 	same_map($on1, 't', 'and what it wrote is there after a reader looked');
+	is($node->safe_psql('postgres', qq{SELECT test_cs_get('pages', decode('$writing', 'hex')) IS NOT NULL}), 't', 'and so is that chunk');
 
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 	same_map($on1, 't', 'and on it goes');
