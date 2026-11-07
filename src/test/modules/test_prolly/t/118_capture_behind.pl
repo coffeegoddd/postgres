@@ -55,24 +55,58 @@ sub same_map
 run(q{CREATE TABLE t (id integer PRIMARY KEY, v text); INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 100) g});
 same_map('t', 'a table');
 
-# held past half of what it may: a warning, once
-my $worker = worker();
+# Waits for the warning, logged after $log.
+sub warned
+{
+	my ($log, $what) = @_;
+	ok( $node->wait_for_log(
+			qr/WARNING:  capture's replication slot "$slot" retains \d+ MB of WAL, more than half of "max_slot_wal_keep_size" \(4 MB\)\nDETAIL:  .* capture has read up to [0-9A-F]+\/[0-9A-F]+, and the slot keeps it from [0-9A-F]+\/[0-9A-F]+, where decoding would begin again\./,
+			$log),
+		$what);
+}
+
+# Waits until the slot retains less than half of what it may, and a pass of the worker's has begun
+# since, so that a warning would be given again.
+sub below_half
+{
+	$node->safe_psql('postgres', 'CHECKPOINT');
+	$node->poll_query_until('postgres',
+		qq{SELECT pg_current_wal_insert_lsn() - restart_lsn < 2 * 1024 * 1024 FROM pg_replication_slots WHERE slot_name = '$slot'})
+	  or die 'the slot retains what it did';
+	run(q{INSERT INTO t VALUES (-1, 'a pass'); DELETE FROM t WHERE id = -1});
+	caught_up();
+}
+
+# retained by a transaction still running, capture caught up: a warning, with where capture has read
+# and where the slot keeps WAL from
 my $log = -s $node->logfile;
+my $open = $node->background_psql('postgres');
+$open->query_safe('BEGIN; SELECT pg_current_xact_id()');
+$node->advance_wal(3);
+warned($log, 'a slot held back by a transaction still running is warned of');
+$open->query_safe('COMMIT');
+$open->quit;
+below_half();
+
+# retained as capture's far behind: a warning, once
+my $worker = worker();
+$log = -s $node->logfile;
 kill 'STOP', $worker;
 $node->advance_wal(3);
 kill 'CONT', $worker;
-ok($node->wait_for_log(qr/WARNING:  capture is behind: its replication slot holds \d+ MB of WAL, past half of "max_slot_wal_keep_size" \(4 MB\)/, $log),
-	'capture far behind is warned of');
+warned($log, 'capture far behind is warned of');
 caught_up();
 is($node->safe_psql('postgres', "SELECT wal_status <> 'lost' FROM pg_replication_slots WHERE slot_name = '$slot'"), 't', 'and its slot kept');
 
-# past all of it: the slot invalidated at a checkpoint, and made again, every table read again
+# past all of it: the slot invalidated at a checkpoint, the worker stopped until the checkpointer
+# waits for it to let go, and the slot made again, every table read again
 $log = -s $node->logfile;
 kill 'STOP', $worker;
 run(q{UPDATE t SET v = 'lost' WHERE id % 2 = 0; INSERT INTO t VALUES (1000, 'while lost')});
 $node->advance_wal(8);
 my $cp = $node->background_psql('postgres');
 $cp->query_until(qr/started/, "\\echo started\nCHECKPOINT;\n\\echo done\n");
+ok($node->wait_for_log(qr/terminating process $worker to release replication slot "$slot"/, $log), 'the checkpointer ends the worker');
 kill 'CONT', $worker;
 $cp->{stdout} = '';
 $cp->{run}->pump until $cp->{stdout} =~ /done/ || !$cp->{run}->pumpable;

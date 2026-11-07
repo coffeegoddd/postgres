@@ -534,20 +534,26 @@ capture_page_read(XLogReaderState *state, XLogRecPtr target_page, int req_len, X
 	return n;
 }
 
-/* Whether capture has said it's past half of what its slot may hold, since it was last below. */
+/* Whether capture has warned its slot retains past half of what it may, since it was last below. */
 static bool capture_behind_warned = false;
 
+/* How much WAL is read between checks of what the slot retains. */
+#define CAPTURE_BEHIND_EVERY (1024 * 1024)
+
 /*
- * Warns, once each time it passes it, that the WAL capture's slot holds is past half of
+ * Warns, once each time it passes it, that the WAL capture's slot retains is past half of
  * max_slot_wal_keep_size: past all of it, the slot is invalidated at a checkpoint and every table
- * read again, so that's while something can still be done.  How far behind each branch is shows as
- * ever, by pg_replication_slots and pg_history.capture_positions.
+ * read again, so that's while something can still be done.  A slot retains WAL from where it may
+ * have to begin decoding again, which a transaction still running holds back however far capture
+ * has read, as well as what capture has yet to read: which it is shows by where each is, which the
+ * warning gives.  How far behind each branch is shows as ever, by pg_replication_slots and
+ * pg_history.capture_positions.
  */
 static void
-capture_check_behind(void)
+capture_check_behind(XLogRecPtr read)
 {
 	XLogRecPtr	restart;
-	uint64		held;
+	XLogRecPtr	now = GetXLogInsertRecPtr();
 	uint64		limit;
 
 	if (max_slot_wal_keep_size_mb < 0)
@@ -557,9 +563,8 @@ capture_check_behind(void)
 	SpinLockRelease(&MyReplicationSlot->mutex);
 	if (XLogRecPtrIsInvalid(restart))
 		return;
-	held = GetXLogInsertRecPtr() - restart;
 	limit = (uint64) max_slot_wal_keep_size_mb * 1024 * 1024;
-	if (held <= limit / 2)
+	if (now - restart <= limit / 2)
 	{
 		capture_behind_warned = false;
 		return;
@@ -569,10 +574,14 @@ capture_check_behind(void)
 	capture_behind_warned = true;
 	ereport(WARNING,
 			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-			 errmsg("capture is behind: its replication slot holds %llu MB of WAL, past half of \"max_slot_wal_keep_size\" (%d MB)",
-					(unsigned long long) (held / (1024 * 1024)), max_slot_wal_keep_size_mb),
-			 errdetail("Past all of it, the slot is invalidated at a checkpoint, and every versioned table is read again."),
-			 errhint("Raise \"max_slot_wal_keep_size\", or write less until capture catches up.")));
+			 errmsg("capture's replication slot \"%s\" retains %llu MB of WAL, more than half of \"max_slot_wal_keep_size\" (%d MB)",
+					NameStr(MyReplicationSlot->data.name), (unsigned long long) ((now - restart) / (1024 * 1024)),
+					max_slot_wal_keep_size_mb),
+			 errdetail("Past all of it, the slot is invalidated at a checkpoint, and every versioned table is read again.  "
+					   "The WAL is written up to %X/%X, capture has read up to %X/%X, and the slot keeps it from %X/%X, "
+					   "where decoding would begin again.",
+					   LSN_FORMAT_ARGS(now), LSN_FORMAT_ARGS(read), LSN_FORMAT_ARGS(restart)),
+			 errhint("Let capture catch up, end any transaction that has long been running, or raise \"max_slot_wal_keep_size\".")));
 }
 
 /*
@@ -584,13 +593,21 @@ capture_decode(LogicalDecodingContext *ctx)
 {
 	XLogRecPtr	flushed = GetFlushRecPtr(NULL);
 	XLogRecPtr	from = ctx->reader->EndRecPtr;
+	XLogRecPtr	check_at = from + CAPTURE_BEHIND_EVERY;
 
-	capture_check_behind();
+	capture_check_behind(from);
 	capture_at_end_of_wal = false;
 	while (ctx->reader->EndRecPtr < flushed && !capture_at_end_of_wal)
 	{
 		char	   *errm = NULL;
 		XLogRecord *record = XLogReadRecord(ctx->reader, &errm);
+
+		/* (a pass reads what was flushed as it began, which may be a long way) */
+		if (ctx->reader->EndRecPtr >= check_at)
+		{
+			capture_check_behind(ctx->reader->EndRecPtr);
+			check_at = ctx->reader->EndRecPtr + CAPTURE_BEHIND_EVERY;
+		}
 
 		if (errm != NULL)
 			elog(ERROR, "could not read a record for capture: %s", errm);
