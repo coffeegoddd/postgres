@@ -229,16 +229,6 @@ $node->safe_psql('postgres', "$on BEGIN; INSERT INTO s.t VALUES (2); TRUNCATE s.
 same_map($on, 't', 'and with rows around it, in one transaction');
 $node->stop;
 
-$on = fresh_node('unchanged_toast');
-$node->safe_psql('postgres', "$on CREATE SCHEMA s VERSIONED");
-slot_active();
-$node->safe_psql('postgres', "$on CREATE TABLE s.t (id integer PRIMARY KEY, n integer, v text); ALTER TABLE s.t ALTER v SET STORAGE EXTERNAL; INSERT INTO s.t VALUES (1, 1, repeat('x', 100000))");
-caught_up();
-$from = -s $node->logfile;
-$node->safe_psql('postgres', "$on UPDATE s.t SET n = 2");
-ok($node->wait_for_log(qr/was not given column "v" of "t"/, $from), 'an unchanged TOASTed value');
-$node->stop;
-
 # what's there when capture begins is in its maps
 $on = fresh_node('schema_txn');
 $node->safe_psql('postgres', "$on BEGIN; CREATE SCHEMA s VERSIONED; CREATE TABLE s.t (id integer PRIMARY KEY); INSERT INTO s.t VALUES (1); COMMIT");

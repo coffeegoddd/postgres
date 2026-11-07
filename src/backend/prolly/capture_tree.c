@@ -39,8 +39,14 @@
  * A table with no key holds its rows by the whole row, with how many there are of it, so a change
  * is one fewer of the old row and one more of the new; CaptureLoggedIdentity has that come whole.
  *
- * This is off by default (capture_to_trees), as there's more it doesn't follow.  A value decoding
- * wasn't given is an error, unless it's in the old row.  An error stops capture
+ * A deferrable key can be held by two rows for a while, in the middle of a transaction, so edits made
+ * one at a time could take off what another's just put.  Its whole old rows are logged, so what a
+ * transaction did comes down to what's left of each row: see tree_net_edits.
+ *
+ * An update doesn't send a value it left out of line.  With no key, or a deferrable one, it's in the
+ * old row; with any other key, it's what the row has now, from what's being applied or else the map, in the tree it's already in.
+ *
+ * This is off by default (capture_to_trees), as there's more it doesn't follow.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
  * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
  * a while and on again, nor an object id used again while its old row map is kept.
@@ -62,6 +68,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
+#include "common/hashfn.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -75,6 +82,7 @@
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_rows.h"
 #include "storage/lmgr.h"
+#include "utils/hsearch.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -107,8 +115,10 @@ typedef struct TreeChange
 	Oid			filenode;
 	int32		branch;
 	XLogRecPtr	commit;
-	char	  **old_row;		/* the key's fields, or with no key all of them: the row to go */
+	char	  **old_row;		/* the key's fields, or all of them if there's none or it's deferrable */
 	char	  **new_row;		/* NULL if there is no new row */
+	bool		unchanged;		/* new_row has columns an update left where they were */
+	bool		whole_old_row;	/* of a deferrable key: see tree_net_edits */
 } TreeChange;
 
 /* How far a branch was applied before this apply, and how far it now is. */
@@ -277,12 +287,16 @@ tree_table_of(Relation relation)
 	return table;
 }
 
+/* In a new row, in place of a value an update left where it was. */
+static char tree_unchanged_value[1];
+
 /*
- * A tuple's fields by the table's shape, each in the context apply empties.  whole is what the old
- * row had, if that's all of it, for a value an update left where it was.
+ * A tuple's fields by the table's shape, each in the context apply empties.  A value an update
+ * left where it was is what old_row has of it, if it has it, or else, if unchanged is given, marked.
  */
 static char **
-tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only, char **whole, const char **problem)
+tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only, char **old_row, bool *unchanged,
+		 const char **problem)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
 	char	  **row = MemoryContextAllocZero(tree_held_cxt, sizeof(char *) * Max(table->shape->nstored, 1));
@@ -311,9 +325,15 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_on
 		{
 			MemoryContext was;
 
-			if (whole != NULL && whole[at] != NULL)
+			if (old_row != NULL && old_row[at] != NULL)
 			{
-				row[at] = whole[at];
+				row[at] = old_row[at];
+				continue;
+			}
+			if (unchanged != NULL)
+			{
+				row[at] = tree_unchanged_value;
+				*unchanged = true;
 				continue;
 			}
 			was = MemoryContextSwitchTo(tree_held_cxt);
@@ -347,14 +367,20 @@ tree_change(const CaptureChange *change)
 		tree_as_of = lappend(tree_as_of, held);
 	}
 	MemoryContextSwitchTo(old);
+	held->whole_old_row = table->shape->nkey > 0 &&
+		!OidIsValid(RelationGetPrimaryKeyIndex(change->relation, false)) &&
+		OidIsValid(RelationGetPrimaryKeyIndex(change->relation, true));
 	if (change->old_tuple == NULL &&
-		(change->kind == CAPTURE_DELETE || (change->kind == CAPTURE_UPDATE && table->shape->nkey == 0)))
+		(change->kind == CAPTURE_DELETE ||
+		 (change->kind == CAPTURE_UPDATE && (table->shape->nkey == 0 || held->whole_old_row))))
 		elog(ERROR, "a change of \"%s\" came with no old row", RelationGetRelationName(change->relation));
 	if (change->old_tuple != NULL)
-		held->old_row = tree_row(change->relation, table, change->old_tuple, table->shape->nkey > 0, NULL, &held->problem);
+		held->old_row = tree_row(change->relation, table, change->old_tuple,
+								 table->shape->nkey > 0 && !held->whole_old_row, NULL, NULL, &held->problem);
 	if (change->new_tuple != NULL)
-		held->new_row = tree_row(change->relation, table, change->new_tuple, false,
-								 table->shape->nkey == 0 ? held->old_row : NULL, &held->problem);
+		held->new_row = tree_row(change->relation, table, change->new_tuple, false, held->old_row,
+								 table->shape->nkey > 0 && !held->whole_old_row && change->kind == CAPTURE_UPDATE ?
+								 &held->unchanged : NULL, &held->problem);
 	old = MemoryContextSwitchTo(tree_held_cxt);
 	table->held = lappend(table->held, held);
 	tree_held = lappend(tree_held, held);
@@ -593,11 +619,200 @@ tree_fields(const WsRowShape *shape, char **row, WsField *f)
 {
 	for (int c = 0; c < shape->nstored; c++)
 	{
+		bool		none = row[c] == NULL || row[c] == tree_unchanged_value;
+
 		f[c].p = (const uint8 *) row[c];
-		f[c].len = row[c] != NULL ? strlen(row[c]) : 0;
-		f[c].null = row[c] == NULL;
+		f[c].len = none ? 0 : strlen(row[c]);
+		f[c].null = none;
 		f[c].large = false;
 	}
+}
+
+/* What's being applied to a table, by key: each key's latest edit. */
+typedef struct TreeEditKey
+{
+	const uint8 *p;
+	size_t		len;
+} TreeEditKey;
+
+typedef struct TreeLatestEdit
+{
+	TreeEditKey key;
+	size_t		edit;
+} TreeLatestEdit;
+
+static uint32
+tree_edit_key_hash(const void *key, Size keysize)
+{
+	const TreeEditKey *k = key;
+
+	return hash_bytes(k->p, (int) k->len);
+}
+
+static int
+tree_edit_key_match(const void *a, const void *b, Size keysize)
+{
+	const TreeEditKey *x = a;
+	const TreeEditKey *y = b;
+
+	return x->len == y->len && memcmp(x->p, y->p, x->len) == 0 ? 0 : 1;
+}
+
+static HTAB *
+tree_latest_edits(void)
+{
+	HASHCTL		ctl = {
+		.keysize = sizeof(TreeEditKey),
+		.entrysize = sizeof(TreeLatestEdit),
+		.hash = tree_edit_key_hash,
+		.match = tree_edit_key_match,
+		.hcxt = CurrentMemoryContext,
+	};
+
+	return hash_create("capture edits by key", 256, &ctl, HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+}
+
+/*
+ * A new row's fields, with what an update left where it was from the row it has now, under key.
+ * They point into what's returned, to be freed once they've been stored.
+ */
+static uint8 *
+tree_fill_unchanged(ProllyCtx *ctx, const TreeTable *table, const TreeChange *change, const PHash *map,
+					HTAB *latest, const ProllyEdit *edits, const uint8 *key, size_t klen, WsField *f)
+{
+	TreeEditKey look = {key, klen};
+	TreeLatestEdit *found = hash_search(latest, &look, HASH_FIND, NULL);
+	const uint8 *now = NULL;
+	size_t		nowlen = 0;
+	uint8	   *copy;
+	WsField    *had = palloc_array(WsField, Max(change->shape->nstored, 1));
+
+	if (found != NULL)
+	{
+		if (!edits[found->edit].del)
+		{
+			now = edits[found->edit].val;
+			nowlen = edits[found->edit].vlen;
+		}
+	}
+	else
+	{
+		int			rc = prolly_get(ctx, map, key, klen, &now, &nowlen);
+
+		if (rc < 0)
+			prolly_report(ctx);
+		if (rc != PROLLY_OK)
+			now = NULL;
+	}
+	if (now == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the row map of relation %u has no row for an update that left a value as it was", table->relid)));
+
+	/* (what prolly_get gives lasts until the next it's asked, and these go on to be stored) */
+	copy = palloc(Max(nowlen, 1));
+	memcpy(copy, now, nowlen);
+	WsRowCodec->decode(change->shape, key, klen, copy, nowlen, had);
+	for (int c = 0; c < change->shape->nstored; c++)
+	{
+		if (change->new_row[c] != tree_unchanged_value)
+			continue;
+		if (had[c].null)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the row map of relation %u has no value for one an update left as it was", table->relid)));
+		f[c] = had[c];
+	}
+	pfree(had);
+	return copy;
+}
+
+static int
+tree_edit_row_cmp(const void *a, const void *b)
+{
+	const ProllyEdit *x = a;
+	const ProllyEdit *y = b;
+	int			c = memcmp(x->key, y->key, Min(x->klen, y->klen));
+
+	if (c == 0)
+		c = (x->klen > y->klen) - (x->klen < y->klen);
+	if (c == 0)
+		c = memcmp(x->val, y->val, Min(x->vlen, y->vlen));
+	if (c == 0)
+		c = (x->vlen > y->vlen) - (x->vlen < y->vlen);
+	return c;
+}
+
+/*
+ * One transaction's edits of a table with a deferrable key, each with its row's value, as what they
+ * come to: how many of each row, whatever order they came in.  By the transaction's end a key has at
+ * most one, which is the edit; or none, and if it lost one, it's gone.  How many edits there now are.
+ */
+static size_t
+tree_net_edits(Oid relid, ProllyEdit *edits, size_t n)
+{
+	size_t		out = 0;
+
+	if (n > 1)
+		qsort(edits, n, sizeof(ProllyEdit), tree_edit_row_cmp);
+	for (size_t i = 0; i < n;)
+	{
+		ProllyEdit	kept = edits[i];
+		bool		have = false;
+		bool		lost = false;
+		size_t		k = i;
+
+		while (k < n && edits[k].klen == edits[i].klen && memcmp(edits[k].key, edits[i].key, edits[i].klen) == 0)
+		{
+			size_t		r = k;
+			int64		net = 0;
+
+			for (; r < n && tree_edit_row_cmp(&edits[k], &edits[r]) == 0; r++)
+				net += edits[r].del ? -1 : 1;
+			if (net < 0)
+				lost = true;
+			if (net > 0)
+			{
+				if (have || net > 1)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("a transaction left a deferrable key of relation %u on more than one row", relid)));
+				have = true;
+				kept = edits[k];
+			}
+			k = r;
+		}
+
+		/* (all but the row that's left go now, as what's kept is all that's freed later) */
+		for (size_t e = i; e < k; e++)
+		{
+			if (have && edits[e].key == kept.key)
+				continue;
+			if (!have && e == i)
+				continue;
+			px_free((void *) edits[e].key);
+			px_free((void *) edits[e].val);
+		}
+		if (have || lost)
+		{
+			if (!have)
+			{
+				px_free((void *) kept.val);
+				kept.val = NULL;
+				kept.vlen = 0;
+			}
+			edits[out] = kept;
+			edits[out].del = !have;
+			out++;
+		}
+		else
+		{
+			px_free((void *) kept.key);
+			px_free((void *) kept.val);
+		}
+		i = k;
+	}
+	return out;
 }
 
 /* Checks a table's layout against what is recorded of it, whichever worker it was that saw it first. */
@@ -679,6 +894,21 @@ tree_apply_context(void *arg)
 	errcontext("capture applying changes to table %s", (const char *) arg);
 }
 
+/* Edits written on a table's map, so that what's looked for from here is found there. */
+static void
+tree_write_edits(ProllyCtx *ctx, PHash *map, ProllyEdit *edits, size_t *n, HTAB **latest, bool has_unchanged)
+{
+	if (*n > 0 && prolly_apply(ctx, map, edits, *n, map) < 0)
+		prolly_report(ctx);
+	if (has_unchanged)
+	{
+		hash_destroy(*latest);
+		*latest = tree_latest_edits();
+	}
+	tree_edits_free(edits, *n);
+	*n = 0;
+}
+
 static void
 tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions)
 {
@@ -692,6 +922,12 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 	char		name[64];
 	PHash		map;
 	ListCell   *lc;
+	HTAB	   *latest = NULL;
+	bool		has_unchanged = false;
+	bool		netting = false;
+	bool		wrote = false;
+	XLogRecPtr	netted = InvalidXLogRecPtr;
+	XLogRecPtr	last_commit = InvalidXLogRecPtr;
 
 	/* (one that's gone has nothing to hold, whatever was wrong with holding it) */
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(table->relid)))
@@ -730,6 +966,18 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		tree_check_table(table, shape);
 
 	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
+	if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
+		prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+		prolly_report(ctx);
+	for (int i = from; i < list_length(table->held); i++)
+	{
+		if (((TreeChange *) list_nth(table->held, i))->unchanged)
+		{
+			latest = tree_latest_edits();
+			has_unchanged = true;
+			break;
+		}
+	}
 	f = palloc_array(WsField, most);
 	edits = palloc_array(ProllyEdit, 2 * (list_length(table->held) - from));
 	for (int i = from; i < list_length(table->held); i++)
@@ -737,29 +985,99 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		TreeChange *change = list_nth(table->held, i);
 		Buf			k = BUF_INIT,
 					v = BUF_INIT;
+		size_t		first = n;
+		uint8	   *kept = NULL;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * A deferrable key's edits are of their transaction, on their own: they're worked out and
+		 * written when it ends, and what came before is written first, as they don't go through latest.
+		 */
+		if (netting && (!change->whole_old_row || change->commit != netted))
+		{
+			if (!change->whole_old_row && change->commit == netted)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it", table->relid)));
+			n = tree_net_edits(table->relid, edits, n);
+			netting = false;
+			tree_write_edits(ctx, &map, edits, &n, &latest, has_unchanged);
+			wrote = true;
+			first = 0;
+		}
+		if (change->whole_old_row && !netting)
+		{
+			if (n > 0 && change->commit == last_commit)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("capture to trees does not follow relation %u having its deferrable key changed in a transaction that writes it", table->relid)));
+			if (n > 0)
+			{
+				tree_write_edits(ctx, &map, edits, &n, &latest, has_unchanged);
+				wrote = true;
+			}
+			first = 0;
+			netting = true;
+			netted = change->commit;
+		}
+		last_commit = change->commit;
 		if (change->old_row != NULL)
 		{
 			tree_fields(change->shape, change->old_row, f);
 			ws_row_store(ctx, change->shape, f, &k, &v);
-			buf_free(&v);
-			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .del = true};
+			if (change->whole_old_row)
+				edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len, .del = true};
+			else
+			{
+				buf_free(&v);
+				edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .del = true};
+			}
 			k = (Buf) BUF_INIT;
 			v = (Buf) BUF_INIT;
 		}
 		if (change->new_row != NULL)
 		{
 			tree_fields(change->shape, change->new_row, f);
-			ws_row_store(ctx, change->shape, f, &k, &v);
+			if (change->unchanged)
+			{
+				/* (the row is found by the key it had, which a key that changed isn't) */
+				if (change->old_row != NULL)
+					kept = tree_fill_unchanged(ctx, table, change, &map, latest, edits, edits[n - 1].key, edits[n - 1].klen, f);
+				else
+				{
+					/* (its key alone, so no value's put in a tree for it) */
+					WsField    *key_alone = palloc_array(WsField, change->shape->nstored);
+
+					for (int c = 0; c < change->shape->nstored; c++)
+						key_alone[c] = c < change->shape->nkey ? f[c] : (WsField) {.null = true};
+					WsRowCodec->encode(change->shape, key_alone, &k, &v);
+					pfree(key_alone);
+					kept = tree_fill_unchanged(ctx, table, change, &map, latest, edits, k.data, k.len, f);
+				}
+			}
+			ws_row_store_kept(ctx, change->shape, f, &k, &v);
+			if (kept != NULL)
+				pfree(kept);
 			edits[n++] = (ProllyEdit) {.key = k.data, .klen = k.len, .val = v.data, .vlen = v.len};
 		}
+		if (latest != NULL && !change->whole_old_row)
+		{
+			for (size_t e = first; e < n; e++)
+			{
+				TreeEditKey key = {edits[e].key, edits[e].klen};
+				TreeLatestEdit *entry = hash_search(latest, &key, HASH_ENTER, NULL);
+
+				entry->edit = e;
+			}
+		}
 	}
-	if (n > 0 || anew)
+	if (netting)
+		n = tree_net_edits(table->relid, edits, n);
+	if (latest != NULL)
+		hash_destroy(latest);
+	if (n > 0 || anew || wrote)
 	{
-		if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
-			prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
-			prolly_report(ctx);
 		if (shape->nkey == 0)
 		{
 			char	   *relname = get_rel_name(table->relid);
