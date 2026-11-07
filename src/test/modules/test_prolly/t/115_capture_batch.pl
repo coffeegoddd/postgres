@@ -214,10 +214,10 @@ SKIP:
 		CREATE TABLE huge_left (id integer PRIMARY KEY, n integer, v text); ALTER TABLE huge_left ALTER v SET STORAGE EXTERNAL;
 		CREATE TABLE huge_deferred (id integer PRIMARY KEY DEFERRABLE, v text);
 		INSERT INTO huge_left VALUES (1, 0, repeat('left', 5000));
-		INSERT INTO huge_deferred SELECT g, repeat('d', 200) FROM generate_series(1, 300) g});
+		INSERT INTO huge_deferred SELECT g, repeat('d', 200) FROM generate_series(1, 1500) g});
 	caught_up();
 	my $at = -s $node->logfile;
-	$node->safe_psql('postgres', qq{CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-applying', 'wait')});
+	$node->safe_psql('postgres', qq{CREATE EXTENSION injection_points; SELECT injection_points_attach('capture-apply-begin', 'wait')});
 	run(q{BEGIN;
 		INSERT INTO huge SELECT g, repeat('h', 800) FROM generate_series(1, 20000) g;
 		UPDATE huge SET v = 'changed' WHERE id % 3 = 0;
@@ -228,17 +228,18 @@ SKIP:
 		UPDATE huge_left SET n = 1;
 		UPDATE huge_deferred SET id = id + 1;
 		COMMIT});
-	$node->wait_for_event('capture worker', 'capture-applying');
+	$node->wait_for_event('capture worker', 'capture-apply-begin');
 	like(slurp_file($node->logfile, $at), qr/capture tree: spilled \d+ bytes/, 'one transaction goes to a file');
 
-	# (what's in memory, with the worker about to commit it: the rows were on file)
+	# (what's in memory with all of it held, about to be applied: of tables each written past what's
+	# held in memory, so that one's room being kept would show)
 	my $memory_at = -s $node->logfile;
 	my $pid = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
 	$node->safe_psql('postgres', "SELECT pg_log_backend_memory_contexts($pid)");
 	ok($node->wait_for_log(qr/capture tree held: \d+ total/, $memory_at), 'what it holds in memory is logged');
 	my ($held) = slurp_file($node->logfile, $memory_at) =~ /capture tree held: (\d+) total/;
-	cmp_ok($held, '<', 1024 * 1024, 'and is little, for one of 16 MB and more');
-	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-applying'); SELECT injection_points_detach('capture-applying')});
+	cmp_ok($held, '<', 256 * 1024, 'and is little, for one of 16 MB and more');
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-apply-begin'); SELECT injection_points_detach('capture-apply-begin')});
 	same_map('huge', 'with a key');
 	same_map('huge_nokey', 'with none');
 	same_map('huge_left', 'a value left out of line');

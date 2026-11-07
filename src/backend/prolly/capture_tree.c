@@ -29,7 +29,8 @@
  * references and tables here don't go in a dump, so a restored store begins again.
  * The chunks only they hold are in a dump like any others, until they're freed.
  *
- * All that was decoded since the last apply is held in memory.
+ * What's been told since the last apply is held: each table's changes as bytes, which go to a file
+ * of its own once all of them are more than logical_decoding_work_mem.
  *
  * What DDL does to a table's rows reaches here as all of its rows, in logical messages at the end
  * of its transaction (capture_rows.c), which void all that was told of the table before them.  So
@@ -127,6 +128,7 @@ typedef struct TreeTable
 	WsRowShape *last_shape;		/* the layout of the last change held */
 	int32		branch;
 	bool		any_unchanged;
+	Size		held_bytes;		/* of tree_held_bytes */
 } TreeTable;
 
 /* One row's change, as text: the shape's fields, NULL for a null. */
@@ -332,7 +334,7 @@ tree_table_of(Relation relation)
 static char tree_unchanged_value[1];
 
 /*
- * A tuple's fields by the table's shape, each in the context apply empties.  A value an update
+ * A tuple's fields by the table's shape, each in tree_change_cxt, reset for each change.  A value an update
  * left where it was is what old_row has of it, if it has it, or else, if unchanged is given, marked.
  */
 static char **
@@ -407,7 +409,11 @@ tree_held_spill(void)
 		if (table->file == NULL)
 			table->file = BufFileCreateTemp(true);
 		BufFileWrite(table->file, table->buf->data, table->buf->len);
-		resetStringInfo(table->buf);
+
+		/* (its room too, which would otherwise stay what it grew to) */
+		pfree(table->buf->data);
+		pfree(table->buf);
+		table->buf = NULL;
 	}
 	MemoryContextSwitchTo(old);
 	elog(DEBUG1, "capture tree: spilled %zu bytes", tree_held_in_memory);
@@ -464,7 +470,7 @@ static void
 tree_held_add(TreeTable *table, const TreeChange *change, const char *problem)
 {
 	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
-	StringInfoData rec;
+	int			start;
 	uint32		len;
 	uint8		flags = (change->old_row != NULL ? 1 : 0) | (change->new_row != NULL ? 2 : 0) |
 		(change->unchanged ? 4 : 0) | (change->whole_old_row ? 8 : 0);
@@ -478,26 +484,30 @@ tree_held_add(TreeTable *table, const TreeChange *change, const char *problem)
 	if (problem != NULL)
 	{
 		table->problems++;
+		if (table->problem != NULL)
+			pfree((char *) table->problem);
 		table->problem = pstrdup(problem);
 		table->problem_at = change->commit;
 	}
 	table->any_unchanged |= change->unchanged;
 	table->nheld++;
 
-	initStringInfo(&rec);
-	appendBinaryStringInfo(&rec, &change->commit, sizeof(change->commit));
-	appendBinaryStringInfo(&rec, &flags, sizeof(flags));
-	appendBinaryStringInfo(&rec, &nstored, sizeof(nstored));
-	if (change->old_row != NULL)
-		tree_held_write_row(&rec, change->old_row, nstored);
-	if (change->new_row != NULL)
-		tree_held_write_row(&rec, change->new_row, nstored);
-	len = rec.len;
+	/* (written where it's held, its length filled in once that's known) */
+	start = table->buf->len;
+	len = 0;
 	appendBinaryStringInfo(table->buf, &len, sizeof(len));
-	appendBinaryStringInfo(table->buf, rec.data, rec.len);
-	tree_held_bytes += sizeof(len) + rec.len;
-	tree_held_in_memory += sizeof(len) + rec.len;
-	pfree(rec.data);
+	appendBinaryStringInfo(table->buf, &change->commit, sizeof(change->commit));
+	appendBinaryStringInfo(table->buf, &flags, sizeof(flags));
+	appendBinaryStringInfo(table->buf, &nstored, sizeof(nstored));
+	if (change->old_row != NULL)
+		tree_held_write_row(table->buf, change->old_row, nstored);
+	if (change->new_row != NULL)
+		tree_held_write_row(table->buf, change->new_row, nstored);
+	len = table->buf->len - start - sizeof(len);
+	memcpy(table->buf->data + start, &len, sizeof(len));
+	tree_held_bytes += sizeof(len) + len;
+	tree_held_in_memory += sizeof(len) + len;
+	table->held_bytes += sizeof(len) + len;
 	MemoryContextSwitchTo(old);
 	tree_held_note(table, change->branch, change->commit);
 	if (tree_held_in_memory > (Size) logical_decoding_work_mem * 1024)
@@ -517,10 +527,14 @@ tree_held_forget(TreeTable *table)
 		pfree(table->buf);
 	}
 	table->buf = NULL;
+	tree_held_bytes -= table->held_bytes;
+	table->held_bytes = 0;
 	table->nheld = 0;
 	table->replaced = false;
 	table->replaced_at = InvalidXLogRecPtr;
 	table->problems = 0;
+	if (table->problem != NULL)
+		pfree((char *) table->problem);
 	table->problem = NULL;
 	table->problem_at = InvalidXLogRecPtr;
 	table->layout_until = InvalidXLogRecPtr;
@@ -836,7 +850,7 @@ tree_check_as_of_commit(void)
 		TreeTable  *table = tree_table_by_id(seen->relid);
 		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(seen->relid));
 
-		/* (one that's been told whole since has nothing held that this could be of) */
+		/* (one that's gone has nothing held that this could be of) */
 		if (HeapTupleIsValid(tup))
 		{
 			char	   *now = CaptureRowsFingerprint(seen->relid, ((Form_pg_class) GETSTRUCT(tup))->relfilenode);
@@ -848,6 +862,8 @@ tree_check_as_of_commit(void)
 			{
 				MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
 
+				if (table->problem != NULL)
+					pfree((char *) table->problem);
 				table->problem = psprintf("capture to trees has a row of relation %u written as catalogs were during its transaction and aren't now", seen->relid);
 				table->problem_at = tree_commit;
 				table->problems++;
@@ -1415,6 +1431,7 @@ tree_apply(void)
 
 	if (tree_held_changes == 0)
 		return;
+	INJECTION_POINT("capture-apply-begin", NULL);
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
