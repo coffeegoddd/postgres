@@ -1,5 +1,5 @@
 -- Tables with a primary key from the fixture rebuilds are checked against, with what capture to
--- trees can't yet follow left out: keyless tables, a table whose updates leave a TOASTed value
+-- trees can't yet follow left out: a table whose updates leave a TOASTed value
 -- unchanged (so "big" has a table of its own), and DDL once rows have been written.  Fewer rows.
 -- Extensions' types and the collation needing ICU are out, as this runs on any build.
 SET search_path = rt;
@@ -145,3 +145,6 @@ FROM generate_series(1, 9000) g;
 
 CREATE TABLE ticket (id serial PRIMARY KEY, note text);
 INSERT INTO ticket (note) SELECT 't' || g FROM generate_series(1, 77) g;
+
+CREATE TABLE no_key (a integer, b text);
+INSERT INTO no_key SELECT g % 5, CASE WHEN g % 7 = 0 THEN NULL ELSE 'same' END FROM generate_series(1, 200) g;

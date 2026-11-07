@@ -46,6 +46,7 @@
 #include "executor/instrument_node.h"
 #include "pgstat.h"
 #include "prolly/branch_filter.h"
+#include "prolly/capture.h"
 #include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -63,7 +64,7 @@ static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  Buffer vmbuffer_old, Buffer newbuf,
 								  Buffer vmbuffer_new, HeapTuple oldtup,
-								  HeapTuple newtup, HeapTuple old_key_tuple,
+								  HeapTuple newtup, HeapTuple old_key_tuple, bool old_whole,
 								  bool all_visible_cleared, bool new_all_visible_cleared,
 								  bool walLogical);
 #ifdef USE_ASSERT_CHECKING
@@ -112,7 +113,7 @@ static void index_delete_sort(TM_IndexDeleteOp *delstate);
 static int	bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
 static HeapTuple ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
-										bool *copy);
+										bool *copy, bool *whole);
 
 
 /*
@@ -2810,6 +2811,7 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	bool		clear_all_visible = false;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
+	bool		old_whole = false;
 
 	Assert(ItemPointerIsValid(tid));
 
@@ -3040,7 +3042,7 @@ l1:
 	 * we don't PANIC upon a memory allocation failure.
 	 */
 	old_key_tuple = walLogical ?
-		ExtractReplicaIdentity(relation, &tp, true, &old_key_copied) : NULL;
+		ExtractReplicaIdentity(relation, &tp, true, &old_key_copied, &old_whole) : NULL;
 
 	/*
 	 * If this is the first possibly-multixact-able operation in the current
@@ -3133,7 +3135,7 @@ l1:
 
 		if (old_key_tuple != NULL)
 		{
-			if (relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+			if (old_whole)
 				xlrec.flags |= XLH_DELETE_CONTAINS_OLD_TUPLE;
 			else
 				xlrec.flags |= XLH_DELETE_CONTAINS_OLD_KEY;
@@ -3313,6 +3315,7 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 	HeapTuple	heaptup;
 	HeapTuple	old_key_tuple = NULL;
 	bool		old_key_copied = false;
+	bool		old_whole = false;
 	bool		walLogical = (options & TABLE_UPDATE_NO_LOGICAL) == 0;
 	Page		page,
 				newpage;
@@ -4144,7 +4147,7 @@ l2:
 	old_key_tuple = ExtractReplicaIdentity(relation, &oldtup,
 										   bms_overlap(modified_attrs, id_attrs) ||
 										   id_has_external,
-										   &old_key_copied);
+										   &old_key_copied, &old_whole);
 
 	clear_all_visible = PageIsAllVisible(page);
 	clear_all_visible_new = newbuf != buffer && PageIsAllVisible(newpage);
@@ -4321,7 +4324,7 @@ l2:
 								 newbuf,
 								 vmbuffer_new_modified ? vmbuffer_new : InvalidBuffer,
 								 &oldtup, heaptup,
-								 old_key_tuple,
+								 old_key_tuple, old_whole,
 								 clear_all_visible,
 								 clear_all_visible_new,
 								 walLogical);
@@ -9063,7 +9066,7 @@ static XLogRecPtr
 log_heap_update(Relation reln, Buffer oldbuf, Buffer vmbuffer_old,
 				Buffer newbuf, Buffer vmbuffer_new,
 				HeapTuple oldtup, HeapTuple newtup,
-				HeapTuple old_key_tuple,
+				HeapTuple old_key_tuple, bool old_whole,
 				bool all_visible_cleared, bool new_all_visible_cleared,
 				bool walLogical)
 {
@@ -9157,7 +9160,7 @@ log_heap_update(Relation reln, Buffer oldbuf, Buffer vmbuffer_old,
 		xlrec.flags |= XLH_UPDATE_CONTAINS_NEW_TUPLE;
 		if (old_key_tuple)
 		{
-			if (reln->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+			if (old_whole)
 				xlrec.flags |= XLH_UPDATE_CONTAINS_OLD_TUPLE;
 			else
 				xlrec.flags |= XLH_UPDATE_CONTAINS_OLD_KEY;
@@ -9384,19 +9387,23 @@ log_heap_new_cid(Relation relation, HeapTuple tup)
  */
 static HeapTuple
 ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
-					   bool *copy)
+					   bool *copy, bool *whole)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
-	char		replident = relation->rd_rel->relreplident;
+	char		replident;
 	Bitmapset  *idattrs;
 	HeapTuple	key_tuple;
 	bool		nulls[MaxHeapAttributeNumber];
 	Datum		values[MaxHeapAttributeNumber];
 
 	*copy = false;
+	*whole = false;
 
 	if (!RelationIsLogicallyLogged(relation))
 		return NULL;
+
+	replident = CaptureLoggedIdentity(relation);
+	*whole = replident == REPLICA_IDENTITY_FULL;
 
 	if (replident == REPLICA_IDENTITY_NOTHING)
 		return NULL;

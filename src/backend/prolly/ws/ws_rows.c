@@ -70,40 +70,63 @@ ws_rows_keyless_count(const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 	return count;
 }
 
-/*
- * Keyless rows the same are one entry with their count, with what the map has
- * of them from earlier batches.  How many entries there now are.
- */
-static size_t
-keyless_entries(CaptureBatch *b, ProllyEdit *edits, size_t n)
+size_t
+ws_rows_keyless_merge(ProllyCtx *ctx, const PHash *map, ProllyEdit *edits, size_t n)
 {
 	size_t		out = 0;
 
+	if (n > 1)
+		qsort(edits, n, sizeof(ProllyEdit), edit_cmp);
 	for (size_t i = 0; i < n;)
 	{
-		size_t		same = i + 1;
-		uint64		count;
+		size_t		same = i;
+		uint64		count = 0;
+		uint64		fewer = 0;
 		const uint8 *held;
 		size_t		heldlen;
-		Buf			count_bytes = BUF_INIT;
-		Buf			val = BUF_INIT;
 		int			rc;
+		bool		had;
 
-		while (same < n && edit_cmp(&edits[i], &edits[same]) == 0)
-			same++;
-		count = same - i;
-		rc = prolly_get(b->ctx, &b->map, edits[i].key, edits[i].klen, &held, &heldlen);
+		for (; same < n && edit_cmp(&edits[i], &edits[same]) == 0; same++)
+		{
+			if (edits[same].del)
+				fewer++;
+			else
+				count++;
+		}
+		rc = prolly_get(ctx, map, edits[i].key, edits[i].klen, &held, &heldlen);
 		if (rc < 0)
-			prolly_report(b->ctx);
-		if (rc == PROLLY_OK)
+			prolly_report(ctx);
+		had = rc == PROLLY_OK;
+		if (had)
 			count += ws_rows_keyless_count(edits[i].key, edits[i].klen, held, heldlen);
-		buf_append_uvarint(&count_bytes, count);
-		WsRowCodec->keyless_value(edits[i].key, edits[i].klen, count_bytes.data, count_bytes.len, &val);
-		edits[out] = edits[i];
-		edits[out].val = val.data;
-		edits[out].vlen = val.len;
-		out++;
-		buf_free(&count_bytes);
+		if (fewer > count)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a row map holds fewer of a keyless row than were removed")));
+		count -= fewer;
+		if (count > 0)
+		{
+			Buf			count_bytes = BUF_INIT;
+			Buf			val = BUF_INIT;
+
+			buf_append_uvarint(&count_bytes, count);
+			WsRowCodec->keyless_value(edits[i].key, edits[i].klen, count_bytes.data, count_bytes.len, &val);
+			buf_free(&count_bytes);
+			edits[out] = edits[i];
+			edits[out].val = val.data;
+			edits[out].vlen = val.len;
+			edits[out].del = false;
+			out++;
+		}
+		else if (had)
+		{
+			edits[out] = edits[i];
+			edits[out].val = NULL;
+			edits[out].vlen = 0;
+			edits[out].del = true;
+			out++;
+		}
 		i = same;
 	}
 	return out;
@@ -143,10 +166,10 @@ capture_batch(void *arg, const WsSqlRows *rows)
 		edits[r].vlen = v.len;
 		edits[r].del = false;
 	}
-	if (n > 1)
-		qsort(edits, n, sizeof(ProllyEdit), edit_cmp);
 	if (s->nkey == 0)
-		n = keyless_entries(b, edits, n);
+		n = ws_rows_keyless_merge(b->ctx, &b->map, edits, n);
+	else if (n > 1)
+		qsort(edits, n, sizeof(ProllyEdit), edit_cmp);
 	if (n > 0 && prolly_apply(b->ctx, &b->map, edits, n, &b->map) < 0)
 		prolly_report(b->ctx);
 }

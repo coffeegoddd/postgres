@@ -18,8 +18,7 @@
  *
  * It's an error above READ COMMITTED, as it reads what's committed now, and in a
  * transaction that's written anything, which would be neither in it nor clearly out.
- * What can't be held in a commit, or a table capture holds no map of, as one with no
- * primary key, is an error too.
+ * What can't be held in a commit, or a table capture holds no map of, is an error too.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -90,8 +89,7 @@ captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash 
 	if (!barrier_refs->routine->get(barrier_refs, name, VC_REF_READ, map))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("capture holds no row map of table \"%s\" of schema \"%s\"", table, schema),
-				 errhint("It may have no primary key, which a commit taken from capture can't hold yet.")));
+				 errmsg("capture holds no row map of table \"%s\" of schema \"%s\"", table, schema)));
 	pfree(table);
 }
 

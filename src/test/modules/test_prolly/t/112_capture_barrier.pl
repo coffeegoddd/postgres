@@ -184,11 +184,18 @@ like($err, qr/is not versioned/, 'not of a shared schema');
 ($rc, $out, $err) = $node->psql('postgres', "$on1 ALTER TABLE s.t SET UNLOGGED");
 like($err, qr/unlogged/, 'a versioned table can not become unlogged');
 
-# a table it holds no map of, which a commit can't hold yet
-$node->safe_psql('postgres', "$on1 CREATE SCHEMA nokey VERSIONED; CREATE TABLE nokey.t (a integer)");
-($rc, $out, $err) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('nokey')");
-like($err, qr/capture holds no row map of table "t"/, 'a table with no primary key');
-$node->safe_psql('postgres', "$on1 DROP SCHEMA nokey CASCADE");
+# a table with no key, with rows the same as each other
+$node->safe_psql('postgres', "$on1 SET ROLE objs; CREATE TABLE s.nokey (a integer, b text); INSERT INTO s.nokey SELECT g % 3, 'x' FROM generate_series(1, 30) g; DELETE FROM s.nokey WHERE ctid = '(0,1)'");
+same_root('s', $on1, 'a table with no key');
+$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.nokey");
+
+# a table it holds no map of
+$node->safe_psql('postgres', "$on1 CREATE SCHEMA nomap VERSIONED; CREATE TABLE nomap.t (a integer PRIMARY KEY)");
+same_root('nomap', $on1, 'a table it has a map of');
+$node->safe_psql('postgres', "$on1 SET allow_system_table_mods = on; DELETE FROM pg_history.pointers WHERE name = 'capture/map/' || 'nomap.t'::regclass::oid");
+($rc, $out, $err) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('nomap')");
+like($err, qr/capture holds no row map of table "t"/, 'and one it has not');
+$node->safe_psql('postgres', "$on1 DROP SCHEMA nomap CASCADE");
 
 # what it saved goes with it, and one given up on is gone at the next
 same_root('s', $on1, 'one more');

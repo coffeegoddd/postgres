@@ -21,3 +21,7 @@ INSERT INTO ticket (note) VALUES ('after');
 UPDATE bigval SET big = repeat('changed ', 30000) WHERE id % 2 = 0;
 DELETE FROM bigval WHERE id = 3;
 INSERT INTO bigval VALUES (100, repeat('new ', 30000));
+
+UPDATE no_key SET b = 'changed' WHERE a = 1;
+DELETE FROM no_key WHERE ctid IN (SELECT ctid FROM no_key WHERE a = 2 LIMIT 3);
+INSERT INTO no_key VALUES (3, 'same'), (9, NULL);

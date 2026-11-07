@@ -210,6 +210,18 @@ rows_write_row(void *arg, const char **fields)
 }
 
 /* A table's rows, the last thing it's told of them. */
+char
+CaptureLoggedIdentity(Relation relation)
+{
+	char		identity = relation->rd_rel->relreplident;
+
+	if (!capture_to_trees || identity == REPLICA_IDENTITY_FULL)
+		return identity;
+	if (identity == REPLICA_IDENTITY_DEFAULT && OidIsValid(RelationGetPrimaryKeyIndex(relation, false)))
+		return identity;
+	return NamespaceBranch(RelationGetNamespace(relation)) != 0 ? REPLICA_IDENTITY_FULL : identity;
+}
+
 static void
 rows_write(Relation rel, int32 branch)
 {
@@ -229,11 +241,6 @@ rows_write(Relation rel, int32 branch)
 	appendBinaryStringInfo(&out, shape.tags, sizeof(uint64) * shape.nstored);
 	(void) LogLogicalMessage(CAPTURE_ROWS_PREFIX, out.data, out.len, true, false);
 	pfree(out.data);
-	if (shape.nkey == 0)
-	{
-		ws_row_shape_free(&shape);
-		return;
-	}
 	initStringInfo(&o.rows);
 	o.nrows = 0;
 	o.nstored = shape.nstored;

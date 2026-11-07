@@ -194,6 +194,15 @@ extern void CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot
  */
 extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root);
 
+/*
+ * The replica identity a change of this table logs by, in place of its own.  With capture on, a
+ * versioned table logs its whole old row unless it has a primary key that identifies a row by
+ * itself, so that a table with no key, one whose key is deferrable and one set to log nothing or
+ * another index all say what a change was of.  What the table says is left as it is, being the
+ * user's, and what a commit holds.  It's not for a critical section, as it reads catalogs.
+ */
+extern char CaptureLoggedIdentity(Relation relation);
+
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
 extern void CaptureRowsAtCommit(bool prepare);
 

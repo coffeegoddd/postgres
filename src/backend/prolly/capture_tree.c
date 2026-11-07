@@ -36,9 +36,11 @@
  * nothing's judged until its transaction has ended: what's wrong with a change only matters if it
  * isn't voided.
  *
- * This is off by default (capture_to_trees), as there's more it doesn't follow.  A table with no
- * primary key and one whose replica identity doesn't give it are errors, as an update changing the
- * key would look like one that didn't, as is a value decoding wasn't given.  An error stops capture
+ * A table with no key holds its rows by the whole row, with how many there are of it, so a change
+ * is one fewer of the old row and one more of the new; CaptureLoggedIdentity has that come whole.
+ *
+ * This is off by default (capture_to_trees), as there's more it doesn't follow.  A value decoding
+ * wasn't given is an error, unless it's in the old row.  An error stops capture
  * of the whole database, as the worker starts again at the same row, and the slot keeps its WAL.
  * What capture_rows.c doesn't find out isn't followed.  Nor is capture to trees being turned off for
  * a while and on again, nor an object id used again while its old row map is kept.
@@ -71,6 +73,7 @@
 #include "prolly/engine/vc_refs.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "prolly/ws/ws_rows.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -274,24 +277,12 @@ tree_table_of(Relation relation)
 	return table;
 }
 
-/* What's wrong with holding a change of this relation, or NULL. */
-static const char *
-tree_problem_of(Relation relation, const TreeTable *table)
-{
-	if (table->shape->nkey == 0)
-		return psprintf("capture to trees does not hold \"%s\", which has no primary key",
-						RelationGetRelationName(relation));
-	if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL &&
-		(relation->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT ||
-		 !OidIsValid(RelationGetPrimaryKeyIndex(relation, false))))
-		return psprintf("capture to trees does not hold \"%s\", whose replica identity does not give its primary key",
-						RelationGetRelationName(relation));
-	return NULL;
-}
-
-/* A tuple's fields by the table's shape, each in the context apply empties. */
+/*
+ * A tuple's fields by the table's shape, each in the context apply empties.  whole is what the old
+ * row had, if that's all of it, for a value an update left where it was.
+ */
 static char **
-tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only, const char **problem)
+tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_only, char **whole, const char **problem)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
 	char	  **row = MemoryContextAllocZero(tree_held_cxt, sizeof(char *) * Max(table->shape->nstored, 1));
@@ -318,8 +309,14 @@ tree_row(Relation relation, const TreeTable *table, HeapTuple tuple, bool key_on
 		getTypeOutputInfo(att->atttypid, &output, &varlena);
 		if (varlena && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
 		{
-			MemoryContext was = MemoryContextSwitchTo(tree_held_cxt);
+			MemoryContext was;
 
+			if (whole != NULL && whole[at] != NULL)
+			{
+				row[at] = whole[at];
+				continue;
+			}
+			was = MemoryContextSwitchTo(tree_held_cxt);
 			*problem = psprintf("capture to trees was not given column \"%s\" of \"%s\", which an update left as it was",
 								NameStr(att->attname), RelationGetRelationName(relation));
 			MemoryContextSwitchTo(was);
@@ -342,7 +339,6 @@ tree_change(const CaptureChange *change)
 	held->shape = table->shape;
 	held->branch = change->branch;
 	held->commit = tree_commit;
-	held->problem = tree_problem_of(change->relation, table);
 	if (change->catalogs_changed)
 	{
 		held->relid = RelationGetRelid(change->relation);
@@ -351,15 +347,14 @@ tree_change(const CaptureChange *change)
 		tree_as_of = lappend(tree_as_of, held);
 	}
 	MemoryContextSwitchTo(old);
-	if (held->problem == NULL)
-	{
-		if (change->kind == CAPTURE_DELETE && change->old_tuple == NULL)
-			elog(ERROR, "a row deleted from \"%s\" came with no key", RelationGetRelationName(change->relation));
-		if (change->old_tuple != NULL)
-			held->old_row = tree_row(change->relation, table, change->old_tuple, true, &held->problem);
-		if (change->new_tuple != NULL)
-			held->new_row = tree_row(change->relation, table, change->new_tuple, false, &held->problem);
-	}
+	if (change->old_tuple == NULL &&
+		(change->kind == CAPTURE_DELETE || (change->kind == CAPTURE_UPDATE && table->shape->nkey == 0)))
+		elog(ERROR, "a change of \"%s\" came with no old row", RelationGetRelationName(change->relation));
+	if (change->old_tuple != NULL)
+		held->old_row = tree_row(change->relation, table, change->old_tuple, table->shape->nkey > 0, NULL, &held->problem);
+	if (change->new_tuple != NULL)
+		held->new_row = tree_row(change->relation, table, change->new_tuple, false,
+								 table->shape->nkey == 0 ? held->old_row : NULL, &held->problem);
 	old = MemoryContextSwitchTo(tree_held_cxt);
 	table->held = lappend(table->held, held);
 	tree_held = lappend(tree_held, held);
@@ -729,13 +724,6 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		tree_check_table(table, shape);
 
 	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
-	if (shape->nkey == 0)
-	{
-		/* told whole, with no key: nothing can hold it, and what was held is void */
-		(void) refs->routine->remove(refs, name);
-		tree_record_shape(table->relid, table->shape);
-		return;
-	}
 	f = palloc_array(WsField, most);
 	edits = palloc_array(ProllyEdit, 2 * (list_length(table->held) - from));
 	for (int i = from; i < list_length(table->held); i++)
@@ -766,6 +754,8 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
 			prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 			prolly_report(ctx);
+		if (shape->nkey == 0)
+			n = ws_rows_keyless_merge(ctx, &map, edits, n);
 		if (n > 0 && prolly_apply(ctx, &map, edits, n, &map) < 0)
 			prolly_report(ctx);
 		refs->routine->set(refs, name, &map);
@@ -929,7 +919,14 @@ tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 		}
 		if (n > 0 && (!more || n == TREE_REBUILD_BATCH_ROWS || bytes >= TREE_REBUILD_BATCH_BYTES))
 		{
-			if (prolly_apply(ctx, map, edits, n, map) < 0)
+			if (b->shape->nkey == 0)
+			{
+				MemoryContext old = MemoryContextSwitchTo(batch_cxt);
+
+				n = ws_rows_keyless_merge(ctx, map, edits, n);
+				MemoryContextSwitchTo(old);
+			}
+			if (n > 0 && prolly_apply(ctx, map, edits, n, map) < 0)
 				prolly_report(ctx);
 			n = 0;
 			bytes = 0;
@@ -941,7 +938,7 @@ tree_rebuild_write(ProllyCtx *ctx, TreeRebuild *b, PHash *map)
 	MemoryContextDelete(batch_cxt);
 }
 
-/* A table's row map, of its rows in the transaction's snapshot, with none for one with no key. */
+/* A table's row map, of its rows in the transaction's snapshot. */
 static void
 tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 {
@@ -953,7 +950,6 @@ tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 
 	rel = table_open(relid, NoLock);
 	CaptureRelationShape(rel, &shape);
-	if (shape.nkey > 0)
 	{
 		TreeRebuild b = {.ctx = ctx,.shape = &shape};
 		TupleDesc	desc = CreateTemplateTupleDesc(2);
