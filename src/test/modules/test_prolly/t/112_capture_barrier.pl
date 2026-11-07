@@ -223,10 +223,11 @@ SKIP:
 	$node->safe_psql('postgres', "$on2 DROP SCHEMA with_view CASCADE");
 }
 
-# a marker told again, after a worker crashed past it, leaves alone what it saved and what others saved
+# a marker told again while its barrier is still building, by a worker that crashed with a commit right
+# after the marker applied: what it saved, and what others saved, is left, and so the root's right
 SKIP:
 {
-	skip 'injection points not supported by this build', 4 if $ENV{enable_injection_points} ne 'yes';
+	skip 'injection points not supported by this build', 6 if $ENV{enable_injection_points} ne 'yes';
 	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
 	same_root('s', $on1, 'with nothing held');
 	my $saved = qq{SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name LIKE 'capture/barrier/%/' || 's.t'::regclass::oid};
@@ -238,15 +239,16 @@ SKIP:
 	my $bg = barrier_held($on1);
 	$straddles->query_safe('COMMIT');
 	$straddles->quit;
-	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait'); SELECT injection_points_attach('capture-barrier-saved', 'wait')});
 	kill 'CONT', $worker;
 	$node->wait_for_event('capture worker', 'capture-applied');
-	ok(defined barrier_result($bg), 'a barrier, with a commit right after its marker applied, not confirmed');
+	$node->wait_for_event('client backend', 'capture-barrier-saved');
 	my $before = $node->safe_psql('postgres', "$on1 $saved");
-	ok( $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < (SELECT max(lsn) FROM pg_history.capture_barriers) FROM pg_replication_slots WHERE slot_name LIKE 'prolly_capture_%'}) eq 't',
-		'its marker is to be told again');
+	isnt($before, '', 'a barrier has its maps, with a commit right after its marker applied, not confirmed');
 	isnt($before, $node->safe_psql('postgres', qq{$on1 SELECT encode(hash, 'hex') FROM pg_history.pointers WHERE name = 'capture/map/' || 's.t'::regclass::oid}),
 		'what it saved is not the map now');
+	ok( $node->safe_psql('postgres', qq{SELECT confirmed_flush_lsn < (SELECT max(lsn) FROM pg_history.capture_barriers) FROM pg_replication_slots WHERE slot_name LIKE 'prolly_capture_%'}) eq 't',
+		'its marker is to be told again');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
@@ -255,6 +257,8 @@ SKIP:
 	$node->safe_psql('postgres', "$on1 DELETE FROM s.t WHERE id = 900006");
 	caught_up();
 	is($node->safe_psql('postgres', "$on1 $saved"), $before, 'and told again, it is left as it was');
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-barrier-saved'); SELECT injection_points_detach('capture-barrier-saved')});
+	is(barrier_result($bg), read_root('s', $on1), 'and the root does not have what came after');
 	$node->safe_psql('postgres', 'DROP EXTENSION injection_points');
 }
 
