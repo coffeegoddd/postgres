@@ -84,15 +84,45 @@ CREATE TYPE pub.under_domain AS (n int);
 CREATE DOMAIN pub.over_it AS pub.under_domain;
 CREATE TABLE uses_domain (id int PRIMARY KEY, c pub.over_it);
 ALTER TYPE pub.under_domain ADD ATTRIBUTE r regrole;
-CREATE TYPE app.outer_one AS (inner_one pub.under_domain);
+CREATE TYPE pub.nested_inner AS (n int);
+CREATE TYPE pub.nested_outer AS (inner_one pub.nested_inner);
+CREATE TABLE uses_nested (id int PRIMARY KEY, c pub.nested_outer);
+ALTER TYPE pub.nested_inner ADD ATTRIBUTE r regclass;
+CREATE TYPE pub.ranged_inner AS (n int);
+CREATE TYPE pub.ranged AS RANGE (SUBTYPE = pub.ranged_inner, MULTIRANGE_TYPE_NAME = pub.ranged_many);
+CREATE TABLE uses_ranged (id int PRIMARY KEY, c pub.ranged_many);
+ALTER TYPE pub.ranged_inner ADD ATTRIBUTE r regclass;
+CREATE FOREIGN DATA WRAPPER no_handler;
+CREATE SERVER nowhere FOREIGN DATA WRAPPER no_handler;
+CREATE FOREIGN TABLE pub.its_foreign (n int) SERVER nowhere;
+CREATE TABLE uses_foreign (id int PRIMARY KEY, c pub.its_foreign);
+ALTER FOREIGN TABLE pub.its_foreign ADD COLUMN r regclass;
 CREATE TABLE pub.its_row (n int);
 CREATE TABLE uses_row (id int PRIMARY KEY, c pub.its_row);
 ALTER TABLE pub.its_row ADD COLUMN r regclass;
 CREATE VIEW pub.its_view AS SELECT 1 AS n;
 CREATE TABLE uses_view (id int PRIMARY KEY, c pub.its_view);
 CREATE OR REPLACE VIEW pub.its_view AS SELECT 1 AS n, 'pg_class'::regclass AS r;
-SELECT string_agg(relname, ',' ORDER BY relname) AS still_fine FROM pg_class
-WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'uses_%';
+SELECT string_agg(relname, ',' ORDER BY relname) AS still_as_they_were FROM pg_class
+WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'uses_%' AND relkind = 'r';
+
+-- a chain of types longer than a walk of them by recursion would have room for
+CREATE TYPE pub.chain_root AS (n int);
+DO $$
+DECLARE
+	under text := 'pub.chain_root';
+BEGIN
+	FOR i IN 1 .. 100000 LOOP
+		EXECUTE format('CREATE DOMAIN pub.chain_%s AS %s', i, under);
+		under := format('pub.chain_%s', i);
+		IF i % 1000 = 0 THEN
+			COMMIT;
+		END IF;
+	END LOOP;
+END
+$$;
+ALTER TYPE pub.chain_root ADD ATTRIBUTE m text;
+SELECT count(*) AS still_up FROM pg_type WHERE typname = 'chain_100000';
 
 -- a typed table
 CREATE TYPE app.row_type AS (id int, v text);
@@ -115,6 +145,8 @@ CREATE TABLE ok (id int PRIMARY KEY, o oid, n name, t text, j jsonb);
 SELECT count(*) AS tables FROM pg_class WHERE relnamespace = 'app'::regnamespace AND relkind IN ('r', 'p');
 
 DROP TABLE pub.anything;
+DROP SERVER nowhere CASCADE;
+DROP FOREIGN DATA WRAPPER no_handler;
 DROP SCHEMA pub CASCADE;
 DROP SCHEMA app CASCADE;
 SET catalog_branch = :b2;

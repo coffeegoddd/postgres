@@ -142,7 +142,25 @@ CREATE TABLE uses_domain (id int PRIMARY KEY, c pub.over_it);
 ALTER TYPE pub.under_domain ADD ATTRIBUTE r regrole;
 ERROR:  column "c" of versioned table "app.uses_domain" cannot be of type over_it, which names an object
 DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
-CREATE TYPE app.outer_one AS (inner_one pub.under_domain);
+CREATE TYPE pub.nested_inner AS (n int);
+CREATE TYPE pub.nested_outer AS (inner_one pub.nested_inner);
+CREATE TABLE uses_nested (id int PRIMARY KEY, c pub.nested_outer);
+ALTER TYPE pub.nested_inner ADD ATTRIBUTE r regclass;
+ERROR:  column "c" of versioned table "app.uses_nested" cannot be of type nested_outer, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE TYPE pub.ranged_inner AS (n int);
+CREATE TYPE pub.ranged AS RANGE (SUBTYPE = pub.ranged_inner, MULTIRANGE_TYPE_NAME = pub.ranged_many);
+CREATE TABLE uses_ranged (id int PRIMARY KEY, c pub.ranged_many);
+ALTER TYPE pub.ranged_inner ADD ATTRIBUTE r regclass;
+ERROR:  column "c" of versioned table "app.uses_ranged" cannot be of type ranged_many, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
+CREATE FOREIGN DATA WRAPPER no_handler;
+CREATE SERVER nowhere FOREIGN DATA WRAPPER no_handler;
+CREATE FOREIGN TABLE pub.its_foreign (n int) SERVER nowhere;
+CREATE TABLE uses_foreign (id int PRIMARY KEY, c pub.its_foreign);
+ALTER FOREIGN TABLE pub.its_foreign ADD COLUMN r regclass;
+ERROR:  column "c" of versioned table "app.uses_foreign" cannot be of type its_foreign, which names an object
+DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
 CREATE TABLE pub.its_row (n int);
 CREATE TABLE uses_row (id int PRIMARY KEY, c pub.its_row);
 ALTER TABLE pub.its_row ADD COLUMN r regclass;
@@ -153,11 +171,33 @@ CREATE TABLE uses_view (id int PRIMARY KEY, c pub.its_view);
 CREATE OR REPLACE VIEW pub.its_view AS SELECT 1 AS n, 'pg_class'::regclass AS r;
 ERROR:  column "c" of versioned table "app.uses_view" cannot be of type its_view, which names an object
 DETAIL:  A rename changes such a value with no change of the row, and names differ between branches.
-SELECT string_agg(relname, ',' ORDER BY relname) AS still_fine FROM pg_class
-WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'uses_%';
-                                                              still_fine                                                              
---------------------------------------------------------------------------------------------------------------------------------------
- uses_domain,uses_domain_pkey,uses_later,uses_later_pkey,uses_row,uses_row_pkey,uses_shared,uses_shared_pkey,uses_view,uses_view_pkey
+SELECT string_agg(relname, ',' ORDER BY relname) AS still_as_they_were FROM pg_class
+WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'uses_%' AND relkind = 'r';
+                                     still_as_they_were                                     
+--------------------------------------------------------------------------------------------
+ uses_domain,uses_foreign,uses_later,uses_nested,uses_ranged,uses_row,uses_shared,uses_view
+(1 row)
+
+-- a chain of types longer than a walk of them by recursion would have room for
+CREATE TYPE pub.chain_root AS (n int);
+DO $$
+DECLARE
+	under text := 'pub.chain_root';
+BEGIN
+	FOR i IN 1 .. 100000 LOOP
+		EXECUTE format('CREATE DOMAIN pub.chain_%s AS %s', i, under);
+		under := format('pub.chain_%s', i);
+		IF i % 1000 = 0 THEN
+			COMMIT;
+		END IF;
+	END LOOP;
+END
+$$;
+ALTER TYPE pub.chain_root ADD ATTRIBUTE m text;
+SELECT count(*) AS still_up FROM pg_type WHERE typname = 'chain_100000';
+ still_up 
+----------
+        1
 (1 row)
 
 -- a typed table
@@ -182,25 +222,20 @@ CREATE TABLE ok (id int PRIMARY KEY, o oid, n name, t text, j jsonb);
 SELECT count(*) AS tables FROM pg_class WHERE relnamespace = 'app'::regnamespace AND relkind IN ('r', 'p');
  tables 
 --------
-      9
+     12
 (1 row)
 
 DROP TABLE pub.anything;
+DROP SERVER nowhere CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to foreign table its_foreign
+drop cascades to column c of table uses_foreign
+DROP FOREIGN DATA WRAPPER no_handler;
 DROP SCHEMA pub CASCADE;
-NOTICE:  drop cascades to 11 other objects
-DETAIL:  drop cascades to table moved
-drop cascades to type shared_later
-drop cascades to column c of table uses_shared
-drop cascades to type under_domain
-drop cascades to column inner_one of composite type outer_one
-drop cascades to type over_it
-drop cascades to column c of table uses_domain
-drop cascades to table its_row
-drop cascades to column c of table uses_row
-drop cascades to view its_view
-drop cascades to column c of table uses_view
+ERROR:  out of shared memory
+HINT:  You might need to increase "max_locks_per_transaction".
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to 16 other objects
+NOTICE:  drop cascades to 18 other objects
 DETAIL:  drop cascades to type names_a_class
 drop cascades to type holds_a_role
 drop cascades to type holds_holder
@@ -212,7 +247,9 @@ drop cascades to type later
 drop cascades to table uses_later
 drop cascades to table uses_shared
 drop cascades to table uses_domain
-drop cascades to type outer_one
+drop cascades to table uses_nested
+drop cascades to table uses_ranged
+drop cascades to table uses_foreign
 drop cascades to table uses_row
 drop cascades to table uses_view
 drop cascades to type row_type

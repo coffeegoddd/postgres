@@ -40,6 +40,7 @@
 #include "storage/sinval.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -159,47 +160,66 @@ check_table(Oid relid)
 /*
  * The versioned tables that use a type, through arrays, domains, ranges, multiranges and the
  * composite types of relations of any kind, asked of: a type changed since is what they use now.
+ * It goes a type at a time from a queue, as a chain of them may be as long as anyone makes it, and
+ * each type and table is asked of once (types, tables).
  */
 static void
-check_type_users(Oid typid, List **seen)
+check_type_users(Oid typid, HTAB *types, HTAB *tables)
 {
-	Relation	depend;
-	ScanKeyData keys[2];
-	SysScanDesc scan;
-	HeapTuple	tup;
-	List	   *types = NIL;
-	List	   *relations = NIL;
+	List	   *queue = NIL;
+	bool		found;
 
-	if (list_member_oid(*seen, typid))
-		return;
-	*seen = lappend_oid(*seen, typid);
-	depend = table_open(DependRelationId, AccessShareLock);
-	ScanKeyInit(&keys[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
-	ScanKeyInit(&keys[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(typid));
-	scan = systable_beginscan(depend, DependReferenceIndexId, true, NULL, 2, keys);
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	(void) hash_search(types, &typid, HASH_ENTER, &found);
+	if (!found)
+		queue = list_make1_oid(typid);
+	while (queue != NIL)
 	{
-		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
+		Oid			type = linitial_oid(queue);
+		Relation	depend;
+		ScanKeyData keys[2];
+		SysScanDesc scan;
+		HeapTuple	tup;
+		List	   *relations = NIL;
 
-		if (dep->classid == TypeRelationId)
-			types = lappend_oid(types, dep->objid);
-		else if (dep->classid == RelationRelationId && dep->objsubid > 0)
-			relations = list_append_unique_oid(relations, dep->objid);
-	}
-	systable_endscan(scan);
-	table_close(depend, AccessShareLock);
-	foreach_oid(other, types)
-		check_type_users(other, seen);
-	foreach_oid(relid, relations)
-	{
-		Oid			rowtype = get_rel_type_id(relid);
+		queue = list_delete_first(queue);
+		CHECK_FOR_INTERRUPTS();
+		depend = table_open(DependRelationId, AccessShareLock);
+		ScanKeyInit(&keys[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
+		ScanKeyInit(&keys[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(type));
+		scan = systable_beginscan(depend, DependReferenceIndexId, true, NULL, 2, keys);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
 
-		check_table(relid);
-		if (OidIsValid(rowtype))
-			check_type_users(rowtype, seen);
+			if (dep->classid == TypeRelationId)
+			{
+				(void) hash_search(types, &dep->objid, HASH_ENTER, &found);
+				if (!found)
+					queue = lappend_oid(queue, dep->objid);
+			}
+			else if (dep->classid == RelationRelationId && dep->objsubid > 0)
+				relations = lappend_oid(relations, dep->objid);
+		}
+		systable_endscan(scan);
+		table_close(depend, AccessShareLock);
+		foreach_oid(relid, relations)
+		{
+			Oid			rowtype;
+
+			(void) hash_search(tables, &relid, HASH_ENTER, &found);
+			if (found)
+				continue;
+			check_table(relid);
+			rowtype = get_rel_type_id(relid);
+			if (OidIsValid(rowtype))
+			{
+				(void) hash_search(types, &rowtype, HASH_ENTER, &found);
+				if (!found)
+					queue = lappend_oid(queue, rowtype);
+			}
+		}
+		list_free(relations);
 	}
-	list_free(types);
-	list_free(relations);
 }
 
 void
@@ -208,17 +228,24 @@ BranchTablesCheckAtCommit(void)
 	SharedInvalidationMessage *msgs;
 	bool		relcache;
 	int			n;
-	List	   *seen = NIL;
+	HASHCTL		ctl = {.keysize = sizeof(Oid),.entrysize = sizeof(Oid),.hcxt = CurrentMemoryContext};
+	HTAB	   *types;
+	HTAB	   *tables;
 
 	/*
 	 * (not in a binary upgrade, which Postgres's own check of reg* columns lets regclass, regrole and
-	 * regtype through: such a table from before this refused them is refused at its next DDL)
+	 * regtype through.  A table that holds one, which only that or a store from before this can make,
+	 * is then refused at the commit of a change to it, or to a type it uses, on whatever branch)
 	 */
 	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode() || IsBinaryUpgrade || IsParallelWorker() ||
 		!TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return;
 	CommandCounterIncrement();
 	n = xactGetCommittedInvalidationMessages(&msgs, &relcache);
+	if (n == 0)
+		return;
+	types = hash_create("versioned tables' types asked of", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	tables = hash_create("versioned tables asked of", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/*
 	 * Each relation invalidated, and those using its row type, as a composite type, a view or a table
@@ -228,15 +255,20 @@ BranchTablesCheckAtCommit(void)
 	 */
 	for (int i = 0; i < n; i++)
 	{
+		Oid			relid = msgs[i].rc.relId;
 		Oid			rowtype;
+		bool		found;
 
-		if (msgs[i].id != SHAREDINVALRELCACHE_ID || msgs[i].rc.dbId != MyDatabaseId ||
-			!OidIsValid(msgs[i].rc.relId))
+		if (msgs[i].id != SHAREDINVALRELCACHE_ID || msgs[i].rc.dbId != MyDatabaseId || !OidIsValid(relid))
 			continue;
-		check_table(msgs[i].rc.relId);
-		rowtype = get_rel_type_id(msgs[i].rc.relId);
+		(void) hash_search(tables, &relid, HASH_ENTER, &found);
+		if (found)
+			continue;
+		check_table(relid);
+		rowtype = get_rel_type_id(relid);
 		if (OidIsValid(rowtype))
-			check_type_users(rowtype, &seen);
+			check_type_users(rowtype, types, tables);
 	}
-	list_free(seen);
+	hash_destroy(types);
+	hash_destroy(tables);
 }
