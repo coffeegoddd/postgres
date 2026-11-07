@@ -98,9 +98,13 @@ same_map('bad', 'and written after');
 	like($err, qr/capture is healing table "bad" of schema "s"/, 'a commit of its schema is refused meanwhile');
 
 	# (left so many times, the worker waits a little for it, which it shows as waiting for a lock)
-	ok( $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND wait_event_type = 'Lock'}),
+	my $bad = run(q{SELECT 's.bad'::regclass::oid});
+	ok( $node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE a.backend_type = 'capture worker' AND l.relation = $bad AND NOT l.granted}),
 		'left a few times, the worker waits a little for the writer');
-	is(run(q{SELECT count(*) FROM pg_history.capture_healing WHERE relid = 's.bad'::regclass}), '1', 'and gives up again for now');
+	run(q{INSERT INTO good VALUES (4, 'four')});
+	same_map('good', 'and gives up again for now, capture going on with the writer still there');
+	is(run(q{SELECT count(*) FROM pg_history.capture_healing WHERE relid = 's.bad'::regclass}), '1', 'and the table still being healed');
 	$writer->query_safe('COMMIT');
 	$writer->quit;
 	healed('bad');
