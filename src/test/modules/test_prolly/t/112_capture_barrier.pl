@@ -341,6 +341,21 @@ my $dropped = $node->safe_psql('postgres', "$on1 SELECT 's.swap_b'::regclass::oi
 $node->safe_psql('postgres', "$on1 SET ROLE objs; BEGIN ISOLATION LEVEL REPEATABLE READ; DROP TABLE s.swap_b; COMMIT");
 is($node->safe_psql('postgres', "SELECT count(*) FROM pg_history.capture_fingerprints WHERE relid = $dropped"), '0',
 	'dropped in REPEATABLE READ, its fingerprint is forgotten');
+# a barrier's marker is flushed as it's written, so that the worker can read it at once, rather than
+# when something else flushes the WAL: with the worker stopped, what's flushed while the barrier
+# waits is past its marker
+SKIP:
+{
+	skip 'no way to stop a process', 1 if $windows_os;
+	kill 'STOP', $worker;
+	my $bg = barrier_held($on1);
+	my $flushed = $node->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
+	kill 'CONT', $worker;
+	isnt(barrier_result($bg), undef, 'a barrier with its marker');
+	is($node->safe_psql('postgres', "SELECT max(lsn) <= '$flushed'::pg_lsn FROM pg_history.capture_barriers"), 't',
+		'its marker flushed before the worker read it');
+}
+
 # a session's own changes, committed, are in the root its next commit is made of, made at once after
 # them: with the worker stopped, so that the barrier has to wait for them
 SKIP:

@@ -77,10 +77,27 @@ sub run_file
 	$node->safe_psql('postgres', "$use\n" . slurp_file("$fixture/$file"));
 }
 
+# A commit's root, from capture, is the one layer 4 makes by reading the tables.
+sub root_same
+{
+	my ($step) = @_;
+	my $root = $node->safe_psql('postgres', "$use SELECT test_capture_barrier('rt')");
+	isnt($root, '', "$step: a root");
+	is($root, $node->safe_psql('postgres', "$use $reader SELECT test_ws_root_capture('rt')"), "$step: the root");
+}
+
 run_file('load.sql');
 ok(each_table_same('load') >= 10, 'the fixture has its tables');
+root_same('load');
 run_file('dml.sql');
 each_table_same('changes');
+root_same('changes');
+run_file('ddl.sql');
+each_table_same('schema changes');
+root_same('schema changes');
+run_file('dml_after.sql');
+each_table_same('changes after them');
+root_same('changes after them');
 
 # DDL that changes a table's rows and tells no change of them, leaving its layout as it was
 sub ddl_step
@@ -108,6 +125,7 @@ $node->safe_psql('postgres', "$use CREATE TABLE rt.again (id integer PRIMARY KEY
 each_table_same('before a table is made again');
 $node->safe_psql('postgres', "$use DROP TABLE rt.again; CREATE TABLE rt.again (id integer PRIMARY KEY); INSERT INTO rt.again VALUES (2)");
 each_table_same('after a table is made again');
+root_same('at the end');
 
 unlike(slurp_file($node->logfile), qr/^(ERROR|FATAL|PANIC):|terminated by signal/m, 'nothing here went wrong, capture\'s worker included');
 $node->stop;
