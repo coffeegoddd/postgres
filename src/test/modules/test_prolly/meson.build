@@ -242,6 +242,7 @@ tests += {
       't/113_capture_keyless.pl',
       't/114_capture_toast.pl',
       't/115_capture_batch.pl',
+      't/116_happy_path.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
