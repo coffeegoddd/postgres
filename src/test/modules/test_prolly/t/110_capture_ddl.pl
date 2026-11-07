@@ -89,6 +89,15 @@ run(q{ALTER TABLE gen ALTER COLUMN s DROP EXPRESSION; UPDATE gen SET s = 99 WHER
 same_map('gen', 'a stored one made an ordinary column, and written');
 run(q{ALTER TABLE gen ADD COLUMN s2 integer GENERATED ALWAYS AS (id + a) STORED; INSERT INTO gen (id, a) VALUES (3, 3)});
 same_map('gen', 'one added, with rows already there, and one written after');
+my ($rc_v, $out_v, $err_v) = $node->psql('postgres', "$on1 ALTER TABLE s.gen ALTER COLUMN v DROP EXPRESSION");
+like($err_v, qr/DROP EXPRESSION is not supported for virtual generated columns/,
+	'a virtual one cannot be made an ordinary column, so none becomes stored');
+run(q{CREATE TABLE gen_key (a integer, k integer GENERATED ALWAYS AS (a * 10) STORED PRIMARY KEY, b text);
+	INSERT INTO gen_key (a, b) VALUES (1, 'one'), (2, 'two'); UPDATE gen_key SET a = 3 WHERE a = 2});
+same_map('gen_key', 'a stored generated column as the key, changed by what it is made from');
+run(q{CREATE TABLE gen_big (id integer PRIMARY KEY, n integer, b text, big text GENERATED ALWAYS AS (repeat(b, 5000)) STORED);
+	ALTER TABLE gen_big ALTER COLUMN big SET STORAGE EXTERNAL; INSERT INTO gen_big (id, n, b) VALUES (1, 0, 'x'); UPDATE gen_big SET n = 1});
+same_map('gen_big', 'a stored generated value out of line, left as it was by an update');
 run(q{ALTER TABLE t ALTER COLUMN g SET EXPRESSION AS (a + 2)});
 same_map('t', 'its expression changed');
 run('ALTER TABLE t RENAME COLUMN v TO w');
