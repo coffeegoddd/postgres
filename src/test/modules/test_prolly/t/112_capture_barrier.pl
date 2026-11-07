@@ -314,6 +314,27 @@ unlike($errr, qr/ran as a barrier read/, 'an operator ahead on the search path')
 like($outr, qr/^[0-9a-f]{40}$/m, 'and the barrier gave a root');
 $node->safe_psql('postgres', 'DROP SCHEMA evil CASCADE');
 
+# a table is its object id, not its name: two swapping names, with the worker going on and starting
+# again between, and a root that's each table's rows by the name it has now
+$node->safe_psql('postgres', "$on1 SET ROLE objs; CREATE TABLE s.swap_a (id integer PRIMARY KEY, v text); CREATE TABLE s.swap_b (id integer PRIMARY KEY, v text);
+	INSERT INTO s.swap_a VALUES (1, 'was a'); INSERT INTO s.swap_b VALUES (1, 'was b'), (2, 'was b')");
+same_root('s', $on1, 'two tables');
+$node->safe_psql('postgres', "$on1 SET ROLE objs; BEGIN; ALTER TABLE s.swap_a RENAME TO swap_tmp; ALTER TABLE s.swap_b RENAME TO swap_a; ALTER TABLE s.swap_tmp RENAME TO swap_b; COMMIT");
+same_root('s', $on1, 'their names swapped');
+$node->safe_psql('postgres', "SELECT pg_terminate_backend($worker)");
+$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $worker})
+  or die 'no worker came back';
+$worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+$node->safe_psql('postgres', "$on1 SET ROLE objs; BEGIN; ALTER TABLE s.swap_a RENAME TO swap_tmp; ALTER TABLE s.swap_b RENAME TO swap_a; ALTER TABLE s.swap_tmp RENAME TO swap_b; COMMIT;
+	INSERT INTO s.swap_a VALUES (3, 'after')");
+same_root('s', $on1, 'swapped back across a worker starting again, and written');
+is($node->safe_psql('postgres', "$on1 SELECT string_agg(v, ',' ORDER BY id) FROM s.swap_a"), 'was a,after', 'by the names they have now');
+
+# a table dropped and another made, which may have its object id: the new one's rows are told whole
+$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.swap_b; CREATE TABLE s.swap_b (id integer PRIMARY KEY, v text); INSERT INTO s.swap_b VALUES (9, 'new')");
+same_root('s', $on1, 'a table dropped and one made in its name');
+$node->safe_psql('postgres', "$on1 SET ROLE objs; DROP TABLE s.swap_a; DROP TABLE s.swap_b");
+
 # its own transaction: nothing it's written, and nothing older than now
 my ($rc, $out, $err) = $node->psql('postgres', "$on1 BEGIN; INSERT INTO s.t VALUES (900004, 'x'); SELECT test_capture_barrier('s'); ROLLBACK");
 like($err, qr/can't run in a transaction that has written anything/, 'not in a transaction that has written');
