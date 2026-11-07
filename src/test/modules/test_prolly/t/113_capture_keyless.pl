@@ -151,6 +151,9 @@ SKIP:
 		  . "SET LOCAL catalog_branch = $other; INSERT INTO s.again VALUES (1), (3); COMMIT");
 	$node->wait_for_event('capture worker', 'capture-applied');
 	my $held = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+
+	# (with what's not been applied after it, so that one read has both)
+	run('INSERT INTO again VALUES (1), (4)');
 	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied')});
 	$node->safe_psql('postgres', "SELECT pg_terminate_backend($held)");
 	$node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'capture worker' AND pid <> $held})
