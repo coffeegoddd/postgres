@@ -1,6 +1,5 @@
 -- Tables from the fixture rebuilds are checked against, with what capture to
--- trees can't yet follow left out: a table whose updates leave a TOASTed value
--- unchanged (so "big" has a table of its own), and DDL once rows have been written.  Fewer rows.
+-- trees can't yet follow left out: DDL once rows have been written.  Fewer rows.
 -- Extensions' types and the collation needing ICU are out, as this runs on any build.
 SET search_path = rt;
 

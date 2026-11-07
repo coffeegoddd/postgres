@@ -529,8 +529,8 @@ const WsLargeValueRoutine TreeWsLargeValues = {
 
 const WsLargeValueRoutine *WsLargeValues = &TreeWsLargeValues;
 
-void
-ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val)
+static void
+row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val, bool kept)
 {
 	WsField    *fields = palloc_array(WsField, Max(s->nstored, 1));
 	Buf			named = BUF_INIT;
@@ -538,10 +538,10 @@ ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Bu
 
 	for (int i = 0; i < s->nstored; i++)
 	{
-		if (f[i].large)
+		if (f[i].large && !kept)
 			elog(ERROR, "a large value's tree given as a value to store");
 		fields[i] = f[i];
-		if (i >= s->nkey && !f[i].null && f[i].len > WS_LARGE_CELL)
+		if (!f[i].large && i >= s->nkey && !f[i].null && f[i].len > WS_LARGE_CELL)
 		{
 			PHash		root;
 
@@ -554,12 +554,24 @@ ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Bu
 	}
 	/* (named has stopped moving) */
 	for (int i = 0; i < s->nstored; i++)
-		if (fields[i].large)
+		if (fields[i].large && !f[i].large)
 			fields[i].p = named.data + at[i];
 	WsRowCodec->encode(s, fields, key, val);
 	buf_free(&named);
 	pfree(at);
 	pfree(fields);
+}
+
+void
+ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val)
+{
+	row_store(ctx, s, f, key, val, false);
+}
+
+void
+ws_row_store_kept(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val)
+{
+	row_store(ctx, s, f, key, val, true);
 }
 
 void

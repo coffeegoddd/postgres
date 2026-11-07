@@ -240,6 +240,7 @@ tests += {
       't/111_capture_rebuild.pl',
       't/112_capture_barrier.pl',
       't/113_capture_keyless.pl',
+      't/114_capture_toast.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

@@ -187,6 +187,9 @@ extern PGDLLIMPORT const WsLargeValueRoutine *WsLargeValues;
 /* A row's key and value, its large values put in their trees. */
 extern void ws_row_store(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val);
 
+/* The same, with fields as the codec's view gives them kept in the trees they name. */
+extern void ws_row_store_kept(ProllyCtx *ctx, const WsRowShape *s, const WsField *f, Buf *key, Buf *val);
+
 /*
  * A row's fields, as the values they were: its large values read into held,
  * which the fields then point into, as the others do into k and v.

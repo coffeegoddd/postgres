@@ -438,7 +438,7 @@
 
 { name => 'capture_to_trees', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Applies what capture decodes to each table\'s row map.',
-  long_desc => 'It does not yet follow a value an update leaves out of line on a table with a primary key, and capture stops at one.',
+  long_desc => 'What it does not yet follow, capture stops at.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'capture_to_trees',
   boot_val => 'false',
