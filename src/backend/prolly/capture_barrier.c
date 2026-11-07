@@ -105,12 +105,11 @@ captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash 
 		return;
 	}
 	snprintf(name, sizeof(name), CAPTURE_BARRIER_REF_PREFIX "%X/%X/%u", LSN_FORMAT_ARGS(barrier_lsn), relid);
-	if (!barrier_refs->routine->get(barrier_refs, name, VC_REF_READ, map))
+	/* (as capture has let go of its map: what it has is of part of it, or nothing) */
 	{
 		Oid			types[1] = {OIDOID};
 		Datum		values[1] = {ObjectIdGetDatum(relid)};
 
-		/* (with no map, as capture let go of it, as it couldn't apply the table's changes) */
 		if (SPI_execute_with_args("SELECT reason FROM pg_history.capture_healing WHERE relid OPERATOR(pg_catalog.=) $1",
 								  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
 			elog(ERROR, "could not read the tables capture is healing");
@@ -120,10 +119,11 @@ captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash 
 					 errmsg("capture is healing table \"%s\" of schema \"%s\"", table, schema),
 					 errdetail("Its changes couldn't be applied: %s", SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1)),
 					 errhint("Try the commit again once its rows have been told whole.")));
+	}
+	if (!barrier_refs->routine->get(barrier_refs, name, VC_REF_READ, map))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("capture holds no row map of table \"%s\" of schema \"%s\"", table, schema)));
-	}
 	pfree(table);
 }
 

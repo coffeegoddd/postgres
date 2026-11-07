@@ -178,6 +178,9 @@ static List *tree_tables = NIL;
 
 /* Tables to be told whole once what's applied is committed: their changes couldn't be. */
 static List *tree_to_heal = NIL;
+
+/* Tables being healed, as pg_history.capture_healing has them: their changes are passed over. */
+static List *tree_healing = NIL;
 static void tree_heal(void);
 
 /* What apply has yet to write; emptied by it. */
@@ -242,8 +245,10 @@ tree_let_go(VcRefs *refs)
 		bool		isnull;
 		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 
-		tree_to_heal = list_append_unique_oid(tree_to_heal,
-											  DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
+		Oid			relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+
+		tree_to_heal = list_append_unique_oid(tree_to_heal, relid);
+		tree_healing = list_append_unique_oid(tree_healing, relid);
 		MemoryContextSwitchTo(old);
 	}
 	tree_exec("DELETE FROM pg_history.capture_positions p WHERE p.branch <> 0 AND "
@@ -1294,6 +1299,13 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 				 errmsg("capture to trees does not follow the layout of relation %u changing", table->relid)));
 	shape = table->last_shape;
 	anew = table->replaced && table->replaced_at > before;
+
+	/* (one being healed has no map: what comes before its rows told whole would make one of part) */
+	if (!anew && list_member_oid(tree_healing, table->relid))
+	{
+		elog(DEBUG1, "capture tree: passed over changes of relation %u, being healed", table->relid);
+		return;
+	}
 	if (!anew)
 		tree_check_table(table, shape);
 
@@ -1445,6 +1457,7 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		if (SPI_execute_with_args("DELETE FROM pg_history.capture_healing WHERE relid = $1",
 								  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
 			elog(ERROR, "could not record a table healed");
+		tree_healing = list_delete_oid(tree_healing, table->relid);
 	}
 	MemoryContextSwitchTo(was);
 	MemoryContextDelete(batch_cxt);
@@ -1476,12 +1489,11 @@ tree_quarantine(VcRefs *refs, TreeTable *table, const char *why, const char *whe
 			 again ? errdetail("Its rows were told whole, so it stays out until a change of what they print as tells them again.") :
 			 errdetail("Its rows will be told whole again, holding off its writers while they're read."),
 			 where != NULL ? errcontext("%s", where) : 0));
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	tree_healing = list_append_unique_oid(tree_healing, table->relid);
 	if (!again)
-	{
-		old = MemoryContextSwitchTo(TopMemoryContext);
 		tree_to_heal = list_append_unique_oid(tree_to_heal, table->relid);
-		MemoryContextSwitchTo(old);
-	}
+	MemoryContextSwitchTo(old);
 }
 
 /* An error applying one table's changes is the table's: anything else stops the worker. */
@@ -1797,6 +1809,10 @@ tree_slot_made(XLogRecPtr from)
 	tree_exec("DELETE FROM pg_history.capture_tables", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_fingerprints", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_healing", SPI_OK_DELETE);
+	list_free(tree_healing);
+	tree_healing = NIL;
+	list_free(tree_to_heal);
+	tree_to_heal = NIL;
 	tree_exec("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
 			  "WHERE n.nspbranch <> 0 AND c.relkind = 'r' AND c.relpersistence = 'p'", SPI_OK_SELECT);
 	for (uint64 i = 0; i < SPI_processed; i++)

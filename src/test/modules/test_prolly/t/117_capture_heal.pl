@@ -90,6 +90,10 @@ same_map('bad', 'and written after');
 	is(run(q{SELECT count(*) FROM pg_history.capture_healing WHERE relid = 's.bad'::regclass}), '1', 'it is being healed');
 	run(q{INSERT INTO good VALUES (3, 'three')});
 	same_map('good', 'and other tables go on meanwhile');
+	run(q{INSERT INTO bad VALUES (5, 'committed while healing')});
+	caught_up();
+	is(run(q{SELECT count(*) FROM pg_history.pointers WHERE name = 'capture/map/' || 's.bad'::regclass::oid}), '0',
+		'its changes meanwhile make no map of part of it');
 	my ($rc, $out, $err) = $node->psql('postgres', "$on SELECT test_capture_barrier('s', 30000)");
 	like($err, qr/capture is healing table "bad" of schema "s"/, 'a commit of its schema is refused meanwhile');
 	$writer->query_safe('COMMIT');
