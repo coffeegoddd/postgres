@@ -20,6 +20,7 @@ OBJS = \
 	branch_catalog_copy.o \
 	branch_catalog_ops.o \
 	branch_filter.o \
+	branch_link.o \
 	branch_tables.o \
 	capture.o \
 	capture_barrier.o \

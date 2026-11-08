@@ -1,0 +1,48 @@
+/*-------------------------------------------------------------------------
+ *
+ * branch_link.h
+ *	  Which catalog branch each branch of the database's repository is.
+ *
+ * A repository is a database's, and its branches are named, as Dolt's are;
+ * a working set is the catalog rows and tables of one catalog branch, an
+ * identifier allocated in this database (prolly/branch_catalog.h).  The link
+ * between them is this database's own: what a commit holds, and what a
+ * remote is sent, names neither the identifier nor the link.  One name is
+ * one identifier, and the other way about.
+ *
+ * Portions Copyright (c) 2026, PostgreSQL Global Development Group
+ *
+ * src/include/prolly/branch_link.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef PROLLY_BRANCH_LINK_H
+#define PROLLY_BRANCH_LINK_H
+
+typedef struct BranchLinkRoutine
+{
+	const char *name;
+
+	/* The catalog branch of a branch, or 0 if it has none. */
+	int32		(*branch_of) (const char *name);
+
+	/* The branch a catalog branch is, palloc'd, or NULL. */
+	char	   *(*name_of) (int32 branch);
+
+	/*
+	 * A branch linked to a catalog branch, allocated in this database:
+	 * ERRCODE_DUPLICATE_OBJECT if either is linked already.  Undone with the
+	 * transaction.
+	 */
+	void		(*link) (const char *name, int32 branch);
+
+	/* A branch's link gone; false if it had none. */
+	bool		(*unlink) (const char *name);
+} BranchLinkRoutine;
+
+extern PGDLLIMPORT const BranchLinkRoutine TableBranchLink;
+
+/* The implementation in use. */
+extern PGDLLIMPORT const BranchLinkRoutine *BranchLink;
+
+#endif							/* PROLLY_BRANCH_LINK_H */

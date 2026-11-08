@@ -1656,6 +1656,14 @@ CREATE TABLE pg_history.capture_tables (
 	tags bigint[] NOT NULL
 );
 
+-- Which catalog branch each branch of the repository is: this database's own,
+-- in no commit and sent to no remote.  One name is one branch, and the other
+-- way about.
+CREATE TABLE pg_history.branches (
+	name text COLLATE "C" PRIMARY KEY CHECK (name <> ''),
+	id integer NOT NULL UNIQUE CHECK (id > 0)
+);
+
 -- The bundles of history pushed to the tier: a row a bundle, which holds
 -- its roots there (pg_history_push and pg_history_release make and delete
 -- them).
