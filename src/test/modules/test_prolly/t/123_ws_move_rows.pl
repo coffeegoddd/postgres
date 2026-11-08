@@ -151,19 +151,21 @@ is(capture_root(), $b, 'and capture has it');
 is($node->safe_psql('postgres', $told), '0', 'and no longer holds the maps for it once it has applied them');
 is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0', 'a move to where it is writes nothing');
 
-# Writing after a move, applied with it: capture goes on from the root's maps, an update that leaves a
+# Writing after a move, applied with it: the worker held once its barrier is saved, so that it reads the
+# move and the writes after it in one go.  Capture goes on from the root's maps, an update that leaves a
 # value out of line where it was finding it in them.
 SKIP:
 {
-	skip 'injection points not supported by this build', 1 unless $injections;
-	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
+	skip 'injection points not supported by this build', 2 unless $injections;
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-marker-saved', 'wait')});
 	sql(qq{SELECT test_ws_move('app', '$a')});
-	$node->wait_for_event('capture worker', 'capture-applied');
+	$node->wait_for_event('capture worker', 'capture-marker-saved');
 	sql(q{UPDATE app.kv SET v = 'after' WHERE id = 1; INSERT INTO app.kv VALUES (200, 'after', NULL);
 		DELETE FROM app.notes WHERE body IS NULL});
-	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied'); SELECT injection_points_wakeup('capture-applied')});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-marker-saved'); SELECT injection_points_wakeup('capture-marker-saved')});
 	my $after = read_root();
-	is(capture_root(), $after, 'what is written after a move is captured on top of it');
+	is(capture_root(), $after, 'what is written after a move is captured on top of it, applied with it');
+	is($node->safe_psql('postgres', $told), '0', 'and the maps are let go of');
 	sql(qq{SELECT test_ws_move('app', '$b')});
 }
 
@@ -172,6 +174,7 @@ sql(qq{SELECT test_ws_move('app', '$a')});
 $node->stop('immediate');
 $node->start;
 is(capture_root(), $a, 'capture has a move after a crash');
+is($node->safe_psql('postgres', $told), '0', 'and lets go of its maps, whether it applied them before or after');
 is(read_root(), $a, 'as the tables do');
 
 # Writers wait for a move, and what one commits while the move waits for it is moved too.
@@ -200,7 +203,9 @@ is(read_root(), $a, 'as the tables do');
 }
 
 # A move is its tables' owner's, which is asked before anything's held.
-$node->safe_psql('postgres', "SET catalog_branch = $branch; " . q{CREATE ROLE mover; GRANT USAGE ON SCHEMA app TO mover;
+$node->safe_psql('postgres', "SET catalog_branch = $branch; " . q{CREATE ROLE mover; GRANT USAGE ON SCHEMA app TO mover; GRANT SELECT ON ALL TABLES IN SCHEMA app TO mover;
+	GRANT SELECT ON ALL SEQUENCES IN SCHEMA app TO mover; GRANT USAGE ON SCHEMA pg_history TO mover;
+	GRANT SELECT ON pg_history.capture_barriers TO mover; GRANT SELECT, INSERT, UPDATE ON pg_history.pointers TO mover;
 	GRANT EXECUTE ON FUNCTION test_ws_move(text, text, integer), test_ws_use_history_store() TO mover});
 my $writing = $node->background_psql('postgres');
 $writing->query("$on BEGIN; INSERT INTO app.kv VALUES (500, 'w', NULL)");
@@ -209,6 +214,9 @@ like($err, qr/must be owner of/, 'a move by a role that does not own the tables 
 $writing->{stderr} = '';
 $writing->query_safe('ROLLBACK');
 $writing->quit;
+($ret, $out, $err) = $node->psql('postgres', "$on REVOKE SELECT ON ALL TABLES IN SCHEMA app FROM mover; SET ROLE mover; SELECT test_ws_move('app', '$b')");
+like($err, qr/permission denied for table/, 'and so is one that could not read them, as a commit from capture asks');
+$node->safe_psql('postgres', "$on REVOKE SELECT ON ALL SEQUENCES IN SCHEMA app FROM mover");
 
 # A table made between the lock and the root would have writers the move doesn't hold off.
 SKIP:

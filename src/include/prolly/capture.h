@@ -76,7 +76,8 @@
 
 /*
  * Where such a map is held from its transaction's commit until capture has applied it or passed it
- * over, as nothing else may: <relid>/<hash>.
+ * over, as nothing else may: <relid>/<xid>/<hash>, by its transaction's id, as another's may tell the
+ * same map of the same table.
  */
 #define CAPTURE_TOLD_REF_PREFIX "capture/told/"
 #define CAPTURE_ROWS_BEGIN 'R'
@@ -233,14 +234,12 @@ extern void CaptureLeaveOut(void);
  * CaptureLeaveOut, then hold, then CaptureBarrier: the root as of now of a transaction whose writes
  * are left out, which is what they start from.  hold takes the locks what's to be written needs,
  * which a lock that keeps readers out can only be once the transaction is left out, as taking one
- * gives it an id; it writes nothing, or the root wouldn't be what the writes start from.  Catalog
- * changes in the database then wait until the transaction ends.
+ * gives it an id; it writes nothing, or the root wouldn't be what the writes start from.  All a
+ * barrier asks of the caller is asked before hold.  Catalog changes in the database then wait until
+ * the transaction ends.
  */
 extern void CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms,
 									 void (*hold) (void *arg), void *arg, PHash *root);
-
-/* What CaptureBarrier asks before anything's held or written, asked alone. */
-extern void CaptureBarrierCheck(const char *schema);
 
 /*
  * In a transaction left out of capture: the table's rows are map's from its commit on, in the
@@ -251,7 +250,7 @@ extern void CaptureRowsAre(Relation relation, const PHash *map);
 
 /* The name of where CaptureRowsAre holds a table's map, into name, of CAPTURE_TOLD_REF_LEN. */
 #define CAPTURE_TOLD_REF_LEN 96
-extern void CaptureToldRefName(Oid relid, const PHash *map, char *name);
+extern void CaptureToldRefName(Oid relid, TransactionId xid, const PHash *map, char *name);
 
 /*
  * The replica identity a change of this table logs by, in place of its own.  With capture on, a

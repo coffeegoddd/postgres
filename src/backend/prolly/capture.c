@@ -284,15 +284,15 @@ CaptureRowsAre(Relation relation, const PHash *map)
 		VcRefs	   *refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
 		char		name[CAPTURE_TOLD_REF_LEN];
 
-		CaptureToldRefName(RelationGetRelid(relation), map, name);
+		CaptureToldRefName(RelationGetRelid(relation), GetTopTransactionId(), map, name);
 		refs->routine->set(refs, name, map);
 	}
 }
 
 void
-CaptureToldRefName(Oid relid, const PHash *map, char *name)
+CaptureToldRefName(Oid relid, TransactionId xid, const PHash *map, char *name)
 {
-	int			at = snprintf(name, CAPTURE_TOLD_REF_LEN, CAPTURE_TOLD_REF_PREFIX "%u/", relid);
+	int			at = snprintf(name, CAPTURE_TOLD_REF_LEN, CAPTURE_TOLD_REF_PREFIX "%u/%u/", relid, xid);
 
 	for (int i = 0; i < PHASH_LEN; i++)
 		at += snprintf(name + at, CAPTURE_TOLD_REF_LEN - at, "%02x", map->b[i]);
