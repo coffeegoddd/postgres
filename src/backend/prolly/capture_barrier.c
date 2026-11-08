@@ -534,8 +534,9 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 
 	/*
 	 * (half of what would find a deadlock, as a user's commit must not be what one fails: so past it,
-	 * waiting on another transaction, it's a serialization failure, whether or not the other waits on
-	 * it in turn; as one that put the same chunks does not, a barrier taken in it just before)
+	 * waiting on another transaction, it's a serialization failure, as it can't tell whether the
+	 * other waits on it in turn: one that put the same chunks, its barrier taken just before, mostly
+	 * doesn't)
 	 */
 	nest = NewGUCNestLevel();
 	quick = LockTimeout == 0 || LockTimeout > Max(DeadlockTimeout / 2, 1);
@@ -556,10 +557,14 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 		{
 			ErrorData  *waited;
 
-			/* (what it waited on kept, as the lock timeout's context names it) */
+			/*
+			 * (what it waited on kept, as the lock timeout's context names it: with every frame
+			 * around it, so none is added again)
+			 */
 			MemoryContextSwitchTo(cxt);
 			waited = CopyErrorData();
 			FlushErrorState();
+			error_context_stack = NULL;
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("could not serialize a commit from capture: it waited on another transaction"),

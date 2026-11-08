@@ -56,6 +56,12 @@ sub tried
 
 my $holder = held_barrier(2);
 tried('a barrier', q{SELECT test_capture_barrier('app')});
+
+# (taken in a function: each frame around the wait named once)
+my ($rc, $out, $err) = $node->psql('postgres', "$on DO \$\$BEGIN PERFORM test_capture_barrier('app'); END\$\$");
+like($err, qr/could not serialize a commit from capture/, 'a barrier in a function: a serialization failure');
+my $frames = () = $err =~ /PL\/pgSQL function inline_code_block/g;
+is($frames, 1, 'naming the function it was taken in once');
 $holder->query_safe('COMMIT');
 $holder->quit;
 my $now = sql(q{SELECT test_capture_barrier('app')});
