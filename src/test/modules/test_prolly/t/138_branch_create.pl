@@ -59,6 +59,8 @@ my $root = sql($main, q{SELECT test_branch_commit('main', 'c1')});
 # Made from main's head.
 my $feature = sql($main, q{SELECT test_branch_create('feature', 'main')});
 is(sql($main, q{SELECT test_branch_of('feature')}), $feature, 'a branch made is linked to its catalog branch');
+is($node->safe_psql('postgres', on($main) . q{SET lock_timeout = '7s'; SELECT test_branch_create('timeout_kept', 'main') > 0;
+	SHOW lock_timeout}), "t\n7s", 'the session\'s lock_timeout is its own after a branch is made');
 is(sql($feature, "SELECT test_branch_barrier($feature)"), $root, 'it holds its parent\'s root');
 is(rows($feature), rows($main), 'with its rows');
 is(sql($feature, q{SELECT last_value FROM app.s}), '42', 'and its sequence where the parent\'s was');

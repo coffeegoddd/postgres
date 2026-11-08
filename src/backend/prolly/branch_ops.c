@@ -219,7 +219,7 @@ round_budget(Holding *h)
 				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 				 errmsg("a round of holding off a branch's writers ran out of time")));
 	snprintf(ms, sizeof(ms), "%ld", left);
-	(void) set_config_option("lock_timeout", ms, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SET, true, 0, false);
+	(void) set_config_option("lock_timeout", ms, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 }
 
 static bool
