@@ -18,6 +18,7 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "prolly/branch_checkout.h"
 #include "prolly/branch_link.h"
 #include "prolly/capture.h"
 #include "prolly/move.h"
@@ -75,6 +76,9 @@ PG_FUNCTION_INFO_V1(test_branch_barrier);
 PG_FUNCTION_INFO_V1(test_branch_commit);
 PG_FUNCTION_INFO_V1(test_dbroot_schemas);
 PG_FUNCTION_INFO_V1(test_branch_unlink);
+PG_FUNCTION_INFO_V1(test_branch_checkout);
+PG_FUNCTION_INFO_V1(test_branch_current);
+PG_FUNCTION_INFO_V1(test_branch_in_use);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
@@ -1129,6 +1133,32 @@ test_dbroot_schemas(PG_FUNCTION_ARGS)
 	WsDbRoot->schemas(&ctx, &root, dbroot_schema_out, &out);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* test_branch_checkout(name text): the session on that branch */
+Datum
+test_branch_checkout(PG_FUNCTION_ARGS)
+{
+	BranchCheckout->checkout(text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	PG_RETURN_VOID();
+}
+
+/* test_branch_current() returns text: the branch the session is on, or NULL */
+Datum
+test_branch_current(PG_FUNCTION_ARGS)
+{
+	char	   *name = BranchCheckout->current();
+
+	if (name == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(name));
+}
+
+/* test_branch_in_use(branch integer) returns boolean: whether another session has it checked out */
+Datum
+test_branch_in_use(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(BranchCheckout->in_use(PG_GETARG_INT32(0)));
 }
 
 /* test_branch_unlink(name text) returns boolean: whether it was linked */

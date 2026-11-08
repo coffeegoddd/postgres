@@ -41,6 +41,7 @@
 #include "port/pg_bitutils.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
+#include "prolly/branch_checkout.h"
 #include "replication/slot.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -1270,6 +1271,10 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* Initialize this backend's session state. */
 	InitializeSession();
+
+	/* a client's session on the branch it's to start on */
+	if (!bootstrap && MyBackendType == B_BACKEND && !am_walsender)
+		BranchCheckoutSessionStart();
 
 	/*
 	 * If this is an interactive session, load any libraries that should be

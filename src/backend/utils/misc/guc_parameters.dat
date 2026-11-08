@@ -842,6 +842,14 @@
   ifdef => 'DEBUG_NODE_TESTS_ENABLED',
 },
 
+{ name => 'default_branch', type => 'string', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the branch a new session checks out.',
+  long_desc => 'An empty string means none: the session starts on no branch.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'default_branch',
+  boot_val => '""',
+},
+
 { name => 'default_statistics_target', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Sets the default statistics target.',
   long_desc => 'This applies to table columns that have not had a column-specific target set via ALTER TABLE SET STATISTICS.',

@@ -1,0 +1,110 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# A session checks a branch out by name, as any role may: it's then on that branch's catalog branch,
+# seeing its tables, and holds it, so another session can tell it's in use.  A checkout rolled back,
+# or rolled back to a savepoint, is undone, its hold given back; of several in one transaction, the
+# last is kept.  One in a transaction that has changed a versioned schema is refused, and one of a
+# branch not there.  While a change has a branch from its sessions, a checkout of it waits.  A new
+# session checks out the database's default branch, or the one its connection names.
+
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+my $node = PostgreSQL::Test::Cluster->new('branch_checkout');
+$node->init;
+$node->append_conf('postgresql.conf', "autovacuum = off\n");
+$node->start;
+$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly; CREATE TABLE public.plain (id integer)');
+
+my ($main, $feat) = map { $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()') } 1 .. 2;
+for my $b ([$main, 'main'], [$feat, 'feat'])
+{
+	my ($id, $name) = @$b;
+	$node->safe_psql('postgres', qq{SET catalog_branch = $id; CREATE SCHEMA app VERSIONED;
+		CREATE TABLE app.t (v text); INSERT INTO app.t VALUES ('$name'); GRANT USAGE ON SCHEMA app TO PUBLIC;
+		GRANT SELECT ON app.t TO PUBLIC; SELECT test_branch_link('$name', $id)});
+}
+
+sub in_use { return $node->safe_psql('postgres', "SELECT test_branch_in_use($_[0])"); }
+
+# Checked out: the session is on it, and holds it.
+my $s = $node->background_psql('postgres');
+$s->query_safe(q{SELECT test_branch_checkout('feat')});
+is($s->query_safe('SHOW catalog_branch'), $feat, 'a checkout puts the session on the branch');
+is($s->query_safe('SELECT v FROM app.t'), 'feat', 'seeing its tables');
+is($s->query_safe('SELECT test_branch_current()'), 'feat', 'and it is the branch the session is on');
+is(in_use($feat), 't', 'another session sees it in use');
+is(in_use($main), 'f', 'and not the branch it isn\'t on');
+
+# Several in one transaction: the last kept, the one before let go.
+$s->query_safe(q{BEGIN; SELECT test_branch_checkout('main'); SELECT test_branch_checkout('feat');
+	SELECT test_branch_checkout('main'); COMMIT});
+is($s->query_safe('SHOW catalog_branch'), $main, 'of several checkouts committed, the last is kept');
+is(in_use($main) . in_use($feat), 'tf', 'it alone held');
+
+# Rolled back, and rolled back to a savepoint: undone, the hold given back.
+$s->query_safe(q{BEGIN; SELECT test_branch_checkout('feat')});
+is(in_use($feat), 't', 'a checkout in a transaction holds the branch');
+$s->query_safe('ROLLBACK');
+is($s->query_safe('SHOW catalog_branch'), $main, 'rolled back, the session is where it was');
+is(in_use($main) . in_use($feat), 'tf', 'holding what it held');
+$s->query_safe(q{BEGIN; SAVEPOINT a; SELECT test_branch_checkout('feat'); ROLLBACK TO a; COMMIT});
+is($s->query_safe('SHOW catalog_branch'), $main, 'rolled back to a savepoint, it is undone');
+is(in_use($main) . in_use($feat), 'tf', 'its hold too');
+
+# Refused in a transaction that changed a versioned schema; not in one that changed only a shared one.
+$s->query_safe(q{BEGIN; INSERT INTO public.plain VALUES (1); SELECT test_branch_checkout('feat'); ROLLBACK});
+pass('a transaction that wrote only to a shared schema checks out');
+my ($rc, $out, $err) = $node->psql('postgres', qq{SET catalog_branch = $main; BEGIN; INSERT INTO app.t VALUES ('x');
+	SELECT test_branch_checkout('feat')});
+like($err, qr/cannot check out branch "feat" in a transaction that has changed a versioned schema/,
+	'one that wrote to a versioned table is refused');
+($rc, $out, $err) = $node->psql('postgres', qq{SET catalog_branch = $main; BEGIN; ALTER TABLE app.t ADD COLUMN w integer;
+	SELECT test_branch_checkout('feat')});
+like($err, qr/cannot check out branch "feat" in a transaction/, 'and one that changed a versioned table\'s definition');
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_checkout('nope')});
+like($err, qr/branch "nope" not found/, 'a branch not there is refused');
+
+# Any role checks out.
+$node->safe_psql('postgres', q{CREATE ROLE plain_user LOGIN});
+is($node->safe_psql('postgres', q{SET ROLE plain_user; DO $$BEGIN PERFORM test_branch_checkout('feat'); END$$; SELECT v FROM app.t}), 'feat',
+	'a role with no powers checks out');
+
+# Taken from its sessions: a checkout waits until that's done.
+my $taker = $node->background_psql('postgres');
+$taker->query_safe("BEGIN; SELECT test_branch_in_use($feat)");
+my $w = $node->background_psql('postgres');
+my $wpid = $w->query_safe('SELECT pg_backend_pid()');
+my $tpid = $taker->query_safe('SELECT pg_backend_pid()');
+$w->query_until(qr/started/, "\\echo started\nSELECT test_branch_checkout('feat');\n\\echo done\n");
+ok($node->poll_query_until('postgres', qq{SELECT pg_blocking_pids($wpid) = ARRAY[$tpid]}),
+	'a checkout waits while a change has the branch from its sessions');
+$taker->query_safe('COMMIT');
+$w->query_until(qr/done/, '');
+is($w->query_safe('SHOW catalog_branch'), $feat, 'and then checks out');
+$_->quit for ($taker, $w);
+
+# Leaving: the hold goes with the session.
+$s->quit;
+ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($main)"), 'a session gone holds nothing');
+
+# The database's default branch, and a connection's own.
+$node->safe_psql('postgres', q{ALTER DATABASE postgres SET default_branch = 'feat'});
+is($node->safe_psql('postgres', q{SELECT current_setting('catalog_branch') || ':' || test_branch_current() || ':' || v FROM app.t}),
+	"$feat:feat:feat", 'a new session checks out the database\'s default branch');
+{
+	local $ENV{PGOPTIONS} = '-c default_branch=main';
+	is($node->safe_psql('postgres', q{SELECT test_branch_current()}), 'main', 'or the one its connection names');
+}
+{
+	local $ENV{PGOPTIONS} = '-c default_branch=nope';
+	($rc, $out, $err) = $node->psql('postgres', 'SELECT 1');
+	like($err, qr/branch "nope" not found/, 'a connection naming a branch not there is refused');
+}
+$node->safe_psql('postgres', q{ALTER DATABASE postgres RESET default_branch});
+is($node->safe_psql('postgres', q{SELECT test_branch_current() IS NULL}), 't', 'with none, a session starts on no branch');
+
+done_testing();
