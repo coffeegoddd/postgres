@@ -256,6 +256,7 @@ tests += {
       't/127_ws_move_pairs.pl',
       't/128_ws_move_merges_ours.pl',
       't/129_ws_move_merges_theirs.pl',
+      't/130_ws_move_prototype_bugs.pl',
       't/131_ws_move_quiet.pl',
     ],
     'env': {
