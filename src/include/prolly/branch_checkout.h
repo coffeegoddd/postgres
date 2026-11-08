@@ -9,8 +9,10 @@
  * what was resolved from schema names; see prolly/branch_catalog.h) and
  * notes it for the session, so that what would take it from under the
  * session (renaming it, deleting it, or giving back its working set) can see
- * that it's in use.  No row is read or written.  A checkout is undone with
- * the transaction or subtransaction it's in, as catalog_branch is.
+ * that it's in use.  No row is read or written, unless the branch is only a
+ * head, which is first given a working set (prolly/branch_ops.h's
+ * materialize).  A checkout is undone with the transaction or subtransaction
+ * it's in, as catalog_branch is.
  *
  * A new session checks out default_branch, if it's set: for the database
  * (ALTER DATABASE ... SET default_branch), and for a connection, which may
