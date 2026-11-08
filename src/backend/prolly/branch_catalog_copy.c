@@ -67,12 +67,14 @@
 #include <ctype.h>
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/index.h"
@@ -118,9 +120,6 @@
 #include "catalog/pg_ws_deferred.h"
 #include "catalog/pg_ws_print.h"
 #include "catalog/storage.h"
-#include "varatt.h"
-#include "access/xloginsert.h"
-#include "access/heapam.h"
 #include "storage/bmap.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -138,6 +137,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "varatt.h"
 
 /* an object, by class and object id */
 typedef struct CopyKey
@@ -2085,14 +2085,23 @@ check_made(CopyState *cs)
  * ------------------------------------------------------------------------
  */
 
-/*
- * Whether a heap page holds a value stored out of line in TOAST relation from; with patch, each
- * of those named to instead.  (A pointer's relation is the last of its fields in each form.)
- */
-static bool
-page_names(Page page, TupleDesc desc, Datum *values, bool *isnull, Oid from, bool patch, Oid to)
+/* (where a pointer's relation is in each of its on-disk forms) */
+static size_t
+pointer_relid_at(const char *ptr)
 {
-	bool		found = false;
+	if (VARTAG_EXTERNAL(ptr) == VARTAG_ONDISK_OID8)
+		return VARHDRSZ_EXTERNAL + offsetof(varatt_external_oid8, va_toastrelid);
+	return VARHDRSZ_EXTERNAL + offsetof(varatt_external_oid, va_toastrelid);
+}
+
+/*
+ * Where on a heap page each value stored out of line in TOAST relation from is named, as offsets into
+ * the page, at most max of them; how many.  Tuples with none such are passed over undeformed.
+ */
+static int
+page_names(Page page, TupleDesc desc, Datum *values, bool *isnull, Oid from, uint32 *at, int max)
+{
+	int			n = 0;
 
 	for (OffsetNumber off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++)
 	{
@@ -2103,66 +2112,81 @@ page_names(Page page, TupleDesc desc, Datum *values, bool *isnull, Oid from, boo
 			continue;
 		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 		tup.t_len = ItemIdGetLength(lp);
+		if (!HeapTupleHasExternal(&tup))
+			continue;
 		heap_deform_tuple(&tup, desc, values, isnull);
 		for (int i = 0; i < desc->natts; i++)
 		{
 			char	   *ptr;
 			Oid			rel;
-			size_t		at;
+			size_t		where;
 
 			if (isnull[i] || TupleDescAttr(desc, i)->attlen != -1)
 				continue;
 			ptr = DatumGetPointer(values[i]);
 			if (!VARATT_IS_EXTERNAL_ONDISK(ptr))
 				continue;
-			at = VARHDRSZ_EXTERNAL + VARTAG_SIZE(VARTAG_EXTERNAL(ptr)) - sizeof(Oid);
-			memcpy(&rel, ptr + at, sizeof(Oid));
+			where = pointer_relid_at(ptr);
+			memcpy(&rel, ptr + where, sizeof(Oid));
 			if (rel != from)
 				continue;
-			found = true;
-			if (patch)
-				memcpy(ptr + at, &to, sizeof(Oid));
+			if (n == max)
+				elog(ERROR, "a heap page names more values stored out of line than it can hold");
+			at[n++] = (uint32) ((ptr + where) - (char *) page);
 		}
 	}
-	return found;
+	return n;
 }
 
 /*
  * A copy's heap, its pages shared with its source's, its values stored out of line naming the
  * source's TOAST relation, from: each page holding one copied to be the copy's own (as taking it to
- * change does) and each named to, the copy's TOAST relation, which holds them all as its pages are
- * the source's, so every value on a branch's pages names the branch's own.  Logged whole.  The pages
- * that hold none stay shared.
+ * change does) and each named the copy's TOAST relation, which holds them all as its pages are the
+ * source's, so every value on a branch's pages names the branch's own.  Logged whole.  The pages that
+ * hold none stay shared.  It reads all of the heap, a page at a time through a ring of buffers, while
+ * the source's writers are held off, as the copy is made.
  */
 static void
-fix_toast_pointers(Relation heap, Oid from, Oid to)
+fix_toast_pointers(Relation heap, Oid from)
 {
 	TupleDesc	desc = RelationGetDescr(heap);
+	Oid			to = heap->rd_rel->reltoastrelid;
 	Datum	   *values = palloc_array(Datum, Max(desc->natts, 1));
 	bool	   *isnull = palloc_array(bool, Max(desc->natts, 1));
+	int			max = MaxHeapTuplesPerPage * Max(desc->natts, 1);
+	uint32	   *at = palloc_array(uint32, max);
 	BlockNumber nblocks = RelationGetNumberOfBlocks(heap);
+	BufferAccessStrategy ring = GetAccessStrategy(BAS_BULKREAD);
 
+	Assert(OidIsValid(to) && to != from);
 	for (BlockNumber blk = 0; blk < nblocks; blk++)
 	{
 		Buffer		buf;
+		int			n;
 
 		CHECK_FOR_INTERRUPTS();
-		buf = ReadBuffer(heap, blk);
+		buf = ReadBufferExtended(heap, MAIN_FORKNUM, blk, RBM_NORMAL, ring);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (!page_names(BufferGetPage(buf), desc, values, isnull, from, false, to))
+		n = page_names(BufferGetPage(buf), desc, values, isnull, from, at, max);
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		if (n == 0)
 		{
-			UnlockReleaseBuffer(buf);
+			ReleaseBuffer(buf);
 			continue;
 		}
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+		/* (the page the same between the two, the copy being this transaction's alone) */
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		START_CRIT_SECTION();
-		(void) page_names(BufferGetPage(buf), desc, values, isnull, from, true, to);
+		for (int i = 0; i < n; i++)
+			memcpy((char *) BufferGetPage(buf) + at[i], &to, sizeof(Oid));
 		MarkBufferDirty(buf);
 		log_newpage_buffer(buf, true);
 		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 	}
+	FreeAccessStrategy(ring);
+	pfree(at);
 	pfree(values);
 	pfree(isnull);
 }
@@ -2226,7 +2250,7 @@ make_storage(CopyState *cs)
 	}
 	CommandCounterIncrement();
 
-	/* (a shared table's values stored out of line named the copy's TOAST relation) */
+	/* (each value a shared table stores out of line made to name the copy's TOAST relation) */
 	for (int i = 0; cs->share && i < cs->nobjs; i++)
 	{
 		CopyKey		obj = cs->objs[i];
@@ -2256,7 +2280,8 @@ make_storage(CopyState *cs)
 				continue;
 		}
 		heap = relation_open(copy_map(cs, RelationRelationId, obj.oid), NoLock);
-		fix_toast_pointers(heap, toast, copy_map(cs, RelationRelationId, toast));
+		Assert(heap->rd_rel->reltoastrelid == copy_map(cs, RelationRelationId, toast));
+		fix_toast_pointers(heap, toast);
 		relation_close(heap, NoLock);
 	}
 

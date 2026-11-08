@@ -106,11 +106,10 @@ indexes_of(Relation pg_index, Oid relid, List *rels)
 
 /*
  * Each table, materialized view and sequence of a branch's schemas, its owner's to share, with its
- * TOAST table and every index of either, in order of their ids, as the catalogs have them now; and
- * the TOAST tables in toasts, each after its table in tables.
+ * TOAST table and every index of either, in order of their ids, as the catalogs have them now.
  */
 static List *
-relations_of(int32 branch, List **tables, List **toasts)
+relations_of(int32 branch)
 {
 	List	   *nsps = NIL;
 	List	   *rels = NIL;
@@ -119,8 +118,6 @@ relations_of(int32 branch, List **tables, List **toasts)
 	SysScanDesc scan;
 	HeapTuple	tup;
 
-	*tables = NIL;
-	*toasts = NIL;
 	rel = table_open(NamespaceRelationId, AccessShareLock);
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
@@ -152,11 +149,7 @@ relations_of(int32 branch, List **tables, List **toasts)
 				aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(c->relkind), NameStr(c->relname));
 			rels = indexes_of(pg_index, c->oid, lappend_oid(rels, c->oid));
 			if (OidIsValid(c->reltoastrelid))
-			{
 				rels = indexes_of(pg_index, c->reltoastrelid, lappend_oid(rels, c->reltoastrelid));
-				*tables = lappend_oid(*tables, c->oid);
-				*toasts = lappend_oid(*toasts, c->reltoastrelid);
-			}
 		}
 		systable_endscan(scan);
 	}
@@ -203,32 +196,24 @@ round_budget(Holding *h)
 static bool
 hold_try(Holding *h)
 {
-	List	   *tables;
-	List	   *toasts;
 	List	   *rels;
 	List	   *again;
-	List	   *t2;
-	List	   *x2;
 	bool		same;
 
 	round_budget(h);
 	LockBranchCatalogs(h->branch, AccessExclusiveLock);
 	round_budget(h);
 	LockBranchHead(h->branch);
-	rels = relations_of(h->branch, &tables, &toasts);
+	rels = relations_of(h->branch);
 	foreach_oid(relid, rels)
 	{
 		round_budget(h);
 		LockRelationOid(relid, ExclusiveLock);
 	}
-	again = relations_of(h->branch, &t2, &x2);
+	again = relations_of(h->branch);
 	same = equal(rels, again);
 	list_free(rels);
 	list_free(again);
-	list_free(tables);
-	list_free(toasts);
-	list_free(t2);
-	list_free(x2);
 	return same;
 }
 
