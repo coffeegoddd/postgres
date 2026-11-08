@@ -43,6 +43,8 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_checkout.h"
 #include "prolly/branch_link.h"
+#include "prolly/branch_ops.h"
+#include "prolly/chunkstore.h"
 #include "storage/lmgr.h"
 #include "storage/ipc.h"
 #include "storage/lock.h"
@@ -52,8 +54,12 @@
 #include "utils/guc_tables.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 
 char	   *default_branch = NULL;
+
+/* (how long a checkout waits for capture as it gives a branch its working set) */
+#define BRANCH_CHECKOUT_TIMEOUT_MS 60000
 
 /*
  * A backend's slot: its database, the catalog branch it's on, and the one it was on as its
@@ -241,10 +247,16 @@ session_checkout(const char *name)
 				 errmsg("cannot check out branch \"%s\" in a transaction that has changed a versioned schema", name),
 				 errhint("Commit or roll back the transaction first.")));
 	branch = BranchLink->branch_of(name);
+
+	/* (one that's only a head given a working set first, at its head; one not there refused) */
 	if (branch == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("branch \"%s\" not found", name)));
+	{
+		ProllyCtx	ctx;
+
+		prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+		branch = BranchOps->materialize(&ctx, name, BRANCH_CHECKOUT_TIMEOUT_MS);
+		prolly_ctx_free(&ctx);
+	}
 
 	/* (waiting, if the branch is being taken from its sessions, until that's done) */
 	hold_tag(&tag, branch);
@@ -308,6 +320,11 @@ BranchCheckoutBackendStart(bool client)
 	BranchCheckoutNote(catalog_branch);
 	if (mine != NULL)
 		pg_atomic_write_u32(&mine->base, (uint32) catalog_branch);
+	/* (in the session's first transaction, which has no snapshot of its own yet) */
 	if (client && default_branch != NULL && default_branch[0] != '\0')
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
 		BranchCheckout->checkout(default_branch);
+		PopActiveSnapshot();
+	}
 }

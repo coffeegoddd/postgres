@@ -45,6 +45,12 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "utils/array.h"
+#include "prolly/branch_checkout.h"
+#include "common/hashfn.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
@@ -420,14 +426,16 @@ commit_check(ProllyCtx *ctx, VcRepo *repo, const PHash *commit, VcCommit *at)
 			 errmsg("commit %s not found", hex)));
 }
 
+/*
+ * A working set for branch name, shared from parent's, which from names: at commit (or from's head),
+ * or with take_changes, at from's head with from's working set, from reset to its head.  With
+ * new_head, the branch of version control is made too; else it's there, at commit.
+ */
 static int32
-shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *commit,
-			  bool take_changes, int timeout_ms)
+share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const char *from,
+		   const PHash *commit, bool take_changes, bool new_head, int timeout_ms)
 {
-	ChunkStore *cs = ChunkStoreOpen("pages");
-	int32		parent = BranchLink->branch_of(from);
 	int32		branch;
-	VcRepo		repo;
 	VcBranch	head;
 	VcBranch	taken;
 	VcCommit	at;
@@ -435,37 +443,6 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 	PHash		root;
 	PHash		target;
 	Holding		holding;
-
-	if (commit != NULL && take_changes)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("a branch made at a commit can't take another's changes")));
-	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("a branch's name is 1 to %d bytes", NAMEDATALEN - 1)));
-	if (parent == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("branch \"%s\" not found", from)));
-
-	if (BranchLink->branch_of(name) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("a branch named \"%s\" already exists", name)));
-	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
-
-	/* (what's refused whatever the parent's head turns out to be, before anything's held) */
-	if (!vc_branch_get(&repo, from, &head))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("branch \"%s\" has no commit", from)));
-	vc_branch_free(&head);
-	if (commit != NULL)
-	{
-		commit_check(ctx, &repo, commit, &at);
-		vc_commit_release(&at);
-	}
 
 	/*
 	 * (the parent at one point, its writers held off until this transaction ends; with its DDL and
@@ -477,18 +454,18 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 	holding.timeout_ms = timeout_ms;
 	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &holding, &root);
 
-	if (BranchLink->branch_of(name) != 0 || vc_branch_get(&repo, name, &taken))
+	if (BranchLink->branch_of(name) != 0 || (new_head && vc_branch_get(repo, name, &taken)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("a branch named \"%s\" already exists", name)));
-	if (!vc_branch_get(&repo, from, &head))
+	if (!vc_branch_get(repo, from, &head))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" has no commit", from)));
 
 	/* (where it's made: the commit, or from's head as it is now) */
 	at_commit = commit != NULL ? *commit : head.head;
-	commit_check(ctx, &repo, &at_commit, &at);
+	commit_check(ctx, repo, &at_commit, &at);
 	target = take_changes ? root : at.root;
 
 	branch = BranchIds->allocate();
@@ -503,26 +480,246 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 	if (take_changes)
 		move_branch(ctx, parent, &root, &head.head_root);
 
-	if (vc_branch_create(&repo, name, &at_commit) != 0)
+	if (new_head && vc_branch_create(repo, name, &at_commit) != 0)
 		elog(ERROR, "could not make branch \"%s\" of version control", name);
 
 	/* (its working root, with the changes it took, as its tables hold it) */
 	if (take_changes)
 	{
-		if (vc_checkout(&repo, name) != 0)
+		if (vc_checkout(repo, name) != 0)
 			elog(ERROR, "could not check out branch \"%s\" of version control", name);
-		vc_set_working(&repo, &root);
+		vc_set_working(repo, &root);
 	}
 	BranchLink->link(name, branch);
 	vc_commit_release(&at);
+	vc_branch_free(&head);
+	return branch;
+}
+
+static void
+name_check(const char *name)
+{
+	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 errmsg("a branch's name is 1 to %d bytes", NAMEDATALEN - 1)));
+}
+
+/* The materialized branches, by name, and each one's head. */
+typedef struct Sources
+{
+	PHash		want;			/* the head a working set is made at */
+	char	   *same;			/* a materialized branch at that head */
+	char	   *main;			/* "main", if it's materialized */
+	char	   *any;			/* any other */
+} Sources;
+
+static void
+source_note(void *arg, const VcBranch *b)
+{
+	Sources    *src = arg;
+
+	if (BranchLink->branch_of(b->name) == 0)
+		return;
+	if (src->same == NULL && phash_eq(&b->head, &src->want))
+		src->same = pstrdup(b->name);
+	else if (src->main == NULL && strcmp(b->name, "main") == 0)
+		src->main = pstrdup(b->name);
+	else if (src->any == NULL)
+		src->any = pstrdup(b->name);
+}
+
+/*
+ * The materialized branch to make a working set at head from: one at the same head if there is, as
+ * then no row differs, or "main", or any; NULL if none has one.
+ */
+static char *
+source_for(VcRepo *repo, const PHash *head)
+{
+	Sources		src = {{{0}}, NULL, NULL, NULL};
+
+	src.want = *head;
+	vc_branch_list(repo, source_note, &src);
+	return src.same != NULL ? src.same : src.main != NULL ? src.main : src.any;
+}
+
+static int32
+shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *commit,
+			  bool take_changes, bool materialize, int timeout_ms)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	VcRepo		repo;
+	VcBranch	head;
+	VcBranch	taken;
+	VcCommit	at;
+	int32		branch = 0;
+	int32		parent = BranchLink->branch_of(from);
+
+	if (commit != NULL && take_changes)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a branch made at a commit can't take another's changes")));
+	name_check(name);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (!vc_branch_get(&repo, from, &head))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" not found", from)));
+	if (BranchLink->branch_of(name) != 0 || vc_branch_get(&repo, name, &taken))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("a branch named \"%s\" already exists", name)));
+	commit_check(ctx, &repo, commit != NULL ? commit : &head.head, &at);
+	vc_commit_release(&at);
+
+	if (take_changes)
+	{
+		/* (what it takes is in the parent's working set, so it must have one) */
+		if (parent == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" has no working set to take changes from", from)));
+		branch = share_from(ctx, &repo, name, parent, from, NULL, true, true, timeout_ms);
+	}
+	else if (materialize && parent != 0)
+		branch = share_from(ctx, &repo, name, parent, from, commit, false, true, timeout_ms);
+	else if (materialize)
+	{
+		/* (from only a head: made from another that has a working set, at what from's head is) */
+		const PHash *at_commit = commit != NULL ? commit : &head.head;
+		char	   *source = source_for(&repo, at_commit);
+
+		if (source == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" can't be given a working set: no branch has one to make it from", name)));
+		branch = share_from(ctx, &repo, name, BranchLink->branch_of(source), source, at_commit, false, true,
+							timeout_ms);
+	}
+	else if (vc_branch_create(&repo, name, commit != NULL ? commit : &head.head) != 0)
+		elog(ERROR, "could not make branch \"%s\" of version control", name);
 	vc_branch_free(&head);
 	vc_repo_free(&repo);
 	return branch;
 }
 
+/* (one name's making taken a turn at, as two making one branch at once are to make one) */
+static void
+lock_making(const char *name)
+{
+	LockDatabaseObject(DatabaseRelationId, (Oid) hash_bytes((const unsigned char *) name, strlen(name)), 4,
+					   ExclusiveLock);
+}
+
+static int32
+shared_materialize(ProllyCtx *ctx, const char *name, int timeout_ms)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	int32		branch = BranchLink->branch_of(name);
+	VcRepo		repo;
+	VcBranch	b;
+	const char *from;
+
+	if (branch != 0)
+		return branch;
+	lock_making(name);
+	branch = BranchLink->branch_of(name);
+	if (branch != 0)
+		return branch;
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (!vc_branch_get(&repo, name, &b))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" not found", name)));
+
+	from = source_for(&repo, &b.head);
+	if (from == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" can't be given a working set: no branch has one to make it from", name)));
+	branch = share_from(ctx, &repo, name, BranchLink->branch_of(from), from, &b.head, false, false, timeout_ms);
+	vc_branch_free(&b);
+	vc_repo_free(&repo);
+	return branch;
+}
+
+/* Whether a database's or role's settings name a branch as default_branch. */
+static bool
+named_default(const char *name)
+{
+	Relation	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+	char	   *setting = psprintf("default_branch=%s", name);
+	bool		named = false;
+
+	while (!named && HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		config = heap_getattr(tup, Anum_pg_db_role_setting_setconfig, RelationGetDescr(rel), &isnull);
+		Oid			db = ((Form_pg_db_role_setting) GETSTRUCT(tup))->setdatabase;
+
+		if (isnull || (db != MyDatabaseId && db != InvalidOid))
+			continue;
+		{
+			ArrayType  *a = DatumGetArrayTypeP(config);
+			Datum	   *elems;
+			int			n;
+
+			deconstruct_array_builtin(a, TEXTOID, &elems, NULL, &n);
+			for (int i = 0; i < n && !named; i++)
+				named = strcmp(TextDatumGetCString(elems[i]), setting) == 0;
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return named;
+}
+
+static void
+shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	int32		branch = BranchLink->branch_of(name);
+	VcRepo		repo;
+	VcBranch	b;
+	PHash		root;
+	Holding		holding;
+
+	if (branch == 0)
+		return;
+	if (branch == catalog_branch || BranchCheckout->in_use(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is checked out", name)));
+	if (named_default(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is a default_branch", name)));
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (!vc_branch_get(&repo, name, &b))
+		elog(ERROR, "branch \"%s\" has a working set and no head", name);
+
+	/* (its working set as its writers are held off: what's given back is its head's) */
+	holding.branch = branch;
+	holding.timeout_ms = timeout_ms;
+	CaptureBranchBarrierLeavingOut(ctx, branch, timeout_ms, lock_writers_out, &holding, &root);
+	if (!phash_eq(&root, &b.head_root))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" has changes not committed", name),
+				 errhint("Commit them, or reset the branch, first.")));
+	BranchCatalogs->drop(branch);
+	(void) BranchLink->unlink(name);
+	vc_branch_free(&b);
+	vc_repo_free(&repo);
+}
+
 const BranchOpsRoutine SharedBranchOps = {
 	.name = "shared",
 	.create = shared_create,
+	.materialize = shared_materialize,
+	.dematerialize = shared_dematerialize,
 };
 
 const BranchOpsRoutine *BranchOps = &SharedBranchOps;

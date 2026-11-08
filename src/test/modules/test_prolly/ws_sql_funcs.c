@@ -79,6 +79,9 @@ PG_FUNCTION_INFO_V1(test_dbroot_schemas);
 PG_FUNCTION_INFO_V1(test_branch_unlink);
 PG_FUNCTION_INFO_V1(test_branch_create);
 PG_FUNCTION_INFO_V1(test_branch_head);
+PG_FUNCTION_INFO_V1(test_branch_make);
+PG_FUNCTION_INFO_V1(test_branch_materialize);
+PG_FUNCTION_INFO_V1(test_branch_dematerialize);
 PG_FUNCTION_INFO_V1(test_branch_checkout);
 PG_FUNCTION_INFO_V1(test_branch_current);
 PG_FUNCTION_INFO_V1(test_branch_in_use);
@@ -1209,10 +1212,54 @@ test_branch_create(PG_FUNCTION_ARGS)
 	if (!PG_ARGISNULL(2))
 		commit = text_hash(PG_GETARG_TEXT_PP(2));
 	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	/* (as a checkout of it would, given a working set) */
 	branch = BranchOps->create(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
-							   PG_ARGISNULL(2) ? NULL : &commit, PG_GETARG_BOOL(3), PG_GETARG_INT32(4));
+							   PG_ARGISNULL(2) ? NULL : &commit, PG_GETARG_BOOL(3), true, PG_GETARG_INT32(4));
 	prolly_ctx_free(&ctx);
 	PG_RETURN_INT32(branch);
+}
+
+/* test_branch_make(name text, from text, commit text) returns void: only the branch's head */
+Datum
+test_branch_make(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	PHash		commit;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		elog(ERROR, "only the commit may be NULL");
+	if (!PG_ARGISNULL(2))
+		commit = text_hash(PG_GETARG_TEXT_PP(2));
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	(void) BranchOps->create(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
+							 PG_ARGISNULL(2) ? NULL : &commit, false, false, 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
+}
+
+/* test_branch_materialize(name text) returns integer: its catalog branch */
+Datum
+test_branch_materialize(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	int32		branch;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	branch = BranchOps->materialize(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_INT32(branch);
+}
+
+/* test_branch_dematerialize(name text) returns void */
+Datum
+test_branch_dematerialize(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	BranchOps->dematerialize(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
 }
 
 /*
