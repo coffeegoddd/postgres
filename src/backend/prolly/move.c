@@ -50,6 +50,7 @@
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -58,6 +59,7 @@ typedef struct MoveTables
 {
 	char	  **names;
 	VcTable    *entries;
+	bool	   *aside;			/* has constraints set aside, here or in the target */
 	int			n;
 	int			cap;
 } MoveTables;
@@ -72,9 +74,11 @@ move_table_add(void *arg, const char *name, const VcTable *entry)
 		t->cap = Max(16, t->cap * 2);
 		t->names = t->names == NULL ? palloc_array(char *, t->cap) : repalloc_array(t->names, char *, t->cap);
 		t->entries = t->entries == NULL ? palloc_array(VcTable, t->cap) : repalloc_array(t->entries, VcTable, t->cap);
+		t->aside = t->aside == NULL ? palloc_array(bool, t->cap) : repalloc_array(t->aside, bool, t->cap);
 	}
 	t->names[t->n] = pstrdup(name);
 	t->entries[t->n] = *entry;
+	t->aside[t->n] = false;
 	t->n++;
 	return true;
 }
@@ -127,14 +131,6 @@ lock_writers_out(void *arg)
 	foreach_oid(relid, relations)
 		LockRelationOid(relid, get_rel_relkind(relid) == RELKIND_SEQUENCE ? AccessExclusiveLock : ExclusiveLock);
 	locks->relations = relations;
-}
-
-static void
-refuse_unbuilt(const char *what)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("a move in place that changes %s is not supported", what)));
 }
 
 static void
@@ -346,13 +342,17 @@ object_kept(const MoveObjects *one, int i, const MoveObjects *other)
 	return false;
 }
 
-/* Whether the other has table i of one, by name, with the same definition. */
+/*
+ * Whether the other has table i of one, by name, with the same definition, and neither has
+ * constraints set aside of it.
+ */
 static bool
 table_kept(const MoveTables *one, int i, const MoveTables *other)
 {
 	for (int k = 0; k < other->n; k++)
 		if (strcmp(one->names[i], other->names[k]) == 0)
-			return memcmp(one->entries[i].schema.b, other->entries[k].schema.b, PHASH_LEN) == 0;
+			return memcmp(one->entries[i].schema.b, other->entries[k].schema.b, PHASH_LEN) == 0 &&
+				!one->aside[i] && !other->aside[k];
 	return false;
 }
 
@@ -678,12 +678,56 @@ find_related(ProllyCtx *ctx, const PHash *root, const MoveTables *tables, char *
 	}
 }
 
-static bool
-has_violations(ProllyCtx *ctx, const PHash *root)
+static void
+aside_mark(MoveTables *t, const char *name)
 {
+	for (int i = 0; i < t->n; i++)
+		if (strcmp(t->names[i], name) == 0)
+			t->aside[i] = true;
+}
+
+/*
+ * Each table that has constraints set aside here, or would have as the target's restored, marked
+ * in both: what's set aside is said by the whole of the table's record and its rows, and a key to
+ * it waits with it, so the table is made again, as restore sets aside of what it makes.  What the
+ * target holds that restore couldn't set aside is refused here, as all of its records are asked.
+ */
+static void
+mark_set_aside(ProllyCtx *ctx, const char *schema, const PHash *to, MoveTables *had, MoveTables *has)
+{
+	MemoryContext asking = AllocSetContextCreate(CurrentMemoryContext, "move set aside", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext was = MemoryContextSwitchTo(asking);
+	const char *params[1] = {schema};
+	WsSqlRows	here;
 	PHash		map;
 
-	return WsRoot->get_map(ctx, root, WS_ROOT_VIOLATIONS, &map);
+	WsSql->run("SELECT DISTINCT c.relname::text FROM pg_ws_deferred d JOIN pg_class c ON c.oid = d.defrelid "
+			   "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name", 1, params, &here);
+	for (int i = 0; i < here.nrows; i++)
+	{
+		char	   *name = ws_name_to_utf8(ws_sql_value(&here, i, 0));
+
+		aside_mark(had, name);
+		aside_mark(has, name);
+	}
+	if (WsRoot->get_map(ctx, to, WS_ROOT_VIOLATIONS, &map))
+	{
+		WsTableSchema *recs = palloc_array(WsTableSchema, Max(has->n, 1));
+		WsDeferrals deferred;
+		PHash		rows;
+
+		for (int i = 0; i < has->n; i++)
+			if (!WsRoot->get_table(ctx, to, has->names[i], &recs[i], &rows))
+				elog(ERROR, "a root's table \"%s\" is gone", has->names[i]);
+		ws_viol_defer(ctx, to, recs, has->n, &deferred);
+		for (int i = 0; i < deferred.n; i++)
+		{
+			aside_mark(had, deferred.items[i].table);
+			aside_mark(has, deferred.items[i].table);
+		}
+	}
+	MemoryContextSwitchTo(was);
+	MemoryContextDelete(asking);
 }
 
 static void
@@ -734,8 +778,6 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("a table of schema \"%s\" was made or dropped as it was being moved", schema),
 				 errhint("Try the move again.")));
-	if (has_violations(ctx, &from) || has_violations(ctx, to))
-		refuse_unbuilt("constraint violations");
 
 	/* (a move to where it is writes nothing at all) */
 	if (memcmp(from.b, to->b, PHASH_LEN) == 0)
@@ -745,6 +787,9 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		return;
 	}
 
+	level = WsSql->begin();
+	mark_set_aside(ctx, schema, to, &had, &has);
+
 	/* (with the same definitions, only rows and sequences differ) */
 	definitions = same_map(ctx, &from, to, WS_ROOT_OBJECTS) && same_map(ctx, &from, to, WS_ROOT_FOREIGN_KEYS) &&
 		same_map(ctx, &from, to, WS_ROOT_ROLES) && had.n == has.n;
@@ -752,7 +797,6 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		definitions = strcmp(had.names[i], has.names[i]) == 0 && table_kept(&had, i, &has);
 	definitions = !definitions;
 
-	level = WsSql->begin();
 	nest = ws_schema_path_begin(schema);
 	populated_read(schema, &populated);
 
@@ -797,7 +841,8 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 				if (!WsRoot->get_table(ctx, &from, had.names[k], &was[i], &rows) ||
 					!WsRoot->get_table(ctx, to, has.names[i], &want[i], &rows))
 					elog(ERROR, "a root's table \"%s\" is gone", has.names[i]);
-				altered[i] = move_alterable(&was[i], &want[i], in_tree, (const char *const *) domains, ndomains);
+				altered[i] = !has.aside[i] &&
+					move_alterable(&was[i], &want[i], in_tree, (const char *const *) domains, ndomains);
 				altered_had[k] = altered[i];
 				gone[i] = !altered[i];
 			}
@@ -938,11 +983,13 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	{
 		pfree(had.names);
 		pfree(had.entries);
+		pfree(had.aside);
 	}
 	if (has.n > 0)
 	{
 		pfree(has.names);
 		pfree(has.entries);
+		pfree(has.aside);
 	}
 }
 

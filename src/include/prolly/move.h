@@ -30,7 +30,10 @@
  * whole otherwise; an object that differs only in its comments, owner or grants is made again,
  * with what depends on it.  A materialized view that held rows is refreshed, after what it
  * reads, as what it's made of may have changed, which runs what it is made of.  Roles are made what the target has them
- * as a checkout makes them, if its roles differ.  A root with constraint violations is refused.
+ * as a checkout makes them, if its roles differ.  A table that has constraints set aside, as rows
+ * violate them, here or in the target (prolly/ws/ws_viol.h), is made again whole, as restore sets
+ * them aside of the table it makes; the rest keep theirs.  A root holding violations restore can't
+ * set aside is refused before anything is done.
  *
  * An enum's value the target has can't be used in the transaction that adds it, so prepare adds
  * them first, in a transaction of its own; a move without it makes such a type again, and every
