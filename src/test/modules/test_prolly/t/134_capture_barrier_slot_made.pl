@@ -41,14 +41,22 @@ my $filled = 0;
 sub lose_slot
 {
 	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
-	$node->poll_query_until('postgres', qq{SELECT wait_event = 'CaptureWorkerMain' FROM pg_stat_activity WHERE pid = $worker})
-	  or die 'the worker is not idle';
-	kill 'STOP', $worker;
+	# (stopped idle, and holding no lock the filler's commit takes: a worker woken in between is let
+	# go and stopped again)
+	for (;;)
+	{
+		$node->poll_query_until('postgres', qq{SELECT wait_event = 'CaptureWorkerMain' FROM pg_stat_activity WHERE pid = $worker})
+		  or die 'the worker is not idle';
+		kill 'STOP', $worker;
+		last if $node->safe_psql('postgres', qq{SELECT count(*) FROM pg_locks WHERE pid = $worker AND granted
+			AND locktype = 'object' AND objsubid = 2}) eq '0';
+		kill 'CONT', $worker;
+	}
 	$filled++;
+	my $log_at = -s $node->logfile;
 	$node->safe_psql('postgres', qq{CREATE TABLE public.filler$filled AS SELECT g, repeat('w', 200) AS v
 		FROM generate_series(1, 100000) g; SELECT pg_switch_wal()});
 	my $checkpoint = $node->background_psql('postgres');
-	my $log_at = -s $node->logfile;
 	$checkpoint->query_until(qr/started/, "\\echo started\nCHECKPOINT;\n\\echo checkpointed\n");
 	$node->wait_for_log(qr/terminating process $worker to release replication slot/, $log_at);
 	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-lost', 'wait');
