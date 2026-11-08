@@ -1,11 +1,12 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # What t/128 and t/129 run, with $side ours or theirs: the merge scenarios of t/099, each that
-# merges with no conflicts applied in place, the side moved to the root the merge made.  After each move the tables hold that root
-# and capture has it, with the violations the scenario expects; nothing a generated column calls
-# ran; and what the scenario checks of the merged tables holds of the side moved, as what it says
-# to resolve then clears.  (As in t/099, the schema a file calls rt is each side's own, and what a
-# function's body names is by its path; a scenario's catalog checks see only the side moved.)
+# merges with no conflicts applied in place, the side moved to the root the merge made.  After each
+# move the tables hold that root and capture has it, with the violations the scenario expects;
+# nothing a generated column calls ran; and what the scenario checks of the merged tables holds of
+# the side moved, as what it says to resolve then clears.  (As in t/099, the schema a file calls rt
+# is each side's own, and what a function's body names is by its path; a scenario's catalog checks
+# see only the side moved.)
 
 use strict;
 use warnings FATAL => 'all';
@@ -145,8 +146,8 @@ sub moved
 	# (what a scenario that stopped left is not for the next to see)
 	$node->safe_psql('postgres', "SET client_min_messages = warning; DROP SCHEMA IF EXISTS $b, $o, $t CASCADE");
 	my @conflicts = split /\n/, between($out, 'merge') // '';
-	shift @conflicts;
-	is_deeply(\@conflicts, [], "$name: merged with no conflicts");
+	like(shift(@conflicts) // '', qr/^[0-9a-f]{40}$/, "$name: merged to a root");
+	is_deeply(\@conflicts, [], "$name: with no conflicts");
 	note("$name: " . (between($out, 'stats') // ''));
 	is(between($out, 'same') // '', 't', "$name: the tables hold the root the merge made");
 	is(between($out, 'captured') // '', 't', "$name: and capture has it");
