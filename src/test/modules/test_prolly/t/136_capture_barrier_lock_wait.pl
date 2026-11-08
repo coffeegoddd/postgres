@@ -51,6 +51,7 @@ sub tried
 	like($err, qr/ERROR:  could not serialize a commit from capture: it waited on another transaction/,
 		"$what: as a serialization failure");
 	unlike($err, qr/lock timeout/, "$what: not a lock timeout");
+	like($err, qr/CONTEXT:  .*waiting for ShareLock on transaction \d+/, "$what: naming what it waited on");
 }
 
 my $holder = held_barrier(2);

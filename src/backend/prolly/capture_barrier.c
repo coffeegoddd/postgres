@@ -534,8 +534,8 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 
 	/*
 	 * (half of what would find a deadlock, as a user's commit must not be what one fails: so past it,
-	 * waiting on another transaction, it's a serialization failure, one that waits on it in turn or
-	 * not; as for one that has put the same chunks, its own barrier's taken just before)
+	 * waiting on another transaction, it's a serialization failure, whether or not the other waits on
+	 * it in turn; as one that put the same chunks does not, a barrier taken in it just before)
 	 */
 	nest = NewGUCNestLevel();
 	quick = LockTimeout == 0 || LockTimeout > Max(DeadlockTimeout / 2, 1);
@@ -554,14 +554,19 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 		WsRows = rows;
 		if (quick && geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE)
 		{
+			ErrorData  *waited;
+
+			/* (what it waited on kept, as the lock timeout's context names it) */
 			MemoryContextSwitchTo(cxt);
+			waited = CopyErrorData();
 			FlushErrorState();
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("could not serialize a commit from capture: it waited on another transaction"),
-					 errdetail("It waits for another transaction for at most %s ms, half of deadlock_timeout, as the other may wait for it.",
+					 errdetail("It waits for another transaction for at most %s ms, as the other may wait for it.",
 							   quickly),
-					 errhint("Try the commit again.")));
+					 errhint("Try the commit again."),
+					 waited->context ? errcontext("%s", waited->context) : 0));
 		}
 		PG_RE_THROW();
 	}
