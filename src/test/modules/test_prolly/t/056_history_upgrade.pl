@@ -249,8 +249,10 @@ my $upgrade = sub {
 	$primary->stop;
 	$old->promote;
 	$old->poll_query_until('postgres', 'SELECT NOT pg_is_in_recovery()');
-	is($old->safe_psql('postgres', q{SELECT timeline_id FROM pg_control_checkpoint()}) > 1 ? 1 : 0, 1,
-		'a promoted standby, on a timeline after the first');
+	# (the timeline written on, as the last checkpoint's is the first until the one promotion asks
+	# for is done)
+	is($old->safe_psql('postgres', q{SELECT ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int > 1}),
+		't', 'a promoted standby, on a timeline after the first');
 	my $before = $old->safe_psql('postgres', q{SELECT max(id) FROM test_tier_packs('pg_history.tier_chunks')});
 	$old->safe_psql('postgres', q{
 		SELECT count(*) FROM generate_series(41, 45) i, LATERAL test_cs_put('pages', leaf(i));
