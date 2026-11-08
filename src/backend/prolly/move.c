@@ -199,7 +199,36 @@ typedef struct MoveObjects
 	Buf		   *keys;
 	Buf		   *values;
 	int			n;
+	int		   *by_key;			/* their indexes, by their keys' bytes */
 } MoveObjects;
+
+static const Buf *key_sort_keys;
+
+static int
+buf_cmp(const Buf *a, const Buf *b)
+{
+	int			c = memcmp(a->data, b->data, Min(a->len, b->len));
+
+	if (c != 0)
+		return c;
+	return (a->len > b->len) - (a->len < b->len);
+}
+
+static int
+by_key_cmp(const void *a, const void *b)
+{
+	return buf_cmp(&key_sort_keys[*(const int *) a], &key_sort_keys[*(const int *) b]);
+}
+
+static void
+objects_index(MoveObjects *o)
+{
+	o->by_key = palloc_array(int, Max(o->n, 1));
+	for (int i = 0; i < o->n; i++)
+		o->by_key[i] = i;
+	key_sort_keys = o->keys;
+	qsort(o->by_key, o->n, sizeof(int), by_key_cmp);
+}
 
 static void
 objects_of(ProllyCtx *ctx, const PHash *root, MoveObjects *o)
@@ -216,6 +245,7 @@ objects_of(ProllyCtx *ctx, const PHash *root, MoveObjects *o)
 		WsObjectCodec->encode_key(&o->objs[i], &o->keys[i]);
 		WsObjectCodec->encode_value(&o->objs[i], &o->values[i]);
 	}
+	objects_index(o);
 }
 
 /* The same, of objects read from the catalogs. */
@@ -231,6 +261,7 @@ objects_listed(WsObject *objs, int n, MoveObjects *o)
 		WsObjectCodec->encode_key(&objs[i], &o->keys[i]);
 		WsObjectCodec->encode_value(&objs[i], &o->values[i]);
 	}
+	objects_index(o);
 }
 
 static void
@@ -244,6 +275,9 @@ objects_free(MoveObjects *o)
 	}
 	pfree(o->keys);
 	pfree(o->values);
+	pfree(o->by_key);
+	if (o->objs != NULL)
+		pfree(o->objs);
 }
 
 /*
@@ -265,6 +299,7 @@ drop_is_of_something(const WsObject *o, const char *schema)
 			   "WHERE n.nspname = $1::name AND c.cfgname = $2::name", 2, params, &rows);
 	there = rows.nrows > 0;
 	ws_sql_rows_free(&rows);
+	pfree((char *) params[1]);
 	return there;
 }
 
@@ -290,9 +325,22 @@ buf_same(const Buf *a, const Buf *b)
 static bool
 object_kept(const MoveObjects *one, int i, const MoveObjects *other)
 {
-	for (int k = 0; k < other->n; k++)
-		if (buf_same(&one->keys[i], &other->keys[k]))
+	int			lo = 0;
+	int			hi = other->n - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) / 2;
+		int			k = other->by_key[mid];
+		int			c = buf_cmp(&one->keys[i], &other->keys[k]);
+
+		if (c == 0)
 			return buf_same(&one->values[i], &other->values[k]);
+		if (c < 0)
+			hi = mid - 1;
+		else
+			lo = mid + 1;
+	}
 	return false;
 }
 
@@ -310,11 +358,13 @@ static void
 drop_table(const char *schema, const char *name)
 {
 	Buf			sql = BUF_INIT;
+	char	   *here = ws_name_from_utf8(name);
 
 	ws_put_text(&sql, "DROP TABLE IF EXISTS ");
 	ws_put_identifier(&sql, schema);
 	ws_put_text(&sql, ".");
-	ws_put_identifier(&sql, ws_name_from_utf8(name));
+	ws_put_identifier(&sql, here);
+	pfree(here);
 	ws_put_text(&sql, " CASCADE");
 	run_sql(&sql);
 	buf_free(&sql);
@@ -491,6 +541,11 @@ populated_refresh(ProllyCtx *ctx, const char *schema, const PHash *to, WsSqlRows
 	MoveObjects ob;
 	int		   *order;
 
+	if (rows->nrows == 0)
+	{
+		ws_sql_rows_free(rows);
+		return;
+	}
 	objects_of(ctx, to, &ob);
 	order = palloc_array(int, Max(ob.n, 1));
 	ws_obj_restore_order(ob.objs, ob.n, order);

@@ -131,6 +131,8 @@ my $people = oid_of('app.people');
 my $counted = oid_of('app.counted');
 my $visits = oid_of('app.visits');
 my $logged = oid_of('app.logged');
+my $dom_t = oid_of('app.dom_t');
+my $comp = oid_of('app.comp');
 
 # The second: a column added to pets, which the foreign key and the view's base keep; a table
 # dropped and another made; the enum given a value, which a kept table's row then has; the
@@ -188,10 +190,13 @@ my $log_at = -s $node->logfile;
 
 # Back to the first, whose enum lacks a value: another type, so it's made again with the table using it.
 my $stats = move_to($a, 'to the first');
-like($stats, qr/ dropped 2$/, "fresh and pp_high dropped: $stats");
+# (made: people as its enum lost values, pets, counted, gone, dom_t, comp, uses_empty, tick, kp and its
+# partition, and child_t; dropped: fresh and pp_high)
+like($stats, qr/ made 11 dropped 2$/, "what differs is made and dropped: $stats");
 isnt(oid_of('app.counted'), $counted, 'a table whose default used a function changed is made again');
 isnt(oid_of('app.people'), $people, 'and one whose enum is');
-isnt(oid_of('app.dom_t'), '', 'a table whose domain lost its check to a function changed is made again with it');
+isnt(oid_of('app.dom_t'), $dom_t, 'a table whose domain lost its check to a function changed is made again with it');
+isnt(oid_of('app.comp'), $comp, 'and one whose composite type lost an attribute');
 is(sql(q{SELECT count(*) FROM pg_constraint WHERE contypid = 'app.pos'::regtype}), '1', 'and the domain with its check');
 is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.outer_t'::regclass AND attnum > 0 AND NOT attisdropped}), '2',
 	"a composite type that lost an attribute to an enum made again is made again");
@@ -212,7 +217,8 @@ my $uses_empty = oid_of('app.uses_empty');
 my $pp = oid_of('app.pp');
 my $kp = oid_of('app.kp');
 $stats = move_to($b, 'to the second');
-like($stats, qr/ dropped 1$/, "gone dropped: $stats");
+# (made: pets, fresh, counted, dom_t, tick, kp and its partition, child_t and pp_high; dropped: gone)
+like($stats, qr/ made 9 dropped 1$/, "what differs is made and dropped: $stats");
 is(oid_of('app.people'), $people, 'a table using an enum given values is kept, and only its rows written');
 is(sql(q{SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = 'app.mood'::regtype}),
 	'meh,sad,calm,happy,joy,ecstatic', 'with values added first, between and last');
