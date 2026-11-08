@@ -258,6 +258,7 @@ tests += {
       't/129_ws_move_merges_theirs.pl',
       't/130_ws_move_prototype_bugs.pl',
       't/131_ws_move_quiet.pl',
+      't/133_ws_move_shared_pages.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
