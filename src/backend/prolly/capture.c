@@ -234,6 +234,12 @@ capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr co
  */
 static TransactionId left_out = InvalidTransactionId;
 
+bool
+CaptureLeftOut(void)
+{
+	return TransactionIdIsValid(left_out) && TransactionIdIsCurrentTransactionId(left_out);
+}
+
 void
 CaptureLeaveOut(void)
 {
@@ -262,7 +268,7 @@ CaptureRowsAre(Relation relation, const PHash *map)
 	StringInfoData out;
 	int32		head[4];
 
-	if (!TransactionIdIsValid(left_out) || !TransactionIdIsCurrentTransactionId(left_out))
+	if (!CaptureLeftOut())
 		elog(ERROR, "a table's rows can only be told as a map in a transaction left out of capture");
 	head[0] = NamespaceBranch(RelationGetNamespace(relation));
 	if (head[0] == 0)

@@ -602,6 +602,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	WsDeferrals deferred = {0};
 	bool	   *owner_absent;
 	bool	   *table_made = NULL;
+	bool		roles_same = false;
 	bool	   *obj_made = NULL;
 	WsTableSchema *made_recs;
 	int			nmade = 0;
@@ -630,7 +631,17 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	ws_sql_rows_free(&rows);
 
 not_empty:
-	if (!definitions_only && !roles_here && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
+
+	/* (roles are as they were when a schema kept has the same as before) */
+	if (missing && previous != NULL)
+	{
+		PHash		before;
+		bool		had = WsRoot->get_map(ctx, previous, WS_ROOT_ROLES, &before);
+		bool		has = WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map);
+
+		roles_same = had == has && (!has || memcmp(before.b, map.b, PHASH_LEN) == 0);
+	}
+	if (!definitions_only && !roles_here && !roles_same && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
 	{
 		WsRole	   *held;
 		WsRole	   *was = NULL;

@@ -5543,7 +5543,7 @@ ws_obj_drop_statement(const WsObject *o, const char *schema, Buf *out)
 		return;
 	}
 	ws_put_text(out, "DROP ");
-	ws_put_text(out, of.kind == WS_OBJ_AGGREGATE ? "AGGREGATE" : kind_sql[of.kind]);
+	ws_put_text(out, kind_sql[of.kind]);
 	ws_put_text(out, " IF EXISTS ");
 	if (of.kind == WS_OBJ_TRIGGER || of.kind == WS_OBJ_RULE || of.kind == WS_OBJ_POLICY)
 	{

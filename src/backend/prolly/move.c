@@ -218,6 +218,68 @@ objects_of(ProllyCtx *ctx, const PHash *root, MoveObjects *o)
 	}
 }
 
+/* The same, of objects read from the catalogs. */
+static void
+objects_listed(WsObject *objs, int n, MoveObjects *o)
+{
+	o->objs = objs;
+	o->n = n;
+	o->keys = palloc0_array(Buf, Max(n, 1));
+	o->values = palloc0_array(Buf, Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		WsObjectCodec->encode_key(&objs[i], &o->keys[i]);
+		WsObjectCodec->encode_value(&objs[i], &o->values[i]);
+	}
+}
+
+static void
+objects_free(MoveObjects *o)
+{
+	for (int i = 0; i < o->n; i++)
+	{
+		buf_free(&o->keys[i]);
+		buf_free(&o->values[i]);
+		ws_obj_free(&o->objs[i]);
+	}
+	pfree(o->keys);
+	pfree(o->values);
+}
+
+/*
+ * Whether dropping an object is anything: a configuration's mapping of a token goes with the
+ * configuration, and there is no saying IF EXISTS of a configuration to take one off it.
+ */
+static bool
+drop_is_of_something(const WsObject *o, const char *schema)
+{
+	const char *params[2];
+	WsSqlRows	rows;
+	bool		there;
+
+	if (o->kind != WS_OBJ_TSMAP)
+		return true;
+	params[0] = schema;
+	params[1] = ws_name_from_utf8(o->name);
+	WsSql->run("SELECT 1 FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace "
+			   "WHERE n.nspname = $1::name AND c.cfgname = $2::name", 2, params, &rows);
+	there = rows.nrows > 0;
+	ws_sql_rows_free(&rows);
+	return there;
+}
+
+static void
+drop_object(const WsObject *o, const char *schema)
+{
+	Buf			sql = BUF_INIT;
+
+	if (!drop_is_of_something(o, schema))
+		return;
+	ws_obj_drop_statement(o, schema, &sql);
+	run_sql(&sql);
+	buf_free(&sql);
+}
+
 static bool
 buf_same(const Buf *a, const Buf *b)
 {
@@ -326,52 +388,64 @@ drop_what_differs(ProllyCtx *ctx, const char *schema, const PHash *from, const P
 		{
 			if (ws_obj_before_tables(&oa.objs[i]) != (pass == 2) || object_kept(&oa, i, &ob))
 				continue;
-			ws_obj_drop_statement(&oa.objs[i], schema, &sql);
-			run_sql(&sql);
+			drop_object(&oa.objs[i], schema);
 		}
 	}
+	objects_free(&oa);
+	objects_free(&ob);
 	buf_free(&sql);
 }
 
 /*
- * Each table left whose definition is now other than the target's, as dropping what it used took
- * a column, default, constraint or index of it, dropped too, until none is: as it was a table the
- * target keeps, it's made again whole.  Its name is set in gone.
+ * Each table and object left that is now other than the target has it, as dropping what it used
+ * took a part of it, dropped too, until none is: a column, default, constraint or index of a table,
+ * a domain's check, a composite type's attribute, a family's member.  As each was one the target
+ * keeps, it's made again whole.  A table's name is set in gone.
  */
 static void
 drop_what_changed(ProllyCtx *ctx, const char *schema, const PHash *to, const MoveTables *has, bool *gone)
 {
+	MoveObjects ob;
 	bool		again = true;
 
+	objects_of(ctx, to, &ob);
 	while (again)
 	{
+		WsObject   *objs;
+		int			nobjs;
+		MoveObjects now;
+
 		again = false;
 		for (int i = 0; i < has->n; i++)
 		{
-			WsTableSchema now;
+			WsTableSchema rec;
 			WsTableSchema want;
 			PHash		rows;
 			Buf			a = BUF_INIT,
 						b = BUF_INIT;
 			bool		same;
+			char	   *name;
 
 			if (gone[i])
 				continue;
 			CHECK_FOR_INTERRUPTS();
-			if (!ws_schema_read(schema, ws_name_from_utf8(has->names[i]), &now))
+			name = ws_name_from_utf8(has->names[i]);
+			same = ws_schema_read(schema, name, &rec);
+			pfree(name);
+			if (!same)
 			{
 				gone[i] = true;
 				continue;
 			}
-			ws_viol_fold(schema, &now);
+			ws_viol_fold(schema, &rec);
 			if (!WsRoot->get_table(ctx, to, has->names[i], &want, &rows))
 				elog(ERROR, "a root's table \"%s\" is gone", has->names[i]);
-			WsSchemaCodec->encode(&now, &a);
+			WsSchemaCodec->encode(&rec, &a);
 			WsSchemaCodec->encode(&want, &b);
 			same = buf_same(&a, &b);
 			buf_free(&a);
 			buf_free(&b);
-			ws_schema_free(&now);
+			ws_schema_free(&rec);
 			ws_schema_free(&want);
 			if (same)
 				continue;
@@ -379,7 +453,22 @@ drop_what_changed(ProllyCtx *ctx, const char *schema, const PHash *to, const Mov
 			gone[i] = true;
 			again = true;
 		}
+
+		/* (what's here but not as the target has it, made after or before tables) */
+		CommandCounterIncrement();
+		ws_obj_read(schema, &objs, &nobjs);
+		objects_listed(objs, nobjs, &now);
+		for (int i = now.n - 1; i >= 0; i--)
+		{
+			if (object_kept(&now, i, &ob))
+				continue;
+			drop_object(&now.objs[i], schema);
+			again = true;
+			CommandCounterIncrement();
+		}
+		objects_free(&now);
 	}
+	objects_free(&ob);
 }
 
 /* The schema's materialized views that hold rows, by name, to hold them again after. */
@@ -388,33 +477,62 @@ populated_read(const char *schema, WsSqlRows *rows)
 {
 	const char *params[1] = {schema};
 
-	WsSql->run("SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c "
-			   "JOIN pg_namespace n ON n.oid = c.relnamespace "
-			   "WHERE n.nspname = $1::name AND c.relkind = 'm' AND c.relispopulated "
-			   "ORDER BY c.relname COLLATE \"C\"", 1, params, rows);
+	WsSql->run("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name AND c.relkind = 'm' AND c.relispopulated", 1, params, rows);
 }
 
+/*
+ * Each that held rows and the target has, holding the rows it's made of now: in the order the
+ * target's objects are made, each after what it reads.
+ */
 static void
-populated_refresh(WsSqlRows *rows)
+populated_refresh(ProllyCtx *ctx, const char *schema, const PHash *to, WsSqlRows *rows)
 {
-	for (int r = 0; r < rows->nrows; r++)
-	{
-		const char *params[1] = {ws_sql_value(rows, r, 0)};
-		WsSqlRows	there;
+	MoveObjects ob;
+	int		   *order;
 
-		WsSql->run("SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'", 1, params, &there);
-		if (there.nrows > 0)
+	objects_of(ctx, to, &ob);
+	order = palloc_array(int, Max(ob.n, 1));
+	ws_obj_restore_order(ob.objs, ob.n, order);
+	for (int i = 0; i < ob.n; i++)
+	{
+		const WsObject *o = &ob.objs[order[i]];
+		char	   *name;
+		bool		held = false;
+
+		if (o->kind != WS_OBJ_MATVIEW)
+			continue;
+		name = ws_name_from_utf8(o->name);
+		for (int r = 0; !held && r < rows->nrows; r++)
+			held = strcmp(ws_sql_value(rows, r, 0), name) == 0;
+		if (held)
 		{
 			Buf			sql = BUF_INIT;
 
 			ws_put_text(&sql, "REFRESH MATERIALIZED VIEW ");
-			ws_put_text(&sql, ws_sql_value(rows, r, 0));
+			ws_put_identifier(&sql, schema);
+			ws_put_text(&sql, ".");
+			ws_put_identifier(&sql, name);
 			run_sql(&sql);
 			buf_free(&sql);
 		}
-		ws_sql_rows_free(&there);
+		pfree(name);
 	}
+	pfree(order);
+	objects_free(&ob);
 	ws_sql_rows_free(rows);
+}
+
+/* Whether two of a root's maps are the same: both absent, or the same tree. */
+static bool
+same_map(ProllyCtx *ctx, const PHash *a, const PHash *b, WsRootMap which)
+{
+	PHash		ma;
+	PHash		mb;
+	bool		has_a = WsRoot->get_map(ctx, a, which, &ma);
+	bool		has_b = WsRoot->get_map(ctx, b, which, &mb);
+
+	return has_a == has_b && (!has_a || memcmp(ma.b, mb.b, PHASH_LEN) == 0);
 }
 
 static bool
@@ -438,6 +556,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	WsSqlRows	populated;
 	int			level;
 	int			nest;
+	bool		definitions;
 	MoveLocks	locks = {nsp, NIL};
 
 	memset(stats, 0, sizeof(*stats));
@@ -472,23 +591,41 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	if (has_violations(ctx, &from) || has_violations(ctx, to))
 		refuse_unbuilt("constraint violations");
 
+	/* (a move to where it is writes nothing at all) */
+	if (memcmp(from.b, to->b, PHASH_LEN) == 0)
+	{
+		PopActiveSnapshot();
+		list_free(locked);
+		return;
+	}
+
+	/* (with the same definitions, only rows and sequences differ) */
+	definitions = same_map(ctx, &from, to, WS_ROOT_OBJECTS) && same_map(ctx, &from, to, WS_ROOT_FOREIGN_KEYS) &&
+		same_map(ctx, &from, to, WS_ROOT_ROLES) && had.n == has.n;
+	for (int i = 0; definitions && i < has.n; i++)
+		definitions = strcmp(had.names[i], has.names[i]) == 0 && table_kept(&had, i, &has);
+	definitions = !definitions;
+
 	level = WsSql->begin();
 	nest = ws_schema_path_begin(schema);
 	populated_read(schema, &populated);
 
-	/* 1. What differs dropped, and what that changed of the tables the target keeps */
-	drop_what_differs(ctx, schema, &from, to, &had, &has);
+	/* 1. What differs dropped, and what that changed of what the target keeps */
 	gone = palloc0_array(bool, Max(has.n, 1));
-	for (int i = 0; i < has.n; i++)
+	if (definitions)
 	{
-		bool		kept = false;
+		drop_what_differs(ctx, schema, &from, to, &had, &has);
+		for (int i = 0; i < has.n; i++)
+		{
+			bool		kept = false;
 
-		for (int k = 0; !kept && k < had.n; k++)
-			kept = strcmp(had.names[k], has.names[i]) == 0 && table_kept(&had, k, &has);
-		gone[i] = !kept;
+			for (int k = 0; !kept && k < had.n; k++)
+				kept = strcmp(had.names[k], has.names[i]) == 0 && table_kept(&had, k, &has);
+			gone[i] = !kept;
+		}
+		drop_what_changed(ctx, schema, to, &has, gone);
+		CommandCounterIncrement();
 	}
-	drop_what_changed(ctx, schema, to, &has, gone);
-	CommandCounterIncrement();
 
 	/* 2. The rows of each table kept that differ */
 	for (int i = 0; i < has.n; i++)
@@ -531,15 +668,19 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	}
 
 	/* 3. What the target has that isn't here, made, a table with all its rows */
-	WsRootIO->restore_missing(ctx, to, &from, schema);
+	if (definitions)
+		WsRootIO->restore_missing(ctx, to, &from, schema);
 	CommandCounterIncrement();
 	for (int i = 0; i < has.n; i++)
 	{
 		Oid			relid;
+		char	   *name;
 
 		if (!gone[i])
 			continue;
-		relid = get_relname_relid(ws_name_from_utf8(has.names[i]), nsp);
+		name = ws_name_from_utf8(has.names[i]);
+		relid = get_relname_relid(name, nsp);
+		pfree(name);
 		if (!OidIsValid(relid))
 			elog(ERROR, "table \"%s\" of schema \"%s\" was not made", has.names[i], schema);
 		stats->made++;
@@ -563,7 +704,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 
 	/* 4. Sequences where the target has them, and views that held rows holding the new ones */
 	move_sequences(ctx, schema, to, stats);
-	populated_refresh(&populated);
+	populated_refresh(ctx, schema, to, &populated);
 
 	ws_schema_path_end(nest);
 	WsSql->end(level);
@@ -620,14 +761,17 @@ add_enum_labels(const WsObject *o, List *want, const char *schema)
 	bool		in_order;
 	char	   *after = NULL;
 
-	WsSql->run("SELECT e.enumlabel::text FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
-			   "JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name AND t.typname = $2::name "
-			   "ORDER BY e.enumsortorder", 2, params, &rows);
+	WsSql->run("SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
+			   "WHERE n.nspname = $1::name AND t.typname = $2::name AND t.typtype = 'e'", 2, params, &rows);
 	if (rows.nrows == 0)
 	{
 		ws_sql_rows_free(&rows);
 		return;
 	}
+	ws_sql_rows_free(&rows);
+	WsSql->run("SELECT e.enumlabel::text FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
+			   "JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1::name AND t.typname = $2::name "
+			   "ORDER BY e.enumsortorder", 2, params, &rows);
 
 	/* (what's here, in the target's order: each found in it after the one before) */
 	foreach_node(String, label, want)
