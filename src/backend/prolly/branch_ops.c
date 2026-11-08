@@ -725,11 +725,6 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out", name)));
-	if (named_default(name))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("branch \"%s\" is a default_branch", name)));
-
 	/* (its working set and its head as its writers and commits are held off) */
 	holding.branch = branch;
 	holding.timeout_ms = timeout_ms;
@@ -742,6 +737,12 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" has changes not committed", name),
 				 errhint("Commit them, or reset the branch, first.")));
+
+	/* (last, as what's set for every database is held off until this transaction ends) */
+	if (named_default(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is a default_branch", name)));
 	BranchCatalogs->drop(branch);
 	(void) BranchLink->unlink(name);
 	vc_branch_free(&b);

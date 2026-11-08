@@ -267,7 +267,8 @@ session_checkout(const char *name)
 					 errmsg("branch \"%s\" has no working set, and can't be given one in a transaction block", name),
 					 errhint("Check it out outside a transaction block.")));
 		GetUserIdAndSecContext(&save_userid, &save_sec_context);
-		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
 		prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
 		branch = BranchOps->materialize(&ctx, name, BRANCH_CHECKOUT_TIMEOUT_MS);
 		prolly_ctx_free(&ctx);
