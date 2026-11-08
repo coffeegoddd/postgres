@@ -3,12 +3,11 @@
 # A branch made from another's head: its catalog rows copied, each table, index, TOAST table and
 # materialized view sharing every page of its parent's, its sequences where the parent's were.  It
 # holds the parent's root, and capture has it from there.  Each branch then writes its own rows, and
-# neither sees the other's; every index stays right on both, and each heap, values stored out of line
-# too.  A writer open on the parent is waited out, and the branch is made after it, at the head,
-# whether it commits or aborts; so is DDL on the parent, and the branch has what it made.  A branch
-# made from one not there, under a name taken, or from one with values stored out of line, which a
-# branch can't share, is refused; one made in a transaction rolled back is not there, and one
-# committed outlasts a crash.
+# neither sees the other's; every index stays right on both, and each heap, values stored out of
+# line too (t/141 has more of those).  A writer open on the parent is waited out, and the branch is
+# made after it, at the head, whether it commits or aborts; so is DDL on the parent, and the branch
+# has what it made.  A branch made from one not there, or under a name taken, is refused; one made
+# in a transaction rolled back is not there, and one committed outlasts a crash.
 
 use strict;
 use warnings FATAL => 'all';
@@ -199,11 +198,6 @@ is(sql($gave_way, q{SELECT count(*) FROM pg_class WHERE relname = 't_late'}) . s
 
 # Refused.
 my ($rc, $err);
-sql($main, q{SET ROLE app_owner; INSERT INTO app.t VALUES (8001, 'big', repeat(md5('x'), 300))});
-($rc, $out, $err) = $node->psql('postgres', on($main) . q{SELECT test_branch_create('toasted', 'main')});
-like($err, qr/table "t" holds values stored out of line, which a branch can't share/,
-	'a branch from one with values stored out of line is refused');
-sql($main, q{SET ROLE app_owner; DELETE FROM app.t WHERE id = 8001});
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_create('x', 'nowhere')});
 like($err, qr/branch "nowhere" not found/, 'a branch from one not there is refused');
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_create('feature', 'main')});
