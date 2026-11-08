@@ -57,6 +57,10 @@ sql(q{CREATE SCHEMA app VERSIONED; SET search_path = app;
 	CREATE TABLE later (id integer PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, v integer);
 	CREATE TABLE gen (id integer PRIMARY KEY, a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
 	CREATE SEQUENCE counter;
+	CREATE TABLE ident (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+	CREATE TABLE ser (id serial PRIMARY KEY, v text);
+	CREATE TABLE spans (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&));
+	CREATE TABLE duq (id integer PRIMARY KEY, code integer UNIQUE DEFERRABLE);
 	CREATE FUNCTION app.note() RETURNS trigger LANGUAGE plpgsql AS
 		$$BEGIN RAISE WARNING 'user code ran: % %', TG_TABLE_NAME, TG_OP; RETURN NULL; END$$;
 	CREATE TRIGGER kv_fired AFTER INSERT OR UPDATE OR DELETE ON kv FOR EACH ROW EXECUTE FUNCTION app.note();
@@ -69,6 +73,10 @@ sql(q{CREATE SCHEMA app VERSIONED; SET search_path = app;
 	INSERT INTO codes VALUES (1, 'x'), (2, 'y');
 	INSERT INTO later VALUES (1, 10), (2, 20);
 	INSERT INTO gen (id, a) VALUES (1, 1), (2, 2);
+	INSERT INTO ident (v) VALUES ('one');
+	INSERT INTO ser (v) VALUES ('one');
+	INSERT INTO spans VALUES (1, '[1,5)'), (2, '[5,10)');
+	INSERT INTO duq VALUES (1, 10), (2, 20);
 	SELECT nextval('counter'), nextval('counter');
 	CREATE RULE codes_nothing AS ON INSERT TO codes DO INSTEAD NOTHING});
 my $a = commit_root();
@@ -85,6 +93,10 @@ sql(q{SET search_path = app;
 	UPDATE codes SET code = 'z' WHERE id = 1; UPDATE codes SET code = 'x' WHERE id = 2; UPDATE codes SET code = 'y' WHERE id = 1;
 	UPDATE later SET id = 3 - id;
 	UPDATE gen SET a = 10 WHERE id = 1;
+	INSERT INTO ident (v) VALUES ('two');
+	INSERT INTO ser (v) VALUES ('two');
+	UPDATE spans SET r = '[20,30)' WHERE id = 1; UPDATE spans SET r = '[1,5)' WHERE id = 2; UPDATE spans SET r = '[5,10)' WHERE id = 1;
+	UPDATE duq SET code = 30 - code;
 	SELECT nextval('counter')});
 my $b = commit_root();
 is($b, read_root(), 'the second is too');
@@ -94,12 +106,13 @@ my $log_at = -s $node->logfile;
 
 # Back to the first.
 my $stats = sql(qq{SELECT test_ws_move('app', '$a')});
-like($stats, qr/^tables 7 deleted \d+ inserted \d+ sequences 1 made 0 dropped 0$/, "a move to the first writes each table that differs: $stats");
+like($stats, qr/^tables 11 deleted \d+ inserted \d+ sequences 3 made 0 dropped 0$/, "a move to the first writes each table and sequence that differs: $stats");
 my ($deleted, $inserted) = $stats =~ /deleted (\d+) inserted (\d+)/;
 # kv: 5 updated taken away and put in again, 5 deleted put back, the new one taken away; notes: a 'b' and
-# the 'c' away, an 'a' back; parted: the row from high back to low; codes and later: both rows; gen: one
-is($deleted, 5 + 1 + 2 + 1 + 2 + 2 + 1, 'taking away only the rows that differ');
-is($inserted, 5 + 5 + 1 + 1 + 2 + 2 + 1, 'and putting in only those');
+# the 'c' away, an 'a' back; parted: the row from high back to low; codes, later, spans and duq: both
+# rows; gen: one; ident and ser: the row added taken away
+is($deleted, 5 + 1 + 2 + 1 + 2 + 2 + 1 + 1 + 1 + 2 + 2, 'taking away only the rows that differ');
+is($inserted, 5 + 5 + 1 + 1 + 2 + 2 + 1 + 0 + 0 + 2 + 2, 'and putting in only those');
 is(read_root(), $a, 'the tables hold the first root');
 is(capture_root(), $a, 'and capture has it, without the writes decoded back');
 unlike(slurp_file($node->logfile, $log_at), qr/user code ran/, 'no trigger ran, ALWAYS or REPLICA');
@@ -107,26 +120,121 @@ is(sql(q{SELECT string_agg(id || code, ',' ORDER BY id) FROM app.codes}), '1x,2y
 is(sql(q{SELECT b FROM app.gen WHERE id = 1}), '2', 'a stored generated column as the root has it');
 is(sql(q{SELECT tableoid::regclass FROM app.parted WHERE id = 1}), 'app.parted_low', 'a row in the partition it was in');
 is(sql(q{SELECT last_value || ' ' || is_called FROM app.counter}), '2 true', 'a sequence where it was');
-is(indexes_check(), '7', 'each index agrees with its table');
+is(sql(q{SELECT (SELECT last_value FROM app.ident_id_seq) || ' ' || (SELECT last_value FROM app.ser_id_seq)}), '1 1',
+	"an identity's and a serial's where they were");
+is(indexes_check(), '12', 'each index agrees with its table');
 
-# Writing after a move: capture goes on from the root's maps.
-sql(q{INSERT INTO app.kv VALUES (200, 'after', NULL); DELETE FROM app.notes WHERE body IS NULL});
-my $after = read_root();
-is(capture_root(), $after, 'what is written after a move is captured on top of it');
-
-# To the second, and to where it already is.
-like(sql(qq{SELECT test_ws_move('app', '$b')}), qr/^tables 7 /, 'a move to the second');
+# To the second, with capture held from applying it: the target's maps are held for capture until then.
+my $injections = $ENV{enable_injection_points} eq 'yes' && !$windows_os;
+my $told = q{SELECT count(*) FROM pg_history.pointers WHERE name LIKE 'capture/told/%'};
+if ($injections)
+{
+	$node->safe_psql('postgres', "CREATE EXTENSION injection_points");
+	my $bg = $node->background_psql('postgres');
+	$bg->query_safe($on);
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-apply-begin', 'wait')});
+	# (the move's own barrier has nothing to apply, and the worker then waits to apply the move)
+	$bg->query_safe(qq{SELECT test_ws_move('app', '$b') AS stats \\gset});
+	$stats = $bg->query_safe(q{\echo :stats});
+	$node->wait_for_event('capture worker', 'capture-apply-begin');
+	is($node->safe_psql('postgres', $told), '11', "each map told is held while capture hasn't applied it");
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-apply-begin'); SELECT injection_points_wakeup('capture-apply-begin')});
+	$bg->quit;
+}
+else
+{
+	$stats = sql(qq{SELECT test_ws_move('app', '$b')});
+}
+like($stats, qr/^tables 11 deleted 21 inserted 20 sequences 3 made 0 dropped 0$/, "a move to the second: $stats");
 is(read_root(), $b, 'holds the second root');
 is(capture_root(), $b, 'and capture has it');
+is($node->safe_psql('postgres', $told), '0', 'and no longer holds the maps for it once it has applied them');
 is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0', 'a move to where it is writes nothing');
 
-# Rolled back, or failing, it leaves everything as it was.
-sql(qq{BEGIN; SELECT test_ws_move('app', '$a'); ROLLBACK});
-is(read_root(), $b, 'a move rolled back leaves the tables');
-is(capture_root(), $b, 'and capture');
-is(sql(q{SELECT last_value || ' ' || is_called FROM app.counter}), '3 true', 'and the sequence, whose setting is otherwise not undone');
+# Writing after a move, applied with it: capture goes on from the root's maps, an update that leaves a
+# value out of line where it was finding it in them.
+SKIP:
+{
+	skip 'injection points not supported by this build', 1 unless $injections;
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-applied', 'wait')});
+	sql(qq{SELECT test_ws_move('app', '$a')});
+	$node->wait_for_event('capture worker', 'capture-applied');
+	sql(q{UPDATE app.kv SET v = 'after' WHERE id = 1; INSERT INTO app.kv VALUES (200, 'after', NULL);
+		DELETE FROM app.notes WHERE body IS NULL});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-applied'); SELECT injection_points_wakeup('capture-applied')});
+	my $after = read_root();
+	is(capture_root(), $after, 'what is written after a move is captured on top of it');
+	sql(qq{SELECT test_ws_move('app', '$b')});
+}
 
-my ($ret, $out, $err) = $node->psql('postgres', "$on BEGIN; INSERT INTO app.kv VALUES (300, 'first', NULL); SELECT test_ws_move('app', '$a'); COMMIT");
+# A restart just after a move: capture tells it again, or passes over what it applied.
+sql(qq{SELECT test_ws_move('app', '$a')});
+$node->stop('immediate');
+$node->start;
+is(capture_root(), $a, 'capture has a move after a crash');
+is(read_root(), $a, 'as the tables do');
+
+# Writers wait for a move, and what one commits while the move waits for it is moved too.
+{
+	my $writer = $node->background_psql('postgres');
+	$writer->query_safe("$on BEGIN; INSERT INTO app.notes VALUES ('late')");
+	my $mover = $node->background_psql('postgres');
+	$mover->query_safe($on);
+	$mover->query_until(qr/moving/, "\\echo moving\nSELECT test_ws_move('app', '$b');\n");
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'the move did not wait';
+	$writer->query_safe('COMMIT');
+	$mover->query_safe('SELECT 1');
+	is(read_root(), $b, 'a keyless row a writer committed as the move waited is taken away too');
+	$writer->quit;
+
+	$mover->query_safe(qq{BEGIN; SELECT test_ws_move('app', '$a')});
+	my ($ret, $out, $err) = $node->psql('postgres', "$on SET lock_timeout = '100ms'; SELECT nextval('app.counter')");
+	like($err, qr/lock timeout/, 'a sequence is held from use during a move');
+	($ret, $out, $err) = $node->psql('postgres', "$on SET lock_timeout = '100ms'; INSERT INTO app.kv VALUES (400, 'w', NULL)");
+	like($err, qr/lock timeout/, 'and a table from writers');
+	is($node->safe_psql('postgres', "$on SET lock_timeout = '100ms'; SELECT count(*) FROM app.kv WHERE id = 100"), '1',
+		"while readers read what was there");
+	$mover->query_safe('COMMIT');
+	$mover->quit;
+	is(read_root(), $a, 'which the move then commits');
+}
+
+# A move is its tables' owner's, which is asked before anything's held.
+$node->safe_psql('postgres', "SET catalog_branch = $branch; " . q{CREATE ROLE mover; GRANT USAGE ON SCHEMA app TO mover;
+	GRANT EXECUTE ON FUNCTION test_ws_move(text, text, integer), test_ws_use_history_store() TO mover});
+my $writing = $node->background_psql('postgres');
+$writing->query("$on BEGIN; INSERT INTO app.kv VALUES (500, 'w', NULL)");
+my ($ret, $out, $err) = $node->psql('postgres', "$on SET ROLE mover; SET lock_timeout = '5s'; SELECT test_ws_move('app', '$b')");
+like($err, qr/must be owner of/, 'a move by a role that does not own the tables is refused, not left waiting for a writer first');
+$writing->{stderr} = '';
+$writing->query_safe('ROLLBACK');
+$writing->quit;
+
+# A table made between the lock and the root would have writers the move doesn't hold off.
+SKIP:
+{
+	skip 'injection points not supported by this build', 1 unless $injections;
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-barrier-locked', 'wait')});
+	my $mover = $node->background_psql('postgres', on_error_stop => 0);
+	$mover->query_safe($on);
+	$mover->query_until(qr/moving/, "\\echo moving\nSELECT test_ws_move('app', '$b');\n");
+	$node->wait_for_event('client backend', 'capture-barrier-locked');
+	sql(q{CREATE TABLE app.sneaked (id integer PRIMARY KEY)});
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-barrier-locked'); SELECT injection_points_wakeup('capture-barrier-locked')});
+	$mover->query('SELECT 1');
+	like($mover->{stderr}, qr/a table of schema "app" was made or dropped as it was being moved/, 'is refused, to try again');
+	$mover->quit;
+	sql(q{DROP TABLE app.sneaked});
+}
+is(read_root(), $a, 'and leaves the tables');
+
+# Rolled back, or failing, it leaves everything as it was.
+sql(qq{BEGIN; SELECT test_ws_move('app', '$b'); ROLLBACK});
+is(read_root(), $a, 'a move rolled back leaves the tables');
+is(capture_root(), $a, 'and capture');
+is(sql(q{SELECT last_value || ' ' || is_called FROM app.counter}), '2 true', 'and the sequence, whose setting is otherwise not undone');
+
+($ret, $out, $err) = $node->psql('postgres', "$on BEGIN; INSERT INTO app.kv VALUES (300, 'first', NULL); SELECT test_ws_move('app', '$b'); COMMIT");
 like($err, qr/a commit from capture can't run in a transaction that has written anything/, 'a move after a write is refused');
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal|capture can't apply/m, 'nothing crashed, and capture applied it all');

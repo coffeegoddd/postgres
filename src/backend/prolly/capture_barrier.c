@@ -320,11 +320,15 @@ barrier_check(const char *schema, Oid nsp)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
+	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
 	return branch;
 }
 
+/* (with hold, catalog changes keep waiting until the transaction ends) */
 static void
-barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int timeout_ms, PHash *root)
+barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int timeout_ms, PHash *root,
+			 bool hold)
 {
 	XLogRecPtr	lsn;
 	TimestampTz start;
@@ -334,9 +338,6 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	List	   *tables;
 	int			nest;
 	char		quickly[32];
-
-	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
-		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
 
 	/* (preparing asks for pg_history's schema, which is what guards it, before anything's held or written) */
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -403,7 +404,8 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	list_free(tables);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
-	UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+	if (!hold)
+		UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
 }
 
 void
@@ -411,16 +413,28 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 {
 	Oid			nsp = get_namespace_oid(schema, false);
 
-	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp), timeout_ms, root);
+	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp), timeout_ms, root, false);
 }
 
-/* (its writes are left out, so the root is of all that's committed, and none of it) */
 void
-CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
+CaptureBarrierCheck(const char *schema)
+{
+	(void) barrier_check(schema, get_namespace_oid(schema, false));
+}
+
+/*
+ * (its writes are left out, so the root is of all that's committed, and none of it; and the lock
+ * catalog changes take turns on is held to its end, which its own commit takes once it has the
+ * tables, as one of theirs may want a table it has)
+ */
+void
+CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, void (*hold) (void *arg),
+						 void *arg, PHash *root)
 {
 	Oid			nsp = get_namespace_oid(schema, false);
 	int32		branch = barrier_check(schema, nsp);
 
 	CaptureLeaveOut();
-	barrier_take(ctx, schema, nsp, branch, timeout_ms, root);
+	hold(arg);
+	barrier_take(ctx, schema, nsp, branch, timeout_ms, root, true);
 }

@@ -3,13 +3,14 @@
  * move.c
  *	  A branch's versioned schema moved to a root value in place.
  *
- * Writers are held off first, by a lock on each of the schema's tables and sequences that only
- * readers get past.  Then capture's root as of now is what the tables hold, as nothing can change
- * them until this ends, and what differs between it and the target is what's written.  A table
- * kept is written as its rows' differences (prolly/ws/ws_rows.h's apply), a table made with all of
- * its rows, and capture told either's rows are the target's map.  What dropping did to a table is
- * found by reading its definition after, not by working out what depends on what.  A sequence's
- * position is set on a new file of it, as setting it otherwise isn't undone by an error.
+ * Writers are held off first, by a lock on each of the schema's tables that only readers get past,
+ * and on each sequence, which a reader waits for too.  Then capture's root as of now is what the
+ * tables hold, as nothing can change them until this ends, and what differs between it and the
+ * target is what's written.  A table kept is written as its rows' differences
+ * (prolly/ws/ws_rows.h's apply), a table made with all of its rows, and capture told either's rows
+ * are the target's map.  What dropping did to a table is found by reading its definition after,
+ * not by working out what depends on what.  A sequence's position is set on a new file of it, as
+ * setting it otherwise isn't undone by an error.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -25,7 +26,9 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
+#include "common/int.h"
 #include "commands/sequence.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -47,6 +50,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 /* A root's tables, by name in UTF8's order. */
 typedef struct MoveTables
@@ -74,10 +78,28 @@ move_table_add(void *arg, const char *name, const VcTable *entry)
 	return true;
 }
 
-/* The schema's tables and sequences, locked against writers; the tables' and sequences' ids. */
-static List *
-lock_writers_out(Oid nsp)
+static int
+relid_cmp(const ListCell *a, const ListCell *b)
 {
+	return pg_cmp_u32(lfirst_oid(a), lfirst_oid(b));
+}
+
+/*
+ * The schema's tables and sequences, each its owner's to move, locked against writers, in order of
+ * their ids, as what else locks more than one does: a sequence against its readers too, as one is
+ * set on a new file of it.  The tables' and sequences' ids.
+ */
+typedef struct MoveLocks
+{
+	Oid			nsp;
+	List	   *relations;
+} MoveLocks;
+
+static void
+lock_writers_out(void *arg)
+{
+	MoveLocks  *locks = arg;
+	Oid			nsp = locks->nsp;
 	List	   *relations = NIL;
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
 	ScanKeyData key;
@@ -92,13 +114,18 @@ lock_writers_out(Oid nsp)
 
 		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
 			c->relkind == RELKIND_SEQUENCE)
+		{
+			if (!object_ownercheck(RelationRelationId, c->oid, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(c->relkind), NameStr(c->relname));
 			relations = lappend_oid(relations, c->oid);
+		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+	list_sort(relations, relid_cmp);
 	foreach_oid(relid, relations)
-		LockRelationOid(relid, ExclusiveLock);
-	return relations;
+		LockRelationOid(relid, get_rel_relkind(relid) == RELKIND_SEQUENCE ? AccessExclusiveLock : ExclusiveLock);
+	locks->relations = relations;
 }
 
 static void
@@ -131,9 +158,6 @@ move_sequence(const char *schema, const WsSeqPosition *pos)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("sequence \"%s\" in schema \"%s\" does not exist", name, schema)));
-	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SEQUENCE, name);
-	LockRelationOid(relid, AccessExclusiveLock);
 	ResetSequence(relid);
 	(void) DirectFunctionCall3(setval3_oid, ObjectIdGetDatum(relid), Int64GetDatum(pos->last_value),
 							   BoolGetDatum(pos->is_called));
@@ -414,10 +438,15 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	WsSqlRows	populated;
 	int			level;
 	int			nest;
+	MoveLocks	locks = {nsp, NIL};
 
 	memset(stats, 0, sizeof(*stats));
-	locked = lock_writers_out(nsp);
-	CaptureBarrierLeavingOut(ctx, schema, timeout_ms, &from);
+	CaptureBarrierCheck(schema);
+	CaptureBarrierLeavingOut(ctx, schema, timeout_ms, lock_writers_out, &locks, &from);
+	locked = locks.relations;
+
+	/* (what's read and written is as of now, with the writers held off, as the root is) */
+	PushActiveSnapshot(GetLatestSnapshot());
 
 	WsRoot->tables(ctx, &from, move_table_add, &had);
 	WsRoot->tables(ctx, to, move_table_add, &has);
@@ -430,8 +459,11 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	}
 	for (int i = 0; i < had.n && nlocked == had.n; i++)
 	{
-		if (!list_member_oid(locked, get_relname_relid(ws_name_from_utf8(had.names[i]), nsp)))
+		char	   *name = ws_name_from_utf8(had.names[i]);
+
+		if (!list_member_oid(locked, get_relname_relid(name, nsp)))
 			nlocked = -1;
+		pfree(name);
 	}
 	if (nlocked != had.n)
 		ereport(ERROR,
@@ -483,7 +515,12 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		stats->inserted += inserted;
 
 		/* (a partitioned table has no rows of its own, nor a map of them) */
-		relid = get_relname_relid(ws_name_from_utf8(rec.name), nsp);
+		{
+			char	   *name = ws_name_from_utf8(rec.name);
+
+			relid = get_relname_relid(name, nsp);
+			pfree(name);
+		}
 		if (get_rel_relkind(relid) == RELKIND_RELATION)
 		{
 			Relation	rel = relation_open(relid, NoLock);
@@ -531,7 +568,22 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 
 	ws_schema_path_end(nest);
 	WsSql->end(level);
+	PopActiveSnapshot();
 	list_free(locked);
+	for (int i = 0; i < had.n; i++)
+		pfree(had.names[i]);
+	for (int i = 0; i < has.n; i++)
+		pfree(has.names[i]);
+	if (had.n > 0)
+	{
+		pfree(had.names);
+		pfree(had.entries);
+	}
+	if (has.n > 0)
+	{
+		pfree(has.names);
+		pfree(has.entries);
+	}
 }
 
 /* An enum's labels as the target makes it, or NIL if it isn't one. */
