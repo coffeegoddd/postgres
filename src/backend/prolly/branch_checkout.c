@@ -149,29 +149,79 @@ BranchCheckoutNote(int32 branch)
 }
 
 /*
- * The catalog branch the session is on once its top transaction commits: what catalog_branch has
- * now, but for what only the transaction set (SET LOCAL, or a SET then a SET LOCAL), which its
- * commit undoes after its locks are let go of.
+ * The catalog branch the session is on once its top transaction commits, and each function that set
+ * it for itself has returned: catalog_branch's stack of what each level set, folded as each level's
+ * end does, from the innermost out.
  */
+typedef struct LevelSet
+{
+	int			level;
+	GucStackState state;
+	int32		prior;
+	int32		masked;
+} LevelSet;
+
 static int32
 branch_after_commit(void)
 {
 	struct config_generic *conf = find_option("catalog_branch", false, true, ERROR);
-	GucStack   *st = conf != NULL ? conf->stack : NULL;
+	int32		branch = catalog_branch;
+	LevelSet   *sets;
+	int			n = 0,
+				top = 0;
 
-	if (st == NULL)
-		return catalog_branch;
-	switch (st->state)
+	if (conf == NULL || conf->stack == NULL)
+		return branch;
+	for (GucStack *st = conf->stack; st != NULL; st = st->prev)
+		n++;
+	sets = palloc(sizeof(LevelSet) * n);
+	n = 0;
+	for (GucStack *st = conf->stack; st != NULL; st = st->prev)
+		sets[n++] = (LevelSet) {st->nest_level, st->state, st->prior.val.intval,
+			st->state == GUC_SET_LOCAL ? st->masked.val.intval : 0};
+
+	for (int level = sets[0].level; level >= 1; level--)
 	{
-		case GUC_SAVE:
-		case GUC_LOCAL:
-			return st->prior.val.intval;
-		case GUC_SET_LOCAL:
-			return st->masked.val.intval;
-		case GUC_SET:
-			return catalog_branch;
+		while (top < n && sets[top].level >= level)
+		{
+			LevelSet   *at = &sets[top];
+			LevelSet   *under = top + 1 < n ? &sets[top + 1] : NULL;
+
+			if (at->state == GUC_SAVE)
+				branch = at->prior;
+			else if (at->level == 1)
+			{
+				if (at->state == GUC_SET_LOCAL)
+					branch = at->masked;
+				else if (at->state == GUC_LOCAL)
+					branch = at->prior;
+			}
+			else if (under == NULL || under->level < at->level - 1)
+			{
+				/* (what it set is the level under's now) */
+				at->level--;
+				break;
+			}
+			else if (at->state == GUC_SET)
+				under->state = GUC_SET;
+			else if (at->state == GUC_LOCAL)
+			{
+				if (under->state == GUC_SET)
+				{
+					under->masked = at->prior;
+					under->state = GUC_SET_LOCAL;
+				}
+			}
+			else
+			{
+				under->masked = at->masked;
+				under->state = GUC_SET_LOCAL;
+			}
+			top++;
+		}
 	}
-	return catalog_branch;
+	pfree(sets);
+	return branch;
 }
 
 /* (at a commit or prepare, where it'll be is what it would return to) */

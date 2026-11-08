@@ -181,6 +181,14 @@ like($err, qr/branch "g2" is checked out in this session/, 'nor the branch this 
 ($rc, $out, $err) = $node->psql('postgres', qq{SELECT test_branch_checkout('g2'); DO \$\$BEGIN
 	PERFORM set_config('catalog_branch', '$main', true); PERFORM test_branch_delete('g2', true); END\$\$});
 like($err, qr/branch "g2" is checked out in this session/, 'nor by what moves off it for itself only');
+($rc, $out, $err) = $node->psql('postgres', qq{SELECT test_branch_checkout('g2'); BEGIN; SET LOCAL catalog_branch = $main;
+	SAVEPOINT s; SET LOCAL catalog_branch = $main; SELECT test_branch_delete('g2', true); COMMIT});
+like($err, qr/branch "g2" is checked out in this session/, 'nor in a subtransaction of a transaction that moves off it');
+($rc, $out, $err) = $node->psql('postgres', qq{SELECT test_branch_checkout('g2');
+	CREATE FUNCTION pg_temp.del() RETURNS void SET catalog_branch = $main
+		AS \$\$SELECT test_branch_delete('g2', true)\$\$ LANGUAGE sql;
+	BEGIN; SET LOCAL catalog_branch = $main; SELECT pg_temp.del(); COMMIT});
+like($err, qr/branch "g2" is checked out in this session/, 'nor by a function moving off it, in a transaction that does');
 
 # A name deleted is made again from scratch.
 sql(q{SELECT test_branch_make('d', 'main'); SELECT test_branch_materialize('d')});
