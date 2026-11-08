@@ -588,7 +588,7 @@ objects_there(const WsObject *objs, int nobjs, const char *schema)
 static void
 restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
 		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows,
-		   bool definitions_only, bool roles_here, bool missing)
+		   bool definitions_only, bool roles_here, bool missing, bool before_tables_only)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -705,6 +705,11 @@ not_empty:
 			obj_made[i] = !obj_made[i];
 	}
 	ws_obj_restore_some(objs, nobjs, obj_made, schema, true);
+	if (before_tables_only)
+	{
+		tables.nnames = 0;
+		goto done;
+	}
 
 	tables_in_order(ctx, root, &tables);
 	table_made = palloc_array(bool, Max(tables.nnames, 1));
@@ -894,32 +899,33 @@ done:
 static void
 schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, false);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, false, false);
 }
 
 static void
 schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
 					void (*fn) (void *arg, const char *schema), void *arg, bool roles_here)
 {
-	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here, false);
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here, false, false);
 }
 
 static void
 schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false, false, false);
 }
 
 static void
 schema_restore_definitions(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false, false, false);
 }
 
 static void
-schema_restore_missing(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
+schema_restore_missing(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
+					   bool before_tables_only)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, true);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, true, before_tables_only);
 }
 
 const WsRootIORoutine SchemaWsRootIO = {

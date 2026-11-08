@@ -16,10 +16,17 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_type.h"
+#include "nodes/miscnodes.h"
+#include "parser/parse_type.h"
 #include "prolly/move_alter.h"
 #include "prolly/ws/ws_sql.h"
 #include "prolly/ws/ws_viol.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+
+/* What a column renamed is named for a moment, and no column of a table altered is. */
+#define MOVE_SPARE_PREFIX "prolly move "
 
 static void
 run_sql(Buf *sql)
@@ -95,6 +102,54 @@ index_same(const WsTableSchema *s, const WsIndex *ix)
 	return false;
 }
 
+/* Whether the record has a constraint or index of that name at all. */
+static bool
+named_in(const WsTableSchema *s, const char *name)
+{
+	for (int i = 0; i < s->nconstraints; i++)
+		if (strcmp(s->constraints[i].name, name) == 0)
+			return true;
+	for (int i = 0; i < s->nindexes; i++)
+		if (strcmp(s->indexes[i].name, name) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * Whether what's said of an index or constraint by its name, its settings, its being the replica
+ * identity's or the one clustered on, or a comment, is of one that's dropped and made again: what
+ * makes it again doesn't say those.
+ */
+static bool
+named_beyond(const WsTableSchema *s, const char *name)
+{
+	for (int i = 0; i < s->nindex_settings; i++)
+		if (strcmp(s->index_settings[i].index, name) == 0)
+			return true;
+	if ((s->replica_index != NULL && strcmp(s->replica_index, name) == 0) ||
+		(s->clustered != NULL && strcmp(s->clustered, name) == 0))
+		return true;
+	for (int i = 0; i < s->ncomments; i++)
+		if ((s->comments[i].kind == WS_COMMENT_CONSTRAINT || s->comments[i].kind == WS_COMMENT_INDEX) &&
+			strcmp(s->comments[i].name, name) == 0)
+			return true;
+	return false;
+}
+
+/* Whether a type a column is to be added as is one that adding it with every row null can be. */
+static bool
+addable_type(const char *type)
+{
+	Oid			typid;
+	int32		typmod;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	/* (one not made yet may be a domain, whose checks adding it would run on each row) */
+	if (!parseTypeString(type, &typid, &typmod, (Node *) &escontext))
+		return false;
+	return get_typtype(typid) != TYPTYPE_DOMAIN;
+}
+
 /* All of a record but its columns, key, constraints, indexes and storage parameters, as bytes. */
 static void
 settings_but_options(const WsTableSchema *s, Buf *out)
@@ -130,6 +185,24 @@ move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related)
 	/* (what's done to one of a tree is done to the rest, which an alter of one can't say) */
 	if (related || from->partition != WS_PARTITION_NONE || from->partition_of != NULL || from->ninherits > 0)
 		return false;
+
+	/* (an index or constraint made again is as its statement says, and only that) */
+	for (int i = 0; i < from->nconstraints; i++)
+		if (named_in(to, from->constraints[i].name) && !constraint_same(to, &from->constraints[i]) &&
+			(named_beyond(from, from->constraints[i].name) || named_beyond(to, from->constraints[i].name)))
+			return false;
+	for (int i = 0; i < from->nindexes; i++)
+		if (named_in(to, from->indexes[i].name) && !index_same(to, &from->indexes[i]) &&
+			(named_beyond(from, from->indexes[i].name) || named_beyond(to, from->indexes[i].name)))
+			return false;
+
+	/* (the spare names renames go through are no column's) */
+	for (int i = 0; i < from->ncols; i++)
+		if (strncmp(from->cols[i].name, MOVE_SPARE_PREFIX, strlen(MOVE_SPARE_PREFIX)) == 0)
+			return false;
+	for (int i = 0; i < to->ncols; i++)
+		if (strncmp(to->cols[i].name, MOVE_SPARE_PREFIX, strlen(MOVE_SPARE_PREFIX)) == 0)
+			return false;
 
 	settings_but_options(from, &a);
 	settings_but_options(to, &b);
@@ -169,7 +242,7 @@ move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related)
 
 		if (at < 0)
 		{
-			if (t->kind != WS_COL_STORED || t->identity != WS_IDENTITY_NONE)
+			if (t->kind != WS_COL_STORED || t->identity != WS_IDENTITY_NONE || !addable_type(t->type))
 				return false;
 			added = true;
 			continue;
@@ -251,7 +324,17 @@ move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char
 			run_sql(&sql);
 			continue;
 		}
-		if (f->not_null != NULL && !text_same(f->not_null, t->not_null))
+		if (f->not_null != NULL && t->not_null != NULL && !text_same(f->not_null, t->not_null))
+		{
+			/* (renamed, as a key's or an identity's can't be dropped) */
+			put_table(from, schema, &sql);
+			ws_put_text(&sql, "RENAME CONSTRAINT ");
+			put_name(f->not_null, &sql);
+			ws_put_text(&sql, " TO ");
+			put_name(t->not_null, &sql);
+			run_sql(&sql);
+		}
+		else if (f->not_null != NULL && t->not_null == NULL)
 		{
 			put_table(from, schema, &sql);
 			ws_put_text(&sql, "ALTER COLUMN ");
@@ -279,7 +362,7 @@ move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char
 
 			if (at < 0 || strcmp(f->name, to->cols[at].name) == 0)
 				continue;
-			snprintf(spare, sizeof(spare), "prolly move " UINT64_FORMAT, f->tag);
+			snprintf(spare, sizeof(spare), MOVE_SPARE_PREFIX UINT64_FORMAT, f->tag);
 			put_table(from, schema, &sql);
 			ws_put_text(&sql, "RENAME COLUMN ");
 			if (pass == 0)
@@ -306,20 +389,9 @@ move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char
 	/* the columns it adds, at the end, null in each row; then defaults, which change no row */
 	for (int i = 0; i < to->ncols; i++)
 	{
-		const WsColumn *t = &to->cols[i];
-
-		if (col_at(from, t->tag) >= 0)
+		if (col_at(from, to->cols[i].tag) >= 0)
 			continue;
-		put_table(to, schema, &sql);
-		ws_put_text(&sql, "ADD COLUMN ");
-		put_name(t->name, &sql);
-		ws_put_text(&sql, " ");
-		ws_put_text(&sql, t->type);
-		if (t->collation != NULL)
-		{
-			ws_put_text(&sql, " COLLATE ");
-			ws_put_text(&sql, t->collation);
-		}
+		ws_schema_add_column(to, to->cols[i].tag, schema, &sql);
 		run_sql(&sql);
 	}
 	for (int i = 0; i < to->ncols; i++)
@@ -329,11 +401,7 @@ move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char
 
 		if (t->kind != WS_COL_STORED || t->def == NULL || (at >= 0 && text_same(from->cols[at].def, t->def)))
 			continue;
-		put_table(to, schema, &sql);
-		ws_put_text(&sql, "ALTER COLUMN ");
-		put_name(t->name, &sql);
-		ws_put_text(&sql, " SET DEFAULT ");
-		ws_schema_render_expression(to, t->def, &sql);
+		ws_schema_set_default(to, t->tag, schema, &sql);
 		run_sql(&sql);
 	}
 	ws_schema_set_tags(schema, to);
@@ -350,7 +418,7 @@ move_alter_after(const WsTableSchema *from, const WsTableSchema *to, const char 
 		const WsColumn *t = &to->cols[i];
 		int			at = col_at(from, t->tag);
 
-		if (t->not_null == NULL || (at >= 0 && text_same(from->cols[at].not_null, t->not_null)))
+		if (t->not_null == NULL || (at >= 0 && from->cols[at].not_null != NULL))
 			continue;
 		ws_schema_add_not_null(to, t->tag, schema, &sql);
 		run_sql(&sql);
@@ -432,4 +500,16 @@ move_alter_check(const WsTableSchema *to, const char *schema)
 	buf_free(&b);
 	ws_schema_free(&now);
 	pfree(name);
+}
+
+bool
+move_alter_drops_unique(const WsTableSchema *from, const WsTableSchema *to)
+{
+	for (int i = 0; i < from->nconstraints; i++)
+		if (from->constraints[i].kind != WS_CONSTRAINT_CHECK && !constraint_same(to, &from->constraints[i]))
+			return true;
+	for (int i = 0; i < from->nindexes; i++)
+		if (from->indexes[i].unique && !index_same(to, &from->indexes[i]))
+			return true;
+	return false;
 }

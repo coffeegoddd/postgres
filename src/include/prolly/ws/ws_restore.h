@@ -87,9 +87,11 @@ typedef struct WsRootIORoutine
 	 * has it already: each table not there by its name, with its rows; each object not there by
 	 * its key; each foreign key not there by its table and name; and of what's made, all restore
 	 * does after.  Sequences' positions are left as they are.  previous is the root it was on.
+	 * With before_tables_only, only the roles and the objects made before tables, which what's to
+	 * be done to tables there may need: what then makes the rest finds those there.
 	 */
 	void		(*restore_missing) (ProllyCtx *ctx, const PHash *root, const PHash *previous,
-									const char *schema);
+									const char *schema, bool before_tables_only);
 } WsRootIORoutine;
 
 extern PGDLLIMPORT const WsRootIORoutine SchemaWsRootIO;

@@ -447,6 +447,29 @@ drop_what_differs(ProllyCtx *ctx, const char *schema, const PHash *from, const P
 	buf_free(&sql);
 }
 
+/* Each object here not as the target has it dropped, once; whether any was. */
+static bool
+drop_objects_once(const char *schema, const MoveObjects *ob)
+{
+	WsObject   *objs;
+	int			nobjs;
+	MoveObjects now;
+	bool		any = false;
+
+	ws_obj_read(schema, &objs, &nobjs);
+	objects_listed(objs, nobjs, &now);
+	for (int i = now.n - 1; i >= 0; i--)
+	{
+		if (object_kept(&now, i, ob))
+			continue;
+		drop_object(&now.objs[i], schema);
+		any = true;
+		CommandCounterIncrement();
+	}
+	objects_free(&now);
+	return any;
+}
+
 /*
  * Each table and object left that is now other than the target has it, as dropping what it used
  * took a part of it, dropped too, until none is: a column, default, constraint or index of a table,
@@ -463,10 +486,6 @@ drop_what_changed(ProllyCtx *ctx, const char *schema, const PHash *to, const Mov
 	objects_of(ctx, to, &ob);
 	while (again)
 	{
-		WsObject   *objs;
-		int			nobjs;
-		MoveObjects now;
-
 		again = false;
 		for (int i = 0; i < has->n; i++)
 		{
@@ -514,19 +533,49 @@ drop_what_changed(ProllyCtx *ctx, const char *schema, const PHash *to, const Mov
 
 		/* (what's here but not as the target has it, made after or before tables) */
 		CommandCounterIncrement();
-		ws_obj_read(schema, &objs, &nobjs);
-		objects_listed(objs, nobjs, &now);
-		for (int i = now.n - 1; i >= 0; i--)
-		{
-			if (object_kept(&now, i, &ob))
-				continue;
-			drop_object(&now.objs[i], schema);
-			again = true;
-			CommandCounterIncrement();
-		}
-		objects_free(&now);
+		again |= drop_objects_once(schema, &ob);
 	}
 	objects_free(&ob);
+}
+
+/*
+ * The foreign keys of tables kept that are to a table altered with a unique constraint or index
+ * dropped, which they may need, dropped: what makes what's missing makes them again.
+ */
+static void
+drop_keys_to_altered(ProllyCtx *ctx, const char *schema, const PHash *from, const MoveTables *has,
+					 const WsTableSchema *was, const WsTableSchema *want, const bool *altered)
+{
+	PHash		map;
+	WsForeignKey *fks;
+	int			n;
+	Buf			sql = BUF_INIT;
+
+	if (!WsRoot->get_map(ctx, from, WS_ROOT_FOREIGN_KEYS, &map))
+		return;
+	ws_fk_list(ctx, &map, &fks, &n);
+	for (int f = 0; f < n; f++)
+		for (int i = 0; i < has->n; i++)
+		{
+			char	   *table;
+			char	   *name;
+
+			if (!altered[i] || strcmp(has->names[i], fks[f].ref_table) != 0 ||
+				!move_alter_drops_unique(&was[i], &want[i]))
+				continue;
+			table = ws_name_from_utf8(fks[f].table);
+			name = ws_name_from_utf8(fks[f].name);
+			ws_put_text(&sql, "ALTER TABLE IF EXISTS ");
+			ws_put_identifier(&sql, schema);
+			ws_put_text(&sql, ".");
+			ws_put_identifier(&sql, table);
+			ws_put_text(&sql, " DROP CONSTRAINT IF EXISTS ");
+			ws_put_identifier(&sql, name);
+			run_sql(&sql);
+			pfree(table);
+			pfree(name);
+		}
+	buf_free(&sql);
 }
 
 /* The schema's materialized views that hold rows, by name, to hold them again after. */
@@ -744,6 +793,11 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		drop_what_differs(ctx, schema, &from, to, &had, &has, altered_had);
 		drop_what_changed(ctx, schema, to, &has, gone, was, altered);
 		CommandCounterIncrement();
+
+		/* (what the target adds that tables use, before a table altered uses it) */
+		WsRootIO->restore_missing(ctx, to, &from, schema, true);
+		CommandCounterIncrement();
+		drop_keys_to_altered(ctx, schema, &from, &has, was, want, altered);
 		for (int i = 0; i < has.n; i++)
 			if (altered[i])
 			{
@@ -751,6 +805,8 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 				stats->altered++;
 			}
 		CommandCounterIncrement();
+
+		pfree(altered_had);
 	}
 
 	/* 2. The rows of each table kept that differ */
@@ -768,7 +824,9 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 			continue;
 		for (k = 0; strcmp(had.names[k], has.names[i]) != 0; k++)
 			;
-		if (memcmp(had.entries[k].data.b, has.entries[i].data.b, PHASH_LEN) == 0)
+
+		/* (one altered has a layout capture is to be told of, whether its rows' bytes changed or not) */
+		if (memcmp(had.entries[k].data.b, has.entries[i].data.b, PHASH_LEN) == 0 && !altered[i])
 			continue;
 		if (!WsRoot->get_table(ctx, to, has.names[i], &rec, &rows))
 			elog(ERROR, "a root's table \"%s\" is gone", has.names[i]);
@@ -807,7 +865,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 
 	/* 3. What the target has that isn't here, made, a table with all its rows */
 	if (definitions)
-		WsRootIO->restore_missing(ctx, to, &from, schema);
+		WsRootIO->restore_missing(ctx, to, &from, schema, false);
 	CommandCounterIncrement();
 	for (int i = 0; i < has.n; i++)
 	{
@@ -848,6 +906,12 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	WsSql->end(level);
 	PopActiveSnapshot();
 	list_free(locked);
+	for (int i = 0; i < has.n; i++)
+		if (altered[i] || was[i].name != NULL)
+		{
+			ws_schema_free(&was[i]);
+			ws_schema_free(&want[i]);
+		}
 	for (int i = 0; i < had.n; i++)
 		pfree(had.names[i]);
 	for (int i = 0; i < has.n; i++)

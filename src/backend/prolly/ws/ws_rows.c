@@ -811,6 +811,12 @@ direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *was, const
 	*deleted = a.deleted;
 	*inserted = a.inserted;
 	*kept = a.kept;
+	if (a.was != NULL)
+	{
+		pfree(a.was_at);
+		pfree(a.was_f);
+		pfree(a.now_f);
+	}
 	ws_row_shape_free(&was_shape);
 }
 

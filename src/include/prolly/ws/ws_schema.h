@@ -444,6 +444,14 @@ extern void ws_schema_add_constraint(const WsTableSchema *s, int n, const char *
 extern void ws_schema_add_not_null(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out);
 
 /*
+ * The ALTER TABLE adding a stored column of the record, by its tag, at the end of the table, with
+ * its type and collation and nothing else, and setting its default; in the named schema, appended
+ * to out.  Checked as the table's statement is.
+ */
+extern void ws_schema_add_column(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out);
+extern void ws_schema_set_default(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out);
+
+/*
  * The ALTER TABLE attaching a partition to its partitioned table, in the named
  * schema, appended to out, to run once both are made, with their indexes, and
  * after that table is attached to its own, if it is a partition too: attaching

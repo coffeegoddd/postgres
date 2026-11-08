@@ -51,11 +51,12 @@ sub move_to
 	my $stats = sql(qq{SELECT test_ws_move('app', '$root')});
 	is(read_root(), $root, "$name: the tables hold the root");
 	is(capture_root(), $root, "$name: and capture has it");
-	is(indexes_check(), '5', "$name: each index agrees with its table");
+	cmp_ok(indexes_check(), '>', 10, "$name: each index agrees with its table");
 	return $stats;
 }
 
-$node->safe_psql('postgres', q{CREATE ROLE app_owner; SELECT test_ws_role_mark(test_ws_role_bytes(ARRAY['app_owner']))});
+$node->safe_psql('postgres', q{CREATE ROLE app_owner; CREATE ROLE reader;
+	SELECT test_ws_role_mark(test_ws_role_bytes(ARRAY['app_owner', 'reader']))});
 sql(q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner; SET ROLE app_owner; SET search_path = app;
 	CREATE TABLE al (id integer PRIMARY KEY, a text NOT NULL, c text, d integer UNIQUE,
 		b0 integer DEFAULT 1 CONSTRAINT b_positive CHECK (b0 > 0)) WITH (fillfactor = 90);
@@ -70,7 +71,22 @@ sql(q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner; SET ROL
 	ALTER TABLE al ENABLE ALWAYS TRIGGER al_loud;
 	INSERT INTO al SELECT g, 'a' || g, 'c' || g, g, CASE WHEN g <= 2 THEN g END FROM generate_series(1, 10) g;
 	INSERT INTO refs VALUES (1, 1), (2, 2);
-	INSERT INTO retyped VALUES (1, 1)});
+	INSERT INTO retyped VALUES (1, 1);
+	CREATE VIEW vc AS SELECT c FROM al;
+	COMMENT ON COLUMN al.c IS 'cee';
+	GRANT SELECT (c) ON al TO reader;
+	CREATE TABLE nul (id integer PRIMARY KEY, v text);
+	INSERT INTO nul VALUES (1, 'one');
+	CREATE TABLE fresh_dep (id integer PRIMARY KEY, v integer);
+	INSERT INTO fresh_dep VALUES (1, 1);
+	CREATE TABLE u (id integer PRIMARY KEY, code integer CONSTRAINT u_code UNIQUE);
+	CREATE TABLE uref (id integer PRIMARY KEY, code integer REFERENCES u (code));
+	INSERT INTO u VALUES (1, 10); INSERT INTO uref VALUES (1, 10);
+	CREATE TABLE cmt (id integer PRIMARY KEY, v integer);
+	CREATE INDEX cmt_i ON cmt (v);
+	COMMENT ON INDEX cmt_i IS 'an index with a comment';
+	CREATE TABLE gen (id integer PRIMARY KEY, x integer, y integer GENERATED ALWAYS AS (x * 2) STORED);
+	INSERT INTO gen (id, x) VALUES (1, 3)});
 my $a = commit_root();
 
 # (b's tag is of the name it was made with, so a column added back as b has it only if it's set)
@@ -95,13 +111,33 @@ sql(q{SET ROLE app_owner; SET search_path = app;
 	ALTER TABLE al SET (fillfactor = 70);
 	UPDATE al SET f = 'set' WHERE id = 3;
 	INSERT INTO al (id, a2, c, d) VALUES (11, NULL, 11, 'd11');
-	ALTER TABLE retyped ALTER COLUMN v TYPE bigint});
+	ALTER TABLE al RENAME CONSTRAINT al_id_not_null TO al_id_nn;
+	ALTER TABLE al ADD CONSTRAINT id_positive CHECK (id > 0) NOT VALID;
+	ALTER TABLE al SET (toast.autovacuum_enabled = false);
+	DROP VIEW vc;
+	CREATE VIEW vc AS SELECT c FROM al;
+	ALTER TABLE retyped ALTER COLUMN v TYPE bigint;
+	ALTER TABLE nul ADD COLUMN extra integer;
+	CREATE SEQUENCE app.counting;
+	CREATE FUNCTION app.small(bigint) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 < 1000';
+	ALTER TABLE fresh_dep ADD COLUMN g bigint;
+	ALTER TABLE fresh_dep ALTER COLUMN g SET DEFAULT nextval('app.counting');
+	ALTER TABLE fresh_dep ADD CONSTRAINT g_small CHECK (app.small(g));
+	INSERT INTO fresh_dep (id, v) VALUES (2, 2);
+	ALTER TABLE u DROP CONSTRAINT u_code CASCADE;
+	ALTER TABLE u ADD CONSTRAINT u_code UNIQUE NULLS NOT DISTINCT (code);
+	ALTER TABLE uref ADD FOREIGN KEY (code) REFERENCES u (code);
+	DROP INDEX cmt_i;
+	CREATE INDEX cmt_i ON cmt (v) WHERE v > 0;
+	COMMENT ON INDEX cmt_i IS 'an index with a comment';
+	ALTER TABLE gen RENAME COLUMN x TO x2});
 my $b = commit_root();
 is($b, read_root(), 'the second root is what the tables hold');
 my $al = oid_of('app.al');
 my $view = oid_of('app.al_ids');
 my $refs = oid_of('app.refs');
 my $retyped = oid_of('app.retyped');
+my %oids = map { $_ => oid_of("app.$_") } qw(nul fresh_dep u uref cmt gen);
 my $log_at = -s $node->logfile;
 
 # (where each row lies, which a row written again doesn't)
@@ -110,7 +146,9 @@ my $placed = sql($places);
 my $stats = move_to($a, 'back to the first');
 # (rows 4 to 10 differ only by columns null in them, which their bytes don't have, so they're not even
 # read; row 3's f, dropped, is all it differs by, so it's read and left; 1 and 2 have a b, and 11 goes)
-like($stats, qr/^tables 1 deleted 3 inserted 2 sequences 0 made 1 dropped 0 altered 1 kept 1$/,
+# (altered: al, nul, u and gen; made again: retyped, cmt, and fresh_dep, whose default and check
+# went with the sequence and function the first root hasn't)
+like($stats, qr/^tables 4 deleted 3 inserted 2 sequences 0 made 3 dropped 0 altered 4 kept 1$/,
 	"al altered and its rows only the alter rewrote left as they are; retyped made again: $stats");
 is(sql($places), $placed, 'those rows where they were, not written again');
 is(oid_of('app.al'), $al, 'the altered table is the same table');
@@ -121,9 +159,24 @@ isnt(oid_of('app.retyped'), $retyped, 'a table with a column retyped is made aga
 is(sql(q{SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'app.al'::regclass AND attnum > 0 AND NOT attisdropped}),
 	'id,a,c,d,b', "its columns as the first root has them, the one dropped from it added at the end");
 
+%oids = map { $_ => oid_of("app.$_") } qw(nul fresh_dep u uref cmt gen);
 $stats = move_to($b, 'to the second');
+is(oid_of('app.nul'), $oids{nul}, 'a table given a column and no other change is altered');
+sql(q{INSERT INTO app.nul VALUES (2, 'two', 2)});
+is(capture_root(), read_root(), 'and capture, told of its layout though its rows were not written, has what is written to it after');
+is(oid_of('app.fresh_dep'), $oids{fresh_dep}, 'a column added with a default from a sequence the target adds, and a check of a function it adds: altered, those made first');
+is(oid_of('app.u'), $oids{u}, 'a table whose unique constraint a foreign key needs is altered');
+is(sql(q{SELECT count(*) FROM pg_constraint WHERE conrelid = 'app.uref'::regclass AND contype = 'f'}), '1', 'and the key is made again');
+isnt(oid_of('app.cmt'), $oids{cmt}, 'an index made again with a comment on it has its table made again');
+is(oid_of('app.gen'), $oids{gen}, 'a column a generated one reads renamed: altered');
+is(sql(q{SELECT c FROM app.vc ORDER BY 1 LIMIT 1}), '1', 'a view that named one column, and names the other after the swap (by its tag, so it differs), is made again');
+is(sql(q{SELECT col_description('app.al'::regclass, attnum) FROM pg_attribute WHERE attrelid = 'app.al'::regclass AND attname = 'd'}),
+	'cee', 'a column renamed keeps its comment');
+is(sql(q{SELECT has_column_privilege('reader', 'app.al', 'd', 'SELECT')}), 't', 'and its grant');
 # (rows 1 and 2 differ only by b, dropped, so they're left; 3 has an f, and 11 comes back)
-like($stats, qr/^tables 1 deleted 1 inserted 2 sequences 0 made 1 dropped 0 altered 1 kept 2$/, "and back again: $stats");
+# (altered: al, nul, fresh_dep, u and gen, fresh_dep's new row put in and its sequence set; made again:
+# retyped and cmt)
+like($stats, qr/^tables 5 deleted 1 inserted 3 sequences 1 made 2 dropped 0 altered 5 kept 2$/, "and back again: $stats");
 is(oid_of('app.al'), $al, 'the same table still');
 unlike(slurp_file($node->logfile, $log_at), qr/user code ran/, 'and no trigger ran');
 

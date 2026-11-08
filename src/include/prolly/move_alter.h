@@ -3,14 +3,17 @@
  * move_alter.h
  *	  A table a move keeps, altered in place from one definition to another.
  *
- * Whether a table can be is said by its two records alone, before anything is done: by
- * renaming, dropping and adding at the end its columns, setting and dropping their defaults
- * and not-null constraints, dropping and adding its constraints and indexes, renaming its key,
- * and setting its storage parameters.  Anything else (a column retyped or moved, a generated
- * or identity column changed or added, its key, partitioning, inheritance, comments, owner,
- * grants or any other setting changed, a table with no key whose columns changed, or one that is
- * partitioned, a partition, or inherits or is inherited from, which related says) has it made
- * again.  A column retyped rewrites every row either way, and Postgres refuses to retype one that
+ * Whether a table can be is said by its two records alone, and the types it would add columns of,
+ * before anything is done: by renaming, dropping and adding at the end its columns, setting and
+ * dropping their defaults and not-null constraints, renaming those, dropping and adding its
+ * constraints and indexes, renaming its key, and setting its storage parameters.  Anything else
+ * has it made again: a column retyped or moved; a generated or identity column changed or added;
+ * a column added of a domain, which adding with every row null would check, or of a type not made
+ * yet, which may be one; its key, partitioning, inheritance, comments, owner, grants or any other
+ * setting changed, an index's own among them; an index or constraint made again that has settings,
+ * a comment, or is the replica identity's or clustered on; a table with no key whose columns
+ * changed; or one that is partitioned, a partition, or inherits or is inherited from, which
+ * related says.  A column retyped rewrites every row either way, and Postgres refuses to retype one that
  * a view or rule uses.
  *
  * What's done is in two halves, around the rows being written: before, what the rows need
@@ -36,5 +39,11 @@ extern void move_alter_after(const WsTableSchema *from, const WsTableSchema *to,
 
 /* An error if the table isn't now as the record has it. */
 extern void move_alter_check(const WsTableSchema *to, const char *schema);
+
+/*
+ * Whether altering drops a unique or exclusion constraint, or a unique index, which a foreign key
+ * of another table may need: those are to be dropped first, and made again after.
+ */
+extern bool move_alter_drops_unique(const WsTableSchema *from, const WsTableSchema *to);
 
 #endif							/* PROLLY_MOVE_ALTER_H */

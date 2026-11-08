@@ -4059,6 +4059,116 @@ ws_schema_add_not_null(const WsTableSchema *s, uint64 tag, const char *schema, B
 	ws_put_identifier(out, ws_name_from_utf8(col->name));
 }
 
+/* The column of a record in server encoding, by its tag. */
+static const WsColumn *
+column_here(const WsTableSchema *here, uint64 tag)
+{
+	for (int i = 0; i < here->ncols; i++)
+		if (here->cols[i].tag == tag)
+			return &here->cols[i];
+	elog(ERROR, "no column tagged " UINT64_FORMAT, tag);
+}
+
+/* One ALTER TABLE of the record's table with one change of a kind, which it gives back. */
+static AlterTableCmd *
+check_alter_one(const WsTableSchema *s, const char *schema, const char *sql, AlterTableType kind)
+{
+	List	   *parsed = parse_text(s, sql);
+	AlterTableStmt *stmt;
+	AlterTableCmd *cmd;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, AlterTableStmt))
+		not_the_record(s, "it is not one ALTER TABLE");
+	stmt = (AlterTableStmt *) linitial_node(RawStmt, parsed)->stmt;
+	if (stmt->relation->catalogname != NULL || stmt->relation->schemaname == NULL ||
+		strcmp(stmt->relation->schemaname, schema) != 0 ||
+		strcmp(stmt->relation->relname, s->name) != 0 || !stmt->relation->inh ||
+		stmt->objtype != OBJECT_TABLE || stmt->missing_ok || list_length(stmt->cmds) != 1)
+		not_the_record(s, "another table");
+	cmd = linitial_node(AlterTableCmd, stmt->cmds);
+	if (cmd->subtype != kind || cmd->newowner != NULL || cmd->missing_ok)
+		not_the_record(s, "another change");
+	return cmd;
+}
+
+void
+ws_schema_add_column(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	WsColumn	bare;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+	AlterTableCmd *cmd;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+
+	/* (its type and collation alone: all else of it is set after, or isn't one this adds) */
+	bare = *column_here(&here, tag);
+	bare.not_null = NULL;
+	bare.def = NULL;
+	bare.identity = WS_IDENTITY_NONE;
+	bare.storage = WS_STORAGE_DEFAULT;
+	bare.compression = WS_COMPRESSION_DEFAULT;
+	if (bare.kind != WS_COL_STORED)
+		elog(ERROR, "a generated column is not one to add");
+	ws_put_text(&sql, "ALTER TABLE ");
+	ws_put_identifier(&sql, schema);
+	ws_put_text(&sql, ".");
+	ws_put_identifier(&sql, here.name);
+	ws_put_text(&sql, " ADD COLUMN ");
+	ws_put_identifier(&sql, bare.name);
+	ws_put_text(&sql, " ");
+	ws_put_text(&sql, bare.type);
+	if (bare.collation != NULL)
+	{
+		ws_put_text(&sql, " COLLATE ");
+		ws_put_text(&sql, bare.collation);
+	}
+	buf_append_byte(&sql, 0);
+	cmd = check_alter_one(&here, schema, (char *) sql.data, AT_AddColumn);
+	if (cmd->def == NULL || !IsA(cmd->def, ColumnDef))
+		not_the_record(&here, "another change");
+	check_column(&here, &bare, (ColumnDef *) cmd->def, schema);
+	statement_end(cxt, &sql, out);
+}
+
+void
+ws_schema_set_default(const WsTableSchema *s, uint64 tag, const char *schema, Buf *out)
+{
+	const char *problem = ws_schema_problem(s);
+	WsTableSchema here;
+	const WsColumn *col;
+	Buf			sql = BUF_INIT;
+	MemoryContext cxt;
+	AlterTableCmd *cmd;
+
+	if (problem != NULL)
+		elog(ERROR, "%s", problem);
+	cxt = statement_begin();
+	schema_in_server_encoding(s, &here);
+	col = column_here(&here, tag);
+	if (col->kind != WS_COL_STORED || col->identity != WS_IDENTITY_NONE || col->def == NULL)
+		elog(ERROR, "no default on a column tagged " UINT64_FORMAT, tag);
+	ws_put_text(&sql, "ALTER TABLE ");
+	ws_put_identifier(&sql, schema);
+	ws_put_text(&sql, ".");
+	ws_put_identifier(&sql, here.name);
+	ws_put_text(&sql, " ALTER COLUMN ");
+	ws_put_identifier(&sql, col->name);
+	ws_put_text(&sql, " SET DEFAULT ");
+	put_expression(&here, col->def, &sql);
+	buf_append_byte(&sql, 0);
+	cmd = check_alter_one(&here, schema, (char *) sql.data, AT_ColumnDefault);
+	if (cmd->name == NULL || strcmp(cmd->name, col->name) != 0 || cmd->def == NULL)
+		not_the_record(&here, "another change");
+	check_expression(&here, col->def, cmd->def);
+	statement_end(cxt, &sql, out);
+}
+
 void
 ws_schema_attach(const WsTableSchema *s, const char *schema, Buf *out)
 {
