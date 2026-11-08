@@ -829,8 +829,12 @@ CREATE FUNCTION test_ws_move(schema text, root text, timeout_ms integer DEFAULT 
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_ws_move_prepare(schema text, root text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_wait(pg_lsn, integer), test_capture_leave_out(), test_capture_commit(text, text, text),
-	test_capture_commit_on(text, text, text), test_ws_use_history_store(), test_ws_move(text, text, integer) FROM PUBLIC;
+	test_capture_commit_on(text, text, text), test_ws_use_history_store(), test_ws_move(text, text, integer), test_ws_move_prepare(text, text) FROM PUBLIC;
 
 CREATE FUNCTION test_ws_schema_shape(schema text, tab text)
 RETURNS text

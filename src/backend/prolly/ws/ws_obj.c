@@ -5494,6 +5494,77 @@ ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out)
 }
 
 void
+ws_obj_drop_statement(const WsObject *o, const char *schema, Buf *out)
+{
+	WsObject	of = *o;
+
+	/* (what's only part of another goes with it, as it can't be undone by itself) */
+	if (o->kind == WS_OBJ_OPLINK)
+		of.kind = WS_OBJ_OPERATOR;
+	else if (o->kind == WS_OBJ_OPMEMBERS)
+		of.kind = WS_OBJ_OPFAMILY;
+	if (of.kind == WS_OBJ_CAST)
+	{
+		char	   *source = ws_text_from_utf8(o->name);
+		char	   *target = ws_text_from_utf8(o->args);
+
+		/* (under the path, as its types are said bare) */
+		ws_put_text(out, "DROP CAST IF EXISTS (");
+		ws_put_text(out, source);
+		ws_put_text(out, " AS ");
+		ws_put_text(out, target);
+		ws_put_text(out, ") CASCADE");
+		pfree(source);
+		pfree(target);
+		return;
+	}
+	if (of.kind == WS_OBJ_TSMAP)
+	{
+		char	   *token = ws_name_from_utf8(o->args);
+
+		ws_put_text(out, "ALTER TEXT SEARCH CONFIGURATION ");
+		ws_put_identifier(out, schema);
+		ws_put_text(out, ".");
+		ws_put_identifier(out, ws_name_from_utf8(o->name));
+		ws_put_text(out, " DROP MAPPING IF EXISTS FOR ");
+		ws_put_identifier(out, token);
+		pfree(token);
+		return;
+	}
+	if (of.kind == WS_OBJ_DEFAULT)
+	{
+		ws_put_text(out, "ALTER VIEW IF EXISTS ");
+		ws_put_identifier(out, schema);
+		ws_put_text(out, ".");
+		ws_put_identifier(out, ws_name_from_utf8(o->args));
+		ws_put_text(out, " ALTER COLUMN ");
+		ws_put_identifier(out, ws_name_from_utf8(o->name));
+		ws_put_text(out, " DROP DEFAULT");
+		return;
+	}
+	ws_put_text(out, "DROP ");
+	ws_put_text(out, kind_sql[of.kind]);
+	ws_put_text(out, " IF EXISTS ");
+	if (of.kind == WS_OBJ_TRIGGER || of.kind == WS_OBJ_RULE || of.kind == WS_OBJ_POLICY)
+	{
+		ws_put_identifier(out, ws_name_from_utf8(o->name));
+		ws_put_text(out, " ON ");
+		ws_put_identifier(out, schema);
+		ws_put_text(out, ".");
+		ws_put_identifier(out, ws_name_from_utf8(o->args));
+	}
+	else if (of.kind == WS_OBJ_INDEX)
+	{
+		ws_put_identifier(out, schema);
+		ws_put_text(out, ".");
+		ws_put_identifier(out, ws_name_from_utf8(o->name));
+	}
+	else
+		put_object(&of, schema, out);
+	ws_put_text(out, " CASCADE");
+}
+
+void
 ws_obj_grant_statement(const WsObject *o, int k, const char *schema, Buf *out)
 {
 	const WsObjectGrant *g;
@@ -5649,6 +5720,13 @@ check_collations_are_free(const WsObject *objs, int n, const char *schema)
 void
 ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tables)
 {
+	ws_obj_restore_some(objs, n, NULL, schema, before_tables);
+}
+
+/* (an object not to be made counts as made: it is there) */
+void
+ws_obj_restore_some(const WsObject *objs, int n, const bool *make, const char *schema, bool before_tables)
+{
 	int			level;
 	int			nest;
 	int		   *order = palloc_array(int, Max(n, 1));
@@ -5656,7 +5734,8 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 
 	ws_obj_restore_order(objs, n, order);
 	for (int i = 0; i < n; i++)
-		any |= ws_obj_before_tables(&objs[i]) == before_tables || (!before_tables && objs[i].owned_table != NULL);
+		any |= (make == NULL || make[i]) &&
+			(ws_obj_before_tables(&objs[i]) == before_tables || (!before_tables && objs[i].owned_table != NULL));
 	if (!any)
 	{
 		pfree(order);
@@ -5664,7 +5743,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 	}
 	check_collations_are_free(objs, n, schema);
 	for (int i = 0; i < n; i++)
-		if (ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind) &&
+		if ((make == NULL || make[i]) && ws_obj_before_tables(&objs[i]) == before_tables && !is_of_table(objs[i].kind) &&
 			objs[i].kind != WS_OBJ_CAST && objs[i].kind != WS_OBJ_COLLATION && objs[i].kind != WS_OBJ_CONVERSION &&
 			!is_of_operators(objs[i].kind) && !is_of_text_search(objs[i].kind) && objs[i].kind != WS_OBJ_STATISTICS)
 			ws_schema_check_defaults(schema, is_function(objs[i].kind) ? DEFACLOBJ_FUNCTION :
@@ -5680,7 +5759,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 	{
 		Buf			sql = BUF_INIT;
 
-		if (ws_obj_before_tables(&objs[order[i]]) != before_tables)
+		if (ws_obj_before_tables(&objs[order[i]]) != before_tables || (make != NULL && !make[order[i]]))
 			continue;
 		check_usings(&objs[order[i]], schema);
 		ws_obj_create_statement(&objs[order[i]], schema, &sql);
@@ -5695,7 +5774,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 	{
 		const WsObject *o = &objs[order[i]];
 
-		if (ws_obj_before_tables(o) != before_tables)
+		if (ws_obj_before_tables(o) != before_tables || (make != NULL && !make[order[i]]))
 			continue;
 		for (int k = 0; k < o->ncomments; k++)
 		{
@@ -5710,7 +5789,7 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		const WsObject *o = &objs[order[i]];
 		Buf			owner = BUF_INIT;
 
-		if (ws_obj_before_tables(o) != before_tables)
+		if (ws_obj_before_tables(o) != before_tables || (make != NULL && !make[order[i]]))
 			continue;
 		ws_obj_owner_statement(o, schema, &owner);
 		if (owner.len > 0)
@@ -5763,6 +5842,8 @@ ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tabl
 		{
 			Buf			sql = BUF_INIT;
 
+			if (make != NULL && !make[i])
+				continue;
 			ws_obj_owned_statement(&objs[i], schema, &sql);
 			if (sql.len > 0)
 				run_statement(&sql);

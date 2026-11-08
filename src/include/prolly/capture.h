@@ -230,6 +230,9 @@ extern void CaptureWaitFor(XLogRecPtr lsn, int timeout_ms);
  */
 extern void CaptureLeaveOut(void);
 
+/* Whether this transaction is left out of capture. */
+extern bool CaptureLeftOut(void);
+
 /*
  * CaptureLeaveOut, then hold, then CaptureBarrier: the root as of now of a transaction whose writes
  * are left out, which is what they start from.  hold takes the locks what's to be written needs,

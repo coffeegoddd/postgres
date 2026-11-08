@@ -81,6 +81,15 @@ typedef struct WsRootIORoutine
 	 */
 	void		(*restore_definitions) (ProllyCtx *ctx, const PHash *root, const char *schema,
 										const PHash *no_rows);
+
+	/*
+	 * What of a root the schema lacks, made as restore makes it, the rest being there as the root
+	 * has it already: each table not there by its name, with its rows; each object not there by
+	 * its key; each foreign key not there by its table and name; and of what's made, all restore
+	 * does after.  Sequences' positions are left as they are.  previous is the root it was on.
+	 */
+	void		(*restore_missing) (ProllyCtx *ctx, const PHash *root, const PHash *previous,
+									const char *schema);
 } WsRootIORoutine;
 
 extern PGDLLIMPORT const WsRootIORoutine SchemaWsRootIO;
