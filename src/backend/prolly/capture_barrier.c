@@ -452,7 +452,7 @@ barrier_check_common(bool leaving_out)
 /*
  * What's asked of a barrier before anything is held or written, of whatever the schema has now:
  * what it then holds is asked again once it's locked.  The schema's branch.  (capture_to_trees
- * first, as a schema that isn't versioned may only be so for it being off)
+ * asked first, before whether the schema is versioned, as it always has been)
  */
 static int32
 barrier_check(const char *schema, Oid nsp, bool leaving_out)
