@@ -887,6 +887,7 @@ inplace_prepare(ProllyCtx *ctx, const char *schema, const PHash *to)
 		if (want != NIL)
 			add_enum_labels(&ob.objs[i], want, schema);
 	}
+	objects_free(&ob);
 	ws_schema_path_end(nest);
 	WsSql->end(level);
 }
