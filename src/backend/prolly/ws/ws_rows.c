@@ -589,10 +589,18 @@ apply_diff(void *arg, const ProllyDiff *d)
 		row->left = had - has;
 		return;
 	}
-	if (!RelationFindReplTupleByIndex(w->rel, w->key_index, true, LockTupleExclusive, w->slot, a->found))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("table \"%s\" has no row with a key its rows were said to have", w->table)));
+	{
+		/* (what finding it takes is the row's) */
+		MemoryContext old = MemoryContextSwitchTo(w->rowcxt);
+		bool		found = RelationFindReplTupleByIndex(w->rel, w->key_index, true, LockTupleExclusive,
+														 w->slot, a->found);
+
+		MemoryContextSwitchTo(old);
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("table \"%s\" has no row with a key its rows were said to have", w->table)));
+	}
 	simple_table_tuple_delete(w->rel, &a->found->tts_tid, GetActiveSnapshot());
 	a->deleted++;
 }
@@ -604,16 +612,20 @@ apply_keyless_deletes(RowsApply *a)
 	RowsWriter *w = a->w;
 	TableScanDesc scan;
 	StringInfoData bytes;
-	MemoryContext row_cxt = AllocSetContextCreate(CurrentMemoryContext, "ws_rows printed row", ALLOCSET_DEFAULT_SIZES);
-	WsField    *f = palloc_array(WsField, Max(w->shape.nstored, 1));
+	MemoryContext row_cxt;
+	WsField    *f;
 	int			level;
 	uint64		left = 0;
 
 	if (a->ndoomed == 0)
 		return;
+
+	/* (no two of them print alike, as one row's text is always one key: ws_row.h) */
 	qsort(a->doomed, a->ndoomed, sizeof(DoomedRow), doomed_cmp);
 	for (int i = 0; i < a->ndoomed; i++)
 		left += a->doomed[i].left;
+	row_cxt = AllocSetContextCreate(CurrentMemoryContext, "ws_rows printed row", ALLOCSET_DEFAULT_SIZES);
+	f = palloc_array(WsField, Max(w->shape.nstored, 1));
 	initStringInfo(&bytes);
 
 	/* (each row as capture prints it, by which a keyless row is told apart) */
@@ -701,6 +713,7 @@ direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const P
 		prolly_report(ctx);
 	apply_keyless_deletes(&a);
 	CommandCounterIncrement();
+	w.cid = GetCurrentCommandId(true);
 	a.inserting = true;
 	if (prolly_diff(ctx, from, to, apply_diff, &a) < 0)
 		prolly_report(ctx);

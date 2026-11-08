@@ -31,6 +31,8 @@
 #include "postmaster/interrupt.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
+#include "prolly/chunkstore.h"
+#include "prolly/engine/vc_refs.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalctl.h"
@@ -276,6 +278,24 @@ CaptureRowsAre(Relation relation, const PHash *map)
 	(void) LogLogicalMessage(CAPTURE_ROWS_ARE_PREFIX, out.data, out.len, true, false);
 	pfree(out.data);
 	ws_row_shape_free(&shape);
+
+	/* (the map is held for capture, which may get to it after whatever else held it lets it go) */
+	{
+		VcRefs	   *refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
+		char		name[CAPTURE_TOLD_REF_LEN];
+
+		CaptureToldRefName(RelationGetRelid(relation), map, name);
+		refs->routine->set(refs, name, map);
+	}
+}
+
+void
+CaptureToldRefName(Oid relid, const PHash *map, char *name)
+{
+	int			at = snprintf(name, CAPTURE_TOLD_REF_LEN, CAPTURE_TOLD_REF_PREFIX "%u/", relid);
+
+	for (int i = 0; i < PHASH_LEN; i++)
+		at += snprintf(name + at, CAPTURE_TOLD_REF_LEN - at, "%02x", map->b[i]);
 }
 
 void

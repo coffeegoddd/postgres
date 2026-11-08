@@ -36,7 +36,8 @@
  * of its transaction (capture_rows.c), which void all that was told of the table before them.  So
  * nothing's judged until its transaction has ended: what's wrong with a change only matters if it
  * isn't voided.  A transaction left out of capture that has made a table's rows a root's says so
- * instead, with the root's row map (CaptureRowsAre): the table is told whole as that map.
+ * instead, with the root's row map (CaptureRowsAre): the table is told whole as that map, which the
+ * transaction holds for capture (CAPTURE_TOLD_REF_PREFIX) until it's applied or passed over.
  *
  * A table with no key holds its rows by the whole row, with how many there are of it, so a change
  * is one fewer of the old row and one more of the new; CaptureLoggedIdentity has that come whole.
@@ -206,6 +207,9 @@ static void tree_heal(void);
 static MemoryContext tree_held_cxt = NULL;
 static List *tree_held_branches = NIL;
 static uint64 tree_held_changes = 0;
+
+/* What holds each map told as a table's rows since the last apply, in tree_held_cxt. */
+static List *tree_told = NIL;
 static Size tree_held_bytes = 0;	/* all of it, on file or not */
 static Size tree_held_in_memory = 0;
 
@@ -251,6 +255,17 @@ tree_let_go(VcRefs *refs)
 		names = lappend(names, SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
 	foreach(lc, names)
 		(void) refs->routine->remove(refs, lfirst(lc));
+	names = NIL;
+
+	/* (a map told as a gone table's rows is of nothing now, whether it was applied or not) */
+	refs->routine->list(refs, CAPTURE_TOLD_REF_PREFIX, tree_forget_ref, &names);
+	foreach_ptr(char, name, names)
+	{
+		Oid			relid = (Oid) strtoul(name + strlen(CAPTURE_TOLD_REF_PREFIX), NULL, 10);
+
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+			(void) refs->routine->remove(refs, name);
+	}
 	tree_exec("DELETE FROM pg_history.capture_tables t "
 			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = t.relid)", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_healing h "
@@ -840,6 +855,16 @@ tree_rows_are(const char *p, const char *end)
 	if (p != end)
 		elog(ERROR, "a message of a table's rows is longer than it says");
 	table->has_base = true;
+
+	/* (what holds it for capture goes once what's held is applied, or passed over) */
+	{
+		MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
+		char		name[CAPTURE_TOLD_REF_LEN];
+
+		CaptureToldRefName(table->relid, &table->base, name);
+		tree_told = lappend(tree_told, pstrdup(name));
+		MemoryContextSwitchTo(old);
+	}
 }
 
 static void
@@ -1750,6 +1775,8 @@ tree_apply(void)
 		if (position->now > position->before)
 			tree_set_position(position->branch, position->now);
 	}
+	foreach_ptr(char, name, tree_told)
+		(void) refs->routine->remove(refs, name);
 	elog(DEBUG1, "capture tree: applied " UINT64_FORMAT " changes", tree_held_changes);
 	prolly_ctx_free(&ctx);
 	if (SPI_finish() != SPI_OK_FINISH)
@@ -1758,6 +1785,7 @@ tree_apply(void)
 	INJECTION_POINT("capture-applying", NULL);
 	CommitTransactionCommand();
 	tree_held_branches = NIL;
+	tree_told = NIL;
 	tree_held_changes = 0;
 	tree_held_bytes = 0;
 	tree_held_in_memory = 0;
@@ -1948,6 +1976,7 @@ tree_slot_made(XLogRecPtr from)
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 
 	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);
+	refs->routine->list(refs, CAPTURE_TOLD_REF_PREFIX, tree_forget_ref, &names);
 	foreach(lc, names)
 		refs->routine->remove(refs, lfirst(lc));
 	tree_exec("DELETE FROM pg_history.capture_positions", SPI_OK_DELETE);
