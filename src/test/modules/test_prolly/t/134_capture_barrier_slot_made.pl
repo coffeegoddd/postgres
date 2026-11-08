@@ -41,15 +41,14 @@ my $filled = 0;
 sub lose_slot
 {
 	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
-	# (stopped idle, and holding no lock the filler's commit takes: a worker woken in between is let
-	# go and stopped again)
+	# (stopped idle, holding nothing: a worker woken in between is let go and stopped again; what it's
+	# waiting on is read with no lock taken)
+	my $idle = qq{SELECT wait_event = 'CaptureWorkerMain' FROM pg_stat_activity WHERE pid = $worker};
 	for (;;)
 	{
-		$node->poll_query_until('postgres', qq{SELECT wait_event = 'CaptureWorkerMain' FROM pg_stat_activity WHERE pid = $worker})
-		  or die 'the worker is not idle';
+		$node->poll_query_until('postgres', $idle) or die 'the worker is not idle';
 		kill 'STOP', $worker;
-		last if $node->safe_psql('postgres', qq{SELECT count(*) FROM pg_locks WHERE pid = $worker AND granted
-			AND locktype = 'object' AND objsubid = 2}) eq '0';
+		last if $node->safe_psql('postgres', $idle) eq 't';
 		kill 'CONT', $worker;
 	}
 	$filled++;
