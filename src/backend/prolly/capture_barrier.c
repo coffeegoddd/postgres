@@ -298,9 +298,55 @@ barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 	return saved;
 }
 
-/* What's asked of a barrier before anything is held or written; the schema's branch. */
+/* What capture keeps of a barrier, and with leaving_out, of a map told, asked of the caller. */
+static void
+check_history(bool leaving_out)
+{
+	Oid			history = get_namespace_oid("pg_history", false);
+	Oid			user = GetUserId();
+
+	if (object_aclcheck(NamespaceRelationId, history, user, ACL_USAGE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, "pg_history");
+	if (pg_class_aclcheck(get_relname_relid("capture_barriers", history), user, ACL_SELECT) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, "capture_barriers");
+	if (leaving_out &&
+		pg_class_aclcheck(get_relname_relid("pointers", history), user, ACL_SELECT | ACL_INSERT | ACL_UPDATE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, "pointers");
+}
+
+/* What reading each of the schema's tables and sequences asks, without locking them. */
+static void
+check_may_read_all(Oid nsp)
+{
+	Relation	rel = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relations = NIL;
+
+	ScanKeyInit(&key, Anum_pg_class_relnamespace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
+			c->relkind == RELKIND_SEQUENCE)
+			relations = lappend_oid(relations, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	foreach_oid(relid, relations)
+		check_may_read(relid);
+	list_free(relations);
+}
+
+/*
+ * What's asked of a barrier before anything is held or written, of whatever the schema has now:
+ * what it then holds is asked again once it's locked.  The schema's branch.
+ */
 static int32
-barrier_check(const char *schema, Oid nsp)
+barrier_check(const char *schema, Oid nsp, bool leaving_out)
 {
 	int32		branch = NamespaceBranch(nsp);
 
@@ -322,6 +368,8 @@ barrier_check(const char *schema, Oid nsp)
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
 	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
+	check_history(leaving_out);
+	check_may_read_all(nsp);
 	return branch;
 }
 
@@ -339,7 +387,7 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	int			nest;
 	char		quickly[32];
 
-	/* (preparing asks for pg_history's schema, which is what guards it, before anything's held or written) */
+	/* (asked of the caller as it began, and asked again by preparing) */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 	plan = SPI_prepare("SELECT 1 FROM pg_history.capture_barriers WHERE lsn OPERATOR(pg_catalog.=) $1", 1, types);
@@ -413,14 +461,9 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 {
 	Oid			nsp = get_namespace_oid(schema, false);
 
-	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp), timeout_ms, root, false);
+	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp, false), timeout_ms, root, false);
 }
 
-void
-CaptureBarrierCheck(const char *schema)
-{
-	(void) barrier_check(schema, get_namespace_oid(schema, false));
-}
 
 /*
  * (its writes are left out, so the root is of all that's committed, and none of it; and the lock
@@ -432,7 +475,7 @@ CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, voi
 						 void *arg, PHash *root)
 {
 	Oid			nsp = get_namespace_oid(schema, false);
-	int32		branch = barrier_check(schema, nsp);
+	int32		branch = barrier_check(schema, nsp, true);
 
 	CaptureLeaveOut();
 	hold(arg);

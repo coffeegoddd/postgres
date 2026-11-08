@@ -225,6 +225,9 @@ static MemoryContext tree_row_cxt = NULL;
 static XLogRecPtr tree_commit = InvalidXLogRecPtr;
 static int	tree_scope = 0;
 
+/* The transaction being told. */
+static TransactionId tree_xid = InvalidTransactionId;
+
 static void
 tree_exec(const char *sql, int spi_ok)
 {
@@ -345,6 +348,7 @@ tree_start(XLogRecPtr from)
 static void
 tree_begin(TransactionId xid, XLogRecPtr final_lsn)
 {
+	tree_xid = xid;
 	tree_commit = final_lsn;
 	tree_scope = WsSql->begin();
 }
@@ -861,7 +865,7 @@ tree_rows_are(const char *p, const char *end)
 		MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
 		char		name[CAPTURE_TOLD_REF_LEN];
 
-		CaptureToldRefName(table->relid, &table->base, name);
+		CaptureToldRefName(table->relid, tree_xid, &table->base, name);
 		tree_told = lappend(tree_told, pstrdup(name));
 		MemoryContextSwitchTo(old);
 	}
@@ -2146,6 +2150,7 @@ tree_marker(void)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+	INJECTION_POINT("capture-marker-saved", NULL);
 }
 
 /*

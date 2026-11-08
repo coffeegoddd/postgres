@@ -201,7 +201,6 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	MoveLocks	locks = {nsp, NIL};
 
 	memset(stats, 0, sizeof(*stats));
-	CaptureBarrierCheck(schema);
 	CaptureBarrierLeavingOut(ctx, schema, timeout_ms, lock_writers_out, &locks, &from);
 	locked = locks.relations;
 
