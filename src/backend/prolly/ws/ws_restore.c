@@ -724,7 +724,14 @@ not_empty:
 		if (table_made[i])
 			made_recs[nmade++] = tables.recs[i];
 	if (fn == NULL && no_rows == NULL)
+	{
+		/* (it takes out of a record what's set aside, so what it's given goes back where it was) */
 		ws_viol_defer(ctx, root, made_recs, nmade, &deferred);
+		nmade = 0;
+		for (int i = 0; i < tables.nnames; i++)
+			if (table_made[i])
+				tables.recs[i] = made_recs[nmade++];
+	}
 	for (int t = 0; t < tables.n; t++)
 	{
 		int			i = tables.order[t];
