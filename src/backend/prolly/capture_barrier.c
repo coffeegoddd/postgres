@@ -84,9 +84,13 @@
 #include "utils/inval.h"
 #include "utils/wait_event.h"
 
-/* What a table's rows are read as while a barrier makes its root. */
+/*
+ * What a table's rows are read as while a barrier makes its root; and what they're written as,
+ * as a root's violations are checked by restoring it, undone.
+ */
 static XLogRecPtr barrier_lsn = InvalidXLogRecPtr;
 static VcRefs *barrier_refs = NULL;
+static const WsRowsRoutine *barrier_rows = NULL;
 
 static void
 captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash *map)
@@ -129,9 +133,24 @@ captured_rows(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, PHash 
 	pfree(table);
 }
 
+static void
+captured_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const PHash *map)
+{
+	barrier_rows->restore(ctx, schema, s, map);
+}
+
+static void
+captured_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *was, const PHash *from,
+			   const WsTableSchema *s, const PHash *to, uint64 *deleted, uint64 *inserted, uint64 *kept)
+{
+	barrier_rows->apply(ctx, schema, was, from, s, to, deleted, inserted, kept);
+}
+
 static const WsRowsRoutine CapturedWsRows = {
 	.name = "captured",
 	.capture = captured_rows,
+	.restore = captured_restore,
+	.apply = captured_apply,
 };
 
 /* Every relation of the schema that building a root reads, locked; those whose contents it holds. */
@@ -448,6 +467,7 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	if (LockTimeout == 0 || LockTimeout > Max(DeadlockTimeout / 2, 1))
 		(void) set_config_option("lock_timeout", quickly, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	barrier_lsn = lsn;
+	barrier_rows = rows;
 	WsRows = &CapturedWsRows;
 	PG_TRY();
 	{
