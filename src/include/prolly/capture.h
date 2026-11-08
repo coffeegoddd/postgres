@@ -262,6 +262,16 @@ extern void CaptureBranchBarrierLeavingOut(ProllyCtx *ctx, int32 branch, int tim
  */
 extern void CaptureRowsAre(Relation relation, const PHash *map);
 
+/*
+ * Once version control's own work in a transaction left out is done: what the transaction would
+ * write after to a versioned table, or change of a versioned schema's objects, is refused, as it
+ * would be in no branch's history (CaptureCheckWrite, CaptureCheckCatalogChange); and a table
+ * whose rows were told (CaptureRowsAre) is to commit in the layout it was told in.
+ */
+extern void CaptureLeftOutSeal(void);
+extern void CaptureCheckWrite(Relation relation, const char *what);
+extern void CaptureCheckCatalogChange(void);
+
 /* The name of where CaptureRowsAre holds a table's map, into name, of CAPTURE_TOLD_REF_LEN. */
 #define CAPTURE_TOLD_REF_LEN 96
 extern void CaptureToldRefName(Oid relid, TransactionId xid, const PHash *map, char *name);

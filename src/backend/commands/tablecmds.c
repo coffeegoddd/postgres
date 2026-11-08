@@ -88,6 +88,7 @@
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/capture.h"
 #include "prolly/chunk_log.h"
 #include "prolly/ws/ws_tags.h"
 #include "rewrite/rewriteDefine.h"
@@ -2030,6 +2031,10 @@ ExecuteTruncateGuts(List *explicit_rels,
 	SubTransactionId mySubid;
 	ListCell   *cell;
 	Oid		   *logrelids;
+
+	/* (prolly: not a versioned table, once a transaction left out of capture is sealed) */
+	foreach_ptr(RelationData, rel, explicit_rels)
+		CaptureCheckWrite(rel, "truncate");
 
 	/*
 	 * Check the explicitly-specified relations.

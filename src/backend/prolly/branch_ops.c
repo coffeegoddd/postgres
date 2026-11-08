@@ -515,6 +515,7 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 	BranchLink->link(name, branch);
 	vc_commit_release(&at);
 	vc_branch_free(&head);
+	CaptureLeftOutSeal();
 	return branch;
 }
 
@@ -745,6 +746,7 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 				 errmsg("branch \"%s\" is a default_branch", name)));
 	BranchCatalogs->drop(branch);
 	(void) BranchLink->unlink(name);
+	CaptureLeftOutSeal();
 	vc_branch_free(&b);
 	vc_repo_free(&repo);
 }

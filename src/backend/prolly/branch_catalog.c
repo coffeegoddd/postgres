@@ -57,6 +57,7 @@
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_checkout.h"
+#include "prolly/capture.h"
 #include "replication/slot.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
@@ -340,6 +341,7 @@ VersionedNamespaceBranch(const char *nspname)
 void
 LockBranchCatalogs(int32 branch, LOCKMODE mode)
 {
+	CaptureCheckCatalogChange();
 	LockDatabaseObject(DatabaseRelationId, (Oid) branch, 1, mode);
 }
 

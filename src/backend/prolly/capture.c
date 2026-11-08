@@ -240,6 +240,115 @@ CaptureLeftOut(void)
 	return TransactionIdIsValid(left_out) && TransactionIdIsCurrentTransactionId(left_out);
 }
 
+/*
+ * Once version control's own work is done, the transaction left out is sealed: what it would write
+ * after to a versioned table, or change of one's objects, would be in no branch's history, as capture
+ * leaves out all it writes, so it's refused.  (A transaction does one such work: a commit from
+ * capture refuses one that has written, and the second would take one.)  And a table whose rows it
+ * told capture are to keep the layout they were told in.
+ */
+static TransactionId sealed = InvalidTransactionId;
+
+typedef struct ToldShape
+{
+	Oid			relid;
+	int			nkey;
+	int			nstored;
+	uint64	   *tags;
+} ToldShape;
+
+static List *told_shapes = NIL;
+static bool told_callback = false;
+
+static bool
+sealed_now(void)
+{
+	return TransactionIdIsValid(sealed) && TransactionIdIsCurrentTransactionId(sealed);
+}
+
+void
+CaptureLeftOutSeal(void)
+{
+	if (CaptureLeftOut())
+		sealed = left_out;
+}
+
+void
+CaptureCheckWrite(Relation relation, const char *what)
+{
+	if (sealed_now() && NamespaceBranch(RelationGetNamespace(relation)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot %s versioned table \"%s\" in a transaction left out of capture",
+						what, RelationGetRelationName(relation)),
+				 errdetail("Its version control work is done, and what it wrote after would be in no branch's history."),
+				 errhint("Do it in a transaction of its own.")));
+}
+
+void
+CaptureCheckCatalogChange(void)
+{
+	if (sealed_now())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot change a versioned schema's objects in a transaction left out of capture"),
+				 errdetail("Its version control work is done, and what it changed after would be in no branch's history."),
+				 errhint("Do it in a transaction of its own.")));
+}
+
+/* (at commit, each table told keeps the layout it was told in) */
+static void
+told_shapes_callback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PRE_PREPARE)
+	{
+		foreach_ptr(ToldShape, t, told_shapes)
+		{
+			Relation	rel = try_relation_open(t->relid, AccessShareLock);
+			WsRowShape	now;
+			bool		same;
+
+			if (rel == NULL)
+				continue;
+			CaptureRelationShape(rel, &now);
+			same = now.nkey == t->nkey && now.nstored == t->nstored &&
+				memcmp(now.tags, t->tags, sizeof(uint64) * now.nstored) == 0;
+			ws_row_shape_free(&now);
+			if (!same)
+				ereport(ERROR,
+						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						 errmsg("table \"%s\" was changed after its rows were told to capture",
+								RelationGetRelationName(rel)),
+						 errdetail("What a transaction left out of capture tells is of the table as it commits."),
+						 errhint("Change it in a transaction of its own.")));
+			relation_close(rel, AccessShareLock);
+		}
+	}
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
+		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
+		told_shapes = NIL;
+}
+
+static void
+told_shape_note(Relation relation, const WsRowShape *shape)
+{
+	MemoryContext was = MemoryContextSwitchTo(TopTransactionContext);
+	ToldShape  *t = palloc(sizeof(ToldShape));
+
+	if (!told_callback)
+	{
+		RegisterXactCallback(told_shapes_callback, NULL);
+		told_callback = true;
+	}
+	t->relid = RelationGetRelid(relation);
+	t->nkey = shape->nkey;
+	t->nstored = shape->nstored;
+	t->tags = palloc(sizeof(uint64) * Max(shape->nstored, 1));
+	memcpy(t->tags, shape->tags, sizeof(uint64) * shape->nstored);
+	told_shapes = lappend(told_shapes, t);
+	MemoryContextSwitchTo(was);
+}
+
 void
 CaptureLeaveOut(void)
 {
@@ -274,6 +383,7 @@ CaptureRowsAre(Relation relation, const PHash *map)
 	if (head[0] == 0)
 		elog(ERROR, "relation \"%s\" is not versioned", RelationGetRelationName(relation));
 	CaptureRelationShape(relation, &shape);
+	told_shape_note(relation, &shape);
 	head[1] = (int32) RelationGetRelid(relation);
 	head[2] = shape.nkey;
 	head[3] = shape.nstored;
