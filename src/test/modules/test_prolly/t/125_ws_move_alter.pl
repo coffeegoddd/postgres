@@ -47,11 +47,11 @@ sub indexes_check
 
 sub move_to
 {
-	my ($root, $name) = @_;
+	my ($root, $name, $indexes) = @_;
 	my $stats = sql(qq{SELECT test_ws_move('app', '$root')});
 	is(read_root(), $root, "$name: the tables hold the root");
 	is(capture_root(), $root, "$name: and capture has it");
-	cmp_ok(indexes_check(), '>', 10, "$name: each index agrees with its table");
+	is(indexes_check(), $indexes, "$name: each index agrees with its table");
 	return $stats;
 }
 
@@ -130,7 +130,10 @@ sql(q{SET ROLE app_owner; SET search_path = app;
 	DROP INDEX cmt_i;
 	CREATE INDEX cmt_i ON cmt (v) WHERE v > 0;
 	COMMENT ON INDEX cmt_i IS 'an index with a comment';
-	ALTER TABLE gen RENAME COLUMN x TO x2});
+	ALTER TABLE gen RENAME COLUMN x TO x2;
+	CREATE TABLE newt (id serial PRIMARY KEY);
+	INSERT INTO newt DEFAULT VALUES;
+	CREATE SEQUENCE app.kept_seq OWNED BY nul.v});
 my $b = commit_root();
 is($b, read_root(), 'the second root is what the tables hold');
 my $al = oid_of('app.al');
@@ -143,12 +146,12 @@ my $log_at = -s $node->logfile;
 # (where each row lies, which a row written again doesn't)
 my $places = q{SELECT string_agg(id || ':' || ctid, ',' ORDER BY id) FROM app.al WHERE id BETWEEN 3 AND 10};
 my $placed = sql($places);
-my $stats = move_to($a, 'back to the first');
+my $stats = move_to($a, 'back to the first', 13);
 # (rows 4 to 10 differ only by columns null in them, which their bytes don't have, so they're not even
 # read; row 3's f, dropped, is all it differs by, so it's read and left; 1 and 2 have a b, and 11 goes)
 # (altered: al, nul, u and gen; made again: retyped, cmt, and fresh_dep, whose default and check
-# went with the sequence and function the first root hasn't)
-like($stats, qr/^tables 4 deleted 3 inserted 2 sequences 0 made 3 dropped 0 altered 4 kept 1$/,
+# went with the sequence and function the first root hasn't; dropped: newt)
+like($stats, qr/^tables 4 deleted 3 inserted 2 sequences 0 made 3 dropped 1 altered 4 kept 1$/,
 	"al altered and its rows only the alter rewrote left as they are; retyped made again: $stats");
 is(sql($places), $placed, 'those rows where they were, not written again');
 is(oid_of('app.al'), $al, 'the altered table is the same table');
@@ -160,7 +163,7 @@ is(sql(q{SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute WHERE
 	'id,a,c,d,b', "its columns as the first root has them, the one dropped from it added at the end");
 
 %oids = map { $_ => oid_of("app.$_") } qw(nul fresh_dep u uref cmt gen);
-$stats = move_to($b, 'to the second');
+$stats = move_to($b, 'to the second', 14);
 is(oid_of('app.nul'), $oids{nul}, 'a table given a column and no other change is altered');
 sql(q{INSERT INTO app.nul VALUES (2, 'two', 2)});
 is(capture_root(), read_root(), 'and capture, told of its layout though its rows were not written, has what is written to it after');
@@ -173,10 +176,13 @@ is(sql(q{SELECT c FROM app.vc ORDER BY 1 LIMIT 1}), '1', 'a view that named one 
 is(sql(q{SELECT col_description('app.al'::regclass, attnum) FROM pg_attribute WHERE attrelid = 'app.al'::regclass AND attname = 'd'}),
 	'cee', 'a column renamed keeps its comment');
 is(sql(q{SELECT has_column_privilege('reader', 'app.al', 'd', 'SELECT')}), 't', 'and its grant');
+is(sql(q{SELECT pg_get_serial_sequence('app.newt', 'id')}), 'app.newt_id_seq', "a new table's serial has its sequence owned by it");
+is(sql(q{SELECT d.refobjid::regclass FROM pg_depend d WHERE d.objid = 'app.kept_seq'::regclass AND d.deptype = 'a'}),
+	'app.nul', 'and a new sequence owned by a table kept is owned by it');
 # (rows 1 and 2 differ only by b, dropped, so they're left; 3 has an f, and 11 comes back)
-# (altered: al, nul, fresh_dep, u and gen, fresh_dep's new row put in and its sequence set; made again:
-# retyped and cmt)
-like($stats, qr/^tables 5 deleted 1 inserted 3 sequences 1 made 2 dropped 0 altered 5 kept 2$/, "and back again: $stats");
+# (altered: al, nul, fresh_dep, u and gen, fresh_dep's new row put in; made: retyped and cmt again,
+# and newt, its sequence and fresh_dep's set)
+like($stats, qr/^tables 5 deleted 1 inserted 3 sequences 2 made 3 dropped 0 altered 5 kept 2$/, "and back again: $stats");
 is(oid_of('app.al'), $al, 'the same table still');
 unlike(slurp_file($node->logfile, $log_at), qr/user code ran/, 'and no trigger ran');
 

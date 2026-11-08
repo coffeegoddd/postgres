@@ -138,16 +138,30 @@ named_beyond(const WsTableSchema *s, const char *name)
 
 /* Whether a type a column is to be added as is one that adding it with every row null can be. */
 static bool
-addable_type(const char *type)
+addable_type(const char *type, const char *const *domains, int ndomains)
 {
 	Oid			typid;
 	int32		typmod;
 	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	char	   *bare = pstrdup(type);
+	char	   *cut = strchr(bare, '[');
+	bool		addable;
 
-	/* (one not made yet may be a domain, whose checks adding it would run on each row) */
-	if (!parseTypeString(type, &typid, &typmod, (Node *) &escontext))
-		return false;
-	return get_typtype(typid) != TYPTYPE_DOMAIN;
+	/* (a domain of the target's, or an array of one, which what's here of its name may not be yet) */
+	if (cut != NULL)
+		*cut = '\0';
+	for (int i = 0; i < ndomains; i++)
+		if (strcmp(bare, quote_identifier(domains[i])) == 0)
+		{
+			pfree(bare);
+			return false;
+		}
+	pfree(bare);
+
+	/* (one not made yet may be a domain too, whose checks adding it would run on each row) */
+	addable = parseTypeString(ws_text_from_utf8(type), &typid, &typmod, (Node *) &escontext) &&
+		get_typtype(typid) != TYPTYPE_DOMAIN;
+	return addable;
 }
 
 /* All of a record but its columns, key, constraints, indexes and storage parameters, as bytes. */
@@ -174,7 +188,8 @@ options_same(const WsTableSchema *a, const WsTableSchema *b)
 }
 
 bool
-move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related)
+move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related, const char *const *domains,
+			   int ndomains)
 {
 	Buf			a = BUF_INIT,
 				b = BUF_INIT;
@@ -195,6 +210,20 @@ move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related)
 		if (named_in(to, from->indexes[i].name) && !index_same(to, &from->indexes[i]) &&
 			(named_beyond(from, from->indexes[i].name) || named_beyond(to, from->indexes[i].name)))
 			return false;
+
+	/* (a not-null constraint renamed to what another of this table's is named now: it isn't free yet) */
+	for (int i = 0; i < to->ncols; i++)
+	{
+		const char *name = to->cols[i].not_null;
+
+		if (name == NULL)
+			continue;
+		for (int k = 0; k < from->ncols; k++)
+			if (from->cols[k].tag != to->cols[i].tag && text_same(from->cols[k].not_null, name))
+				return false;
+		if (named_in(from, name))
+			return false;
+	}
 
 	/* (the spare names renames go through are no column's) */
 	for (int i = 0; i < from->ncols; i++)
@@ -242,7 +271,7 @@ move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related)
 
 		if (at < 0)
 		{
-			if (t->kind != WS_COL_STORED || t->identity != WS_IDENTITY_NONE || !addable_type(t->type))
+			if (t->kind != WS_COL_STORED || t->identity != WS_IDENTITY_NONE || !addable_type(t->type, domains, ndomains))
 				return false;
 			added = true;
 			continue;
@@ -286,7 +315,7 @@ put_name(const char *utf8, Buf *out)
 }
 
 void
-move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char *schema)
+move_alter_drop(const WsTableSchema *from, const WsTableSchema *to, const char *schema)
 {
 	Buf			sql = BUF_INIT;
 
@@ -385,6 +414,14 @@ move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char
 		put_name(to->key_name, &sql);
 		run_sql(&sql);
 	}
+	buf_free(&sql);
+}
+
+void
+move_alter_add(const WsTableSchema *from, const WsTableSchema *to, const char *schema)
+{
+	Buf			sql = BUF_INIT;
+
 
 	/* the columns it adds, at the end, null in each row; then defaults, which change no row */
 	for (int i = 0; i < to->ncols; i++)

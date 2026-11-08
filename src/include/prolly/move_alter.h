@@ -9,16 +9,17 @@
  * constraints and indexes, renaming its key, and setting its storage parameters.  Anything else
  * has it made again: a column retyped or moved; a generated or identity column changed or added;
  * a column added of a domain, which adding with every row null would check, or of a type not made
- * yet, which may be one; its key, partitioning, inheritance, comments, owner, grants or any other
+ * yet, which may be one (domains names the target's); a not-null constraint renamed to a name
+ * another constraint of the table has; its key, partitioning, inheritance, comments, owner, grants or any other
  * setting changed, an index's own among them; an index or constraint made again that has settings,
  * a comment, or is the replica identity's or clustered on; a table with no key whose columns
  * changed; or one that is partitioned, a partition, or inherits or is inherited from, which
  * related says.  A column retyped rewrites every row either way, and Postgres refuses to retype one that
  * a view or rule uses.
  *
- * What's done is in two halves, around the rows being written: before, what the rows need
- * the table to be (its columns, with nothing they'd be refused by that the target doesn't have
- * too); after, what needs the rows (not-null constraints, constraints and indexes the target
+ * What's done is in three parts: before the target's new objects are made, what it drops and
+ * renames, which may free the names they take; then what the rows need the table to be (its
+ * columns added, and defaults), which may use those objects; and after the rows, what needs them (not-null constraints, constraints and indexes the target
  * adds, and storage parameters).  Then the table is read again, and anything but the target's
  * record is an error.
  *
@@ -33,8 +34,10 @@
 
 #include "prolly/ws/ws_schema.h"
 
-extern bool move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related);
-extern void move_alter_before(const WsTableSchema *from, const WsTableSchema *to, const char *schema);
+extern bool move_alterable(const WsTableSchema *from, const WsTableSchema *to, bool related,
+						   const char *const *domains, int ndomains);
+extern void move_alter_drop(const WsTableSchema *from, const WsTableSchema *to, const char *schema);
+extern void move_alter_add(const WsTableSchema *from, const WsTableSchema *to, const char *schema);
 extern void move_alter_after(const WsTableSchema *from, const WsTableSchema *to, const char *schema);
 
 /* An error if the table isn't now as the record has it. */

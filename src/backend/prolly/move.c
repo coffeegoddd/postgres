@@ -575,6 +575,8 @@ drop_keys_to_altered(ProllyCtx *ctx, const char *schema, const PHash *from, cons
 			pfree(table);
 			pfree(name);
 		}
+	for (int f = 0; f < n; f++)
+		ws_fk_free(&fks[f]);
 	buf_free(&sql);
 }
 
@@ -763,9 +765,18 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		bool	   *altered_had = palloc0_array(bool, Max(had.n, 1));
 		char	  **related = NULL;
 		int			nrelated = 0;
+		char	  **domains;
+		int			ndomains = 0;
+		MoveObjects ob;
 
 		find_related(ctx, &from, &had, &related, &nrelated);
 		find_related(ctx, to, &has, &related, &nrelated);
+		objects_of(ctx, to, &ob);
+		domains = palloc_array(char *, Max(ob.n, 1));
+		for (int i = 0; i < ob.n; i++)
+			if (ob.objs[i].kind == WS_OBJ_DOMAIN)
+				domains[ndomains++] = pstrdup(ob.objs[i].name);
+		objects_free(&ob);
 		for (int i = 0; i < has.n; i++)
 		{
 			bool		kept = false;
@@ -785,7 +796,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 				if (!WsRoot->get_table(ctx, &from, had.names[k], &was[i], &rows) ||
 					!WsRoot->get_table(ctx, to, has.names[i], &want[i], &rows))
 					elog(ERROR, "a root's table \"%s\" is gone", has.names[i]);
-				altered[i] = move_alterable(&was[i], &want[i], in_tree);
+				altered[i] = move_alterable(&was[i], &want[i], in_tree, (const char *const *) domains, ndomains);
 				altered_had[k] = altered[i];
 				gone[i] = !altered[i];
 			}
@@ -794,16 +805,22 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		drop_what_changed(ctx, schema, to, &has, gone, was, altered);
 		CommandCounterIncrement();
 
-		/* (what the target adds that tables use, before a table altered uses it) */
-		WsRootIO->restore_missing(ctx, to, &from, schema, true);
-		CommandCounterIncrement();
+		/* (what alters drop first, as what the target adds may take a name they free) */
 		drop_keys_to_altered(ctx, schema, &from, &has, was, want, altered);
 		for (int i = 0; i < has.n; i++)
 			if (altered[i])
 			{
-				move_alter_before(&was[i], &want[i], schema);
+				move_alter_drop(&was[i], &want[i], schema);
 				stats->altered++;
 			}
+		CommandCounterIncrement();
+
+		/* (what the target adds that tables use, before a table altered uses it) */
+		WsRootIO->restore_missing(ctx, to, &from, schema, true);
+		CommandCounterIncrement();
+		for (int i = 0; i < has.n; i++)
+			if (altered[i])
+				move_alter_add(&was[i], &want[i], schema);
 		CommandCounterIncrement();
 
 		pfree(altered_had);

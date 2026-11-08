@@ -580,6 +580,44 @@ objects_there(const WsObject *objs, int nobjs, const char *schema)
 	return there;
 }
 
+/* Which of a root's objects the previous root has as they are. */
+static bool *
+objects_as_before(ProllyCtx *ctx, const WsObject *objs, int nobjs, const PHash *previous)
+{
+	PHash		map;
+	WsObject   *was = NULL;
+	int			nwas = 0;
+	bool	   *same = palloc0_array(bool, Max(nobjs, 1));
+
+	if (previous != NULL && WsRoot->get_map(ctx, previous, WS_ROOT_OBJECTS, &map))
+		ws_obj_list(ctx, &map, &was, &nwas);
+	for (int i = 0; i < nobjs; i++)
+	{
+		Buf			k = BUF_INIT,
+					v = BUF_INIT;
+
+		WsObjectCodec->encode_key(&objs[i], &k);
+		WsObjectCodec->encode_value(&objs[i], &v);
+		for (int w = 0; !same[i] && w < nwas; w++)
+		{
+			Buf			kw = BUF_INIT,
+						vw = BUF_INIT;
+
+			WsObjectCodec->encode_key(&was[w], &kw);
+			WsObjectCodec->encode_value(&was[w], &vw);
+			same[i] = kw.len == k.len && memcmp(kw.data, k.data, k.len) == 0 &&
+				vw.len == v.len && memcmp(vw.data, v.data, v.len) == 0;
+			buf_free(&kw);
+			buf_free(&vw);
+		}
+		buf_free(&k);
+		buf_free(&v);
+	}
+	for (int w = 0; w < nwas; w++)
+		ws_obj_free(&was[w]);
+	return same;
+}
+
 /*
  * Restoring: all of it; with fn, only what restore_rows says, then fn; with no_rows, all
  * of it, each table holding that, or if definitions_only, what restore_definitions says;
@@ -604,6 +642,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	bool	   *table_made = NULL;
 	bool		roles_same = false;
 	bool	   *obj_made = NULL;
+	bool	   *obj_finished = NULL;
 	WsTableSchema *made_recs;
 	int			nmade = 0;
 
@@ -632,8 +671,10 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 
 not_empty:
 
-	/* (roles are as they were when a schema kept has the same as before) */
-	if (missing && previous != NULL)
+	/* (roles are as they were when a schema kept has the same as before, or were made first) */
+	if (missing && !before_tables_only)
+		roles_same = true;
+	else if (missing && previous != NULL)
 	{
 		PHash		before;
 		bool		had = WsRoot->get_map(ctx, previous, WS_ROOT_ROLES, &before);
@@ -700,9 +741,22 @@ not_empty:
 		}
 	if (missing)
 	{
-		obj_made = objects_there(objs, nobjs, schema);
+		bool	   *there = objects_there(objs, nobjs, schema);
+		bool	   *before = objects_as_before(ctx, objs, nobjs, previous);
+
+		/*
+		 * (what isn't there is made; and what the first part made, there now and not as before, is
+		 * seen to after tables as what's made is, being owned by a column, and remembered)
+		 */
+		obj_made = palloc_array(bool, Max(nobjs, 1));
+		obj_finished = palloc_array(bool, Max(nobjs, 1));
 		for (int i = 0; i < nobjs; i++)
-			obj_made[i] = !obj_made[i];
+		{
+			obj_made[i] = !there[i];
+			obj_finished[i] = !there[i] || !before[i];
+		}
+		pfree(there);
+		pfree(before);
 	}
 	ws_obj_restore_some(objs, nobjs, obj_made, schema, true);
 	if (before_tables_only)
@@ -851,7 +905,7 @@ not_empty:
 			run_statement(&sql);
 		}
 	}
-	ws_obj_restore_some(objs, nobjs, obj_made, schema, false);
+	ws_obj_restore_some(objs, nobjs, obj_finished, schema, false);
 	for (int t = 0; t < tables.n; t++)
 	{
 		if (!table_made[tables.order[t]])
@@ -877,7 +931,7 @@ not_empty:
 		int			n = 0;
 
 		for (int i = 0; i < nobjs; i++)
-			if (obj_made[i])
+			if (obj_finished[i])
 				made[n++] = objs[i];
 		ws_obj_remember(made, n, schema);
 		pfree(made);
