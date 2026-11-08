@@ -20,6 +20,7 @@
 #include "access/toast_internals.h"
 #include "common/int.h"
 #include "common/pg_lzcompress.h"
+#include "prolly/branch_toast.h"
 #include "utils/expandeddatum.h"
 #include "utils/rel.h"
 
@@ -377,7 +378,8 @@ toast_fetch_datum(varlena *attr)
 	/*
 	 * Open the toast relation and its indexes
 	 */
-	toastrel = table_open(toastrelid, AccessShareLock);
+	/* (on a branch, its copy of the TOAST relation the value names) */
+	toastrel = table_open(BranchToast->to_read(toastrelid), AccessShareLock);
 
 	/* Fetch all chunks */
 	table_relation_fetch_toast_slice(toastrel, valueid,
@@ -461,7 +463,8 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 		return result;			/* Can save a lot of work at this point! */
 
 	/* Open the toast relation */
-	toastrel = table_open(toastrelid, AccessShareLock);
+	/* (on a branch, its copy of the TOAST relation the value names) */
+	toastrel = table_open(BranchToast->to_read(toastrelid), AccessShareLock);
 
 	/* Fetch all chunks */
 	table_relation_fetch_toast_slice(toastrel, valueid,

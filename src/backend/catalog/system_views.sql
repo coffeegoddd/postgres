@@ -1664,6 +1664,18 @@ CREATE TABLE pg_history.branches (
 	id integer NOT NULL UNIQUE CHECK (id > 0)
 );
 
+-- Each TOAST relation a branch's copy shares the pages of another's, with
+-- that other, its source: a value stored out of line on a page they share
+-- names the source, and is read on the branch from the copy.  A source
+-- dropped, its copies have its own sources too, as their pages may name
+-- those.
+CREATE TABLE pg_history.toast_copies (
+	copy oid NOT NULL,
+	source oid NOT NULL,
+	PRIMARY KEY (copy, source)
+);
+CREATE INDEX toast_copies_source ON pg_history.toast_copies (source);
+
 -- The bundles of history pushed to the tier: a row a bundle, which holds
 -- its roots there (pg_history_push and pg_history_release make and delete
 -- them).

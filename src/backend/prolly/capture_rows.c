@@ -138,6 +138,7 @@ CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot snapshot, C
 	TupleTableSlot *slot;
 	TableScanDesc scan;
 	int			scope;
+	int			branch_level;
 
 	for (int i = 0; i < shape->nstored; i++)
 	{
@@ -162,6 +163,9 @@ CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot snapshot, C
 			elog(ERROR, "\"%s\" has no column of tag " UINT64_FORMAT, RelationGetRelationName(rel), shape->tags[i]);
 	}
 	scope = WsSql->begin();
+
+	/* (on the table's branch, as a value stored out of line is read from its copy of the TOAST relation) */
+	branch_level = CatalogBranchEnter(NamespaceBranch(RelationGetNamespace(rel)));
 	slot = table_slot_create(rel, NULL);
 	scan = table_beginscan(rel, snapshot, 0, NULL, SO_NONE);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
@@ -181,6 +185,7 @@ CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot snapshot, C
 	}
 	table_endscan(scan);
 	ExecDropSingleTupleTableSlot(slot);
+	CatalogBranchLeave(branch_level);
 	WsSql->end(scope);
 	MemoryContextDelete(row_cxt);
 	pfree(at);

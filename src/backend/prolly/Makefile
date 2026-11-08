@@ -23,6 +23,7 @@ OBJS = \
 	branch_filter.o \
 	branch_link.o \
 	branch_ops.o \
+	branch_toast.o \
 	branch_tables.o \
 	capture.o \
 	capture_barrier.o \

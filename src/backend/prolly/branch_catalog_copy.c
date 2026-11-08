@@ -122,6 +122,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_toast.h"
 #include "prolly/capture.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -2117,6 +2118,9 @@ make_storage(CopyState *cs)
 								RelationGetRelationName(src)),
 						 errdetail("Its storage isn't block-mapped.")));
 			(void) RelationCreateStorageShared(dst->rd_locator, RelationGetSmgr(src), true);
+			/* (its values, on the pages it shares, name the source's id) */
+			if (src->rd_rel->relkind == RELKIND_TOASTVALUE)
+				BranchToast->copied(newoid, obj.oid);
 			relation_close(dst, NoLock);
 			relation_close(src, NoLock);
 			continue;

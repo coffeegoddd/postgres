@@ -68,6 +68,7 @@
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_toast.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_tier.h"
@@ -1885,6 +1886,10 @@ heap_drop_with_catalog(Oid relid)
 	}
 	else if (RelationIsChunkIndex(rel))
 		ChunkTierCheckIndex(rel, "drop");
+
+	/* (prolly: a TOAST relation that's a branch's copy of another's stops being one) */
+	if (rel->rd_rel->relkind == RELKIND_TOASTVALUE && !IsBootstrapProcessingMode())
+		BranchToast->dropped(relid);
 
 	/*
 	 * There can no longer be anyone *else* touching the relation, but we

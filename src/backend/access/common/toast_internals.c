@@ -23,6 +23,7 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "miscadmin.h"
+#include "prolly/branch_toast.h"
 #include "utils/fmgroids.h"
 #include "utils/injection_point.h"
 #include "utils/rel.h"
@@ -483,7 +484,8 @@ toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 	/*
 	 * Open the toast relation and its indexes
 	 */
-	toastrel = table_open(toast_ext_data.toastrelid, RowExclusiveLock);
+	/* (on a branch, its heap's own TOAST relation, whose pages hold the value too) */
+	toastrel = table_open(BranchToast->to_delete(rel, toast_ext_data.toastrelid), RowExclusiveLock);
 
 	/* Fetch valid relation used for process */
 	validIndex = toast_open_indexes(toastrel,
