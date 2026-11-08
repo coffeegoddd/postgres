@@ -14,6 +14,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $node = PostgreSQL::Test::Cluster->new('branch_checkout');
 $node->init;
@@ -72,21 +73,17 @@ is($s->query_safe('SHOW catalog_branch'), $feat, 'a checkout in a function stand
 is(in_use($main) . in_use($feat), 'ft', 'and what another can tell is where the session is');
 $s->query_safe(q{SELECT test_branch_checkout('main')});
 
-# A function's own setting of the branch: in use while it runs, undone as it returns.
-$node->safe_psql('postgres', qq{SET catalog_branch = $main; CREATE FUNCTION app.on_feat() RETURNS boolean LANGUAGE sql
-	SET catalog_branch = $feat AS 'SELECT test_branch_in_use($main) IS NOT NULL'});
-my ($frc, $fout, $ferr) = $node->psql('postgres', qq{SET catalog_branch = $main; SELECT app.on_feat()});
-if ($frc == 0)
-{
-	$s->query_safe(q{SELECT app.on_feat()});
-	is($s->query_safe('SHOW catalog_branch'), $main, 'a function\'s own setting of the branch is undone as it returns');
-	is(in_use($main) . in_use($feat), 'tf', 'and what another can tell is where the session is');
-}
-else
-{
-	like($ferr, qr/catalog_branch/, 'a function can\'t set the branch itself');
-	pass('and so leaves nothing to undo');
-}
+# A function's own setting of the branch: on it while it runs, undone as it returns.
+$node->safe_psql('postgres', qq{SET catalog_branch = $main; CREATE FUNCTION public.on_feat() RETURNS text LANGUAGE sql
+	SET catalog_branch = $feat AS 'SELECT current_setting(''catalog_branch'')'});
+is($s->query_safe(q{SELECT public.on_feat()}), $feat, 'a function\'s own setting of the branch puts it there while it runs');
+is($s->query_safe('SHOW catalog_branch'), $main, 'and is undone as it returns');
+is(in_use($main) . in_use($feat), 'tf', 'and what another can tell is where the session is');
+
+# Set for the transaction alone: committed, where the session goes back to.
+$s->query_safe(qq{BEGIN; SET LOCAL catalog_branch = $feat; COMMIT});
+is($s->query_safe('SHOW catalog_branch') . ':' . in_use($main) . in_use($feat), "$main:tf",
+	'a branch set for a transaction alone is let go of as it commits');
 
 # Reset: on the branch it resets to, and holding that.
 $s->query_safe(q{SELECT test_branch_checkout('feat')});
@@ -137,13 +134,22 @@ ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($feat)"), 
 # Leaving: the hold goes with the session, and with one ended in the middle of a transaction.
 $s->quit;
 ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($main)"), 'a session gone holds nothing');
+# (watched from a session begun before, as a new one could have the gone one's slot)
+my $watch = $node->background_psql('postgres');
 my $mid = $node->background_psql('postgres');
 $mid->query_safe(q{SELECT test_branch_checkout('main')});
 my $midpid = $mid->query_safe(q{BEGIN; SELECT test_branch_checkout('feat'); SELECT pg_backend_pid()});
 $node->safe_psql('postgres', "SELECT pg_terminate_backend($midpid)");
 eval { $mid->quit };
-ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($main) AND NOT test_branch_in_use($feat)"),
-	'and one ended in the middle of a transaction');
+my $free;
+for (1 .. 100)
+{
+	$free = $watch->query_safe("SELECT test_branch_in_use($main)::text || test_branch_in_use($feat)::text");
+	last if $free eq 'falsefalse';
+	usleep(100_000);
+}
+is($free, 'falsefalse', 'and one ended in the middle of a transaction');
+$watch->quit;
 
 # The database's default branch, and a connection's own.
 $node->safe_psql('postgres', q{ALTER DATABASE postgres SET default_branch = 'feat'});

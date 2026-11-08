@@ -8,8 +8,9 @@
  * and the one the session would be on were its transaction to abort: what it
  * was as the transaction began, which only a commit or prepare moves on.
  * Whatever else a transaction may yet return to, by a savepoint rolled back or
- * a function's setting undone, was set by a checkout in it, which holds that
- * branch's lock until the transaction ends.  A checkout takes the branch's
+ * a function's setting undone, was set in it: by a checkout, which holds that
+ * branch's lock until the transaction ends, or by setting catalog_branch
+ * itself, which holds nothing, as below.  A checkout takes the branch's
  * lock, a database object lock of pg_database's class on its number with
  * sub-id 2 (its catalogs' lock has sub-id 1), in a mode only a change taking
  * the branch from its sessions conflicts with, and sets catalog_branch while
@@ -17,8 +18,9 @@
  * conflicts, which it holds to its transaction's end, and then reads the
  * slots: a checkout in a transaction still open holds the lock, one done is in
  * its slot, and one that comes after waits.  A session that sets
- * catalog_branch itself takes no lock, so it may land on a branch just being
- * taken, and then finds it gone, as it would a schema dropped under it.
+ * catalog_branch itself, directly or in a function's SET clause, takes no
+ * lock, so it may land on a branch being taken, or return to one taken
+ * meanwhile, and then finds it gone, as it would a schema dropped under it.
  *
  * Whether a transaction has written to a versioned schema is told by the
  * locks it holds: a write, or a change of an object, takes its relation's
@@ -47,6 +49,7 @@
 #include "storage/shmem.h"
 #include "storage/proc.h"
 #include "utils/guc.h"
+#include "utils/guc_tables.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 
@@ -138,15 +141,41 @@ BranchCheckoutNote(int32 branch)
 		pg_atomic_write_u32(&mine->base, (uint32) branch);
 }
 
-/* (at a commit or prepare, what it's on is what it would return to; its own settings undone after) */
+/*
+ * The catalog branch the session is on once its top transaction commits: what catalog_branch has
+ * now, but for what only the transaction set (SET LOCAL, or a SET then a SET LOCAL), which its
+ * commit undoes after its locks are let go of.
+ */
+static int32
+branch_after_commit(void)
+{
+	struct config_generic *conf = find_option("catalog_branch", false, true, ERROR);
+	GucStack   *st = conf != NULL ? conf->stack : NULL;
+
+	if (st == NULL)
+		return catalog_branch;
+	switch (st->state)
+	{
+		case GUC_SAVE:
+		case GUC_LOCAL:
+			return st->prior.val.intval;
+		case GUC_SET_LOCAL:
+			return st->masked.val.intval;
+		case GUC_SET:
+			break;
+	}
+	return catalog_branch;
+}
+
+/* (at a commit or prepare, where it'll be is what it would return to) */
 static void
 checkout_xact_callback(XactEvent event, void *arg)
 {
 	CheckoutSlot *mine = my_slot();
 
-	if (mine != NULL &&
-		(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PREPARE))
-		pg_atomic_write_u32(&mine->base, pg_atomic_read_u32(&mine->branch));
+	if (mine != NULL && (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+						 event == XACT_EVENT_PREPARE))
+		pg_atomic_write_u32(&mine->base, (uint32) branch_after_commit());
 }
 
 /* (a backend exiting is on no branch, whatever its abort, which comes after, sets) */
