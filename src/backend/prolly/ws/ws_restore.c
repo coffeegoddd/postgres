@@ -1052,13 +1052,16 @@ make_dry_run_schema(const char *schema)
 {
 	WsSqlRows	rows;
 	char	   *sql;
+	int			level;
 
 	(void) NamespaceCreateOnBranch(schema, GetUserId(), false, VersionedNamespaceBranch(schema));
 	CommandCounterIncrement();
+	level = WsSql->begin();
 	sql = psprintf("GRANT ALL ON SCHEMA %s TO PUBLIC", quote_identifier(schema));
 	WsSql->run(sql, 0, NULL, &rows);
 	ws_sql_rows_free(&rows);
 	pfree(sql);
+	WsSql->end(level);
 }
 
 static void

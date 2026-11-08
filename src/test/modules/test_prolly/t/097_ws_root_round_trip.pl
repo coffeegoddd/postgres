@@ -311,24 +311,24 @@ is($rc, 0, 'a dry run by a role with no right to make schemas runs') or diag($er
 like($out, qr/^nothing$/m, 'and goes through');
 like($out, qr/^g_small$/m, 'and is as that role after');
 
-# nothing of it runs as anyone but who asked: not an event trigger on what it does
+# nothing of it runs as anyone, not an event trigger on what it does, which runs as who asked for
+# what is done by hand
 my $superuser = $node->safe_psql('postgres', 'SELECT current_user');
 ($rc, $out, $err) = in_one_session(q{
 	CREATE FUNCTION public.who_ran() RETURNS event_trigger LANGUAGE plpgsql AS $$
-	BEGIN RAISE NOTICE 'ran as %', current_user; END $$;
+	BEGIN RAISE NOTICE 'ran as % for %', current_user, tg_tag; END $$;
 	CREATE EVENT TRIGGER who_ran ON ddl_command_end EXECUTE FUNCTION public.who_ran();
+	ALTER EVENT TRIGGER who_ran ENABLE ALWAYS;
 	SELECT test_ws_root_capture('dr') AS r \gset
 	SET ROLE g_small;
 	SELECT coalesce(test_ws_root_refused(:'r'), 'nothing');
+	CREATE TEMP TABLE by_hand (a integer);
 	RESET ROLE;
 	DROP EVENT TRIGGER who_ran;
 });
 is($rc, 0, 'a dry run under an event trigger runs') or diag($err);
-like($err, qr/ran as g_small/, 'which fires as who asked');
-my @ran = $err =~ /ran as (\S+)/g;
-my $during = grep { $_ eq 'g_small' } @ran;
-ok($during > 0, 'it fired during the run');
-is(scalar(grep { $_ ne 'g_small' } @ran), 0, 'as no one else');
+my @ran = $err =~ /ran as (\S+ for [^\n]*)/g;
+is_deeply(\@ran, ['g_small for CREATE TABLE'], 'it fires for what is done by hand, as who asked, and not during the run');
 
 # what a role's index is made of runs as that role, not whoever restores it
 ($rc, $out, $err) = in_one_session(q{
