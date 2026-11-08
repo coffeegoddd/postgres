@@ -152,6 +152,29 @@ my ($after_ddl) = $out =~ /^(\d+)$/m;
 is(sql($after_ddl, q{SELECT to_regclass('app.late') IS NOT NULL}), 't', 'with the table it made, its changes taken');
 is(sql($main, q{SELECT to_regclass('app.late') IS NULL}), 't', 'which the parent, reset to its head, no longer has');
 
+# A writer that goes on to DDL as the branch waits for it: the branch gives way, and the writer's
+# transaction is never what fails.
+my $wd = $node->background_psql('postgres', on_error_stop => 0);
+$wd->query_safe(on($main));
+$wd->query_safe(q{BEGIN; SET ROLE app_owner; INSERT INTO app.t VALUES (9001, 'then DDL', NULL)});
+my $wdpid = $wd->query_safe('SELECT pg_backend_pid()');
+$maker = $node->background_psql('postgres', on_error_stop => 0);
+$maker->query_safe(on($main));
+$maker->query_until(qr/started/, "\\echo started\nSELECT test_branch_create('gave_way', 'main');\n\\echo made\n");
+ok($node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity
+	WHERE query LIKE 'SELECT test_branch_create%' AND $wdpid = ANY (pg_blocking_pids(pid))}),
+	'a branch waits for a writer open on its parent');
+$wd->query_safe(q{CREATE INDEX t_late ON app.t (id, v)});
+is($wd->{stderr}, '', 'which goes on to DDL, and isn\'t what fails');
+$wd->query_safe('COMMIT');
+$wd->quit;
+$out = $maker->query_until(qr/made/, '');
+is($maker->{stderr}, '', 'and the branch is made once it commits');
+$maker->quit;
+my ($gave_way) = $out =~ /^(\d+)$/m;
+is(sql($gave_way, q{SELECT count(*) FROM pg_class WHERE relname = 't_late'}) . sql($main, q{SELECT count(*) FROM pg_class WHERE relname = 't_late'}),
+	'01', 'at the head, the index the writer made left on the parent as its change');
+
 # Refused.
 my ($rc, $err);
 sql($main, q{SET ROLE app_owner; INSERT INTO app.t VALUES (8001, 'big', repeat(md5('x'), 300))});

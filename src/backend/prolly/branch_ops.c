@@ -36,23 +36,20 @@
  */
 #include "postgres.h"
 
-#include "executor/executor.h"
-#include "storage/lockdefs.h"
-#include "access/stratnum.h"
-#include "utils/fmgroids.h"
-#include "utils/snapmgr.h"
-#include "utils/guc.h"
-#include "utils/acl.h"
-#include "executor/tuptable.h"
-#include "access/tableam.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/stratnum.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_link.h"
@@ -67,11 +64,20 @@
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
+#include "utils/snapmgr.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 /* What the parent's writers are held off for: the branch, and how long a lock is waited for. */
 typedef struct Holding
@@ -102,37 +108,53 @@ refuse_values_out_of_line(Oid table, Oid toast)
 				 errdetail("A value stored out of line is named by its TOAST table's object id, which a branch's copy doesn't have.")));
 }
 
-/*
- * Each table, materialized view and sequence of a branch's schemas, its owner's to share, locked so
- * that its writers are waited out and held off, with VACUUM and whatever else changes its pages,
- * and so its TOAST table and every index: in order of their ids, as what else locks more than one
- * does, waiting at most the time given.
- */
-static void
-lock_writers_out(void *arg)
+/* (each index of a relation, as the catalogs have them now) */
+static List *
+indexes_of(Relation pg_index, Oid relid, List *rels)
 {
-	Holding    *h = arg;
-	List	   *nsps = NIL;
-	List	   *tables = NIL;
-	List	   *rels = NIL;
-	Relation	rel;
+	ScanKeyData key;
 	SysScanDesc scan;
 	HeapTuple	tup;
-	int			nest;
 
+	ScanKeyInit(&key, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_index, IndexIndrelidIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		rels = lappend_oid(rels, ((Form_pg_index) GETSTRUCT(tup))->indexrelid);
+	systable_endscan(scan);
+	return rels;
+}
+
+/*
+ * Each table, materialized view and sequence of a branch's schemas, its owner's to share, with its
+ * TOAST table and every index of either, in order of their ids, as the catalogs have them now; and
+ * the TOAST tables in toasts, each after its table in tables.
+ */
+static List *
+relations_of(int32 branch, List **tables, List **toasts)
+{
+	List	   *nsps = NIL;
+	List	   *rels = NIL;
+	Relation	rel;
+	Relation	pg_index;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	*tables = NIL;
+	*toasts = NIL;
 	rel = table_open(NamespaceRelationId, AccessShareLock);
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
 
-		if (ns->nspbranch == h->branch)
+		if (ns->nspbranch == branch)
 			nsps = lappend_oid(nsps, ns->oid);
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
 	rel = table_open(RelationRelationId, AccessShareLock);
+	pg_index = table_open(IndexRelationId, AccessShareLock);
 	foreach_oid(nsp, nsps)
 	{
 		ScanKeyData key;
@@ -143,54 +165,129 @@ lock_writers_out(void *arg)
 		{
 			Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-			if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW ||
-				c->relkind == RELKIND_SEQUENCE)
+			if (c->relkind != RELKIND_RELATION && c->relkind != RELKIND_MATVIEW &&
+				c->relkind != RELKIND_SEQUENCE)
+				continue;
+			if (!object_ownercheck(RelationRelationId, c->oid, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(c->relkind), NameStr(c->relname));
+			rels = indexes_of(pg_index, c->oid, lappend_oid(rels, c->oid));
+			if (OidIsValid(c->reltoastrelid))
 			{
-				if (!object_ownercheck(RelationRelationId, c->oid, GetUserId()))
-					aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(c->relkind), NameStr(c->relname));
-				tables = lappend_oid(tables, c->oid);
+				rels = indexes_of(pg_index, c->reltoastrelid, lappend_oid(rels, c->reltoastrelid));
+				*tables = lappend_oid(*tables, c->oid);
+				*toasts = lappend_oid(*toasts, c->reltoastrelid);
 			}
 		}
 		systable_endscan(scan);
 	}
+	table_close(pg_index, AccessShareLock);
 	table_close(rel, AccessShareLock);
-
-	/* (the lock's wait bounded, as the barrier's is) */
-	nest = NewGUCNestLevel();
-	if (h->timeout_ms > 0 && (LockTimeout == 0 || LockTimeout > h->timeout_ms))
-	{
-		char		ms[32];
-
-		snprintf(ms, sizeof(ms), "%d", h->timeout_ms);
-		(void) set_config_option("lock_timeout", ms, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-	}
-	list_sort(tables, list_oid_cmp);
-	foreach_oid(relid, tables)
-	{
-		Relation	r;
-		Oid			toast;
-
-		LockRelationOid(relid, ExclusiveLock);
-		r = relation_open(relid, NoLock);
-		toast = r->rd_rel->reltoastrelid;
-		rels = list_concat(rels, RelationGetIndexList(r));
-		relation_close(r, NoLock);
-		if (OidIsValid(toast))
-		{
-			LockRelationOid(toast, ExclusiveLock);
-			r = relation_open(toast, NoLock);
-			rels = list_concat(rels, RelationGetIndexList(r));
-			relation_close(r, NoLock);
-			refuse_values_out_of_line(relid, toast);
-		}
-	}
+	list_free(nsps);
 	list_sort(rels, list_oid_cmp);
+	return rels;
+}
+
+/*
+ * The parent held: its DDL and its commits waited out and held off (its catalogs' lock, and its
+ * head's), and each of its relations locked so that its writers are waited out and held off, with
+ * VACUUM and whatever else changes its pages.  A transaction of the parent's can take these in any
+ * order, a write and then DDL, so no order of taking them rules out a deadlock: so each is waited
+ * for at most half of what would find one, and past that all taken so far are let go of, giving
+ * way, and taken again, until the time given is up.  A relation dropped or made meanwhile is found
+ * as they're taken again.
+ */
+static bool
+hold_try(Holding *h)
+{
+	List	   *tables;
+	List	   *toasts;
+	List	   *rels;
+	List	   *again;
+	List	   *t2;
+	List	   *x2;
+	bool		same;
+
+	LockBranchCatalogs(h->branch, AccessExclusiveLock);
+	LockBranchHead(h->branch);
+	rels = relations_of(h->branch, &tables, &toasts);
 	foreach_oid(relid, rels)
 		LockRelationOid(relid, ExclusiveLock);
-	AtEOXact_GUC(true, nest);
-	list_free(tables);
+	again = relations_of(h->branch, &t2, &x2);
+	same = equal(rels, again);
+	if (same)
+	{
+		ListCell   *t;
+		ListCell   *x;
+
+		forboth(t, tables, x, toasts)
+			refuse_values_out_of_line(lfirst_oid(t), lfirst_oid(x));
+	}
 	list_free(rels);
-	list_free(nsps);
+	list_free(again);
+	return same;
+}
+
+static void
+lock_writers_out(void *arg)
+{
+	Holding    *h = arg;
+	TimestampTz start = GetCurrentTimestamp();
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	int			nest = NewGUCNestLevel();
+	char		quickly[32];
+
+	snprintf(quickly, sizeof(quickly), "%d", Max(DeadlockTimeout / 2, 1));
+	(void) set_config_option("lock_timeout", quickly, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	for (;;)
+	{
+		bool		held = false;
+		bool		gave_way = false;
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		PG_TRY();
+		{
+			held = hold_try(h);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *e;
+
+			MemoryContextSwitchTo(cxt);
+			e = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+			if (e->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+				ReThrowError(e);
+			FreeErrorData(e);
+			gave_way = true;
+		}
+		PG_END_TRY();
+		if (!gave_way)
+		{
+			if (held)
+			{
+				ReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(cxt);
+				CurrentResourceOwner = owner;
+				break;
+			}
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+		}
+		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), h->timeout_ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("could not hold off the writers of the branch being made from in time")));
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_CAPTURE_BARRIER);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	AtEOXact_GUC(true, nest);
 }
 
 typedef struct Told
@@ -340,20 +437,23 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" not found", from)));
 
-	/*
-	 * (the parent's DDL waited out and held off, as a table made meanwhile would have writers the
-	 * barrier doesn't hold off; and its head, as a commit writing it from a root taken before this
-	 * one's would leave it behind the working set)
-	 */
-	LockBranchCatalogs(parent, AccessExclusiveLock);
-	LockBranchHead(parent);
-
 	if (BranchLink->branch_of(name) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("a branch named \"%s\" already exists", name)));
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
-	if (vc_branch_get(&repo, name, &taken))
+
+	/*
+	 * (the parent at one point, its writers held off until this transaction ends; with its DDL and
+	 * its commits, as a table made meanwhile would have writers the barrier doesn't hold off, and a
+	 * commit writing its head from a root taken before this one's would leave the head behind the
+	 * working set: so the head is read once they're held off)
+	 */
+	holding.branch = parent;
+	holding.timeout_ms = timeout_ms;
+	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &holding, &root);
+
+	if (BranchLink->branch_of(name) != 0 || vc_branch_get(&repo, name, &taken))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("a branch named \"%s\" already exists", name)));
@@ -383,11 +483,6 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				 errmsg("commit %s is outside the window", hex),
 				 errhint("Attach the history it's in first.")));
 	}
-
-	/* (the parent at one point, its writers held off until this transaction ends) */
-	holding.branch = parent;
-	holding.timeout_ms = timeout_ms;
-	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &holding, &root);
 	target = take_changes ? root : at.root;
 
 	branch = BranchIds->allocate();
@@ -410,7 +505,6 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 	{
 		if (vc_checkout(&repo, name) != 0)
 			elog(ERROR, "could not check out branch \"%s\" of version control", name);
-		(void) vc_working_lock(&repo);
 		vc_set_working(&repo, &root);
 	}
 	BranchLink->link(name, branch);
