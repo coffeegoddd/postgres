@@ -47,8 +47,10 @@
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -240,6 +242,121 @@ CaptureLeftOut(void)
 	return TransactionIdIsValid(left_out) && TransactionIdIsCurrentTransactionId(left_out);
 }
 
+/*
+ * Once version control's own work is done, the transaction left out is sealed: what it would write
+ * after to a versioned table, or change of one's objects, would be in no branch's history, as capture
+ * leaves out all it writes, so it's refused.  (A transaction does one such work: a commit from
+ * capture refuses one that has written, and the second would take one.)  And as it commits, a table
+ * whose rows' layout changed is to have been told, and as it is.
+ */
+static TransactionId sealed = InvalidTransactionId;
+
+/* Each table told as a map in this transaction, by its object id, and its fingerprint as it was told. */
+typedef struct Told
+{
+	Oid			relid;
+	char	   *fingerprint;
+} Told;
+
+static HTAB *told = NULL;
+static bool told_callback = false;
+
+static bool
+sealed_now(void)
+{
+	return TransactionIdIsValid(sealed) && TransactionIdIsCurrentTransactionId(sealed);
+}
+
+void
+CaptureLeftOutSeal(void)
+{
+	if (CaptureLeftOut())
+		sealed = left_out;
+}
+
+void
+CaptureCheckWrite(Relation relation, const char *what)
+{
+	char		kind = relation->rd_rel->relkind;
+
+	if (sealed_now() && (kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+		NamespaceBranch(RelationGetNamespace(relation)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot %s versioned table \"%s\" in a transaction left out of capture",
+						what, RelationGetRelationName(relation)),
+				 errdetail("Its version control work is done, and what it wrote after would be in no branch's history."),
+				 errhint("Do it in a transaction of its own.")));
+}
+
+void
+CaptureCheckCatalogChange(void)
+{
+	if (sealed_now())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("cannot change a versioned schema's objects in a transaction left out of capture"),
+				 errdetail("Its version control work is done, and what it changed after would be in no branch's history."),
+				 errhint("Do it in a transaction of its own.")));
+}
+
+static void
+told_callback_fn(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
+		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
+		told = NULL;			/* (it's in the transaction's memory) */
+}
+
+static void
+told_note(Relation relation)
+{
+	MemoryContext was;
+	Told	   *t;
+	char	   *fingerprint = CaptureRowsFingerprint(RelationGetRelid(relation),
+												 relation->rd_rel->relfilenode);
+
+	if (!told_callback)
+	{
+		RegisterXactCallback(told_callback_fn, NULL);
+		told_callback = true;
+	}
+	if (told == NULL)
+	{
+		HASHCTL		ctl = {.keysize = sizeof(Oid), .entrysize = sizeof(Told), .hcxt = TopTransactionContext};
+
+		told = hash_create("tables told", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	t = hash_search(told, &(Oid) {RelationGetRelid(relation)}, HASH_ENTER, NULL);
+	was = MemoryContextSwitchTo(TopTransactionContext);
+	t->fingerprint = pstrdup(fingerprint);
+	MemoryContextSwitchTo(was);
+	pfree(fingerprint);
+}
+
+void
+CaptureCheckChanged(Oid relid, const char *fingerprint)
+{
+	Told	   *t;
+
+	if (!CaptureLeftOut())
+		return;
+	t = told == NULL ? NULL : hash_search(told, &relid, HASH_FIND, NULL);
+	if (t == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("table \"%s\" changed in a transaction left out of capture, and its rows weren't told",
+						get_rel_name(relid)),
+				 errdetail("A transaction left out of capture is to tell it the rows of each table whose layout it changes, and none was told for this one.")));
+	if (strcmp(t->fingerprint, fingerprint) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("table \"%s\" changed in a transaction left out of capture after its rows were told",
+						get_rel_name(relid)),
+				 errdetail("A transaction left out of capture tells it each table's rows as they commit."),
+				 errhint("Change it in a transaction of its own.")));
+}
+
 void
 CaptureLeaveOut(void)
 {
@@ -284,6 +401,7 @@ CaptureRowsAre(Relation relation, const PHash *map)
 	(void) LogLogicalMessage(CAPTURE_ROWS_ARE_PREFIX, out.data, out.len, true, false);
 	pfree(out.data);
 	ws_row_shape_free(&shape);
+	told_note(relation);
 
 	/* (the map is held for capture, which may get to it after whatever else held it lets it go) */
 	{

@@ -1005,6 +1005,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 
 	move_tables(ctx, schema, nsp, &from, to, true, stats);
 	list_free(locked);
+	CaptureLeftOutSeal();
 }
 
 static void

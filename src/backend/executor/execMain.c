@@ -57,6 +57,7 @@
 #include "parser/parse_relation.h"
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/capture.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -1082,6 +1083,9 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 {
 	Relation	resultRel = resultRelInfo->ri_RelationDesc;
 	FdwRoutine *fdwroutine;
+
+	/* (prolly: not a versioned table, once a transaction left out of capture is sealed) */
+	CaptureCheckWrite(resultRel, "write to");
 
 	/* Expect a fully-formed ResultRelInfo from InitResultRelInfo(). */
 	Assert(resultRelInfo->ri_needLockTagTuple ==

@@ -88,6 +88,7 @@
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/capture.h"
 #include "prolly/chunk_log.h"
 #include "prolly/ws/ws_tags.h"
 #include "rewrite/rewriteDefine.h"
@@ -2073,6 +2074,10 @@ ExecuteTruncateGuts(List *explicit_rels,
 			}
 		}
 	}
+
+	/* (prolly: none versioned, once a transaction left out of capture is sealed, cascaded to or not) */
+	foreach_ptr(RelationData, rel, rels)
+		CaptureCheckWrite(rel, "truncate");
 
 	/*
 	 * Check foreign key references.  In CASCADE mode, this should be
