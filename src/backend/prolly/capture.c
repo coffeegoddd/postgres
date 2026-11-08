@@ -347,7 +347,7 @@ CaptureCheckChanged(Oid relid, const char *fingerprint)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("table \"%s\" changed in a transaction left out of capture, and its rows weren't told",
 						get_rel_name(relid)),
-				 errdetail("A transaction left out of capture tells it the rows of each table whose layout it changes; what changed this one told it nothing.")));
+				 errdetail("A transaction left out of capture is to tell it the rows of each table whose layout it changes, and none was told for this one.")));
 	if (strcmp(t->fingerprint, fingerprint) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
