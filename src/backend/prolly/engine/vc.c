@@ -1098,6 +1098,12 @@ vc_branch_get(VcRepo *r, const char *name, VcBranch *out)
 	return branch_read(r, name, VC_REF_READ, out);
 }
 
+bool
+vc_branch_lock(VcRepo *r, const char *name, VcBranch *out)
+{
+	return branch_read(r, name, VC_REF_UPDATE, out);
+}
+
 void
 vc_branch_free(VcBranch *b)
 {
@@ -1248,6 +1254,31 @@ vc_branch_delete(VcRepo *r, const char *name)
 	found = vc_refs_remove(r->refs, ref);
 	pfree(ref);
 	return found ? VC_OK : VC_ERR;
+}
+
+int
+vc_branch_rename(VcRepo *r, const char *name, const char *to)
+{
+	VcBranch	b;
+	char	   *ref;
+	bool		added;
+
+	if (strcmp(name, r->cur) == 0 || strcmp(name, "main") == 0 || strcmp(to, "main") == 0 ||
+		!branch_name_ok(name) || !branch_name_ok(to))
+		return VC_ERR;
+	/* (its chunk names it, so it's written anew under the new name, the old let go of) */
+	if (!branch_read(r, name, VC_REF_UPDATE, &b))
+		return VC_ERR;
+	pfree(b.name);
+	b.name = pstrdup(to);
+	added = branch_add(r, &b);
+	vc_branch_free(&b);
+	if (!added)
+		return VC_ERR;
+	ref = branch_ref(name);
+	(void) vc_refs_remove(r->refs, ref);
+	pfree(ref);
+	return VC_OK;
 }
 
 int

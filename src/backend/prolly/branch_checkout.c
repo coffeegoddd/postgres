@@ -149,29 +149,62 @@ BranchCheckoutNote(int32 branch)
 }
 
 /*
- * The catalog branch the session is on once its top transaction commits: what catalog_branch has
- * now, but for what only the transaction set (SET LOCAL, or a SET then a SET LOCAL), which its
- * commit undoes after its locks are let go of.
+ * The catalog branch the session is on once its top transaction commits, and each function that set
+ * it for itself has returned: catalog_branch's stack of what each level set, folded as each level's
+ * end does.  Each entry ends merged into the one under it, if any, before that one's level ends, so
+ * it's one walk from the innermost out, what each passes to the one under carried.  (Nothing
+ * allocated, as it's at commit too.)
  */
 static int32
 branch_after_commit(void)
 {
 	struct config_generic *conf = find_option("catalog_branch", false, true, ERROR);
-	GucStack   *st = conf != NULL ? conf->stack : NULL;
+	int32		branch = catalog_branch;
+	bool		carried = false;
+	GucStackState carried_state = GUC_SET;
+	int32		carried_masked = 0;
 
-	if (st == NULL)
-		return catalog_branch;
-	switch (st->state)
+	if (conf == NULL)
+		return branch;
+	for (GucStack *st = conf->stack; st != NULL; st = st->prev)
 	{
-		case GUC_SAVE:
-		case GUC_LOCAL:
-			return st->prior.val.intval;
-		case GUC_SET_LOCAL:
-			return st->masked.val.intval;
-		case GUC_SET:
-			return catalog_branch;
+		GucStackState state = carried ? carried_state : st->state;
+		int32		masked = carried && carried_state == GUC_SET_LOCAL ? carried_masked :
+			st->state == GUC_SET_LOCAL ? st->masked.val.intval : 0;
+
+		carried = false;
+		if (state == GUC_SAVE)
+			branch = st->prior.val.intval;
+		else if (st->prev == NULL)
+		{
+			/* (the last, at the top level's end) */
+			if (state == GUC_SET_LOCAL)
+				branch = masked;
+			else if (state == GUC_LOCAL)
+				branch = st->prior.val.intval;
+		}
+		else if (state == GUC_SET)
+		{
+			carried = true;
+			carried_state = GUC_SET;
+		}
+		else if (state == GUC_LOCAL)
+		{
+			if (st->prev->state == GUC_SET)
+			{
+				carried = true;
+				carried_state = GUC_SET_LOCAL;
+				carried_masked = st->prior.val.intval;
+			}
+		}
+		else
+		{
+			carried = true;
+			carried_state = GUC_SET_LOCAL;
+			carried_masked = masked;
+		}
 	}
-	return catalog_branch;
+	return branch;
 }
 
 /* (at a commit or prepare, where it'll be is what it would return to) */
@@ -319,11 +352,19 @@ session_in_use(int32 branch)
 	return false;
 }
 
+/* (not what it was on as its transaction began: it's back on that only if what moved it is undone) */
+static bool
+session_mine(int32 branch)
+{
+	return branch == catalog_branch || branch == branch_after_commit();
+}
+
 const BranchCheckoutRoutine SessionBranchCheckout = {
 	.name = "session",
 	.checkout = session_checkout,
 	.current = session_current,
 	.in_use = session_in_use,
+	.mine = session_mine,
 };
 
 const BranchCheckoutRoutine *BranchCheckout = &SessionBranchCheckout;

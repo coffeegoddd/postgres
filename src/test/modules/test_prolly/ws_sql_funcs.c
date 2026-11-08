@@ -82,6 +82,8 @@ PG_FUNCTION_INFO_V1(test_branch_head);
 PG_FUNCTION_INFO_V1(test_branch_make);
 PG_FUNCTION_INFO_V1(test_branch_materialize);
 PG_FUNCTION_INFO_V1(test_branch_dematerialize);
+PG_FUNCTION_INFO_V1(test_branch_rename);
+PG_FUNCTION_INFO_V1(test_branch_delete);
 PG_FUNCTION_INFO_V1(test_branch_checkout);
 PG_FUNCTION_INFO_V1(test_branch_current);
 PG_FUNCTION_INFO_V1(test_branch_in_use);
@@ -1101,8 +1103,19 @@ test_branch_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" is linked to no catalog branch", name)));
+	/* (before the head's lock, as what it's to wait on can be waiting on what this has written) */
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a commit from capture can't run in a transaction that has written anything")));
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	LockBranchHead(branch);
+	/* (renamed or deleted as it waited: it would commit on a name no longer the branch's) */
+	if (BranchLink->branch_of(name) != branch)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("branch \"%s\" changed as it was being committed", name),
+				 errhint("Try again.")));
 	CaptureBranchBarrier(&ctx, branch, 60000, &root);
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
 	if (vc_branch_get(&repo, name, &found))
@@ -1258,6 +1271,31 @@ test_branch_dematerialize(PG_FUNCTION_ARGS)
 
 	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
 	BranchOps->dematerialize(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
+}
+
+/* test_branch_rename(name text, "to" text, force boolean) returns void */
+Datum
+test_branch_rename(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	BranchOps->rename(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
+					  PG_GETARG_BOOL(2), 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
+}
+
+/* test_branch_delete(name text, force boolean) returns void */
+Datum
+test_branch_delete(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	BranchOps->remove(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_BOOL(1), 60000);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_VOID();
 }

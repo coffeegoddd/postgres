@@ -52,6 +52,24 @@ typedef struct BranchOpsRoutine
 	 * while it's a database's or role's default_branch, or while its working set isn't its head.
 	 */
 	void		(*dematerialize) (ProllyCtx *ctx, const char *name, int timeout_ms);
+
+	/*
+	 * A branch renamed, its head, working set and sessions kept: its name only.  Refused for "main"
+	 * and onto "main", onto its own name, while it's a default_branch, while another session is on it
+	 * unless forced, and while a branch has the new name unless forced, that one then deleted as a
+	 * forced delete is (and so in a transaction that has written nothing, as delete is asked to be).
+	 */
+	void		(*rename) (ProllyCtx *ctx, const char *name, const char *to, bool force, int timeout_ms);
+
+	/*
+	 * A branch deleted: its working set, if it has one, given back as dematerialize does, changes
+	 * and all, and its head.  Refused for "main", for the branch this session is on, and while it's
+	 * a default_branch; unless forced, while another session is on it, and while its head isn't in
+	 * the history of the branch this session is on (or "main", if none).  In a transaction that has
+	 * written nothing, as it's done in one left out of capture; an error if capture hasn't got there
+	 * within timeout_ms.
+	 */
+	void		(*remove) (ProllyCtx *ctx, const char *name, bool force, int timeout_ms);
 } BranchOpsRoutine;
 
 extern PGDLLIMPORT const BranchOpsRoutine SharedBranchOps;

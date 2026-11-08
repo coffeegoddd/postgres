@@ -251,6 +251,12 @@ extern void vc_repo_free(VcRepo *r);
 /* The branch, false if there is none; vc_branch_free frees out's name. */
 extern bool vc_branch_get(VcRepo *r, const char *name, VcBranch *out);
 extern void vc_branch_free(VcBranch *b);
+/*
+ * vc_branch_get with the branch locked until the transaction ends: nothing
+ * moves it meanwhile, and what waited on it while it changed sees it as it
+ * is then (gone, if it was deleted or renamed).
+ */
+extern bool vc_branch_lock(VcRepo *r, const char *name, VcBranch *out);
 /* Every branch, in name order. */
 extern void vc_branch_list(VcRepo *r, VcBranchFn fn, void *arg);
 /* The branch checked out. */
@@ -266,6 +272,12 @@ extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
  * its working set goes.
  */
 extern int	vc_branch_delete(VcRepo *r, const char *name);
+/*
+ * Renames a branch other than the one checked out, and other than "main",
+ * to a name no branch has (nor "main"); its working set and merge state go
+ * with it.
+ */
+extern int	vc_branch_rename(VcRepo *r, const char *name, const char *to);
 extern int	vc_checkout(VcRepo *r, const char *name);
 extern PHash vc_commit(VcRepo *r, const char *msg);
 
