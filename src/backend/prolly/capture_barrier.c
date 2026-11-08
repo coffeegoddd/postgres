@@ -230,6 +230,30 @@ wake_worker(void)
 }
 
 /*
+ * Whether this database's capture has its slot, made and kept: a slot being made reads every table
+ * under the lock what changes their rows untold takes turns on, and is kept once that's committed.
+ */
+static bool
+slot_kept(void)
+{
+	char		name[NAMEDATALEN];
+	ReplicationSlot *slot;
+	bool		kept = false;
+
+	snprintf(name, NAMEDATALEN, CAPTURE_SLOT_PREFIX "%u", MyDatabaseId);
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(name, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		kept = slot->data.persistency == RS_PERSISTENT;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+	return kept;
+}
+
+/*
  * Every branch's changes are applied together, and the slot moves only once they're committed, so
  * the slot's position is how far capture has got for each; a branch's own position moves only when
  * it has changes, so it isn't.  A slot made again, as one invalidated is, reads every table whole
@@ -427,7 +451,31 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 
 	tables = lock_schema_relations(nsp, true);
 	INJECTION_POINT("capture-barrier-locked", NULL);
-	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+
+	/*
+	 * (a marker is read only by a slot made before it, and a slot being made waits for this lock: so
+	 * the slot is waited for first, holding nothing it needs, and the lock let go of again if the slot
+	 * is gone once it's held)
+	 */
+	start = GetCurrentTimestamp();
+	for (;;)
+	{
+		if (slot_kept())
+		{
+			LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+			if (slot_kept())
+				break;
+			UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+		}
+		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_QUERY_CANCELED),
+					 errmsg("capture of database \"%s\" has no slot made in time", get_database_name(MyDatabaseId))));
+		wake_worker();
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_CAPTURE_BARRIER);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
 	AcceptInvalidationMessages();
 	if (get_namespace_oid(schema, true) != nsp)
 		ereport(ERROR,
