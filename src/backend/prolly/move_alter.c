@@ -42,7 +42,7 @@ run_sql(Buf *sql)
 static bool
 buf_same(const Buf *a, const Buf *b)
 {
-	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+	return bytes_eq(a->data, a->len, b->data, b->len);
 }
 
 static bool

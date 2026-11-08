@@ -253,6 +253,7 @@ tests += {
       't/124_ws_move_schema.pl',
       't/125_ws_move_alter.pl',
       't/126_ws_move_violations.pl',
+      't/127_ws_move_pairs.pl',
       't/128_ws_move_merges_ours.pl',
       't/129_ws_move_merges_theirs.pl',
     ],
