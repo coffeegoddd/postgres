@@ -152,6 +152,26 @@ my ($after_ddl) = $out =~ /^(\d+)$/m;
 is(sql($after_ddl, q{SELECT to_regclass('app.late') IS NOT NULL}), 't', 'with the table it made, its changes taken');
 is(sql($main, q{SELECT to_regclass('app.late') IS NULL}), 't', 'which the parent, reset to its head, no longer has');
 
+# A schema being made on the parent: waited out, and the branch has it.
+$ddl = $node->background_psql('postgres');
+$ddl->query_safe(on($main));
+$ddl->query_safe(q{BEGIN; CREATE SCHEMA newer VERSIONED});
+$dpid = $ddl->query_safe('SELECT pg_backend_pid()');
+$maker = $node->background_psql('postgres', on_error_stop => 0);
+$maker->query_safe(on($main));
+$maker->query_until(qr/started/, "\\echo started\nSELECT test_branch_create('after_schema', 'main', NULL, true);\n\\echo made\n");
+ok($node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activity
+	WHERE query LIKE 'SELECT test_branch_create%' AND $dpid = ANY (pg_blocking_pids(pid))}),
+	'a branch waits for a schema being made on its parent');
+$ddl->query_safe('COMMIT');
+$ddl->quit;
+$out = $maker->query_until(qr/made/, '');
+is($maker->{stderr}, '', 'and is made once it commits');
+$maker->quit;
+my ($after_schema) = $out =~ /^(\d+)$/m;
+is(sql($after_schema, q{SELECT count(*) FROM pg_namespace WHERE nspname = 'newer' AND nspbranch <> 0}), '1',
+	'with the schema, its changes taken');
+
 # A writer that goes on to DDL as the branch waits for it: the branch gives way, and the writer's
 # transaction is never what fails.
 my $wd = $node->background_psql('postgres', on_error_stop => 0);

@@ -72,7 +72,6 @@
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -84,6 +83,9 @@ typedef struct Holding
 {
 	int32		branch;
 	int			timeout_ms;
+	TimestampTz start;			/* when the holding began */
+	TimestampTz round;			/* when this round of it began */
+	int			user_timeout;	/* the session's own lock_timeout, or 0 */
 } Holding;
 
 /* (a TOAST table's values are named by its id, which the branch's copy of it doesn't have) */
@@ -196,6 +198,30 @@ relations_of(int32 branch, List **tables, List **toasts)
  * way, and taken again, until the time given is up.  A relation dropped or made meanwhile is found
  * as they're taken again.
  */
+/*
+ * (what's left of this round's wait, which all of it together keeps under half of what would find a
+ * deadlock, as one waiting on what this holds began after this took it; and of the whole time, and
+ * the session's own bound: none left, and this round gives way)
+ */
+static void
+round_budget(Holding *h)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	long		left = Max(DeadlockTimeout / 2, 1) - TimestampDifferenceMilliseconds(h->round, now);
+	long		whole = h->timeout_ms - TimestampDifferenceMilliseconds(h->start, now);
+	char		ms[32];
+
+	left = Min(left, whole);
+	if (h->user_timeout > 0)
+		left = Min(left, h->user_timeout);
+	if (left <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("a round of holding off a branch's writers ran out of time")));
+	snprintf(ms, sizeof(ms), "%ld", left);
+	(void) set_config_option("lock_timeout", ms, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SET, true, 0, false);
+}
+
 static bool
 hold_try(Holding *h)
 {
@@ -207,11 +233,16 @@ hold_try(Holding *h)
 	List	   *x2;
 	bool		same;
 
+	round_budget(h);
 	LockBranchCatalogs(h->branch, AccessExclusiveLock);
+	round_budget(h);
 	LockBranchHead(h->branch);
 	rels = relations_of(h->branch, &tables, &toasts);
 	foreach_oid(relid, rels)
+	{
+		round_budget(h);
 		LockRelationOid(relid, ExclusiveLock);
+	}
 	again = relations_of(h->branch, &t2, &x2);
 	same = equal(rels, again);
 	if (same)
@@ -224,6 +255,10 @@ hold_try(Holding *h)
 	}
 	list_free(rels);
 	list_free(again);
+	list_free(tables);
+	list_free(toasts);
+	list_free(t2);
+	list_free(x2);
 	return same;
 }
 
@@ -231,19 +266,18 @@ static void
 lock_writers_out(void *arg)
 {
 	Holding    *h = arg;
-	TimestampTz start = GetCurrentTimestamp();
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	int			nest = NewGUCNestLevel();
-	char		quickly[32];
 
-	snprintf(quickly, sizeof(quickly), "%d", Max(DeadlockTimeout / 2, 1));
-	(void) set_config_option("lock_timeout", quickly, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	h->start = GetCurrentTimestamp();
+	h->user_timeout = LockTimeout;
 	for (;;)
 	{
 		bool		held = false;
 		bool		gave_way = false;
 
+		h->round = GetCurrentTimestamp();
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
 		PG_TRY();
@@ -279,11 +313,11 @@ lock_writers_out(void *arg)
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
 		}
-		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), h->timeout_ms))
+		if (TimestampDifferenceExceeds(h->start, GetCurrentTimestamp(), h->timeout_ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 					 errmsg("could not hold off the writers of the branch being made from in time")));
-		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_CAPTURE_BARRIER);
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_BRANCH_HOLD_GIVE_WAY);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -408,6 +442,29 @@ move_branch(ProllyCtx *ctx, int32 branch, const PHash *from, const PHash *to)
 	CatalogBranchLeave(level);
 }
 
+/* A commit the repository has, in its window, loaded into at: an error otherwise. */
+static void
+commit_check(ProllyCtx *ctx, VcRepo *repo, const PHash *commit, VcCommit *at)
+{
+	char		hex[PHASH_HEX_LEN + 1];
+
+	if (vc_commit_load(ctx, commit, at))
+	{
+		if (vc_in_window(repo, commit))
+			return;
+		vc_commit_release(at);
+		phash_hex(commit, hex);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("commit %s is outside the window", hex),
+				 errhint("Attach the history it's in first.")));
+	}
+	phash_hex(commit, hex);
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("commit %s not found", hex)));
+}
+
 static int32
 shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *commit,
 			  bool take_changes, int timeout_ms)
@@ -443,6 +500,18 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				 errmsg("a branch named \"%s\" already exists", name)));
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
 
+	/* (what's refused whatever the parent's head turns out to be, before anything's held) */
+	if (!vc_branch_get(&repo, from, &head))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" has no commit", from)));
+	vc_branch_free(&head);
+	if (commit != NULL)
+	{
+		commit_check(ctx, &repo, commit, &at);
+		vc_commit_release(&at);
+	}
+
 	/*
 	 * (the parent at one point, its writers held off until this transaction ends; with its DDL and
 	 * its commits, as a table made meanwhile would have writers the barrier doesn't hold off, and a
@@ -462,27 +531,9 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" has no commit", from)));
 
-	/* (where it's made: the commit, which the repository has in its window, or from's head) */
+	/* (where it's made: the commit, or from's head as it is now) */
 	at_commit = commit != NULL ? *commit : head.head;
-	if (!vc_commit_load(ctx, &at_commit, &at))
-	{
-		char		hex[PHASH_HEX_LEN + 1];
-
-		phash_hex(&at_commit, hex);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("commit %s not found", hex)));
-	}
-	if (!vc_in_window(&repo, &at_commit))
-	{
-		char		hex[PHASH_HEX_LEN + 1];
-
-		phash_hex(&at_commit, hex);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("commit %s is outside the window", hex),
-				 errhint("Attach the history it's in first.")));
-	}
+	commit_check(ctx, &repo, &at_commit, &at);
 	target = take_changes ? root : at.root;
 
 	branch = BranchIds->allocate();

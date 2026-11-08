@@ -454,24 +454,35 @@ barrier_check_common(bool leaving_out)
  * what it then holds is asked again once it's locked.  The schema's branch.  (capture_to_trees
  * asked first, before whether the schema is versioned, as it always has been)
  */
+/* What's asked of a barrier of each schema it's of, a transaction having written or not. */
 static int32
-barrier_check(const char *schema, Oid nsp, bool leaving_out)
+barrier_check_schema(const char *schema, Oid nsp)
 {
 	int32		branch = NamespaceBranch(nsp);
 
-	if (!capture_to_trees)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("a commit from capture needs capture_to_trees on")));
 	if (branch == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("schema \"%s\" is not versioned", schema)));
-	barrier_check_common(leaving_out);
 	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
 	check_may_read_all(nsp);
 	return branch;
+}
+
+static int32
+barrier_check(const char *schema, Oid nsp, bool leaving_out)
+{
+	if (!capture_to_trees)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a commit from capture needs capture_to_trees on")));
+	if (NamespaceBranch(nsp) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("schema \"%s\" is not versioned", schema)));
+	barrier_check_common(leaving_out);
+	return barrier_check_schema(schema, nsp);
 }
 
 /*
@@ -655,47 +666,66 @@ branch_schemas(int32 branch)
 }
 
 /* (with hold, as CaptureBarrierLeavingOut, of the branch's schemas) */
+/* A branch's schemas, by name, each asked what a barrier of it asks: in schemas, nsps and keys. */
+typedef struct BranchSchemas
+{
+	int			n;
+	const char **schemas;
+	char	  **keys;			/* each name as a root has it */
+	Oid		   *nsps;
+} BranchSchemas;
+
+static void
+branch_schemas_read(int32 branch, BranchSchemas *b)
+{
+	List	   *names = branch_schemas(branch);
+	int			i = 0;
+
+	b->n = list_length(names);
+	b->schemas = palloc_array(const char *, Max(b->n, 1));
+	b->keys = palloc_array(char *, Max(b->n, 1));
+	b->nsps = palloc_array(Oid, Max(b->n, 1));
+	foreach_ptr(char, name, names)
+		b->schemas[i++] = name;
+	qsort(b->schemas, b->n, sizeof(const char *), schema_name_cmp);
+	for (i = 0; i < b->n; i++)
+	{
+		/* (one dropped since they were read, as one dropped once they're locked) */
+		b->nsps[i] = get_namespace_oid(b->schemas[i], true);
+		if (!OidIsValid(b->nsps[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema \"%s\" changed during a commit from capture", b->schemas[i]),
+					 errhint("Try the commit again.")));
+		(void) barrier_check_schema(b->schemas[i], b->nsps[i]);
+		/* (its name as the root has it, before anything's written) */
+		b->keys[i] = ws_name_to_utf8(b->schemas[i]);
+	}
+}
+
+/*
+ * (with hold, as CaptureBarrierLeavingOut, of the branch's schemas: read again once it's held, as
+ * what it holds may have waited out the making of one)
+ */
 static void
 branch_barrier(ProllyCtx *ctx, int32 branch, int timeout_ms, void (*hold) (void *arg), void *arg,
 			   PHash *root)
 {
-	List	   *names;
-	const char **schemas;
-	char	  **keys;
-	Oid		   *nsps;
+	BranchSchemas b;
 	PHash	   *roots;
-	int			n;
-	int			i = 0;
 	int			level;
 
 	if (branch <= 0 || !BranchIds->allocated(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch %d has not been allocated", branch)));
+	if (!capture_to_trees)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a commit from capture needs capture_to_trees on")));
 	barrier_check_common(hold != NULL);
 	level = CatalogBranchEnter(branch);
-	names = branch_schemas(branch);
-	n = list_length(names);
-	schemas = palloc_array(const char *, Max(n, 1));
-	keys = palloc_array(char *, Max(n, 1));
-	nsps = palloc_array(Oid, Max(n, 1));
-	roots = palloc_array(PHash, Max(n, 1));
-	foreach_ptr(char, name, names)
-		schemas[i++] = name;
-	qsort(schemas, n, sizeof(const char *), schema_name_cmp);
-	for (i = 0; i < n; i++)
-	{
-		/* (one dropped since they were read, as one dropped once they're locked) */
-		nsps[i] = get_namespace_oid(schemas[i], true);
-		if (!OidIsValid(nsps[i]))
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("schema \"%s\" changed during a commit from capture", schemas[i]),
-					 errhint("Try the commit again.")));
-		(void) barrier_check(schemas[i], nsps[i], hold != NULL);
-		/* (its name as the root has it, before anything's written) */
-		keys[i] = ws_name_to_utf8(schemas[i]);
-	}
+	branch_schemas_read(branch, &b);
 
 	/* (before leaving out gives this transaction an ID, which a slot being made would wait for) */
 	if (hold)
@@ -703,19 +733,22 @@ branch_barrier(ProllyCtx *ctx, int32 branch, int timeout_ms, void (*hold) (void 
 		slot_wait(GetCurrentTimestamp(), timeout_ms);
 		CaptureLeaveOut();
 		hold(arg);
+		AcceptInvalidationMessages();
+		branch_schemas_read(branch, &b);
 	}
+	roots = palloc_array(PHash, Max(b.n, 1));
 
 	/*
 	 * (with no schema, nothing to wait for: an empty root, as of any point; with hold, catalog
 	 * changes still wait until the transaction ends)
 	 */
 	*root = vc_root_empty(ctx);
-	if (n > 0)
-		barrier_take(ctx, schemas, nsps, n, branch, true, timeout_ms, roots, hold != NULL);
+	if (b.n > 0)
+		barrier_take(ctx, b.schemas, b.nsps, b.n, branch, true, timeout_ms, roots, hold != NULL);
 	else if (hold)
 		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
-	for (i = 0; i < n; i++)
-		WsDbRoot->put_schema(ctx, root, keys[i], &roots[i], root);
+	for (int i = 0; i < b.n; i++)
+		WsDbRoot->put_schema(ctx, root, b.keys[i], &roots[i], root);
 	CatalogBranchLeave(level);
 }
 
