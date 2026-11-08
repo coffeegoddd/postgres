@@ -204,11 +204,7 @@ static const Buf *key_sort_keys;
 static int
 buf_cmp(const Buf *a, const Buf *b)
 {
-	int			c = memcmp(a->data, b->data, Min(a->len, b->len));
-
-	if (c != 0)
-		return c;
-	return (a->len > b->len) - (a->len < b->len);
+	return key_cmp(a->data, a->len, b->data, b->len);
 }
 
 static int
@@ -315,8 +311,7 @@ drop_object(const WsObject *o, const char *schema)
 static bool
 buf_same(const Buf *a, const Buf *b)
 {
-	/* (an empty one has no data, which memcmp must not be given) */
-	return a->len == b->len && (a->len == 0 || memcmp(a->data, b->data, a->len) == 0);
+	return bytes_eq(a->data, a->len, b->data, b->len);
 }
 
 /* Whether the other has object i of one as it is. */

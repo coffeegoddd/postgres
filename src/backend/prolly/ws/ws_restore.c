@@ -592,11 +592,7 @@ obj_bytes_cmp(const void *a, const void *b)
 {
 	const ObjBytes *x = a;
 	const ObjBytes *y = b;
-	int			c = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
-
-	if (c != 0)
-		return c;
-	return (x->key.len > y->key.len) - (x->key.len < y->key.len);
+	return key_cmp(x->key.data, x->key.len, y->key.data, y->key.len);
 }
 
 /* Which of a root's objects the previous root has as they are. */
@@ -627,8 +623,7 @@ objects_as_before(ProllyCtx *ctx, const WsObject *objs, int nobjs, const PHash *
 		WsObjectCodec->encode_key(&objs[i], &one.key);
 		WsObjectCodec->encode_value(&objs[i], &one.value);
 		hit = nwas > 0 ? bsearch(&one, before, nwas, sizeof(ObjBytes), obj_bytes_cmp) : NULL;
-		same[i] = hit != NULL && hit->value.len == one.value.len &&
-			memcmp(hit->value.data, one.value.data, one.value.len) == 0;
+		same[i] = hit != NULL && bytes_eq(hit->value.data, hit->value.len, one.value.data, one.value.len);
 		buf_free(&one.key);
 		buf_free(&one.value);
 	}
