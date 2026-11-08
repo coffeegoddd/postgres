@@ -56,6 +56,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_checkout.h"
 #include "replication/slot.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
@@ -81,6 +82,7 @@ assign_catalog_branch(int newval, void *extra)
 {
 	if (newval == catalog_branch)
 		return;
+	BranchCheckoutNote(newval);
 
 	catalog_branch_changing = true;
 	PG_TRY();

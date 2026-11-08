@@ -19,6 +19,7 @@ OBJS = \
 	branch_catalog.o \
 	branch_catalog_copy.o \
 	branch_catalog_ops.o \
+	branch_checkout.o \
 	branch_filter.o \
 	branch_link.o \
 	branch_ops.o \

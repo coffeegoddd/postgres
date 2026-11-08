@@ -13,6 +13,12 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/stratnum.h"
+#include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -20,6 +26,10 @@
 #include "prolly/branch_link.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 static void
 link_connect(void)
@@ -35,46 +45,69 @@ link_finish(void)
 		elog(ERROR, "could not finish with SPI");
 }
 
+/*
+ * (read directly, through a key, as a checkout reads it for any session, which the table's
+ * privileges, its writers', don't give; as of now, as any statement reads)
+ */
+static Relation
+links_open(void)
+{
+	Oid			history = get_namespace_oid("pg_history", false);
+
+	return table_open(get_relname_relid("branches", history), AccessShareLock);
+}
+
 static int32
 table_branch_of(const char *name)
 {
-	Oid			types[1] = {TEXTOID};
-	Datum		values[1] = {CStringGetTextDatum(name)};
+	Relation	rel = links_open();
+	Oid			key = get_relname_relid("branches_pkey", RelationGetNamespace(rel));
+	ScanKeyData skey;
+	Snapshot	snapshot;
+	SysScanDesc scan;
+	HeapTuple	tup;
 	int32		branch = 0;
 
-	link_connect();
-	if (SPI_execute_with_args("SELECT id FROM pg_history.branches WHERE name OPERATOR(pg_catalog.=) $1",
-							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
-		elog(ERROR, "could not read a branch's link");
-	if (SPI_processed == 1)
+	ScanKeyEntryInitialize(&skey, 0, 1, BTEqualStrategyNumber, TEXTOID, C_COLLATION_OID, F_TEXTEQ,
+						   CStringGetTextDatum(name));
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	scan = systable_beginscan(rel, key, true, snapshot, 1, &skey);
+	if (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		bool		isnull;
 
-		branch = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+		branch = DatumGetInt32(heap_getattr(tup, 2, RelationGetDescr(rel), &isnull));
 	}
-	link_finish();
+	systable_endscan(scan);
+	UnregisterSnapshot(snapshot);
+	table_close(rel, AccessShareLock);
 	return branch;
 }
 
 static char *
 table_name_of(int32 branch)
 {
-	Oid			types[1] = {INT4OID};
-	Datum		values[1] = {Int32GetDatum(branch)};
+	Relation	rel = links_open();
+	Oid			key = get_relname_relid("branches_id_key", RelationGetNamespace(rel));
+	ScanKeyData skey;
+	Snapshot	snapshot;
+	SysScanDesc scan;
+	HeapTuple	tup;
 	char	   *name = NULL;
-	MemoryContext caller = CurrentMemoryContext;
 
-	link_connect();
-	if (SPI_execute_with_args("SELECT name FROM pg_history.branches WHERE id OPERATOR(pg_catalog.=) $1",
-							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
-		elog(ERROR, "could not read a branch's link");
-	if (SPI_processed == 1)
+	ScanKeyEntryInitialize(&skey, 0, 2, BTEqualStrategyNumber, INT4OID, InvalidOid, F_INT4EQ,
+						   Int32GetDatum(branch));
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	scan = systable_beginscan(rel, key, true, snapshot, 1, &skey);
+	if (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		char	   *found = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		bool		isnull;
 
-		name = MemoryContextStrdup(caller, found);
+		name = TextDatumGetCString(heap_getattr(tup, 1, RelationGetDescr(rel), &isnull));
 	}
-	link_finish();
+	systable_endscan(scan);
+	UnregisterSnapshot(snapshot);
+	table_close(rel, AccessShareLock);
 	return name;
 }
 
