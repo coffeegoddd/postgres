@@ -311,9 +311,7 @@ is($rc, 0, 'a dry run by a role with no right to make schemas runs') or diag($er
 like($out, qr/^nothing$/m, 'and goes through');
 like($out, qr/^g_small$/m, 'and is as that role after');
 
-# nothing of it runs as anyone, not an event trigger on what it does, which runs as who asked for
-# what is done by hand
-my $superuser = $node->safe_psql('postgres', 'SELECT current_user');
+# no event trigger fires for what a dry run does; one fires, as who asked, for what is done by hand
 ($rc, $out, $err) = in_one_session(q{
 	CREATE FUNCTION public.who_ran() RETURNS event_trigger LANGUAGE plpgsql AS $$
 	BEGIN RAISE NOTICE 'ran as % for %', current_user, tg_tag; END $$;
@@ -327,6 +325,7 @@ my $superuser = $node->safe_psql('postgres', 'SELECT current_user');
 	DROP EVENT TRIGGER who_ran;
 });
 is($rc, 0, 'a dry run under an event trigger runs') or diag($err);
+like($out, qr/^nothing$/m, 'and goes through');
 my @ran = $err =~ /ran as (\S+ for [^\n]*)/g;
 is_deeply(\@ran, ['g_small for CREATE TABLE'], 'it fires for what is done by hand, as who asked, and not during the run');
 

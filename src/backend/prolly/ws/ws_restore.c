@@ -1045,7 +1045,8 @@ ws_root_scratch_branch(void)
  * a function's text says of its own schema then means this one, and not what is on the
  * branch whoever merges is on.  Whoever merges needs no right to make it, for it to own: it is
  * made by no statement, so that nothing a statement would fire runs for it.  All may use
- * it, as a root's owners must.  It goes when the run does.
+ * it, as a root's owners must, granted under the settings the engine's statements run under,
+ * where no event trigger runs.  It goes when the run does.
  */
 static void
 make_dry_run_schema(const char *schema)

@@ -1,9 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # No user code runs during a move in place: not a trigger or rule of a table it writes, enabled
-# ALWAYS, REPLICA or as made, nor an event trigger of any event, enabled ALWAYS or as made, for
-# what the move drops, makes, alters or rewrites, nor for what its enum step adds.  Each runs for
-# the same things done by hand.
+# ALWAYS, REPLICA, as made or disabled, nor an event trigger of any event, enabled ALWAYS or as made,
+# for what the move drops, makes, alters, rewrites or refreshes, nor for what its enum step adds.
+# Each runs for the same things done by hand, but the one disabled; and each trigger keeps its
+# enabling, its table kept, altered or made again.
 
 use strict;
 use warnings FATAL => 'all';
@@ -96,6 +97,7 @@ sql(q{SET ROLE app_owner; SET search_path = app;
 	INSERT INTO altered VALUES (1, 1);
 	INSERT INTO gone VALUES (1)});
 my $first = commit_root();
+my $first_enablings = enablings();
 
 # The second: rows changed, a column added and one retyped (a rewrite), a table dropped and one
 # made, an index and a view made, and the enum given a value a row uses.
@@ -142,6 +144,7 @@ move_to($first, 'to the first');
 move_to($second, 'to the second');
 is(enablings(), $second_enablings, 'each trigger enabled as it was, its table kept or made again');
 move_to($first, 'to the first again');
+is(enablings(), $first_enablings, 'and as it was in the first');
 unlike(slurp_file($node->logfile, $log_at), qr/user code ran/, 'no trigger, rule or event trigger ran during the moves');
 
 done_testing();
