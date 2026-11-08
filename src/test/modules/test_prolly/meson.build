@@ -257,6 +257,7 @@ tests += {
       't/128_ws_move_merges_ours.pl',
       't/129_ws_move_merges_theirs.pl',
       't/130_ws_move_prototype_bugs.pl',
+      't/131_ws_move_quiet.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
