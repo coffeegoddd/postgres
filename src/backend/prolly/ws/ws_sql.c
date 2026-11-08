@@ -31,7 +31,8 @@ const WsSqlRoutine *WsSql = &SpiWsSql;
  * row_security: a policy does not quietly leave rows out.
  * default_tablespace, default_table_access_method: what a statement does not
  * say is what a record holds.
- * xmloption: a value is read back whichever form it is in.)
+ * xmloption: a value is read back whichever form it is in.
+ * event_triggers: no user's code runs for what is done here.)
  */
 static const struct
 {
@@ -51,6 +52,7 @@ static const struct
 	{"default_tablespace", ""},
 	{"default_table_access_method", "heap"},
 	{"xmloption", "content"},
+	{"event_triggers", "off"},
 };
 
 /* (as PGC_SUSET: catalog_branch_filter is, and this is no user's choosing) */
