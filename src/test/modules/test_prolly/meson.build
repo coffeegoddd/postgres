@@ -254,6 +254,7 @@ tests += {
       't/125_ws_move_alter.pl',
       't/126_ws_move_violations.pl',
       't/127_ws_move_pairs.pl',
+      't/130_ws_move_prototype_bugs.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
