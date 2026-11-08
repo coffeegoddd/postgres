@@ -82,6 +82,8 @@ PG_FUNCTION_INFO_V1(test_branch_head);
 PG_FUNCTION_INFO_V1(test_branch_make);
 PG_FUNCTION_INFO_V1(test_branch_materialize);
 PG_FUNCTION_INFO_V1(test_branch_dematerialize);
+PG_FUNCTION_INFO_V1(test_branch_rename);
+PG_FUNCTION_INFO_V1(test_branch_delete);
 PG_FUNCTION_INFO_V1(test_branch_checkout);
 PG_FUNCTION_INFO_V1(test_branch_current);
 PG_FUNCTION_INFO_V1(test_branch_in_use);
@@ -1258,6 +1260,31 @@ test_branch_dematerialize(PG_FUNCTION_ARGS)
 
 	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
 	BranchOps->dematerialize(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
+}
+
+/* test_branch_rename(name text, "to" text, force boolean) returns void */
+Datum
+test_branch_rename(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	BranchOps->rename(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
+					  PG_GETARG_BOOL(2), 60000);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
+}
+
+/* test_branch_delete(name text, force boolean) returns void */
+Datum
+test_branch_delete(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	BranchOps->remove(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_BOOL(1), 60000);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_VOID();
 }

@@ -266,6 +266,12 @@ extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
  * its working set goes.
  */
 extern int	vc_branch_delete(VcRepo *r, const char *name);
+/*
+ * Renames a branch other than the one checked out, and other than "main",
+ * to a name no branch has (nor "main"); its working set and merge state go
+ * with it.
+ */
+extern int	vc_branch_rename(VcRepo *r, const char *name, const char *to);
 extern int	vc_checkout(VcRepo *r, const char *name);
 extern PHash vc_commit(VcRepo *r, const char *msg);
 

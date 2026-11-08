@@ -707,15 +707,57 @@ named_default(const char *name)
 	return named;
 }
 
+/* Refused while a database's or role's default_branch names it. */
+static void
+default_check(const char *name)
+{
+	/* (last of the refusals, as what's set for every database is held off until this transaction ends) */
+	if (named_default(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is a default_branch", name)));
+}
+
+/*
+ * A branch's working set given back, as its writers and commits are held off: its catalog rows and
+ * the relations they hold dropped, the link let go of.  With keep_changes, refused while it has
+ * changes not committed.  Refused while it's a default_branch.  (Its making's lock held.)
+ */
+static void
+give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool keep_changes, int timeout_ms)
+{
+	PHash		root;
+	Holding		holding;
+
+	holding.branch = branch;
+	holding.timeout_ms = timeout_ms;
+	CaptureBranchBarrierLeavingOut(ctx, branch, timeout_ms, lock_writers_out, &holding, &root);
+	if (keep_changes)
+	{
+		VcBranch	b;
+		bool		changed;
+
+		if (!vc_branch_get(repo, name, &b))
+			elog(ERROR, "branch \"%s\" has a working set and no head", name);
+		changed = !phash_eq(&root, &b.head_root);
+		vc_branch_free(&b);
+		if (changed)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("branch \"%s\" has changes not committed", name),
+					 errhint("Commit them, or reset the branch, first.")));
+	}
+	default_check(name);
+	BranchCatalogs->drop(branch);
+	(void) BranchLink->unlink(name);
+}
+
 static void
 shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 {
 	ChunkStore *cs = ChunkStoreOpen("pages");
 	int32		branch;
 	VcRepo		repo;
-	VcBranch	b;
-	PHash		root;
-	Holding		holding;
 
 	/* (no one giving it a working set meanwhile, as it's given back) */
 	lock_making(name);
@@ -726,28 +768,152 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out", name)));
-	/* (its working set and its head as its writers and commits are held off) */
-	holding.branch = branch;
-	holding.timeout_ms = timeout_ms;
-	CaptureBranchBarrierLeavingOut(ctx, branch, timeout_ms, lock_writers_out, &holding, &root);
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
-	if (!vc_branch_get(&repo, name, &b))
-		elog(ERROR, "branch \"%s\" has a working set and no head", name);
-	if (!phash_eq(&root, &b.head_root))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("branch \"%s\" has changes not committed", name),
-				 errhint("Commit them, or reset the branch, first.")));
+	give_back(ctx, &repo, name, branch, true, timeout_ms);
+	CaptureLeftOutSeal();
+	vc_repo_free(&repo);
+}
 
-	/* (last, as what's set for every database is held off until this transaction ends) */
-	if (named_default(name))
+/* Refused for "main", which every repository has. */
+static void
+not_main(const char *name, const char *what)
+{
+	if (strcmp(name, "main") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("branch \"main\" can't be %s", what)));
+}
+
+/* Refused while another session is on it, unless forced; branch 0 has no working set, so none. */
+static void
+others_check(const char *name, int32 branch, bool force)
+{
+	if (!force && branch != 0 && branch != catalog_branch && BranchCheckout->in_use(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("branch \"%s\" is a default_branch", name)));
-	BranchCatalogs->drop(branch);
-	(void) BranchLink->unlink(name);
-	CaptureLeftOutSeal();
+				 errmsg("branch \"%s\" is checked out in another session", name),
+				 errhint("Use force to change it anyway.")));
+}
+
+/*
+ * Whether the branch's head is in the history of the head of the branch this session is on, or of
+ * "main" if it's on none: whether deleting it loses no commit.
+ */
+static bool
+merged(VcRepo *repo, const VcBranch *b)
+{
+	char	   *on = catalog_branch == 0 ? NULL : BranchLink->name_of(catalog_branch);
+	VcBranch	into;
+	PHash		base;
+	bool		is;
+
+	if (!vc_branch_get(repo, on != NULL ? on : "main", &into) && !vc_branch_get(repo, "main", &into))
+		return false;
+	is = phash_eq(&into.head, &b->head) ||
+		(vc_merge_base_in(repo, &b->head, &into.head, 0, &base) == 1 && phash_eq(&base, &b->head));
+	vc_branch_free(&into);
+	return is;
+}
+
+/* A branch deleted, its making's lock held: refused as remove says. */
+static void
+remove_locked(ProllyCtx *ctx, VcRepo *repo, const char *name, bool force, int timeout_ms)
+{
+	VcBranch	b;
+	int32		branch = BranchLink->branch_of(name);
+
+	not_main(name, "deleted");
+	if (!vc_branch_get(repo, name, &b))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" not found", name)));
+	if (branch != 0 && branch == catalog_branch)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" is checked out in this session", name),
+				 errhint("Check out another first.")));
+	others_check(name, branch, force);
+	if (!force && !merged(repo, &b))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("branch \"%s\" is not fully merged", name),
+				 errhint("Use force to delete it anyway.")));
 	vc_branch_free(&b);
+
+	/* (its working set given back, changes and all, as its head goes) */
+	if (branch != 0)
+		give_back(ctx, repo, name, branch, false, timeout_ms);
+	else
+		default_check(name);
+	if (vc_branch_delete(repo, name) != VC_OK)
+		elog(ERROR, "could not delete branch \"%s\" of version control", name);
+}
+
+static void
+shared_remove(ProllyCtx *ctx, const char *name, bool force, int timeout_ms)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	VcRepo		repo;
+
+	lock_making(name);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	remove_locked(ctx, &repo, name, force, timeout_ms);
+	CaptureLeftOutSeal();
+	vc_repo_free(&repo);
+}
+
+static void
+shared_rename(ProllyCtx *ctx, const char *name, const char *to, bool force, int timeout_ms)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	VcRepo		repo;
+	VcBranch	b;
+	int32		branch;
+
+	name_check(to);
+	not_main(name, "renamed");
+	if (strcmp(name, to) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch \"%s\" is already named so", name)));
+	not_main(to, "replaced");
+
+	/* (both names' makings held, in one order, so none is made, given or given back meanwhile) */
+	lock_making(strcmp(name, to) < 0 ? name : to);
+	lock_making(strcmp(name, to) < 0 ? to : name);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (!vc_branch_get(&repo, name, &b))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" not found", name)));
+	vc_branch_free(&b);
+	branch = BranchLink->branch_of(name);
+	others_check(name, branch, force);
+
+	/* (one with the new name already replaced, forced: deleted as a forced delete is) */
+	if (vc_branch_get(&repo, to, &b))
+	{
+		vc_branch_free(&b);
+		if (!force)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("a branch named \"%s\" already exists", to),
+					 errhint("Use force to replace it.")));
+		remove_locked(ctx, &repo, to, true, timeout_ms);
+	}
+
+	/* (its commits waited out, as one in flight would commit on the name it read) */
+	if (branch != 0)
+		LockBranchHead(branch);
+	default_check(name);
+	if (vc_branch_rename(&repo, name, to) != VC_OK)
+		elog(ERROR, "could not rename branch \"%s\" of version control", name);
+	if (branch != 0)
+	{
+		(void) BranchLink->unlink(name);
+		BranchLink->link(to, branch);
+	}
+	CaptureLeftOutSeal();
 	vc_repo_free(&repo);
 }
 
@@ -756,6 +922,8 @@ const BranchOpsRoutine SharedBranchOps = {
 	.create = shared_create,
 	.materialize = shared_materialize,
 	.dematerialize = shared_dematerialize,
+	.rename = shared_rename,
+	.remove = shared_remove,
 };
 
 const BranchOpsRoutine *BranchOps = &SharedBranchOps;

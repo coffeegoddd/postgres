@@ -270,6 +270,7 @@ tests += {
       't/141_branch_toast.pl',
       't/142_branch_materialize.pl',
       't/143_capture_left_out_sealed.pl',
+      't/144_branch_rename_delete.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

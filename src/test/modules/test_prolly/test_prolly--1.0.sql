@@ -869,6 +869,14 @@ CREATE FUNCTION test_branch_dematerialize(name text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_branch_rename(name text, "to" text, force boolean DEFAULT false)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_branch_delete(name text, force boolean DEFAULT false)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_branch_head(name text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
@@ -893,7 +901,7 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_wait(pg_lsn, integer), test_capture_leave_out(), test_capture_commit(text, text, text),
 	test_capture_commit_on(text, text, text), test_branch_link(text, integer), test_branch_of(text),
 	test_branch_barrier(integer, integer), test_branch_commit(text, text), test_branch_unlink(text), test_dbroot_schemas(text), test_branch_in_use(integer), test_branch_create(text, text, text, boolean, integer), test_branch_head(text), test_branch_make(text, text, text), test_branch_materialize(text),
-	test_branch_dematerialize(text), test_ws_use_history_store(), test_ws_move(text, text, integer), test_ws_move_prepare(text, text) FROM PUBLIC;
+	test_branch_dematerialize(text), test_branch_rename(text, text, boolean), test_branch_delete(text, boolean), test_ws_use_history_store(), test_ws_move(text, text, integer), test_ws_move_prepare(text, text) FROM PUBLIC;
 
 CREATE FUNCTION test_ws_schema_shape(schema text, tab text)
 RETURNS text
