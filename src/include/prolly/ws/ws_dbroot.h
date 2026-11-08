@@ -54,10 +54,4 @@ extern PGDLLIMPORT const WsDbRootRoutine MapWsDbRoot;
 /* The implementation in use. */
 extern PGDLLIMPORT const WsDbRootRoutine *WsDbRoot;
 
-/*
- * Each schema of a branch root made on branch, which has none of those names: as
- * prolly/ws/ws_restore.h's restore makes one.
- */
-extern void ws_dbroot_restore(ProllyCtx *ctx, const PHash *rv, int32 branch);
-
 #endif							/* PROLLY_WS_DBROOT_H */

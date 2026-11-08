@@ -14,12 +14,8 @@
 #include "postgres.h"
 
 #include "mb/pg_wchar.h"
-#include "prolly/branch_catalog.h"
 #include "prolly/engine/vc.h"
 #include "prolly/ws/ws_dbroot.h"
-#include "prolly/ws/ws_restore.h"
-#include "prolly/ws/ws_schema.h"
-#include "prolly/ws/ws_sql.h"
 #include "utils/builtins.h"
 
 #define SCHEMA_PREFIX "s/"
@@ -56,8 +52,10 @@ entry_check(ProllyCtx *ctx, const VcTable *t)
 	size_t		len;
 
 	bytes = vc_schema_get(ctx, &t->schema, &len);
-	if (bytes == NULL || len != 0)
-		corrupt("has a schema's entry with a schema chunk");
+	if (bytes == NULL)
+		corrupt("has a schema's entry naming a schema chunk that is none");
+	if (len != 0)
+		corrupt("has a schema's entry with a table's schema");
 	px_free(bytes);
 }
 
@@ -120,7 +118,7 @@ dbroot_schemas(ProllyCtx *ctx, const PHash *rv, WsDbRootSchemaFn fn, void *arg)
 			corrupt("has an entry that is nothing known");
 		nlen = klen - SCHEMA_PREFIX_LEN;
 		/* (as a schema's name is: the name a caller is given is a name) */
-		if (nlen >= NAMEDATALEN || memchr(key + SCHEMA_PREFIX_LEN, '\0', nlen) != NULL ||
+		if (nlen >= NAMEDATALEN ||
 			!pg_verify_mbstr(PG_UTF8, (const char *) key + SCHEMA_PREFIX_LEN, (int) nlen, true))
 			corrupt("has a schema's entry that names no schema");
 		vc_table_decode(val, vlen, &t);
@@ -143,35 +141,3 @@ const WsDbRootRoutine MapWsDbRoot = {
 };
 
 const WsDbRootRoutine *WsDbRoot = &MapWsDbRoot;
-
-typedef struct DbRestore
-{
-	ProllyCtx  *ctx;
-} DbRestore;
-
-static bool
-restore_one(void *arg, const char *name, const PHash *root)
-{
-	DbRestore  *r = arg;
-	char	   *schema = ws_name_from_utf8(name);
-	WsSqlRows	rows;
-	int			level = WsSql->begin();
-
-	/* (made on the branch, which the caller is on, versioned, owned by the caller) */
-	WsSql->run(psprintf("CREATE SCHEMA %s VERSIONED", quote_identifier(schema)), 0, NULL, &rows);
-	ws_sql_rows_free(&rows);
-	WsSql->end(level);
-	WsRootIO->restore(r->ctx, root, NULL, schema);
-	pfree(schema);
-	return true;
-}
-
-void
-ws_dbroot_restore(ProllyCtx *ctx, const PHash *rv, int32 branch)
-{
-	DbRestore	r = {ctx};
-	int			level = CatalogBranchEnter(branch);
-
-	WsDbRoot->schemas(ctx, rv, restore_one, &r);
-	CatalogBranchLeave(level);
-}

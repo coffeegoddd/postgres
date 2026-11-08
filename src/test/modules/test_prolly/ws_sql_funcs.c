@@ -74,7 +74,7 @@ PG_FUNCTION_INFO_V1(test_branch_of);
 PG_FUNCTION_INFO_V1(test_branch_barrier);
 PG_FUNCTION_INFO_V1(test_branch_commit);
 PG_FUNCTION_INFO_V1(test_dbroot_schemas);
-PG_FUNCTION_INFO_V1(test_dbroot_restore);
+PG_FUNCTION_INFO_V1(test_branch_unlink);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
@@ -1131,17 +1131,11 @@ test_dbroot_schemas(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 
-/* test_dbroot_restore(root text, branch integer): each schema of a branch's root made on a branch */
+/* test_branch_unlink(name text) returns boolean: whether it was linked */
 Datum
-test_dbroot_restore(PG_FUNCTION_ARGS)
+test_branch_unlink(PG_FUNCTION_ARGS)
 {
-	ProllyCtx	ctx;
-	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
-
-	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
-	ws_dbroot_restore(&ctx, &root, PG_GETARG_INT32(1));
-	prolly_ctx_free(&ctx);
-	PG_RETURN_VOID();
+	PG_RETURN_BOOL(BranchLink->unlink(text_to_cstring(PG_GETARG_TEXT_PP(0))));
 }
 
 /*

@@ -10,6 +10,7 @@ SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1;
        relname        |       amname       
 ----------------------+--------------------
+ branches             | heap
  bundles              | heap
  capture_barriers     | heap
  capture_fingerprints | heap
@@ -21,7 +22,7 @@ WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1
  pointers             | heap
  tier_chunks          | prolly_tier
  tier_index           | prolly_chunk_index
-(11 rows)
+(12 rows)
 
 -- (d as a chunk of the history store's format, the engine's: its hash, and
 -- a put of it)
