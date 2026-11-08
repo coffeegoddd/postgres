@@ -82,14 +82,15 @@ sub through_indexes
 	}
 }
 
-# What each constraint refuses, by its SQLSTATE: anything else, or nothing, is an error.
+# What each constraint refuses, by its SQLSTATE: anything else, or nothing, is an error.  (None takes
+# a sequence's value, which no rollback gives back.)
 my @refused = (
 	[ '23505', q{INSERT INTO rt.kinds (a, b) SELECT a, b FROM rt.kinds LIMIT 1} ],
 	[ '23503', q{INSERT INTO rt.ledger VALUES (-1, 1, 1)} ],
 	[ '23503', q{SET CONSTRAINTS ALL IMMEDIATE; DELETE FROM rt.node WHERE id = 1} ],
-	[ '23514', q{INSERT INTO rt.acct (email, score) VALUES ('new@x', 101)} ],
+	[ '23514', q{INSERT INTO rt.acct (id, email, score) OVERRIDING SYSTEM VALUE VALUES (-1, 'new@x', 101)} ],
 	[ '23514', q{INSERT INTO rt.kinds (a, b, dom) VALUES (7777, 'q', 0)} ],
-	[ '23502', q{INSERT INTO rt.acct (email) VALUES (NULL)} ],
+	[ '23502', q{INSERT INTO rt.acct (id, email) OVERRIDING SYSTEM VALUE VALUES (-1, NULL)} ],
 	[ '428C9', q{INSERT INTO rt.acct (id, email) VALUES (1, 'a')} ]);
 
 sub constraints_refuse
@@ -140,12 +141,12 @@ for my $k (1 .. $#order)
 	sql(qq{SELECT test_ws_move_prepare('rt', '$root[$to]')});
 	my $before = changes();
 	sql(q{SELECT pg_create_logical_replication_slot('watch', 'test_decoding')});
-	my $stats = sql(qq{SELECT test_ws_move('rt', '$root[$to]')});
+	my $stats = sql(qq{SELECT test_ws_move('rt', '$root[$to]'); SELECT pg_stat_force_next_flush()});
 	note("$name: $stats");
 	is(read_root(), $root[$to], "$name: the tables hold the root");
 	is(capture_root(), $root[$to], "$name: and capture has it");
 
-	# (the move's session has ended, and with it sent its counts)
+	# (the move's session sent its counts before it said it was done)
 	# (as bytes: a value it prints may hold a zero byte, and only how a line starts is asked)
 	my $sent = sql(q{SELECT count(*) FROM pg_logical_slot_get_binary_changes('watch', NULL, NULL)
 		WHERE encode(substring(data FROM 1 FOR 200), 'escape') ~ '^table rt\.[^:]+: (INSERT|UPDATE|DELETE):'});
@@ -166,6 +167,7 @@ for my $k (1 .. $#order)
 	is(indexes_there(), $there[$to], "$name: the indexes a query checks are the target's");
 	through_indexes($name);
 	constraints_refuse($name);
+	is(read_root(), $root[$to], "$name: what is refused leaves the tables as they were");
 }
 is(scalar(keys %done), 12, 'every ordered pair is moved between once');
 

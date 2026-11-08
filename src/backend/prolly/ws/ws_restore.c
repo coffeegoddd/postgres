@@ -592,6 +592,7 @@ obj_bytes_cmp(const void *a, const void *b)
 {
 	const ObjBytes *x = a;
 	const ObjBytes *y = b;
+
 	return key_cmp(x->key.data, x->key.len, y->key.data, y->key.len);
 }
 
