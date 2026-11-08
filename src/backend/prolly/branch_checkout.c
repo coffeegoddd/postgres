@@ -3,23 +3,21 @@
  * branch_checkout.c
  *	  A session on a branch, held for it.
  *
- * A checked-out branch is held in shared memory: each backend's slot says
- * which branch it's on as of its last commit, and which one a checkout in its
- * open transaction has taken.  (Not a session lock: an abort lets go of all
- * of those, and a user's can be let go of by pg_advisory_unlock_all.)  A
- * checkout takes the branch's lock, a database object lock of pg_database's
- * class on its number with sub-id 2 (its catalogs' lock has sub-id 1), in a
- * mode only a change taking the branch from its sessions conflicts with, and
- * notes it in its slot while holding that, until its transaction ends.  That
- * change asks for the lock conditionally, in a mode that conflicts, which it
- * holds to its transaction's end, and then reads the slots: a checkout that
- * got there first has noted it, and one that comes after waits for it.
- *
- * A checkout is undone with the transaction or subtransaction it's in, as
- * catalog_branch, which it sets, is: so what it took is noted with the
- * subtransaction's nesting level, and the slot's taken branch is the last of
- * those still standing; at the top transaction's commit it's the one held.
- *
+ * Which branch each backend is on is in shared memory: its slot has the
+ * catalog branch catalog_branch now names, written as the setting changes, so
+ * it follows the setting through every commit, abort, savepoint, function's
+ * own setting and reset.  A checkout takes the branch's lock, a database
+ * object lock of pg_database's class on its number with sub-id 2 (its
+ * catalogs' lock has sub-id 1), in a mode only a change taking the branch
+ * from its sessions conflicts with, and sets catalog_branch while holding
+ * it, until its transaction ends.  That change asks for the lock
+ * conditionally, in a mode that conflicts, which it holds to its
+ * transaction's end, and then reads the slots: a checkout in a transaction
+ * still open holds the lock, one done is in its slot, and one that comes
+ * after waits.  A session that sets catalog_branch itself takes no lock, so
+ * it may land on a branch just being taken, and then finds it gone, as it
+ * would a schema dropped under it.
+
  * Whether a transaction has written to a versioned schema is told by the
  * locks it holds: a write, or a change of an object, takes its relation's
  * lock in a mode above what a read or a row lock takes, and keeps it until
@@ -53,12 +51,11 @@
 
 char	   *default_branch = NULL;
 
-/* A backend's slot: its database, the branch it holds, and the one its transaction has taken, or 0. */
+/* A backend's slot: its database, and the catalog branch it's on, or 0. */
 typedef struct CheckoutSlot
 {
 	pg_atomic_uint32 db;
-	pg_atomic_uint32 held;
-	pg_atomic_uint32 taken;
+	pg_atomic_uint32 branch;
 } CheckoutSlot;
 
 static CheckoutSlot *slots = NULL;
@@ -95,31 +92,9 @@ BranchCheckoutShmemInit(void *arg)
 	for (int i = 0; i < nslots; i++)
 	{
 		pg_atomic_init_u32(&slots[i].db, InvalidOid);
-		pg_atomic_init_u32(&slots[i].held, 0);
-		pg_atomic_init_u32(&slots[i].taken, 0);
+		pg_atomic_init_u32(&slots[i].branch, 0);
 	}
 }
-
-static CheckoutSlot *
-my_slot(void)
-{
-	if (nslots == 0)
-		nslots = slot_count();
-	Assert(MyProcNumber >= 0 && MyProcNumber < nslots);
-	return &slots[MyProcNumber];
-}
-
-/* What checkouts in the transaction took: each branch, and the nesting level it was taken at. */
-typedef struct Taken
-{
-	int32		branch;
-	int			level;
-} Taken;
-
-static Taken *taken = NULL;
-static int	ntaken = 0;
-static int	taken_cap = 0;
-static bool callbacks_registered = false;
 
 static void
 hold_tag(LOCKTAG *tag, int32 branch)
@@ -127,62 +102,25 @@ hold_tag(LOCKTAG *tag, int32 branch)
 	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, DatabaseRelationId, (Oid) branch, 2);
 }
 
-/* (the slot's taken branch: the last of those standing) */
-static void
-taken_note(void)
+/* (as the setting changes: anywhere, an abort too, so only what can't fail) */
+void
+BranchCheckoutNote(int32 branch)
 {
-	pg_atomic_write_u32(&my_slot()->taken, ntaken > 0 ? (uint32) taken[ntaken - 1].branch : 0);
-}
-
-static void
-checkout_xact_callback(XactEvent event, void *arg)
-{
-	CheckoutSlot *mine;
-
-	if (ntaken == 0)
+	if (slots == NULL || MyProcNumber < 0)
 		return;
-	mine = my_slot();
-	switch (event)
-	{
-		case XACT_EVENT_COMMIT:
-		case XACT_EVENT_PARALLEL_COMMIT:
-		case XACT_EVENT_PREPARE:
-			pg_atomic_write_u32(&mine->held, (uint32) taken[ntaken - 1].branch);
-			ntaken = 0;
-			taken_note();
-			break;
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_ABORT:
-			ntaken = 0;
-			taken_note();
-			break;
-		default:
-			break;
-	}
-}
-
-static void
-checkout_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
-						  SubTransactionId parentSubid, void *arg)
-{
-	int			level = GetCurrentTransactionNestLevel();
-
-	if (event != SUBXACT_EVENT_ABORT_SUB)
+	if (nslots == 0)
+		nslots = slot_count();
+	if (MyProcNumber >= nslots)
 		return;
-	while (ntaken > 0 && taken[ntaken - 1].level >= level)
-		ntaken--;
-	taken_note();
+	pg_atomic_write_u32(&slots[MyProcNumber].db, MyDatabaseId);
+	pg_atomic_write_u32(&slots[MyProcNumber].branch, (uint32) branch);
 }
 
 /* (a backend exiting is on no branch) */
 static void
 checkout_exit(int code, Datum arg)
 {
-	CheckoutSlot *mine = my_slot();
-
-	pg_atomic_write_u32(&mine->taken, 0);
-	pg_atomic_write_u32(&mine->held, 0);
-	pg_atomic_write_u32(&mine->db, InvalidOid);
+	BranchCheckoutNote(0);
 }
 
 /* Whether the transaction holds a versioned relation's lock in a mode that writes or changes it. */
@@ -201,11 +139,22 @@ wrote_versioned(void)
 		LockInstanceData *l = &locks->locks[i];
 		Oid			nsp;
 
-		if (l->pid != MyProcPid || l->locktag.locktag_type != LOCKTAG_RELATION ||
-			l->locktag.locktag_field1 != MyDatabaseId || (l->holdMask & ~reads) == 0)
+		if (l->pid != MyProcPid || l->locktag.locktag_field1 != MyDatabaseId)
 			continue;
+
+		/* (a branch's catalogs locked: one of its objects made, changed or dropped) */
+		if (l->locktag.locktag_type == LOCKTAG_OBJECT &&
+			l->locktag.locktag_field2 == DatabaseRelationId && l->locktag.locktag_field4 == 1)
+		{
+			wrote = true;
+			continue;
+		}
+		if (l->locktag.locktag_type != LOCKTAG_RELATION || (l->holdMask & ~reads) == 0)
+			continue;
+
+		/* (one dropped in the transaction, its schema gone with it, may have been a branch's) */
 		nsp = get_rel_namespace((Oid) l->locktag.locktag_field2);
-		wrote = OidIsValid(nsp) && NamespaceBranch(nsp) != 0;
+		wrote = !OidIsValid(nsp) || NamespaceBranch(nsp) != 0;
 	}
 	return wrote;
 }
@@ -228,28 +177,9 @@ session_checkout(const char *name)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" not found", name)));
 
-	if (!callbacks_registered)
-	{
-		RegisterXactCallback(checkout_xact_callback, NULL);
-		RegisterSubXactCallback(checkout_subxact_callback, NULL);
-		before_shmem_exit(checkout_exit, (Datum) 0);
-		pg_atomic_write_u32(&my_slot()->db, MyDatabaseId);
-		callbacks_registered = true;
-	}
-	if (ntaken == taken_cap)
-	{
-		taken_cap = Max(4, taken_cap * 2);
-		taken = taken == NULL ? MemoryContextAlloc(TopMemoryContext, sizeof(Taken) * taken_cap) :
-			repalloc(taken, sizeof(Taken) * taken_cap);
-	}
-
 	/* (waiting, if the branch is being taken from its sessions, until that's done) */
 	hold_tag(&tag, branch);
 	(void) LockAcquire(&tag, AccessShareLock, false, false);
-	taken[ntaken].branch = branch;
-	taken[ntaken].level = GetCurrentTransactionNestLevel();
-	ntaken++;
-	taken_note();
 
 	/* (gone meanwhile, or another's: as it is now) */
 	AcceptInvalidationMessages();
@@ -282,10 +212,8 @@ session_in_use(int32 branch)
 		nslots = slot_count();
 	for (int i = 0; i < nslots; i++)
 	{
-		if (i == MyProcNumber || pg_atomic_read_u32(&slots[i].db) != MyDatabaseId)
-			continue;
-		if (pg_atomic_read_u32(&slots[i].held) == (uint32) branch ||
-			pg_atomic_read_u32(&slots[i].taken) == (uint32) branch)
+		if (i != MyProcNumber && pg_atomic_read_u32(&slots[i].db) == MyDatabaseId &&
+			pg_atomic_read_u32(&slots[i].branch) == (uint32) branch)
 			return true;
 	}
 	return false;
@@ -301,8 +229,10 @@ const BranchCheckoutRoutine SessionBranchCheckout = {
 const BranchCheckoutRoutine *BranchCheckout = &SessionBranchCheckout;
 
 void
-BranchCheckoutSessionStart(void)
+BranchCheckoutBackendStart(bool client)
 {
-	if (default_branch != NULL && default_branch[0] != '\0')
+	before_shmem_exit(checkout_exit, (Datum) 0);
+	BranchCheckoutNote(catalog_branch);
+	if (client && default_branch != NULL && default_branch[0] != '\0')
 		BranchCheckout->checkout(default_branch);
 }

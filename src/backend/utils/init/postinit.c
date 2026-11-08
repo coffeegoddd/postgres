@@ -1272,9 +1272,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* Initialize this backend's session state. */
 	InitializeSession();
 
-	/* a client's session on the branch it's to start on */
-	if (!bootstrap && MyBackendType == B_BACKEND && !am_walsender)
-		BranchCheckoutSessionStart();
+	/* the branch it's on noted, and a client's session on the one it's to start on */
+	if (!bootstrap)
+		BranchCheckoutBackendStart(MyBackendType == B_BACKEND && !am_walsender);
 
 	/*
 	 * If this is an interactive session, load any libraries that should be

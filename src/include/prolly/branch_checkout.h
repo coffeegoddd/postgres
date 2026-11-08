@@ -7,17 +7,18 @@
  * A session checks a branch out by its name (prolly/branch_link.h), which
  * puts the session on its catalog branch (catalog_branch, which discards
  * what was resolved from schema names; see prolly/branch_catalog.h) and
- * holds the branch for the session, so that what would take it from under
- * the session (renaming it, deleting it, or giving back its working set) can
- * see that it's in use.  No row is read or written.  A checkout is undone
- * with the transaction or subtransaction it's in, the hold with it.
+ * notes it for the session, so that what would take it from under the
+ * session (renaming it, deleting it, or giving back its working set) can see
+ * that it's in use.  No row is read or written.  A checkout is undone with
+ * the transaction or subtransaction it's in, as catalog_branch is.
  *
  * A new session checks out default_branch, if it's set: for the database
  * (ALTER DATABASE ... SET default_branch), and for a connection, which may
  * name another.
  *
- * Setting catalog_branch itself puts a session on a catalog branch and holds
- * nothing: it's for the engine's own work, and its tests.
+ * Setting catalog_branch itself puts a session on a catalog branch, which is
+ * noted too, but without what a checkout waits for: it's for the engine's
+ * own work, and its tests.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -63,7 +64,13 @@ extern PGDLLIMPORT const BranchCheckoutRoutine *BranchCheckout;
 
 extern PGDLLIMPORT const ShmemCallbacks BranchCheckoutShmemCallbacks;
 
-/* At a session's start, in its first transaction: default_branch checked out. */
-extern void BranchCheckoutSessionStart(void);
+/*
+ * At a backend's start, in its first transaction: its slot kept from then until it exits, and for a
+ * client's session, default_branch checked out.
+ */
+extern void BranchCheckoutBackendStart(bool client);
+
+/* The catalog branch this backend is now on, as catalog_branch changes. */
+extern void BranchCheckoutNote(int32 branch);
 
 #endif							/* PROLLY_BRANCH_CHECKOUT_H */

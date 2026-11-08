@@ -1,9 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A session checks a branch out by name, as any role may: it's then on that branch's catalog branch,
-# seeing its tables, and holds it, so another session can tell it's in use.  A checkout rolled back,
-# or rolled back to a savepoint, is undone, its hold given back; of several in one transaction, the
-# last is kept.  One in a transaction that has changed a versioned schema is refused, and one of a
+# seeing its tables, and another session can tell it's in use.  A checkout rolled back, or rolled back
+# to a savepoint, is undone; of several in one transaction, the last is kept; one in a savepoint
+# released stands, and so does one in a function; after a reset the
+# session is where it started.  What another can tell is always where the session is.  One in a transaction that has changed a versioned schema is refused, and one of a
 # branch not there.  While a change has a branch from its sessions, a checkout of it waits.  A new
 # session checks out the database's default branch, or the one its connection names.
 
@@ -55,6 +56,27 @@ $s->query_safe(q{BEGIN; SAVEPOINT a; SELECT test_branch_checkout('feat'); ROLLBA
 is($s->query_safe('SHOW catalog_branch'), $main, 'rolled back to a savepoint, it is undone');
 is(in_use($main) . in_use($feat), 'tf', 'its hold too');
 
+# Released, then a sibling rolled back: the checkout stands, and is held.
+$s->query_safe(q{BEGIN; SAVEPOINT a; SELECT test_branch_checkout('feat'); RELEASE a; SAVEPOINT b; ROLLBACK TO b; COMMIT});
+is($s->query_safe('SHOW catalog_branch'), $feat, 'a checkout in a savepoint released stands, a sibling rolled back');
+is(in_use($main) . in_use($feat), 'ft', 'and is held');
+$s->query_safe(q{SELECT test_branch_checkout('main')});
+
+# In a function of a versioned schema: it stands as the function returns, as the setting does.
+$node->safe_psql('postgres', qq{SET catalog_branch = $main; CREATE FUNCTION app.go() RETURNS void LANGUAGE plpgsql
+	AS \$\$BEGIN PERFORM test_branch_checkout('feat'); END\$\$});
+$s->query_safe(q{SELECT app.go()});
+is($s->query_safe('SHOW catalog_branch'), $feat, 'a checkout in a function stands as it returns');
+is(in_use($main) . in_use($feat), 'ft', 'and what another can tell is where the session is');
+$s->query_safe(q{SELECT test_branch_checkout('main')});
+
+# Reset: on the branch it resets to, and holding that.
+$s->query_safe(q{SELECT test_branch_checkout('feat')});
+$s->query_safe('DISCARD ALL');
+is($s->query_safe('SHOW catalog_branch'), '0', 'DISCARD ALL puts the session where it started');
+is(in_use($main) . in_use($feat), 'ff', 'holding nothing');
+$s->query_safe(q{SELECT test_branch_checkout('main')});
+
 # Refused in a transaction that changed a versioned schema; not in one that changed only a shared one.
 $s->query_safe(q{BEGIN; INSERT INTO public.plain VALUES (1); SELECT test_branch_checkout('feat'); ROLLBACK});
 pass('a transaction that wrote only to a shared schema checks out');
@@ -65,6 +87,12 @@ like($err, qr/cannot check out branch "feat" in a transaction that has changed a
 ($rc, $out, $err) = $node->psql('postgres', qq{SET catalog_branch = $main; BEGIN; ALTER TABLE app.t ADD COLUMN w integer;
 	SELECT test_branch_checkout('feat')});
 like($err, qr/cannot check out branch "feat" in a transaction/, 'and one that changed a versioned table\'s definition');
+($rc, $out, $err) = $node->psql('postgres', qq{SET catalog_branch = $main; BEGIN; CREATE TABLE app.gone (id integer);
+	COMMIT; BEGIN; DROP TABLE app.gone; SELECT test_branch_checkout('feat')});
+like($err, qr/cannot check out branch "feat" in a transaction/, 'and one that dropped a versioned table');
+($rc, $out, $err) = $node->psql('postgres', qq{SET catalog_branch = $main; BEGIN;
+	CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS 'SELECT 1'; SELECT test_branch_checkout('feat')});
+like($err, qr/cannot check out branch "feat" in a transaction/, 'and one that made a function in a versioned schema');
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_checkout('nope')});
 like($err, qr/branch "nope" not found/, 'a branch not there is refused');
 
@@ -86,6 +114,7 @@ $taker->query_safe('COMMIT');
 $w->query_until(qr/done/, '');
 is($w->query_safe('SHOW catalog_branch'), $feat, 'and then checks out');
 $_->quit for ($taker, $w);
+ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($feat)"), 'which, gone, holds nothing');
 
 # Leaving: the hold goes with the session.
 $s->quit;
