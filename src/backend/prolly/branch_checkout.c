@@ -38,6 +38,7 @@
 
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
@@ -248,26 +249,42 @@ session_checkout(const char *name)
 				 errhint("Commit or roll back the transaction first.")));
 	branch = BranchLink->branch_of(name);
 
-	/* (one that's only a head given a working set first, at its head; one not there refused) */
+	/*
+	 * (one that's only a head given a working set first, at its head; one not there refused.  It's
+	 * made in a transaction left out of capture, so not in a block with what else would be left out
+	 * too.  It's the engine's work, whoever checks out, as making a branch's catalog rows and
+	 * history needs what only a superuser has)
+	 */
 	if (branch == 0)
 	{
 		ProllyCtx	ctx;
+		Oid			save_userid;
+		int			save_sec_context;
 
+		if (IsTransactionBlock())
+			ereport(ERROR,
+					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+					 errmsg("branch \"%s\" has no working set, and can't be given one in a transaction block", name),
+					 errhint("Check it out outside a transaction block.")));
+		GetUserIdAndSecContext(&save_userid, &save_sec_context);
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 		prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
 		branch = BranchOps->materialize(&ctx, name, BRANCH_CHECKOUT_TIMEOUT_MS);
 		prolly_ctx_free(&ctx);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
 	}
 
 	/* (waiting, if the branch is being taken from its sessions, until that's done) */
 	hold_tag(&tag, branch);
 	(void) LockAcquire(&tag, AccessShareLock, false, false);
 
-	/* (gone meanwhile, or another's: as it is now) */
+	/* (gone meanwhile, or given back, or another's: as it is now) */
 	AcceptInvalidationMessages();
 	if (BranchLink->branch_of(name) != branch)
 		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("branch \"%s\" not found", name)));
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("branch \"%s\" changed as it was being checked out", name),
+				 errhint("Try again.")));
 
 	snprintf(value, sizeof(value), "%d", branch);
 	(void) set_config_option("catalog_branch", value, PGC_USERSET, PGC_S_SESSION,

@@ -45,19 +45,18 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "utils/array.h"
-#include "prolly/branch_checkout.h"
-#include "common/hashfn.h"
-#include "catalog/pg_type.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_checkout.h"
 #include "prolly/branch_link.h"
 #include "prolly/branch_ops.h"
 #include "prolly/capture.h"
@@ -74,6 +73,7 @@
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -454,10 +454,32 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 	holding.timeout_ms = timeout_ms;
 	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &holding, &root);
 
-	if (BranchLink->branch_of(name) != 0 || (new_head && vc_branch_get(repo, name, &taken)))
+	/* (the parent still the one held, its working set not given back meanwhile) */
+	if (BranchLink->branch_of(from) != parent)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("branch \"%s\" gave back its working set as a branch was being made from it", from),
+				 errhint("Try again.")));
+	if (BranchLink->branch_of(name) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("a branch named \"%s\" already exists", name)));
+	if (vc_branch_get(repo, name, &taken))
+	{
+		/* (one there already is the one being given a working set, at the head it was asked at) */
+		bool		moved = !new_head && commit != NULL && !phash_eq(&taken.head, commit);
+
+		vc_branch_free(&taken);
+		if (new_head)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("a branch named \"%s\" already exists", name)));
+		if (moved)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("branch \"%s\" moved as it was being given a working set", name),
+					 errhint("Try again.")));
+	}
 	if (!vc_branch_get(repo, from, &head))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -597,7 +619,14 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 							timeout_ms);
 	}
 	else if (vc_branch_create(&repo, name, commit != NULL ? commit : &head.head) != 0)
+	{
+		/* (another of that name made meanwhile) */
+		if (vc_branch_get(&repo, name, &taken))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("a branch named \"%s\" already exists", name)));
 		elog(ERROR, "could not make branch \"%s\" of version control", name);
+	}
 	vc_branch_free(&head);
 	vc_repo_free(&repo);
 	return branch;
@@ -647,7 +676,8 @@ shared_materialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 static bool
 named_default(const char *name)
 {
-	Relation	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
+	/* (none set meanwhile: what sets one waits until this transaction ends) */
+	Relation	rel = table_open(DbRoleSettingRelationId, ShareLock);
 	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	HeapTuple	tup;
 	char	   *setting = psprintf("default_branch=%s", name);
@@ -672,7 +702,7 @@ named_default(const char *name)
 		}
 	}
 	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
+	table_close(rel, NoLock);
 	return named;
 }
 
@@ -680,12 +710,15 @@ static void
 shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 {
 	ChunkStore *cs = ChunkStoreOpen("pages");
-	int32		branch = BranchLink->branch_of(name);
+	int32		branch;
 	VcRepo		repo;
 	VcBranch	b;
 	PHash		root;
 	Holding		holding;
 
+	/* (no one giving it a working set meanwhile, as it's given back) */
+	lock_making(name);
+	branch = BranchLink->branch_of(name);
 	if (branch == 0)
 		return;
 	if (branch == catalog_branch || BranchCheckout->in_use(branch))
@@ -696,14 +729,14 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is a default_branch", name)));
-	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
-	if (!vc_branch_get(&repo, name, &b))
-		elog(ERROR, "branch \"%s\" has a working set and no head", name);
 
-	/* (its working set as its writers are held off: what's given back is its head's) */
+	/* (its working set and its head as its writers and commits are held off) */
 	holding.branch = branch;
 	holding.timeout_ms = timeout_ms;
 	CaptureBranchBarrierLeavingOut(ctx, branch, timeout_ms, lock_writers_out, &holding, &root);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (!vc_branch_get(&repo, name, &b))
+		elog(ERROR, "branch \"%s\" has a working set and no head", name);
 	if (!phash_eq(&root, &b.head_root))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

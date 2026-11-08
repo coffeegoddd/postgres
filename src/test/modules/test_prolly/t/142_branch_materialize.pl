@@ -4,7 +4,8 @@
 # given a working set as a session checks it out, or on request, at its head, from a branch that has
 # one, sharing its pages; two sessions giving it one at once make one.  It gives the working set back
 # on request, its head kept, and is given one again row for row; that's refused while another session
-# is on it, while it's a database's default_branch, or while it has changes not committed.  Crashes
+# is on it, while it's a database's or role's default_branch, or while it has changes not committed.
+# A checkout gives one, for any role, as a session starts too, but not in a transaction block.  Crashes
 # leave it whole or a head.
 
 use strict;
@@ -59,6 +60,24 @@ ok($f > 0, 'checked out, a branch is given a working set');
 is($s->query_safe(q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM app.t}), $c2_rows, 'at its head');
 is($node->safe_psql('postgres', $schemas), $before + 1, 'and only it');
 
+# Not in a transaction block, as what it's made in is left out of capture.
+my ($rc, $out, $err) = $node->psql('postgres', q{BEGIN; SELECT test_branch_checkout('h3'); COMMIT});
+like($err, qr/branch "h3" has no working set, and can't be given one in a transaction block/,
+	'a branch with no working set isn\'t given one by a checkout in a transaction block');
+
+# By any role, and as a session starts on it.
+$node->safe_psql('postgres', q{CREATE ROLE plain LOGIN});
+is($node->safe_psql('postgres', q{SET ROLE plain; DO $$BEGIN PERFORM test_branch_checkout('h4'); END$$;
+	SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM app.t}), $c2_rows,
+	'a role with no powers checks out a branch with no working set, which is given one');
+{
+	local $ENV{PGOPTIONS} = '-c default_branch=h5';
+	is($node->safe_psql('postgres', q{SELECT test_branch_current()}, extra_params => ['-U', 'plain']), 'h5',
+		'and a session starting on one gives it one');
+}
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_create('taker', 'h6', NULL, true)});
+like($err, qr/branch "h6" has no working set to take changes from/, 'changes aren\'t taken from a branch with none');
+
 # Given one on request, at an older commit, from a branch at another.
 my $old = $node->safe_psql('postgres', q{SELECT test_branch_materialize('old')});
 is(rows($old), $c1_rows, 'given one on request, a branch at an older commit has its rows');
@@ -74,13 +93,12 @@ ok($node->poll_query_until('postgres', qq{SELECT count(*) = 1 FROM pg_stat_activ
 	WHERE query LIKE 'SELECT test_branch_materialize%' AND $apid = ANY (pg_blocking_pids(pid))}),
 	'a second session giving a branch a working set waits for the first');
 $a->query_safe('COMMIT');
-my $out = $b->query_until(qr/done/, '');
+$out = $b->query_until(qr/done/, '');
 my ($h1) = $out =~ /^(\d+)$/m;
 is($h1, $node->safe_psql('postgres', q{SELECT test_branch_of('h1')}), 'and has the one it made');
 $_->quit for ($a, $b);
 
 # Given back: refused on another session's branch, a default_branch, or with changes not committed.
-my ($rc, $err);
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_dematerialize('f')});
 like($err, qr/branch "f" is checked out/, 'giving back a working set another session is on is refused');
 $s->query_safe(q{SELECT test_branch_checkout('main')});
@@ -92,7 +110,13 @@ $node->safe_psql('postgres', q{ALTER DATABASE postgres SET default_branch = 'f'}
 	($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_dematerialize('f')});
 }
 like($err, qr/branch "f" is a default_branch/, 'and a default_branch\'s');
-$node->safe_psql('postgres', q{ALTER DATABASE postgres RESET default_branch});
+$node->safe_psql('postgres', q{ALTER DATABASE postgres RESET default_branch; ALTER ROLE plain SET default_branch = 'f'});
+{
+	local $ENV{PGOPTIONS} = '-c default_branch=';
+	($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_dematerialize('f')});
+}
+like($err, qr/branch "f" is a default_branch/, 'and a role\'s');
+$node->safe_psql('postgres', q{ALTER ROLE plain RESET default_branch});
 sql($f, q{SET ROLE app_owner; INSERT INTO app.t VALUES (6, 'uncommitted')});
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_dematerialize('f')});
 like($err, qr/branch "f" has changes not committed/, 'and one with changes not committed');
@@ -102,7 +126,7 @@ sql($f, q{SET ROLE app_owner; DELETE FROM app.t WHERE id = 6});
 $node->safe_psql('postgres', q{SELECT test_branch_dematerialize('f')});
 is($node->safe_psql('postgres', q{SELECT test_branch_of('f') IS NULL AND test_branch_head('f') IS NOT NULL}), 't',
 	'given back, a branch is only its head again');
-is($node->safe_psql('postgres', $schemas), $before + 2, 'its catalog rows gone');
+is($node->safe_psql('postgres', $schemas), $before + 4, 'its catalog rows gone, the others\' kept');
 my $f2 = $node->safe_psql('postgres', q{SELECT test_branch_materialize('f')});
 is(rows($f2), $c2_rows, 'given one again, it has its head\'s rows');
 
