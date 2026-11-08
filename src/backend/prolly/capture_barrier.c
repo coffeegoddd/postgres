@@ -430,10 +430,6 @@ check_may_read_all(Oid nsp)
 	list_free(relations);
 }
 
-/*
- * What's asked of a barrier before anything is held or written, of whatever the schema has now:
- * what it then holds is asked again once it's locked.  The schema's branch.
- */
 /* What's asked of a barrier whatever it's of. */
 static void
 barrier_check_common(bool leaving_out)
@@ -453,6 +449,11 @@ barrier_check_common(bool leaving_out)
 	check_history(leaving_out);
 }
 
+/*
+ * What's asked of a barrier before anything is held or written, of whatever the schema has now:
+ * what it then holds is asked again once it's locked.  The schema's branch.  (capture_to_trees
+ * first, as a schema that isn't versioned may only be so for it being off)
+ */
 static int32
 barrier_check(const char *schema, Oid nsp, bool leaving_out)
 {
