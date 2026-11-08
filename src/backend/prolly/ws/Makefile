@@ -14,6 +14,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	ws_dbroot.o \
 	ws_diff.o \
 	ws_fk.o \
 	ws_merge.o \

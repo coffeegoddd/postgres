@@ -216,6 +216,13 @@ extern void CaptureTableRowsRead(Relation rel, const WsRowShape *shape, Snapshot
 extern void CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root);
 
 /*
+ * As CaptureBarrier, of every versioned schema on a branch at one point: the branch's root
+ * (prolly/ws/ws_dbroot.h), each schema's root under its name, empty if it has none.  A schema of it
+ * made meanwhile is a serialization failure, as one changed is.
+ */
+extern void CaptureBranchBarrier(ProllyCtx *ctx, int32 branch, int timeout_ms, PHash *root);
+
+/*
  * Waits until capture has applied to every branch's working trees what this database's
  * transactions committed up to lsn, a record's end as flushed, such as a commit's; an error if it
  * hasn't within timeout_ms, if the database isn't being captured, if its slot's been invalidated,

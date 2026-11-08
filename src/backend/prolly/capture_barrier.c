@@ -58,9 +58,12 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
 #include "prolly/chunkstore.h"
+#include "prolly/engine/vc.h"
 #include "prolly/engine/vc_refs.h"
+#include "prolly/ws/ws_dbroot.h"
 #include "prolly/ws/ws_restore.h"
 #include "prolly/ws/ws_rows.h"
+#include "prolly/ws/ws_schema.h"
 #include "replication/message.h"
 #include "replication/slot.h"
 #include "storage/ipc.h"
@@ -88,6 +91,8 @@
  * What a table's rows are read as while a barrier makes its root; and what they're written as,
  * as a root's violations are checked by restoring it, undone.
  */
+static List *branch_schemas(int32 branch);
+
 static XLogRecPtr barrier_lsn = InvalidXLogRecPtr;
 static VcRefs *barrier_refs = NULL;
 static const WsRowsRoutine *barrier_rows = NULL;
@@ -456,17 +461,20 @@ barrier_check(const char *schema, Oid nsp, bool leaving_out)
 	return branch;
 }
 
-/* (with hold, catalog changes keep waiting until the transaction ends) */
+/*
+ * The roots of n schemas of one branch at one point, each in roots.  (with hold, catalog changes
+ * keep waiting until the transaction ends)
+ */
 static void
-barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int timeout_ms, PHash *root,
-			 bool hold)
+barrier_take(ProllyCtx *ctx, const char *const *schemas, const Oid *nsps, int n, int32 branch,
+			 bool whole_branch, int timeout_ms, PHash *roots, bool hold)
 {
 	XLogRecPtr	lsn;
 	TimestampTz start;
 	const WsRowsRoutine *rows = WsRows;
 	Oid			types[1] = {PG_LSNOID};
 	SPIPlanPtr	plan;
-	List	   *tables;
+	List	   *tables = NIL;
 	int			nest;
 	bool		quick;
 	char		quickly[32];
@@ -483,7 +491,8 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	/* (the slot first, holding no table, and the lock let go of again if it's gone once held) */
 	start = GetCurrentTimestamp();
 	slot_wait(start, timeout_ms);
-	tables = lock_schema_relations(nsp, true);
+	for (int i = 0; i < n; i++)
+		tables = list_concat(tables, lock_schema_relations(nsps[i], true));
 	INJECTION_POINT("capture-barrier-locked", NULL);
 	for (;;)
 	{
@@ -494,13 +503,22 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 		slot_wait(start, timeout_ms);
 	}
 	AcceptInvalidationMessages();
-	if (get_namespace_oid(schema, true) != nsp)
+	for (int i = 0; i < n; i++)
+		if (get_namespace_oid(schemas[i], true) != nsps[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema \"%s\" changed during a commit from capture", schemas[i]),
+					 errhint("Try the commit again.")));
+	/* (and with the whole branch's, none made since they were read: each of the n is still there) */
+	if (whole_branch && list_length(branch_schemas(branch)) != n)
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("schema \"%s\" changed during a commit from capture", schema),
+				 errmsg("a schema of branch %d was made during a commit from capture", branch),
 				 errhint("Try the commit again.")));
 	list_free(tables);
-	tables = lock_schema_relations(nsp, false);
+	tables = NIL;
+	for (int i = 0; i < n; i++)
+		tables = list_concat(tables, lock_schema_relations(nsps[i], false));
 	foreach_oid(relid, tables)
 		check_may_read(relid);
 
@@ -548,7 +566,8 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	WsRows = &CapturedWsRows;
 	PG_TRY();
 	{
-		WsRootIO->capture(ctx, schema, root);
+		for (int i = 0; i < n; i++)
+			WsRootIO->capture(ctx, schemas[i], &roots[i]);
 	}
 	PG_CATCH();
 	{
@@ -591,7 +610,74 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 {
 	Oid			nsp = get_namespace_oid(schema, false);
 
-	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp, false), timeout_ms, root, false);
+	barrier_take(ctx, &schema, &nsp, 1, barrier_check(schema, nsp, false), false, timeout_ms, root, false);
+}
+
+/* (each of the branch's schemas, by name) */
+static int
+schema_name_cmp(const void *a, const void *b)
+{
+	return strcmp(*(const char *const *) a, *(const char *const *) b);
+}
+
+/* The names of a branch's schemas, as the catalogs have them now (pg_namespace has every branch's). */
+static List *
+branch_schemas(int32 branch)
+{
+	Relation	rel = table_open(NamespaceRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tup;
+	List	   *names = NIL;
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
+
+		if (ns->nspbranch == branch)
+			names = lappend(names, pstrdup(NameStr(ns->nspname)));
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return names;
+}
+
+void
+CaptureBranchBarrier(ProllyCtx *ctx, int32 branch, int timeout_ms, PHash *root)
+{
+	List	   *names;
+	const char **schemas;
+	Oid		   *nsps;
+	PHash	   *roots;
+	int			n;
+	int			i = 0;
+	int			level;
+
+	if (branch <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch %d holds no versioned schema", branch)));
+	level = CatalogBranchEnter(branch);
+	names = branch_schemas(branch);
+	n = list_length(names);
+	schemas = palloc_array(const char *, Max(n, 1));
+	nsps = palloc_array(Oid, Max(n, 1));
+	roots = palloc_array(PHash, Max(n, 1));
+	foreach_ptr(char, name, names)
+		schemas[i++] = name;
+	qsort(schemas, n, sizeof(const char *), schema_name_cmp);
+	for (i = 0; i < n; i++)
+	{
+		nsps[i] = get_namespace_oid(schemas[i], false);
+		(void) barrier_check(schemas[i], nsps[i], false);
+	}
+
+	/* (with no schema, nothing to wait for: an empty root, as of any point) */
+	*root = vc_root_empty(ctx);
+	if (n > 0)
+		barrier_take(ctx, schemas, nsps, n, branch, true, timeout_ms, roots, false);
+	for (i = 0; i < n; i++)
+		WsDbRoot->put_schema(ctx, root, ws_name_to_utf8(schemas[i]), &roots[i], root);
+	CatalogBranchLeave(level);
 }
 
 
@@ -611,5 +697,5 @@ CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, voi
 	slot_wait(GetCurrentTimestamp(), timeout_ms);
 	CaptureLeaveOut();
 	hold(arg);
-	barrier_take(ctx, schema, nsp, branch, timeout_ms, root, true);
+	barrier_take(ctx, &schema, &nsp, 1, branch, false, timeout_ms, root, true);
 }

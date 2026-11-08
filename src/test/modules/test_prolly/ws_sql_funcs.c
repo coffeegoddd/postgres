@@ -18,8 +18,10 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "prolly/branch_link.h"
 #include "prolly/capture.h"
 #include "prolly/move.h"
+#include "prolly/ws/ws_dbroot.h"
 #include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
@@ -67,6 +69,12 @@ PG_FUNCTION_INFO_V1(test_ws_move);
 PG_FUNCTION_INFO_V1(test_ws_move_prepare);
 PG_FUNCTION_INFO_V1(test_capture_commit);
 PG_FUNCTION_INFO_V1(test_capture_commit_on);
+PG_FUNCTION_INFO_V1(test_branch_link);
+PG_FUNCTION_INFO_V1(test_branch_of);
+PG_FUNCTION_INFO_V1(test_branch_barrier);
+PG_FUNCTION_INFO_V1(test_branch_commit);
+PG_FUNCTION_INFO_V1(test_dbroot_schemas);
+PG_FUNCTION_INFO_V1(test_dbroot_restore);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
@@ -1030,6 +1038,110 @@ test_capture_commit_on(PG_FUNCTION_ARGS)
 	vc_repo_free(&repo);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* test_branch_link(name text, branch integer): a branch of the repository linked to a catalog branch */
+Datum
+test_branch_link(PG_FUNCTION_ARGS)
+{
+	BranchLink->link(text_to_cstring(PG_GETARG_TEXT_PP(0)), PG_GETARG_INT32(1));
+	PG_RETURN_VOID();
+}
+
+/* test_branch_of(name text) returns integer: its catalog branch, or NULL */
+Datum
+test_branch_of(PG_FUNCTION_ARGS)
+{
+	int32		branch = BranchLink->branch_of(text_to_cstring(PG_GETARG_TEXT_PP(0)));
+
+	if (branch == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_INT32(branch);
+}
+
+/* test_branch_barrier(branch integer, timeout_ms integer) returns text: the branch's root as of an exact point */
+Datum
+test_branch_barrier(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	PHash		root;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	CaptureBranchBarrier(&ctx, PG_GETARG_INT32(0), PG_GETARG_INT32(1), &root);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/*
+ * test_branch_commit(name text, msg text) returns text: a commit of a branch, as its catalog branch is
+ * now, on that branch of version control, made from main's head if there's none.  The root it holds.
+ */
+Datum
+test_branch_commit(PG_FUNCTION_ARGS)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		branch = BranchLink->branch_of(name);
+	ProllyCtx	ctx;
+	VcRepo		repo;
+	VcBranch	found;
+	PHash		root;
+
+	if (branch == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" is linked to no catalog branch", name)));
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	CaptureBranchBarrier(&ctx, branch, 60000, &root);
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (vc_branch_get(&repo, name, &found))
+		vc_branch_free(&found);
+	else if (vc_branch_create(&repo, name, NULL) != 0)
+		elog(ERROR, "could not make branch \"%s\"", name);
+	if (vc_checkout(&repo, name) != 0)
+		elog(ERROR, "could not check out branch \"%s\"", name);
+	(void) vc_commit_root(&repo, &root, text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	vc_repo_free(&repo);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+static bool
+dbroot_schema_out(void *arg, const char *name, const PHash *root)
+{
+	StringInfo	out = arg;
+	text	   *hash = hash_text(root);
+
+	appendStringInfo(out, "%s%s=%s", out->len > 0 ? "," : "", name, text_to_cstring(hash));
+	return true;
+}
+
+/* test_dbroot_schemas(root text) returns text: "schema=root,..." of a branch's root, in name order */
+Datum
+test_dbroot_schemas(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+	StringInfoData out;
+
+	initStringInfo(&out);
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	WsDbRoot->schemas(&ctx, &root, dbroot_schema_out, &out);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/* test_dbroot_restore(root text, branch integer): each schema of a branch's root made on a branch */
+Datum
+test_dbroot_restore(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(0));
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	ws_dbroot_restore(&ctx, &root, PG_GETARG_INT32(1));
+	prolly_ctx_free(&ctx);
+	PG_RETURN_VOID();
 }
 
 /*
