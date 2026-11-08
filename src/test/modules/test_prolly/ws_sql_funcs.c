@@ -1103,6 +1103,11 @@ test_branch_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" is linked to no catalog branch", name)));
+	/* (before the head's lock, as what it's to wait on can be waiting on what this has written) */
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a commit from capture can't run in a transaction that has written anything")));
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	LockBranchHead(branch);
 	/* (renamed or deleted as it waited: it would commit on a name no longer the branch's) */

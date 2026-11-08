@@ -86,6 +86,8 @@ $s5->query_until(qr/started/, "\\echo started\nSELECT test_branch_commit('r', 'l
 $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'no wait';
 $s4->query_safe(q{COMMIT});
 $s4->quit;
+$s5->query(q{SELECT 1});
+like($s5->{stderr}, qr/branch "r" changed as it was being committed/, 'a commit waiting on a rename is refused');
 $s5->quit;
 is(sql(q{SELECT test_branch_head('r') IS NULL}), 't', 'a commit waiting on a rename makes no branch of the old name');
 is(sql(q{SELECT test_branch_head('r2')}), $r_head, 'nor commits on the new one');
@@ -99,6 +101,13 @@ sql(q{SELECT test_branch_rename('x', 'y', true)});
 is(sql(q{SELECT test_branch_of('y') IS NULL AND test_branch_head('x') IS NULL AND test_branch_head('y') IS NOT NULL}), 't',
 	'forced, it is, the one there deleted');
 is($node->safe_psql('postgres', $schemas), $with_y - 1, 'its working set given back');
+
+# This session's branch, left for another in the delete's transaction: deleted.
+sql(q{SELECT test_branch_make('b1', 'main'); SELECT test_branch_materialize('b1')});
+$node->safe_psql('postgres', qq{SELECT test_branch_checkout('b1');
+	BEGIN; SET catalog_branch = $main; SELECT test_branch_delete('b1'); COMMIT});
+is(sql(q{SELECT test_branch_head('b1') IS NULL}), 't',
+	'a branch this session left in the delete\'s own transaction is deleted');
 
 # Neither "main" nor a default_branch, nor to the same name.
 like(fails(q{SELECT test_branch_rename('main', 'trunk', true)}), qr/branch "main" can't be renamed/, '"main" isn\'t renamed');
@@ -136,6 +145,8 @@ $s7->query_until(qr/started/, $on . "\\echo started\nSELECT test_branch_delete('
 $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'no wait';
 $s6->query_safe(q{COMMIT});
 $s6->quit;
+$s7->query(q{SELECT 1});
+like($s7->{stderr}, qr/branch "k2" is not fully merged/, 'a delete waiting on a commit not merged is refused');
 $s7->quit;
 is(sql(q{SELECT test_branch_head('k2') IS NOT NULL}), 't',
 	'a delete waiting on a commit not merged is refused, as it checks the head committed');

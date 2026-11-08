@@ -319,13 +319,11 @@ session_in_use(int32 branch)
 	return false;
 }
 
+/* (not what it was on as its transaction began: it's back on that only if what moved it is undone) */
 static bool
 session_mine(int32 branch)
 {
-	CheckoutSlot *mine = my_slot();
-
-	return branch == catalog_branch || branch == branch_after_commit() ||
-		(mine != NULL && pg_atomic_read_u32(&mine->base) == (uint32) branch);
+	return branch == catalog_branch || branch == branch_after_commit();
 }
 
 const BranchCheckoutRoutine SessionBranchCheckout = {
