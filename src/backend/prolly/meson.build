@@ -6,6 +6,7 @@ backend_sources += files(
   'branch_catalog_ops.c',
   'branch_filter.c',
   'branch_link.c',
+  'branch_ops.c',
   'branch_tables.c',
   'capture.c',
   'capture_barrier.c',

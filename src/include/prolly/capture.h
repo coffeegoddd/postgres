@@ -251,6 +251,10 @@ extern bool CaptureLeftOut(void);
 extern void CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms,
 									 void (*hold) (void *arg), void *arg, PHash *root);
 
+/* As CaptureBarrierLeavingOut, of every versioned schema on a branch, as CaptureBranchBarrier. */
+extern void CaptureBranchBarrierLeavingOut(ProllyCtx *ctx, int32 branch, int timeout_ms,
+										   void (*hold) (void *arg), void *arg, PHash *root);
+
 /*
  * In a transaction left out of capture: the table's rows are map's from its commit on, in the
  * layout the table has as this is called, which is to be the one it commits with.  The map is the

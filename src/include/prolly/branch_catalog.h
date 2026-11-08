@@ -93,12 +93,14 @@ extern PGDLLIMPORT const BranchCatalogRoutine DependencyBranchCatalogs;
  * of src's versioned schemas, and every object in them, anew on dst (which
  * has none), under new object ids, every reference between them rewritten
  * to the copies' (see branch_catalog_copy.c).  Each relation copied gets
- * storage of its own.  It errors out, copying nothing, if src holds an
- * object it doesn't know how to copy.
+ * storage of its own: empty, or with share, its source's pages shared
+ * copy-on-write (RelationCreateStorageShared()), which the caller keeps from
+ * changing meanwhile, with a lock that waits for their writers.  It errors
+ * out, copying nothing, if src holds an object it doesn't know how to copy.
  */
 typedef struct BranchCatalogCopyRoutine
 {
-	void		(*copy) (int32 src, int32 dst);
+	void		(*copy) (int32 src, int32 dst, bool share);
 } BranchCatalogCopyRoutine;
 
 extern PGDLLIMPORT const BranchCatalogCopyRoutine *BranchCatalogCopy;

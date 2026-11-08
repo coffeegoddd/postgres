@@ -158,6 +158,7 @@ typedef struct CopyState
 {
 	int32		src;
 	int32		dst;
+	bool		share;			/* storage shared with the source's, not empty */
 	HTAB	   *map;			/* CopyEntry by CopyKey */
 	HTAB	   *sources;		/* SourceEntry: every source object's id */
 	CopyKey    *objs;			/* the objects, in the order found */
@@ -2099,6 +2100,19 @@ make_storage(CopyState *cs)
 		newoid = copy_map(cs, RelationRelationId, obj.oid);
 		src = relation_open(obj.oid, AccessShareLock);
 		dst = relation_open(newoid, AccessExclusiveLock);
+
+		/*
+		 * (a sequence's page is copied either way: as the buffers have it,
+		 * and its own from then on, as each branch's sequence goes its own
+		 * way)
+		 */
+		if (cs->share && src->rd_rel->relkind != RELKIND_SEQUENCE)
+		{
+			(void) RelationCreateStorageShared(dst->rd_locator, RelationGetSmgr(src), true);
+			relation_close(dst, NoLock);
+			relation_close(src, NoLock);
+			continue;
+		}
 		dstsmgr = RelationCreateStorageWith(dst->rd_locator,
 											dst->rd_rel->relpersistence, true,
 											RelationGetSmgr(src)->smgr_which);
@@ -2119,7 +2133,7 @@ make_storage(CopyState *cs)
 	}
 	CommandCounterIncrement();
 
-	/* (indexes valid on their empty tables) */
+	/* (indexes valid on their empty tables; shared ones are their sources', and valid as they are) */
 	foreach_oid(relid, tables)
 	{
 		ReindexParams params = {0};
@@ -2156,6 +2170,16 @@ make_storage(CopyState *cs)
 			d->reltuples = s->reltuples;
 			d->relallvisible = s->relallvisible;
 			d->relallfrozen = s->relallfrozen;
+
+			/*
+			 * (shared pages hold the source's tuples, as old as its horizons
+			 * say, which are the copy's then; a sequence's page is its own)
+			 */
+			if (cs->share && s->relkind != RELKIND_SEQUENCE)
+			{
+				d->relfrozenxid = s->relfrozenxid;
+				d->relminmxid = s->relminmxid;
+			}
 			CatalogTupleUpdate(pg_class, &dst->t_self, dst);
 			heap_freetuple(src);
 			heap_freetuple(dst);
@@ -2170,7 +2194,7 @@ make_storage(CopyState *cs)
  */
 
 static void
-dependency_copy(int32 src, int32 dst)
+dependency_copy(int32 src, int32 dst, bool share)
 {
 	CopyState	cs;
 	HASHCTL		ctl;
@@ -2191,6 +2215,7 @@ dependency_copy(int32 src, int32 dst)
 	memset(&cs, 0, sizeof(cs));
 	cs.src = src;
 	cs.dst = dst;
+	cs.share = share;
 	ctl.keysize = sizeof(CopyKey);
 	ctl.entrysize = sizeof(CopyEntry);
 	ctl.hcxt = CurrentMemoryContext;
@@ -2240,6 +2265,6 @@ Datum
 pg_branch_catalog_copy(PG_FUNCTION_ARGS)
 {
 	CaptureSchemaMade();
-	BranchCatalogCopy->copy(PG_GETARG_INT32(0), PG_GETARG_INT32(1));
+	BranchCatalogCopy->copy(PG_GETARG_INT32(0), PG_GETARG_INT32(1), false);
 	PG_RETURN_VOID();
 }

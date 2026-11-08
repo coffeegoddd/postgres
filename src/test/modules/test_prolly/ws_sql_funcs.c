@@ -19,6 +19,7 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "prolly/branch_link.h"
+#include "prolly/branch_ops.h"
 #include "prolly/capture.h"
 #include "prolly/move.h"
 #include "prolly/ws/ws_dbroot.h"
@@ -75,6 +76,7 @@ PG_FUNCTION_INFO_V1(test_branch_barrier);
 PG_FUNCTION_INFO_V1(test_branch_commit);
 PG_FUNCTION_INFO_V1(test_dbroot_schemas);
 PG_FUNCTION_INFO_V1(test_branch_unlink);
+PG_FUNCTION_INFO_V1(test_branch_create);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
@@ -1136,6 +1138,20 @@ Datum
 test_branch_unlink(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_BOOL(BranchLink->unlink(text_to_cstring(PG_GETARG_TEXT_PP(0))));
+}
+
+/* test_branch_create(name text, from text, timeout_ms integer) returns integer: the catalog branch made */
+Datum
+test_branch_create(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	int32		branch;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	branch = BranchOps->create(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
+							   PG_GETARG_INT32(2));
+	prolly_ctx_free(&ctx);
+	PG_RETURN_INT32(branch);
 }
 
 /*

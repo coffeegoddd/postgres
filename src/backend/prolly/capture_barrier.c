@@ -654,8 +654,10 @@ branch_schemas(int32 branch)
 	return names;
 }
 
-void
-CaptureBranchBarrier(ProllyCtx *ctx, int32 branch, int timeout_ms, PHash *root)
+/* (with hold, as CaptureBarrierLeavingOut, of the branch's schemas) */
+static void
+branch_barrier(ProllyCtx *ctx, int32 branch, int timeout_ms, void (*hold) (void *arg), void *arg,
+			   PHash *root)
 {
 	List	   *names;
 	const char **schemas;
@@ -670,7 +672,7 @@ CaptureBranchBarrier(ProllyCtx *ctx, int32 branch, int timeout_ms, PHash *root)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch %d has not been allocated", branch)));
-	barrier_check_common(false);
+	barrier_check_common(hold != NULL);
 	level = CatalogBranchEnter(branch);
 	names = branch_schemas(branch);
 	n = list_length(names);
@@ -690,20 +692,45 @@ CaptureBranchBarrier(ProllyCtx *ctx, int32 branch, int timeout_ms, PHash *root)
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("schema \"%s\" changed during a commit from capture", schemas[i]),
 					 errhint("Try the commit again.")));
-		(void) barrier_check(schemas[i], nsps[i], false);
+		(void) barrier_check(schemas[i], nsps[i], hold != NULL);
 		/* (its name as the root has it, before anything's written) */
 		keys[i] = ws_name_to_utf8(schemas[i]);
 	}
 
-	/* (with no schema, nothing to wait for: an empty root, as of any point) */
+	/* (before leaving out gives this transaction an ID, which a slot being made would wait for) */
+	if (hold)
+	{
+		slot_wait(GetCurrentTimestamp(), timeout_ms);
+		CaptureLeaveOut();
+		hold(arg);
+	}
+
+	/*
+	 * (with no schema, nothing to wait for: an empty root, as of any point; with hold, catalog
+	 * changes still wait until the transaction ends)
+	 */
 	*root = vc_root_empty(ctx);
 	if (n > 0)
-		barrier_take(ctx, schemas, nsps, n, branch, true, timeout_ms, roots, false);
+		barrier_take(ctx, schemas, nsps, n, branch, true, timeout_ms, roots, hold != NULL);
+	else if (hold)
+		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
 	for (i = 0; i < n; i++)
 		WsDbRoot->put_schema(ctx, root, keys[i], &roots[i], root);
 	CatalogBranchLeave(level);
 }
 
+void
+CaptureBranchBarrier(ProllyCtx *ctx, int32 branch, int timeout_ms, PHash *root)
+{
+	branch_barrier(ctx, branch, timeout_ms, NULL, NULL, root);
+}
+
+void
+CaptureBranchBarrierLeavingOut(ProllyCtx *ctx, int32 branch, int timeout_ms, void (*hold) (void *arg),
+							   void *arg, PHash *root)
+{
+	branch_barrier(ctx, branch, timeout_ms, hold, arg, root);
+}
 
 /*
  * (its writes are left out, so the root is of all that's committed, and none of it; and the lock
