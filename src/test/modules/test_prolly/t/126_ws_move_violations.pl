@@ -13,7 +13,9 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('move_viol');
 $node->init(allows_streaming => 'logical');
-$node->append_conf('postgresql.conf', "autovacuum = off\ncapture_to_trees = on\ndebug_block_mapped_heap = on\n");
+# (the roots moved to are merged or read, and no commit holds them: no freer takes their chunks)
+$node->append_conf('postgresql.conf',
+	"autovacuum = off\ncapture_to_trees = on\ndebug_block_mapped_heap = on\nchunk_free_in_background = off\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
 
