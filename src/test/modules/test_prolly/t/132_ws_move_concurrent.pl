@@ -7,8 +7,8 @@
 # target.  A move waits for a writer open before it, and moves from what that writer leaves; a
 # second move waits for the first, and moves from what it leaves.  Another branch's writers wait
 # for nothing; DDL anywhere in the database waits, as capture's commit of what DDL changes does.
-# A move that alters a table has its readers wait, as an ALTER's do, and those of a sequence of the
-# schema, which it holds as it may set them; readers of another table don't.
+# A move that alters a table has its readers wait, as an ALTER's do; readers of another table don't.
+# Readers of a sequence of the schema wait for any move, which holds them as it may set them.
 #
 # A crash with a move open, or with its barrier taken, leaves the rows as they were, and capture
 # with them; a crash once it commits, before capture applies it, leaves the target, which capture
@@ -43,8 +43,11 @@ sub sql
 sub quickly
 {
 	my ($sql, $prefix) = @_;
-	my ($rc, $out, $err) = $node->psql('postgres', ($prefix // $on) . $sql, timeout => 10, on_error_stop => 1);
-	return $rc == 0 ? $out : "failed or waited: $err";
+	my $waited;
+	my ($rc, $out, $err) = $node->psql('postgres', ($prefix // $on) . $sql, timeout => 10, timed_out => \$waited,
+		on_error_stop => 1);
+	return 'waited' if $waited;
+	return defined $rc && $rc == 0 ? $out : "failed: $err";
 }
 
 my $commits = 0;
@@ -105,10 +108,10 @@ my ($ddl, $ddl_pid) = session($on_other);
 $ddl->query_until(qr/started/, "\\echo started\nCREATE TABLE other.o2 (id integer);\n\\echo made\n");
 ok(waits_on($ddl_pid, $mover_pid), 'DDL on another branch waits for it too');
 $mover->query_safe('COMMIT');
-like($writer->query_until(qr/written/, ''), qr/^1\n/m, 'once it commits, the writer writes on the target: a row it lacks is not there');
+is($writer->query_until(qr/written/, ''), "1\nwritten\n", 'once it commits, the writer writes on the target: a row it lacks is not there');
 $ddl->query_until(qr/made/, '');
 is(rows(), '1:11,2:1,3:1', 'and one it has is updated from what the target has');
-is($before->query_safe('SELECT string_agg(id || \':\' || v, \',\' ORDER BY id) FROM app.t'), '1:2,2:2,3:2,4:2',
+is($before->query_safe(q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM app.t}), '1:2,2:2,3:2,4:2',
 	'a snapshot taken before still sees them as they were');
 $before->query_safe('COMMIT');
 my $now = read_root();
