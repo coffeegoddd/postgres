@@ -66,6 +66,20 @@
 
 /* A transaction's first message, if it's left out of capture. */
 #define CAPTURE_LEAVE_OUT_PREFIX PROLLY_MESSAGE_PREFIX "capture.leave_out"
+
+/*
+ * A message of what a table's rows are as its transaction commits, which one left out of capture
+ * still tells: int32 branch, relid, nkey, nstored; uint64 tags[nstored]; and the hash of their row
+ * map.  All that's been told of the table is void, as with CAPTURE_ROWS_BEGIN.
+ */
+#define CAPTURE_ROWS_ARE_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows_are"
+
+/*
+ * Where such a map is held from its transaction's commit until capture has applied it or passed it
+ * over, as nothing else may: <relid>/<xid>/<hash>, by its transaction's id, as another's may tell the
+ * same map of the same table.
+ */
+#define CAPTURE_TOLD_REF_PREFIX "capture/told/"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
 
@@ -215,6 +229,28 @@ extern void CaptureWaitFor(XLogRecPtr lsn, int timeout_ms);
  * Before the transaction writes anything.
  */
 extern void CaptureLeaveOut(void);
+
+/*
+ * CaptureLeaveOut, then hold, then CaptureBarrier: the root as of now of a transaction whose writes
+ * are left out, which is what they start from.  hold takes the locks what's to be written needs,
+ * which a lock that keeps readers out can only be once the transaction is left out, as taking one
+ * gives it an id; it writes nothing, or the root wouldn't be what the writes start from.  All a
+ * barrier asks of the caller is asked before hold.  Catalog changes in the database then wait until
+ * the transaction ends.
+ */
+extern void CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms,
+									 void (*hold) (void *arg), void *arg, PHash *root);
+
+/*
+ * In a transaction left out of capture: the table's rows are map's from its commit on, in the
+ * layout the table has as this is called, which is to be the one it commits with.  The map is the
+ * history store's, as capture's are.  For what has made a table's rows a root's without capture.
+ */
+extern void CaptureRowsAre(Relation relation, const PHash *map);
+
+/* The name of where CaptureRowsAre holds a table's map, into name, of CAPTURE_TOLD_REF_LEN. */
+#define CAPTURE_TOLD_REF_LEN 96
+extern void CaptureToldRefName(Oid relid, TransactionId xid, const PHash *map, char *name);
 
 /*
  * The replica identity a change of this table logs by, in place of its own.  With capture on, a

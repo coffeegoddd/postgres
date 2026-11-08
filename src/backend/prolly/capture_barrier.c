@@ -22,7 +22,8 @@
  * themselves don't wait for it.  A change of a role from another database isn't held off.
  *
  * It's an error above READ COMMITTED, as it reads what's committed now, and in a
- * transaction that's written anything, which would be neither in it nor clearly out.
+ * transaction that's written anything, which would be neither in it nor clearly out.  One
+ * whose writes are all to be left out of capture, from before it takes the root, is clearly out.
  * What can't be held in a commit, or a table capture holds no map of, is an error too.
  * The caller needs what it would to read the tables, as it's given all their rows, so a role
  * row security applies to is refused.  Those are asked before anything's written; what can't be
@@ -297,19 +298,68 @@ barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 	return saved;
 }
 
-void
-CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
+/* Each of mode's privileges on one of pg_history's tables, asked of the caller. */
+static void
+check_history_table(Oid history, const char *table, AclMode mode)
 {
-	Oid			nsp = get_namespace_oid(schema, false);
+	Oid			relid = get_relname_relid(table, history);
+
+	if (pg_class_aclmask(relid, GetUserId(), mode, ACLMASK_ALL) != mode)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, table);
+}
+
+/*
+ * What a barrier reads of capture's own (its barriers, what's being healed, and the maps it saved),
+ * and with leaving_out what holding a map told writes, asked of the caller as the executor asks it:
+ * so writing pg_history is a superuser's.
+ */
+static void
+check_history(bool leaving_out)
+{
+	Oid			history = get_namespace_oid("pg_history", false);
+
+	if (object_aclcheck(NamespaceRelationId, history, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, "pg_history");
+	check_history_table(history, "capture_barriers", ACL_SELECT);
+	check_history_table(history, "capture_healing", ACL_SELECT);
+	check_history_table(history, "pointers", leaving_out ? ACL_SELECT | ACL_INSERT | ACL_UPDATE : ACL_SELECT);
+}
+
+/* What reading each of the schema's tables and sequences asks, without locking them. */
+static void
+check_may_read_all(Oid nsp)
+{
+	Relation	rel = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relations = NIL;
+
+	ScanKeyInit(&key, Anum_pg_class_relnamespace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE ||
+			c->relkind == RELKIND_SEQUENCE)
+			relations = lappend_oid(relations, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	foreach_oid(relid, relations)
+		check_may_read(relid);
+	list_free(relations);
+}
+
+/*
+ * What's asked of a barrier before anything is held or written, of whatever the schema has now:
+ * what it then holds is asked again once it's locked.  The schema's branch.
+ */
+static int32
+barrier_check(const char *schema, Oid nsp, bool leaving_out)
+{
 	int32		branch = NamespaceBranch(nsp);
-	XLogRecPtr	lsn;
-	TimestampTz start;
-	const WsRowsRoutine *rows = WsRows;
-	Oid			types[1] = {PG_LSNOID};
-	SPIPlanPtr	plan;
-	List	   *tables;
-	int			nest;
-	char		quickly[32];
 
 	if (!capture_to_trees)
 		ereport(ERROR,
@@ -327,11 +377,28 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
-
 	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
+	check_history(leaving_out);
+	check_may_read_all(nsp);
+	return branch;
+}
 
-	/* (preparing asks for pg_history's schema, which is what guards it, before anything's held or written) */
+/* (with hold, catalog changes keep waiting until the transaction ends) */
+static void
+barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int timeout_ms, PHash *root,
+			 bool hold)
+{
+	XLogRecPtr	lsn;
+	TimestampTz start;
+	const WsRowsRoutine *rows = WsRows;
+	Oid			types[1] = {PG_LSNOID};
+	SPIPlanPtr	plan;
+	List	   *tables;
+	int			nest;
+	char		quickly[32];
+
+	/* (asked of the caller as it began, and asked again by preparing) */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 	plan = SPI_prepare("SELECT 1 FROM pg_history.capture_barriers WHERE lsn OPERATOR(pg_catalog.=) $1", 1, types);
@@ -396,5 +463,32 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 	list_free(tables);
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
-	UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+	if (!hold)
+		UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+}
+
+void
+CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+
+	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp, false), timeout_ms, root, false);
+}
+
+
+/*
+ * (its writes are left out, so the root is of all that's committed, and none of it; and the lock
+ * catalog changes take turns on is held to its end, which its own commit takes once it has the
+ * tables, as one of theirs may want a table it has)
+ */
+void
+CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, void (*hold) (void *arg),
+						 void *arg, PHash *root)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+	int32		branch = barrier_check(schema, nsp, true);
+
+	CaptureLeaveOut();
+	hold(arg);
+	barrier_take(ctx, schema, nsp, branch, timeout_ms, root, true);
 }
