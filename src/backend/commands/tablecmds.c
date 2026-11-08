@@ -2032,7 +2032,6 @@ ExecuteTruncateGuts(List *explicit_rels,
 	ListCell   *cell;
 	Oid		   *logrelids;
 
-
 	/*
 	 * Check the explicitly-specified relations.
 	 *

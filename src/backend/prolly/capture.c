@@ -47,6 +47,7 @@
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -245,19 +246,19 @@ CaptureLeftOut(void)
  * Once version control's own work is done, the transaction left out is sealed: what it would write
  * after to a versioned table, or change of one's objects, would be in no branch's history, as capture
  * leaves out all it writes, so it's refused.  (A transaction does one such work: a commit from
- * capture refuses one that has written, and the second would take one.)  And a table whose rows it
- * told capture are to keep the layout they were told in.
+ * capture refuses one that has written, and the second would take one.)  And as it commits, a table
+ * whose rows' layout changed is to have been told, and as it is.
  */
 static TransactionId sealed = InvalidTransactionId;
 
-/* Each table told as a map in this transaction, and its fingerprint as it was told. */
+/* Each table told as a map in this transaction, by its object id, and its fingerprint as it was told. */
 typedef struct Told
 {
 	Oid			relid;
 	char	   *fingerprint;
 } Told;
 
-static List *told = NIL;
+static HTAB *told = NULL;
 static bool told_callback = false;
 
 static bool
@@ -304,7 +305,7 @@ told_callback_fn(XactEvent event, void *arg)
 {
 	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
 		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
-		told = NIL;
+		told = NULL;			/* (it's in the transaction's memory) */
 }
 
 static void
@@ -320,11 +321,15 @@ told_note(Relation relation)
 		RegisterXactCallback(told_callback_fn, NULL);
 		told_callback = true;
 	}
+	if (told == NULL)
+	{
+		HASHCTL		ctl = {.keysize = sizeof(Oid), .entrysize = sizeof(Told), .hcxt = TopTransactionContext};
+
+		told = hash_create("tables told", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	t = hash_search(told, &(Oid) {RelationGetRelid(relation)}, HASH_ENTER, NULL);
 	was = MemoryContextSwitchTo(TopTransactionContext);
-	t = palloc(sizeof(Told));
-	t->relid = RelationGetRelid(relation);
 	t->fingerprint = pstrdup(fingerprint);
-	told = lappend(told, t);
 	MemoryContextSwitchTo(was);
 	pfree(fingerprint);
 }
@@ -332,19 +337,21 @@ told_note(Relation relation)
 void
 CaptureCheckChanged(Oid relid, const char *fingerprint)
 {
-	const char *was = NULL;
+	Told	   *t;
 
 	if (!CaptureLeftOut())
 		return;
-	foreach_ptr(Told, t, told)
-	{
-		if (t->relid == relid)
-			was = t->fingerprint;
-	}
-	if (was == NULL || strcmp(was, fingerprint) != 0)
+	t = told == NULL ? NULL : hash_search(told, &relid, HASH_FIND, NULL);
+	if (t == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-				 errmsg("table \"%s\" was changed in a transaction left out of capture after its rows were told, or untold",
+				 errmsg("table \"%s\" changed in a transaction left out of capture, and its rows weren't told",
+						get_rel_name(relid)),
+				 errdetail("A transaction left out of capture tells it the rows of each table whose layout it changes; what changed this one told it nothing.")));
+	if (strcmp(t->fingerprint, fingerprint) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("table \"%s\" changed in a transaction left out of capture after its rows were told",
 						get_rel_name(relid)),
 				 errdetail("A transaction left out of capture tells it each table's rows as they commit."),
 				 errhint("Change it in a transaction of its own.")));

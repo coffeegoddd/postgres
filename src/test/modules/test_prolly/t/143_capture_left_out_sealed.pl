@@ -54,10 +54,10 @@ like(after_move($first, q{TRUNCATE app.t}), qr/cannot truncate versioned table "
 like(after_move($first, q{CREATE TABLE app.x (id integer)}),
 	qr/cannot change a versioned schema's objects in a transaction left out of capture/, 'and a table made');
 like(after_move($first, q{ALTER TABLE app.t ADD COLUMN w integer}),
-	qr/table "t" was changed in a transaction left out of capture after its rows were told, or untold/,
+	qr/table "t" changed in a transaction left out of capture after its rows were told/,
 	'and a table its rows told of altered, at commit');
 like(after_move($first, q{ALTER TABLE app.u ADD COLUMN w integer}),
-	qr/table "u" was changed in a transaction left out of capture after its rows were told, or untold/,
+	qr/table "u" changed in a transaction left out of capture, and its rows weren't told/,
 	'and one whose rows weren\'t told, altered');
 like(after_move($first, q{TRUNCATE public.p CASCADE}),
 	qr/cannot truncate versioned table "c" in a transaction left out of capture/,
