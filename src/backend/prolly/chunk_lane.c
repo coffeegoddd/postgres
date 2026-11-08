@@ -467,9 +467,9 @@ make_lane(Relation log, uint32 lane)
 		appendStringInfo(&sql, " TABLESPACE %s", quote_identifier(ts));
 
 	/*
-	 * (as the log's owner, whoever appends; and with no event trigger run for
-	 * it, as an append runs no user's code: as PGC_SUSET, as this is no
-	 * user's choosing)
+	 * (as the log's owner, whoever appends, and with event_triggers off, as
+	 * an append runs no user's code; set as PGC_SUSET, this being no user's
+	 * choosing)
 	 */
 	level = NewGUCNestLevel();
 	(void) set_config_option("event_triggers", "off", PGC_SUSET, PGC_S_SESSION,
@@ -495,7 +495,7 @@ make_lane(Relation log, uint32 lane)
 	AtEOXact_GUC(true, level);
 	CommandCounterIncrement();
 
-	made =relation_open(get_relname_relid(name, RelationGetNamespace(log)), RowExclusiveLock);
+	made = relation_open(get_relname_relid(name, RelationGetNamespace(log)), RowExclusiveLock);
 	ObjectAddressSet(laneaddr, RelationRelationId, RelationGetRelid(made));
 	ObjectAddressSet(logaddr, RelationRelationId, RelationGetRelid(log));
 	recordDependencyOn(&laneaddr, &logaddr, DEPENDENCY_INTERNAL);
