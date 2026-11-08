@@ -260,6 +260,7 @@ tests += {
       't/131_ws_move_quiet.pl',
       't/132_ws_move_concurrent.pl',
       't/133_ws_move_shared_pages.pl',
+      't/134_capture_barrier_slot_made.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
