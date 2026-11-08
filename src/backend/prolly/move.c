@@ -319,7 +319,8 @@ drop_object(const WsObject *o, const char *schema)
 static bool
 buf_same(const Buf *a, const Buf *b)
 {
-	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+	/* (an empty one has no data, which memcmp must not be given) */
+	return a->len == b->len && (a->len == 0 || memcmp(a->data, b->data, a->len) == 0);
 }
 
 /* Whether the other has object i of one as it is. */
