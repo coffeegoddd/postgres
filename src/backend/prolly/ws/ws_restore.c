@@ -580,6 +580,25 @@ objects_there(const WsObject *objs, int nobjs, const char *schema)
 	return there;
 }
 
+/* An object's key and value as bytes, to find one as another has it. */
+typedef struct ObjBytes
+{
+	Buf			key;
+	Buf			value;
+} ObjBytes;
+
+static int
+obj_bytes_cmp(const void *a, const void *b)
+{
+	const ObjBytes *x = a;
+	const ObjBytes *y = b;
+	int			c = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
+
+	if (c != 0)
+		return c;
+	return (x->key.len > y->key.len) - (x->key.len < y->key.len);
+}
+
 /* Which of a root's objects the previous root has as they are. */
 static bool *
 objects_as_before(ProllyCtx *ctx, const WsObject *objs, int nobjs, const PHash *previous)
@@ -587,34 +606,38 @@ objects_as_before(ProllyCtx *ctx, const WsObject *objs, int nobjs, const PHash *
 	PHash		map;
 	WsObject   *was = NULL;
 	int			nwas = 0;
+	ObjBytes   *before;
 	bool	   *same = palloc0_array(bool, Max(nobjs, 1));
 
 	if (previous != NULL && WsRoot->get_map(ctx, previous, WS_ROOT_OBJECTS, &map))
 		ws_obj_list(ctx, &map, &was, &nwas);
+	before = palloc0_array(ObjBytes, Max(nwas, 1));
+	for (int w = 0; w < nwas; w++)
+	{
+		WsObjectCodec->encode_key(&was[w], &before[w].key);
+		WsObjectCodec->encode_value(&was[w], &before[w].value);
+		ws_obj_free(&was[w]);
+	}
+	qsort(before, nwas, sizeof(ObjBytes), obj_bytes_cmp);
 	for (int i = 0; i < nobjs; i++)
 	{
-		Buf			k = BUF_INIT,
-					v = BUF_INIT;
+		ObjBytes	one = {BUF_INIT, BUF_INIT};
+		ObjBytes   *hit;
 
-		WsObjectCodec->encode_key(&objs[i], &k);
-		WsObjectCodec->encode_value(&objs[i], &v);
-		for (int w = 0; !same[i] && w < nwas; w++)
-		{
-			Buf			kw = BUF_INIT,
-						vw = BUF_INIT;
-
-			WsObjectCodec->encode_key(&was[w], &kw);
-			WsObjectCodec->encode_value(&was[w], &vw);
-			same[i] = kw.len == k.len && memcmp(kw.data, k.data, k.len) == 0 &&
-				vw.len == v.len && memcmp(vw.data, v.data, v.len) == 0;
-			buf_free(&kw);
-			buf_free(&vw);
-		}
-		buf_free(&k);
-		buf_free(&v);
+		WsObjectCodec->encode_key(&objs[i], &one.key);
+		WsObjectCodec->encode_value(&objs[i], &one.value);
+		hit = nwas > 0 ? bsearch(&one, before, nwas, sizeof(ObjBytes), obj_bytes_cmp) : NULL;
+		same[i] = hit != NULL && hit->value.len == one.value.len &&
+			memcmp(hit->value.data, one.value.data, one.value.len) == 0;
+		buf_free(&one.key);
+		buf_free(&one.value);
 	}
 	for (int w = 0; w < nwas; w++)
-		ws_obj_free(&was[w]);
+	{
+		buf_free(&before[w].key);
+		buf_free(&before[w].value);
+	}
+	pfree(before);
 	return same;
 }
 
@@ -742,7 +765,7 @@ not_empty:
 	if (missing)
 	{
 		bool	   *there = objects_there(objs, nobjs, schema);
-		bool	   *before = objects_as_before(ctx, objs, nobjs, previous);
+		bool	   *before = before_tables_only ? NULL : objects_as_before(ctx, objs, nobjs, previous);
 
 		/*
 		 * (what isn't there is made; and what the first part made, there now and not as before, is
@@ -753,10 +776,11 @@ not_empty:
 		for (int i = 0; i < nobjs; i++)
 		{
 			obj_made[i] = !there[i];
-			obj_finished[i] = !there[i] || !before[i];
+			obj_finished[i] = !there[i] || (before != NULL && !before[i]);
 		}
 		pfree(there);
-		pfree(before);
+		if (before != NULL)
+			pfree(before);
 	}
 	ws_obj_restore_some(objs, nobjs, obj_made, schema, true);
 	if (before_tables_only)

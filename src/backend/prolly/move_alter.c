@@ -145,22 +145,32 @@ addable_type(const char *type, const char *const *domains, int ndomains)
 	ErrorSaveContext escontext = {T_ErrorSaveContext};
 	char	   *bare = pstrdup(type);
 	char	   *cut = strchr(bare, '[');
+	char	   *here;
 	bool		addable;
 
 	/* (a domain of the target's, or an array of one, which what's here of its name may not be yet) */
 	if (cut != NULL)
 		*cut = '\0';
 	for (int i = 0; i < ndomains; i++)
-		if (strcmp(bare, quote_identifier(domains[i])) == 0)
+	{
+		const char *quoted = quote_identifier(domains[i]);
+		bool		named = strcmp(bare, quoted) == 0;
+
+		if (quoted != domains[i])
+			pfree((char *) quoted);
+		if (named)
 		{
 			pfree(bare);
 			return false;
 		}
+	}
 	pfree(bare);
 
 	/* (one not made yet may be a domain too, whose checks adding it would run on each row) */
-	addable = parseTypeString(ws_text_from_utf8(type), &typid, &typmod, (Node *) &escontext) &&
+	here = ws_text_from_utf8(type);
+	addable = parseTypeString(here, &typid, &typmod, (Node *) &escontext) &&
 		get_typtype(typid) != TYPTYPE_DOMAIN;
+	pfree(here);
 	return addable;
 }
 
