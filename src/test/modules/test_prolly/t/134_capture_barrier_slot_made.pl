@@ -42,13 +42,15 @@ sub lose_slot
 {
 	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
 	# (stopped idle, holding nothing: a worker woken in between is let go and stopped again; what it's
-	# waiting on is read with no lock taken)
+	# waiting on is read with no lock taken, in a time, as a stopped worker's status may be half
+	# written)
 	my $idle = qq{SELECT wait_event = 'CaptureWorkerMain' FROM pg_stat_activity WHERE pid = $worker};
 	for (;;)
 	{
 		$node->poll_query_until('postgres', $idle) or die 'the worker is not idle';
 		kill 'STOP', $worker;
-		last if $node->safe_psql('postgres', $idle) eq 't';
+		my ($rc, $out) = $node->psql('postgres', "SET statement_timeout = '5s'; $idle");
+		last if $rc == 0 && $out eq 't';
 		kill 'CONT', $worker;
 	}
 	$filled++;
