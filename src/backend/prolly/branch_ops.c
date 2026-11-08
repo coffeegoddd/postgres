@@ -36,6 +36,15 @@
  */
 #include "postgres.h"
 
+#include "executor/executor.h"
+#include "storage/lockdefs.h"
+#include "access/stratnum.h"
+#include "utils/fmgroids.h"
+#include "utils/snapmgr.h"
+#include "utils/guc.h"
+#include "utils/acl.h"
+#include "executor/tuptable.h"
+#include "access/tableam.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
@@ -44,6 +53,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
+#include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_link.h"
 #include "prolly/branch_ops.h"
@@ -58,20 +68,57 @@
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
-/* Each table and sequence of a branch's schemas, locked so that its writers are waited out. */
+/* What the parent's writers are held off for: the branch, and how long a lock is waited for. */
+typedef struct Holding
+{
+	int32		branch;
+	int			timeout_ms;
+} Holding;
+
+/* (a TOAST table's values are named by its id, which the branch's copy of it doesn't have) */
+static void
+refuse_values_out_of_line(Oid table, Oid toast)
+{
+	Relation	rel = table_open(toast, NoLock);
+	Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	TableScanDesc scan = table_beginscan(rel, snapshot, 0, NULL, 0);
+	TupleTableSlot *slot = table_slot_create(rel, NULL);
+	bool		any = table_scan_getnextslot(scan, ForwardScanDirection, slot);
+
+	ExecDropSingleTupleTableSlot(slot);
+	table_endscan(scan);
+	UnregisterSnapshot(snapshot);
+	table_close(rel, NoLock);
+	if (any)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" holds values stored out of line, which a branch can't share",
+						get_rel_name(table)),
+				 errdetail("A value stored out of line is named by its TOAST table's object id, which a branch's copy doesn't have.")));
+}
+
+/*
+ * Each table, materialized view and sequence of a branch's schemas, its owner's to share, locked so
+ * that its writers are waited out and held off, with VACUUM and whatever else changes its pages,
+ * and so its TOAST table and every index: in order of their ids, as what else locks more than one
+ * does, waiting at most the time given.
+ */
 static void
 lock_writers_out(void *arg)
 {
-	int32		branch = *(int32 *) arg;
+	Holding    *h = arg;
 	List	   *nsps = NIL;
+	List	   *tables = NIL;
 	List	   *rels = NIL;
 	Relation	rel;
 	SysScanDesc scan;
 	HeapTuple	tup;
+	int			nest;
 
 	rel = table_open(NamespaceRelationId, AccessShareLock);
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
@@ -79,30 +126,69 @@ lock_writers_out(void *arg)
 	{
 		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
 
-		if (ns->nspbranch == branch)
+		if (ns->nspbranch == h->branch)
 			nsps = lappend_oid(nsps, ns->oid);
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
 	rel = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	foreach_oid(nsp, nsps)
 	{
-		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+		ScanKeyData key;
 
-		if (list_member_oid(nsps, c->relnamespace) &&
-			(c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW ||
-			 c->relkind == RELKIND_SEQUENCE))
-			rels = lappend_oid(rels, c->oid);
+		ScanKeyInit(&key, Anum_pg_class_relnamespace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
+		scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, &key);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+			if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW ||
+				c->relkind == RELKIND_SEQUENCE)
+			{
+				if (!object_ownercheck(RelationRelationId, c->oid, GetUserId()))
+					aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(c->relkind), NameStr(c->relname));
+				tables = lappend_oid(tables, c->oid);
+			}
+		}
+		systable_endscan(scan);
 	}
-	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
-	/* (in object id order, as another of these takes them) */
+	/* (the lock's wait bounded, as the barrier's is) */
+	nest = NewGUCNestLevel();
+	if (h->timeout_ms > 0 && (LockTimeout == 0 || LockTimeout > h->timeout_ms))
+	{
+		char		ms[32];
+
+		snprintf(ms, sizeof(ms), "%d", h->timeout_ms);
+		(void) set_config_option("lock_timeout", ms, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	}
+	list_sort(tables, list_oid_cmp);
+	foreach_oid(relid, tables)
+	{
+		Relation	r;
+		Oid			toast;
+
+		LockRelationOid(relid, ExclusiveLock);
+		r = relation_open(relid, NoLock);
+		toast = r->rd_rel->reltoastrelid;
+		rels = list_concat(rels, RelationGetIndexList(r));
+		relation_close(r, NoLock);
+		if (OidIsValid(toast))
+		{
+			LockRelationOid(toast, ExclusiveLock);
+			r = relation_open(toast, NoLock);
+			rels = list_concat(rels, RelationGetIndexList(r));
+			relation_close(r, NoLock);
+			refuse_values_out_of_line(relid, toast);
+		}
+	}
 	list_sort(rels, list_oid_cmp);
 	foreach_oid(relid, rels)
-		LockRelationOid(relid, ShareLock);
+		LockRelationOid(relid, ExclusiveLock);
+	AtEOXact_GUC(true, nest);
+	list_free(tables);
 	list_free(rels);
 	list_free(nsps);
 }
@@ -125,10 +211,10 @@ tell_table(void *arg, const char *name, const VcTable *entry)
 
 	if (!OidIsValid(relid))
 		elog(ERROR, "table \"%s\" of schema \"%s\" isn't there", table, t->schema);
-	rel = relation_open(relid, NoLock);
+	rel = relation_open(relid, AccessShareLock);
 	if (rel->rd_rel->relkind == RELKIND_RELATION)
 		CaptureRowsAre(rel, &entry->data);
-	relation_close(rel, NoLock);
+	relation_close(rel, AccessShareLock);
 	pfree(table);
 	return true;
 }
@@ -146,11 +232,18 @@ tell_schema(void *arg, const char *name, const PHash *root)
 	return true;
 }
 
+typedef enum MoveStep
+{
+	MOVE_MAKE,					/* a schema the target has that isn't there, restored */
+	MOVE_KEPT,					/* one both have, moved to the target's */
+	MOVE_DROP,					/* one the target lacks, dropped with all in it */
+} MoveStep;
+
 typedef struct Moving
 {
 	ProllyCtx  *ctx;
 	const PHash *other;			/* the branch root the other side is */
-	bool		to;				/* walking the target's schemas, not the source's */
+	MoveStep	step;
 } Moving;
 
 static void
@@ -164,7 +257,6 @@ run_statement(const char *sql)
 	WsSql->end(level);
 }
 
-/* (a schema the target lacks, dropped with all in it; or one it has, moved to it, or made) */
 static bool
 move_schema(void *arg, const char *name, const PHash *root)
 {
@@ -173,18 +265,15 @@ move_schema(void *arg, const char *name, const PHash *root)
 	PHash		other;
 	bool		has = WsDbRoot->get_schema(m->ctx, m->other, name, &other);
 
-	if (!m->to)
-	{
-		if (!has)
-			run_statement(psprintf("DROP SCHEMA %s CASCADE", quote_identifier(schema)));
-	}
-	else if (has)
+	if (m->step == MOVE_DROP && !has)
+		run_statement(psprintf("DROP SCHEMA %s CASCADE", quote_identifier(schema)));
+	else if (m->step == MOVE_KEPT && has)
 	{
 		WsMoveStats stats;
 
 		WsMove->move_from(m->ctx, schema, &other, root, &stats);
 	}
-	else
+	else if (m->step == MOVE_MAKE && !has)
 	{
 		run_statement(psprintf("CREATE SCHEMA %s VERSIONED", quote_identifier(schema)));
 		WsRootIO->restore(m->ctx, root, NULL, schema);
@@ -195,22 +284,27 @@ move_schema(void *arg, const char *name, const PHash *root)
 
 /*
  * A branch whose working set holds from made to hold to, in a transaction left out of capture
- * that holds off its writers, and capture told each of its tables' rows, as to has them.
+ * that holds off its writers, and capture told each of its tables' rows, as to has them: the
+ * schemas to has that aren't there made first, as a schema it keeps may use what's in them; then
+ * those kept moved, and last those it lacks dropped, once nothing kept uses them.
  */
 static void
 move_branch(ProllyCtx *ctx, int32 branch, const PHash *from, const PHash *to)
 {
 	int			level = CatalogBranchEnter(branch);
-	Moving		m = {ctx, to, false};
+	Moving		m = {ctx, from, MOVE_MAKE};
 	Told		told = {ctx};
 
 	if (!phash_eq(from, to))
 	{
-		WsDbRoot->schemas(ctx, from, move_schema, &m);
-		CommandCounterIncrement();
-		m.other = from;
-		m.to = true;
 		WsDbRoot->schemas(ctx, to, move_schema, &m);
+		CommandCounterIncrement();
+		m.step = MOVE_KEPT;
+		WsDbRoot->schemas(ctx, to, move_schema, &m);
+		CommandCounterIncrement();
+		m.other = to;
+		m.step = MOVE_DROP;
+		WsDbRoot->schemas(ctx, from, move_schema, &m);
 		CommandCounterIncrement();
 	}
 	WsDbRoot->schemas(ctx, to, tell_schema, &told);
@@ -231,15 +325,29 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 	PHash		at_commit;
 	PHash		root;
 	PHash		target;
+	Holding		holding;
 
 	if (commit != NULL && take_changes)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a branch made at a commit can't take another's changes")));
+	if (name[0] == '\0' || strlen(name) >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 errmsg("a branch's name is 1 to %d bytes", NAMEDATALEN - 1)));
 	if (parent == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" not found", from)));
+
+	/*
+	 * (the parent's DDL waited out and held off, as a table made meanwhile would have writers the
+	 * barrier doesn't hold off; and its head, as a commit writing it from a root taken before this
+	 * one's would leave it behind the working set)
+	 */
+	LockBranchCatalogs(parent, AccessExclusiveLock);
+	LockBranchHead(parent);
+
 	if (BranchLink->branch_of(name) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -254,7 +362,7 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" has no commit", from)));
 
-	/* (where it's made: the commit, which the repository has, or from's head) */
+	/* (where it's made: the commit, which the repository has in its window, or from's head) */
 	at_commit = commit != NULL ? *commit : head.head;
 	if (!vc_commit_load(ctx, &at_commit, &at))
 	{
@@ -265,9 +373,21 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("commit %s not found", hex)));
 	}
+	if (!vc_in_window(&repo, &at_commit))
+	{
+		char		hex[PHASH_HEX_LEN + 1];
+
+		phash_hex(&at_commit, hex);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("commit %s is outside the window", hex),
+				 errhint("Attach the history it's in first.")));
+	}
 
 	/* (the parent at one point, its writers held off until this transaction ends) */
-	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &parent, &root);
+	holding.branch = parent;
+	holding.timeout_ms = timeout_ms;
+	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &holding, &root);
 	target = take_changes ? root : at.root;
 
 	branch = BranchIds->allocate();
@@ -284,6 +404,15 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 
 	if (vc_branch_create(&repo, name, &at_commit) != 0)
 		elog(ERROR, "could not make branch \"%s\" of version control", name);
+
+	/* (its working root, with the changes it took, as its tables hold it) */
+	if (take_changes)
+	{
+		if (vc_checkout(&repo, name) != 0)
+			elog(ERROR, "could not check out branch \"%s\" of version control", name);
+		(void) vc_working_lock(&repo);
+		vc_set_working(&repo, &root);
+	}
 	BranchLink->link(name, branch);
 	vc_commit_release(&at);
 	vc_branch_free(&head);

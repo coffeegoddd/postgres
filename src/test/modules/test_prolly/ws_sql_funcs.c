@@ -1095,6 +1095,7 @@ test_branch_commit(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" is linked to no catalog branch", name)));
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	LockBranchHead(branch);
 	CaptureBranchBarrier(&ctx, branch, 60000, &root);
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
 	if (vc_branch_get(&repo, name, &found))

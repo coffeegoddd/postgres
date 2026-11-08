@@ -118,6 +118,7 @@
 #include "catalog/pg_ws_deferred.h"
 #include "catalog/pg_ws_print.h"
 #include "catalog/storage.h"
+#include "storage/bmap.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "prolly/branch_catalog.h"
@@ -2108,6 +2109,13 @@ make_storage(CopyState *cs)
 		 */
 		if (cs->share && src->rd_rel->relkind != RELKIND_SEQUENCE)
 		{
+			/* (an access method's own storage, not block-mapped, has no pages to share) */
+			if (RelationGetSmgr(src)->smgr_which != SMGR_BMAP)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("relation \"%s\" can't share its pages with a branch",
+								RelationGetRelationName(src)),
+						 errdetail("Its storage isn't block-mapped.")));
 			(void) RelationCreateStorageShared(dst->rd_locator, RelationGetSmgr(src), true);
 			relation_close(dst, NoLock);
 			relation_close(src, NoLock);

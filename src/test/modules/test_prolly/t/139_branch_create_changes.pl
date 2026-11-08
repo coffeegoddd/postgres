@@ -15,9 +15,11 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('branch_changes');
 $node->init(allows_streaming => 'logical');
-$node->append_conf('postgresql.conf', "autovacuum = off\ncapture_to_trees = on\ndebug_block_mapped_heap = on\n");
+$node->append_conf('postgresql.conf', "autovacuum = off\ncapture_to_trees = on\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly; CREATE EXTENSION amcheck');
+my $injections = $ENV{enable_injection_points} eq 'yes' && !$windows_os;
+$node->safe_psql('postgres', 'CREATE EXTENSION injection_points') if $injections;
 
 my $main = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
 sub on { return "SET catalog_branch = $_[0]; SELECT test_ws_use_history_store() IS NULL AS on_history \\gset\n"; }
@@ -55,7 +57,11 @@ sql($main, q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner;
 	SET ROLE app_owner;
 	CREATE TABLE app.t (id integer PRIMARY KEY, v text); CREATE INDEX t_v ON app.t (v);
 	INSERT INTO app.t SELECT g, 'c1' FROM generate_series(1, 1000) g;
-	CREATE TABLE keep.k (id integer PRIMARY KEY); INSERT INTO keep.k VALUES (1)});
+	CREATE TABLE keep.k (id integer PRIMARY KEY); INSERT INTO keep.k VALUES (1);
+	CREATE TABLE app.p (id integer, v text) PARTITION BY RANGE (id);
+	CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (100);
+	CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (100) TO (200);
+	INSERT INTO app.p SELECT g, 'c1' FROM generate_series(1, 150) g});
 sql($main, "SELECT test_branch_link('main', $main)");
 my $c1_root = sql($main, q{SELECT test_branch_commit('main', 'c1')});
 my $c1 = sql($main, q{SELECT test_branch_head('main')});
@@ -68,6 +74,8 @@ sub change
 		INSERT INTO app.t VALUES (2000, 'new'); ALTER TABLE app.t ADD COLUMN w integer;
 		RESET ROLE; CREATE SCHEMA extra VERSIONED; GRANT ALL ON SCHEMA extra TO app_owner; SET ROLE app_owner;
 		CREATE TABLE extra.e (id integer PRIMARY KEY); INSERT INTO extra.e VALUES (7);
+		CREATE DOMAIN extra.d AS integer CHECK (VALUE > 0); ALTER TABLE app.t ADD COLUMN m extra.d;
+		UPDATE app.p SET v = 'dirty' WHERE id IN (50, 150);
 		RESET ROLE; DROP SCHEMA keep CASCADE});
 }
 change();
@@ -80,8 +88,10 @@ my $clean = sql($main, q{SELECT test_branch_create('clean', 'main')});
 is(root($clean), $c1_root, 'a branch made from one with changes is at its head');
 is(rows($clean), $c1_rows, 'with its head\'s rows');
 is(schemas($clean), 'app,keep', 'a schema made since dropped, and one dropped since made again');
-is(sql($clean, q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'w'}), '0',
-	'a column added since not there');
+is(sql($clean, q{SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname IN ('w', 'm')}), '0',
+	'a column added since not there, one of a type in a schema made since too');
+is(sql($clean, q{SELECT string_agg(id || v, ',' ORDER BY id) FROM app.p WHERE id IN (50, 150)}), '50c1,150c1',
+	'and a partitioned table\'s rows its head\'s');
 is(checks($clean), '3 indexes/0 wrong/capture right', 'every index and heap right, and capture with them');
 is(root($main), $dirty_root, 'and main keeps its changes');
 is(rows($main), $dirty_rows, 'its rows as they were');
@@ -91,6 +101,8 @@ is(test_head('clean'), $c1, 'made at main\'s head');
 my $moved = sql($main, q{SELECT test_branch_create('moved', 'main', NULL, true)});
 is(root($moved), $dirty_root, 'a branch taking another\'s changes has them');
 is(rows($moved), $dirty_rows, 'with their rows');
+is(sql($moved, q{SELECT string_agg(id || v, ',' ORDER BY id) FROM app.p WHERE id IN (50, 150)}), '50dirty,150dirty',
+	'a partitioned table\'s too');
 is(schemas($moved), 'app,extra', 'and their schemas');
 is(checks($moved), '3 indexes/0 wrong/capture right', 'every index and heap right, and capture with them');
 is(root($main), $c1_root, 'and the one they came from is reset to its head');
@@ -114,6 +126,35 @@ my $copy = sql($moved, q{SELECT test_branch_create('copy', 'moved')});
 is(root($copy), $c1_root, 'a branch made from another branch is at that one\'s head');
 is(root($moved), $dirty_root, 'which keeps its changes');
 is(checks($copy), '3 indexes/0 wrong/capture right', 'every index and heap right, and capture with them');
+
+SKIP:
+{
+	skip 'injection points not supported by this build', 3 unless $injections;
+
+	# A commit of main between its root and its head, as a branch takes main's changes: the branch
+	# waits, and is made at that commit, main reset to it.
+	sql($main, q{SET ROLE app_owner; UPDATE app.t SET v = 'held' WHERE id = 500});
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-barrier-saved', 'wait')});
+	my $committer = $node->background_psql('postgres');
+	$committer->query_safe(on($main));
+	$committer->query_until(qr/started/, "\\echo started\nSELECT test_branch_commit('main', 'c3');\n\\echo done\n");
+	$node->wait_for_event('client backend', 'capture-barrier-saved');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-barrier-saved')});
+	sql($main, q{SET ROLE app_owner; UPDATE app.t SET v = 'after' WHERE id = 501});
+	my $taker = $node->background_psql('postgres');
+	$taker->query_safe(on($main));
+	my $tpid = $taker->query_safe('SELECT pg_backend_pid()');
+	$taker->query_until(qr/started/, "\\echo started\nSELECT test_branch_create('raced', 'main', NULL, true);\n\\echo done\n");
+	ok($node->poll_query_until('postgres', qq{SELECT cardinality(pg_blocking_pids($tpid)) > 0}),
+		'a branch taking main\'s changes waits for a commit of main between its root and its head');
+	$node->safe_psql('postgres', q{SELECT injection_points_wakeup('capture-barrier-saved')});
+	$committer->query_until(qr/done/, '');
+	$taker->query_until(qr/done/, '');
+	$_->quit for ($committer, $taker);
+	is(test_head('raced'), test_head('main'), 'and is made at that commit');
+	is(sql($main, q{SELECT v FROM app.t WHERE id = 500}) . '/' . sql($main, q{SELECT v FROM app.t WHERE id = 501}),
+		'held/c1', 'main reset to it: its change kept, the one after taken');
+}
 
 # Refused.
 my ($rc, $out, $err) = $node->psql('postgres', qq{SELECT test_branch_create('x', 'main', '$c1', true)});
