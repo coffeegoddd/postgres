@@ -1035,7 +1035,7 @@ test_capture_commit_on(PG_FUNCTION_ARGS)
 /*
  * test_ws_move(schema text, root text, timeout_ms integer) returns text: the schema moved in place to a
  * root of the history store, and what was written, as "tables T deleted D inserted I sequences S made M
- * dropped X".
+ * dropped X altered A kept K".
  */
 Datum
 test_ws_move(PG_FUNCTION_ARGS)
@@ -1047,9 +1047,9 @@ test_ws_move(PG_FUNCTION_ARGS)
 	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
 	WsMove->move(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), &root, PG_GETARG_INT32(2), &stats);
 	prolly_ctx_free(&ctx);
-	PG_RETURN_TEXT_P(cstring_to_text(psprintf("tables %d deleted " UINT64_FORMAT " inserted " UINT64_FORMAT " sequences %d made %d dropped %d",
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("tables %d deleted " UINT64_FORMAT " inserted " UINT64_FORMAT " sequences %d made %d dropped %d altered %d kept " UINT64_FORMAT,
 											  stats.tables, stats.deleted, stats.inserted, stats.sequences,
-											  stats.made, stats.dropped)));
+											  stats.made, stats.dropped, stats.altered, stats.kept)));
 }
 
 /* test_ws_move_prepare(schema text, root text): what a move to it needs committed first */

@@ -25,10 +25,11 @@
  * schema, and so is a table the target keeps that dropping took a part of, as a column whose type
  * went.  Then what the target has and the schema now lacks is made as restore makes it, a table
  * with all its rows (prolly/ws/ws_restore.h's restore_missing), and each table kept has only the
- * rows that differ written.  A table whose definition differs is made again whole, so far, rather
- * than altered, and so is an object that differs only in its comments, owner or grants, with what
- * depends on it.  A materialized view that held rows is refreshed, after what it reads, as what it's
- * made of may have changed, which runs what it is made of.  Roles are made what the target has them
+ * rows that differ written.  A table whose definition differs is altered in place where it can be
+ * (prolly/move_alter.h), its rows that only the alter rewrote left as they are, and made again
+ * whole otherwise; an object that differs only in its comments, owner or grants is made again,
+ * with what depends on it.  A materialized view that held rows is refreshed, after what it
+ * reads, as what it's made of may have changed, which runs what it is made of.  Roles are made what the target has them
  * as a checkout makes them, if its roles differ.  A root with constraint violations is refused.
  *
  * An enum's value the target has can't be used in the transaction that adds it, so prepare adds
@@ -55,6 +56,8 @@ typedef struct WsMoveStats
 	int			sequences;		/* whose positions changed */
 	int			made;			/* tables made, or made again, and loaded whole */
 	int			dropped;		/* tables the target doesn't have */
+	int			altered;		/* tables altered in place */
+	uint64		kept;			/* rows of those only the alter rewrote, which are left */
 } WsMoveStats;
 
 typedef struct WsMoveRoutine

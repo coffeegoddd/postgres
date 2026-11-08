@@ -106,7 +106,7 @@ my $log_at = -s $node->logfile;
 
 # Back to the first.
 my $stats = sql(qq{SELECT test_ws_move('app', '$a')});
-like($stats, qr/^tables 11 deleted \d+ inserted \d+ sequences 3 made 0 dropped 0$/, "a move to the first writes each table and sequence that differs: $stats");
+like($stats, qr/^tables 11 deleted \d+ inserted \d+ sequences 3 made 0 dropped 0 altered 0 kept 0$/, "a move to the first writes each table and sequence that differs: $stats");
 my ($deleted, $inserted) = $stats =~ /deleted (\d+) inserted (\d+)/;
 # kv: 5 updated taken away and put in again, 5 deleted put back, the new one taken away; notes: a 'b' and
 # the 'c' away, an 'a' back; parted: the row from high back to low; codes, later, spans and duq: both
@@ -145,11 +145,11 @@ else
 {
 	$stats = sql(qq{SELECT test_ws_move('app', '$b')});
 }
-like($stats, qr/^tables 11 deleted 21 inserted 20 sequences 3 made 0 dropped 0$/, "a move to the second: $stats");
+like($stats, qr/^tables 11 deleted 21 inserted 20 sequences 3 made 0 dropped 0 altered 0 kept 0$/, "a move to the second: $stats");
 is(read_root(), $b, 'holds the second root');
 is(capture_root(), $b, 'and capture has it');
 is($node->safe_psql('postgres', $told), '0', 'and no longer holds the maps for it once it has applied them');
-is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0', 'a move to where it is writes nothing');
+is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0 altered 0 kept 0', 'a move to where it is writes nothing');
 
 # Writing after a move, applied with it: the worker held once its barrier is saved, so that it reads the
 # move and the writes after it in one go.  Capture goes on from the root's maps, an update that leaves a

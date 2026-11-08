@@ -580,6 +580,67 @@ objects_there(const WsObject *objs, int nobjs, const char *schema)
 	return there;
 }
 
+/* An object's key and value as bytes, to find one as another has it. */
+typedef struct ObjBytes
+{
+	Buf			key;
+	Buf			value;
+} ObjBytes;
+
+static int
+obj_bytes_cmp(const void *a, const void *b)
+{
+	const ObjBytes *x = a;
+	const ObjBytes *y = b;
+	int			c = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
+
+	if (c != 0)
+		return c;
+	return (x->key.len > y->key.len) - (x->key.len < y->key.len);
+}
+
+/* Which of a root's objects the previous root has as they are. */
+static bool *
+objects_as_before(ProllyCtx *ctx, const WsObject *objs, int nobjs, const PHash *previous)
+{
+	PHash		map;
+	WsObject   *was = NULL;
+	int			nwas = 0;
+	ObjBytes   *before;
+	bool	   *same = palloc0_array(bool, Max(nobjs, 1));
+
+	if (previous != NULL && WsRoot->get_map(ctx, previous, WS_ROOT_OBJECTS, &map))
+		ws_obj_list(ctx, &map, &was, &nwas);
+	before = palloc0_array(ObjBytes, Max(nwas, 1));
+	for (int w = 0; w < nwas; w++)
+	{
+		WsObjectCodec->encode_key(&was[w], &before[w].key);
+		WsObjectCodec->encode_value(&was[w], &before[w].value);
+		ws_obj_free(&was[w]);
+	}
+	qsort(before, nwas, sizeof(ObjBytes), obj_bytes_cmp);
+	for (int i = 0; i < nobjs; i++)
+	{
+		ObjBytes	one = {BUF_INIT, BUF_INIT};
+		ObjBytes   *hit;
+
+		WsObjectCodec->encode_key(&objs[i], &one.key);
+		WsObjectCodec->encode_value(&objs[i], &one.value);
+		hit = nwas > 0 ? bsearch(&one, before, nwas, sizeof(ObjBytes), obj_bytes_cmp) : NULL;
+		same[i] = hit != NULL && hit->value.len == one.value.len &&
+			memcmp(hit->value.data, one.value.data, one.value.len) == 0;
+		buf_free(&one.key);
+		buf_free(&one.value);
+	}
+	for (int w = 0; w < nwas; w++)
+	{
+		buf_free(&before[w].key);
+		buf_free(&before[w].value);
+	}
+	pfree(before);
+	return same;
+}
+
 /*
  * Restoring: all of it; with fn, only what restore_rows says, then fn; with no_rows, all
  * of it, each table holding that, or if definitions_only, what restore_definitions says;
@@ -588,7 +649,7 @@ objects_there(const WsObject *objs, int nobjs, const char *schema)
 static void
 restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
 		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows,
-		   bool definitions_only, bool roles_here, bool missing)
+		   bool definitions_only, bool roles_here, bool missing, bool before_tables_only)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -604,6 +665,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	bool	   *table_made = NULL;
 	bool		roles_same = false;
 	bool	   *obj_made = NULL;
+	bool	   *obj_finished = NULL;
 	WsTableSchema *made_recs;
 	int			nmade = 0;
 
@@ -632,8 +694,10 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 
 not_empty:
 
-	/* (roles are as they were when a schema kept has the same as before) */
-	if (missing && previous != NULL)
+	/* (roles are as they were when a schema kept has the same as before, or were made first) */
+	if (missing && !before_tables_only)
+		roles_same = true;
+	else if (missing && previous != NULL)
 	{
 		PHash		before;
 		bool		had = WsRoot->get_map(ctx, previous, WS_ROOT_ROLES, &before);
@@ -700,11 +764,30 @@ not_empty:
 		}
 	if (missing)
 	{
-		obj_made = objects_there(objs, nobjs, schema);
+		bool	   *there = objects_there(objs, nobjs, schema);
+		bool	   *before = before_tables_only ? NULL : objects_as_before(ctx, objs, nobjs, previous);
+
+		/*
+		 * (what isn't there is made; and what the first part made, there now and not as before, is
+		 * seen to after tables as what's made is, being owned by a column, and remembered)
+		 */
+		obj_made = palloc_array(bool, Max(nobjs, 1));
+		obj_finished = palloc_array(bool, Max(nobjs, 1));
 		for (int i = 0; i < nobjs; i++)
-			obj_made[i] = !obj_made[i];
+		{
+			obj_made[i] = !there[i];
+			obj_finished[i] = !there[i] || (before != NULL && !before[i]);
+		}
+		pfree(there);
+		if (before != NULL)
+			pfree(before);
 	}
 	ws_obj_restore_some(objs, nobjs, obj_made, schema, true);
+	if (before_tables_only)
+	{
+		tables.nnames = 0;
+		goto done;
+	}
 
 	tables_in_order(ctx, root, &tables);
 	table_made = palloc_array(bool, Max(tables.nnames, 1));
@@ -846,7 +929,7 @@ not_empty:
 			run_statement(&sql);
 		}
 	}
-	ws_obj_restore_some(objs, nobjs, obj_made, schema, false);
+	ws_obj_restore_some(objs, nobjs, obj_finished, schema, false);
 	for (int t = 0; t < tables.n; t++)
 	{
 		if (!table_made[tables.order[t]])
@@ -872,7 +955,7 @@ not_empty:
 		int			n = 0;
 
 		for (int i = 0; i < nobjs; i++)
-			if (obj_made[i])
+			if (obj_finished[i])
 				made[n++] = objs[i];
 		ws_obj_remember(made, n, schema);
 		pfree(made);
@@ -894,32 +977,33 @@ done:
 static void
 schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, false);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, false, false);
 }
 
 static void
 schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
 					void (*fn) (void *arg, const char *schema), void *arg, bool roles_here)
 {
-	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here, false);
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here, false, false);
 }
 
 static void
 schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false, false, false);
 }
 
 static void
 schema_restore_definitions(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false, false, false);
 }
 
 static void
-schema_restore_missing(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
+schema_restore_missing(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
+					   bool before_tables_only)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, true);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, true, before_tables_only);
 }
 
 const WsRootIORoutine SchemaWsRootIO = {
