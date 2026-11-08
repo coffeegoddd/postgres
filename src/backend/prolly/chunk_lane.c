@@ -48,6 +48,7 @@
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -454,6 +455,7 @@ make_lane(Relation log, uint32 lane)
 	StringInfoData sql;
 	Oid			save_userid;
 	int			save_sec_context;
+	int			level;
 	Relation	made;
 	ObjectAddress laneaddr,
 				logaddr;
@@ -464,7 +466,14 @@ make_lane(Relation log, uint32 lane)
 	if (ts)
 		appendStringInfo(&sql, " TABLESPACE %s", quote_identifier(ts));
 
-	/* (as the log's owner, whoever appends) */
+	/*
+	 * (as the log's owner, whoever appends; and with no event trigger run for
+	 * it, as an append runs no user's code: as PGC_SUSET, as this is no
+	 * user's choosing)
+	 */
+	level = NewGUCNestLevel();
+	(void) set_config_option("event_triggers", "off", PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 	SetUserIdAndSecContext(log->rd_rel->relowner,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
@@ -483,9 +492,10 @@ make_lane(Relation log, uint32 lane)
 		SetUserIdAndSecContext(save_userid, save_sec_context);
 	}
 	PG_END_TRY();
+	AtEOXact_GUC(true, level);
 	CommandCounterIncrement();
 
-	made = relation_open(get_relname_relid(name, RelationGetNamespace(log)), RowExclusiveLock);
+	made =relation_open(get_relname_relid(name, RelationGetNamespace(log)), RowExclusiveLock);
 	ObjectAddressSet(laneaddr, RelationRelationId, RelationGetRelid(made));
 	ObjectAddressSet(logaddr, RelationRelationId, RelationGetRelid(log));
 	recordDependencyOn(&laneaddr, &logaddr, DEPENDENCY_INTERNAL);
