@@ -202,20 +202,21 @@ is(read_root(), $a, 'as the tables do');
 	is(read_root(), $a, 'which the move then commits');
 }
 
-# A move is its tables' owner's, which is asked before anything's held.
-$node->safe_psql('postgres', "SET catalog_branch = $branch; " . q{CREATE ROLE mover; GRANT USAGE ON SCHEMA app TO mover; GRANT SELECT ON ALL TABLES IN SCHEMA app TO mover;
-	GRANT SELECT ON ALL SEQUENCES IN SCHEMA app TO mover; GRANT USAGE ON SCHEMA pg_history TO mover;
-	GRANT SELECT ON pg_history.capture_barriers TO mover; GRANT SELECT, INSERT, UPDATE ON pg_history.pointers TO mover;
+# What a move asks is asked before anything's held, writing pg_history among it, which is a superuser's:
+# a role that isn't one is refused without waiting for a writer first.
+$node->safe_psql('postgres', "SET catalog_branch = $branch; " . q{CREATE ROLE mover; GRANT USAGE ON SCHEMA app TO mover;
+	GRANT SELECT ON ALL TABLES IN SCHEMA app TO mover; GRANT SELECT ON ALL SEQUENCES IN SCHEMA app TO mover;
+	GRANT USAGE ON SCHEMA pg_history TO mover; GRANT SELECT ON pg_history.capture_barriers, pg_history.capture_healing TO mover;
+	GRANT SELECT, INSERT, UPDATE ON pg_history.pointers TO mover;
 	GRANT EXECUTE ON FUNCTION test_ws_move(text, text, integer), test_ws_use_history_store() TO mover});
 my $writing = $node->background_psql('postgres');
 $writing->query("$on BEGIN; INSERT INTO app.kv VALUES (500, 'w', NULL)");
 my ($ret, $out, $err) = $node->psql('postgres', "$on SET ROLE mover; SET lock_timeout = '5s'; SELECT test_ws_move('app', '$b')");
-like($err, qr/must be owner of/, 'a move by a role that does not own the tables is refused, not left waiting for a writer first');
+like($err, qr/permission denied for table pointers/, 'a move by a role that may not write pg_history is refused, not left waiting for a writer first');
+$node->safe_psql('postgres', "$on REVOKE SELECT ON ALL TABLES IN SCHEMA app FROM mover");
 $writing->{stderr} = '';
 $writing->query_safe('ROLLBACK');
 $writing->quit;
-($ret, $out, $err) = $node->psql('postgres', "$on REVOKE SELECT ON ALL TABLES IN SCHEMA app FROM mover; SET ROLE mover; SELECT test_ws_move('app', '$b')");
-like($err, qr/permission denied for table/, 'and so is one that could not read them, as a commit from capture asks');
 $node->safe_psql('postgres', "$on REVOKE SELECT ON ALL SEQUENCES IN SCHEMA app FROM mover");
 
 # A table made between the lock and the root would have writers the move doesn't hold off.

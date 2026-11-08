@@ -298,20 +298,31 @@ barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 	return saved;
 }
 
-/* What capture keeps of a barrier, and with leaving_out, of a map told, asked of the caller. */
+/* Each of mode's privileges on one of pg_history's tables, asked of the caller. */
+static void
+check_history_table(Oid history, const char *table, AclMode mode)
+{
+	Oid			relid = get_relname_relid(table, history);
+
+	if (pg_class_aclmask(relid, GetUserId(), mode, ACLMASK_ALL) != mode)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, table);
+}
+
+/*
+ * What a barrier reads of capture's own (its barriers, what's being healed, and the maps it saved),
+ * and with leaving_out what holding a map told writes, asked of the caller as the executor asks it:
+ * so writing pg_history is a superuser's.
+ */
 static void
 check_history(bool leaving_out)
 {
 	Oid			history = get_namespace_oid("pg_history", false);
-	Oid			user = GetUserId();
 
-	if (object_aclcheck(NamespaceRelationId, history, user, ACL_USAGE) != ACLCHECK_OK)
+	if (object_aclcheck(NamespaceRelationId, history, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, "pg_history");
-	if (pg_class_aclcheck(get_relname_relid("capture_barriers", history), user, ACL_SELECT) != ACLCHECK_OK)
-		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, "capture_barriers");
-	if (leaving_out &&
-		pg_class_aclcheck(get_relname_relid("pointers", history), user, ACL_SELECT | ACL_INSERT | ACL_UPDATE) != ACLCHECK_OK)
-		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, "pointers");
+	check_history_table(history, "capture_barriers", ACL_SELECT);
+	check_history_table(history, "capture_healing", ACL_SELECT);
+	check_history_table(history, "pointers", leaving_out ? ACL_SELECT | ACL_INSERT | ACL_UPDATE : ACL_SELECT);
 }
 
 /* What reading each of the schema's tables and sequences asks, without locking them. */
