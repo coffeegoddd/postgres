@@ -23,6 +23,11 @@
  * then stands behind them; unless the table's own checks imply its bound, as ATTACH
  * then scans nothing, so whatever makes rows from two sides must see to that.
  *
+ * Apply writes as restore does, into a table as it stands, attached or not: what it puts in is a
+ * root's rows of the same table, so neither the table's checks nor a partition's bound are asked of
+ * them again.  It finds a keyed row by its primary key, and a keyless one by what it prints as, in
+ * one scan of the table, holding in memory what it's to take away.
+ *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
  * src/include/prolly/ws/ws_rows.h
@@ -43,6 +48,16 @@ typedef struct WsRowsRoutine
 	/* A row map's rows put in the table, an empty one of the record's made so. */
 	void		(*restore) (ProllyCtx *ctx, const char *schema, const WsTableSchema *s,
 							const PHash *map);
+
+	/*
+	 * The table's rows, which are from's, made to's, writing only the rows that differ: each of
+	 * from's taken away before any of to's is put in, so that one row can have what another had.
+	 * As restore writes them, no trigger, rule or domain's check runs, and the table's indexes are
+	 * kept.  A row from has and the table doesn't is an error.  How many rows were taken away and
+	 * put in, a keyed row changed being both.
+	 */
+	void		(*apply) (ProllyCtx *ctx, const char *schema, const WsTableSchema *s,
+						  const PHash *from, const PHash *to, uint64 *deleted, uint64 *inserted);
 } WsRowsRoutine;
 
 extern PGDLLIMPORT const WsRowsRoutine DirectWsRows;

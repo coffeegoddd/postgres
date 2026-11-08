@@ -35,7 +35,8 @@
  * What DDL does to a table's rows reaches here as all of its rows, in logical messages at the end
  * of its transaction (capture_rows.c), which void all that was told of the table before them.  So
  * nothing's judged until its transaction has ended: what's wrong with a change only matters if it
- * isn't voided.
+ * isn't voided.  A transaction left out of capture that has made a table's rows a root's says so
+ * instead, with the root's row map (CaptureRowsAre): the table is told whole as that map.
  *
  * A table with no key holds its rows by the whole row, with how many there are of it, so a change
  * is one fewer of the old row and one more of the new; CaptureLoggedIdentity has that come whole.
@@ -137,6 +138,8 @@ typedef struct TreeTable
 	int32		branch;
 	bool		any_unchanged;
 	Size		held_bytes;		/* of tree_held_bytes */
+	bool		has_base;		/* told whole as base, a row map, with what's held after it */
+	PHash		base;
 } TreeTable;
 
 /* One row's change, as text: the shape's fields, NULL for a null. */
@@ -587,6 +590,7 @@ tree_held_forget(TreeTable *table)
 	table->last_at = InvalidXLogRecPtr;
 	table->last_shape = NULL;
 	table->any_unchanged = false;
+	table->has_base = false;
 }
 
 /* Reading a table's changes held back, in order, from its file and then what's still in memory. */
@@ -781,9 +785,10 @@ read_int32(const char **p, const char *end)
 }
 
 /* All that's been told of the table is void, and its rows are those that follow, in this layout. */
-static void
-tree_rows_begin(const char *p, const char *end)
+static TreeTable *
+tree_rows_begin(const char **at, const char *end)
 {
+	const char *p = *at;
 	int32		branch = read_int32(&p, end);
 	Oid			relid = (Oid) read_int32(&p, end);
 	int32		nkey = read_int32(&p, end);
@@ -821,6 +826,20 @@ tree_rows_begin(const char *p, const char *end)
 	table->replaced_at = tree_commit;
 	table->last_shape = table->shape;
 	tree_held_note(table, branch, tree_commit);
+	*at = p;
+	return table;
+}
+
+/* The same, with the table's rows a row map's, which no rows follow. */
+static void
+tree_rows_are(const char *p, const char *end)
+{
+	TreeTable  *table = tree_rows_begin(&p, end);
+
+	memcpy(table->base.b, tree_take(&p, end, PHASH_LEN), PHASH_LEN);
+	if (p != end)
+		elog(ERROR, "a message of a table's rows is longer than it says");
+	table->has_base = true;
 }
 
 static void
@@ -871,12 +890,21 @@ tree_message(const char *prefix, const char *data, Size size, bool transactional
 		tree_barrier_lsn = lsn;
 		return;
 	}
+	if (transactional && strcmp(prefix, CAPTURE_ROWS_ARE_PREFIX) == 0)
+	{
+		tree_rows_are(data, end);
+		return;
+	}
 	if (!transactional || strcmp(prefix, CAPTURE_ROWS_PREFIX) != 0)
 		return;
 	if (size < 1)
 		elog(ERROR, "a message of a table's rows is empty");
 	if (data[0] == CAPTURE_ROWS_BEGIN)
-		tree_rows_begin(data + 1, end);
+	{
+		const char *p = data + 1;
+
+		(void) tree_rows_begin(&p, end);
+	}
 	else if (data[0] == CAPTURE_ROWS_BATCH)
 		tree_rows_batch(data + 1, end);
 	else
@@ -1344,8 +1372,10 @@ tree_apply_table(ProllyCtx *ctx, VcRefs *refs, TreeTable *table, List *positions
 		tree_check_table(table, shape);
 
 	snprintf(name, sizeof(name), "capture/map/%u", table->relid);
-	if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
-		prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+	if (anew && table->has_base)
+		map = table->base;
+	else if ((anew || !refs->routine->get(refs, name, VC_REF_READ, &map)) &&
+			 prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
 		prolly_report(ctx);
 	batch_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture apply batch", ALLOCSET_DEFAULT_SIZES);
 	read_cxt = AllocSetContextCreate(CurrentMemoryContext, "capture apply read", ALLOCSET_DEFAULT_SIZES);

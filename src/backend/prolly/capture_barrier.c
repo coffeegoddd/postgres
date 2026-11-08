@@ -22,7 +22,8 @@
  * themselves don't wait for it.  A change of a role from another database isn't held off.
  *
  * It's an error above READ COMMITTED, as it reads what's committed now, and in a
- * transaction that's written anything, which would be neither in it nor clearly out.
+ * transaction that's written anything, which would be neither in it nor clearly out.  One
+ * whose writes are all to be left out of capture, from before it takes the root, is clearly out.
  * What can't be held in a commit, or a table capture holds no map of, is an error too.
  * The caller needs what it would to read the tables, as it's given all their rows, so a role
  * row security applies to is refused.  Those are asked before anything's written; what can't be
@@ -297,19 +298,11 @@ barrier_saved(SPIPlanPtr plan, XLogRecPtr lsn)
 	return saved;
 }
 
-void
-CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
+/* What's asked of a barrier before anything is held or written; the schema's branch. */
+static int32
+barrier_check(const char *schema, Oid nsp)
 {
-	Oid			nsp = get_namespace_oid(schema, false);
 	int32		branch = NamespaceBranch(nsp);
-	XLogRecPtr	lsn;
-	TimestampTz start;
-	const WsRowsRoutine *rows = WsRows;
-	Oid			types[1] = {PG_LSNOID};
-	SPIPlanPtr	plan;
-	List	   *tables;
-	int			nest;
-	char		quickly[32];
 
 	if (!capture_to_trees)
 		ereport(ERROR,
@@ -327,6 +320,20 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit from capture can't run in a transaction that has written anything")));
+	return branch;
+}
+
+static void
+barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int timeout_ms, PHash *root)
+{
+	XLogRecPtr	lsn;
+	TimestampTz start;
+	const WsRowsRoutine *rows = WsRows;
+	Oid			types[1] = {PG_LSNOID};
+	SPIPlanPtr	plan;
+	List	   *tables;
+	int			nest;
+	char		quickly[32];
 
 	if (object_aclcheck(NamespaceRelationId, nsp, GetUserId(), ACL_USAGE) != ACLCHECK_OK)
 		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, schema);
@@ -397,4 +404,23 @@ CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "could not finish with SPI");
 	UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+}
+
+void
+CaptureBarrier(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+
+	barrier_take(ctx, schema, nsp, barrier_check(schema, nsp), timeout_ms, root);
+}
+
+/* (its writes are left out, so the root is of all that's committed, and none of it) */
+void
+CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+	int32		branch = barrier_check(schema, nsp);
+
+	CaptureLeaveOut();
+	barrier_take(ctx, schema, nsp, branch, timeout_ms, root);
 }

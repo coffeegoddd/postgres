@@ -19,6 +19,7 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "prolly/capture.h"
+#include "prolly/move.h"
 #include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_fk.h"
 #include "prolly/ws/ws_merge.h"
@@ -62,6 +63,7 @@ PG_FUNCTION_INFO_V1(test_ws_schema_shape);
 PG_FUNCTION_INFO_V1(test_capture_barrier);
 PG_FUNCTION_INFO_V1(test_capture_wait);
 PG_FUNCTION_INFO_V1(test_capture_leave_out);
+PG_FUNCTION_INFO_V1(test_ws_move);
 PG_FUNCTION_INFO_V1(test_capture_commit);
 PG_FUNCTION_INFO_V1(test_capture_commit_on);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
@@ -1027,6 +1029,24 @@ test_capture_commit_on(PG_FUNCTION_ARGS)
 	vc_repo_free(&repo);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/*
+ * test_ws_move(schema text, root text, timeout_ms integer) returns text: the schema moved in place to a
+ * root of the history store, and what was written, as "tables T deleted D inserted I sequences S".
+ */
+Datum
+test_ws_move(PG_FUNCTION_ARGS)
+{
+	ProllyCtx	ctx;
+	PHash		root = text_hash(PG_GETARG_TEXT_PP(1));
+	WsMoveStats stats;
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	WsMove->move(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), &root, PG_GETARG_INT32(2), &stats);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("tables %d deleted " UINT64_FORMAT " inserted " UINT64_FORMAT " sequences %d",
+											  stats.tables, stats.deleted, stats.inserted, stats.sequences)));
 }
 
 /* test_ws_use_history_store() returns void: this backend's test_ws_ functions use the history store */

@@ -66,6 +66,13 @@
 
 /* A transaction's first message, if it's left out of capture. */
 #define CAPTURE_LEAVE_OUT_PREFIX PROLLY_MESSAGE_PREFIX "capture.leave_out"
+
+/*
+ * A message of what a table's rows are as its transaction commits, which one left out of capture
+ * still tells: int32 branch, relid, nkey, nstored; uint64 tags[nstored]; and the hash of their row
+ * map.  All that's been told of the table is void, as with CAPTURE_ROWS_BEGIN.
+ */
+#define CAPTURE_ROWS_ARE_PREFIX PROLLY_MESSAGE_PREFIX "capture.rows_are"
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
 
@@ -215,6 +222,19 @@ extern void CaptureWaitFor(XLogRecPtr lsn, int timeout_ms);
  * Before the transaction writes anything.
  */
 extern void CaptureLeaveOut(void);
+
+/*
+ * CaptureLeaveOut, then CaptureBarrier, with nothing written between: the root as of now of a
+ * transaction whose writes are left out, which is what they start from.
+ */
+extern void CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, PHash *root);
+
+/*
+ * In a transaction left out of capture: the table's rows are map's from its commit on, in the
+ * layout the table has as this is called, which is to be the one it commits with.  The map is the
+ * history store's, as capture's are.  For what has made a table's rows a root's without capture.
+ */
+extern void CaptureRowsAre(Relation relation, const PHash *map);
 
 /*
  * The replica identity a change of this table logs by, in place of its own.  With capture on, a

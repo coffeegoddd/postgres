@@ -25,6 +25,7 @@ backend_sources += files(
   'chunk_tier.c',
   'chunkstore.c',
   'history_upgrade.c',
+  'move.c',
   'object_store.c',
   'registry.c',
 )

@@ -234,6 +234,7 @@ typedef struct RestoreColumn
 	FmgrInfo	input;
 	Oid			ioparam;
 	int32		typmod;
+	FmgrInfo	output;
 } RestoreColumn;
 
 /* A row's column by its base type's input: a domain's checks are user code. */
@@ -243,43 +244,211 @@ restore_column_init(RestoreColumn *c, Form_pg_attribute att)
 	int32		typmod = att->atttypmod;
 	Oid			base = getBaseTypeAndTypmod(att->atttypid, &typmod);
 	Oid			input;
+	Oid			output;
+	bool		varlena;
 
 	c->attnum = att->attnum;
 	c->typmod = typmod;
 	getTypeInputInfo(base, &input, &c->ioparam);
 	fmgr_info(input, &c->input);
+	getTypeOutputInfo(att->atttypid, &output, &varlena);
+	fmgr_info(output, &c->output);
+}
+
+/*
+ * What writes a table's rows directly, as logical replication's apply does, below the rewriter and
+ * with no trigger: no rule, trigger or domain's check runs, and a stored generated column is
+ * written as given.  Its indexes are kept, and their uniqueness checked as each row goes in.
+ */
+typedef struct RowsWriter
+{
+	ProllyCtx  *ctx;
+	char	   *table;
+	Relation	rel;
+	TupleDesc	desc;
+	WsRowShape	shape;
+	RestoreColumn *cols;
+	EState	   *estate;
+	ResultRelInfo *rri;
+	TupleTableSlot *slot;
+	CommandId	cid;
+	WsField    *f;
+	MemoryContext rowcxt;
+	Oid			key_index;		/* the primary key's, of a keyed table */
+} RowsWriter;
+
+/* The table the record names opened to write, or false if it's partitioned, with no rows of its own. */
+static bool
+writer_open(RowsWriter *w, ProllyCtx *ctx, const char *schema, const WsTableSchema *s, bool attached,
+			const char *what)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+	Oid			relid;
+	int			live = 0;
+
+	memset(w, 0, sizeof(*w));
+	w->ctx = ctx;
+	w->table = ws_name_from_utf8(s->name);
+	relid = get_relname_relid(w->table, nsp);
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" in schema \"%s\" does not exist", w->table, schema)));
+	if (s->partition != WS_PARTITION_NONE)
+		return false;
+	PreventCommandIfReadOnly(what);
+	PreventCommandIfParallelMode(what);
+	PreventCommandDuringRecovery(what);
+	w->rel = table_open(relid, RowExclusiveLock);
+	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, w->table);
+	if (w->rel->rd_rel->relkind != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a table to hold rows", w->table)));
+	if (!attached && w->rel->rd_rel->relispartition)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("rows cannot be restored into \"%s\" while it is attached", w->table),
+				 errhint("Restore a partition's rows before attaching it, whose check of its bound stands behind them.")));
+
+	/* each stored column of the record, and no other, by its tag */
+	w->desc = RelationGetDescr(w->rel);
+	ws_schema_row_shape(s, &w->shape);
+	w->cols = palloc0_array(RestoreColumn, Max(w->shape.nstored, 1));
+	for (int i = 0; i < w->desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(w->desc, i);
+		int			at;
+
+		if (att->attisdropped || att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			continue;
+		at = ws_row_shape_at(&w->shape, (uint64) att->attcoltag);
+		if (at < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("column \"%s\" of table \"%s\" is not one its rows hold",
+							NameStr(att->attname), w->table)));
+		restore_column_init(&w->cols[at], att);
+		live++;
+	}
+	if (live != w->shape.nstored)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("table \"%s\" has %d of the %d columns its rows hold",
+						w->table, live, w->shape.nstored)));
+
+	w->estate = CreateExecutorState();
+	w->rri = makeNode(ResultRelInfo);
+	InitResultRelInfo(w->rri, w->rel, 1, NULL, 0);
+	ExecOpenIndices(w->rri, false);
+	w->key_index = InvalidOid;
+	for (int i = 0; i < w->rri->ri_NumIndices; i++)
+		if (w->rri->ri_IndexRelationDescs[i]->rd_index->indisprimary)
+			w->key_index = RelationGetRelid(w->rri->ri_IndexRelationDescs[i]);
+	w->slot = table_slot_create(w->rel, NULL);
+	w->cid = GetCurrentCommandId(true);
+	w->f = palloc_array(WsField, Max(w->shape.nstored, 1));
+	w->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "ws_rows row", ALLOCSET_DEFAULT_SIZES);
+	return true;
+}
+
+static void
+writer_close(RowsWriter *w)
+{
+	if (w->rel != NULL)
+	{
+		MemoryContextDelete(w->rowcxt);
+		ExecDropSingleTupleTableSlot(w->slot);
+		ExecCloseIndices(w->rri);
+		FreeExecutorState(w->estate);
+		table_close(w->rel, NoLock);
+		CommandCounterIncrement();
+		ws_row_shape_free(&w->shape);
+		pfree(w->f);
+		pfree(w->cols);
+	}
+	pfree(w->table);
+}
+
+/* A row of the map in the writer's slot, its fields in w->f; how many of it a keyless row is. */
+static uint64
+writer_fill(RowsWriter *w, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
+{
+	MemoryContext old;
+	uint64		count = 1;
+	Buf			held = BUF_INIT;	/* (the row's, as all else of it) */
+
+	MemoryContextReset(w->rowcxt);
+	old = MemoryContextSwitchTo(w->rowcxt);
+	ws_row_load(w->ctx, &w->shape, k, kl, v, vl, w->f, &held);
+	if (w->shape.nkey == 0)
+		count = ws_rows_keyless_count(k, kl, v, vl);
+	ExecClearTuple(w->slot);
+	memset(w->slot->tts_isnull, true, w->desc->natts * sizeof(bool));
+
+	/* (the values' own only: an index's functions may rely on a domain) */
+	domain_checks_suspended = true;
+	PG_TRY();
+	{
+		for (int i = 0; i < w->shape.nstored; i++)
+			if (!w->f[i].null)
+			{
+				char	   *text = pnstrdup((const char *) w->f[i].p, w->f[i].len);
+				int			att = w->cols[i].attnum - 1;
+
+				w->slot->tts_values[att] = InputFunctionCall(&w->cols[i].input, ws_text_from_utf8(text),
+															 w->cols[i].ioparam, w->cols[i].typmod);
+				w->slot->tts_isnull[att] = false;
+			}
+	}
+	PG_FINALLY();
+	{
+		domain_checks_suspended = false;
+	}
+	PG_END_TRY();
+	ExecStoreVirtualTuple(w->slot);
+	MemoryContextSwitchTo(old);
+	return count;
+}
+
+/* The row in the writer's slot inserted, with its index entries. */
+static void
+writer_insert(RowsWriter *w)
+{
+	MemoryContext old;
+
+	CHECK_FOR_INTERRUPTS();
+	ResetPerTupleExprContext(w->estate);
+	old = MemoryContextSwitchTo(GetPerTupleMemoryContext(w->estate));
+	table_tuple_insert(w->rel, w->slot, w->cid, 0, NULL);
+
+	/*
+	 * (A deferrable key says what it would check at commit.  All of a
+	 * state is written here, so that is now.)
+	 */
+	if (w->rri->ri_NumIndices > 0 &&
+		ExecInsertIndexTuples(w->rri, w->estate, 0, w->slot, NIL, NULL) != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg("a row of table \"%s\" has a key another has, under a deferrable constraint",
+						w->table)));
+	MemoryContextSwitchTo(old);
 }
 
 static void
 direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const PHash *map)
 {
-	char	   *table = ws_name_from_utf8(s->name);
-	Oid			nsp = get_namespace_oid(schema, false);
-	Oid			relid = get_relname_relid(table, nsp);
-	Relation	rel;
-	TupleDesc	desc;
-	WsRowShape	shape;
-	RestoreColumn *cols;
-	int			live = 0;
-	EState	   *estate;
-	ResultRelInfo *rri;
-	TupleTableSlot *slot;
-	CommandId	cid;
+	RowsWriter	w;
 	ProllyIter *it;
 	const uint8 *k,
 			   *v;
 	size_t		kl,
 				vl;
-	WsField    *f;
-	MemoryContext rowcxt;
 	int			rc;
 	int			level;
 
-	if (!OidIsValid(relid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("table \"%s\" in schema \"%s\" does not exist", table, schema)));
-	if (s->partition != WS_PARTITION_NONE)
+	if (!writer_open(&w, ctx, schema, s, false, "restoring rows"))
 	{
 		uint64		count;
 
@@ -288,143 +457,266 @@ direct_restore(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const
 		if (count != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("partitioned table \"%s\" holds rows of its own", table)));
-		pfree(table);
+					 errmsg("partitioned table \"%s\" holds rows of its own", w.table)));
+		writer_close(&w);
 		return;
 	}
-	PreventCommandIfReadOnly("restoring rows");
-	PreventCommandIfParallelMode("restoring rows");
-	PreventCommandDuringRecovery("restoring rows");
-	rel = table_open(relid, RowExclusiveLock);
-	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, table);
-	if (rel->rd_rel->relkind != RELKIND_RELATION)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table to hold rows", table)));
-	if (rel->rd_rel->relispartition)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("rows cannot be restored into \"%s\" while it is attached", table),
-				 errhint("Restore a partition's rows before attaching it, whose check of its bound stands behind them.")));
-
-	/* each stored column of the record, and no other, by its tag */
-	desc = RelationGetDescr(rel);
-	ws_schema_row_shape(s, &shape);
-	cols = palloc0_array(RestoreColumn, Max(shape.nstored, 1));
-	for (int i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
-		int			at;
-
-		if (att->attisdropped || att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
-			continue;
-		at = ws_row_shape_at(&shape, (uint64) att->attcoltag);
-		if (at < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("column \"%s\" of table \"%s\" is not one its rows hold",
-							NameStr(att->attname), table)));
-		restore_column_init(&cols[at], att);
-		live++;
-	}
-	if (live != shape.nstored)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("table \"%s\" has %d of the %d columns its rows hold",
-						table, live, shape.nstored)));
-
-	estate = CreateExecutorState();
-	rri = makeNode(ResultRelInfo);
-	InitResultRelInfo(rri, rel, 1, NULL, 0);
-	ExecOpenIndices(rri, false);
-	slot = table_slot_create(rel, NULL);
-	cid = GetCurrentCommandId(true);
-	f = palloc_array(WsField, Max(shape.nstored, 1));
-	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "ws_rows row", ALLOCSET_DEFAULT_SIZES);
 
 	level = WsSql->begin();
 	if (prolly_iter_open(ctx, map, NULL, 0, &it) < 0)
 		prolly_report(ctx);
-	PG_TRY();
+	while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
 	{
-		while ((rc = prolly_iter_next(it, &k, &kl, &v, &vl)) > 0)
-		{
-			MemoryContext old;
-			uint64		count = 1;
-			Buf			held = BUF_INIT;	/* (the row's, as all else of it) */
+		uint64		count;
 
-			CHECK_FOR_INTERRUPTS();
-			MemoryContextReset(rowcxt);
-			old = MemoryContextSwitchTo(rowcxt);
-			ws_row_load(ctx, &shape, k, kl, v, vl, f, &held);
-			if (shape.nkey == 0)
-				count = ws_rows_keyless_count(k, kl, v, vl);
-			ExecClearTuple(slot);
-			memset(slot->tts_isnull, true, desc->natts * sizeof(bool));
-
-			/* (the values' own only: an index's functions may rely on a domain) */
-			domain_checks_suspended = true;
-			for (int i = 0; i < shape.nstored; i++)
-				if (!f[i].null)
-				{
-					char	   *text = pnstrdup((const char *) f[i].p, f[i].len);
-					int			att = cols[i].attnum - 1;
-
-					slot->tts_values[att] = InputFunctionCall(&cols[i].input, ws_text_from_utf8(text),
-															  cols[i].ioparam, cols[i].typmod);
-					slot->tts_isnull[att] = false;
-				}
-			domain_checks_suspended = false;
-			ExecStoreVirtualTuple(slot);
-			MemoryContextSwitchTo(old);
-			for (uint64 i = 0; i < count; i++)
-			{
-				CHECK_FOR_INTERRUPTS();
-				ResetPerTupleExprContext(estate);
-				old = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-				table_tuple_insert(rel, slot, cid, 0, NULL);
-
-				/*
-				 * (A deferrable key says what it would check at commit.  All of a
-				 * state is written here, so that is now.)
-				 */
-				if (rri->ri_NumIndices > 0 &&
-					ExecInsertIndexTuples(rri, estate, 0, slot, NIL, NULL) != NIL)
-					ereport(ERROR,
-							(errcode(ERRCODE_UNIQUE_VIOLATION),
-							 errmsg("a row of table \"%s\" has a key another has, under a deferrable constraint",
-									table)));
-				MemoryContextSwitchTo(old);
-			}
-		}
+		CHECK_FOR_INTERRUPTS();
+		count = writer_fill(&w, k, kl, v, vl);
+		for (uint64 i = 0; i < count; i++)
+			writer_insert(&w);
 	}
-	PG_FINALLY();
-	{
-		domain_checks_suspended = false;
-	}
-	PG_END_TRY();
 	prolly_iter_close(it);
 	if (rc < 0)
 		prolly_report(ctx);
 	WsSql->end(level);
+	writer_close(&w);
+}
 
-	MemoryContextDelete(rowcxt);
-	ExecDropSingleTupleTableSlot(slot);
-	ExecCloseIndices(rri);
-	FreeExecutorState(estate);
-	table_close(rel, NoLock);
-	CommandCounterIncrement();
-	ws_row_shape_free(&shape);
+/* A keyless row's fields as bytes to tell it by: each a length, -1 for a null, and its text. */
+static void
+row_print_bytes(const WsField *f, int n, StringInfo out)
+{
+	for (int i = 0; i < n; i++)
+	{
+		int32		len = f[i].null ? -1 : (int32) f[i].len;
+
+		appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
+		if (!f[i].null)
+			appendBinaryStringInfo(out, (const char *) f[i].p, f[i].len);
+	}
+}
+
+/* Keyless rows to be taken away, by what they print as, and how many of each are left to find. */
+typedef struct DoomedRow
+{
+	char	   *bytes;
+	int			len;
+	uint64		left;
+} DoomedRow;
+
+static int
+doomed_cmp(const void *a, const void *b)
+{
+	const DoomedRow *x = a;
+	const DoomedRow *y = b;
+	int			c = memcmp(x->bytes, y->bytes, Min(x->len, y->len));
+
+	if (c != 0)
+		return c;
+	return (x->len > y->len) - (x->len < y->len);
+}
+
+typedef struct RowsApply
+{
+	RowsWriter *w;
+	bool		inserting;
+	uint64		deleted;
+	uint64		inserted;
+	DoomedRow  *doomed;
+	int			ndoomed;
+	int			doomed_cap;
+	TupleTableSlot *found;
+} RowsApply;
+
+/*
+ * One key that differs: in the first pass, what from has of it taken away, and in the second, what to
+ * has put in.  A keyed row is found by its key; a keyless one is only noted, to be found in one scan.
+ */
+static void
+apply_diff(void *arg, const ProllyDiff *d)
+{
+	RowsApply  *a = arg;
+	RowsWriter *w = a->w;
+	uint64		had = 0;
+	uint64		has = 0;
+
+	CHECK_FOR_INTERRUPTS();
+	if (w->shape.nkey == 0)
+	{
+		if (d->from != NULL)
+			had = ws_rows_keyless_count(d->key, d->klen, d->from, d->flen);
+		if (d->to != NULL)
+			has = ws_rows_keyless_count(d->key, d->klen, d->to, d->tlen);
+	}
+	else
+	{
+		had = d->from != NULL;
+		has = d->to != NULL;
+	}
+
+	if (a->inserting)
+	{
+		/* (a keyed row changed is put in again whole, as it was taken away) */
+		uint64		more = w->shape.nkey == 0 ? (has > had ? has - had : 0) : has;
+
+		if (more > 0)
+		{
+			(void) writer_fill(w, d->key, d->klen, d->to, d->tlen);
+			for (uint64 i = 0; i < more; i++)
+				writer_insert(w);
+			a->inserted += more;
+		}
+		return;
+	}
+	if (had == 0 || (w->shape.nkey == 0 && had <= has))
+		return;
+	(void) writer_fill(w, d->key, d->klen, d->from, d->flen);
+	if (w->shape.nkey == 0)
+	{
+		StringInfoData bytes;
+		DoomedRow  *row;
+
+		if (a->ndoomed == a->doomed_cap)
+		{
+			a->doomed_cap = Max(16, a->doomed_cap * 2);
+			a->doomed = a->doomed == NULL ? palloc_array(DoomedRow, a->doomed_cap) :
+				repalloc_array(a->doomed, DoomedRow, a->doomed_cap);
+		}
+		initStringInfo(&bytes);
+		row_print_bytes(w->f, w->shape.nstored, &bytes);
+		row = &a->doomed[a->ndoomed++];
+		row->bytes = bytes.data;
+		row->len = bytes.len;
+		row->left = had - has;
+		return;
+	}
+	if (!RelationFindReplTupleByIndex(w->rel, w->key_index, true, LockTupleExclusive, w->slot, a->found))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("table \"%s\" has no row with a key its rows were said to have", w->table)));
+	simple_table_tuple_delete(w->rel, &a->found->tts_tid, GetActiveSnapshot());
+	a->deleted++;
+}
+
+/* The keyless rows noted taken away, as many of each as there are to be, in one scan. */
+static void
+apply_keyless_deletes(RowsApply *a)
+{
+	RowsWriter *w = a->w;
+	TableScanDesc scan;
+	StringInfoData bytes;
+	MemoryContext row_cxt = AllocSetContextCreate(CurrentMemoryContext, "ws_rows printed row", ALLOCSET_DEFAULT_SIZES);
+	WsField    *f = palloc_array(WsField, Max(w->shape.nstored, 1));
+	int			level;
+	uint64		left = 0;
+
+	if (a->ndoomed == 0)
+		return;
+	qsort(a->doomed, a->ndoomed, sizeof(DoomedRow), doomed_cmp);
+	for (int i = 0; i < a->ndoomed; i++)
+		left += a->doomed[i].left;
+	initStringInfo(&bytes);
+
+	/* (each row as capture prints it, by which a keyless row is told apart) */
+	level = WsSql->begin();
+	scan = table_beginscan(w->rel, GetActiveSnapshot(), 0, NULL, SO_NONE);
+	while (left > 0 && table_scan_getnextslot(scan, ForwardScanDirection, a->found))
+	{
+		MemoryContext old = MemoryContextSwitchTo(row_cxt);
+		DoomedRow	key;
+		DoomedRow  *hit;
+
+		CHECK_FOR_INTERRUPTS();
+		slot_getallattrs(a->found);
+		for (int i = 0; i < w->shape.nstored; i++)
+		{
+			int			att = w->cols[i].attnum - 1;
+
+			f[i].null = a->found->tts_isnull[att];
+			if (!f[i].null)
+			{
+				char	   *text = ws_text_to_utf8(OutputFunctionCall(&w->cols[i].output, a->found->tts_values[att]));
+
+				f[i].p = (const uint8 *) text;
+				f[i].len = strlen(text);
+			}
+		}
+		resetStringInfo(&bytes);
+		row_print_bytes(f, w->shape.nstored, &bytes);
+		key.bytes = bytes.data;
+		key.len = bytes.len;
+		hit = bsearch(&key, a->doomed, a->ndoomed, sizeof(DoomedRow), doomed_cmp);
+		MemoryContextSwitchTo(old);
+		if (hit != NULL && hit->left > 0)
+		{
+			simple_table_tuple_delete(w->rel, &a->found->tts_tid, GetActiveSnapshot());
+			hit->left--;
+			left--;
+			a->deleted++;
+		}
+		MemoryContextReset(row_cxt);
+	}
+	table_endscan(scan);
+	WsSql->end(level);
+	if (left > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("table \"%s\" has fewer of a row than its rows were said to have", w->table)));
+	MemoryContextDelete(row_cxt);
 	pfree(f);
-	pfree(cols);
-	pfree(table);
+	pfree(bytes.data);
+}
+
+static void
+direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const PHash *from,
+			 const PHash *to, uint64 *deleted, uint64 *inserted)
+{
+	RowsWriter	w;
+	RowsApply	a = {&w};
+	int			level;
+
+	*deleted = 0;
+	*inserted = 0;
+	if (!writer_open(&w, ctx, schema, s, true, "moving rows"))
+	{
+		uint64		count;
+
+		if (prolly_count(ctx, to, &count) < 0)
+			prolly_report(ctx);
+		if (count != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("partitioned table \"%s\" holds rows of its own", w.table)));
+		writer_close(&w);
+		return;
+	}
+	if (w.shape.nkey > 0 && !OidIsValid(w.key_index))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("table \"%s\" has no primary key, and its rows are keyed", w.table)));
+	a.found = table_slot_create(w.rel, NULL);
+
+	/* (every row taken away before any is put in, so that one can have what another had) */
+	level = WsSql->begin();
+	if (prolly_diff(ctx, from, to, apply_diff, &a) < 0)
+		prolly_report(ctx);
+	apply_keyless_deletes(&a);
+	CommandCounterIncrement();
+	a.inserting = true;
+	if (prolly_diff(ctx, from, to, apply_diff, &a) < 0)
+		prolly_report(ctx);
+	WsSql->end(level);
+
+	ExecDropSingleTupleTableSlot(a.found);
+	writer_close(&w);
+	*deleted = a.deleted;
+	*inserted = a.inserted;
 }
 
 const WsRowsRoutine DirectWsRows = {
 	.name = "direct",
 	.capture = direct_capture,
 	.restore = direct_restore,
+	.apply = direct_apply,
 };
 
 const WsRowsRoutine *WsRows = &DirectWsRows;

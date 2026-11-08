@@ -29,6 +29,7 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
@@ -207,7 +208,7 @@ capture_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr l
 		capture_left_out = true;
 		return;
 	}
-	if (transactional && capture_left_out)
+	if (transactional && capture_left_out && strcmp(prefix, CAPTURE_ROWS_ARE_PREFIX) != 0)
 		return;
 	CaptureSinkInUse->message(prefix, message, size, transactional, lsn);
 }
@@ -225,14 +226,15 @@ capture_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr co
  * and in a subtransaction, it's left out with what that rolls back.  For version control's own
  * writes, which make the tables what it has made the branch's trees, such as a hard reset's: what
  * the transaction does to any versioned table, its rows and its shape, is the caller's to have made
- * the trees of.  As it has written, a commit from capture refuses it.  (Written is having an xid,
- * which a subtransaction's write rolled back still leaves the transaction: that refuses too.)
+ * the trees of, which CaptureRowsAre tells capture.  As it has written, a commit from capture
+ * refuses it, but for the one CaptureBarrierLeavingOut takes as it begins.  (Written is having an
+ * xid, which a subtransaction's write rolled back still leaves the transaction: that refuses too.)
  */
+static TransactionId left_out = InvalidTransactionId;
+
 void
 CaptureLeaveOut(void)
 {
-	static TransactionId left_out = InvalidTransactionId;
-
 	if (!IsTransactionState() || IsInParallelMode())
 		elog(ERROR, "capture can only leave out a transaction, and not in parallel");
 	if (TransactionIdIsValid(left_out) && TransactionIdIsCurrentTransactionId(left_out))
@@ -244,6 +246,36 @@ CaptureLeaveOut(void)
 				 errdetail("It has written already.")));
 	(void) LogLogicalMessage(CAPTURE_LEAVE_OUT_PREFIX, "", 0, true, false);
 	left_out = GetCurrentTransactionId();
+}
+
+/*
+ * Told whole as a row map, rather than as rows: in a transaction left out, as only what's made the
+ * table's rows so knows they're the map's, and what's told of them otherwise, its changes and its
+ * rows told at commit, isn't told.
+ */
+void
+CaptureRowsAre(Relation relation, const PHash *map)
+{
+	WsRowShape	shape;
+	StringInfoData out;
+	int32		head[4];
+
+	if (!TransactionIdIsValid(left_out) || !TransactionIdIsCurrentTransactionId(left_out))
+		elog(ERROR, "a table's rows can only be told as a map in a transaction left out of capture");
+	head[0] = NamespaceBranch(RelationGetNamespace(relation));
+	if (head[0] == 0)
+		elog(ERROR, "relation \"%s\" is not versioned", RelationGetRelationName(relation));
+	CaptureRelationShape(relation, &shape);
+	head[1] = (int32) RelationGetRelid(relation);
+	head[2] = shape.nkey;
+	head[3] = shape.nstored;
+	initStringInfo(&out);
+	appendBinaryStringInfo(&out, (const char *) head, sizeof(head));
+	appendBinaryStringInfo(&out, (const char *) shape.tags, sizeof(uint64) * shape.nstored);
+	appendBinaryStringInfo(&out, (const char *) map->b, PHASH_LEN);
+	(void) LogLogicalMessage(CAPTURE_ROWS_ARE_PREFIX, out.data, out.len, true, false);
+	pfree(out.data);
+	ws_row_shape_free(&shape);
 }
 
 void
