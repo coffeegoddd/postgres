@@ -7,7 +7,8 @@
  * Capture runs behind the tables.  So this writes a marker in the WAL, flushed,
  * and wakes the worker, which at the marker applies what it holds and saves each of
  * the branch's row maps as of it.  The root is then what prolly/ws/ws_restore.h's
- * capture makes of the schema, with those for its tables' rows.
+ * capture makes of the schema, with those for its tables' rows.  A branch's root is
+ * each of its schemas' at one marker, all of them locked as one schema's are.
  *
  * What the WAL doesn't carry (definitions, sequences' positions) is read as this
  * runs, with catalog changes in this database held off: it holds the lock that has them
