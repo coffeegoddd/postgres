@@ -19,10 +19,12 @@
 #include "access/table.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_link.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -161,3 +163,10 @@ const BranchLinkRoutine TableBranchLink = {
 };
 
 const BranchLinkRoutine *BranchLink = &TableBranchLink;
+
+/* (a database object lock of pg_database's class on the catalog branch's number, sub-id 3) */
+void
+LockBranchHead(int32 branch)
+{
+	LockDatabaseObject(DatabaseRelationId, (Oid) branch, 3, ExclusiveLock);
+}

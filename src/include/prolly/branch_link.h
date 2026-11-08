@@ -42,6 +42,14 @@ typedef struct BranchLinkRoutine
 
 extern PGDLLIMPORT const BranchLinkRoutine TableBranchLink;
 
+/*
+ * What reads a branch's head and writes one from a barrier's root holds this, of the branch's
+ * catalog branch, from before its barrier to its transaction's end, so that no other writes the
+ * head between: two, each with a root, would each write over what the other had.  It's a lock of
+ * no row, so a transaction that has written nothing, as a barrier's is to be, can take it.
+ */
+extern void LockBranchHead(int32 branch);
+
 /* The implementation in use. */
 extern PGDLLIMPORT const BranchLinkRoutine *BranchLink;
 

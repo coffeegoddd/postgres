@@ -725,15 +725,17 @@ mark_set_aside(ProllyCtx *ctx, const char *schema, const PHash *to, MoveTables *
 	MemoryContextDelete(asking);
 }
 
+/*
+ * The schema's tables, holding from, made to hold to; with tell, capture told each table written
+ * has the target's rows.  In a transaction left out of capture, the schema's writers held off.
+ */
 static void
-inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms, WsMoveStats *stats)
+move_tables(ProllyCtx *ctx, const char *schema, Oid nsp, const PHash *from_root, const PHash *to,
+			bool tell, WsMoveStats *stats)
 {
-	Oid			nsp = get_namespace_oid(schema, false);
-	List	   *locked;
-	PHash		from;
+	PHash		from = *from_root;
 	MoveTables	had = {0};
 	MoveTables	has = {0};
-	int			nlocked = 0;
 	bool	   *gone;
 	WsSqlRows	populated;
 	int			level;
@@ -742,45 +744,16 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	bool	   *altered;
 	WsTableSchema *was;
 	WsTableSchema *want;
-	MoveLocks	locks = {nsp, NIL};
 
-	memset(stats, 0, sizeof(*stats));
-	CaptureBarrierLeavingOut(ctx, schema, timeout_ms, lock_writers_out, &locks, &from);
-	locked = locks.relations;
+	/* (a move to where it is writes nothing at all) */
+	if (memcmp(from.b, to->b, PHASH_LEN) == 0)
+		return;
 
 	/* (what's read and written is as of now, with the writers held off, as the root is) */
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	WsRoot->tables(ctx, &from, move_table_add, &had);
 	WsRoot->tables(ctx, to, move_table_add, &has);
-
-	/* (a table made after the lock was taken, and before the root, would have writers still) */
-	foreach_oid(relid, locked)
-	{
-		if (get_rel_relkind(relid) != RELKIND_SEQUENCE)
-			nlocked++;
-	}
-	for (int i = 0; i < had.n && nlocked == had.n; i++)
-	{
-		char	   *name = ws_name_from_utf8(had.names[i]);
-
-		if (!list_member_oid(locked, get_relname_relid(name, nsp)))
-			nlocked = -1;
-		pfree(name);
-	}
-	if (nlocked != had.n)
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("a table of schema \"%s\" was made or dropped as it was being moved", schema),
-				 errhint("Try the move again.")));
-
-	/* (a move to where it is writes nothing at all) */
-	if (memcmp(from.b, to->b, PHASH_LEN) == 0)
-	{
-		PopActiveSnapshot();
-		list_free(locked);
-		return;
-	}
 
 	level = WsSql->begin();
 	mark_set_aside(ctx, schema, to, &had, &has);
@@ -902,7 +875,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 			relid = get_relname_relid(name, nsp);
 			pfree(name);
 		}
-		if (get_rel_relkind(relid) == RELKIND_RELATION)
+		if (tell && get_rel_relkind(relid) == RELKIND_RELATION)
 		{
 			Relation	rel = relation_open(relid, NoLock);
 
@@ -938,7 +911,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		if (!OidIsValid(relid))
 			elog(ERROR, "table \"%s\" of schema \"%s\" was not made", has.names[i], schema);
 		stats->made++;
-		if (get_rel_relkind(relid) == RELKIND_RELATION)
+		if (tell && get_rel_relkind(relid) == RELKIND_RELATION)
 		{
 			Relation	rel = relation_open(relid, NoLock);
 
@@ -963,7 +936,6 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	ws_schema_path_end(nest);
 	WsSql->end(level);
 	PopActiveSnapshot();
-	list_free(locked);
 	for (int i = 0; i < has.n; i++)
 		if (altered[i] || was[i].name != NULL)
 		{
@@ -986,6 +958,61 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 		pfree(has.entries);
 		pfree(has.aside);
 	}
+}
+
+static void
+inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms, WsMoveStats *stats)
+{
+	Oid			nsp = get_namespace_oid(schema, false);
+	List	   *locked;
+	PHash		from;
+	MoveTables	had = {0};
+	int			nlocked = 0;
+	MoveLocks	locks = {nsp, NIL};
+
+	memset(stats, 0, sizeof(*stats));
+	CaptureBarrierLeavingOut(ctx, schema, timeout_ms, lock_writers_out, &locks, &from);
+	locked = locks.relations;
+
+	/* (a table made after the lock was taken, and before the root, would have writers still) */
+	WsRoot->tables(ctx, &from, move_table_add, &had);
+	foreach_oid(relid, locked)
+	{
+		if (get_rel_relkind(relid) != RELKIND_SEQUENCE)
+			nlocked++;
+	}
+	for (int i = 0; i < had.n && nlocked == had.n; i++)
+	{
+		char	   *name = ws_name_from_utf8(had.names[i]);
+
+		if (!list_member_oid(locked, get_relname_relid(name, nsp)))
+			nlocked = -1;
+		pfree(name);
+	}
+	if (nlocked != had.n)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("a table of schema \"%s\" was made or dropped as it was being moved", schema),
+				 errhint("Try the move again.")));
+	for (int i = 0; i < had.n; i++)
+		pfree(had.names[i]);
+	if (had.n > 0)
+	{
+		pfree(had.names);
+		pfree(had.entries);
+		pfree(had.aside);
+	}
+
+	move_tables(ctx, schema, nsp, &from, to, true, stats);
+	list_free(locked);
+}
+
+static void
+inplace_move_from(ProllyCtx *ctx, const char *schema, const PHash *from, const PHash *to,
+				  WsMoveStats *stats)
+{
+	memset(stats, 0, sizeof(*stats));
+	move_tables(ctx, schema, get_namespace_oid(schema, false), from, to, false, stats);
 }
 
 /* An enum's labels as the target makes it, or NIL if it isn't one. */
@@ -1103,6 +1130,7 @@ const WsMoveRoutine InPlaceWsMove = {
 	.name = "in place",
 	.prepare = inplace_prepare,
 	.move = inplace_move,
+	.move_from = inplace_move_from,
 };
 
 const WsMoveRoutine *WsMove = &InPlaceWsMove;
