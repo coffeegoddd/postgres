@@ -215,7 +215,8 @@ SKIP:
 	$node->poll_query_until('postgres', q{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '%ADD COLUMN b integer%' AND wait_event_type = 'Lock'}) or die 'DDL did not wait';
 	kill 'CONT', $worker;
 	finish($bg);
-	like($bg->{stderr}, qr/lock timeout/, 'what a view depends on, changing: the barrier gives up');
+	like($bg->{stderr}, qr/could not serialize a commit from capture: it waited on another transaction/,
+		'what a view depends on, changing: the barrier gives up');
 	$bg->quit;
 	finish($ddl);
 	$ddl->quit;
@@ -410,7 +411,8 @@ my $held_open = $node->background_psql('postgres');
 $node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900009, 'new chunks')");
 $held_open->query_safe("$on1 BEGIN; SELECT test_capture_barrier('s')");
 my ($rco, $outo, $erro) = $node->psql('postgres', "$on1 SELECT test_capture_barrier('s')");
-like($erro, qr/lock timeout/, 'a barrier beside one in an open transaction gives up');
+like($erro, qr/could not serialize a commit from capture: it waited on another transaction/,
+	'a barrier beside one in an open transaction gives up');
 $node->safe_psql('postgres', "$on1 INSERT INTO s.t VALUES (900010, 'capture goes on')");
 caught_up();
 pass('capture does not wait for it');

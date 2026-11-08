@@ -468,7 +468,9 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	SPIPlanPtr	plan;
 	List	   *tables;
 	int			nest;
+	bool		quick;
 	char		quickly[32];
+	MemoryContext cxt = CurrentMemoryContext;
 
 	/* (asked of the caller as it began, and asked again by preparing) */
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -530,10 +532,16 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 
 	INJECTION_POINT("capture-barrier-saved", NULL);
 
-	/* (half of what would find a deadlock, as a user's commit must not be what one fails) */
+	/*
+	 * (half of what would find a deadlock, as a user's commit must not be what one fails: so past it,
+	 * waiting on another transaction, it's a serialization failure, as it can't tell whether the
+	 * other waits on it in turn: one that put the same chunks, its barrier taken just before, mostly
+	 * doesn't)
+	 */
 	nest = NewGUCNestLevel();
+	quick = LockTimeout == 0 || LockTimeout > Max(DeadlockTimeout / 2, 1);
 	snprintf(quickly, sizeof(quickly), "%d", Max(DeadlockTimeout / 2, 1));
-	if (LockTimeout == 0 || LockTimeout > Max(DeadlockTimeout / 2, 1))
+	if (quick)
 		(void) set_config_option("lock_timeout", quickly, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	barrier_lsn = lsn;
 	barrier_rows = rows;
@@ -542,11 +550,33 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	{
 		WsRootIO->capture(ctx, schema, root);
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		WsRows = rows;
+		if (quick && geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE)
+		{
+			ErrorData  *waited;
+
+			/*
+			 * (what it waited on kept, as the lock timeout's context names it: with every frame
+			 * around it, so none is added again)
+			 */
+			MemoryContextSwitchTo(cxt);
+			waited = CopyErrorData();
+			FlushErrorState();
+			error_context_stack = NULL;
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not serialize a commit from capture: it waited on another transaction"),
+					 errdetail("It waits for another transaction for at most %s ms, as the other may wait for it.",
+							   quickly),
+					 errhint("Try the commit again."),
+					 waited->context ? errcontext("%s", waited->context) : 0));
+		}
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	WsRows = rows;
 	AtEOXact_GUC(true, nest);
 
 	list_free(tables);

@@ -262,6 +262,7 @@ tests += {
       't/133_ws_move_shared_pages.pl',
       't/134_capture_barrier_slot_made.pl',
       't/135_chunk_lane_event_triggers.pl',
+      't/136_capture_barrier_lock_wait.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
