@@ -26,6 +26,7 @@ backend_sources += files(
   'chunkstore.c',
   'history_upgrade.c',
   'move.c',
+  'move_alter.c',
   'object_store.c',
   'registry.c',
 )

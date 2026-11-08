@@ -41,6 +41,7 @@ OBJS = \
 	chunkstore.o \
 	history_upgrade.o \
 	move.o \
+	move_alter.o \
 	object_store.o \
 	registry.o
 

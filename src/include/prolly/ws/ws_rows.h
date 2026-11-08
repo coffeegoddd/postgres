@@ -53,11 +53,15 @@ typedef struct WsRowsRoutine
 	 * The table's rows, which are from's, made to's, writing only the rows that differ: each of
 	 * from's taken away before any of to's is put in, so that one row can have what another had.
 	 * As restore writes them, no trigger, rule or domain's check runs, and the table's indexes are
-	 * kept.  A row from has and the table doesn't is an error.  How many rows were taken away and
-	 * put in, a keyed row changed being both.
+	 * kept.  A row from has and the table doesn't is an error.  The table is as s has it; from's
+	 * rows are in was's shape, which may differ from it by the columns other than its key, as a
+	 * table altered has them now: a row's fields where the table still has them, and null in
+	 * those it added.  A row the target has so is kept as it is.  How many rows were taken away
+	 * and put in, a keyed row changed being both, and kept.
 	 */
-	void		(*apply) (ProllyCtx *ctx, const char *schema, const WsTableSchema *s,
-						  const PHash *from, const PHash *to, uint64 *deleted, uint64 *inserted);
+	void		(*apply) (ProllyCtx *ctx, const char *schema, const WsTableSchema *was,
+						  const PHash *from, const WsTableSchema *s, const PHash *to,
+						  uint64 *deleted, uint64 *inserted, uint64 *kept);
 } WsRowsRoutine;
 
 extern PGDLLIMPORT const WsRowsRoutine DirectWsRows;

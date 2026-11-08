@@ -371,19 +371,12 @@ writer_close(RowsWriter *w)
 	pfree(w->table);
 }
 
-/* A row of the map in the writer's slot, its fields in w->f; how many of it a keyless row is. */
-static uint64
-writer_fill(RowsWriter *w, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
+/* Fields in the writer's slot, in its shape's order, read in the row's context. */
+static void
+writer_fill_fields(RowsWriter *w, const WsField *f)
 {
-	MemoryContext old;
-	uint64		count = 1;
-	Buf			held = BUF_INIT;	/* (the row's, as all else of it) */
+	MemoryContext old = MemoryContextSwitchTo(w->rowcxt);
 
-	MemoryContextReset(w->rowcxt);
-	old = MemoryContextSwitchTo(w->rowcxt);
-	ws_row_load(w->ctx, &w->shape, k, kl, v, vl, w->f, &held);
-	if (w->shape.nkey == 0)
-		count = ws_rows_keyless_count(k, kl, v, vl);
 	ExecClearTuple(w->slot);
 	memset(w->slot->tts_isnull, true, w->desc->natts * sizeof(bool));
 
@@ -392,9 +385,9 @@ writer_fill(RowsWriter *w, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 	PG_TRY();
 	{
 		for (int i = 0; i < w->shape.nstored; i++)
-			if (!w->f[i].null)
+			if (!f[i].null)
 			{
-				char	   *text = pnstrdup((const char *) w->f[i].p, w->f[i].len);
+				char	   *text = pnstrdup((const char *) f[i].p, f[i].len);
 				int			att = w->cols[i].attnum - 1;
 
 				w->slot->tts_values[att] = InputFunctionCall(&w->cols[i].input, ws_text_from_utf8(text),
@@ -409,6 +402,23 @@ writer_fill(RowsWriter *w, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
 	PG_END_TRY();
 	ExecStoreVirtualTuple(w->slot);
 	MemoryContextSwitchTo(old);
+}
+
+/* A row of the map in the writer's slot, its fields in w->f; how many of it a keyless row is. */
+static uint64
+writer_fill(RowsWriter *w, const uint8 *k, size_t kl, const uint8 *v, size_t vl)
+{
+	MemoryContext old;
+	uint64		count = 1;
+	Buf			held = BUF_INIT;	/* (the row's, as all else of it) */
+
+	MemoryContextReset(w->rowcxt);
+	old = MemoryContextSwitchTo(w->rowcxt);
+	ws_row_load(w->ctx, &w->shape, k, kl, v, vl, w->f, &held);
+	if (w->shape.nkey == 0)
+		count = ws_rows_keyless_count(k, kl, v, vl);
+	MemoryContextSwitchTo(old);
+	writer_fill_fields(w, w->f);
 	return count;
 }
 
@@ -518,9 +528,14 @@ doomed_cmp(const void *a, const void *b)
 typedef struct RowsApply
 {
 	RowsWriter *w;
+	const WsRowShape *was;		/* what from's rows are in, if not the table's now, or NULL */
+	int		   *was_at;			/* each of the table's fields' place in it, or -1: null now */
+	WsField    *was_f;
+	WsField    *now_f;
 	bool		inserting;
 	uint64		deleted;
 	uint64		inserted;
+	uint64		kept;
 	DoomedRow  *doomed;
 	int			ndoomed;
 	int			doomed_cap;
@@ -553,6 +568,42 @@ apply_diff(void *arg, const ProllyDiff *d)
 		has = d->to != NULL;
 	}
 
+	/*
+	 * (a row only the change of the table's definition rewrote is as the target has it already:
+	 * from's fields where the table now has them, and null in those it added)
+	 */
+	if (a->was != NULL && had == 1 && has == 1)
+	{
+		Buf			held_was = BUF_INIT;
+		Buf			held_to = BUF_INIT;
+		bool		same = true;
+
+		MemoryContextReset(w->rowcxt);
+		{
+			MemoryContext old = MemoryContextSwitchTo(w->rowcxt);
+
+			ws_row_load(w->ctx, a->was, d->key, d->klen, d->from, d->flen, a->was_f, &held_was);
+			ws_row_load(w->ctx, &w->shape, d->key, d->klen, d->to, d->tlen, w->f, &held_to);
+			MemoryContextSwitchTo(old);
+		}
+		for (int i = 0; i < w->shape.nstored; i++)
+		{
+			const WsField *now = a->was_at[i] >= 0 ? &a->was_f[a->was_at[i]] : NULL;
+
+			a->now_f[i] = now != NULL ? *now : (WsField) {.null = true};
+			if (same && (a->now_f[i].null != w->f[i].null ||
+						 (!w->f[i].null && (a->now_f[i].len != w->f[i].len ||
+											memcmp(a->now_f[i].p, w->f[i].p, w->f[i].len) != 0))))
+				same = false;
+		}
+		if (same)
+		{
+			if (!a->inserting)
+				a->kept++;
+			return;
+		}
+	}
+
 	if (a->inserting)
 	{
 		/* (a keyed row changed is put in again whole, as it was taken away) */
@@ -569,7 +620,23 @@ apply_diff(void *arg, const ProllyDiff *d)
 	}
 	if (had == 0 || (w->shape.nkey == 0 && had <= has))
 		return;
-	(void) writer_fill(w, d->key, d->klen, d->from, d->flen);
+	if (a->was != NULL)
+	{
+		Buf			held = BUF_INIT;
+
+		MemoryContextReset(w->rowcxt);
+		{
+			MemoryContext old = MemoryContextSwitchTo(w->rowcxt);
+
+			ws_row_load(w->ctx, a->was, d->key, d->klen, d->from, d->flen, a->was_f, &held);
+			MemoryContextSwitchTo(old);
+		}
+		for (int i = 0; i < w->shape.nstored; i++)
+			a->now_f[i] = a->was_at[i] >= 0 ? a->was_f[a->was_at[i]] : (WsField) {.null = true};
+		writer_fill_fields(w, a->now_f);
+	}
+	else
+		(void) writer_fill(w, d->key, d->klen, d->from, d->flen);
 	if (w->shape.nkey == 0)
 	{
 		StringInfoData bytes;
@@ -679,15 +746,17 @@ apply_keyless_deletes(RowsApply *a)
 }
 
 static void
-direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const PHash *from,
-			 const PHash *to, uint64 *deleted, uint64 *inserted)
+direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *was, const PHash *from,
+			 const WsTableSchema *s, const PHash *to, uint64 *deleted, uint64 *inserted, uint64 *kept)
 {
 	RowsWriter	w;
 	RowsApply	a = {&w};
 	int			level;
+	WsRowShape	was_shape;
 
 	*deleted = 0;
 	*inserted = 0;
+	*kept = 0;
 	if (!writer_open(&w, ctx, schema, s, true, "moving rows"))
 	{
 		uint64		count;
@@ -707,6 +776,24 @@ direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const P
 				 errmsg("table \"%s\" has no primary key, and its rows are keyed", w.table)));
 	a.found = table_slot_create(w.rel, NULL);
 
+	/* (from's rows in its own record's shape, which only a table with a key can differ from) */
+	ws_schema_row_shape(was, &was_shape);
+	if (was_shape.nstored != w.shape.nstored ||
+		memcmp(was_shape.tags, w.shape.tags, sizeof(uint64) * w.shape.nstored) != 0)
+	{
+		if (w.shape.nkey == 0 || was_shape.nkey != w.shape.nkey ||
+			memcmp(was_shape.tags, w.shape.tags, sizeof(uint64) * w.shape.nkey) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("rows of table \"%s\" can be moved from another layout only by the same key", w.table)));
+		a.was = &was_shape;
+		a.was_at = palloc_array(int, Max(w.shape.nstored, 1));
+		for (int i = 0; i < w.shape.nstored; i++)
+			a.was_at[i] = ws_row_shape_at(&was_shape, w.shape.tags[i]);
+		a.was_f = palloc_array(WsField, Max(was_shape.nstored, 1));
+		a.now_f = palloc_array(WsField, Max(w.shape.nstored, 1));
+	}
+
 	/* (every row taken away before any is put in, so that one can have what another had) */
 	level = WsSql->begin();
 	if (prolly_diff(ctx, from, to, apply_diff, &a) < 0)
@@ -723,6 +810,8 @@ direct_apply(ProllyCtx *ctx, const char *schema, const WsTableSchema *s, const P
 	writer_close(&w);
 	*deleted = a.deleted;
 	*inserted = a.inserted;
+	*kept = a.kept;
+	ws_row_shape_free(&was_shape);
 }
 
 const WsRowsRoutine DirectWsRows = {

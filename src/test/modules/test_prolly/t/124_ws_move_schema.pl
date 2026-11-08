@@ -190,9 +190,10 @@ my $log_at = -s $node->logfile;
 
 # Back to the first, whose enum lacks a value: another type, so it's made again with the table using it.
 my $stats = move_to($a, 'to the first');
-# (made: people as its enum lost values, pets, counted, gone, dom_t, comp, uses_empty, tick, kp and its
-# partition, and child_t; dropped: fresh and pp_high)
-like($stats, qr/ made 11 dropped 2$/, "what differs is made and dropped: $stats");
+# (made: people as its enum lost values, counted, gone, dom_t, comp, uses_empty, kp and its partition,
+# and child_t; dropped: fresh and pp_high; altered: pets and tick, each dropping a column, pets' rows
+# whose dropped column was all that differed left as they are)
+like($stats, qr/ made 9 dropped 2 altered 2 kept 2$/, "what differs is made, dropped and altered: $stats");
 isnt(oid_of('app.counted'), $counted, 'a table whose default used a function changed is made again');
 isnt(oid_of('app.people'), $people, 'and one whose enum is');
 isnt(oid_of('app.dom_t'), $dom_t, 'a table whose domain lost its check to a function changed is made again with it');
@@ -217,8 +218,9 @@ my $uses_empty = oid_of('app.uses_empty');
 my $pp = oid_of('app.pp');
 my $kp = oid_of('app.kp');
 $stats = move_to($b, 'to the second');
-# (made: pets, fresh, counted, dom_t, tick, kp and its partition, child_t and pp_high; dropped: gone)
-like($stats, qr/ made 9 dropped 1$/, "what differs is made and dropped: $stats");
+# (made: fresh, counted, dom_t, kp and its partition, child_t and pp_high; dropped: gone; altered: pets
+# and tick, each adding a column, every row of pets given a value in it)
+like($stats, qr/ made 7 dropped 1 altered 2 kept 0$/, "what differs is made, dropped and altered: $stats");
 is(oid_of('app.people'), $people, 'a table using an enum given values is kept, and only its rows written');
 is(sql(q{SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = 'app.mood'::regtype}),
 	'meh,sad,calm,happy,joy,ecstatic', 'with values added first, between and last');
@@ -233,7 +235,7 @@ unlike(slurp_file($node->logfile, $log_at), qr/user code ran/, 'and no trigger r
 
 # A move to where it is drops, makes and refreshes nothing.
 my $mv_file = sql(q{SELECT pg_relation_filenode('app.mv_a')});
-is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0', 'a move to where it is writes nothing');
+is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0 altered 0 kept 0', 'a move to where it is writes nothing');
 is(sql(q{SELECT pg_relation_filenode('app.mv_a')}), $mv_file, 'not even a materialized view');
 
 # Rolled back, a move that changes definitions leaves all as it was.
