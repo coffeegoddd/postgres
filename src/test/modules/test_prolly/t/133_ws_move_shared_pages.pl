@@ -4,7 +4,7 @@
 # relation's storage (tables, a TOAST table and its index, an index, a sequence, a materialized
 # view) is shared with a copy, as another branch's of the same commit would be, one through a root
 # captured of it; the schema is then moved, writing rows, altering a table in place, making one
-# again, dropping one, setting a sequence and refreshing a view.  With what the move let go of freed
+# again, dropping one, resetting a sequence and refreshing a view.  With what the move let go of freed
 # and written over, and each copy read from storage after a restart, and again after a crash in a
 # second move, each reads page for page and row for row what it did; a table the move didn't write
 # still shares every page with its copy, and one it wrote shares only those it didn't.
@@ -83,7 +83,7 @@ for my $name (sort keys %copy)
 	$pages{$name} = sql(qq{SELECT test_bmap_digest($copy{$name})});
 	$rows{$name} = sql(qq{SELECT test_bmap_rows_digest($copy{$name})}) if $heap{$name};
 }
-is(sql(q{SELECT count(*) FROM pg_toast.} . (split /\./, $rel{toast})[1]) > 0 ? 't' : 'f', 't', 'kept has values out of line');
+ok(sql(qq{SELECT count(*) FROM $rel{toast}}) > 0, 'kept has values out of line');
 
 # Each copy read from storage, not from its buffers.
 sub copies_as_they_were
@@ -117,7 +117,8 @@ is(sql(q{SELECT to_regclass('app.gone')}), '', 'gone: dropped');
 is(sql(q{SELECT last_value FROM app.s}), '10', 's: set to the first\'s');
 
 # What the move let go of freed, and written over by what comes after.
-sql(q{SELECT * FROM test_bmap_release_drain(0); SELECT * FROM test_bmap_sweep()});
+ok(sql(q{SELECT entries FROM test_bmap_release_drain(0)}) > 0, 'what the move let go of is drained');
+sql(q{SELECT * FROM test_bmap_sweep()});
 sql(q{CREATE TABLE public.filler AS SELECT g, repeat('f', 500) AS v FROM generate_series(1, 20000) g});
 copies_as_they_were('after the move');
 
