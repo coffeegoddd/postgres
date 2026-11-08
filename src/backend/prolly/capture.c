@@ -816,6 +816,7 @@ capture_slot_ready(const char *name)
 		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("capture's replication slot \"%s\" was invalidated, and is being made again", name)));
+		INJECTION_POINT("capture-slot-lost", NULL);
 		ReplicationSlotDrop(name, true);
 		exists = false;
 	}

@@ -259,6 +259,7 @@ tests += {
       't/130_ws_move_prototype_bugs.pl',
       't/131_ws_move_quiet.pl',
       't/132_ws_move_concurrent.pl',
+      't/134_capture_barrier_slot_made.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

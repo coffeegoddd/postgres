@@ -230,6 +230,59 @@ wake_worker(void)
 }
 
 /*
+ * Whether this database's capture has its slot, made and kept, and not lost: a slot being made
+ * reads every table under the lock what changes their rows untold takes turns on, and is kept once
+ * that's committed; one invalidated is dropped and made again.
+ */
+static bool
+slot_kept(void)
+{
+	char		name[NAMEDATALEN];
+	ReplicationSlot *slot;
+	bool		kept = false;
+
+	snprintf(name, NAMEDATALEN, CAPTURE_SLOT_PREFIX "%u", MyDatabaseId);
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	slot = SearchNamedReplicationSlot(name, false);
+	if (slot != NULL)
+	{
+		SpinLockAcquire(&slot->mutex);
+		kept = slot->data.persistency == RS_PERSISTENT && slot->data.invalidated == RS_INVAL_NONE;
+		SpinLockRelease(&slot->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+	return kept;
+}
+
+/*
+ * Waits for this database's capture to have its slot, since start; an error past timeout_ms.  (A
+ * marker is read only by a slot made before it, and a slot's making waits for the lock a barrier
+ * holds, which this is called without, and for every transaction with an ID to end: so one that has
+ * an ID, as a move's left out, can't wait for it, and it's a serialization failure.)
+ */
+static void
+slot_wait(TimestampTz start, int timeout_ms)
+{
+	while (!slot_kept())
+	{
+		if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("capture's slot was lost as a commit from capture held its tables"),
+					 errhint("Try the commit again once capture has made its slot again.")));
+		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_QUERY_CANCELED),
+					 errmsg("capture of database \"%s\" has no slot made in time", get_database_name(MyDatabaseId)),
+					 errhint("Capture makes its slot once the database has a versioned schema, with capture_to_trees on.")));
+		wake_worker();
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_CAPTURE_BARRIER);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
  * Every branch's changes are applied together, and the slot moves only once they're committed, so
  * the slot's position is how far capture has got for each; a branch's own position moves only when
  * it has changes, so it isn't.  A slot made again, as one invalidated is, reads every table whole
@@ -425,9 +478,19 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 		elog(ERROR, "could not read a barrier");
 	barrier_refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
 
+	/* (the slot first, holding no table, and the lock let go of again if it's gone once held) */
+	start = GetCurrentTimestamp();
+	slot_wait(start, timeout_ms);
 	tables = lock_schema_relations(nsp, true);
 	INJECTION_POINT("capture-barrier-locked", NULL);
-	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+	for (;;)
+	{
+		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+		if (slot_kept())
+			break;
+		UnlockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+		slot_wait(start, timeout_ms);
+	}
 	AcceptInvalidationMessages();
 	if (get_namespace_oid(schema, true) != nsp)
 		ereport(ERROR,
@@ -446,13 +509,19 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 	}
 	wake_worker();
 
-	start = GetCurrentTimestamp();
 	while (!barrier_saved(plan, lsn))
 	{
 		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("capture did not reach %X/%X in time", LSN_FORMAT_ARGS(lsn))));
+
+		/* (a slot made again, as one lost is, would wait for this lock to read the tables) */
+		if (!slot_kept() && !barrier_saved(plan, lsn))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("capture's slot was lost as a commit from capture waited for it"),
+					 errhint("Try the commit again once capture has made its slot again.")));
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 2, WAIT_EVENT_CAPTURE_BARRIER);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
@@ -508,6 +577,8 @@ CaptureBarrierLeavingOut(ProllyCtx *ctx, const char *schema, int timeout_ms, voi
 	Oid			nsp = get_namespace_oid(schema, false);
 	int32		branch = barrier_check(schema, nsp, true);
 
+	/* (before leaving out gives this transaction an ID, which a slot being made would wait for) */
+	slot_wait(GetCurrentTimestamp(), timeout_ms);
 	CaptureLeaveOut();
 	hold(arg);
 	barrier_take(ctx, schema, nsp, branch, timeout_ms, root, true);
