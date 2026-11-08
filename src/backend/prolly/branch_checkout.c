@@ -151,76 +151,59 @@ BranchCheckoutNote(int32 branch)
 /*
  * The catalog branch the session is on once its top transaction commits, and each function that set
  * it for itself has returned: catalog_branch's stack of what each level set, folded as each level's
- * end does, from the innermost out.
+ * end does.  Each entry ends merged into the one under it, if any, before that one's level ends, so
+ * it's one walk from the innermost out, what each passes to the one under carried.  (Nothing
+ * allocated, as it's at commit too.)
  */
-typedef struct LevelSet
-{
-	int			level;
-	GucStackState state;
-	int32		prior;
-	int32		masked;
-} LevelSet;
-
 static int32
 branch_after_commit(void)
 {
 	struct config_generic *conf = find_option("catalog_branch", false, true, ERROR);
 	int32		branch = catalog_branch;
-	LevelSet   *sets;
-	int			n = 0,
-				top = 0;
+	bool		carried = false;
+	GucStackState carried_state = GUC_SET;
+	int32		carried_masked = 0;
 
-	if (conf == NULL || conf->stack == NULL)
+	if (conf == NULL)
 		return branch;
 	for (GucStack *st = conf->stack; st != NULL; st = st->prev)
-		n++;
-	sets = palloc(sizeof(LevelSet) * n);
-	n = 0;
-	for (GucStack *st = conf->stack; st != NULL; st = st->prev)
-		sets[n++] = (LevelSet) {st->nest_level, st->state, st->prior.val.intval,
-			st->state == GUC_SET_LOCAL ? st->masked.val.intval : 0};
-
-	for (int level = sets[0].level; level >= 1; level--)
 	{
-		while (top < n && sets[top].level >= level)
-		{
-			LevelSet   *at = &sets[top];
-			LevelSet   *under = top + 1 < n ? &sets[top + 1] : NULL;
+		GucStackState state = carried ? carried_state : st->state;
+		int32		masked = carried && carried_state == GUC_SET_LOCAL ? carried_masked :
+			st->state == GUC_SET_LOCAL ? st->masked.val.intval : 0;
 
-			if (at->state == GUC_SAVE)
-				branch = at->prior;
-			else if (at->level == 1)
+		carried = false;
+		if (state == GUC_SAVE)
+			branch = st->prior.val.intval;
+		else if (st->prev == NULL)
+		{
+			/* (the last, at the top level's end) */
+			if (state == GUC_SET_LOCAL)
+				branch = masked;
+			else if (state == GUC_LOCAL)
+				branch = st->prior.val.intval;
+		}
+		else if (state == GUC_SET)
+		{
+			carried = true;
+			carried_state = GUC_SET;
+		}
+		else if (state == GUC_LOCAL)
+		{
+			if (st->prev->state == GUC_SET)
 			{
-				if (at->state == GUC_SET_LOCAL)
-					branch = at->masked;
-				else if (at->state == GUC_LOCAL)
-					branch = at->prior;
+				carried = true;
+				carried_state = GUC_SET_LOCAL;
+				carried_masked = st->prior.val.intval;
 			}
-			else if (under == NULL || under->level < at->level - 1)
-			{
-				/* (what it set is the level under's now) */
-				at->level--;
-				break;
-			}
-			else if (at->state == GUC_SET)
-				under->state = GUC_SET;
-			else if (at->state == GUC_LOCAL)
-			{
-				if (under->state == GUC_SET)
-				{
-					under->masked = at->prior;
-					under->state = GUC_SET_LOCAL;
-				}
-			}
-			else
-			{
-				under->masked = at->masked;
-				under->state = GUC_SET_LOCAL;
-			}
-			top++;
+		}
+		else
+		{
+			carried = true;
+			carried_state = GUC_SET_LOCAL;
+			carried_masked = masked;
 		}
 	}
-	pfree(sets);
 	return branch;
 }
 
