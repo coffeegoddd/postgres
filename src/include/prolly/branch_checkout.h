@@ -57,6 +57,12 @@ typedef struct BranchCheckoutRoutine
 	 * for a change that takes the branch from them.
 	 */
 	bool		(*in_use) (int32 branch);
+
+	/*
+	 * Whether this session is on a catalog branch, or is to be on it once
+	 * its transaction ends (a function that set another only for itself).
+	 */
+	bool		(*mine) (int32 branch);
 } BranchCheckoutRoutine;
 
 extern PGDLLIMPORT const BranchCheckoutRoutine SessionBranchCheckout;

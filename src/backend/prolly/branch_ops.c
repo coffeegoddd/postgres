@@ -94,6 +94,8 @@ typedef struct Holding
 	int			user_timeout;	/* the session's own lock_timeout, or 0 */
 } Holding;
 
+static void lock_making(const char *name);
+
 /* (each index of a relation, as the catalogs have them now) */
 static List *
 indexes_of(Relation pg_index, Oid relid, List *rels)
@@ -583,6 +585,8 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a branch made at a commit can't take another's changes")));
 	name_check(name);
+	/* (none other of the name made, renamed to it, or given a working set meanwhile) */
+	lock_making(name);
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
 	if (!vc_branch_get(&repo, from, &head))
 		ereport(ERROR,
@@ -633,12 +637,27 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *c
 	return branch;
 }
 
+static Oid
+making_key(const char *name)
+{
+	return (Oid) hash_bytes((const unsigned char *) name, strlen(name));
+}
+
 /* (one name's making taken a turn at, as two making one branch at once are to make one) */
 static void
 lock_making(const char *name)
 {
-	LockDatabaseObject(DatabaseRelationId, (Oid) hash_bytes((const unsigned char *) name, strlen(name)), 4,
-					   ExclusiveLock);
+	LockDatabaseObject(DatabaseRelationId, making_key(name), 4, ExclusiveLock);
+}
+
+/* Two names' makings, in the order of their locks, so two takers of both wait rather than deadlock. */
+static void
+lock_making_two(const char *a, const char *b)
+{
+	bool		a_first = making_key(a) <= making_key(b);
+
+	lock_making(a_first ? a : b);
+	lock_making(a_first ? b : a);
 }
 
 static int32
@@ -764,7 +783,7 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 	branch = BranchLink->branch_of(name);
 	if (branch == 0)
 		return;
-	if (branch == catalog_branch || BranchCheckout->in_use(branch))
+	if (BranchCheckout->mine(branch) || BranchCheckout->in_use(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out", name)));
@@ -788,7 +807,7 @@ not_main(const char *name, const char *what)
 static void
 others_check(const char *name, int32 branch, bool force)
 {
-	if (!force && branch != 0 && branch != catalog_branch && BranchCheckout->in_use(branch))
+	if (!force && branch != 0 && BranchCheckout->in_use(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out in another session", name),
@@ -806,8 +825,11 @@ merged(VcRepo *repo, const VcBranch *b)
 	VcBranch	into;
 	PHash		base;
 	bool		is;
+	bool		found = vc_branch_get(repo, on != NULL ? on : "main", &into);
 
-	if (!vc_branch_get(repo, on != NULL ? on : "main", &into) && !vc_branch_get(repo, "main", &into))
+	if (on != NULL)
+		pfree(on);
+	if (!found)
 		return false;
 	is = phash_eq(&into.head, &b->head) ||
 		(vc_merge_base_in(repo, &b->head, &into.head, 0, &base) == 1 && phash_eq(&base, &b->head));
@@ -823,28 +845,49 @@ remove_locked(ProllyCtx *ctx, VcRepo *repo, const char *name, bool force, int ti
 	int32		branch = BranchLink->branch_of(name);
 
 	not_main(name, "deleted");
-	if (!vc_branch_get(repo, name, &b))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("branch \"%s\" not found", name)));
-	if (branch != 0 && branch == catalog_branch)
+	if (branch != 0 && BranchCheckout->mine(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out in this session", name),
 				 errhint("Check out another first.")));
 	others_check(name, branch, force);
+
+	/*
+	 * (its head as it is, nothing committing on it meanwhile: one with a working set has capture's
+	 * commits held off, and is locked once its writers are, as a transaction that has written
+	 * nothing is what holds them off; one without, at once)
+	 */
+	if (branch != 0)
+		LockBranchHead(branch);
+	if (!(branch != 0 ? vc_branch_get(repo, name, &b) : vc_branch_lock(repo, name, &b)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch \"%s\" not found", name)));
 	if (!force && !merged(repo, &b))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" is not fully merged", name),
 				 errhint("Use force to delete it anyway.")));
-	vc_branch_free(&b);
 
 	/* (its working set given back, changes and all, as its head goes) */
 	if (branch != 0)
+	{
+		VcBranch	now;
+		bool		moved;
+
 		give_back(ctx, repo, name, branch, false, timeout_ms);
+		moved = !vc_branch_lock(repo, name, &now) || !phash_eq(&now.head, &b.head);
+		if (!moved)
+			vc_branch_free(&now);
+		if (moved)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("branch \"%s\" moved as it was being deleted", name),
+					 errhint("Try again.")));
+	}
 	else
 		default_check(name);
+	vc_branch_free(&b);
 	if (vc_branch_delete(repo, name) != VC_OK)
 		elog(ERROR, "could not delete branch \"%s\" of version control", name);
 }
@@ -878,17 +921,24 @@ shared_rename(ProllyCtx *ctx, const char *name, const char *to, bool force, int 
 				 errmsg("branch \"%s\" is already named so", name)));
 	not_main(to, "replaced");
 
-	/* (both names' makings held, in one order, so none is made, given or given back meanwhile) */
-	lock_making(strcmp(name, to) < 0 ? name : to);
-	lock_making(strcmp(name, to) < 0 ? to : name);
+	/* (both names' makings held, so neither is made, given a working set or given it back meanwhile) */
+	lock_making_two(name, to);
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	branch = BranchLink->branch_of(name);
+	others_check(name, branch, force);
+
+	/*
+	 * (its commits waited out, as one in flight would commit on the name it read, and then held;
+	 * its reference locked as it's renamed, after the forced delete's barrier, which is to be in a
+	 * transaction that has written nothing)
+	 */
+	if (branch != 0)
+		LockBranchHead(branch);
 	if (!vc_branch_get(&repo, name, &b))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch \"%s\" not found", name)));
 	vc_branch_free(&b);
-	branch = BranchLink->branch_of(name);
-	others_check(name, branch, force);
 
 	/* (one with the new name already replaced, forced: deleted as a forced delete is) */
 	if (vc_branch_get(&repo, to, &b))
@@ -901,13 +951,16 @@ shared_rename(ProllyCtx *ctx, const char *name, const char *to, bool force, int 
 					 errhint("Use force to replace it.")));
 		remove_locked(ctx, &repo, to, true, timeout_ms);
 	}
-
-	/* (its commits waited out, as one in flight would commit on the name it read) */
-	if (branch != 0)
-		LockBranchHead(branch);
 	default_check(name);
 	if (vc_branch_rename(&repo, name, to) != VC_OK)
+	{
+		/* (deleted meanwhile by what didn't take its making's lock) */
+		if (!vc_branch_get(&repo, name, &b))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch \"%s\" not found", name)));
 		elog(ERROR, "could not rename branch \"%s\" of version control", name);
+	}
 	if (branch != 0)
 	{
 		(void) BranchLink->unlink(name);

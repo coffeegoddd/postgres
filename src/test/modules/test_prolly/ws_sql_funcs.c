@@ -1105,6 +1105,12 @@ test_branch_commit(PG_FUNCTION_ARGS)
 				 errmsg("branch \"%s\" is linked to no catalog branch", name)));
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	LockBranchHead(branch);
+	/* (renamed or deleted as it waited: it would commit on a name no longer the branch's) */
+	if (BranchLink->branch_of(name) != branch)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("branch \"%s\" changed as it was being committed", name),
+				 errhint("Try again.")));
 	CaptureBranchBarrier(&ctx, branch, 60000, &root);
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
 	if (vc_branch_get(&repo, name, &found))

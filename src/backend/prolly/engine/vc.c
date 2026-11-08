@@ -1098,6 +1098,12 @@ vc_branch_get(VcRepo *r, const char *name, VcBranch *out)
 	return branch_read(r, name, VC_REF_READ, out);
 }
 
+bool
+vc_branch_lock(VcRepo *r, const char *name, VcBranch *out)
+{
+	return branch_read(r, name, VC_REF_UPDATE, out);
+}
+
 void
 vc_branch_free(VcBranch *b)
 {

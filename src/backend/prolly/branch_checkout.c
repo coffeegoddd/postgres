@@ -319,11 +319,21 @@ session_in_use(int32 branch)
 	return false;
 }
 
+static bool
+session_mine(int32 branch)
+{
+	CheckoutSlot *mine = my_slot();
+
+	return branch == catalog_branch || branch == branch_after_commit() ||
+		(mine != NULL && pg_atomic_read_u32(&mine->base) == (uint32) branch);
+}
+
 const BranchCheckoutRoutine SessionBranchCheckout = {
 	.name = "session",
 	.checkout = session_checkout,
 	.current = session_current,
 	.in_use = session_in_use,
+	.mine = session_mine,
 };
 
 const BranchCheckoutRoutine *BranchCheckout = &SessionBranchCheckout;

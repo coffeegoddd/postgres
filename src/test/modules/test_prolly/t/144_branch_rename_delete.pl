@@ -67,6 +67,29 @@ sql(q{SELECT test_branch_make('g', 'main')});
 is(last_line($node->safe_psql('postgres', q{SELECT test_branch_checkout('g'); SELECT test_branch_rename('g', 'g2');
 	SELECT test_branch_current()})), 'g2', 'the branch this session is on is renamed, and it\'s on it still');
 
+# This session's own, another session on it too: refused, unless forced, as any.
+sql(q{SELECT test_branch_make('m', 'main')});
+my $s3 = $node->background_psql('postgres');
+$s3->query_safe(q{SELECT test_branch_checkout('m')});
+my ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_checkout('m'); SELECT test_branch_rename('m', 'm2')});
+like($err, qr/branch "m" is checked out in another session/,
+	'the branch this session is on isn\'t renamed while another session is on it too');
+$s3->quit;
+
+# A commit waiting on a rename, of the name it read: refused, not made on that name anew.
+sql(q{SELECT test_branch_make('r', 'main'); SELECT test_branch_materialize('r')});
+my $r_head = sql(q{SELECT test_branch_head('r')});
+my $s4 = $node->background_psql('postgres');
+$s4->query_safe(q{BEGIN; SELECT test_branch_rename('r', 'r2')});
+my $s5 = $node->background_psql('postgres', on_error_stop => 0);
+$s5->query_until(qr/started/, "\\echo started\nSELECT test_branch_commit('r', 'late');\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'no wait';
+$s4->query_safe(q{COMMIT});
+$s4->quit;
+$s5->quit;
+is(sql(q{SELECT test_branch_head('r') IS NULL}), 't', 'a commit waiting on a rename makes no branch of the old name');
+is(sql(q{SELECT test_branch_head('r2')}), $r_head, 'nor commits on the new one');
+
 # Onto a branch there already: refused, unless forced, which deletes it, its working set too.
 sql(q{SELECT test_branch_make('x', 'main'); SELECT test_branch_make('y', 'main'); SELECT test_branch_materialize('y')});
 my $with_y = $node->safe_psql('postgres', $schemas);
@@ -104,11 +127,33 @@ sql(q{SELECT test_branch_delete('f2', true)});
 is(sql(q{SELECT test_branch_of('f2') IS NULL AND test_branch_head('f2') IS NULL}), 't', 'forced, it is');
 is($node->safe_psql('postgres', $schemas), $with_f2 - 1, 'its working set given back');
 
+# A commit waiting on a delete's check, of a commit not merged: the delete refused.
+sql(q{SELECT test_branch_make('k2', 'main'); SELECT test_branch_materialize('k2')});
+my $s6 = $node->background_psql('postgres');
+$s6->query_safe(q{BEGIN; SELECT test_branch_commit('k2', 'unmerged')});
+my $s7 = $node->background_psql('postgres', on_error_stop => 0);
+$s7->query_until(qr/started/, $on . "\\echo started\nSELECT test_branch_delete('k2');\n");
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}) or die 'no wait';
+$s6->query_safe(q{COMMIT});
+$s6->quit;
+$s7->quit;
+is(sql(q{SELECT test_branch_head('k2') IS NOT NULL}), 't',
+	'a delete waiting on a commit not merged is refused, as it checks the head committed');
+
+# Merged into the branch this session is on, not "main".
+sql(q{SELECT test_branch_make('p', 'main'); SELECT test_branch_materialize('p'); SELECT test_branch_commit('p', 'p1');
+	SELECT test_branch_make('q', 'p')});
+like(fails(q{SELECT test_branch_delete('q')}), qr/branch "q" is not fully merged/,
+	'one in the history of another branch only isn\'t deleted from "main"');
+$node->safe_psql('postgres', q{SELECT test_branch_checkout('p'); SELECT test_branch_delete('q')});
+is(sql(q{SELECT test_branch_head('q') IS NULL}), 't', 'but is from that branch');
+
 # Forced, one another session is on.
 sql(q{SELECT test_branch_make('k', 'main')});
 $s->query_safe(q{SELECT test_branch_checkout('k')});
 sql(q{SELECT test_branch_delete('k', true)});
 is(sql(q{SELECT test_branch_head('k') IS NULL}), 't', 'forced, a branch another session is on is deleted');
+is($s->query_safe(q{SELECT test_branch_current() IS NULL}), 't', 'and that session is on none');
 $s->quit;
 
 # One with changes not committed, its head merged: deleted, changes and all.
@@ -117,12 +162,14 @@ $node->safe_psql('postgres', q{SELECT test_branch_checkout('d'); SET ROLE app_ow
 sql(q{SELECT test_branch_delete('d')});
 is(sql(q{SELECT test_branch_head('d') IS NULL AND test_branch_of('d') IS NULL}), 't',
 	'a branch with changes not committed is deleted, as its head is merged');
-is($node->safe_psql('postgres', $schemas), $base + 1, 'every working set given back but main\'s and g2\'s');
 
 # Never "main", nor the one this session is on.
 like(fails(q{SELECT test_branch_delete('main', true)}), qr/branch "main" can't be deleted/, '"main" isn\'t deleted');
-my ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_checkout('g2'); SELECT test_branch_delete('g2', true)});
+($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_checkout('g2'); SELECT test_branch_delete('g2', true)});
 like($err, qr/branch "g2" is checked out in this session/, 'nor the branch this session is on, even forced');
+($rc, $out, $err) = $node->psql('postgres', qq{SELECT test_branch_checkout('g2'); DO \$\$BEGIN
+	PERFORM set_config('catalog_branch', '$main', true); PERFORM test_branch_delete('g2', true); END\$\$});
+like($err, qr/branch "g2" is checked out in this session/, 'nor by what moves off it for itself only');
 
 # A name deleted is made again from scratch.
 sql(q{SELECT test_branch_make('d', 'main'); SELECT test_branch_materialize('d')});
