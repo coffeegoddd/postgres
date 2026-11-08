@@ -77,6 +77,7 @@ PG_FUNCTION_INFO_V1(test_branch_commit);
 PG_FUNCTION_INFO_V1(test_dbroot_schemas);
 PG_FUNCTION_INFO_V1(test_branch_unlink);
 PG_FUNCTION_INFO_V1(test_branch_create);
+PG_FUNCTION_INFO_V1(test_branch_head);
 PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
@@ -1140,16 +1141,45 @@ test_branch_unlink(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(BranchLink->unlink(text_to_cstring(PG_GETARG_TEXT_PP(0))));
 }
 
-/* test_branch_create(name text, from text, timeout_ms integer) returns integer: the catalog branch made */
+/* test_branch_head(name text) returns text: its head commit of version control, or NULL */
+Datum
+test_branch_head(PG_FUNCTION_ARGS)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	VcRepo		repo;
+	VcBranch	b;
+	text	   *out = NULL;
+
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	if (vc_branch_get(&repo, text_to_cstring(PG_GETARG_TEXT_PP(0)), &b))
+	{
+		out = hash_text(&b.head);
+		vc_branch_free(&b);
+	}
+	vc_repo_free(&repo);
+	if (out == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(out);
+}
+
+/*
+ * test_branch_create(name text, from text, commit text, take_changes boolean, timeout_ms integer) returns
+ * integer: the catalog branch made, at commit or (NULL) from's head
+ */
 Datum
 test_branch_create(PG_FUNCTION_ARGS)
 {
 	ProllyCtx	ctx;
+	PHash		commit;
 	int32		branch;
 
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(3) || PG_ARGISNULL(4))
+		elog(ERROR, "only the commit may be NULL");
+	if (!PG_ARGISNULL(2))
+		commit = text_hash(PG_GETARG_TEXT_PP(2));
 	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
 	branch = BranchOps->create(&ctx, text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1)),
-							   PG_GETARG_INT32(2));
+							   PG_ARGISNULL(2) ? NULL : &commit, PG_GETARG_BOOL(3), PG_GETARG_INT32(4));
 	prolly_ctx_free(&ctx);
 	PG_RETURN_INT32(branch);
 }

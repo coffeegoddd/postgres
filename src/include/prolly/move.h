@@ -76,6 +76,14 @@ typedef struct WsMoveRoutine
 	void		(*prepare) (ProllyCtx *ctx, const char *schema, const PHash *to);
 	void		(*move) (ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms,
 						 WsMoveStats *stats);
+
+	/*
+	 * As move, of a schema whose tables hold from, in a transaction left out of capture that holds
+	 * off their writers already, and with capture told nothing: the caller tells it each table's
+	 * rows are the target's (CaptureRowsAre), once all it writes in the transaction is written.
+	 */
+	void		(*move_from) (ProllyCtx *ctx, const char *schema, const PHash *from, const PHash *to,
+							  WsMoveStats *stats);
 } WsMoveRoutine;
 
 extern PGDLLIMPORT const WsMoveRoutine InPlaceWsMove;

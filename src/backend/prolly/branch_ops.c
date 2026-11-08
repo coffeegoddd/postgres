@@ -10,16 +10,22 @@
  * transaction is left out of capture, as taking one gives it an id.  Every
  * tuple on the parent's pages is then of a transaction that has committed or
  * aborted, so the new branch, sharing them, shows exactly what the parent had
- * committed then, and the barrier's root is that too: each table's row map as
- * of the marker is the new table's, which capture is told (CaptureRowsAre).
- * Catalog changes in the database wait until the transaction ends, as they do
- * for any commit from capture that's left out.
+ * committed then, and the barrier's root is that too: the parent's working
+ * set.  Catalog changes in the database wait until the transaction ends, as
+ * they do for any commit from capture that's left out.
  *
  * The catalog rows are copied (prolly/branch_catalog.h), each relation's
  * storage sharing its source's copy-on-write, but a sequence's, whose page is
- * copied; the branch of version control is made at the parent's head, and
- * linked to the catalog branch.  All in the caller's transaction: an abort
- * leaves none of it, the shared storage dropped as any made in it is.
+ * copied.  The new branch's tables then hold the parent's working set, and
+ * what differs from what it's to hold is written on it as a move writes it
+ * (prolly/move.h): a commit's rows, or the head's, leaving the parent's
+ * changes on the parent; or with its changes taken, nothing, and the parent
+ * is moved back to its head.  A schema the target lacks is dropped, and one it
+ * has that isn't there is restored.  Capture is told each table's rows, as the
+ * target has them, once all that's written is.  The branch of version control
+ * is made at its commit, and linked to the catalog branch.  All in the
+ * caller's transaction: an abort leaves none of it, the shared storage dropped
+ * as any made in it is.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -45,10 +51,14 @@
 #include "prolly/chunkstore.h"
 #include "prolly/engine/vc.h"
 #include "prolly/engine/vc_refs.h"
+#include "prolly/move.h"
 #include "prolly/ws/ws_dbroot.h"
+#include "prolly/ws/ws_restore.h"
 #include "prolly/ws/ws_root.h"
 #include "prolly/ws/ws_schema.h"
+#include "prolly/ws/ws_sql.h"
 #include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -100,12 +110,11 @@ lock_writers_out(void *arg)
 typedef struct Told
 {
 	ProllyCtx  *ctx;
-	int32		branch;
-	Oid			nsp;			/* the schema being told of, on the new branch */
+	Oid			nsp;			/* the schema being told of */
 	const char *schema;
 } Told;
 
-/* (a table's map told as the new one's rows; a partitioned table holds none of its own) */
+/* (a table's map told as its rows; a partitioned table holds none of its own) */
 static bool
 tell_table(void *arg, const char *name, const VcTable *entry)
 {
@@ -115,7 +124,7 @@ tell_table(void *arg, const char *name, const VcTable *entry)
 	Relation	rel;
 
 	if (!OidIsValid(relid))
-		elog(ERROR, "table \"%s\" of schema \"%s\" wasn't copied", table, t->schema);
+		elog(ERROR, "table \"%s\" of schema \"%s\" isn't there", table, t->schema);
 	rel = relation_open(relid, NoLock);
 	if (rel->rd_rel->relkind == RELKIND_RELATION)
 		CaptureRowsAre(rel, &entry->data);
@@ -137,8 +146,80 @@ tell_schema(void *arg, const char *name, const PHash *root)
 	return true;
 }
 
+typedef struct Moving
+{
+	ProllyCtx  *ctx;
+	const PHash *other;			/* the branch root the other side is */
+	bool		to;				/* walking the target's schemas, not the source's */
+} Moving;
+
+static void
+run_statement(const char *sql)
+{
+	WsSqlRows	rows;
+	int			level = WsSql->begin();
+
+	WsSql->run(sql, 0, NULL, &rows);
+	ws_sql_rows_free(&rows);
+	WsSql->end(level);
+}
+
+/* (a schema the target lacks, dropped with all in it; or one it has, moved to it, or made) */
+static bool
+move_schema(void *arg, const char *name, const PHash *root)
+{
+	Moving	   *m = arg;
+	char	   *schema = ws_name_from_utf8(name);
+	PHash		other;
+	bool		has = WsDbRoot->get_schema(m->ctx, m->other, name, &other);
+
+	if (!m->to)
+	{
+		if (!has)
+			run_statement(psprintf("DROP SCHEMA %s CASCADE", quote_identifier(schema)));
+	}
+	else if (has)
+	{
+		WsMoveStats stats;
+
+		WsMove->move_from(m->ctx, schema, &other, root, &stats);
+	}
+	else
+	{
+		run_statement(psprintf("CREATE SCHEMA %s VERSIONED", quote_identifier(schema)));
+		WsRootIO->restore(m->ctx, root, NULL, schema);
+	}
+	pfree(schema);
+	return true;
+}
+
+/*
+ * A branch whose working set holds from made to hold to, in a transaction left out of capture
+ * that holds off its writers, and capture told each of its tables' rows, as to has them.
+ */
+static void
+move_branch(ProllyCtx *ctx, int32 branch, const PHash *from, const PHash *to)
+{
+	int			level = CatalogBranchEnter(branch);
+	Moving		m = {ctx, to, false};
+	Told		told = {ctx};
+
+	if (!phash_eq(from, to))
+	{
+		WsDbRoot->schemas(ctx, from, move_schema, &m);
+		CommandCounterIncrement();
+		m.other = from;
+		m.to = true;
+		WsDbRoot->schemas(ctx, to, move_schema, &m);
+		CommandCounterIncrement();
+	}
+	WsDbRoot->schemas(ctx, to, tell_schema, &told);
+	CatalogBranchLeave(level);
+}
+
 static int32
-shared_create(ProllyCtx *ctx, const char *name, const char *from, int timeout_ms)
+shared_create(ProllyCtx *ctx, const char *name, const char *from, const PHash *commit,
+			  bool take_changes, int timeout_ms)
 {
 	ChunkStore *cs = ChunkStoreOpen("pages");
 	int32		parent = BranchLink->branch_of(from);
@@ -146,10 +227,15 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, int timeout_ms
 	VcRepo		repo;
 	VcBranch	head;
 	VcBranch	taken;
+	VcCommit	at;
+	PHash		at_commit;
 	PHash		root;
-	int			level;
-	Told		told;
+	PHash		target;
 
+	if (commit != NULL && take_changes)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a branch made at a commit can't take another's changes")));
 	if (parent == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -168,28 +254,38 @@ shared_create(ProllyCtx *ctx, const char *name, const char *from, int timeout_ms
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch \"%s\" has no commit", from)));
 
+	/* (where it's made: the commit, which the repository has, or from's head) */
+	at_commit = commit != NULL ? *commit : head.head;
+	if (!vc_commit_load(ctx, &at_commit, &at))
+	{
+		char		hex[PHASH_HEX_LEN + 1];
+
+		phash_hex(&at_commit, hex);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("commit %s not found", hex)));
+	}
+
 	/* (the parent at one point, its writers held off until this transaction ends) */
 	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &parent, &root);
-	if (!phash_eq(&root, &head.head_root))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("branch \"%s\" has changes not committed", from),
-				 errdetail("A branch is made only from one whose working set is its head.")));
+	target = take_changes ? root : at.root;
 
 	branch = BranchIds->allocate();
 	BranchCatalogCopy->copy(parent, branch, true);
 	CommandCounterIncrement();
 
-	/* (each table's rows, as capture is to have them, are the parent's as of the marker) */
-	level = CatalogBranchEnter(branch);
-	told.ctx = ctx;
-	told.branch = branch;
-	WsDbRoot->schemas(ctx, &root, tell_schema, &told);
-	CatalogBranchLeave(level);
+	/*
+	 * (its tables hold the parent's working set, the root: what differs from what it's to hold
+	 * written; and with its changes taken, the parent's written back to its head)
+	 */
+	move_branch(ctx, branch, &root, &target);
+	if (take_changes)
+		move_branch(ctx, parent, &root, &head.head_root);
 
-	if (vc_branch_create(&repo, name, &head.head) != 0)
+	if (vc_branch_create(&repo, name, &at_commit) != 0)
 		elog(ERROR, "could not make branch \"%s\" of version control", name);
 	BranchLink->link(name, branch);
+	vc_commit_release(&at);
 	vc_branch_free(&head);
 	vc_repo_free(&repo);
 	return branch;

@@ -4,9 +4,9 @@
 # materialized view sharing every page of its parent's, its sequences where the parent's were.  It
 # holds the parent's root, and capture has it from there.  Each branch then writes its own rows, and
 # neither sees the other's; every index stays right on both, and each heap.  A writer open on the
-# parent is waited out, and the branch is made as of after it, whether it commits or aborts.  A branch
-# made from one with changes not committed, from one not there, or under a name taken, is refused; one
-# made in a transaction rolled back is not there, and one committed outlasts a crash.
+# parent is waited out, and the branch is made after it, at the head, whether it commits or aborts.  A
+# branch made from one not there, or under a name taken, is refused; one made in a transaction rolled
+# back is not there, and one committed outlasts a crash.
 
 use strict;
 use warnings FATAL => 'all';
@@ -111,36 +111,22 @@ for my $case (['COMMIT', 5000], ['ROLLBACK', 5001])
 	pass("a branch waits for a writer open on its parent ($ending)");
 	$writer->query_safe($ending);
 	$writer->quit;
-	if ($ending eq 'COMMIT')
-	{
-		# (committed after the head, it's a change not committed: refused)
-		$maker->query_until(qr/made/, '');
-		like($maker->{stderr}, qr/branch "main" has changes not committed/,
-			'one that commits leaves the parent with changes, and the branch is refused');
-		$maker->quit;
-		sql($main, q{SELECT test_branch_commit('main', 'c3')});
-		my $made = sql($main, qq{SELECT test_branch_create('$name', 'main')});
-		is(sql($made, qq{SELECT v FROM app.t WHERE id = $id}), 'open', 'made again, it has the writer\'s row');
-	}
-	else
-	{
-		my $out = $maker->query_until(qr/made/, '');
-		is($maker->{stderr}, '', 'one that rolls back: the branch is made');
-		$maker->quit;
-		my ($made) = $out =~ /^(\d+)$/m;
-		is(sql($made, qq{SELECT count(*) FROM app.t WHERE id = $id}), '0', 'without the writer\'s row');
-	}
+	my $out = $maker->query_until(qr/made/, '');
+	is($maker->{stderr}, '', "and is made once it ends ($ending)");
+	$maker->quit;
+	my ($made) = $out =~ /^(\d+)$/m;
+	is(sql($made, qq{SELECT count(*) FROM app.t WHERE id = $id}), '0',
+		"without the writer's row, at the head ($ending)");
+	is(sql($main, qq{SELECT count(*) FROM app.t WHERE id = $id}), $ending eq 'COMMIT' ? '1' : '0',
+		"which the parent has if it committed ($ending)");
 }
 
 # Refused.
-sql($main, q{INSERT INTO app.t VALUES (6000, 'dirty', NULL)});
-my ($rc, $out, $err) = $node->psql('postgres', on($main) . q{SELECT test_branch_create('dirty', 'main')});
-like($err, qr/branch "main" has changes not committed/, 'a branch from one with changes not committed is refused');
+my ($rc, $out, $err);
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_create('x', 'nowhere')});
-like($err, qr/branch "nowhere" not found/, 'and from one not there');
+like($err, qr/branch "nowhere" not found/, 'a branch from one not there is refused');
 ($rc, $out, $err) = $node->psql('postgres', q{SELECT test_branch_create('feature', 'main')});
 like($err, qr/a branch named "feature" already exists/, 'and under a name taken');
-sql($main, q{DELETE FROM app.t WHERE id = 6000});
 
 # Rolled back: not there.
 my $before = $node->safe_psql('postgres', q{SELECT count(*) FROM pg_namespace WHERE nspname = 'app'});
