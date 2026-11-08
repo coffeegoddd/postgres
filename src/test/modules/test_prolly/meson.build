@@ -252,6 +252,7 @@ tests += {
       't/123_ws_move_rows.pl',
       't/124_ws_move_schema.pl',
       't/125_ws_move_alter.pl',
+      't/126_ws_move_violations.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
