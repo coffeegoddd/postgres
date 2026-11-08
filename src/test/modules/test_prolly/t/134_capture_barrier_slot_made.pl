@@ -34,6 +34,38 @@ sub waiting_barrier
 		qq{SELECT count(*) = 1 FROM pg_stat_activity WHERE query LIKE '$like' AND wait_event = 'CaptureBarrier'});
 }
 
+# The slot lost: the worker, idle, stopped, and more WAL written than the slot may keep, so a
+# checkpoint invalidates it once the worker, let go, ends; the next worker is held before it drops
+# the slot lost, and again as it makes it anew.
+my $filled = 0;
+sub lose_slot
+{
+	my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
+	$node->poll_query_until('postgres', qq{SELECT wait_event = 'CaptureWorkerMain' FROM pg_stat_activity WHERE pid = $worker})
+	  or die 'the worker is not idle';
+	kill 'STOP', $worker;
+	$filled++;
+	$node->safe_psql('postgres', qq{CREATE TABLE public.filler$filled AS SELECT g, repeat('w', 200) AS v
+		FROM generate_series(1, 100000) g; SELECT pg_switch_wal()});
+	my $checkpoint = $node->background_psql('postgres');
+	my $log_at = -s $node->logfile;
+	$checkpoint->query_until(qr/started/, "\\echo started\nCHECKPOINT;\n\\echo checkpointed\n");
+	$node->wait_for_log(qr/terminating process $worker to release replication slot/, $log_at);
+	$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-lost', 'wait');
+		SELECT injection_points_attach('capture-slot-snapshot', 'wait')});
+	kill 'CONT', $worker;
+	$checkpoint->query_until(qr/checkpointed/, '');
+	$checkpoint->quit;
+	$node->wait_for_event('capture worker', 'capture-slot-lost');
+}
+
+sub slot_made_again
+{
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-lost'); SELECT injection_points_wakeup('capture-slot-lost')});
+	$node->wait_for_event('capture worker', 'capture-slot-snapshot');
+	$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-snapshot'); SELECT injection_points_wakeup('capture-slot-snapshot')});
+}
+
 # The worker held as its slot is being made, before it reads the tables.
 $node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-snapshot', 'wait')});
 $node->safe_psql('postgres', "$on CREATE SCHEMA app VERSIONED; CREATE TABLE app.t (id integer PRIMARY KEY, v integer);
@@ -51,22 +83,8 @@ $barrier->quit;
 is($node->safe_psql('postgres', "$on SELECT test_capture_barrier('app')"),
 	$node->safe_psql('postgres', "$on SELECT test_ws_root_capture('app')"), 'and capture has what the tables hold');
 
-# A slot lost: the worker stopped, and more WAL written than the slot may keep, so a checkpoint
-# invalidates it; the worker then ends, and the next is held before it drops the slot lost, and
-# again as it makes it anew.
-my $worker = $node->safe_psql('postgres', q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'capture worker'});
 $node->safe_psql('postgres', q{ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'; SELECT pg_reload_conf()});
-kill 'STOP', $worker;
-$node->safe_psql('postgres', q{CREATE TABLE public.filler AS SELECT g, repeat('w', 200) AS v FROM generate_series(1, 100000) g;
-	SELECT pg_switch_wal()});
-my $checkpoint = $node->background_psql('postgres');
-$checkpoint->query_until(qr/started/, "\\echo started\nCHECKPOINT;\n\\echo checkpointed\n");
-$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-slot-lost', 'wait');
-	SELECT injection_points_attach('capture-slot-snapshot', 'wait')});
-kill 'CONT', $worker;
-$checkpoint->query_until(qr/checkpointed/, '');
-$checkpoint->quit;
-$node->wait_for_event('capture worker', 'capture-slot-lost');
+lose_slot();
 is($node->safe_psql('postgres', q{SELECT invalidation_reason IS NOT NULL FROM pg_replication_slots
 	WHERE slot_name LIKE 'prolly\_capture\_%'}), 't', 'the slot is lost, and there');
 
@@ -82,13 +100,32 @@ my $no_xid = q{SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT te
 is($node->safe_psql('postgres', $no_xid), '0', 'nor a transaction ID');
 $node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-lost'); SELECT injection_points_wakeup('capture-slot-lost')});
 $node->wait_for_event('capture worker', 'capture-slot-snapshot');
-ok(waiting_barrier('SELECT test_ws_move%'), 'and waits on as it is made');
-is($node->safe_psql('postgres', $no_xid), '0', 'still with no transaction ID');
+is($node->safe_psql('postgres', $no_xid), '0', 'and as it is made again, still with no transaction ID');
 $node->safe_psql('postgres', q{SELECT injection_points_detach('capture-slot-snapshot'); SELECT injection_points_wakeup('capture-slot-snapshot')});
 like($mover->query_until(qr/done/, ''), qr/^t$/m, 'once it is, the move moves');
 is($mover->{stderr}, '', 'with no error');
 $mover->quit;
 is($node->safe_psql('postgres', "$on SELECT test_ws_root_capture('app')"), $root, 'the tables hold the root');
+is($node->safe_psql('postgres', "$on SELECT test_capture_barrier('app')"), $root, 'and capture has it');
+
+# A move that has its transaction ID and its tables when the slot is lost: it can't wait for the
+# slot, which waits for it, and it's a serialization failure at once.
+$node->safe_psql('postgres', "$on UPDATE app.t SET v = 3");
+$node->safe_psql('postgres', q{SELECT injection_points_attach('capture-barrier-locked', 'wait')});
+$mover = $node->background_psql('postgres', on_error_stop => 0);
+$mover->query_until(qr/started/, "\\echo started\n$on SELECT test_ws_move('app', '$root', 60000) IS NOT NULL AS moved;\n\\echo done\n");
+$node->wait_for_event('client backend', 'capture-barrier-locked');
+lose_slot();
+my $start = time;
+$node->safe_psql('postgres', q{SELECT injection_points_detach('capture-barrier-locked'); SELECT injection_points_wakeup('capture-barrier-locked')});
+$mover->query_until(qr/done/, '');
+like($mover->{stderr}, qr/capture's slot was lost as a commit from capture held its tables/,
+	'a move with its transaction ID and its tables, the slot lost, fails to be tried again');
+ok(time - $start < 30, 'at once, not waiting out its time');
+$mover->quit;
+slot_made_again();
+$node->safe_psql('postgres', "$on SELECT test_ws_move('app', '$root')");
+is($node->safe_psql('postgres', "$on SELECT test_ws_root_capture('app')"), $root, 'tried again, it moves');
 is($node->safe_psql('postgres', "$on SELECT test_capture_barrier('app')"), $root, 'and capture has it');
 
 done_testing();

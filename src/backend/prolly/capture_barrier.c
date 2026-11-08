@@ -255,15 +255,21 @@ slot_kept(void)
 }
 
 /*
- * Waits, holding nothing, for this database's capture to have its slot, since start; an error past
- * timeout_ms.  (A marker is read only by a slot made before it, and a slot's making waits for the
- * lock a barrier holds, and for every transaction with an ID to end.)
+ * Waits for this database's capture to have its slot, since start; an error past timeout_ms.  (A
+ * marker is read only by a slot made before it, and a slot's making waits for the lock a barrier
+ * holds, which this is called without, and for every transaction with an ID to end: so one that has
+ * an ID, as a move's left out, can't wait for it, and it's a serialization failure.)
  */
 static void
 slot_wait(TimestampTz start, int timeout_ms)
 {
 	while (!slot_kept())
 	{
+		if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("capture's slot was lost as a commit from capture held its tables"),
+					 errhint("Try the commit again once capture has made its slot again.")));
 		if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
@@ -511,7 +517,7 @@ barrier_take(ProllyCtx *ctx, const char *schema, Oid nsp, int32 branch, int time
 					 errmsg("capture did not reach %X/%X in time", LSN_FORMAT_ARGS(lsn))));
 
 		/* (a slot made again, as one lost is, would wait for this lock to read the tables) */
-		if (!slot_kept())
+		if (!slot_kept() && !barrier_saved(plan, lsn))
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("capture's slot was lost as a commit from capture waited for it"),
