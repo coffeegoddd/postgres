@@ -88,28 +88,6 @@ typedef struct Holding
 	int			user_timeout;	/* the session's own lock_timeout, or 0 */
 } Holding;
 
-/* (a TOAST table's values are named by its id, which the branch's copy of it doesn't have) */
-static void
-refuse_values_out_of_line(Oid table, Oid toast)
-{
-	Relation	rel = table_open(toast, NoLock);
-	Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
-	TableScanDesc scan = table_beginscan(rel, snapshot, 0, NULL, 0);
-	TupleTableSlot *slot = table_slot_create(rel, NULL);
-	bool		any = table_scan_getnextslot(scan, ForwardScanDirection, slot);
-
-	ExecDropSingleTupleTableSlot(slot);
-	table_endscan(scan);
-	UnregisterSnapshot(snapshot);
-	table_close(rel, NoLock);
-	if (any)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("table \"%s\" holds values stored out of line, which a branch can't share",
-						get_rel_name(table)),
-				 errdetail("A value stored out of line is named by its TOAST table's object id, which a branch's copy doesn't have.")));
-}
-
 /* (each index of a relation, as the catalogs have them now) */
 static List *
 indexes_of(Relation pg_index, Oid relid, List *rels)
@@ -245,14 +223,6 @@ hold_try(Holding *h)
 	}
 	again = relations_of(h->branch, &t2, &x2);
 	same = equal(rels, again);
-	if (same)
-	{
-		ListCell   *t;
-		ListCell   *x;
-
-		forboth(t, tables, x, toasts)
-			refuse_values_out_of_line(lfirst_oid(t), lfirst_oid(x));
-	}
 	list_free(rels);
 	list_free(again);
 	list_free(tables);

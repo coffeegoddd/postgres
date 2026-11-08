@@ -118,6 +118,9 @@
 #include "catalog/pg_ws_deferred.h"
 #include "catalog/pg_ws_print.h"
 #include "catalog/storage.h"
+#include "varatt.h"
+#include "access/xloginsert.h"
+#include "access/heapam.h"
 #include "storage/bmap.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -2082,6 +2085,88 @@ check_made(CopyState *cs)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Whether a heap page holds a value stored out of line in TOAST relation from; with patch, each
+ * of those named to instead.  (A pointer's relation is the last of its fields in each form.)
+ */
+static bool
+page_names(Page page, TupleDesc desc, Datum *values, bool *isnull, Oid from, bool patch, Oid to)
+{
+	bool		found = false;
+
+	for (OffsetNumber off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+		HeapTupleData tup;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+		tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		heap_deform_tuple(&tup, desc, values, isnull);
+		for (int i = 0; i < desc->natts; i++)
+		{
+			char	   *ptr;
+			Oid			rel;
+			size_t		at;
+
+			if (isnull[i] || TupleDescAttr(desc, i)->attlen != -1)
+				continue;
+			ptr = DatumGetPointer(values[i]);
+			if (!VARATT_IS_EXTERNAL_ONDISK(ptr))
+				continue;
+			at = VARHDRSZ_EXTERNAL + VARTAG_SIZE(VARTAG_EXTERNAL(ptr)) - sizeof(Oid);
+			memcpy(&rel, ptr + at, sizeof(Oid));
+			if (rel != from)
+				continue;
+			found = true;
+			if (patch)
+				memcpy(ptr + at, &to, sizeof(Oid));
+		}
+	}
+	return found;
+}
+
+/*
+ * A copy's heap, its pages shared with its source's, its values stored out of line naming the
+ * source's TOAST relation, from: each page holding one copied to be the copy's own (as taking it to
+ * change does) and each named to, the copy's TOAST relation, which holds them all as its pages are
+ * the source's, so every value on a branch's pages names the branch's own.  Logged whole.  The pages
+ * that hold none stay shared.
+ */
+static void
+fix_toast_pointers(Relation heap, Oid from, Oid to)
+{
+	TupleDesc	desc = RelationGetDescr(heap);
+	Datum	   *values = palloc_array(Datum, Max(desc->natts, 1));
+	bool	   *isnull = palloc_array(bool, Max(desc->natts, 1));
+	BlockNumber nblocks = RelationGetNumberOfBlocks(heap);
+
+	for (BlockNumber blk = 0; blk < nblocks; blk++)
+	{
+		Buffer		buf;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBuffer(heap, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!page_names(BufferGetPage(buf), desc, values, isnull, from, false, to))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		START_CRIT_SECTION();
+		(void) page_names(BufferGetPage(buf), desc, values, isnull, from, true, to);
+		MarkBufferDirty(buf);
+		log_newpage_buffer(buf, true);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(buf);
+	}
+	pfree(values);
+	pfree(isnull);
+}
+
 static void
 make_storage(CopyState *cs)
 {
@@ -2140,6 +2225,40 @@ make_storage(CopyState *cs)
 		relation_close(src, NoLock);
 	}
 	CommandCounterIncrement();
+
+	/* (a shared table's values stored out of line named the copy's TOAST relation) */
+	for (int i = 0; cs->share && i < cs->nobjs; i++)
+	{
+		CopyKey		obj = cs->objs[i];
+		char		kind;
+		Oid			toast;
+		Relation	heap;
+
+		if (obj.classid != RelationRelationId)
+			continue;
+		kind = get_rel_relkind(obj.oid);
+		if (kind != RELKIND_RELATION && kind != RELKIND_MATVIEW)
+			continue;
+		{
+			Relation	src = relation_open(obj.oid, NoLock);
+
+			toast = src->rd_rel->reltoastrelid;
+			relation_close(src, NoLock);
+		}
+		if (!OidIsValid(toast))
+			continue;
+		{
+			Relation	t = relation_open(toast, AccessShareLock);
+			bool		empty = RelationGetNumberOfBlocks(t) == 0;
+
+			relation_close(t, NoLock);
+			if (empty)
+				continue;
+		}
+		heap = relation_open(copy_map(cs, RelationRelationId, obj.oid), NoLock);
+		fix_toast_pointers(heap, toast, copy_map(cs, RelationRelationId, toast));
+		relation_close(heap, NoLock);
+	}
 
 	/* (indexes valid on their empty tables; shared ones are their sources', and valid as they are) */
 	foreach_oid(relid, tables)

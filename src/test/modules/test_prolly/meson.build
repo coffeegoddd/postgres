@@ -267,6 +267,7 @@ tests += {
       't/138_branch_create.pl',
       't/139_branch_create_changes.pl',
       't/140_branch_checkout.pl',
+      't/141_branch_toast.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
