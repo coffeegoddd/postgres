@@ -473,9 +473,11 @@ rows_compare(SharedInvalidationMessage *msgs, int nmsgs)
 						 errdetail("It changes a table's rows, which capture then reads as they're committed now.")));
 			rel = table_open(t->relid, ShareLock);
 
-			/* (what's left out of capture has told it its rows another way, if at all) */
+			/* (what's left out of capture has told it its rows another way, as they are) */
 			if (!CaptureLeftOut())
 				rows_write(rel, NamespaceBranch(RelationGetNamespace(rel)));
+			else
+				CaptureCheckChanged(t->relid, fingerprint);
 			table_close(rel, NoLock);
 			if (SPI_execute_with_args("INSERT INTO pg_history.capture_fingerprints VALUES ($1, $2) "
 									  "ON CONFLICT (relid) DO UPDATE SET fingerprint = excluded.fingerprint",

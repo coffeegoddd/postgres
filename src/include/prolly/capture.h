@@ -265,12 +265,14 @@ extern void CaptureRowsAre(Relation relation, const PHash *map);
 /*
  * Once version control's own work in a transaction left out is done: what the transaction would
  * write after to a versioned table, or change of a versioned schema's objects, is refused, as it
- * would be in no branch's history (CaptureCheckWrite, CaptureCheckCatalogChange); and a table
- * whose rows were told (CaptureRowsAre) is to commit in the layout it was told in.
+ * would be in no branch's history (CaptureCheckWrite, CaptureCheckCatalogChange).  And as a
+ * transaction left out commits, each table whose fingerprint (CaptureRowsFingerprint) changed is to
+ * have been told (CaptureRowsAre), as it is: an error otherwise (CaptureCheckChanged).
  */
 extern void CaptureLeftOutSeal(void);
 extern void CaptureCheckWrite(Relation relation, const char *what);
 extern void CaptureCheckCatalogChange(void);
+extern void CaptureCheckChanged(Oid relid, const char *fingerprint);
 
 /* The name of where CaptureRowsAre holds a table's map, into name, of CAPTURE_TOLD_REF_LEN. */
 #define CAPTURE_TOLD_REF_LEN 96

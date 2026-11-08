@@ -2032,9 +2032,6 @@ ExecuteTruncateGuts(List *explicit_rels,
 	ListCell   *cell;
 	Oid		   *logrelids;
 
-	/* (prolly: not a versioned table, once a transaction left out of capture is sealed) */
-	foreach_ptr(RelationData, rel, explicit_rels)
-		CaptureCheckWrite(rel, "truncate");
 
 	/*
 	 * Check the explicitly-specified relations.
@@ -2078,6 +2075,10 @@ ExecuteTruncateGuts(List *explicit_rels,
 			}
 		}
 	}
+
+	/* (prolly: none versioned, once a transaction left out of capture is sealed, cascaded to or not) */
+	foreach_ptr(RelationData, rel, rels)
+		CaptureCheckWrite(rel, "truncate");
 
 	/*
 	 * Check foreign key references.  In CASCADE mode, this should be

@@ -49,6 +49,7 @@
 #include "utils/guc.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -249,15 +250,14 @@ CaptureLeftOut(void)
  */
 static TransactionId sealed = InvalidTransactionId;
 
-typedef struct ToldShape
+/* Each table told as a map in this transaction, and its fingerprint as it was told. */
+typedef struct Told
 {
 	Oid			relid;
-	int			nkey;
-	int			nstored;
-	uint64	   *tags;
-} ToldShape;
+	char	   *fingerprint;
+} Told;
 
-static List *told_shapes = NIL;
+static List *told = NIL;
 static bool told_callback = false;
 
 static bool
@@ -276,7 +276,10 @@ CaptureLeftOutSeal(void)
 void
 CaptureCheckWrite(Relation relation, const char *what)
 {
-	if (sealed_now() && NamespaceBranch(RelationGetNamespace(relation)) != 0)
+	char		kind = relation->rd_rel->relkind;
+
+	if (sealed_now() && (kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+		NamespaceBranch(RelationGetNamespace(relation)) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("cannot %s versioned table \"%s\" in a transaction left out of capture",
@@ -296,57 +299,55 @@ CaptureCheckCatalogChange(void)
 				 errhint("Do it in a transaction of its own.")));
 }
 
-/* (at commit, each table told keeps the layout it was told in) */
 static void
-told_shapes_callback(XactEvent event, void *arg)
+told_callback_fn(XactEvent event, void *arg)
 {
-	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PRE_PREPARE)
-	{
-		foreach_ptr(ToldShape, t, told_shapes)
-		{
-			Relation	rel = try_relation_open(t->relid, AccessShareLock);
-			WsRowShape	now;
-			bool		same;
-
-			if (rel == NULL)
-				continue;
-			CaptureRelationShape(rel, &now);
-			same = now.nkey == t->nkey && now.nstored == t->nstored &&
-				memcmp(now.tags, t->tags, sizeof(uint64) * now.nstored) == 0;
-			ws_row_shape_free(&now);
-			if (!same)
-				ereport(ERROR,
-						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-						 errmsg("table \"%s\" was changed after its rows were told to capture",
-								RelationGetRelationName(rel)),
-						 errdetail("What a transaction left out of capture tells is of the table as it commits."),
-						 errhint("Change it in a transaction of its own.")));
-			relation_close(rel, AccessShareLock);
-		}
-	}
 	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT || event == XACT_EVENT_PREPARE ||
 		event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
-		told_shapes = NIL;
+		told = NIL;
 }
 
 static void
-told_shape_note(Relation relation, const WsRowShape *shape)
+told_note(Relation relation)
 {
-	MemoryContext was = MemoryContextSwitchTo(TopTransactionContext);
-	ToldShape  *t = palloc(sizeof(ToldShape));
+	MemoryContext was;
+	Told	   *t;
+	char	   *fingerprint = CaptureRowsFingerprint(RelationGetRelid(relation),
+												 relation->rd_rel->relfilenode);
 
 	if (!told_callback)
 	{
-		RegisterXactCallback(told_shapes_callback, NULL);
+		RegisterXactCallback(told_callback_fn, NULL);
 		told_callback = true;
 	}
+	was = MemoryContextSwitchTo(TopTransactionContext);
+	t = palloc(sizeof(Told));
 	t->relid = RelationGetRelid(relation);
-	t->nkey = shape->nkey;
-	t->nstored = shape->nstored;
-	t->tags = palloc(sizeof(uint64) * Max(shape->nstored, 1));
-	memcpy(t->tags, shape->tags, sizeof(uint64) * shape->nstored);
-	told_shapes = lappend(told_shapes, t);
+	t->fingerprint = pstrdup(fingerprint);
+	told = lappend(told, t);
 	MemoryContextSwitchTo(was);
+	pfree(fingerprint);
+}
+
+void
+CaptureCheckChanged(Oid relid, const char *fingerprint)
+{
+	const char *was = NULL;
+
+	if (!CaptureLeftOut())
+		return;
+	foreach_ptr(Told, t, told)
+	{
+		if (t->relid == relid)
+			was = t->fingerprint;
+	}
+	if (was == NULL || strcmp(was, fingerprint) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("table \"%s\" was changed in a transaction left out of capture after its rows were told, or untold",
+						get_rel_name(relid)),
+				 errdetail("A transaction left out of capture tells it each table's rows as they commit."),
+				 errhint("Change it in a transaction of its own.")));
 }
 
 void
@@ -383,7 +384,6 @@ CaptureRowsAre(Relation relation, const PHash *map)
 	if (head[0] == 0)
 		elog(ERROR, "relation \"%s\" is not versioned", RelationGetRelationName(relation));
 	CaptureRelationShape(relation, &shape);
-	told_shape_note(relation, &shape);
 	head[1] = (int32) RelationGetRelid(relation);
 	head[2] = shape.nkey;
 	head[3] = shape.nstored;
@@ -394,6 +394,7 @@ CaptureRowsAre(Relation relation, const PHash *map)
 	(void) LogLogicalMessage(CAPTURE_ROWS_ARE_PREFIX, out.data, out.len, true, false);
 	pfree(out.data);
 	ws_row_shape_free(&shape);
+	told_note(relation);
 
 	/* (the map is held for capture, which may get to it after whatever else held it lets it go) */
 	{
