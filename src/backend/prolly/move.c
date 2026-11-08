@@ -50,6 +50,7 @@
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -691,24 +692,23 @@ aside_mark(MoveTables *t, const char *name)
  * target holds that restore couldn't set aside is refused here, as all of its records are asked.
  */
 static void
-mark_set_aside(ProllyCtx *ctx, const char *schema, Oid nsp, const PHash *to, MoveTables *had, MoveTables *has)
+mark_set_aside(ProllyCtx *ctx, const char *schema, const PHash *to, MoveTables *had, MoveTables *has)
 {
+	MemoryContext asking = AllocSetContextCreate(CurrentMemoryContext, "move set aside", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext was = MemoryContextSwitchTo(asking);
+	const char *params[1] = {schema};
+	WsSqlRows	here;
 	PHash		map;
 
-	if (ws_viol_any_deferred(schema))
-		for (int i = 0; i < had->n; i++)
-		{
-			char	   *name = ws_name_from_utf8(had->names[i]);
-			int			n;
+	WsSql->run("SELECT DISTINCT c.relname::text FROM pg_ws_deferred d JOIN pg_class c ON c.oid = d.defrelid "
+			   "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1::name", 1, params, &here);
+	for (int i = 0; i < here.nrows; i++)
+	{
+		char	   *name = ws_name_to_utf8(ws_sql_value(&here, i, 0));
 
-			(void) WsDeferreds->load(get_relname_relid(name, nsp), &n);
-			pfree(name);
-			if (n > 0)
-			{
-				aside_mark(had, had->names[i]);
-				aside_mark(has, had->names[i]);
-			}
-		}
+		aside_mark(had, name);
+		aside_mark(has, name);
+	}
 	if (WsRoot->get_map(ctx, to, WS_ROOT_VIOLATIONS, &map))
 	{
 		WsTableSchema *recs = palloc_array(WsTableSchema, Max(has->n, 1));
@@ -724,10 +724,9 @@ mark_set_aside(ProllyCtx *ctx, const char *schema, Oid nsp, const PHash *to, Mov
 			aside_mark(had, deferred.items[i].table);
 			aside_mark(has, deferred.items[i].table);
 		}
-		for (int i = 0; i < has->n; i++)
-			ws_schema_free(&recs[i]);
-		pfree(recs);
 	}
+	MemoryContextSwitchTo(was);
+	MemoryContextDelete(asking);
 }
 
 static void
@@ -788,7 +787,7 @@ inplace_move(ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms
 	}
 
 	level = WsSql->begin();
-	mark_set_aside(ctx, schema, nsp, to, &had, &has);
+	mark_set_aside(ctx, schema, to, &had, &has);
 
 	/* (with the same definitions, only rows and sequences differ) */
 	definitions = same_map(ctx, &from, to, WS_ROOT_OBJECTS) && same_map(ctx, &from, to, WS_ROOT_FOREIGN_KEYS) &&

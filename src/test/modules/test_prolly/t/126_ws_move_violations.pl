@@ -41,6 +41,7 @@ sub move_to
 	my ($root, $name) = @_;
 	sql(qq{SELECT test_ws_move_prepare('app', '$root')});
 	my $stats = sql(qq{SELECT test_ws_move('app', '$root')});
+	note("$name: $stats");
 	is(read_root(), $root, "$name: the tables hold the root");
 	is(capture_root(), $root, "$name: and capture has it");
 	return $stats;
@@ -52,8 +53,12 @@ my $base = q{CREATE TABLE p (id integer PRIMARY KEY, code integer NOT NULL, CONS
 	CREATE TABLE c (id integer PRIMARY KEY, code integer REFERENCES p (code));
 	CREATE TABLE t (id integer PRIMARY KEY, v integer);
 	CREATE TABLE other (id integer PRIMARY KEY, v text);
-	INSERT INTO p VALUES (1, 7); INSERT INTO c VALUES (1, 7);
-	INSERT INTO t VALUES (1, 1); INSERT INTO other VALUES (1, 'x')};
+	CREATE TABLE k (id integer PRIMARY KEY, pid integer REFERENCES p (id));
+	CREATE VIEW pv AS SELECT id, code FROM p;
+	CREATE MATERIALIZED VIEW pm AS SELECT count(*) AS n FROM p;
+	INSERT INTO p VALUES (1, 7); INSERT INTO c VALUES (1, 7); INSERT INTO k VALUES (1, 1);
+	INSERT INTO t VALUES (1, 1); INSERT INTO other VALUES (1, 'x');
+	REFRESH MATERIALIZED VIEW pm};
 
 # The root of a schema made of the base and then text, the schema dropped after.
 my $made = 0;
@@ -86,8 +91,14 @@ my $m1 = merged($a, q{INSERT INTO p VALUES (2, 9); UPDATE other SET v = 'y'}, q{
 is(sql(qq{SELECT test_ws_violations('$m1')}), "unique p code_one 2\nunique p code_one 3",
 	'the merge holds the rows a unique key refuses');
 
-my %oid = map { $_ => oid_of("app.$_") } qw(p c t other);
-move_to($m1, 'to a root holding violations');
+# A barrier over a schema with constraints set aside checks them by restoring its root, undone.
+sql(qq{CREATE SCHEMA r VERSIONED; GRANT ALL ON SCHEMA r TO app_owner; SELECT test_ws_root_restore('$m1', 'r')});
+is(sql(q{SELECT test_capture_barrier('r')}), $m1, 'a barrier over a schema with constraints set aside has its root');
+sql(q{DROP SCHEMA r CASCADE});
+
+my %oid = map { $_ => oid_of("app.$_") } qw(p c t other k);
+my $stats = move_to($m1, 'to a root holding violations');
+like($stats, qr/ made 2 dropped 0 altered 0 /, "the two tables with what is set aside are made: $stats");
 is(deferred(), "c|f|c_code_fkey\np|u|code_one", 'the unique constraint is set aside, and the key that needs it');
 is(sql(q{SELECT count(*) FROM pg_constraint WHERE conrelid IN ('app.p'::regclass, 'app.c'::regclass) AND contype IN ('u', 'f')}),
 	'0', 'and neither is on its table');
@@ -97,6 +108,11 @@ isnt(oid_of('app.p'), $oid{p}, 'the table with what is set aside is made again')
 isnt(oid_of('app.c'), $oid{c}, 'and the one with the key that needs it');
 is(oid_of('app.t'), $oid{t}, 'a table with nothing set aside is kept');
 is(oid_of('app.other'), $oid{other}, 'and one whose rows differ');
+is(oid_of('app.k'), $oid{k}, 'and one with a key to a table made again');
+is(sql(q{SELECT conname FROM pg_constraint WHERE conrelid = 'app.k'::regclass AND contype = 'f'}), 'k_pid_fkey',
+	'which has its key again');
+is(sql(q{SELECT count(*) FROM app.pv}), '3', 'a view of a table made again reads it');
+is(sql(q{SELECT n FROM app.pm}), '3', 'and a materialized view of it is refreshed');
 
 move_to($a, 'back to a root holding none');
 is(deferred(), '', 'nothing is set aside');
