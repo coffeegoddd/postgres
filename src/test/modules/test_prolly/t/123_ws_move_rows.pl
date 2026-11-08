@@ -94,7 +94,7 @@ my $log_at = -s $node->logfile;
 
 # Back to the first.
 my $stats = sql(qq{SELECT test_ws_move('app', '$a')});
-like($stats, qr/^tables 7 deleted \d+ inserted \d+ sequences 1$/, "a move to the first writes each table that differs: $stats");
+like($stats, qr/^tables 7 deleted \d+ inserted \d+ sequences 1 made 0 dropped 0$/, "a move to the first writes each table that differs: $stats");
 my ($deleted, $inserted) = $stats =~ /deleted (\d+) inserted (\d+)/;
 # kv: 5 updated taken away and put in again, 5 deleted put back, the new one taken away; notes: a 'b' and
 # the 'c' away, an 'a' back; parted: the row from high back to low; codes and later: both rows; gen: one
@@ -118,7 +118,7 @@ is(capture_root(), $after, 'what is written after a move is captured on top of i
 like(sql(qq{SELECT test_ws_move('app', '$b')}), qr/^tables 7 /, 'a move to the second');
 is(read_root(), $b, 'holds the second root');
 is(capture_root(), $b, 'and capture has it');
-is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0', 'a move to where it is writes nothing');
+is(sql(qq{SELECT test_ws_move('app', '$b')}), 'tables 0 deleted 0 inserted 0 sequences 0 made 0 dropped 0', 'a move to where it is writes nothing');
 
 # Rolled back, or failing, it leaves everything as it was.
 sql(qq{BEGIN; SELECT test_ws_move('app', '$a'); ROLLBACK});
@@ -128,12 +128,6 @@ is(sql(q{SELECT last_value || ' ' || is_called FROM app.counter}), '3 true', 'an
 
 my ($ret, $out, $err) = $node->psql('postgres', "$on BEGIN; INSERT INTO app.kv VALUES (300, 'first', NULL); SELECT test_ws_move('app', '$a'); COMMIT");
 like($err, qr/a commit from capture can't run in a transaction that has written anything/, 'a move after a write is refused');
-
-sql(q{ALTER TABLE app.kv ADD COLUMN extra integer});
-my $c = commit_root();
-($ret, $out, $err) = $node->psql('postgres', "$on SELECT test_ws_move('app', '$a')");
-like($err, qr/a move in place that changes its tables is not supported/, 'a move that changes a definition is refused, as not built yet');
-is(read_root(), $c, 'and leaves the tables');
 
 unlike(slurp_file($node->logfile), qr/^PANIC:|terminated by signal|capture can't apply/m, 'nothing crashed, and capture applied it all');
 $node->stop;

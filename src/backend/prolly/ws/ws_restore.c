@@ -436,9 +436,26 @@ definitions_record(const WsTableSchema *s, WsTableSchema *out)
 	out->ngrants = 0;
 }
 
+/* Whether a table of the schema has a constraint of that name. */
+static bool
+constraint_there(const char *schema, const char *table, const char *name)
+{
+	const char *params[3] = {schema, ws_name_from_utf8(table), ws_name_from_utf8(name)};
+	WsSqlRows	rows;
+	bool		there;
+
+	WsSql->run("SELECT 1 FROM pg_constraint o JOIN pg_class c ON c.oid = o.conrelid "
+			   "JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name AND c.relname = $2::name AND o.conname = $3::name",
+			   3, params, &rows);
+	there = rows.nrows > 0;
+	ws_sql_rows_free(&rows);
+	return there;
+}
+
 static void
 add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, const WsDeferrals *deferred,
-				 const char *schema)
+				 const char *schema, bool missing)
 {
 	PHash		map;
 	WsForeignKey *fks;
@@ -454,7 +471,8 @@ add_foreign_keys(ProllyCtx *ctx, const PHash *root, const TableOrder *tables, co
 
 		/* (a table's last name first: the list is by table, then name) */
 		for (int i = n - 1; i >= 0; i--)
-			if (strcmp(fks[i].table, rec->name) == 0 && !ws_viol_key_deferred(deferred, &fks[i]))
+			if (strcmp(fks[i].table, rec->name) == 0 && !ws_viol_key_deferred(deferred, &fks[i]) &&
+				!(missing && constraint_there(schema, fks[i].table, fks[i].name)))
 			{
 				const WsTableSchema *to = &tables->recs[table_index(tables, fks[i].ref_table)];
 
@@ -510,14 +528,67 @@ exhaust_sequences(const char *schema)
 	ws_sql_rows_free(&rows);
 }
 
+/* Which of a root's tables, by name in the order's, the schema has. */
+static bool *
+tables_there(const TableOrder *tables, const char *schema)
+{
+	const char *params[1] = {schema};
+	WsSqlRows	rows;
+	bool	   *there = palloc0_array(bool, Max(tables->nnames, 1));
+
+	WsSql->run("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+			   "WHERE n.nspname = $1::name AND c.relkind IN ('r', 'p')", 1, params, &rows);
+	for (int r = 0; r < rows.nrows; r++)
+	{
+		char	   *name = ws_name_to_utf8(ws_sql_value(&rows, r, 0));
+
+		for (int i = 0; i < tables->nnames; i++)
+			if (strcmp(tables->names[i], name) == 0)
+				there[i] = true;
+		pfree(name);
+	}
+	ws_sql_rows_free(&rows);
+	return there;
+}
+
+/* Which of a root's objects, by key, the schema has. */
+static bool *
+objects_there(const WsObject *objs, int nobjs, const char *schema)
+{
+	WsObject   *cur;
+	int			ncur;
+	bool	   *there = palloc0_array(bool, Max(nobjs, 1));
+	Buf		   *keys = palloc0_array(Buf, Max(nobjs, 1));
+
+	ws_obj_read(schema, &cur, &ncur);
+	for (int i = 0; i < nobjs; i++)
+		WsObjectCodec->encode_key(&objs[i], &keys[i]);
+	for (int c = 0; c < ncur; c++)
+	{
+		Buf			key = BUF_INIT;
+
+		WsObjectCodec->encode_key(&cur[c], &key);
+		for (int i = 0; i < nobjs; i++)
+			if (keys[i].len == key.len && memcmp(keys[i].data, key.data, key.len) == 0)
+				there[i] = true;
+		buf_free(&key);
+		ws_obj_free(&cur[c]);
+	}
+	for (int i = 0; i < nobjs; i++)
+		buf_free(&keys[i]);
+	pfree(keys);
+	return there;
+}
+
 /*
  * Restoring: all of it; with fn, only what restore_rows says, then fn; with no_rows, all
- * of it, each table holding that, or if definitions_only, what restore_definitions says.
+ * of it, each table holding that, or if definitions_only, what restore_definitions says;
+ * if missing, what restore_missing says.
  */
 static void
 restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema,
 		   void (*fn) (void *arg, const char *schema), void *arg, const PHash *no_rows,
-		   bool definitions_only, bool roles_here)
+		   bool definitions_only, bool roles_here, bool missing)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	rows;
@@ -530,7 +601,13 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	Buf			sql = BUF_INIT;
 	WsDeferrals deferred = {0};
 	bool	   *owner_absent;
+	bool	   *table_made = NULL;
+	bool	   *obj_made = NULL;
+	WsTableSchema *made_recs;
+	int			nmade = 0;
 
+	if (missing)
+		goto not_empty;
 	WsSql->run("SELECT (SELECT count(*) FROM pg_namespace n, LATERAL (" \
 			   "SELECT 1 FROM pg_class WHERE relnamespace = n.oid UNION ALL " \
 			   "SELECT 1 FROM pg_type WHERE typnamespace = n.oid UNION ALL " \
@@ -552,6 +629,7 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 				 errmsg("schema \"%s\" holds something, and a root is restored into one that does not", schema)));
 	ws_sql_rows_free(&rows);
 
+not_empty:
 	if (!definitions_only && !roles_here && WsRoot->get_map(ctx, root, WS_ROOT_ROLES, &map))
 	{
 		WsRole	   *held;
@@ -609,16 +687,40 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 					owner_absent[i] = true;
 			}
 		}
-	ws_obj_restore(objs, nobjs, schema, true);
+	if (missing)
+	{
+		obj_made = objects_there(objs, nobjs, schema);
+		for (int i = 0; i < nobjs; i++)
+			obj_made[i] = !obj_made[i];
+	}
+	ws_obj_restore_some(objs, nobjs, obj_made, schema, true);
 
 	tables_in_order(ctx, root, &tables);
+	table_made = palloc_array(bool, Max(tables.nnames, 1));
+	if (missing)
+	{
+		bool	   *there = tables_there(&tables, schema);
+
+		for (int i = 0; i < tables.nnames; i++)
+			table_made[i] = !there[i];
+		pfree(there);
+	}
+	else
+		for (int i = 0; i < tables.nnames; i++)
+			table_made[i] = true;
+	made_recs = palloc_array(WsTableSchema, Max(tables.nnames, 1));
+	for (int i = 0; i < tables.nnames; i++)
+		if (table_made[i])
+			made_recs[nmade++] = tables.recs[i];
 	if (fn == NULL && no_rows == NULL)
-		ws_viol_defer(ctx, root, tables.recs, tables.nnames, &deferred);
+		ws_viol_defer(ctx, root, made_recs, nmade, &deferred);
 	for (int t = 0; t < tables.n; t++)
 	{
 		int			i = tables.order[t];
 
 		CHECK_FOR_INTERRUPTS();
+		if (!table_made[i])
+			continue;
 		if (fn != NULL || definitions_only)
 		{
 			WsTableSchema bare;
@@ -659,6 +761,8 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
 
+		if (!table_made[tables.order[t]])
+			continue;
 		if (s->partition_of != NULL)
 		{
 			ws_schema_attach(s, schema, &sql);
@@ -675,6 +779,8 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
 
+		if (!table_made[tables.order[t]])
+			continue;
 		for (int i = 0; i < s->nconstraints; i++)
 			if (s->constraints[i].not_valid)
 			{
@@ -686,6 +792,8 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
 
+		if (!table_made[tables.order[t]])
+			continue;
 		for (int p = 0; p < s->ninherits; p++)
 		{
 			ws_schema_inherit(s, p, schema, &sql);
@@ -693,12 +801,15 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 		}
 	}
 	for (int t = 0; t < tables.n; t++)
-		ws_schema_set_inherited(schema, &tables.recs[tables.order[t]]);
-	add_foreign_keys(ctx, root, &tables, &deferred, schema);
+		if (table_made[tables.order[t]])
+			ws_schema_set_inherited(schema, &tables.recs[tables.order[t]]);
+	add_foreign_keys(ctx, root, &tables, &deferred, schema, missing);
 	for (int t = 0; t < tables.n; t++)
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
 
+		if (!table_made[tables.order[t]])
+			continue;
 		for (int i = 0; i < s->ncomments; i++)
 		{
 			ws_schema_comment(s, i, schema, &sql);
@@ -709,19 +820,23 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	{
 		const WsTableSchema *s = &tables.recs[tables.order[t]];
 
+		if (!table_made[tables.order[t]])
+			continue;
 		for (int i = 0; i < s->ngrants; i++)
 		{
 			ws_schema_grant(s, i, schema, &sql);
 			run_statement(&sql);
 		}
 	}
-	ws_obj_restore(objs, nobjs, schema, false);
+	ws_obj_restore_some(objs, nobjs, obj_made, schema, false);
 	for (int t = 0; t < tables.n; t++)
 	{
+		if (!table_made[tables.order[t]])
+			continue;
 		ws_schema_row_security(&tables.recs[tables.order[t]], schema, &sql);
 		run_statement(&sql);
 	}
-	if (WsRoot->get_map(ctx, root, WS_ROOT_SEQUENCES, &map))
+	if (!missing && WsRoot->get_map(ctx, root, WS_ROOT_SEQUENCES, &map))
 	{
 		WsSeqPosition *seqs;
 		int			nseqs;
@@ -731,8 +846,21 @@ restore_as(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char 
 	}
 	CommandCounterIncrement();
 	for (int t = 0; t < tables.n; t++)
-		ws_schema_remember(&tables.recs[tables.order[t]], schema);
-	ws_obj_remember(objs, nobjs, schema);
+		if (table_made[tables.order[t]])
+			ws_schema_remember(&tables.recs[tables.order[t]], schema);
+	if (missing)
+	{
+		WsObject   *made = palloc_array(WsObject, Max(nobjs, 1));
+		int			n = 0;
+
+		for (int i = 0; i < nobjs; i++)
+			if (obj_made[i])
+				made[n++] = objs[i];
+		ws_obj_remember(made, n, schema);
+		pfree(made);
+	}
+	else
+		ws_obj_remember(objs, nobjs, schema);
 	ws_viol_defer_end(schema, &deferred);
 
 done:
@@ -748,26 +876,32 @@ done:
 static void
 schema_restore(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
 {
-	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false);
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, false);
 }
 
 static void
 schema_restore_rows(ProllyCtx *ctx, const PHash *root, const char *schema,
 					void (*fn) (void *arg, const char *schema), void *arg, bool roles_here)
 {
-	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here);
+	restore_as(ctx, root, NULL, schema, fn, arg, NULL, false, roles_here, false);
 }
 
 static void
 schema_restore_statements(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, false, false, false);
 }
 
 static void
 schema_restore_definitions(ProllyCtx *ctx, const PHash *root, const char *schema, const PHash *no_rows)
 {
-	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false);
+	restore_as(ctx, root, NULL, schema, NULL, NULL, no_rows, true, false, false);
+}
+
+static void
+schema_restore_missing(ProllyCtx *ctx, const PHash *root, const PHash *previous, const char *schema)
+{
+	restore_as(ctx, root, previous, schema, NULL, NULL, NULL, false, false, true);
 }
 
 const WsRootIORoutine SchemaWsRootIO = {
@@ -777,6 +911,7 @@ const WsRootIORoutine SchemaWsRootIO = {
 	.restore_rows = schema_restore_rows,
 	.restore_statements = schema_restore_statements,
 	.restore_definitions = schema_restore_definitions,
+	.restore_missing = schema_restore_missing,
 };
 
 const WsRootIORoutine *WsRootIO = &SchemaWsRootIO;

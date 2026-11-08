@@ -15,8 +15,17 @@
  * get there within the time given.  Writing the rows is a table's owner's, as restoring them is.
  * The root is the history store's.
  *
- * Only rows and sequences' positions move so far: a root whose tables, their definitions, objects,
- * foreign keys, roles or violations aren't the schema's is refused.
+ * What the target doesn't have as the schema has it is dropped, with what depends on it in the
+ * schema, and so is a table the target keeps that dropping took a part of, as a column whose type
+ * went.  Then what the target has and the schema now lacks is made as restore makes it, a table
+ * with all its rows (prolly/ws/ws_restore.h's restore_missing), and each table kept has only the
+ * rows that differ written.  A table whose definition differs is made again whole, so far, rather
+ * than altered.  A materialized view that held rows is refreshed, as what it's made of may have
+ * changed, which runs what it is made of.  A root with constraint violations is refused.
+ *
+ * An enum's value the target has can't be used in the transaction that adds it, so prepare adds
+ * them first, in a transaction of its own; a move without it makes such a type again, and every
+ * table using it.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -36,11 +45,21 @@ typedef struct WsMoveStats
 	uint64		deleted;		/* rows taken away, a keyed row changed among them */
 	uint64		inserted;		/* and put in */
 	int			sequences;		/* whose positions changed */
+	int			made;			/* tables made, or made again, and loaded whole */
+	int			dropped;		/* tables the target doesn't have */
 } WsMoveStats;
 
 typedef struct WsMoveRoutine
 {
 	const char *name;
+
+	/*
+	 * What a move can't do in its own transaction, as Postgres can't use an enum's value in the
+	 * one that adds it: each value the target's enums have and the schema's lack, added where it
+	 * goes, in the caller's transaction, to commit before the move.  It only adds, so nothing is
+	 * lost if the move is then refused or never made.
+	 */
+	void		(*prepare) (ProllyCtx *ctx, const char *schema, const PHash *to);
 	void		(*move) (ProllyCtx *ctx, const char *schema, const PHash *to, int timeout_ms,
 						 WsMoveStats *stats);
 } WsMoveRoutine;

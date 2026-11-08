@@ -252,6 +252,15 @@ extern void ws_obj_grant_statement(const WsObject *o, int k, const char *schema,
 extern void ws_obj_owned_statement(const WsObject *o, const char *schema, Buf *out);
 
 /*
+ * The statement dropping an object if it's there, appended to out, with what depends on it: what
+ * is only part of another, an operator's commutator and negator or a family's members outside any
+ * class, drops that other, whose parts are all to be made again.  A view column's default and a
+ * configuration's mapping of a token are taken off what they're of.  A cast's types are said bare,
+ * so it's to run with the schema on the path.
+ */
+extern void ws_obj_drop_statement(const WsObject *o, const char *schema, Buf *out);
+
+/*
  * The roles an object names, as a commit holds them, for what collects ~roles: its owner,
  * who it grants to, and who a policy is for, which only its statement says.  Appended to
  * *names, of *n and palloc'd or NULL if none yet.
@@ -271,6 +280,10 @@ extern void ws_obj_roles(const WsObject *o, char ***names, int *n);
  * change of owner.
  */
 extern void ws_obj_restore(const WsObject *objs, int n, const char *schema, bool before_tables);
+
+/* The same, making only those make says, the others being there already. */
+extern void ws_obj_restore_some(const WsObject *objs, int n, const bool *make, const char *schema,
+								bool before_tables);
 
 /* Whether a type's name, unqualified, is one of those whose values are names. */
 extern bool ws_is_reg_type(const char *type);
