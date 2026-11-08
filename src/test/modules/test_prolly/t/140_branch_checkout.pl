@@ -1,10 +1,11 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A session checks a branch out by name, as any role may: it's then on that branch's catalog branch,
-# seeing its tables, and another session can tell it's in use.  A checkout rolled back, or rolled back
-# to a savepoint, is undone; of several in one transaction, the last is kept; one in a savepoint
-# released stands, and so does one in a function; after a reset the
-# session is where it started.  What another can tell is always where the session is.  One in a transaction that has changed a versioned schema is refused, and one of a
+# seeing its tables, and another session can tell it's in use, and the one it would return to.  A
+# checkout rolled back, or rolled back to a savepoint, is undone; of several in one transaction, the
+# last is kept; one in a savepoint released stands, and so does one in a function; a function's own
+# setting is undone as it returns; after a reset the session is where it started.  What another can
+# tell is always where the session is or would return to, until it's gone, mid-transaction or not.  One in a transaction that has changed a versioned schema is refused, and one of a
 # branch not there.  While a change has a branch from its sessions, a checkout of it waits.  A new
 # session checks out the database's default branch, or the one its connection names.
 
@@ -49,6 +50,7 @@ is(in_use($main) . in_use($feat), 'tf', 'it alone held');
 # Rolled back, and rolled back to a savepoint: undone, the hold given back.
 $s->query_safe(q{BEGIN; SELECT test_branch_checkout('feat')});
 is(in_use($feat), 't', 'a checkout in a transaction holds the branch');
+is(in_use($main), 't', 'and the one it would return to, were it rolled back');
 $s->query_safe('ROLLBACK');
 is($s->query_safe('SHOW catalog_branch'), $main, 'rolled back, the session is where it was');
 is(in_use($main) . in_use($feat), 'tf', 'holding what it held');
@@ -69,6 +71,22 @@ $s->query_safe(q{SELECT app.go()});
 is($s->query_safe('SHOW catalog_branch'), $feat, 'a checkout in a function stands as it returns');
 is(in_use($main) . in_use($feat), 'ft', 'and what another can tell is where the session is');
 $s->query_safe(q{SELECT test_branch_checkout('main')});
+
+# A function's own setting of the branch: in use while it runs, undone as it returns.
+$node->safe_psql('postgres', qq{SET catalog_branch = $main; CREATE FUNCTION app.on_feat() RETURNS boolean LANGUAGE sql
+	SET catalog_branch = $feat AS 'SELECT test_branch_in_use($main) IS NOT NULL'});
+my ($frc, $fout, $ferr) = $node->psql('postgres', qq{SET catalog_branch = $main; SELECT app.on_feat()});
+if ($frc == 0)
+{
+	$s->query_safe(q{SELECT app.on_feat()});
+	is($s->query_safe('SHOW catalog_branch'), $main, 'a function\'s own setting of the branch is undone as it returns');
+	is(in_use($main) . in_use($feat), 'tf', 'and what another can tell is where the session is');
+}
+else
+{
+	like($ferr, qr/catalog_branch/, 'a function can\'t set the branch itself');
+	pass('and so leaves nothing to undo');
+}
 
 # Reset: on the branch it resets to, and holding that.
 $s->query_safe(q{SELECT test_branch_checkout('feat')});
@@ -116,9 +134,16 @@ is($w->query_safe('SHOW catalog_branch'), $feat, 'and then checks out');
 $_->quit for ($taker, $w);
 ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($feat)"), 'which, gone, holds nothing');
 
-# Leaving: the hold goes with the session.
+# Leaving: the hold goes with the session, and with one ended in the middle of a transaction.
 $s->quit;
 ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($main)"), 'a session gone holds nothing');
+my $mid = $node->background_psql('postgres');
+$mid->query_safe(q{SELECT test_branch_checkout('main')});
+my $midpid = $mid->query_safe(q{BEGIN; SELECT test_branch_checkout('feat'); SELECT pg_backend_pid()});
+$node->safe_psql('postgres', "SELECT pg_terminate_backend($midpid)");
+eval { $mid->quit };
+ok($node->poll_query_until('postgres', "SELECT NOT test_branch_in_use($main) AND NOT test_branch_in_use($feat)"),
+	'and one ended in the middle of a transaction');
 
 # The database's default branch, and a connection's own.
 $node->safe_psql('postgres', q{ALTER DATABASE postgres SET default_branch = 'feat'});

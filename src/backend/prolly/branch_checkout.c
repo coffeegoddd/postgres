@@ -4,20 +4,22 @@
  *	  A session on a branch, held for it.
  *
  * Which branch each backend is on is in shared memory: its slot has the
- * catalog branch catalog_branch now names, written as the setting changes, so
- * it follows the setting through every commit, abort, savepoint, function's
- * own setting and reset.  A checkout takes the branch's lock, a database
- * object lock of pg_database's class on its number with sub-id 2 (its
- * catalogs' lock has sub-id 1), in a mode only a change taking the branch
- * from its sessions conflicts with, and sets catalog_branch while holding
- * it, until its transaction ends.  That change asks for the lock
- * conditionally, in a mode that conflicts, which it holds to its
- * transaction's end, and then reads the slots: a checkout in a transaction
- * still open holds the lock, one done is in its slot, and one that comes
- * after waits.  A session that sets catalog_branch itself takes no lock, so
- * it may land on a branch just being taken, and then finds it gone, as it
- * would a schema dropped under it.
-
+ * catalog branch catalog_branch now names, written as the setting changes,
+ * and the one the session would be on were its transaction to abort: what it
+ * was as the transaction began, which only a commit or prepare moves on.
+ * Whatever else a transaction may yet return to, by a savepoint rolled back or
+ * a function's setting undone, was set by a checkout in it, which holds that
+ * branch's lock until the transaction ends.  A checkout takes the branch's
+ * lock, a database object lock of pg_database's class on its number with
+ * sub-id 2 (its catalogs' lock has sub-id 1), in a mode only a change taking
+ * the branch from its sessions conflicts with, and sets catalog_branch while
+ * holding it.  That change asks for the lock conditionally, in a mode that
+ * conflicts, which it holds to its transaction's end, and then reads the
+ * slots: a checkout in a transaction still open holds the lock, one done is in
+ * its slot, and one that comes after waits.  A session that sets
+ * catalog_branch itself takes no lock, so it may land on a branch just being
+ * taken, and then finds it gone, as it would a schema dropped under it.
+ *
  * Whether a transaction has written to a versioned schema is told by the
  * locks it holds: a write, or a change of an object, takes its relation's
  * lock in a mode above what a read or a row lock takes, and keeps it until
@@ -47,15 +49,18 @@
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 
 char	   *default_branch = NULL;
 
-/* A backend's slot: its database, and the catalog branch it's on, or 0. */
+/*
+ * A backend's slot: its database, the catalog branch it's on, and the one it was on as its
+ * transaction began, or 0.
+ */
 typedef struct CheckoutSlot
 {
 	pg_atomic_uint32 db;
 	pg_atomic_uint32 branch;
+	pg_atomic_uint32 base;
 } CheckoutSlot;
 
 static CheckoutSlot *slots = NULL;
@@ -93,6 +98,7 @@ BranchCheckoutShmemInit(void *arg)
 	{
 		pg_atomic_init_u32(&slots[i].db, InvalidOid);
 		pg_atomic_init_u32(&slots[i].branch, 0);
+		pg_atomic_init_u32(&slots[i].base, 0);
 	}
 }
 
@@ -102,25 +108,59 @@ hold_tag(LOCKTAG *tag, int32 branch)
 	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, DatabaseRelationId, (Oid) branch, 2);
 }
 
-/* (as the setting changes: anywhere, an abort too, so only what can't fail) */
+static bool exited = false;
+
+static CheckoutSlot *
+my_slot(void)
+{
+	if (slots == NULL || MyProcNumber < 0 || exited)
+		return NULL;
+	if (nslots == 0)
+		nslots = slot_count();
+	return MyProcNumber < nslots ? &slots[MyProcNumber] : NULL;
+}
+
+/*
+ * (as the setting changes: anywhere, an abort too, so only what can't fail.  Outside a
+ * transaction, or as the top one ends and what it set only for itself is undone, it's what the
+ * next begins on too.)
+ */
 void
 BranchCheckoutNote(int32 branch)
 {
-	if (slots == NULL || MyProcNumber < 0)
+	CheckoutSlot *mine = my_slot();
+
+	if (mine == NULL)
 		return;
-	if (nslots == 0)
-		nslots = slot_count();
-	if (MyProcNumber >= nslots)
-		return;
-	pg_atomic_write_u32(&slots[MyProcNumber].db, MyDatabaseId);
-	pg_atomic_write_u32(&slots[MyProcNumber].branch, (uint32) branch);
+	pg_atomic_write_u32(&mine->db, MyDatabaseId);
+	pg_atomic_write_u32(&mine->branch, (uint32) branch);
+	if (GetCurrentTransactionNestLevel() <= 1 && !IsTransactionState())
+		pg_atomic_write_u32(&mine->base, (uint32) branch);
 }
 
-/* (a backend exiting is on no branch) */
+/* (at a commit or prepare, what it's on is what it would return to; its own settings undone after) */
+static void
+checkout_xact_callback(XactEvent event, void *arg)
+{
+	CheckoutSlot *mine = my_slot();
+
+	if (mine != NULL &&
+		(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PREPARE))
+		pg_atomic_write_u32(&mine->base, pg_atomic_read_u32(&mine->branch));
+}
+
+/* (a backend exiting is on no branch, whatever its abort, which comes after, sets) */
 static void
 checkout_exit(int code, Datum arg)
 {
-	BranchCheckoutNote(0);
+	CheckoutSlot *mine = my_slot();
+
+	if (mine == NULL)
+		return;
+	pg_atomic_write_u32(&mine->branch, 0);
+	pg_atomic_write_u32(&mine->base, 0);
+	pg_atomic_write_u32(&mine->db, InvalidOid);
+	exited = true;
 }
 
 /* Whether the transaction holds a versioned relation's lock in a mode that writes or changes it. */
@@ -213,7 +253,8 @@ session_in_use(int32 branch)
 	for (int i = 0; i < nslots; i++)
 	{
 		if (i != MyProcNumber && pg_atomic_read_u32(&slots[i].db) == MyDatabaseId &&
-			pg_atomic_read_u32(&slots[i].branch) == (uint32) branch)
+			(pg_atomic_read_u32(&slots[i].branch) == (uint32) branch ||
+			 pg_atomic_read_u32(&slots[i].base) == (uint32) branch))
 			return true;
 	}
 	return false;
@@ -231,8 +272,13 @@ const BranchCheckoutRoutine *BranchCheckout = &SessionBranchCheckout;
 void
 BranchCheckoutBackendStart(bool client)
 {
+	CheckoutSlot *mine = my_slot();
+
 	before_shmem_exit(checkout_exit, (Datum) 0);
+	RegisterXactCallback(checkout_xact_callback, NULL);
 	BranchCheckoutNote(catalog_branch);
+	if (mine != NULL)
+		pg_atomic_write_u32(&mine->base, (uint32) catalog_branch);
 	if (client && default_branch != NULL && default_branch[0] != '\0')
 		BranchCheckout->checkout(default_branch);
 }
