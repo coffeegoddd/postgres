@@ -25,13 +25,15 @@
 const WsSqlRoutine *WsSql = &SpiWsSql;
 
 /*
- * The settings a commit is captured under.  (lc_monetary: money's output.
+ * The settings the engine's statements run under: a commit is captured under them, and a root
+ * restored, merged or moved to.  (lc_monetary: money's output.
  * quote_all_identifiers: what format_type and the pg_get_* functions print.
  * catalog_branch_filter: other branches' objects stay out of a commit.
  * row_security: a policy does not quietly leave rows out.
  * default_tablespace, default_table_access_method: what a statement does not
  * say is what a record holds.
- * xmloption: a value is read back whichever form it is in.)
+ * xmloption: a value is read back whichever form it is in.
+ * event_triggers: no event trigger runs for what is done here.)
  */
 static const struct
 {
@@ -51,6 +53,7 @@ static const struct
 	{"default_tablespace", ""},
 	{"default_table_access_method", "heap"},
 	{"xmloption", "content"},
+	{"event_triggers", "off"},
 };
 
 /* (as PGC_SUSET: catalog_branch_filter is, and this is no user's choosing) */
