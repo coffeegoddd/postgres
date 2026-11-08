@@ -162,7 +162,7 @@ branch_after_commit(void)
 		case GUC_SET_LOCAL:
 			return st->masked.val.intval;
 		case GUC_SET:
-			break;
+			return catalog_branch;
 	}
 	return catalog_branch;
 }
