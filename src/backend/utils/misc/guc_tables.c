@@ -72,6 +72,7 @@
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_checkout.h"
 #include "prolly/branch_filter.h"
 #include "prolly/chunk_format.h"
 #include "prolly/capture.h"

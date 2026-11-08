@@ -264,6 +264,7 @@ tests += {
       't/135_chunk_lane_event_triggers.pl',
       't/136_capture_barrier_lock_wait.pl',
       't/137_branch_roots.pl',
+      't/140_branch_checkout.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

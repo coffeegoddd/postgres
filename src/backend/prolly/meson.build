@@ -4,6 +4,7 @@ backend_sources += files(
   'branch_catalog.c',
   'branch_catalog_copy.c',
   'branch_catalog_ops.c',
+  'branch_checkout.c',
   'branch_filter.c',
   'branch_link.c',
   'branch_tables.c',
