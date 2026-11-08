@@ -1,8 +1,9 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Moves in place a first build got wrong, each kept: objects and tables whose names are each a
-# prefix of another's; a partition, with an index and a constraint of its own, that the target
-# drops or detaches; and a table whose fillfactor alone changes, which is altered, not made again.
+# Moves in place a first build got wrong, each kept: keys of views and tables each a prefix of
+# another's; a partition, with what it has of its own and of its table, that the target drops or
+# detaches; and a table whose storage parameters alone change, a TOAST table's among them, which is
+# altered, not made again.
 
 use strict;
 use warnings FATAL => 'all';
@@ -71,6 +72,7 @@ my $second = commit_root();
 sql(q{SET ROLE app_owner; SET search_path = app; DROP VIEW v; DROP TABLE t; INSERT INTO t2 VALUES (2, 3)});
 my $third = commit_root();
 
+# (what tells a key taken for another's: what is there)
 sub names
 {
 	return sql(q{SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM pg_class c
@@ -81,11 +83,11 @@ is(names(), 't,t2,t2_pkey,t_pkey,t_v,v', 'names: each of the first, and nothing 
 my %oid = map { $_ => oid_of("app.$_") } qw(v t2);
 move_to($second, 'names: to the second, which adds the longer');
 is(names(), 't,t2,t2_pkey,t_pkey,t_v,t_v2,v,v2', 'names: the longer made beside the shorter');
-is(oid_of('app.v'), $oid{v}, 'names: the shorter view kept, not taken for the longer');
+is(oid_of('app.v'), $oid{v}, 'names: the shorter view kept, not made again');
 $oid{v2} = oid_of('app.v2');
 move_to($third, 'names: to the third, which drops the shorter');
 is(names(), 't2,t2_pkey,v2', 'names: the shorter gone, the longer there');
-is(oid_of('app.v2'), $oid{v2}, 'names: the longer view kept, not taken for the shorter');
+is(oid_of('app.v2'), $oid{v2}, 'names: the longer view kept, not made again');
 is(oid_of('app.t2'), $oid{t2}, 'names: and the longer table');
 move_to($second, 'names: and back');
 is(oid_of('app.v2'), $oid{v2}, 'names: the longer view kept still');
@@ -113,14 +115,14 @@ sql(q{SET ROLE app_owner; SET search_path = app;
 
 sub of_partition
 {
-	return sql(q{SELECT (SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class
-			WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'ev\_a%') || ' ' ||
-		(SELECT string_agg(tgname, ',' ORDER BY tgname) FROM pg_trigger
-			WHERE tgrelid = to_regclass('app.ev_a') AND NOT tgisinternal) || ' ' ||
-		(SELECT string_agg(conname, ',' ORDER BY conname) FROM pg_constraint
-			WHERE conrelid = to_regclass('app.ev_a') AND contype = 'c') || ' ' ||
-		(SELECT string_agg(polname, ',') FROM pg_policy WHERE polrelid = to_regclass('app.ev_a')) || ' ' ||
-		(SELECT string_agg(stxname, ',') FROM pg_statistic_ext WHERE stxrelid = to_regclass('app.ev_a'))});
+	return sql(q{SELECT coalesce((SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class
+			WHERE relnamespace = 'app'::regnamespace AND relname LIKE 'ev\_a%'), '-') || ' ' ||
+		coalesce((SELECT string_agg(tgname, ',' ORDER BY tgname) FROM pg_trigger
+			WHERE tgrelid = to_regclass('app.ev_a') AND NOT tgisinternal), '-') || ' ' ||
+		coalesce((SELECT string_agg(conname, ',' ORDER BY conname) FROM pg_constraint
+			WHERE conrelid = to_regclass('app.ev_a') AND contype = 'c'), '-') || ' ' ||
+		coalesce((SELECT string_agg(polname, ',') FROM pg_policy WHERE polrelid = to_regclass('app.ev_a')), '-') || ' ' ||
+		coalesce((SELECT string_agg(stxname, ',') FROM pg_statistic_ext WHERE stxrelid = to_regclass('app.ev_a')), '-')});
 }
 my $whole = commit_root();
 my $whole_has = of_partition();
@@ -130,6 +132,7 @@ my $dropped = commit_root();
 sql(q{SET ROLE app_owner; SET search_path = app;} . $partition . q{; ALTER TABLE ev DETACH PARTITION ev_a});
 my $detached = commit_root();
 my $detached_has = of_partition();
+like(slurp_file($node->logfile), qr/user code ran: ev_a INSERT/, 'partitions: its triggers run where they would');
 my $log_at = -s $node->logfile;
 move_to($whole, 'partitions: to the whole table');
 %oid = map { $_ => oid_of("app.$_") } qw(ev ev_b);
