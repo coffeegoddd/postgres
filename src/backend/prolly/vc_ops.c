@@ -37,11 +37,11 @@ ident_check(const VcIdent *id, const char *who)
 	if (id->name && id->name[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("Aborting commit due to empty %s name.", who)));
+				 errmsg("Aborting commit due to empty %s name. Is your config set?", who)));
 	if (id->email && id->email[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("Aborting commit due to empty %s email.", who)));
+				 errmsg("Aborting commit due to empty %s email. Is your config set?", who)));
 }
 
 static void
@@ -50,7 +50,7 @@ options_check(const VcCommitOptions *opts)
 	if (opts->allow_empty && opts->skip_empty)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot use both --allow-empty and --skip-empty")));
+				 errmsg("error: cannot use both --allow-empty and --skip-empty")));
 	if (!opts->amend && opts->msg == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -74,21 +74,28 @@ commit_made(const char *name, const VcCommitOptions *opts, int timeout_ms, PHash
 	PHash		root;
 	const char *msg = opts->msg && opts->msg[0] != '\0' ? opts->msg : NULL;
 	int			flags = (opts->allow_empty ? VC_COMMIT_ALLOW_EMPTY : 0) |
-		(opts->amend ? VC_COMMIT_AMEND : 0);
+		(opts->amend ? VC_COMMIT_AMEND : 0) | (opts->skip_empty ? VC_COMMIT_SKIP_EMPTY : 0);
 	int			rc;
 
-	/* (before the head's lock, as what it's to wait on can be waiting on what this has written) */
+	/*
+	 * (before the head's lock, as what it's to wait on can be waiting on what this has written; a
+	 * commit writes too, so a transaction block holds one at most)
+	 */
 	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit can't be made in a transaction that has written"),
+				 errdetail("A commit writes, so a transaction block can make only one."),
 				 errhint("Commit the transaction first, or make the commit with CALL outside a transaction block.")));
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	branch = BranchLink->branch_of(name);
 	if (branch != 0)
 	{
 		LockBranchHead(branch);
-		/* (renamed, deleted or given back as it waited: it would commit what's no longer the branch's) */
+		/*
+		 * (renamed, deleted or given back as it waited: it would commit what's no longer the
+		 * branch's)
+		 */
 		if (BranchLink->branch_of(name) != branch)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),

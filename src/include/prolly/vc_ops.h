@@ -39,8 +39,9 @@ typedef struct VcOpsRoutine
 	 * capture has of it there, waited for for up to timeout_ms; a branch with
 	 * no working set has its head as one.  The commit in *out, and true.
 	 * With nothing to commit (its working set its head's, and no merge in
-	 * progress), refused, or with skip_empty, false and nothing made; with
-	 * allow_empty or amend, made all the same.  Amending, the commit takes
+	 * progress), refused; with allow_empty or amend, made all the same; with
+	 * skip_empty, false and nothing made, amending or merging too, if its
+	 * working set is its head's.  Amending, the commit takes
 	 * the head's place, its parents, and its message if given none; refused
 	 * while a merge is in progress.  Dolt's commit commits the SQL
 	 * transaction first: so does this with nonatomic (a CALL outside a
@@ -49,7 +50,7 @@ typedef struct VcOpsRoutine
 	 * Unlike Dolt, in a transaction block, where Postgres lets nothing
 	 * commit: it's made in the caller's transaction, which an abort then
 	 * undoes, and refused once that has written, as what the commit waits
-	 * for would wait on it.
+	 * for would wait on it; a commit writes, so a block makes one at most.
 	 */
 	bool		(*commit) (const char *branch, const VcCommitOptions *opts, bool nonatomic,
 						   int timeout_ms, PHash *out);

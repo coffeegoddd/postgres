@@ -1416,19 +1416,25 @@ vc_commit_with(VcRepo *r, const PHash *root, const char *msg,
 	char	   *amended_msg = NULL;
 
 	lock_head(r, &b);
-	if (root == NULL)
-		root = &b.head_root;
 	if ((flags & VC_COMMIT_AMEND) && b.merging)
 	{
 		vc_branch_free(&b);
 		return VC_ERR_MERGING;
 	}
-	if (!(flags & (VC_COMMIT_ALLOW_EMPTY | VC_COMMIT_AMEND)) && !b.merging &&
-		phash_eq(root, &b.head_root))
+	if (phash_eq(root ? root : &b.head_root, &b.head_root) &&
+		((flags & VC_COMMIT_SKIP_EMPTY) ||
+		 (!(flags & (VC_COMMIT_ALLOW_EMPTY | VC_COMMIT_AMEND)) && !b.merging)))
 	{
 		vc_branch_free(&b);
 		return VC_ERR_NOTHING;
 	}
+	if (root == NULL && b.merging)
+	{
+		vc_branch_free(&b);
+		return VC_ERR_MERGING;
+	}
+	if (root == NULL)
+		root = &b.head_root;
 	if (flags & VC_COMMIT_AMEND)
 	{
 		VcCommit	head = must_load_commit(&r->ctx, &b.head);

@@ -334,17 +334,20 @@ extern PHash vc_commit_root(VcRepo *r, const PHash *root, const char *msg);
 /* vc_commit_with's flags. */
 #define VC_COMMIT_ALLOW_EMPTY 0x1	/* a commit whose root is its head's */
 #define VC_COMMIT_AMEND 0x2		/* in place of the head: its parents */
+#define VC_COMMIT_SKIP_EMPTY 0x4	/* none whose root is its head's, whatever */
 
 /*
  * As vc_commit_root, as Dolt's commit is, made by meta (NULL: the
  * defaults), of root, or of the head's root if that's NULL (a branch
  * whose working set is its head); the commit in *out.  VC_ERR_NOTHING,
- * with nothing made, if
- * root is the head's root with no merge in progress, unless allowed empty
- * or amending.  Amending, the commit takes the head's parents, and msg
- * NULL takes the head's message; VC_ERR_MERGING while a merge is in
- * progress.  The branch is locked before it's read, as every call that
- * changes one.
+ * with nothing made, if root is the head's root with no merge in
+ * progress, unless allowed empty or amending; and if it is with
+ * VC_COMMIT_SKIP_EMPTY, merging or amending or not, as Dolt's
+ * --skip-empty.  Amending, the commit takes the head's parents, and msg
+ * NULL takes the head's message.  VC_ERR_MERGING for an amend while a
+ * merge is in progress, and for the head's root then, which would leave
+ * the merge's changes out.  The branch is locked before it's read, as
+ * every call that changes one.
  */
 extern int	vc_commit_with(VcRepo *r, const PHash *root, const char *msg,
 						   const VcCommitMeta *meta, int flags, PHash *out);

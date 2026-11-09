@@ -835,7 +835,13 @@ ENGINE_TEST(test_commit_with)
 	CHECK(c.nparents == 1 && phash_eq(&c.parents[0], &base) && held_is(c.msg, c.msglen, "reworded"));
 	vc_commit_release(&c);
 
-	/* a merge in progress: no amending, and the head's root commits it */
+	/* skipping empty: nothing made, amending too */
+	CHECK_EQ(vc_commit_with(&r, &root, "skip", NULL, VC_COMMIT_AMEND | VC_COMMIT_SKIP_EMPTY, &a),
+			 VC_ERR_NOTHING);
+	a = head_of(&r);
+	CHECK(phash_eq(&a, &h));
+
+	/* a merge in progress: no amending, nor the head's root, which leaves its changes out */
 	CHECK_EQ(vc_branch_create(&r, "feature", NULL), VC_OK);
 	put_row(&r, "t", 1, 1);
 	vc_commit(&r, "main side");
@@ -847,10 +853,40 @@ ENGINE_TEST(test_commit_with)
 	CHECK(m.status == VC_MERGE_CONFLICTS);
 	vc_merge_result_free(&m);
 	CHECK_EQ(vc_commit_with(&r, NULL, NULL, NULL, VC_COMMIT_AMEND, &h), VC_ERR_MERGING);
-	CHECK_EQ(vc_commit_with(&r, NULL, "merged", NULL, 0, &h), VC_OK);
+	CHECK_EQ(vc_commit_with(&r, NULL, "merged", NULL, 0, &h), VC_ERR_MERGING);
+	root = vc_working(&r);
+	CHECK_EQ(vc_commit_with(&r, &root, "merged", NULL, 0, &h), VC_OK);
 	CHECK(vc_commit_load(&r.ctx, &h, &c));
 	CHECK_EQ(c.nparents, 2);
 	vc_commit_release(&c);
+	/* a merge commit amended keeps both parents */
+	{
+		VcCommit	merged,
+					amended;
+
+		CHECK(vc_commit_load(&r.ctx, &h, &merged));
+		CHECK_EQ(vc_commit_with(&r, &root, "merge reworded", NULL, VC_COMMIT_AMEND, &a), VC_OK);
+		CHECK(vc_commit_load(&r.ctx, &a, &amended));
+		CHECK(amended.nparents == 2 && phash_eq(&amended.parents[0], &merged.parents[0]) &&
+			  phash_eq(&amended.parents[1], &merged.parents[1]));
+		vc_commit_release(&merged);
+		vc_commit_release(&amended);
+	}
+
+	/* a commit cut short, in its idents or its message, isn't one */
+	{
+		uint32		len;
+		uint8	   *d = cs_get(cs, a.b, &len);
+
+		for (uint32 cut = 1; cut <= 24; cut++)
+		{
+			PHash		bad;
+
+			CHECK_EQ(prolly_put_chunk(&r.ctx, d, len - cut, &bad), PROLLY_OK);
+			CHECK(!vc_commit_load(&r.ctx, &bad, &c));
+		}
+		pfree(d);
+	}
 	settle_and_check(cs);
 	vc_repo_free(&r);
 	cs_destroy(cs);

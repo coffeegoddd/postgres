@@ -72,14 +72,14 @@ is(meta($e, 'root'), meta($c1, 'root'), 'of its root');
 
 # Dolt's refusals.
 refused(on($main) . q{SELECT test_vc_ops_commit('main', 'x', allow_empty => true, skip_empty => true)},
-	qr/cannot use both --allow-empty and --skip-empty/, 'both empties refused');
+	qr/error: cannot use both --allow-empty and --skip-empty/, 'both empties refused');
 refused(on($main) . q{SELECT test_vc_ops_commit('main')}, qr/Must provide commit message\./, 'no message refused');
 refused(on($main) . q{SELECT test_vc_ops_commit('main', '', allow_empty => true)},
 	qr/Aborting commit due to empty commit message\./, 'an empty message refused');
 refused(on($main) . q{SELECT test_vc_ops_commit('main', 'x', author => '', allow_empty => true)},
-	qr/Aborting commit due to empty author name\./, 'an empty author refused');
+	qr/Aborting commit due to empty author name\. Is your config set\?/, 'an empty author refused');
 refused(on($main) . q{SELECT test_vc_ops_commit('main', 'x', committer_email => '', allow_empty => true)},
-	qr/Aborting commit due to empty committer email\./, 'an empty committer email refused');
+	qr/Aborting commit due to empty committer email\. Is your config set\?/, 'an empty committer email refused');
 refused(on($main) . q{SELECT test_vc_ops_commit('nowhere', 'x', allow_empty => true)},
 	qr/branch "nowhere" not found/, 'a branch that isn\'t refused');
 is(head('main'), $e, 'none of them moves the head');
@@ -109,6 +109,9 @@ is(meta($a, q{test_dbroot_schemas(root)}),
 my $a2 = sql($main, q{SELECT test_vc_ops_commit('main', 'reworded', amend => true)});
 is(meta($a2, q{message || ' ' || parents[1]}), "reworded $c2", 'amended with nothing changed, a message given');
 is(meta($a2, 'root'), meta($a, 'root'), 'the same root');
+is(sql($main, q{SELECT test_vc_ops_commit('main', 'x', amend => true, skip_empty => true) IS NULL}), 't',
+	'amending with --skip-empty and nothing changed makes none, as Dolt\'s');
+is(head('main'), $a2, 'the head kept');
 
 # A branch with no working set: its head is one.
 $node->safe_psql('postgres', q{SELECT test_branch_make('h', 'main')});
@@ -118,6 +121,9 @@ my $h = $node->safe_psql('postgres', q{SELECT test_vc_ops_commit('h', 'on h', al
 is(meta($h, q{parents[1]}), $a2, 'allowed empty, it\'s committed after its head');
 is(meta($h, 'root'), meta($a2, 'root'), 'of its head\'s root');
 is($node->safe_psql('postgres', q{SELECT test_branch_of('h') IS NULL}), 't', 'and given no working set');
+my $ha = $node->safe_psql('postgres', q{SELECT test_vc_ops_commit('h', 'on h, amended', amend => true)});
+is(meta($ha, q{message || ' ' || parents[1] || ' ' || (root = '} . meta($h, 'root') . q{')}), "on h, amended $a2 true",
+	'amended, in its head\'s place');
 
 # In a transaction block: made in it, undone with it, refused once it has written.
 refused(on($main) . q{BEGIN; INSERT INTO app.t VALUES (10, 'w'); SELECT test_vc_ops_commit('main', 'w')},
@@ -131,6 +137,11 @@ sql($main, q{BEGIN; CALL test_vc_ops_commit_call('main', 'in a block'); COMMIT})
 my $b = head('main');
 isnt($b, $a2, 'called in a transaction block, it\'s made in it');
 is(meta($b, q{message}), 'in a block', 'as told');
+refused(on($main) . q{BEGIN; SELECT test_vc_ops_commit('main', 'one', allow_empty => true);
+	SELECT test_vc_ops_commit('main', 'two', allow_empty => true)},
+	qr/a commit can't be made in a transaction that has written\nDETAIL:  A commit writes, so a transaction block can make only one\./,
+	'a second commit in a transaction block refused, as the first wrote');
+is(head('main'), $b, 'and the first with it');
 
 # Called outside one: the transaction committed first, its writes then in the commit, which is
 # durable when the call returns.
@@ -166,7 +177,26 @@ my $second = head('main');
 my $first = meta($second, q{parents[1]});
 is(meta($first, q{message || ' ' || parents[1]}), "first $before", 'the first after the head');
 is(meta($second, q{message}), 'second', 'the second after the first, waiting its turn');
+
+# A branch renamed as its commit waited for it: the commit refused, as it would be of a name no longer
+# the branch's.
+$node->safe_psql('postgres', q{SELECT test_branch_create('f', 'main')});
+# (the waiting session carrying on past its error, to say it's done)
+my $s3 = $node->background_psql('postgres', on_error_stop => 0);
+$s1->query_safe(q{BEGIN; SELECT test_branch_rename('f', 'g')});
+$s3->query_until(qr/started/, q{\echo started
+	SELECT test_vc_ops_commit('f', 'renamed away', allow_empty => true);
+	\echo done
+});
+$node->poll_query_until('postgres',
+	q{SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%renamed away%'})
+  or die 'the commit never waited for the rename';
+$s1->query_safe('COMMIT');
+$s3->query_until(qr/done/, '');
+like($s3->{stderr}, qr/branch "f" changed as it was being committed/, 'a commit waiting out a rename is refused');
+is(head('g'), $second, 'and made nothing on it');
 $s1->quit;
 $s2->quit;
+$s3->quit;
 
 done_testing();

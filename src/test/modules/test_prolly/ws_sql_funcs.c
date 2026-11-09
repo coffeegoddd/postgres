@@ -16,6 +16,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "common/int.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -1154,7 +1155,28 @@ arg_ident(FunctionCallInfo fcinfo, int i, VcIdent *id)
 	id->email = arg_text(fcinfo, i + 1);
 	id->dated = !PG_ARGISNULL(i + 2);
 	if (id->dated)
-		id->date = PG_GETARG_TIMESTAMPTZ(i + 2) + UNIX_EPOCH_USECS;
+	{
+		TimestampTz date = PG_GETARG_TIMESTAMPTZ(i + 2);
+
+		if (TIMESTAMP_NOT_FINITE(date))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a commit's date is a time")));
+		id->date = date + UNIX_EPOCH_USECS;
+	}
+}
+
+/* (a commit's date as a timestamptz, which it can be out of the range of) */
+static Datum
+date_datum(int64 date)
+{
+	TimestampTz ts;
+
+	if (pg_sub_s64_overflow(date, UNIX_EPOCH_USECS, &ts) || !IS_VALID_TIMESTAMP(ts))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("a commit's date is out of a timestamp's range")));
+	return TimestampTzGetDatum(ts);
 }
 
 /*
@@ -1232,10 +1254,10 @@ test_vc_commit_meta(PG_FUNCTION_ARGS)
 				 errmsg("no commit %s", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
 	values[0] = held_text(c.author.name, c.author.namelen);
 	values[1] = held_text(c.author.email, c.author.emaillen);
-	values[2] = TimestampTzGetDatum(c.author.date - UNIX_EPOCH_USECS);
+	values[2] = date_datum(c.author.date);
 	values[3] = held_text(c.committer.name, c.committer.namelen);
 	values[4] = held_text(c.committer.email, c.committer.emaillen);
-	values[5] = TimestampTzGetDatum(c.committer.date - UNIX_EPOCH_USECS);
+	values[5] = date_datum(c.committer.date);
 	values[6] = held_text(c.msg, c.msglen);
 	parents = palloc_array(Datum, Max(c.nparents, 1));
 	for (uint32 i = 0; i < c.nparents; i++)
