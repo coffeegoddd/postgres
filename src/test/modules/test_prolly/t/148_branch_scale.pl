@@ -6,9 +6,9 @@
 # is given its working set.  A working set takes C object ids from the cluster's 32-bit counter, one
 # for each object it copies, and its catalog rows are read, and hidden, by every scan of a catalog on
 # another branch: a scan costs more with every object on other branches, as does a catalog query by
-# a name other branches' objects have too, while one by name in a schema, and names resolved, do not.  A thousand
-# branches of one table, each with one row changed, store the pages they changed, not a thousand
-# copies of the table.
+# a name other branches' objects have too, while one by name in a schema, and names resolved, do
+# not.  A thousand branches of one table, each with one row changed, store the pages they changed,
+# not a thousand copies of the table.
 
 use strict;
 use warnings FATAL => 'all';
@@ -83,8 +83,8 @@ is($node->safe_psql('postgres', $schemas), $before{schemas}, 'with no catalog ro
 is(cost($scan), $before{scan}, 'a catalog scan costs what it did');
 is(cost($any_named), $before{any_named}, 'a catalog query by name too');
 is(cost($resolved), $before{resolved}, 'and names resolved');
-# (another level of the heads' index may be read)
-cmp_ok(checkout('k'), '<=', $before{checkout} + 3, 'a checkout reads the blocks it did');
+# (one with a working set reads its link, not the heads)
+is(checkout('k'), $before{checkout}, 'a checkout reads the blocks it did');
 my $h = (split /\n/, $node->safe_psql('postgres', q{SELECT test_branch_checkout('h5000'); SELECT test_branch_of('h5000')}))[-1];
 ok($h > 0, 'one of them checked out is given its working set');
 is(sql($h, q{SELECT count(*) FROM app.t}), '100000', 'at its head');
