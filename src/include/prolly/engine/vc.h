@@ -334,7 +334,7 @@ extern PHash vc_commit_root(VcRepo *r, const PHash *root, const char *msg);
 /* vc_commit_with's flags. */
 #define VC_COMMIT_ALLOW_EMPTY 0x1	/* a commit whose root is its head's */
 #define VC_COMMIT_AMEND 0x2		/* in place of the head: its parents */
-#define VC_COMMIT_SKIP_EMPTY 0x4	/* none whose root is its head's, whatever */
+#define VC_COMMIT_SKIP_EMPTY 0x4	/* none whose root is its head's, merging or amending too */
 
 /*
  * As vc_commit_root, as Dolt's commit is, made by meta (NULL: the

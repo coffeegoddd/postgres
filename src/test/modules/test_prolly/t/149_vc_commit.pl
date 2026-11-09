@@ -82,6 +82,10 @@ refused(on($main) . q{SELECT test_vc_ops_commit('main', 'x', committer_email => 
 	qr/Aborting commit due to empty committer email\. Is your config set\?/, 'an empty committer email refused');
 refused(on($main) . q{SELECT test_vc_ops_commit('nowhere', 'x', allow_empty => true)},
 	qr/branch "nowhere" not found/, 'a branch that isn\'t refused');
+refused(on($main) . q{SELECT test_vc_ops_commit('main', 'x', author_date => '294270-01-01+00', allow_empty => true)},
+	qr/a commit's date is out of range/, 'a date past what a commit holds refused');
+refused(on($main) . q{SELECT test_vc_ops_commit('main', 'x', author_date => 'infinity', allow_empty => true)},
+	qr/a commit's date is a time/, 'an infinite date refused');
 is(head('main'), $e, 'none of them moves the head');
 
 # Who, as given: --author and --date set the committer's too, unless it's given.
@@ -139,7 +143,7 @@ isnt($b, $a2, 'called in a transaction block, it\'s made in it');
 is(meta($b, q{message}), 'in a block', 'as told');
 refused(on($main) . q{BEGIN; SELECT test_vc_ops_commit('main', 'one', allow_empty => true);
 	SELECT test_vc_ops_commit('main', 'two', allow_empty => true)},
-	qr/a commit can't be made in a transaction that has written\nDETAIL:  A commit writes, so a transaction block can make only one\./,
+	qr/a commit can't be made in a transaction that has written\nDETAIL:  .*a commit writes too, so a transaction block makes one at most\./,
 	'a second commit in a transaction block refused, as the first wrote');
 is(head('main'), $b, 'and the first with it');
 

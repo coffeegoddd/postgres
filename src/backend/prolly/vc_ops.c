@@ -85,7 +85,7 @@ commit_made(const char *name, const VcCommitOptions *opts, int timeout_ms, PHash
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a commit can't be made in a transaction that has written"),
-				 errdetail("A commit writes, so a transaction block can make only one."),
+				 errdetail("What a commit waits on could wait on this transaction's writes; a commit writes too, so a transaction block makes one at most."),
 				 errhint("Commit the transaction first, or make the commit with CALL outside a transaction block.")));
 	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	branch = BranchLink->branch_of(name);
@@ -111,7 +111,8 @@ commit_made(const char *name, const VcCommitOptions *opts, int timeout_ms, PHash
 	rc = vc_commit_with(&repo, branch != 0 ? &root : NULL, msg, &opts->meta, flags, out);
 	vc_repo_free(&repo);
 	prolly_ctx_free(&ctx);
-	if (rc == VC_ERR_MERGING)
+	/* (a branch with no working set is never merging, so it's an amend that's refused so) */
+	if (rc == VC_ERR_MERGING && opts->amend)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("you are in the middle of a merge -- cannot amend")));

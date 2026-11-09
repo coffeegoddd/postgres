@@ -1162,7 +1162,10 @@ arg_ident(FunctionCallInfo fcinfo, int i, VcIdent *id)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a commit's date is a time")));
-		id->date = date + UNIX_EPOCH_USECS;
+		if (pg_add_s64_overflow(date, UNIX_EPOCH_USECS, &id->date))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("a commit's date is out of range")));
 	}
 }
 
