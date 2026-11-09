@@ -77,6 +77,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -455,6 +456,7 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 	holding.branch = parent;
 	holding.timeout_ms = timeout_ms;
 	CaptureBranchBarrierLeavingOut(ctx, parent, timeout_ms, lock_writers_out, &holding, &root);
+	INJECTION_POINT("branch-share-held", NULL);
 
 	/* (the parent still the one held, its working set not given back meanwhile) */
 	if (BranchLink->branch_of(from) != parent)
@@ -495,6 +497,7 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 	branch = BranchIds->allocate();
 	BranchCatalogCopy->copy(parent, branch, true);
 	CommandCounterIncrement();
+	INJECTION_POINT("branch-share-copied", NULL);
 
 	/*
 	 * (its tables hold the parent's working set, the root: what differs from what it's to hold
@@ -503,6 +506,7 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 	move_branch(ctx, branch, &root, &target);
 	if (take_changes)
 		move_branch(ctx, parent, &root, &head.head_root);
+	INJECTION_POINT("branch-share-moved", NULL);
 
 	if (new_head && vc_branch_create(repo, name, &at_commit) != 0)
 		elog(ERROR, "could not make branch \"%s\" of version control", name);
@@ -515,6 +519,7 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 		vc_set_working(repo, &root);
 	}
 	BranchLink->link(name, branch);
+	INJECTION_POINT("branch-share-linked", NULL);
 	BranchCheckout->used(branch);
 	vc_commit_release(&at);
 	vc_branch_free(&head);
@@ -775,6 +780,7 @@ give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool kee
 		return false;
 	default_check(name);
 	BranchCatalogs->drop(branch);
+	INJECTION_POINT("branch-give-back-dropped", NULL);
 	(void) BranchLink->unlink(name);
 	return true;
 }
@@ -930,6 +936,7 @@ remove_locked(ProllyCtx *ctx, VcRepo *repo, const char *name, bool force, int ti
 	vc_branch_free(&b);
 	if (vc_branch_delete(repo, name) != VC_OK)
 		elog(ERROR, "could not delete branch \"%s\" of version control", name);
+	INJECTION_POINT("branch-delete-removed", NULL);
 }
 
 static void

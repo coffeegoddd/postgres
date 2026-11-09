@@ -272,6 +272,7 @@ tests += {
       't/143_capture_left_out_sealed.pl',
       't/144_branch_rename_delete.pl',
       't/145_branch_idle.pl',
+      't/146_branch_crash_steps.pl',
       't/147_branch_at_once.pl',
     ],
     'env': {
