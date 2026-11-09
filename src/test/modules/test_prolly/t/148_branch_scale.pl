@@ -1,11 +1,12 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # What branches cost as there are more of them, and the limits that come with it.  A branch with no
-# working set is its head alone: ten thousand of them leave the catalogs as they were, and a catalog
-# scan, a lookup and a checkout cost what they did; one of them checked out is given its working set.
-# A working set costs C object ids from the cluster's 32-bit counter, one for each object it copies,
-# and its catalog rows are read, and hidden, by every scan of a catalog on another branch, so a scan
-# costs more with every object on other branches while a lookup by name or key does not.  A thousand
+# working set is its head alone: ten thousand of them take no object id and leave the catalogs as
+# they were, and a catalog scan, a lookup and a checkout cost what they did; one of them checked out
+# is given its working set.  A working set takes C object ids from the cluster's 32-bit counter, one
+# for each object it copies, and its catalog rows are read, and hidden, by every scan of a catalog on
+# another branch: a scan costs more with every object on other branches, as does a catalog query by
+# a name other branches' objects have too, while one by name in a schema, and names resolved, do not.  A thousand
 # branches of one table, each with one row changed, store the pages they changed, not a thousand
 # copies of the table.
 
@@ -32,17 +33,30 @@ my $unfiltered = 'SET catalog_branch_filter = off; ';
 my $schemas = $unfiltered . 'SELECT count(*) FROM pg_namespace WHERE nspbranch <> 0';
 my $classes = $unfiltered . 'SELECT count(*) FROM pg_class';
 
-# What the catalog filter does for a query on main: the questions it's asked, the catalog reads made
-# to answer them.
+# What the catalog filter does for a query on main, its map emptied first: the questions it's
+# asked, the catalog reads made to answer them.
 sub cost
 {
 	my ($query) = @_;
 	return (split /\n/, $node->safe_psql('postgres', on($main)
-		. "SELECT test_branch_map_reset(); $query; SELECT probes || ' probes, ' || reads || ' reads' FROM test_branch_map_stats()"))[-1];
+		. "SELECT test_branch_map_reset(); SELECT probes AS p0, reads AS r0 FROM test_branch_map_stats() \\gset\n$query;\n"
+		. q{SELECT (probes - :p0) || ' probes, ' || (reads - :r0) || ' reads' FROM test_branch_map_stats()}))[-1];
 }
 my $scan = 'SELECT count(*) FROM pg_class';
-my $lookup = q{SELECT count(*) FROM app.t WHERE id = 5; SELECT 'app.t_v'::regclass};
-my $checkout = q{SELECT test_branch_checkout('main'); SELECT count(*) FROM app.t WHERE id = 5};
+my $by_name = q{SELECT oid FROM pg_class WHERE relname = 't' AND relnamespace = 'app'::regnamespace};
+my $any_named = q{SELECT count(*) FROM pg_class WHERE relname = 't'};
+# (names resolved by the caches, which the filter leaves whole)
+my $resolved = q{SELECT count(*) FROM app.t WHERE id = 5; SELECT 'app.t_v'::regclass};
+
+# The blocks a checkout reads, of the branches' links and heads and all else, from a new session.
+sub checkout
+{
+	my ($name) = @_;
+	my $plan = $node->safe_psql('postgres', qq{EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, SUMMARY OFF) SELECT test_branch_checkout('$name')});
+	my ($hit) = $plan =~ /"Shared Hit Blocks": (\d+)/;
+	my ($read) = $plan =~ /"Shared Read Blocks": (\d+)/;
+	return $hit + $read;
+}
 
 $node->safe_psql('postgres', q{CREATE ROLE app_owner; SELECT test_ws_role_mark(test_ws_role_bytes(ARRAY['app_owner']))});
 sql($main, q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner; SET ROLE app_owner;
@@ -52,18 +66,25 @@ sql($main, q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner; 
 sql($main, "SELECT test_branch_link('main', $main)");
 sql($main, q{SELECT test_branch_commit('main', 'c1')});
 
-# Ten thousand heads: the catalogs as they were, and the filter's work too.
-my %before = (schemas => $node->safe_psql('postgres', $schemas), scan => cost($scan), lookup => cost($lookup),
-	checkout => cost($checkout));
+# Ten thousand heads: no object id, the catalogs as they were, and the work of each as it was.
+sql($main, q{SELECT test_branch_create('k', 'main')});
+checkout('k');
+my %before = (schemas => $node->safe_psql('postgres', $schemas), scan => cost($scan), by_name => cost($by_name),
+	any_named => cost($any_named), resolved => cost($resolved), checkout => checkout('k'));
+my $from = $node->safe_psql('postgres', 'SELECT lo_create(0)');
 # (a thousand to a transaction, as each takes a lock on its name until it ends)
 $node->safe_psql('postgres', "SELECT test_branch_make('h' || g, 'main') FROM generate_series($_ * 1000 + 1, $_ * 1000 + 1000) g")
   for 0 .. 9;
+# (a large object takes one id from the counter, so two bound what's taken between them)
+is($node->safe_psql('postgres', 'SELECT lo_create(0)') - $from, 1, 'ten thousand heads made take no object id');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM generate_series(1, 10000) g WHERE test_branch_head('h' || g) IS NOT NULL}),
 	'10000', 'ten thousand branches made, each a head');
 is($node->safe_psql('postgres', $schemas), $before{schemas}, 'with no catalog rows');
 is(cost($scan), $before{scan}, 'a catalog scan costs what it did');
-is(cost($lookup), $before{lookup}, 'a lookup by name or key too');
-is(cost($checkout), $before{checkout}, 'and a checkout');
+is(cost($any_named), $before{any_named}, 'a catalog query by name too');
+is(cost($resolved), $before{resolved}, 'and names resolved');
+# (another level of the heads' index may be read)
+cmp_ok(checkout('k'), '<=', $before{checkout} + 3, 'a checkout reads the blocks it did');
 my $h = (split /\n/, $node->safe_psql('postgres', q{SELECT test_branch_checkout('h5000'); SELECT test_branch_of('h5000')}))[-1];
 ok($h > 0, 'one of them checked out is given its working set');
 is(sql($h, q{SELECT count(*) FROM app.t}), '100000', 'at its head');
@@ -78,7 +99,6 @@ my $c = sql($main, q{SELECT (SELECT count(*) FROM pg_namespace WHERE oid = 'app'
 	+ (SELECT count(*) FROM pg_type WHERE typnamespace = 'app'::regnamespace)
 	+ (SELECT count(*) FROM pg_constraint WHERE connamespace = 'app'::regnamespace)
 	+ (SELECT count(*) FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class WHERE c.relnamespace = 'app'::regnamespace)});
-# (a large object takes one id from the counter, so two bound what's taken between them)
 for my $name (qw(o1 o2))
 {
 	my $from = $node->safe_psql('postgres', 'SELECT lo_create(0)');
@@ -89,16 +109,18 @@ for my $name (qw(o1 o2))
 cmp_ok($c, '>', 10, '(C counts every object the branch has)');
 
 # Every scan of a catalog reads, and hides, the rows of other branches' objects: it costs more with
-# each, while a lookup by name or key, which finds only this branch's, does not.
+# each, and a query by a name theirs have too with each of those; one by name in a schema, which
+# finds only this branch's, and names resolved, do not.
 my $classes_before = $node->safe_psql('postgres', $classes);
 my ($probes_before) = cost($scan) =~ /^(\d+)/;
+my ($named_before) = cost($any_named) =~ /^(\d+)/;
 $node->safe_psql('postgres', join('', map { on($main) . "SELECT test_branch_create('m$_', 'main');\n" } 1 .. 10));
 my $more = $node->safe_psql('postgres', $classes) - $classes_before;
-my ($probes_after) = cost($scan) =~ /^(\d+)/;
 cmp_ok($more, '>=', 10 * 6, 'ten more working sets, each with its relations\' rows in pg_class');
-cmp_ok($probes_after - $probes_before, '>=', $more, 'a scan of pg_class on another branch asks of each of them');
-is(cost($lookup), $before{lookup}, 'a lookup by name or key costs what it did');
-is(cost($checkout), $before{checkout}, 'and a checkout');
+cmp_ok((cost($scan) =~ /^(\d+)/)[0] - $probes_before, '>=', $more, 'a scan of pg_class on another branch asks of each of them');
+cmp_ok((cost($any_named) =~ /^(\d+)/)[0] - $named_before, '>=', 10, 'a query by a name they have too asks of each of theirs');
+is(cost($by_name), $before{by_name}, 'one by name in a schema costs what it did');
+is(cost($resolved), $before{resolved}, 'and names resolved');
 
 # A thousand branches, each with one row changed: the pages changed, not a thousand copies.
 my $pages = sql($main, q{SELECT sum(pg_relation_size(c.oid, f.fork)) / 8192 FROM pg_class c,
@@ -124,10 +146,10 @@ for my $w (1, 250, 500, 750, 1000)
 		$own += $node->safe_psql('postgres', "SELECT count(*) FROM test_bmap_diff($theirs, $mine)");
 	}
 }
-cmp_ok($own / 5, '<=', 4, 'each branch\'s own pages are the few its change wrote');
-# (and for each, the map's nodes over them, and its catalog rows)
-cmp_ok($grown / 1000, '<', 32, 'a thousand branches store that much each');
-cmp_ok($grown, '<', $pages * 1000 / 20, 'not a thousand copies of the table');
+# (the heap's page the old row was on and the one the new went to, and a leaf of each index)
+cmp_ok($own / 5, '<=', 6, 'each branch\'s own pages are the few its change wrote');
+# (and for each, the map's nodes over them)
+cmp_ok($grown / 1000, '<', $pages / 25, 'a thousand branches store that much each, not a thousand copies of the table');
 diag(sprintf('a thousand branches of %d pages: %d blocks, %.1f a branch', $pages, $grown, $grown / 1000));
 
 done_testing();
