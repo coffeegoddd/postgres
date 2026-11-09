@@ -47,6 +47,7 @@ OBJS = \
 	move.o \
 	move_alter.o \
 	object_store.o \
-	registry.o
+	registry.o \
+	vc_ops.o
 
 include $(top_srcdir)/src/backend/common.mk

@@ -78,6 +78,8 @@
 #define VC_ERR_UNRELATED (-13)	/* the histories share no commit */
 #define VC_ERR_DETACHED (-14)	/* the sender's history is cut before it attaches */
 #define VC_ERR_REWRITTEN (-15)	/* remotes, with a repository that rewrites its history */
+#define VC_ERR_NOTHING (-16)	/* a commit with nothing to commit */
+#define VC_ERR_MERGING (-17)	/* refused while a merge is in progress */
 
 /* Stop at the window's edge: refuse any commit the window does not hold. */
 #define VC_WINDOW_ONLY 0x1
@@ -101,8 +103,44 @@ typedef struct VcTableChange
 typedef void (*VcTableChangeFn) (void *arg, const VcTableChange *c);
 
 /*
- * A commit as loaded: its fields, its message in its chunk's bytes, which
- * it owns (vc_commit_release frees them).
+ * Who made a commit, as Dolt has it: its author and its committer, each a
+ * name, an email and a date, microseconds since 1970 (before it too).  A
+ * commit's own time, which orders it after its parents, is apart from them.
+ */
+typedef struct VcIdent
+{
+	const char *name;			/* NULL: the default */
+	const char *email;			/* NULL: the default */
+	bool		dated;
+	int64		date;			/* when dated */
+} VcIdent;
+
+/*
+ * Who a commit is made by.  An author with no name is the session's user,
+ * and one with no email has user@host, host the client's address; a
+ * committer with no name or email has the author's.  An undated author is
+ * dated with the commit's time, and an undated committer with the author's
+ * date.
+ */
+typedef struct VcCommitMeta
+{
+	VcIdent		author;
+	VcIdent		committer;
+} VcCommitMeta;
+
+/* An ident as a commit holds it, in its chunk's bytes (not NUL-terminated). */
+typedef struct VcIdentHeld
+{
+	const char *name;
+	size_t		namelen;
+	const char *email;
+	size_t		emaillen;
+	int64		date;
+} VcIdentHeld;
+
+/*
+ * A commit as loaded: its fields, its message and idents in its chunk's
+ * bytes, which it owns (vc_commit_release frees them).
  */
 typedef struct VcCommit
 {
@@ -116,6 +154,8 @@ typedef struct VcCommit
 	uint64		parent_gen[VC_MAX_PARENTS];
 	uint64		parent_bytes[VC_MAX_PARENTS];
 	uint64		parent_time[VC_MAX_PARENTS];
+	VcIdentHeld author;
+	VcIdentHeld committer;
 	const char *msg;			/* not NUL-terminated */
 	size_t		msglen;
 	uint8	   *chunk;			/* the commit's bytes, msg in them */
@@ -229,9 +269,11 @@ extern void vc_conflicts_free(VcConflict *c, size_t n);
 /* Commits. */
 extern bool vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out);
 extern void vc_commit_release(VcCommit *c);
+/* meta NULL: made by the defaults VcCommitMeta names. */
 extern PHash vc_commit_write(ProllyCtx *ctx, const PHash *root,
 							 const PHash *parents, uint32 nparents,
-							 uint64 time, const char *msg);
+							 uint64 time, const char *msg,
+							 const VcCommitMeta *meta);
 /* 1 with the base, 0 if none, VC_ERR_SEVERED if the walk crosses a cut. */
 extern int	vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
 						  PHash *out);
@@ -288,6 +330,27 @@ extern PHash vc_commit(VcRepo *r, const char *msg);
  * point while the working set keeps moving.
  */
 extern PHash vc_commit_root(VcRepo *r, const PHash *root, const char *msg);
+
+/* vc_commit_with's flags. */
+#define VC_COMMIT_ALLOW_EMPTY 0x1	/* a commit whose root is its head's */
+#define VC_COMMIT_AMEND 0x2		/* in place of the head: its parents */
+#define VC_COMMIT_SKIP_EMPTY 0x4	/* none whose root is its head's, merging or amending too */
+
+/*
+ * As vc_commit_root, as Dolt's commit is, made by meta (NULL: the
+ * defaults), of root, or of the head's root if that's NULL (a branch
+ * whose working set is its head); the commit in *out.  VC_ERR_NOTHING,
+ * with nothing made, if root is the head's root with no merge in
+ * progress, unless allowed empty or amending; and if it is with
+ * VC_COMMIT_SKIP_EMPTY, merging or amending or not, as Dolt's
+ * --skip-empty.  Amending, the commit takes the head's parents, and msg
+ * NULL takes the head's message.  VC_ERR_MERGING for an amend while a
+ * merge is in progress, and for the head's root then, which would leave
+ * the merge's changes out.  The branch is locked before it's read, as
+ * every call that changes one.
+ */
+extern int	vc_commit_with(VcRepo *r, const PHash *root, const char *msg,
+						   const VcCommitMeta *meta, int flags, PHash *out);
 extern int	vc_reset_hard(VcRepo *r, const PHash *commit);
 
 /*

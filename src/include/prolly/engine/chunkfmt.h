@@ -20,7 +20,10 @@
  * Commit:	tag, version, root value hash (strong), uvarint generation,
  *			uvarint change bytes, uvarint time, uvarint nparents, (parent
  *			hash (weak), uvarint generation, uvarint change bytes, uvarint
- *			time)..., uvarint msglen, msg
+ *			time)..., author, committer, uvarint msglen, msg
+ *			An author and a committer are each a uvarint namelen, name,
+ *			uvarint emaillen, email, and a date: microseconds since 1970,
+ *			zigzag-encoded as a uvarint, as it can be before.
  * Delta:	tag, version, base hash (weak), target hash (weak), uvarint n,
  *			(op byte, uvarint klen, key, [uvarint vlen, value])...
  * Manifest: tag, version, uvarint namelen, source repo name, uvarint n,
@@ -85,7 +88,7 @@
  * Covers the encodings and the chunk boundary function; anything that
  * changes the bytes a given set of rows produces must bump it.
  */
-#define CHUNK_FORMAT_VERSION 4
+#define CHUNK_FORMAT_VERSION 5
 
 /* A tree's vrefs when each leaf value says how many hashes it starts with. */
 #define CHUNK_VREFS_COUNTED 0xFF

@@ -1424,7 +1424,7 @@ ENGINE_TEST(test_change_bytes)
 	/* a commit written with a time before its parent's is placed after it */
 	h = head_of(&r);
 	CHECK(vc_commit_load(&r.ctx, &h, &p));
-	h = vc_commit_write(&r.ctx, &p.root, &p.hash, 1, p.time - 100 * SEC, "early");
+	h = vc_commit_write(&r.ctx, &p.root, &p.hash, 1, p.time - 100 * SEC, "early", NULL);
 	CHECK(vc_commit_load(&r.ctx, &h, &c));
 	CHECK_EQ(c.time, p.time + 1);
 	vc_commit_release(&c);

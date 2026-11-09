@@ -13,16 +13,21 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "common/int.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "nodes/parsenodes.h"
 #include "prolly/branch_checkout.h"
 #include "prolly/branch_link.h"
 #include "prolly/branch_ops.h"
 #include "prolly/capture.h"
 #include "prolly/move.h"
+#include "prolly/vc_ops.h"
 #include "prolly/ws/ws_dbroot.h"
 #include "prolly/ws/ws_diff.h"
 #include "prolly/ws/ws_fk.h"
@@ -38,6 +43,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
+#include "utils/timestamp.h"
 #include "varatt.h"
 
 PG_FUNCTION_INFO_V1(test_ws_schema_bytes);
@@ -75,6 +81,9 @@ PG_FUNCTION_INFO_V1(test_branch_link);
 PG_FUNCTION_INFO_V1(test_branch_of);
 PG_FUNCTION_INFO_V1(test_branch_barrier);
 PG_FUNCTION_INFO_V1(test_branch_commit);
+PG_FUNCTION_INFO_V1(test_vc_ops_commit);
+PG_FUNCTION_INFO_V1(test_vc_ops_commit_call);
+PG_FUNCTION_INFO_V1(test_vc_commit_meta);
 PG_FUNCTION_INFO_V1(test_dbroot_schemas);
 PG_FUNCTION_INFO_V1(test_branch_unlink);
 PG_FUNCTION_INFO_V1(test_branch_create);
@@ -1128,6 +1137,139 @@ test_branch_commit(PG_FUNCTION_ARGS)
 	vc_repo_free(&repo);
 	prolly_ctx_free(&ctx);
 	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* (a timestamptz as microseconds since 1970) */
+#define UNIX_EPOCH_USECS ((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY)
+
+static const char *
+arg_text(FunctionCallInfo fcinfo, int i)
+{
+	return PG_ARGISNULL(i) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(i));
+}
+
+static void
+arg_ident(FunctionCallInfo fcinfo, int i, VcIdent *id)
+{
+	id->name = arg_text(fcinfo, i);
+	id->email = arg_text(fcinfo, i + 1);
+	id->dated = !PG_ARGISNULL(i + 2);
+	if (id->dated)
+	{
+		TimestampTz date = PG_GETARG_TIMESTAMPTZ(i + 2);
+
+		if (TIMESTAMP_NOT_FINITE(date))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a commit's date is a time")));
+		if (pg_add_s64_overflow(date, UNIX_EPOCH_USECS, &id->date))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("a commit's date is out of range")));
+	}
+}
+
+/* (a commit's date as a timestamptz, which it can be out of the range of) */
+static Datum
+date_datum(int64 date)
+{
+	TimestampTz ts;
+
+	if (pg_sub_s64_overflow(date, UNIX_EPOCH_USECS, &ts) || !IS_VALID_TIMESTAMP(ts))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("a commit's date is out of a timestamp's range")));
+	return TimestampTzGetDatum(ts);
+}
+
+/*
+ * (name, msg, author, author_email, author_date, committer, committer_email, committer_date,
+ * allow_empty, skip_empty, amend), each but the name NULL for none: a commit of a branch, as
+ * VcOps->commit makes it, nonatomic if called so.
+ */
+static bool
+vc_ops_commit_args(FunctionCallInfo fcinfo, bool nonatomic, PHash *out)
+{
+	VcCommitOptions opts = {0};
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "a commit is of a branch");
+	opts.msg = arg_text(fcinfo, 1);
+	arg_ident(fcinfo, 2, &opts.meta.author);
+	arg_ident(fcinfo, 5, &opts.meta.committer);
+	opts.allow_empty = !PG_ARGISNULL(8) && PG_GETARG_BOOL(8);
+	opts.skip_empty = !PG_ARGISNULL(9) && PG_GETARG_BOOL(9);
+	opts.amend = !PG_ARGISNULL(10) && PG_GETARG_BOOL(10);
+	return VcOps->commit(text_to_cstring(PG_GETARG_TEXT_PP(0)), &opts, nonatomic, 60000, out);
+}
+
+/* test_vc_ops_commit(...) returns text: as vc_ops_commit_args, the commit's hash, or NULL if skipped */
+Datum
+test_vc_ops_commit(PG_FUNCTION_ARGS)
+{
+	PHash		h;
+
+	if (!vc_ops_commit_args(fcinfo, false, &h))
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
+/* CALL test_vc_ops_commit_call(...): as vc_ops_commit_args, nonatomic outside a transaction block */
+Datum
+test_vc_ops_commit_call(PG_FUNCTION_ARGS)
+{
+	PHash		h;
+	bool		nonatomic = fcinfo->context && IsA(fcinfo->context, CallContext) &&
+		!castNode(CallContext, fcinfo->context)->atomic;
+
+	(void) vc_ops_commit_args(fcinfo, nonatomic, &h);
+	PG_RETURN_VOID();
+}
+
+static Datum
+held_text(const char *s, size_t len)
+{
+	return PointerGetDatum(cstring_to_text_with_len(s, len));
+}
+
+/*
+ * test_vc_commit_meta(commit text) returns (author, author_email, author_date, committer,
+ * committer_email, committer_date, message, parents, root): who made a commit, and its message,
+ * parents and root
+ */
+Datum
+test_vc_commit_meta(PG_FUNCTION_ARGS)
+{
+	PHash		h = text_hash(PG_GETARG_TEXT_PP(0));
+	ProllyCtx	ctx;
+	VcCommit	c;
+	TupleDesc	desc;
+	Datum		values[9];
+	bool		nulls[9] = {0};
+	Datum	   *parents;
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "test_vc_commit_meta returns a record");
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	if (!vc_commit_load(&ctx, &h, &c))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("no commit %s", text_to_cstring(PG_GETARG_TEXT_PP(0)))));
+	values[0] = held_text(c.author.name, c.author.namelen);
+	values[1] = held_text(c.author.email, c.author.emaillen);
+	values[2] = date_datum(c.author.date);
+	values[3] = held_text(c.committer.name, c.committer.namelen);
+	values[4] = held_text(c.committer.email, c.committer.emaillen);
+	values[5] = date_datum(c.committer.date);
+	values[6] = held_text(c.msg, c.msglen);
+	parents = palloc_array(Datum, Max(c.nparents, 1));
+	for (uint32 i = 0; i < c.nparents; i++)
+		parents[i] = PointerGetDatum(hash_text(&c.parents[i]));
+	values[7] = PointerGetDatum(construct_array_builtin(parents, c.nparents, TEXTOID));
+	values[8] = PointerGetDatum(hash_text(&c.root));
+	vc_commit_release(&c);
+	prolly_ctx_free(&ctx);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(desc, values, nulls)));
 }
 
 static bool
