@@ -53,11 +53,10 @@ sub checks
 # The storage of transactions that never committed dropped, as autovacuum drops it after a start,
 # and what was freed freed: then what a sweep frees and puts right, which is a block nothing holds,
 # and the maps no catalog row of any branch names.
-my $drained;
 sub leaks
 {
 	$node->safe_psql('postgres', q{SELECT test_bmap_drop_orphans()});
-	$drained = $node->safe_psql('postgres', q{SELECT freed FROM test_bmap_release_drain()});
+	$node->safe_psql('postgres', q{SELECT * FROM test_bmap_release_drain()});
 	return $node->safe_psql('postgres', q{SELECT freed || ' freed, ' || recounted || ' recounted' FROM test_bmap_sweep()})
 	  . ', ' . $node->safe_psql('postgres', q{SET catalog_branch_filter = off;
 		SELECT count(*) || ' maps unnamed' FROM (SELECT 'base/' || d.oid AS dir FROM pg_database d
@@ -87,7 +86,7 @@ sub commits
 	sql($branch, qq{SET ROLE app_owner; INSERT INTO app.t VALUES (9000, '$name', NULL)});
 	my $root = sql($branch, qq{SELECT test_branch_commit('$name', 'after')});
 	return $node->safe_psql('postgres', qq{SELECT test_branch_head('$name')}) ne $was
-	  && sql($branch, "SELECT test_branch_barrier($branch)") eq $root;
+	  && sql($branch, "SELECT test_dbroot_schemas('$root') = 'app=' || test_ws_root_capture('app')") eq 't';
 }
 
 # Not at all: no head, no working set, no catalog rows.
@@ -191,7 +190,6 @@ my $made_rows = rows($node->safe_psql('postgres', q{SELECT test_branch_of('made'
 my $made_head = $node->safe_psql('postgres', q{SELECT test_branch_head('made')});
 my $taker_rows = rows($node->safe_psql('postgres', q{SELECT test_branch_of('taker')}));
 my $taker_head = $node->safe_psql('postgres', q{SELECT test_branch_head('taker')});
-$base = $node->safe_psql('postgres', $schemas);
 
 # Given back: at the step, whole after the crash.
 crash_at('branch-give-back-dropped', q{SELECT test_branch_dematerialize('head')});
@@ -207,7 +205,6 @@ for my $point (qw(branch-give-back-dropped branch-delete-removed))
 		"deleted, crashed at $point: the branch whole, its changes too");
 	is(leaks(), $none, "$point: nothing leaked");
 }
-$taker_rows =~ s/9000:taker/9000:dirty/;
 
 # A head alone deleted: there still after a crash.
 crash_at('branch-delete-removed', q{SELECT test_branch_delete('alone', true)});
@@ -232,6 +229,7 @@ sql($main, q{SELECT test_branch_rename('r1', 'r2', true)});
 sql($main, q{SELECT test_branch_delete('alone', true)});
 $node->stop('immediate');
 $node->start;
+my $pending = $node->safe_psql('postgres', q{SELECT test_bmap_release_pending()});
 is($node->safe_psql('postgres', q{SELECT test_branch_head('taker') IS NULL AND test_branch_of('taker') IS NULL
 	AND test_branch_head('alone') IS NULL}), 't', 'deleted and committed, a branch isn\'t there after a crash');
 is($node->safe_psql('postgres', q{SELECT test_branch_head('head') IS NOT NULL AND test_branch_of('head') IS NULL}), 't',
@@ -241,7 +239,7 @@ ok(whole('r2', $c1, $c1_rows) && $node->safe_psql('postgres', q{SELECT test_bran
 is($node->safe_psql('postgres', qq{SET catalog_branch_filter = off; SELECT count(*) FROM pg_namespace WHERE nspbranch IN ($gone)}),
 	'0', 'the catalog rows of those deleted and given back gone');
 is(leaks(), $none, 'nothing leaked');
-cmp_ok($drained, '>', 0, 'the pages they alone held freed');
+cmp_ok($pending, '>', 0, 'the pages they alone held queued to be freed');
 ok(whole('made', $made_head, $made_rows) && whole('fresh', $c1, $c1_rows) && whole('src', $c1, $c1_rows), 'the others whole');
 is(rows($main), $c1_rows, 'and their parent');
 
