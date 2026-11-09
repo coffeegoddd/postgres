@@ -19,6 +19,8 @@
 #ifndef PROLLY_BRANCH_LINK_H
 #define PROLLY_BRANCH_LINK_H
 
+#include "nodes/pg_list.h"
+
 typedef struct BranchLinkRoutine
 {
 	const char *name;
@@ -38,6 +40,9 @@ typedef struct BranchLinkRoutine
 
 	/* A branch's link gone; false if it had none. */
 	bool		(*unlink) (const char *name);
+
+	/* The name of every branch that has a catalog branch, palloc'd, as of now. */
+	List	   *(*names) (void);
 } BranchLinkRoutine;
 
 extern PGDLLIMPORT const BranchLinkRoutine TableBranchLink;

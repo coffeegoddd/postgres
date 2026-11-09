@@ -116,7 +116,7 @@ patch src/backend/meson.build  0  links the engine's code in src/backend/prolly 
 patch src/backend/optimizer/util/clauses.c  1b  a function that runs on another branch than the session's is not inlined
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED; also (4) the TRAVELS role option
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
-patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker; also (5) the capture launcher and worker; also (5) BGWORKER_SKIP_SETTINGS
+patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker; also (5) the capture launcher and worker; also (5) BGWORKER_SKIP_SETTINGS; also (7) the branch idle worker
 patch src/backend/postmaster/postmaster.c  5  registers the capture launcher
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/replication/logical/logical.c  5  capture's output plugin is built in
@@ -151,9 +151,9 @@ patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cache
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
 patch src/backend/utils/init/postinit.c  5  a connection can leave out the database's and role's settings; also (7) a client's session checks out default_branch
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format; also (5) capture_in_background; also (7) default_branch
-patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h; also (5) capture_in_background; also (7) prolly/branch_checkout.h
-patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size; also (5) capture
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch and catalog_branch_filter; also (2) chunk_compact_dead_fraction, chunk_free_in_background, history_tier_location and history_tier_store; also (3) chunk_format; also (5) capture_in_background; also (7) default_branch and branch_idle_timeout
+patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings; also (2) includes the history store's (prolly/chunk_freer.h, prolly/chunk_tier.h); also (3) prolly/chunk_format.h; also (5) capture_in_background; also (7) prolly/branch_checkout.h and prolly/branch_idle.h
+patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size; also (5) capture; also (7) branch_idle_timeout
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
 patch src/bin/pg_amcheck/t/002_nonesuch.pl  2  schema exclusion patterns exclude pg_history too, for no relations to check
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage

@@ -30,6 +30,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_idle.h"
 #include "prolly/capture.h"
 #include "prolly/chunkstore.h"
 #include "prolly/engine/vc_refs.h"
@@ -1179,6 +1180,10 @@ CaptureLauncherMain(Datum main_arg)
 				none_free = true;
 			MemoryContextSwitchTo(look);
 		}
+
+		/* (capture's first, which what gives back working sets waits for) */
+		if (!none_free)
+			BranchIdleLook(marked);
 
 		/* (once, for as long as it lasts; the next look tries again) */
 		if (none_free && !warned)

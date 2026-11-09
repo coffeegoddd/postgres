@@ -22,6 +22,10 @@
  * noted too, but without what a checkout waits for: it's for the engine's
  * own work, and its tests.
  *
+ * When each catalog branch was last used is kept too, for what gives back a
+ * branch's working set once it has been unused for a while: when a session
+ * last left it, or it was last given a working set, since the server started.
+ *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
  * src/include/prolly/branch_checkout.h
@@ -63,6 +67,19 @@ typedef struct BranchCheckoutRoutine
 	 * its transaction ends (a function that set another only for itself).
 	 */
 	bool		(*mine) (int32 branch);
+
+	/* A catalog branch noted as used now. */
+	void		(*used) (int32 branch);
+
+	/*
+	 * How long, in milliseconds, since a catalog branch was last used: since
+	 * a session last left it or it was noted used, or since the server
+	 * started, whichever is later; never less.  The engine's own work on a
+	 * branch, which puts catalog_branch on it for a while, leaves it too.
+	 * After in_use, which holds off what would come on, what has left is in
+	 * it.
+	 */
+	int64		(*unused_for) (int32 branch);
 } BranchCheckoutRoutine;
 
 extern PGDLLIMPORT const BranchCheckoutRoutine SessionBranchCheckout;
