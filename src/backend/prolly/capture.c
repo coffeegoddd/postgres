@@ -30,6 +30,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_idle.h"
 #include "prolly/capture.h"
 #include "prolly/chunkstore.h"
 #include "prolly/engine/vc_refs.h"
@@ -1139,6 +1140,7 @@ CaptureLauncherMain(Datum main_arg)
 		old = MemoryContextSwitchTo(look);
 		marked = capture_in_background ? databases_marked() : NIL;
 		drop_slots_not_of(marked);
+		BranchIdleLook(marked);
 		foreach(lc, running)
 		{
 			CaptureRunning *one = lfirst(lc);

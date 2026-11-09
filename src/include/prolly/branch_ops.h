@@ -48,10 +48,20 @@ typedef struct BranchOpsRoutine
 	int32		(*materialize) (ProllyCtx *ctx, const char *name, int timeout_ms);
 
 	/*
-	 * A branch's working set given back, its head kept: refused while another session is on it,
-	 * while it's a database's or role's default_branch, or while its working set isn't its head.
+	 * A branch's working set given back, its head kept: refused for "main", which keeps its own so
+	 * that there's always one to make another from; while another session is on it, while it's a
+	 * database's or role's default_branch, or while its working set isn't its head.  In a
+	 * transaction that has written nothing, as create is asked to be.
 	 */
 	void		(*dematerialize) (ProllyCtx *ctx, const char *name, int timeout_ms);
+
+	/*
+	 * A branch's working set given back as dematerialize gives it back, if it has gone unused for
+	 * idle_ms (prolly/branch_checkout.h's unused_for): true.  False where dematerialize would refuse,
+	 * and while it has been used within idle_ms, its transaction then to be rolled back: one with
+	 * changes not committed is noted used, so it isn't looked at again for as long.
+	 */
+	bool		(*dematerialize_idle) (ProllyCtx *ctx, const char *name, int idle_ms, int timeout_ms);
 
 	/*
 	 * A branch renamed, its head, working set and sessions kept: its name only.  Refused for "main"

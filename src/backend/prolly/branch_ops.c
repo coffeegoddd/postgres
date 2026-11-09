@@ -515,6 +515,7 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 		vc_set_working(repo, &root);
 	}
 	BranchLink->link(name, branch);
+	BranchCheckout->used(branch);
 	vc_commit_release(&at);
 	vc_branch_free(&head);
 	CaptureLeftOutSeal();
@@ -739,11 +740,13 @@ default_check(const char *name)
 
 /*
  * A branch's working set given back, as its writers and commits are held off: its catalog rows and
- * the relations they hold dropped, the link let go of.  With keep_changes, refused while it has
- * changes not committed.  Refused while it's a default_branch.  (Its making's lock held.)
+ * the relations they hold dropped, the link let go of; true.  With keep_changes, refused while it
+ * has changes not committed, or with quiet, false and nothing dropped.  Refused while it's a
+ * default_branch.  (Its making's lock held.)
  */
-static void
-give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool keep_changes, int timeout_ms)
+static bool
+give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool keep_changes, bool quiet,
+		  int timeout_ms)
 {
 	PHash		root;
 	Holding		holding;
@@ -760,6 +763,8 @@ give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool kee
 			elog(ERROR, "branch \"%s\" has a working set and no head", name);
 		changed = !phash_eq(&root, &b.head_root);
 		vc_branch_free(&b);
+		if (changed && quiet)
+			return false;
 		if (changed)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -769,6 +774,17 @@ give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool kee
 	default_check(name);
 	BranchCatalogs->drop(branch);
 	(void) BranchLink->unlink(name);
+	return true;
+}
+
+/* Refused for "main", which every repository has. */
+static void
+not_main(const char *name, const char *what)
+{
+	if (strcmp(name, "main") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("branch \"main\" can't be %s", what)));
 }
 
 static void
@@ -777,6 +793,9 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 	ChunkStore *cs = ChunkStoreOpen("pages");
 	int32		branch;
 	VcRepo		repo;
+
+	/* (it keeps its working set, so that there's always one to make another from) */
+	not_main(name, "dematerialized");
 
 	/* (no one giving it a working set meanwhile, as it's given back) */
 	lock_making(name);
@@ -788,19 +807,38 @@ shared_dematerialize(ProllyCtx *ctx, const char *name, int timeout_ms)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out", name)));
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
-	give_back(ctx, &repo, name, branch, true, timeout_ms);
+	(void) give_back(ctx, &repo, name, branch, true, false, timeout_ms);
 	CaptureLeftOutSeal();
 	vc_repo_free(&repo);
 }
 
-/* Refused for "main", which every repository has. */
-static void
-not_main(const char *name, const char *what)
+static bool
+shared_dematerialize_idle(ProllyCtx *ctx, const char *name, int idle_ms, int timeout_ms)
 {
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	int32		branch;
+	VcRepo		repo;
+	bool		given;
+
 	if (strcmp(name, "main") == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("branch \"main\" can't be %s", what)));
+		return false;
+	lock_making(name);
+	branch = BranchLink->branch_of(name);
+
+	/* (in_use holds off what would come on, so what has left is in unused_for) */
+	if (branch == 0 || BranchCheckout->mine(branch) || BranchCheckout->in_use(branch) ||
+		BranchCheckout->unused_for(branch) < idle_ms || named_default(name))
+		return false;
+	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
+	given = give_back(ctx, &repo, name, branch, true, true, timeout_ms);
+
+	/* (one with changes not looked at again until it has been unused as long once more) */
+	if (!given)
+		BranchCheckout->used(branch);
+	else
+		CaptureLeftOutSeal();
+	vc_repo_free(&repo);
+	return given;
 }
 
 /* Refused while another session is on it, unless forced; branch 0 has no working set, so none. */
@@ -875,7 +913,7 @@ remove_locked(ProllyCtx *ctx, VcRepo *repo, const char *name, bool force, int ti
 		VcBranch	now;
 		bool		moved;
 
-		give_back(ctx, repo, name, branch, false, timeout_ms);
+		(void) give_back(ctx, repo, name, branch, false, false, timeout_ms);
 		moved = !vc_branch_lock(repo, name, &now) || !phash_eq(&now.head, &b.head);
 		if (!moved)
 			vc_branch_free(&now);
@@ -975,6 +1013,7 @@ const BranchOpsRoutine SharedBranchOps = {
 	.create = shared_create,
 	.materialize = shared_materialize,
 	.dematerialize = shared_dematerialize,
+	.dematerialize_idle = shared_dematerialize_idle,
 	.rename = shared_rename,
 	.remove = shared_remove,
 };

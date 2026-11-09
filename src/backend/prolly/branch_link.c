@@ -154,12 +154,34 @@ table_unlink(const char *name)
 	return found;
 }
 
+static List *
+table_names(void)
+{
+	Relation	rel = links_open();
+	Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, snapshot, 0, NULL);
+	HeapTuple	tup;
+	List	   *names = NIL;
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+
+		names = lappend(names, TextDatumGetCString(heap_getattr(tup, 1, RelationGetDescr(rel), &isnull)));
+	}
+	systable_endscan(scan);
+	UnregisterSnapshot(snapshot);
+	table_close(rel, AccessShareLock);
+	return names;
+}
+
 const BranchLinkRoutine TableBranchLink = {
 	.name = "table",
 	.branch_of = table_branch_of,
 	.name_of = table_name_of,
 	.link = table_link,
 	.unlink = table_unlink,
+	.names = table_names,
 };
 
 const BranchLinkRoutine *BranchLink = &TableBranchLink;

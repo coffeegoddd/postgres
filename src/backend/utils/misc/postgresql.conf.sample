@@ -366,6 +366,7 @@
 #wal_keep_size = 0              # in megabytes; 0 disables
 #max_slot_wal_keep_size = -1    # in megabytes; -1 disables
 #capture_in_background = on             # keep branches' working trees from the WAL
+#branch_idle_timeout = 0                # in milliseconds; 0 disables
 #block_map_standby_hold_max_size = -1   # in megabytes; -1 disables
 #idle_replication_slot_timeout = 0      # in seconds; 0 disables
 #wal_sender_timeout = 60s       # in milliseconds; 0 disables

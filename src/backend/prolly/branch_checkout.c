@@ -22,6 +22,16 @@
  * lock, so it may land on a branch being taken, or return to one taken
  * meanwhile, and then finds it gone, as it would a schema dropped under it.
  *
+ * When each catalog branch was last used is in shared memory too, as buckets
+ * of times its database and number hash to: a backend's slot moving off a
+ * branch, by either of its two, first moves that branch's bucket on to now,
+ * as does a branch being given a working set.  Two branches in one bucket
+ * share the later time, which makes one seem used more recently than it was,
+ * never less.  Every bucket starts at the server's start, what came before
+ * not kept.  What reads it reads the slots first, after taking the branch's
+ * lock as in_use does: a slot read off the branch was moved after its bucket
+ * was.
+ *
  * Whether a transaction has written to a versioned schema is told by the
  * locks it holds: a write, or a change of an object, takes its relation's
  * lock in a mode above what a read or a row lock takes, and keeps it until
@@ -40,6 +50,7 @@
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_checkout.h"
@@ -56,6 +67,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 
 char	   *default_branch = NULL;
 
@@ -75,6 +87,12 @@ typedef struct CheckoutSlot
 
 static CheckoutSlot *slots = NULL;
 static int	nslots = 0;
+
+/* (a power of two) */
+#define USE_BUCKETS 4096
+
+/* When the branches hashing to each bucket were last used. */
+static pg_atomic_uint64 *uses = NULL;
 
 static void BranchCheckoutShmemRequest(void *arg);
 static void BranchCheckoutShmemInit(void *arg);
@@ -99,6 +117,10 @@ BranchCheckoutShmemRequest(void *arg)
 					   .size = mul_size(nslots, sizeof(CheckoutSlot)),
 					   .ptr = (void **) &slots,
 		);
+	ShmemRequestStruct(.name = "Branch Uses",
+					   .size = mul_size(USE_BUCKETS, sizeof(pg_atomic_uint64)),
+					   .ptr = (void **) &uses,
+		);
 }
 
 static void
@@ -110,6 +132,33 @@ BranchCheckoutShmemInit(void *arg)
 		pg_atomic_init_u32(&slots[i].branch, 0);
 		pg_atomic_init_u32(&slots[i].base, 0);
 	}
+	for (int i = 0; i < USE_BUCKETS; i++)
+		pg_atomic_init_u64(&uses[i], (uint64) GetCurrentTimestamp());
+}
+
+static pg_atomic_uint64 *
+use_bucket(Oid db, int32 branch)
+{
+	return &uses[hash_combine(murmurhash32(db), murmurhash32((uint32) branch)) & (USE_BUCKETS - 1)];
+}
+
+/* (anywhere, an abort too: it can't fail) */
+static void
+use_stamp(Oid db, int32 branch)
+{
+	if (uses != NULL && branch != 0)
+		pg_atomic_monotonic_advance_u64(use_bucket(db, branch), (uint64) GetCurrentTimestamp());
+}
+
+/* (each of a slot's two written only after the branch it was on is stamped, if it moves off one) */
+static void
+slot_write(CheckoutSlot *slot, pg_atomic_uint32 *field, uint32 branch)
+{
+	uint32		was = pg_atomic_read_u32(field);
+
+	if (was != branch)
+		use_stamp(pg_atomic_read_u32(&slot->db), (int32) was);
+	pg_atomic_write_u32(field, branch);
 }
 
 static void
@@ -143,9 +192,9 @@ BranchCheckoutNote(int32 branch)
 	if (mine == NULL)
 		return;
 	pg_atomic_write_u32(&mine->db, MyDatabaseId);
-	pg_atomic_write_u32(&mine->branch, (uint32) branch);
+	slot_write(mine, &mine->branch, (uint32) branch);
 	if (GetCurrentTransactionNestLevel() <= 1 && !IsTransactionState())
-		pg_atomic_write_u32(&mine->base, (uint32) branch);
+		slot_write(mine, &mine->base, (uint32) branch);
 }
 
 /*
@@ -215,7 +264,7 @@ checkout_xact_callback(XactEvent event, void *arg)
 
 	if (mine != NULL && (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
 						 event == XACT_EVENT_PREPARE))
-		pg_atomic_write_u32(&mine->base, (uint32) branch_after_commit());
+		slot_write(mine, &mine->base, (uint32) branch_after_commit());
 }
 
 /* (a backend exiting is on no branch, whatever its abort, which comes after, sets) */
@@ -226,8 +275,8 @@ checkout_exit(int code, Datum arg)
 
 	if (mine == NULL)
 		return;
-	pg_atomic_write_u32(&mine->branch, 0);
-	pg_atomic_write_u32(&mine->base, 0);
+	slot_write(mine, &mine->branch, 0);
+	slot_write(mine, &mine->base, 0);
 	pg_atomic_write_u32(&mine->db, InvalidOid);
 	exited = true;
 }
@@ -359,12 +408,31 @@ session_mine(int32 branch)
 	return branch == catalog_branch || branch == branch_after_commit();
 }
 
+static void
+session_used(int32 branch)
+{
+	use_stamp(MyDatabaseId, branch);
+}
+
+static int64
+session_unused_for(int32 branch)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz last;
+
+	/* (what in_use read of the slots before this, moved after the stamp, is older) */
+	last = (TimestampTz) pg_atomic_read_membarrier_u64(use_bucket(MyDatabaseId, branch));
+	return now > last ? (now - last) / 1000 : 0;
+}
+
 const BranchCheckoutRoutine SessionBranchCheckout = {
 	.name = "session",
 	.checkout = session_checkout,
 	.current = session_current,
 	.in_use = session_in_use,
 	.mine = session_mine,
+	.used = session_used,
+	.unused_for = session_unused_for,
 };
 
 const BranchCheckoutRoutine *BranchCheckout = &SessionBranchCheckout;
@@ -378,7 +446,7 @@ BranchCheckoutBackendStart(bool client)
 	RegisterXactCallback(checkout_xact_callback, NULL);
 	BranchCheckoutNote(catalog_branch);
 	if (mine != NULL)
-		pg_atomic_write_u32(&mine->base, (uint32) catalog_branch);
+		slot_write(mine, &mine->base, (uint32) catalog_branch);
 	/* (in the session's first transaction, which has no snapshot of its own yet) */
 	if (client && default_branch != NULL && default_branch[0] != '\0')
 	{

@@ -21,6 +21,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
 #include "postmaster/postmaster.h"
+#include "prolly/branch_idle.h"
 #include "prolly/capture.h"
 #include "prolly/chunk_freer.h"
 #include "replication/logicallauncher.h"
@@ -180,6 +181,10 @@ static const struct
 	{
 		.fn_name = "CaptureWorkerMain",
 		.fn_addr = CaptureWorkerMain
+	},
+	{
+		.fn_name = "BranchIdleWorkerMain",
+		.fn_addr = BranchIdleWorkerMain
 	}
 };
 

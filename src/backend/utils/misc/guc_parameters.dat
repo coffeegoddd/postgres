@@ -422,6 +422,16 @@
   boot_val => '""',
 },
 
+{ name => 'branch_idle_timeout', type => 'int', context => 'PGC_SIGHUP', group => 'REPLICATION_SENDING',
+  short_desc => 'Sets how long a branch goes unused before its working set is given back.',
+  long_desc => '0 disables. A branch with changes not committed, "main", or a default_branch keeps its working set.',
+  flags => 'GUC_UNIT_MS',
+  variable => 'branch_idle_timeout',
+  boot_val => '0',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'bytea_output', type => 'enum', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Sets the output format for bytea.',
   variable => 'bytea_output',

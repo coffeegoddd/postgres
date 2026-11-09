@@ -13,7 +13,8 @@
  * wal_level minimal, or no replication slots, is no capture.  As with any logical slot, a
  * server with one will not start with those set, and capture's slots count against
  * max_replication_slots.  Each such database takes a worker of max_worker_processes, and the
- * launcher another.
+ * launcher another; with branch_idle_timeout set, the launcher starts one more at a time for
+ * prolly/branch_idle.h.
  *
  * capture_in_background turns all of this off, and the slots go with it.
  *

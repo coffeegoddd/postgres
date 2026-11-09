@@ -74,6 +74,7 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/branch_checkout.h"
 #include "prolly/branch_filter.h"
+#include "prolly/branch_idle.h"
 #include "prolly/chunk_format.h"
 #include "prolly/capture.h"
 #include "prolly/chunk_freer.h"
