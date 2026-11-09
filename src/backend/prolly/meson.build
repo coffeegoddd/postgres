@@ -33,6 +33,7 @@ backend_sources += files(
   'move_alter.c',
   'object_store.c',
   'registry.c',
+  'vc_ops.c',
 )
 
 subdir('engine')

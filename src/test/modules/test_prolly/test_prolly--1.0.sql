@@ -841,6 +841,32 @@ CREATE FUNCTION test_branch_commit(name text, msg text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- A commit of a branch, as version control's commit makes it: its hash,
+-- or NULL if skipped as empty.  Each option NULL for none.
+CREATE FUNCTION test_vc_ops_commit(name text, msg text DEFAULT NULL,
+	author text DEFAULT NULL, author_email text DEFAULT NULL, author_date timestamptz DEFAULT NULL,
+	committer text DEFAULT NULL, committer_email text DEFAULT NULL,
+	committer_date timestamptz DEFAULT NULL, allow_empty boolean DEFAULT false,
+	skip_empty boolean DEFAULT false, amend boolean DEFAULT false)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+-- The same, called: outside a transaction block, the transaction committed
+-- first, and the commit in one of its own.
+CREATE PROCEDURE test_vc_ops_commit_call(name text, msg text DEFAULT NULL,
+	author text DEFAULT NULL, author_email text DEFAULT NULL, author_date timestamptz DEFAULT NULL,
+	committer text DEFAULT NULL, committer_email text DEFAULT NULL,
+	committer_date timestamptz DEFAULT NULL, allow_empty boolean DEFAULT false,
+	skip_empty boolean DEFAULT false, amend boolean DEFAULT false)
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Who made a commit, its message, its parents and its root.
+CREATE FUNCTION test_vc_commit_meta(commit text, OUT author text, OUT author_email text,
+	OUT author_date timestamptz, OUT committer text, OUT committer_email text,
+	OUT committer_date timestamptz, OUT message text, OUT parents text[], OUT root text)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_dbroot_schemas(root text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
@@ -905,7 +931,9 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_wait(pg_lsn, integer), test_capture_leave_out(), test_capture_commit(text, text, text),
 	test_capture_commit_on(text, text, text), test_branch_link(text, integer), test_branch_of(text),
 	test_branch_barrier(integer, integer), test_branch_commit(text, text), test_branch_unlink(text), test_dbroot_schemas(text), test_branch_in_use(integer), test_branch_create(text, text, text, boolean, integer), test_branch_head(text), test_branch_make(text, text, text), test_branch_materialize(text),
-	test_branch_dematerialize(text), test_branch_rename(text, text, boolean), test_branch_delete(text, boolean), test_ws_use_history_store(), test_ws_move(text, text, integer), test_ws_move_prepare(text, text) FROM PUBLIC;
+	test_branch_dematerialize(text), test_branch_rename(text, text, boolean), test_branch_delete(text, boolean), test_ws_use_history_store(), test_ws_move(text, text, integer), test_ws_move_prepare(text, text),
+	test_vc_ops_commit(text, text, text, text, timestamptz, text, text, timestamptz, boolean, boolean, boolean), test_vc_commit_meta(text) FROM PUBLIC;
+REVOKE ALL ON PROCEDURE test_vc_ops_commit_call(text, text, text, text, timestamptz, text, text, timestamptz, boolean, boolean, boolean) FROM PUBLIC;
 
 CREATE FUNCTION test_ws_schema_shape(schema text, tab text)
 RETURNS text

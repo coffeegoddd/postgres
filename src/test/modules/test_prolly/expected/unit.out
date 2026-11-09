@@ -79,6 +79,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  engine_vc       | merge_fast_forward_and_up_to_date    | ok     | 
  engine_vc       | three_way_merge                      | ok     | 
  engine_vc       | merge_conflicts                      | ok     | 
+ engine_vc       | commit_with                          | ok     | 
  engine_vc       | same_changes_same_root               | ok     | 
  engine_vc       | merge_base_shapes                    | ok     | 
  engine_vc       | window_edge                          | ok     | 
@@ -267,7 +268,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  ws_tags         | template_refused                     | ok     | 
  ws_tags         | derive                               | ok     | 
  ws_tags         | tupdesc                              | ok     | 
-(255 rows)
+(256 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

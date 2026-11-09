@@ -1148,9 +1148,9 @@ ENGINE_TEST(test_large_change_bytes)
 	rv = vc_root_empty(&ctx);
 	vc_table_put(&ctx, &rv, "t", "x", 1, &one, &rv1);
 	vc_table_put(&ctx, &rv, "t", "x", 1, &two, &rv2);
-	c1 = vc_commit_write(&ctx, &rv, NULL, 0, 1, "none");
-	c2 = vc_commit_write(&ctx, &rv1, &c1, 1, 2, "large");
-	c3 = vc_commit_write(&ctx, &rv2, &c2, 1, 3, "edit");
+	c1 = vc_commit_write(&ctx, &rv, NULL, 0, 1, "none", NULL);
+	c2 = vc_commit_write(&ctx, &rv1, &c1, 1, 2, "large", NULL);
+	c3 = vc_commit_write(&ctx, &rv2, &c2, 1, 3, "edit", NULL);
 	CHECK(vc_commit_load(&ctx, &c1, &k));
 	b1 = k.bytes;
 	vc_commit_release(&k);

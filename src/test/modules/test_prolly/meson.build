@@ -275,6 +275,7 @@ tests += {
       't/146_branch_crash_steps.pl',
       't/147_branch_at_once.pl',
       't/148_branch_scale.pl',
+      't/149_vc_commit.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

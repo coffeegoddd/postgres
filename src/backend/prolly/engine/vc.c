@@ -23,6 +23,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "prolly/engine/vc.h"
 #include "utils/builtins.h"
@@ -402,6 +403,43 @@ vc_conflicts_free(VcConflict *c, size_t n)
 
 /* -------------------------------------------------------------- commits */
 
+/* (a text of a commit's: its length, then it, which must fit what's left) */
+static bool
+read_text(const uint8 **p, const uint8 *end, const char **out, size_t *len)
+{
+	uint64		l;
+
+	if (!read_uvarint(p, end, &l) || l > (uint64) (end - *p))
+		return false;
+	*out = (const char *) *p;
+	*len = l;
+	*p += l;
+	return true;
+}
+
+static bool
+read_ident(const uint8 **p, const uint8 *end, VcIdentHeld *out)
+{
+	uint64		z;
+
+	if (!read_text(p, end, &out->name, &out->namelen) ||
+		!read_text(p, end, &out->email, &out->emaillen) ||
+		!read_uvarint(p, end, &z))
+		return false;
+	out->date = (int64) (z >> 1) ^ -(int64) (z & 1);
+	return true;
+}
+
+static void
+put_ident(Buf *b, const VcIdentHeld *id)
+{
+	buf_append_uvarint(b, id->namelen);
+	buf_append(b, id->name, id->namelen);
+	buf_append_uvarint(b, id->emaillen);
+	buf_append(b, id->email, id->emaillen);
+	buf_append_uvarint(b, ((uint64) id->date << 1) ^ (uint64) (id->date >> 63));
+}
+
 bool
 vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out)
 {
@@ -438,7 +476,8 @@ vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out)
 			!read_uvarint(&p, end, &out->parent_time[i]))
 			goto bad;
 	}
-	if (!read_uvarint(&p, end, &ml) || ml != (uint64) (end - p))
+	if (!read_ident(&p, end, &out->author) || !read_ident(&p, end, &out->committer) ||
+		!read_uvarint(&p, end, &ml) || ml != (uint64) (end - p))
 		goto bad;
 	out->msg = (const char *) p;
 	out->msglen = ml;
@@ -555,7 +594,8 @@ change_bytes(ProllyCtx *ctx, const PHash *root, const PHash *base)
 static PHash
 commit_put(ProllyCtx *ctx, const PHash *root, uint64 gen, uint64 bytes, uint64 time,
 		   uint32 nparents, const PHash *parents, const uint64 *pgen,
-		   const uint64 *pbytes, const uint64 *ptime, const char *msg, size_t msglen)
+		   const uint64 *pbytes, const uint64 *ptime, const VcIdentHeld *author,
+		   const VcIdentHeld *committer, const char *msg, size_t msglen)
 {
 	Buf			b = BUF_INIT;
 	PHash		h;
@@ -574,11 +614,58 @@ commit_put(ProllyCtx *ctx, const PHash *root, uint64 gen, uint64 bytes, uint64 t
 		buf_append_uvarint(&b, pbytes[i]);
 		buf_append_uvarint(&b, ptime[i]);
 	}
+	put_ident(&b, author);
+	put_ident(&b, committer);
 	buf_append_uvarint(&b, msglen);
 	buf_append(&b, msg, msglen);
 	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
 	buf_free(&b);
 	return h;
+}
+
+static void
+held_text(const char *s, const char **out, size_t *len)
+{
+	*out = s;
+	*len = strlen(s);
+}
+
+/*
+ * meta's idents with the defaults VcCommitMeta names filled in, those of
+ * the session's user palloc'd, of a commit at time.
+ */
+static void
+resolve_idents(const VcCommitMeta *meta, uint64 time, VcIdentHeld *author,
+			   VcIdentHeld *committer)
+{
+	static const VcCommitMeta none = {0};
+	char	   *user = NULL;
+
+	if (meta == NULL)
+		meta = &none;
+	if (meta->author.name == NULL || meta->author.email == NULL)
+		user = GetUserNameFromId(GetSessionUserId(), false);
+	held_text(meta->author.name ? meta->author.name : user, &author->name, &author->namelen);
+	if (meta->author.email)
+		held_text(meta->author.email, &author->email, &author->emaillen);
+	else
+	{
+		/* (a socket's client is this host) */
+		const char *host = MyProcPort && MyProcPort->remote_host &&
+			strcmp(MyProcPort->remote_host, "[local]") != 0 ?
+			MyProcPort->remote_host : "localhost";
+
+		held_text(psprintf("%s@%s", user, host), &author->email, &author->emaillen);
+	}
+	author->date = meta->author.dated ? meta->author.date : (int64) time;
+
+	*committer = *author;
+	if (meta->committer.name)
+		held_text(meta->committer.name, &committer->name, &committer->namelen);
+	if (meta->committer.email)
+		held_text(meta->committer.email, &committer->email, &committer->emaillen);
+	if (meta->committer.dated)
+		committer->date = meta->committer.date;
 }
 
 /*
@@ -587,8 +674,11 @@ commit_put(ProllyCtx *ctx, const PHash *root, uint64 gen, uint64 bytes, uint64 t
  */
 PHash
 vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
-				uint32 nparents, uint64 time, const char *msg)
+				uint32 nparents, uint64 time, const char *msg,
+				const VcCommitMeta *meta)
 {
+	VcIdentHeld author,
+				committer;
 	VcCommit	pc[VC_MAX_PARENTS];
 	uint64		gen = 0,
 				bytes = 0,
@@ -617,8 +707,9 @@ vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
 		ptime[i] = pc[i].time;
 		vc_commit_release(&pc[i]);
 	}
+	resolve_idents(meta, time, &author, &committer);
 	h = commit_put(ctx, root, gen + 1, bytes, time, nparents, parents, pgen, pbytes,
-				   ptime, msg, strlen(msg));
+				   ptime, &author, &committer, msg, strlen(msg));
 	return h;
 }
 
@@ -997,9 +1088,9 @@ vc_set_clock(VcRepo *r, uint64 (*now) (void *arg), void *arg)
 /* Writes a commit and keeps it in the window's history, by its reference. */
 static PHash
 keep_commit(VcRepo *r, const PHash *root, const PHash *parents, uint32 np,
-			const char *msg)
+			const char *msg, const VcCommitMeta *meta)
 {
-	PHash		h = vc_commit_write(&r->ctx, root, parents, np, now_us(r), msg);
+	PHash		h = vc_commit_write(&r->ctx, root, parents, np, now_us(r), msg, meta);
 	char	   *ref = commit_ref(&h);
 
 	vc_refs_set(r->refs, ref, &h);
@@ -1046,7 +1137,7 @@ vc_repo_open_clock(VcRepo *r, ChunkStore *cs, VcRefs *refs,
 	{
 		PHash		root = vc_root_empty(&r->ctx);
 		PHash		commit = vc_commit_write(&r->ctx, &root, NULL, 0, unique_clock(r),
-											 "init");
+											 "init", NULL);
 		char	   *ref = commit_ref(&commit);
 		bool		added = vc_refs_add(r->refs, ref, &commit);
 
@@ -1294,18 +1385,74 @@ vc_checkout(VcRepo *r, const char *name)
 	return VC_OK;
 }
 
+/* (b's head and the commit it was moved to are of root, and of no merge then) */
+static void
+head_moved(VcRepo *r, VcBranch *b, const PHash *h, const PHash *root)
+{
+	b->head = *h;
+	b->head_root = *root;
+	b->merging = false;
+	branch_write(r, b);
+}
+
 /* Commits root on the locked branch b, which this moves. */
 static PHash
 commit_on(VcRepo *r, VcBranch *b, const PHash *root, const char *msg)
 {
 	PHash		parents[2] = {b->head, b->merge_head};
-	PHash		h = keep_commit(r, root, parents, b->merging ? 2 : 1, msg);
+	PHash		h = keep_commit(r, root, parents, b->merging ? 2 : 1, msg, NULL);
 
-	b->head = h;
-	b->head_root = *root;
-	b->merging = false;
-	branch_write(r, b);
+	head_moved(r, b, &h, root);
 	return h;
+}
+
+int
+vc_commit_with(VcRepo *r, const PHash *root, const char *msg,
+			   const VcCommitMeta *meta, int flags, PHash *out)
+{
+	VcBranch	b;
+	PHash		parents[VC_MAX_PARENTS];
+	uint32		np;
+	char	   *amended_msg = NULL;
+
+	lock_head(r, &b);
+	if (root == NULL)
+		root = &b.head_root;
+	if ((flags & VC_COMMIT_AMEND) && b.merging)
+	{
+		vc_branch_free(&b);
+		return VC_ERR_MERGING;
+	}
+	if (!(flags & (VC_COMMIT_ALLOW_EMPTY | VC_COMMIT_AMEND)) && !b.merging &&
+		phash_eq(root, &b.head_root))
+	{
+		vc_branch_free(&b);
+		return VC_ERR_NOTHING;
+	}
+	if (flags & VC_COMMIT_AMEND)
+	{
+		VcCommit	head = must_load_commit(&r->ctx, &b.head);
+
+		np = head.nparents;
+		memcpy(parents, head.parents, np * sizeof(PHash));
+		if (msg == NULL)
+			msg = amended_msg = pnstrdup(head.msg, head.msglen);
+		vc_commit_release(&head);
+	}
+	else
+	{
+		parents[0] = b.head;
+		parents[1] = b.merge_head;
+		np = b.merging ? 2 : 1;
+	}
+	if (msg == NULL)
+		elog(ERROR, "a commit not amending has a message");
+	*out = keep_commit(r, root, parents, np, msg, meta);
+	head_moved(r, &b, out, root);
+	if (amended_msg)
+		pfree(amended_msg);
+	vc_branch_free(&b);
+	return VC_OK;
 }
 
 PHash
@@ -2468,7 +2615,7 @@ rewrite_history(VcRepo *r, const PHash *cut, size_t ncut, PHashMap *win)
 		k[i].gen = gen + 1;
 		k[i].bytes = bytes + own;
 		k[i].now = commit_put(&r->ctx, &c->root, k[i].gen, k[i].bytes, c->time, np, par,
-							  pg, pb, pt, c->msg, c->msglen);
+							  pg, pb, pt, &c->author, &c->committer, c->msg, c->msglen);
 		k[i].moved = true;
 	}
 

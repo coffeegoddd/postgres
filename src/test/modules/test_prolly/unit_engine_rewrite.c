@@ -52,12 +52,15 @@ head_of(VcRepo *r)
 	return h;
 }
 
+/* As commit_rows, made by meta. */
 static PHash
-commit_rows(VcRepo *r, uint64 lo, uint64 hi, uint64 ver, const char *msg)
+commit_rows_by(VcRepo *r, uint64 lo, uint64 hi, uint64 ver, const char *msg,
+			   const VcCommitMeta *meta)
 {
 	EditBatch	b;
 	PHash		rv = vc_working_lock(r),
-				out;
+				out,
+				h;
 
 	batch_init(&b, hi - lo);
 	for (uint64 k = lo; k < hi; k++)
@@ -65,7 +68,22 @@ commit_rows(VcRepo *r, uint64 lo, uint64 hi, uint64 ver, const char *msg)
 	CHECK_EQ(vc_table_edit(&r->ctx, &rv, "t", b.e, b.n, &out), VC_OK);
 	vc_set_working(r, &out);
 	batch_free(&b);
-	return vc_commit(r, msg);
+	CHECK_EQ(vc_commit_with(r, &out, msg, meta, VC_COMMIT_ALLOW_EMPTY, &h), VC_OK);
+	return h;
+}
+
+static PHash
+commit_rows(VcRepo *r, uint64 lo, uint64 hi, uint64 ver, const char *msg)
+{
+	return commit_rows_by(r, lo, hi, ver, msg, NULL);
+}
+
+static bool
+idents_eq(const VcIdentHeld *a, const VcIdentHeld *b)
+{
+	return a->namelen == b->namelen && memcmp(a->name, b->name, a->namelen) == 0 &&
+		a->emaillen == b->emaillen && memcmp(a->email, b->email, a->emaillen) == 0 &&
+		a->date == b->date;
 }
 
 static void
@@ -619,7 +637,15 @@ ENGINE_TEST(test_measures_stay)
 
 	rewriting(&r, cs, &m);
 	for (int i = 0; i < 12; i++)
-		h[i] = commit_rows(&r, (uint64) i * 100, (uint64) i * 100 + 20 + i, (uint64) i, "m");
+	{
+		/* (each by its own, and before 1970 for some) */
+		VcCommitMeta by = {
+			.author = {psprintf("a%d", i), psprintf("a%d@x", i), true, (int64) (i - 6) * 1000000},
+			.committer = {psprintf("c%d", i), NULL, i % 2 == 0, (int64) i * 7},
+		};
+
+		h[i] = commit_rows_by(&r, (uint64) i * 100, (uint64) i * 100 + 20 + i, (uint64) i, "m", &by);
+	}
 	for (int i = 0; i < 12; i++)
 		CHECK(vc_commit_load(&r.ctx, &h[i], &before[i]));
 	H0 = before[11];
@@ -635,6 +661,11 @@ ENGINE_TEST(test_measures_stay)
 		CHECK_EQ(H1.generation - after.generation, H0.generation - before[i].generation);
 		CHECK_EQ(after.time, before[i].time);
 		CHECK(phash_eq(&after.root, &before[i].root));
+		/* (who made it, kept) */
+		CHECK(idents_eq(&after.author, &before[i].author));
+		CHECK(idents_eq(&after.committer, &before[i].committer));
+		CHECK(after.msglen == before[i].msglen &&
+			  memcmp(after.msg, before[i].msg, after.msglen) == 0);
 		vc_commit_release(&after);
 	}
 	vc_commit_release(&H1);

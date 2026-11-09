@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "engine_test_util.h"
+#include "miscadmin.h"
 
 static const char *schema_v1 = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 static const char *schema_v2 = "CREATE TABLE t (id int8 PRIMARY KEY, v int8, w text)";
@@ -753,6 +754,108 @@ ENGINE_TEST(test_merge_conflicts)
 	cs_destroy(cs);
 }
 
+static bool
+held_is(const char *s, size_t len, const char *want)
+{
+	return len == strlen(want) && memcmp(s, want, len) == 0;
+}
+
+/*
+ * A commit as Dolt's: who made it, defaults and all; nothing to commit
+ * refused unless allowed empty; amending takes the head's place, parents
+ * and message; and refused while a merge is in progress, as a commit of the
+ * head's root then is not.
+ */
+ENGINE_TEST(test_commit_with)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		base,
+				h,
+				e,
+				a,
+				root;
+	VcCommit	c;
+	VcMergeResult m;
+	char	   *user = GetUserNameFromId(GetSessionUserId(), false);
+	char	   *at = psprintf("%s@", user);
+	VcCommitMeta by = {
+		.author = {"Ann", "ann@x", true, -86400 * (int64) 1000000},
+		.committer = {"Cy", NULL, false, 0},
+	};
+
+	repo_open(&r, cs, &small_policy);
+	create_table(&r, "t", schema_v1);
+	put_row(&r, "t", 1, 0);
+	root = vc_working(&r);
+	CHECK_EQ(vc_commit_with(&r, &root, "base", NULL, 0, &base), VC_OK);
+	CHECK(vc_commit_load(&r.ctx, &base, &c));
+	/* the session's user, user@host, and the commit's time, for both */
+	CHECK(held_is(c.author.name, c.author.namelen, user));
+	CHECK(c.author.emaillen > strlen(at) && memcmp(c.author.email, at, strlen(at)) == 0);
+	CHECK_EQ(c.author.date, (int64) c.time);
+	CHECK(held_is(c.committer.name, c.committer.namelen, user));
+	CHECK(c.committer.emaillen == c.author.emaillen &&
+		  memcmp(c.committer.email, c.author.email, c.author.emaillen) == 0);
+	CHECK_EQ(c.committer.date, (int64) c.time);
+	CHECK(held_is(c.msg, c.msglen, "base"));
+	vc_commit_release(&c);
+
+	/* nothing to commit, the head's root given or taken */
+	CHECK_EQ(vc_commit_with(&r, &root, "again", NULL, 0, &h), VC_ERR_NOTHING);
+	CHECK_EQ(vc_commit_with(&r, NULL, "again", NULL, 0, &h), VC_ERR_NOTHING);
+	h = head_of(&r);
+	CHECK(phash_eq(&h, &base));
+	CHECK_EQ(vc_commit_with(&r, NULL, "empty", &by, VC_COMMIT_ALLOW_EMPTY, &e), VC_OK);
+	CHECK(vc_commit_load(&r.ctx, &e, &c));
+	CHECK(c.nparents == 1 && phash_eq(&c.parents[0], &base) && phash_eq(&c.root, &root));
+	/* given, and the committer's email and date the author's */
+	CHECK(held_is(c.author.name, c.author.namelen, "Ann"));
+	CHECK(held_is(c.author.email, c.author.emaillen, "ann@x"));
+	CHECK_EQ(c.author.date, -86400 * (int64) 1000000);
+	CHECK(held_is(c.committer.name, c.committer.namelen, "Cy"));
+	CHECK(held_is(c.committer.email, c.committer.emaillen, "ann@x"));
+	CHECK_EQ(c.committer.date, -86400 * (int64) 1000000);
+	CHECK(c.time > 0);
+	vc_commit_release(&c);
+
+	/* amended: in the head's place, its parents and message, with what changed since */
+	put_row(&r, "t", 2, 0);
+	root = vc_working(&r);
+	CHECK_EQ(vc_commit_with(&r, &root, NULL, NULL, VC_COMMIT_AMEND, &a), VC_OK);
+	CHECK(vc_commit_load(&r.ctx, &a, &c));
+	CHECK(c.nparents == 1 && phash_eq(&c.parents[0], &base) && phash_eq(&c.root, &root));
+	CHECK(held_is(c.msg, c.msglen, "empty"));
+	vc_commit_release(&c);
+	h = head_of(&r);
+	CHECK(phash_eq(&h, &a));
+	/* amending with nothing changed, a message given */
+	CHECK_EQ(vc_commit_with(&r, &root, "reworded", NULL, VC_COMMIT_AMEND, &h), VC_OK);
+	CHECK(vc_commit_load(&r.ctx, &h, &c));
+	CHECK(c.nparents == 1 && phash_eq(&c.parents[0], &base) && held_is(c.msg, c.msglen, "reworded"));
+	vc_commit_release(&c);
+
+	/* a merge in progress: no amending, and the head's root commits it */
+	CHECK_EQ(vc_branch_create(&r, "feature", NULL), VC_OK);
+	put_row(&r, "t", 1, 1);
+	vc_commit(&r, "main side");
+	CHECK_EQ(vc_checkout(&r, "feature"), VC_OK);
+	put_row(&r, "t", 1, 2);
+	vc_commit(&r, "feature side");
+	CHECK_EQ(vc_checkout(&r, "main"), VC_OK);
+	CHECK_EQ(vc_merge(&r, "feature", &m), VC_OK);
+	CHECK(m.status == VC_MERGE_CONFLICTS);
+	vc_merge_result_free(&m);
+	CHECK_EQ(vc_commit_with(&r, NULL, NULL, NULL, VC_COMMIT_AMEND, &h), VC_ERR_MERGING);
+	CHECK_EQ(vc_commit_with(&r, NULL, "merged", NULL, 0, &h), VC_OK);
+	CHECK(vc_commit_load(&r.ctx, &h, &c));
+	CHECK_EQ(c.nparents, 2);
+	vc_commit_release(&c);
+	settle_and_check(cs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 /* Two branches reaching the same contents by different paths agree. */
 ENGINE_TEST(test_same_changes_same_root)
 {
@@ -847,7 +950,7 @@ ENGINE_TEST(test_window_edge)
 	c1 = vc_commit(&r, "one");
 	/* (a commit written, but not kept: no reference) */
 	root = commit_root(&r, &c1);
-	orphan = vc_commit_write(&r.ctx, &root, &c1, 1, 0, "outside");
+	orphan = vc_commit_write(&r.ctx, &root, &c1, 1, 0, "outside", NULL);
 	CHECK(!vc_in_window(&r, &orphan));
 	CHECK(vc_in_window(&r, &c1));
 	CHECK_EQ(vc_reset_hard(&r, &orphan), VC_ERR_OUTSIDE_WINDOW);
@@ -888,7 +991,7 @@ ENGINE_TEST(test_window_edge)
 
 	/* histories sharing no commit have no merge base, window-only or not */
 	{
-		PHash		other = vc_commit_write(&r.ctx, &root, NULL, 0, 1, "another root");
+		PHash		other = vc_commit_write(&r.ctx, &root, NULL, 0, 1, "another root", NULL);
 
 		mb = absent;
 		CHECK_EQ(vc_merge_base_in(&r, &other, &orphan, 0, &mb), 0);
@@ -1192,6 +1295,7 @@ static const ProllyUnitTest tests[] = {
 	{"merge_fast_forward_and_up_to_date", test_merge_fast_forward_and_up_to_date},
 	{"three_way_merge", test_three_way_merge},
 	{"merge_conflicts", test_merge_conflicts},
+	{"commit_with", test_commit_with},
 	{"same_changes_same_root", test_same_changes_same_root},
 	{"merge_base_shapes", test_merge_base_shapes},
 	{"window_edge", test_window_edge},
