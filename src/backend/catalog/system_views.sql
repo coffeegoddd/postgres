@@ -1655,6 +1655,24 @@ CREATE TABLE pg_history.capture_tables (
 	nkey integer NOT NULL,
 	tags bigint[] NOT NULL
 );
+-- What each versioned schema's definitions were last told as, kept by
+-- whoever commits a change to its branch's catalogs: NULL if they can't be
+-- held.  And capture's own, as of what it has applied: the schema's name, its
+-- tables' oids and their names as the definitions have them, and why they
+-- can't be held, if so (capture/defs/<nspid> holds them otherwise).
+CREATE TABLE pg_history.capture_defined (
+	nspid oid PRIMARY KEY,
+	branch integer NOT NULL,
+	root bytea
+);
+CREATE TABLE pg_history.capture_definitions (
+	nspid oid PRIMARY KEY,
+	branch integer NOT NULL,
+	name text COLLATE "C" NOT NULL,
+	tables oid[] NOT NULL,
+	keys text[] COLLATE "C" NOT NULL,
+	why text COLLATE "C"
+);
 
 -- Which catalog branch each branch of the repository is: this database's own,
 -- in no commit and sent to no remote.  One name is one branch, and the other

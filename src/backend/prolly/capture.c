@@ -213,7 +213,8 @@ capture_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr l
 		capture_left_out = true;
 		return;
 	}
-	if (transactional && capture_left_out && strcmp(prefix, CAPTURE_ROWS_ARE_PREFIX) != 0)
+	if (transactional && capture_left_out && strcmp(prefix, CAPTURE_ROWS_ARE_PREFIX) != 0 &&
+		strcmp(prefix, CAPTURE_DEFINITIONS_PREFIX) != 0)
 		return;
 	CaptureSinkInUse->message(prefix, message, size, transactional, lsn);
 }
@@ -412,6 +413,15 @@ CaptureRowsAre(Relation relation, const PHash *map)
 		CaptureToldRefName(RelationGetRelid(relation), GetTopTransactionId(), map, name);
 		refs->routine->set(refs, name, map);
 	}
+}
+
+void
+CaptureToldDefsRefName(Oid nspid, TransactionId xid, const PHash *root, char *name)
+{
+	int			at = snprintf(name, CAPTURE_TOLD_REF_LEN, CAPTURE_TOLD_DEFS_REF_PREFIX "%u/%u/", nspid, xid);
+
+	for (int i = 0; i < PHASH_LEN; i++)
+		at += snprintf(name + at, CAPTURE_TOLD_REF_LEN - at, "%02x", root->b[i]);
 }
 
 void

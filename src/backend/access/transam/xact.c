@@ -2338,6 +2338,7 @@ CommitTransaction(void)
 
 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_PRE_COMMIT
 					  : XACT_EVENT_PRE_COMMIT);
+	CaptureDefinitionsAtCommit(false);
 
 	/*
 	 * If this xact has started any unfinished parallel operation, clean up
@@ -2625,6 +2626,7 @@ PrepareTransaction(void)
 	}
 
 	CallXactCallbacks(XACT_EVENT_PRE_PREPARE);
+	CaptureDefinitionsAtCommit(true);
 
 	/*
 	 * The remaining actions cannot call any user-defined code, so it's safe

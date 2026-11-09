@@ -809,6 +809,16 @@ CREATE FUNCTION test_capture_barrier(schema text, timeout_ms integer DEFAULT 600
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+-- What a schema's definitions are now, as a session reads them; and capture's
+-- of it, as of what it has applied (NULL if none).
+CREATE FUNCTION test_ws_definitions(schema text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_capture_definitions(schema text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_capture_wait(lsn pg_lsn, timeout_ms integer DEFAULT 60000)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
@@ -928,6 +938,7 @@ CREATE FUNCTION test_ws_move_prepare(schema text, root text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+REVOKE ALL ON FUNCTION test_ws_definitions(text), test_capture_definitions(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION test_capture_barrier(text, integer), test_capture_wait(pg_lsn, integer), test_capture_leave_out(), test_capture_commit(text, text, text),
 	test_capture_commit_on(text, text, text), test_branch_link(text, integer), test_branch_of(text),
 	test_branch_barrier(integer, integer), test_branch_commit(text, text), test_branch_unlink(text), test_dbroot_schemas(text), test_branch_in_use(integer), test_branch_create(text, text, text, boolean, integer), test_branch_head(text), test_branch_make(text, text, text), test_branch_materialize(text),

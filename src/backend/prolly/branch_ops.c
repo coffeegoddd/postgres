@@ -497,6 +497,8 @@ share_from(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 parent, const c
 	branch = BranchIds->allocate();
 	BranchCatalogCopy->copy(parent, branch, true);
 	CommandCounterIncrement();
+	/* (its definitions told as this commits, as its catalog rows are copied in) */
+	CaptureNoteBranchDefinitions(branch);
 	INJECTION_POINT("branch-share-copied", NULL);
 
 	/*
@@ -780,6 +782,8 @@ give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool kee
 		return false;
 	default_check(name);
 	BranchCatalogs->drop(branch);
+	/* (its schemas told gone as this commits) */
+	CaptureNoteBranchDefinitions(branch);
 	INJECTION_POINT("branch-give-back-dropped", NULL);
 	(void) BranchLink->unlink(name);
 	return true;
