@@ -740,13 +740,14 @@ branch_barrier(ProllyCtx *ctx, int32 branch, int timeout_ms, void (*hold) (void 
 
 	/*
 	 * (with no schema, nothing to wait for: an empty root, as of any point; with hold, catalog
-	 * changes still wait until the transaction ends)
+	 * changes still wait until the transaction ends.  The root put together after, as writing it
+	 * gives this transaction an ID, which a slot being made would wait for.)
 	 */
-	*root = vc_root_empty(ctx);
 	if (b.n > 0)
 		barrier_take(ctx, b.schemas, b.nsps, b.n, branch, true, timeout_ms, roots, hold != NULL);
 	else if (hold)
 		LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+	*root = vc_root_empty(ctx);
 	for (int i = 0; i < b.n; i++)
 		WsDbRoot->put_schema(ctx, root, b.keys[i], &roots[i], root);
 	CatalogBranchLeave(level);

@@ -18,6 +18,16 @@
  * buffer lock).  Index-only scans of filtered catalogs always visit the
  * heap, and scans of them run page at a time.
  *
+ * The cost: a scan of a catalog reads every branch's rows and hides the
+ * others', so it costs more with each object on other branches, as does a
+ * query by a name their objects have too.  Each backend's map of objects
+ * to branches grows to an entry for every object its scans meet (a scan
+ * meeting many relations it doesn't know learns every branch's at once).
+ * A name resolved finds the schema's row for the session's branch, a query
+ * by name in a schema finds only that branch's rows, and a lookup by
+ * object id needs no branch, so none of them costs more.  A branch without
+ * catalog rows costs nothing.
+ *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
  * src/include/prolly/branch_filter.h
