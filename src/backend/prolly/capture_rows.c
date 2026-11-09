@@ -64,6 +64,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -72,10 +73,14 @@
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/capture.h"
+#include "prolly/chunkstore.h"
+#include "prolly/engine/vc_refs.h"
+#include "prolly/ws/ws_restore.h"
 #include "prolly/ws/ws_schema.h"
 #include "prolly/ws/ws_sql.h"
 #include "replication/message.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/sinval.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -513,6 +518,253 @@ rows_compare(SharedInvalidationMessage *msgs, int nmsgs)
 		elog(ERROR, "could not forget a table's fingerprint");
 }
 
+/* ------------------------------------------------------------------ definitions */
+
+/* The branches this transaction changed the catalogs of, in its memory, and which one it was. */
+static List *noted_branches = NIL;
+static LocalTransactionId noted_lxid = InvalidLocalTransactionId;
+
+static List *
+noted_now(void)
+{
+	if (MyProc == NULL || noted_lxid != MyProc->vxid.lxid)
+		return NIL;
+	return noted_branches;
+}
+
+void
+CaptureNoteBranchDefinitions(int32 branch)
+{
+	MemoryContext old;
+
+	if (branch == 0 || MyProc == NULL || !capture_to_trees || am_capture_worker)
+		return;
+	if (noted_lxid != MyProc->vxid.lxid)
+	{
+		noted_branches = NIL;
+		noted_lxid = MyProc->vxid.lxid;
+	}
+	if (list_member_int(noted_branches, branch))
+		return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	noted_branches = lappend_int(noted_branches, branch);
+	MemoryContextSwitchTo(old);
+}
+
+void
+CaptureNoteCatalogChange(void)
+{
+	CaptureNoteBranchDefinitions(catalog_branch);
+}
+
+static void
+put_text(StringInfo out, const char *text)
+{
+	put_int32(out, (int32) strlen(text));
+	appendBinaryStringInfoNT(out, text, strlen(text));
+}
+
+void
+CaptureSchemaTables(Oid nspid, List **relids, List **keys)
+{
+	Oid			types[1] = {OIDOID};
+	Datum		values[1] = {ObjectIdGetDatum(nspid)};
+
+	*relids = NIL;
+	*keys = NIL;
+	if (SPI_execute_with_args("SELECT oid, relname::text FROM pg_catalog.pg_class "
+							  "WHERE relnamespace = $1 AND relkind IN ('r', 'p') ORDER BY oid",
+							  1, types, values, NULL, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read a schema's tables");
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+
+		*relids = lappend_oid(*relids, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
+		*keys = lappend(*keys, ws_name_to_utf8(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2)));
+	}
+}
+
+/*
+ * Capture told what a schema's definitions are: root, or that it's gone if that's NULL, or that a
+ * commit can't hold them, why.  The root is held for capture until it has it.
+ */
+static void
+definitions_tell(int32 branch, Oid nspid, const char *name, const PHash *root, const char *why)
+{
+	StringInfoData out;
+	ListCell   *lc;
+
+	initStringInfo(&out);
+	put_int32(&out, branch);
+	put_int32(&out, (int32) nspid);
+	appendStringInfoChar(&out, root != NULL ? 1 : why != NULL ? 2 : 0);
+	if (root != NULL)
+		appendBinaryStringInfo(&out, (const char *) root->b, PHASH_LEN);
+	put_text(&out, name);
+	if (why != NULL)
+		put_text(&out, why);
+	if (root != NULL)
+	{
+		List	   *relids;
+		List	   *keys;
+		ListCell   *k;
+
+		CaptureSchemaTables(nspid, &relids, &keys);
+		put_int32(&out, list_length(relids));
+		forboth(lc, relids, k, keys)
+		{
+			put_int32(&out, (int32) lfirst_oid(lc));
+			put_text(&out, lfirst(k));
+		}
+	}
+	(void) LogLogicalMessage(CAPTURE_DEFINITIONS_PREFIX, out.data, out.len, true, false);
+	pfree(out.data);
+	if (root != NULL)
+	{
+		VcRefs	   *refs = VcRefsOpen("pointers", ChunkStoreOpen("pages"));
+		char		ref[CAPTURE_TOLD_REF_LEN];
+
+		CaptureToldDefsRefName(nspid, GetTopTransactionId(), root, ref);
+		refs->routine->set(refs, ref, root);
+	}
+}
+
+/*
+ * A schema's definitions, or why a commit can't hold them (what can't be held is the user's to
+ * change, not a reason to refuse what made it so), into *why.
+ */
+static bool
+definitions_read(ProllyCtx *ctx, const char *name, PHash *root, char **why)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	bool		held = true;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		WsRootIO->definitions(ctx, name, root);
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *e;
+
+		MemoryContextSwitchTo(cxt);
+		e = CopyErrorData();
+		if (e->sqlerrcode != ERRCODE_FEATURE_NOT_SUPPORTED)
+			PG_RE_THROW();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		*why = e->message;
+		held = false;
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	return held;
+}
+
+bool
+CaptureDefinitionsOf(ProllyCtx *ctx, int32 branch, Oid nspid, PHash *root, char **why)
+{
+	int			level = CatalogBranchEnter(branch);
+	int			gucs = NewGUCNestLevel();
+	bool		held;
+
+	(void) set_config_option("catalog_branch_filter", "on", PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	held = definitions_read(ctx, get_namespace_name(nspid), root, why);
+	AtEOXact_GUC(true, gucs);
+	CatalogBranchLeave(level);
+	return held;
+}
+
+/*
+ * Each schema of each branch this transaction changed the catalogs of, read as it is now, on its
+ * branch: capture told of each one whose definitions aren't what it was last told, and of each
+ * gone.  (As the catalogs' changes take turns, what's last told is of the one before.)
+ */
+static void
+definitions_compare(void)
+{
+	ProllyCtx	ctx;
+	List	   *branches = list_copy(noted_now());
+
+	prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+	foreach_int(branch, branches)
+	{
+		List	   *nsps = NIL;
+		Oid			btypes[1] = {INT4OID};
+		Datum		bvalues[1] = {Int32GetDatum(branch)};
+
+		if (SPI_execute_with_args("SELECT oid, nspname::text FROM pg_catalog.pg_namespace WHERE nspbranch = $1 ORDER BY oid",
+								  1, btypes, bvalues, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not read a branch's schemas");
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+
+			nsps = lappend_oid(nsps, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
+		}
+		foreach_oid(nspid, nsps)
+		{
+			char	   *name = get_namespace_name(nspid);
+			PHash		root;
+			char	   *why = NULL;
+			bool		held = CaptureDefinitionsOf(&ctx, branch, nspid, &root, &why);
+			Oid			types[3] = {OIDOID, INT4OID, BYTEAOID};
+			Datum		values[3] = {ObjectIdGetDatum(nspid), Int32GetDatum(branch), (Datum) 0};
+			char		nulls[3] = {' ', ' ', held ? ' ' : 'n'};
+
+			if (held)
+			{
+				bytea	   *b = palloc(VARHDRSZ + PHASH_LEN);
+
+				SET_VARSIZE(b, VARHDRSZ + PHASH_LEN);
+				memcpy(VARDATA(b), root.b, PHASH_LEN);
+				values[2] = PointerGetDatum(b);
+			}
+			if (SPI_execute_with_args("SELECT 1 FROM pg_history.capture_defined WHERE nspid = $1 AND branch = $2 "
+									  "AND root IS NOT DISTINCT FROM $3",
+									  3, types, values, nulls, true, 1) != SPI_OK_SELECT)
+				elog(ERROR, "could not read what a schema's definitions were told as");
+			if (SPI_processed > 0)
+				continue;
+			definitions_tell(branch, nspid, name, held ? &root : NULL, held ? NULL : why);
+			if (SPI_execute_with_args("INSERT INTO pg_history.capture_defined VALUES ($1, $2, $3) "
+									  "ON CONFLICT (nspid) DO UPDATE SET branch = excluded.branch, root = excluded.root",
+									  3, types, values, nulls, false, 0) != SPI_OK_INSERT)
+				elog(ERROR, "could not record what a schema's definitions were told as");
+		}
+
+		/* (one gone from the branch, dropped or the branch given back, told so) */
+		if (SPI_execute_with_args("SELECT d.nspid FROM pg_history.capture_defined d WHERE d.branch = $1 AND NOT EXISTS "
+								  "(SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.oid = d.nspid AND n.nspbranch = $1)",
+								  1, btypes, bvalues, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not read what a branch's definitions were told as");
+		nsps = NIL;
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+
+			nsps = lappend_oid(nsps, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
+		}
+		foreach_oid(nspid, nsps)
+		{
+			Oid			types[1] = {OIDOID};
+			Datum		values[1] = {ObjectIdGetDatum(nspid)};
+
+			definitions_tell(branch, nspid, "", NULL, NULL);
+			if (SPI_execute_with_args("DELETE FROM pg_history.capture_defined WHERE nspid = $1",
+									  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
+				elog(ERROR, "could not forget what a schema's definitions were told as");
+		}
+	}
+	prolly_ctx_free(&ctx);
+}
+
 static bool
 database_is_versioned(void)
 {
@@ -570,6 +822,51 @@ CaptureRowsAtCommit(bool prepare)
 		elog(ERROR, "could not finish with SPI");
 	PopActiveSnapshot();
 	INJECTION_POINT("capture-rows-written", NULL);
+	AtEOXact_GUC(true, gucs);
+	SetUserIdAndSecContext(saved_user, saved_context);
+	XactReadOnly = saved_read_only;
+}
+
+/*
+ * (before the deferred-trigger manager is shut down, as reading definitions takes a subtransaction;
+ * what runs after, ON COMMIT's actions, changes only temporary tables, of no versioned schema)
+ */
+void
+CaptureDefinitionsAtCommit(bool prepare)
+{
+	Oid			saved_user;
+	int			saved_context;
+	int			gucs;
+	bool		saved_read_only = XactReadOnly;
+
+	if (!capture_to_trees || !XLogLogicalInfoActive() || IsParallelWorker() || am_capture_worker ||
+		!OidIsValid(MyDatabaseId) || IsBinaryUpgrade || IsBootstrapProcessingMode() ||
+		!TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		return;
+	CommandCounterIncrement();
+	if (noted_now() == NIL || !database_is_versioned())
+		return;
+	if (prepare)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("capture to trees can't prepare a transaction that changed catalogs")));
+
+	/* (as CaptureRowsAtCommit, taking turns with it, and each its own kind) */
+	XactReadOnly = false;
+	GetUserIdAndSecContext(&saved_user, &saved_context);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, saved_context | SECURITY_LOCAL_USERID_CHANGE | SECURITY_RESTRICTED_OPERATION);
+	gucs = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog, pg_temp", PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("catalog_branch_filter", "off", PGC_SUSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	LockSharedObject(DatabaseRelationId, MyDatabaseId, CAPTURE_ROWS_LOCK, ExclusiveLock);
+	AcceptInvalidationMessages();
+	PushActiveSnapshot(GetLatestSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not connect to SPI");
+	definitions_compare();
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "could not finish with SPI");
+	PopActiveSnapshot();
 	AtEOXact_GUC(true, gucs);
 	SetUserIdAndSecContext(saved_user, saved_context);
 	XactReadOnly = saved_read_only;

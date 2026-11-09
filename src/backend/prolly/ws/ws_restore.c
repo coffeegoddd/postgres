@@ -65,7 +65,7 @@ name_add(char ***names, int *n, const char *name)
 }
 
 static void
-schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
+schema_read(ProllyCtx *ctx, const char *schema, bool rows, PHash *root)
 {
 	const char *params[1] = {schema};
 	WsSqlRows	tables;
@@ -113,7 +113,6 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 	{
 		const char *table = ws_sql_value(&tables, i, 0);
 		WsTableSchema rec;
-		PHash		rows;
 		WsForeignKey *fks;
 		int			nfks;
 
@@ -121,8 +120,11 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		if (!ws_schema_read(schema, table, &rec))
 			elog(ERROR, "table \"%s\" of schema \"%s\" is gone", table, schema);
 		ws_viol_fold(schema, &rec);
-		WsRows->capture(ctx, schema, &rec, &rows);
-		WsRoot->put_table(ctx, &rv, &rec, &rows, &rv);
+		if (rows)
+			WsRows->capture(ctx, schema, &rec, &map);
+		else if (prolly_empty(ctx, WS_ROW_VREFS, &map) < 0)
+			prolly_report(ctx);
+		WsRoot->put_table(ctx, &rv, &rec, &map, &rv);
 		if (rec.owner != NULL)
 			name_add(&roles, &nroles, rec.owner);
 		for (int g = 0; g < rec.ngrants; g++)
@@ -171,7 +173,7 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 		ws_role_map(ctx, held, nheld, &map);
 		WsRoot->put_map(ctx, &rv, WS_ROOT_ROLES, &map, &rv);
 	}
-	if (ws_viol_any_deferred(schema))
+	if (rows && ws_viol_any_deferred(schema))
 	{
 		char	   *why = NULL;
 
@@ -183,6 +185,18 @@ schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
 	}
 	WsSql->end(level);
 	*root = rv;
+}
+
+static void
+schema_capture(ProllyCtx *ctx, const char *schema, PHash *root)
+{
+	schema_read(ctx, schema, true, root);
+}
+
+static void
+schema_definitions(ProllyCtx *ctx, const char *schema, PHash *root)
+{
+	schema_read(ctx, schema, false, root);
 }
 
 /* ---------------------------------------------------------------- restore */
@@ -1005,6 +1019,7 @@ schema_restore_missing(ProllyCtx *ctx, const PHash *root, const PHash *previous,
 const WsRootIORoutine SchemaWsRootIO = {
 	.name = "schema",
 	.capture = schema_capture,
+	.definitions = schema_definitions,
 	.restore = schema_restore,
 	.restore_rows = schema_restore_rows,
 	.restore_statements = schema_restore_statements,

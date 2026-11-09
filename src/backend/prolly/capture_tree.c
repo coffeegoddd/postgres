@@ -102,6 +102,7 @@
 #include "storage/proc.h"
 #include "utils/hsearch.h"
 #include "utils/array.h"
+#include "catalog/pg_type.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/injection_point.h"
@@ -208,8 +209,25 @@ static MemoryContext tree_held_cxt = NULL;
 static List *tree_held_branches = NIL;
 static uint64 tree_held_changes = 0;
 
-/* What holds each map told as a table's rows since the last apply, in tree_held_cxt. */
+/* What holds each map told as a table's rows, or root as a schema's definitions, since the last apply, in tree_held_cxt. */
 static List *tree_told = NIL;
+
+/* A schema's definitions as told, in tree_held_cxt; kind as the message has it. */
+typedef struct TreeDefinitions
+{
+	int32		branch;
+	Oid			nspid;
+	char		kind;			/* 1: root; 2: why it can't be held; 0: gone */
+	PHash		root;
+	char	   *name;
+	char	   *why;
+	List	   *tables;			/* oids */
+	List	   *keys;			/* names, as the root has them */
+	XLogRecPtr	commit;
+} TreeDefinitions;
+
+/* Each schema's definitions told since the last apply, in the order told. */
+static List *tree_held_definitions = NIL;
 static Size tree_held_bytes = 0;	/* all of it, on file or not */
 static Size tree_held_in_memory = 0;
 
@@ -271,6 +289,25 @@ tree_let_go(VcRefs *refs)
 	}
 	tree_exec("DELETE FROM pg_history.capture_tables t "
 			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = t.relid)", SPI_OK_DELETE);
+
+	/*
+	 * (a gone schema's definitions are of nothing now, and those told of it held for nothing: its
+	 * telling gone is what's applied, or was)
+	 */
+	names = NIL;
+	refs->routine->list(refs, CAPTURE_TOLD_DEFS_REF_PREFIX, tree_forget_ref, &names);
+	refs->routine->list(refs, CAPTURE_DEFS_REF_PREFIX, tree_forget_ref, &names);
+	foreach_ptr(char, name, names)
+	{
+		const char *at = strncmp(name, CAPTURE_TOLD_DEFS_REF_PREFIX, strlen(CAPTURE_TOLD_DEFS_REF_PREFIX)) == 0 ?
+			name + strlen(CAPTURE_TOLD_DEFS_REF_PREFIX) : name + strlen(CAPTURE_DEFS_REF_PREFIX);
+		Oid			nspid = (Oid) strtoul(at, NULL, 10);
+
+		if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(nspid)))
+			(void) refs->routine->remove(refs, name);
+	}
+	tree_exec("DELETE FROM pg_history.capture_definitions d "
+			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.oid = d.nspid)", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_healing h "
 			  "WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = h.relid)", SPI_OK_DELETE);
 
@@ -490,8 +527,9 @@ tree_held_spill(void)
 	tree_held_in_memory = 0;
 }
 
+/* A branch held as having what's told at commit to apply. */
 static void
-tree_held_note(TreeTable *table, int32 branch, XLogRecPtr commit)
+tree_held_branch(int32 branch, XLogRecPtr commit)
 {
 	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
 	bool		known = false;
@@ -513,6 +551,12 @@ tree_held_note(TreeTable *table, int32 branch, XLogRecPtr commit)
 		tree_held_branches = lappend(tree_held_branches, held);
 	}
 	MemoryContextSwitchTo(old);
+}
+
+static void
+tree_held_note(TreeTable *table, int32 branch, XLogRecPtr commit)
+{
+	tree_held_branch(branch, commit);
 	table->branch = branch;
 	table->last_at = commit;
 	tree_held_changes++;
@@ -904,6 +948,61 @@ tree_rows_batch(const char *p, const char *end)
 	MemoryContextSwitchTo(old);
 }
 
+static char *
+read_text(const char **p, const char *end)
+{
+	int32		len = read_int32(p, end);
+
+	if (len < 0)
+		elog(ERROR, "a message's text is %d bytes long", len);
+	return pnstrdup(tree_take(p, end, len), len);
+}
+
+/* What a schema's definitions are as of this transaction, held until it's applied. */
+static void
+tree_definitions(const char *p, const char *end)
+{
+	MemoryContext old = MemoryContextSwitchTo(tree_held_cxt);
+	TreeDefinitions *defs = palloc0_object(TreeDefinitions);
+
+	defs->branch = read_int32(&p, end);
+	defs->nspid = (Oid) read_int32(&p, end);
+	defs->kind = *tree_take(&p, end, 1);
+	if (defs->kind == 1)
+		memcpy(defs->root.b, tree_take(&p, end, PHASH_LEN), PHASH_LEN);
+	defs->name = read_text(&p, end);
+	if (defs->kind == 2)
+		defs->why = read_text(&p, end);
+	if (defs->kind == 1)
+	{
+		int32		n = read_int32(&p, end);
+
+		for (int32 i = 0; i < n; i++)
+		{
+			defs->tables = lappend_oid(defs->tables, (Oid) read_int32(&p, end));
+			defs->keys = lappend(defs->keys, read_text(&p, end));
+		}
+	}
+	else if (defs->kind != 0 && defs->kind != 2)
+		elog(ERROR, "a message of a schema's definitions of unknown kind %d", defs->kind);
+	if (p != end)
+		elog(ERROR, "a message of a schema's definitions is longer than it says");
+	defs->commit = tree_commit;
+	tree_held_definitions = lappend(tree_held_definitions, defs);
+
+	/* (what holds it for capture goes once it's applied, or passed over) */
+	if (defs->kind == 1)
+	{
+		char		name[CAPTURE_TOLD_REF_LEN];
+
+		CaptureToldDefsRefName(defs->nspid, tree_xid, &defs->root, name);
+		tree_told = lappend(tree_told, pstrdup(name));
+	}
+	MemoryContextSwitchTo(old);
+	tree_held_branch(defs->branch, tree_commit);
+	tree_held_changes++;
+}
+
 /* A barrier's marker just told, to be seen to before the next record is read. */
 static int32 tree_barrier_branch = 0;
 static XLogRecPtr tree_barrier_lsn = InvalidXLogRecPtr;
@@ -922,6 +1021,11 @@ tree_message(const char *prefix, const char *data, Size size, bool transactional
 	if (transactional && strcmp(prefix, CAPTURE_ROWS_ARE_PREFIX) == 0)
 	{
 		tree_rows_are(data, end);
+		return;
+	}
+	if (transactional && strcmp(prefix, CAPTURE_DEFINITIONS_PREFIX) == 0)
+	{
+		tree_definitions(data, end);
 		return;
 	}
 	if (!transactional || strcmp(prefix, CAPTURE_ROWS_PREFIX) != 0)
@@ -1735,6 +1839,48 @@ tree_heal(void)
 	tree_to_heal = later;
 }
 
+/* A schema's definitions kept as capture's, as of what it has applied. */
+static void
+tree_definitions_save(VcRefs *refs, const TreeDefinitions *defs)
+{
+	char		ref[64];
+	Oid			types[6] = {OIDOID, INT4OID, TEXTOID, OIDARRAYOID, TEXTARRAYOID, TEXTOID};
+	Datum		values[6];
+	char		nulls[6] = {' ', ' ', ' ', ' ', ' ', defs->why ? ' ' : 'n'};
+	int			n = list_length(defs->tables);
+	Datum	   *oids = palloc_array(Datum, Max(n, 1));
+	Datum	   *keys = palloc_array(Datum, Max(n, 1));
+
+	snprintf(ref, sizeof(ref), CAPTURE_DEFS_REF_PREFIX "%u", defs->nspid);
+	if (defs->kind == 1)
+		refs->routine->set(refs, ref, &defs->root);
+	else
+		(void) refs->routine->remove(refs, ref);
+	values[0] = ObjectIdGetDatum(defs->nspid);
+	if (defs->kind == 0)
+	{
+		if (SPI_execute_with_args("DELETE FROM pg_history.capture_definitions WHERE nspid = $1",
+								  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not forget a schema's definitions");
+		return;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		oids[i] = ObjectIdGetDatum(list_nth_oid(defs->tables, i));
+		keys[i] = CStringGetTextDatum((char *) list_nth(defs->keys, i));
+	}
+	values[1] = Int32GetDatum(defs->branch);
+	values[2] = CStringGetTextDatum(defs->name);
+	values[3] = PointerGetDatum(construct_array_builtin(oids, n, OIDOID));
+	values[4] = PointerGetDatum(construct_array_builtin(keys, n, TEXTOID));
+	values[5] = defs->why ? CStringGetTextDatum(defs->why) : (Datum) 0;
+	if (SPI_execute_with_args("INSERT INTO pg_history.capture_definitions VALUES ($1, $2, $3, $4, $5, $6) "
+							  "ON CONFLICT (nspid) DO UPDATE SET branch = excluded.branch, name = excluded.name, "
+							  "tables = excluded.tables, keys = excluded.keys, why = excluded.why",
+							  6, types, values, nulls, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not keep a schema's definitions");
+}
+
 static void
 tree_apply(void)
 {
@@ -1774,6 +1920,13 @@ tree_apply(void)
 			tree_apply_one(&ctx, refs, table, positions);
 		tree_held_forget(table);
 	}
+
+	/* (in the order told, each at most once: one its branch has applied is being told again) */
+	foreach_ptr(TreeDefinitions, defs, tree_held_definitions)
+	{
+		if (defs->commit > tree_position_of(positions, defs->branch)->before)
+			tree_definitions_save(refs, defs);
+	}
 	foreach_ptr(TreePosition, position, positions)
 	{
 		if (position->now > position->before)
@@ -1790,6 +1943,7 @@ tree_apply(void)
 	CommitTransactionCommand();
 	tree_held_branches = NIL;
 	tree_told = NIL;
+	tree_held_definitions = NIL;
 	tree_held_changes = 0;
 	tree_held_bytes = 0;
 	tree_held_in_memory = 0;
@@ -1958,6 +2112,52 @@ tree_rebuild_table(ProllyCtx *ctx, VcRefs *refs, Oid relid)
 	table_close(rel, NoLock);
 }
 
+/*
+ * Each versioned schema's definitions read as the slot begins, under its first position's snapshot,
+ * as its tables' rows are: capture's, and what each was last told as.
+ */
+static void
+tree_definitions_begin(ProllyCtx *ctx, VcRefs *refs)
+{
+	List	   *nsps = NIL;
+	List	   *branches = NIL;
+	ListCell   *lc_nsp;
+	ListCell   *b;
+
+	tree_exec("SELECT oid, nspbranch FROM pg_catalog.pg_namespace WHERE nspbranch <> 0 ORDER BY oid", SPI_OK_SELECT);
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+
+		nsps = lappend_oid(nsps, DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)));
+		branches = lappend_int(branches, DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull)));
+	}
+	forboth(lc_nsp, nsps, b, branches)
+	{
+		TreeDefinitions defs = {.branch = lfirst_int(b), .nspid = lfirst_oid(lc_nsp)};
+		bool		held = CaptureDefinitionsOf(ctx, defs.branch, defs.nspid, &defs.root, &defs.why);
+		Oid			types[3] = {OIDOID, INT4OID, BYTEAOID};
+		Datum		values[3] = {ObjectIdGetDatum(defs.nspid), Int32GetDatum(defs.branch), (Datum) 0};
+		char		nulls[3] = {' ', ' ', held ? ' ' : 'n'};
+
+		defs.kind = held ? 1 : 2;
+		defs.name = get_namespace_name(defs.nspid);
+		if (held)
+		{
+			bytea	   *root = palloc(VARHDRSZ + PHASH_LEN);
+
+			CaptureSchemaTables(defs.nspid, &defs.tables, &defs.keys);
+			SET_VARSIZE(root, VARHDRSZ + PHASH_LEN);
+			memcpy(VARDATA(root), defs.root.b, PHASH_LEN);
+			values[2] = PointerGetDatum(root);
+		}
+		tree_definitions_save(refs, &defs);
+		if (SPI_execute_with_args("INSERT INTO pg_history.capture_defined VALUES ($1, $2, $3)",
+								  3, types, values, nulls, false, 0) != SPI_OK_INSERT)
+			elog(ERROR, "could not record what a schema's definitions were told as");
+	}
+}
+
 static void
 tree_slot_made(XLogRecPtr from)
 {
@@ -1981,9 +2181,13 @@ tree_slot_made(XLogRecPtr from)
 
 	refs->routine->list(refs, "capture/map/", tree_forget_ref, &names);
 	refs->routine->list(refs, CAPTURE_TOLD_REF_PREFIX, tree_forget_ref, &names);
+	refs->routine->list(refs, CAPTURE_DEFS_REF_PREFIX, tree_forget_ref, &names);
+	refs->routine->list(refs, CAPTURE_TOLD_DEFS_REF_PREFIX, tree_forget_ref, &names);
 	foreach(lc, names)
 		refs->routine->remove(refs, lfirst(lc));
 	tree_exec("DELETE FROM pg_history.capture_positions", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_definitions", SPI_OK_DELETE);
+	tree_exec("DELETE FROM pg_history.capture_defined", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_tables", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_fingerprints", SPI_OK_DELETE);
 	tree_exec("DELETE FROM pg_history.capture_healing", SPI_OK_DELETE);
@@ -2022,6 +2226,7 @@ tree_slot_made(XLogRecPtr from)
 	INJECTION_POINT("capture-slot-locked", NULL);
 	foreach(lc, tables)
 		tree_rebuild_table(&ctx, refs, lfirst_oid(lc));
+	tree_definitions_begin(&ctx, refs);
 
 	if (SPI_execute_with_args("INSERT INTO pg_history.capture_positions VALUES (0, $1)",
 							  1, types, values, NULL, false, 0) != SPI_OK_INSERT)

@@ -84,6 +84,23 @@
 #define CAPTURE_ROWS_BEGIN 'R'
 #define CAPTURE_ROWS_BATCH 'D'
 
+/*
+ * A message of what a versioned schema's definitions are as its transaction commits, one that
+ * changed them (prolly/ws/ws_restore.h's definitions): int32 branch, the schema's oid, a byte 1 and
+ * the hash of its definitions' root, or 0 if it's gone; then its name, and its tables, each its oid
+ * and its name as the root has it, each name an int32 length and its bytes.  Left out of capture
+ * or not, it's told.
+ */
+#define CAPTURE_DEFINITIONS_PREFIX PROLLY_MESSAGE_PREFIX "capture.definitions"
+
+/*
+ * Where such a root is held from its transaction's commit until capture has applied it or passed it
+ * over: <nspid>/<xid>/<hash>.  And where capture holds each schema's definitions as of what it has
+ * applied: <nspid>.
+ */
+#define CAPTURE_TOLD_DEFS_REF_PREFIX "capture/told_defs/"
+#define CAPTURE_DEFS_REF_PREFIX "capture/defs/"
+
 /* The sub-id of the lock on a database that has what changes its tables' rows, untold, take turns. */
 #define CAPTURE_ROWS_LOCK 2
 
@@ -275,6 +292,9 @@ extern void CaptureCheckWrite(Relation relation, const char *what);
 extern void CaptureCheckCatalogChange(void);
 extern void CaptureCheckChanged(Oid relid, const char *fingerprint);
 
+/* The name of where a transaction holds a schema's definitions for capture, as that of a map. */
+extern void CaptureToldDefsRefName(Oid nspid, TransactionId xid, const PHash *root, char *name);
+
 /* The name of where CaptureRowsAre holds a table's map, into name, of CAPTURE_TOLD_REF_LEN. */
 #define CAPTURE_TOLD_REF_LEN 96
 extern void CaptureToldRefName(Oid relid, TransactionId xid, const PHash *map, char *name);
@@ -298,6 +318,30 @@ extern bool CaptureRowsResend(Oid relid, int wait_ms);
 
 /* As a transaction commits or prepares: tells capture of what it did to rows and told no change of. */
 extern void CaptureRowsAtCommit(bool prepare);
+
+/*
+ * As a transaction commits or prepares, before its deferred triggers are let go of: tells capture
+ * of what it did to the definitions of the schemas of each branch it changed catalogs on.
+ */
+extern void CaptureDefinitionsAtCommit(bool prepare);
+
+/*
+ * A catalog row written: the session's branch, if it's on one, is noted as one this transaction
+ * changed the catalogs of, whose schemas' definitions capture is told as it commits.
+ */
+extern void CaptureNoteCatalogChange(void);
+
+/* The same of a branch whatever the session's is, as one whose catalog rows are copied in. */
+extern void CaptureNoteBranchDefinitions(int32 branch);
+
+/*
+ * A versioned schema's definitions as they are now, on its branch (prolly/ws/ws_restore.h's): true,
+ * or false with why a commit can't hold them.  Through SPI, which the caller has connected.
+ */
+extern bool CaptureDefinitionsOf(ProllyCtx *ctx, int32 branch, Oid nspid, PHash *root, char **why);
+
+/* A schema's tables: their oids and their names as its definitions have them, in oid order. */
+extern void CaptureSchemaTables(Oid nspid, List **relids, List **keys);
 
 /* What makes up what a table's rows are, of the catalogs as they are for this reader. */
 extern char *CaptureRowsFingerprint(Oid relid, Oid relfilenode);

@@ -22,10 +22,13 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "nodes/parsenodes.h"
+#include "prolly/branch_catalog.h"
 #include "prolly/branch_checkout.h"
 #include "prolly/branch_link.h"
 #include "prolly/branch_ops.h"
 #include "prolly/capture.h"
+#include "prolly/chunkstore.h"
+#include "prolly/engine/vc_refs.h"
 #include "prolly/move.h"
 #include "prolly/vc_ops.h"
 #include "prolly/ws/ws_dbroot.h"
@@ -100,6 +103,8 @@ PG_FUNCTION_INFO_V1(test_ws_use_history_store);
 PG_FUNCTION_INFO_V1(test_ws_rows_hash);
 PG_FUNCTION_INFO_V1(test_ws_rows_copy);
 PG_FUNCTION_INFO_V1(test_ws_root_capture);
+PG_FUNCTION_INFO_V1(test_ws_definitions);
+PG_FUNCTION_INFO_V1(test_capture_definitions);
 PG_FUNCTION_INFO_V1(test_ws_root_restore);
 PG_FUNCTION_INFO_V1(test_ws_root_restore_after);
 PG_FUNCTION_INFO_V1(test_ws_root_refused);
@@ -972,6 +977,32 @@ test_ws_root_capture(PG_FUNCTION_ARGS)
 	PHash		root;
 
 	WsRootIO->capture(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(0)), &root);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* test_ws_definitions(schema text) returns text: what its definitions are now (WsRootIO->definitions) */
+Datum
+test_ws_definitions(PG_FUNCTION_ARGS)
+{
+	PHash		root;
+
+	WsRootIO->definitions(backend_ctx(), text_to_cstring(PG_GETARG_TEXT_PP(0)), &root);
+	PG_RETURN_TEXT_P(hash_text(&root));
+}
+
+/* test_capture_definitions(schema text) returns text: capture's of the schema, as of what it has applied, or NULL */
+Datum
+test_capture_definitions(PG_FUNCTION_ARGS)
+{
+	ChunkStore *cs = ChunkStoreOpen("pages");
+	VcRefs	   *refs = VcRefsOpen("pointers", cs);
+	char		name[64];
+	PHash		root;
+
+	snprintf(name, sizeof(name), CAPTURE_DEFS_REF_PREFIX "%u",
+			 NamespaceOidByName(text_to_cstring(PG_GETARG_TEXT_PP(0))));
+	if (!refs->routine->get(refs, name, VC_REF_READ, &root))
+		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(hash_text(&root));
 }
 

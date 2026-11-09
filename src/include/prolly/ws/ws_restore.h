@@ -53,6 +53,13 @@ typedef struct WsRootIORoutine
 	void		(*capture) (ProllyCtx *ctx, const char *schema, PHash *root);
 
 	/*
+	 * As capture, but each table holding an empty map of rows, and constraints set aside not
+	 * checked, as they're of rows: what the schema's definitions are, which a root with its
+	 * tables' rows put in is the schema's.
+	 */
+	void		(*definitions) (ProllyCtx *ctx, const char *schema, PHash *root);
+
+	/*
 	 * Makes a root in schema, which must hold nothing: ERRCODE_DUPLICATE_SCHEMA
 	 * otherwise.  previous is the root this database was on, whose roles a root's
 	 * may have changed, or NULL.
