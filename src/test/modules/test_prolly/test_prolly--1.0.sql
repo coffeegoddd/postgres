@@ -60,10 +60,6 @@ CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_bmap_used_blocks()
-RETURNS int8
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
 -- The slot following the page store's flushes for shares and captures.
 CREATE FUNCTION test_bmap_store_sync(OUT written int8, OUT flushing int4)
 RETURNS record
