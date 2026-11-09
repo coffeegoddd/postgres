@@ -143,12 +143,12 @@ $node->safe_psql('postgres', "$on SELECT test_branch_link('main', $branch)");
 $node->safe_psql('postgres', "$on UPDATE app.t SET v = 4");
 lose_slot();
 my $committer = $node->background_psql('postgres', on_error_stop => 0);
-$committer->query_until(qr/started/, "\\echo started\n$on SELECT test_branch_commit('main', 'c') IS NOT NULL AS committed;\n\\echo done\n");
-ok(waiting_barrier('SELECT test_branch_commit%'), 'a branch\'s commit waits for the slot lost to be made again');
-is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT test_branch_commit%'
+$committer->query_until(qr/started/, "\\echo started\n$on SELECT test_dbroot_schemas(test_branch_commit('main', 'c')) = 'app=' || test_ws_root_capture('app') AS committed;\n\\echo done\n");
+ok(waiting_barrier('SELECT test_dbroot_schemas(test_branch_commit%'), 'a branch\'s commit waits for the slot lost to be made again');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT test_dbroot_schemas(test_branch_commit%'
 	AND backend_xid IS NOT NULL}), '0', 'with no transaction ID');
 slot_made_again();
-like($committer->query_until(qr/done/, ''), qr/^t$/m, 'once it is, the branch commits');
+like($committer->query_until(qr/done/, ''), qr/^t$/m, 'once it is, the branch commits what its tables hold');
 is($committer->{stderr}, '', 'with no error');
 $committer->quit;
 is($node->safe_psql('postgres', "$on SELECT test_capture_barrier('app')"), $node->safe_psql('postgres', "$on SELECT test_ws_root_capture('app')"),
