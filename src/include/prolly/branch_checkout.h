@@ -74,8 +74,10 @@ typedef struct BranchCheckoutRoutine
 	/*
 	 * How long, in milliseconds, since a catalog branch was last used: since
 	 * a session last left it or it was noted used, or since the server
-	 * started, whichever is later; never less.  After in_use, which holds off
-	 * what would come on, what has left is in it.
+	 * started, whichever is later; never less.  The engine's own work on a
+	 * branch, which puts catalog_branch on it for a while, leaves it too.
+	 * After in_use, which holds off what would come on, what has left is in
+	 * it.
 	 */
 	int64		(*unused_for) (int32 branch);
 } BranchCheckoutRoutine;

@@ -1140,7 +1140,6 @@ CaptureLauncherMain(Datum main_arg)
 		old = MemoryContextSwitchTo(look);
 		marked = capture_in_background ? databases_marked() : NIL;
 		drop_slots_not_of(marked);
-		BranchIdleLook(marked);
 		foreach(lc, running)
 		{
 			CaptureRunning *one = lfirst(lc);
@@ -1181,6 +1180,10 @@ CaptureLauncherMain(Datum main_arg)
 				none_free = true;
 			MemoryContextSwitchTo(look);
 		}
+
+		/* (capture's first, which what gives back working sets waits for) */
+		if (!none_free)
+			BranchIdleLook(marked);
 
 		/* (once, for as long as it lasts; the next look tries again) */
 		if (none_free && !warned)

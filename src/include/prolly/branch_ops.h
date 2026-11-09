@@ -59,7 +59,9 @@ typedef struct BranchOpsRoutine
 	 * A branch's working set given back as dematerialize gives it back, if it has gone unused for
 	 * idle_ms (prolly/branch_checkout.h's unused_for): true.  False where dematerialize would refuse,
 	 * and while it has been used within idle_ms, its transaction then to be rolled back: one with
-	 * changes not committed is noted used, so it isn't looked at again for as long.
+	 * changes not committed, or a default_branch, is noted used, so it isn't looked at again for as
+	 * long.  An error, as dematerialize's, if its writers can't be held off or capture hasn't got
+	 * there within timeout_ms.
 	 */
 	bool		(*dematerialize_idle) (ProllyCtx *ctx, const char *name, int idle_ms, int timeout_ms);
 

@@ -12,7 +12,16 @@
  * than every branch_idle_timeout, or every minute if that's less, so a
  * working set goes up to that, and a look of the launcher's, after its time.
  * What came before the server started isn't kept: a branch used only before
- * then has gone unused since the start.
+ * then has gone unused since the start.  Only while capture runs
+ * (capture_in_background), as giving back waits for it.
+ *
+ * A branch kept for its changes, or as a default_branch, is looked at again
+ * once it has gone unused as long once more, each time holding off its
+ * checkouts while its writers are and capture gets there, as does one whose
+ * giving back fails.  A session that sets catalog_branch itself, rather
+ * than checking a branch out, is seen as on it only once it has set it
+ * (prolly/branch_checkout.h), so a database's or role's catalog_branch may
+ * name one given back meanwhile; default_branch is what's for that.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *

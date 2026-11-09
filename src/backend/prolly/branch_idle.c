@@ -8,8 +8,9 @@
  * the next worker, for the one looked at longest ago that's due, once the
  * last has stopped.  One it can't start, with none free, is started at a
  * later look.  The worker gives back each branch's working set in a
- * transaction of its own, rolled back if it's given nothing, and stops; an
- * error stops it too, the rest left to the next.
+ * transaction of its own, rolled back if it's given nothing, and stops.  An
+ * error giving one back is reported and rolled back, the branch noted used,
+ * and the worker goes on to the next.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -23,6 +24,7 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
+#include "prolly/branch_checkout.h"
 #include "prolly/branch_idle.h"
 #include "prolly/branch_link.h"
 #include "prolly/branch_ops.h"
@@ -39,8 +41,11 @@ int			branch_idle_timeout = 0;
 /* The longest a database waits between looks. */
 #define BRANCH_IDLE_LOOK_MAX_MS 60000
 
-/* (how long a worker waits for capture as it gives a branch's working set back) */
-#define BRANCH_IDLE_CAPTURE_TIMEOUT_MS 60000
+/*
+ * (how long a worker waits to hold off a branch's writers and for capture as it gives its working
+ * set back: checkouts of it wait as long)
+ */
+#define BRANCH_IDLE_CAPTURE_TIMEOUT_MS 10000
 
 typedef struct IdleLooked
 {
@@ -154,28 +159,47 @@ BranchIdleWorkerMain(Datum main_arg)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	/* (the setting as it was when this started, as it's gone before a reload could matter) */
 	foreach_ptr(char, name, names)
 	{
-		ProllyCtx	ctx;
-		bool		given;
+		volatile int32 branch = 0;
 
 		CHECK_FOR_INTERRUPTS();
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
-		given = BranchOps->dematerialize_idle(&ctx, name, branch_idle_timeout, BRANCH_IDLE_CAPTURE_TIMEOUT_MS);
-		prolly_ctx_free(&ctx);
-		PopActiveSnapshot();
-		if (given)
+		PG_TRY();
 		{
-			CommitTransactionCommand();
-			ereport(DEBUG1,
-					(errmsg_internal("gave back the working set of branch \"%s\", unused for %d ms",
-									 name, branch_idle_timeout)));
+			ProllyCtx	ctx;
+			bool		given;
+
+			PushActiveSnapshot(GetTransactionSnapshot());
+			branch = BranchLink->branch_of(name);
+			prolly_ctx_init(&ctx, ChunkStoreOpen("pages"), &prolly_default_policy);
+			given = BranchOps->dematerialize_idle(&ctx, name, branch_idle_timeout, BRANCH_IDLE_CAPTURE_TIMEOUT_MS);
+			prolly_ctx_free(&ctx);
+			PopActiveSnapshot();
+			if (given)
+			{
+				CommitTransactionCommand();
+				ereport(DEBUG1,
+						(errmsg_internal("gave back the working set of branch \"%s\", unused for %d ms",
+										 name, branch_idle_timeout)));
+			}
+			else
+				AbortCurrentTransaction();
 		}
-		else
-			AbortCurrentTransaction();
+		PG_CATCH();
+		{
+			/* (reported, and not looked at again until it has been unused as long once more) */
+			HOLD_INTERRUPTS();
+			MemoryContextSwitchTo(cxt);
+			EmitErrorReport();
+			AbortOutOfAnyTransaction();
+			FlushErrorState();
+			RESUME_INTERRUPTS();
+			BranchCheckout->used(branch);
+		}
+		PG_END_TRY();
 	}
 	proc_exit(0);
 }

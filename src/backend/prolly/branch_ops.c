@@ -279,7 +279,7 @@ lock_writers_out(void *arg)
 		if (TimestampDifferenceExceeds(h->start, GetCurrentTimestamp(), h->timeout_ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("could not hold off the writers of the branch being made from in time")));
+					 errmsg("could not hold off the writers of catalog branch %d in time", h->branch)));
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10, WAIT_EVENT_BRANCH_HOLD_GIVE_WAY);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
@@ -741,8 +741,8 @@ default_check(const char *name)
 /*
  * A branch's working set given back, as its writers and commits are held off: its catalog rows and
  * the relations they hold dropped, the link let go of; true.  With keep_changes, refused while it
- * has changes not committed, or with quiet, false and nothing dropped.  Refused while it's a
- * default_branch.  (Its making's lock held.)
+ * has changes not committed.  Refused while it's a default_branch.  With quiet, false and nothing
+ * dropped for either.  (Its making's lock held.)
  */
 static bool
 give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool keep_changes, bool quiet,
@@ -771,6 +771,8 @@ give_back(ProllyCtx *ctx, VcRepo *repo, const char *name, int32 branch, bool kee
 					 errmsg("branch \"%s\" has changes not committed", name),
 					 errhint("Commit them, or reset the branch, first.")));
 	}
+	if (quiet && named_default(name))
+		return false;
 	default_check(name);
 	BranchCatalogs->drop(branch);
 	(void) BranchLink->unlink(name);
@@ -827,12 +829,12 @@ shared_dematerialize_idle(ProllyCtx *ctx, const char *name, int idle_ms, int tim
 
 	/* (in_use holds off what would come on, so what has left is in unused_for) */
 	if (branch == 0 || BranchCheckout->mine(branch) || BranchCheckout->in_use(branch) ||
-		BranchCheckout->unused_for(branch) < idle_ms || named_default(name))
+		BranchCheckout->unused_for(branch) < idle_ms)
 		return false;
 	vc_repo_open(&repo, cs, VcRefsOpen("pointers", cs), &prolly_default_policy);
 	given = give_back(ctx, &repo, name, branch, true, true, timeout_ms);
 
-	/* (one with changes not looked at again until it has been unused as long once more) */
+	/* (one kept not looked at again until it has been unused as long once more) */
 	if (!given)
 		BranchCheckout->used(branch);
 	else
