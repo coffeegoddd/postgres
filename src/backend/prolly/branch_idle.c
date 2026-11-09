@@ -42,8 +42,8 @@ int			branch_idle_timeout = 0;
 #define BRANCH_IDLE_LOOK_MAX_MS 60000
 
 /*
- * (how long a worker waits to hold off a branch's writers and for capture as it gives its working
- * set back: checkouts of it wait as long)
+ * (how long a worker waits for each of capture's slot, a branch's writers held off, and capture
+ * getting there, as it gives its working set back: checkouts of it wait for all of those)
  */
 #define BRANCH_IDLE_CAPTURE_TIMEOUT_MS 10000
 

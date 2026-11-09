@@ -16,7 +16,7 @@ use Test::More;
 use Time::HiRes qw(time usleep);
 
 # (no session of the test's checks out the database's default_branch)
-$ENV{PGOPTIONS} = '-c default_branch=';
+$ENV{PGOPTIONS} = ($ENV{PGOPTIONS} // '') . ' -c default_branch=';
 
 my $node = PostgreSQL::Test::Cluster->new('branch_idle');
 $node->init(allows_streaming => 'logical');
@@ -67,6 +67,9 @@ sql($id{dirty}, q{SET ROLE app_owner; INSERT INTO app.t VALUES (6, 'uncommitted'
 $node->safe_psql('postgres', q{CREATE ROLE away; ALTER ROLE away SET default_branch = 'def'});
 $node->safe_psql('postgres', q{ALTER DATABASE postgres SET default_branch = 'ddef'});
 sql($id{prep}, q{BEGIN; SET LOCAL ROLE app_owner; INSERT INTO app.t VALUES (7, 'prepared'); PREPARE TRANSACTION 'p'});
+
+# (those to be given back in the pass that can't give back "prep" left after it, so it's due in that pass too)
+sql($id{$_}, 'SELECT 1') for qw(idle late);
 
 # Ones a session stays on past the time, then leaves: by a checkout, and by a savepoint rolled back.
 my $l = $node->background_psql('postgres');
