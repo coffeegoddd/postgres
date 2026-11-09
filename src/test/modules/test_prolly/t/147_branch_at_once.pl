@@ -160,9 +160,9 @@ $s{$_}->query_safe('COMMIT') for qw(c d);
 for my $br (qw(c d))
 {
 	my $other = $br eq 'c' ? 'd' : 'c';
-	is(sql($id{$br}, qq{SELECT count(*) || '/' || count(*) FILTER (WHERE v LIKE '%-$other%' OR v = '$other+')
-		|| '/' || count(*) FILTER (WHERE big IS NOT NULL AND big <> repeat(md5(id || '$br'), 300)) FROM app.t}),
-		'1175/0/0', "$br has its own rows and values stored out of line, none of the other's");
+	is(sql($id{$br}, qq{SELECT count(*) || '/' || count(*) FILTER (WHERE v NOT IN ('c1-$br+', '$br+'))
+		|| '/' || count(big) || '/' || count(*) FILTER (WHERE big <> repeat(md5(id || '$br'), 300)) FROM app.t}),
+		'1175/0/225/0', "$br has each of its own rows and values stored out of line, none of the other's");
 	is(checks($id{$br}), '3/0', "every index and heap of $br is right, TOAST too");
 	is(sql($id{$br}, q{SELECT test_capture_barrier('app')}), sql($id{$br}, q{SELECT test_ws_root_capture('app')}),
 		"capture has $br\'s writes");
@@ -200,8 +200,8 @@ sub standby_of { return $standby->safe_psql('postgres', qq{SELECT test_branch_of
 sub standby_rows { return $standby->safe_psql('postgres', "SET catalog_branch = $_[0]; $rows"); }
 sub heads_match
 {
-	return $standby->safe_psql('postgres', qq{SELECT test_branch_head('$_[0]')})
-	  eq $node->safe_psql('postgres', qq{SELECT test_branch_head('$_[0]')});
+	my $head = $node->safe_psql('postgres', qq{SELECT test_branch_head('$_[0]')});
+	return $head ne '' && $standby->safe_psql('postgres', qq{SELECT test_branch_head('$_[0]')}) eq $head;
 }
 my %rows_of = (a => $a_rows, b => $b_rows, p => $p_rows, c => rows($id{c}), d => rows($id{d}));
 $node->wait_for_replay_catchup($standby);
@@ -231,7 +231,7 @@ $node->safe_psql('postgres', q{SELECT test_branch_dematerialize('a')});
 $node->safe_psql('postgres', q{SELECT test_branch_rename('b', 'b2')});
 $node->safe_psql('postgres', q{SELECT test_branch_delete('p', true)});
 $node->wait_for_replay_catchup($standby);
-isnt($node->safe_psql('postgres', q{SELECT test_branch_head('a')}), $c1, 'committed, a branch\'s head moves');
+like($node->safe_psql('postgres', q{SELECT test_branch_head('a')}), qr/^(?!\Q$c1\E$)\w+$/, 'committed, a branch\'s head moves');
 ok(heads_match('a'), 'and the standby has it there');
 is($standby->safe_psql('postgres', q{SELECT test_branch_of('a') IS NULL}), 't', 'given back, a head alone');
 is($standby->safe_psql('postgres', q{SELECT test_branch_of('b') IS NULL AND test_branch_of('b2') = } . $id{b}), 't',
