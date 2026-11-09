@@ -273,6 +273,7 @@ tests += {
       't/144_branch_rename_delete.pl',
       't/145_branch_idle.pl',
       't/146_branch_crash_steps.pl',
+      't/148_branch_scale.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

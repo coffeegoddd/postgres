@@ -261,6 +261,19 @@ test_bmap_free_blocks(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(nfree);
 }
 
+/* test_bmap_used_blocks(): the page store's blocks in use, those below its end not free */
+PG_FUNCTION_INFO_V1(test_bmap_used_blocks);
+
+Datum
+test_bmap_used_blocks(PG_FUNCTION_ARGS)
+{
+	BlockNumber hw;
+	uint32		nfree;
+
+	bmap_inspect_allocator(locator_of(InvalidRelFileNumber), &hw, &nfree);
+	PG_RETURN_INT64((int64) hw - nfree);
+}
+
 /*
  * test_bmap_store_sync(): the slot following the page store's flushes for
  * shares and captures, as bmap_inspect_store_sync() reads it (written and

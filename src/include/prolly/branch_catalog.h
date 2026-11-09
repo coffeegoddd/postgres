@@ -20,6 +20,14 @@
  * of that name, nor a versioned one while a shared one exists.  The same
  * holds for extensions, whose names are not qualified by a schema.
  *
+ * Object ids are the limit: a branch given its catalog rows takes one
+ * from the cluster's 32-bit counter for each object it copies (C of them:
+ * each schema, relation, type, constraint, rule...), the counter every
+ * database's new objects take theirs from too.  Making and dropping
+ * working sets wears the counter round sooner; past its wrap, new ids
+ * skip those in use, as they do for any object.  A branch with no catalog
+ * rows takes none.
+ *
  * Branch identifiers are allocated per database by a BranchIdRoutine.
  * This file knows only the identifiers; what a branch is called, and what
  * it holds besides its catalog rows, is kept elsewhere.
