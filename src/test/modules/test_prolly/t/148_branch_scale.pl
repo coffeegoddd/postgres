@@ -64,6 +64,8 @@ sql($main, q{CREATE SCHEMA app VERSIONED; GRANT ALL ON SCHEMA app TO app_owner; 
 	INSERT INTO app.t SELECT g, 'c1' FROM generate_series(1, 100000) g;
 	CREATE VIEW app.vw AS SELECT * FROM app.t; CREATE SEQUENCE app.s});
 sql($main, "SELECT test_branch_link('main', $main)");
+# (capture's slot made, and it has the rows, before the commit, which can't wait for the slot)
+sql($main, q{SELECT test_capture_barrier('app')});
 sql($main, q{SELECT test_branch_commit('main', 'c1')});
 
 # Ten thousand heads: no object id, the catalogs as they were, and the work of each as it was.
